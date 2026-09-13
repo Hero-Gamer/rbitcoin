@@ -3,7 +3,7 @@
 use super::*;
 use crate::compact::{
     classify_script, decode_script_kind_v17, encode_script_kind_v17, expand_script_kind,
-    SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
+    write_uleb128, SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
     SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
     SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
 };
@@ -1641,6 +1641,63 @@ fn output_run_roundtrip() {
         "op_true+value should be compact: {}",
         tiny.len()
     );
+}
+
+#[test]
+fn output_1btc_uses_exp_nibble_and_uleb_mantissa() {
+    let rec = OutputRecord::unspent(100_000_000, vec![0x51]);
+    let enc = rec.encode();
+    assert_eq!(enc[0] & 0x0f, SCRIPT_KIND_V17_OP_TRUE);
+    assert_eq!(enc[0] >> 4, 8);
+    assert_eq!(enc[1], 1);
+    assert_eq!(enc.len(), 2);
+    assert_eq!(OutputRecord::decode(&enc).unwrap().value, 100_000_000);
+    assert_eq!(OutputRecord::skip_at(&enc).unwrap(), enc.len());
+    assert_eq!(rec.encoded_len_exact(), enc.len());
+}
+
+#[test]
+fn output_messy_546_keeps_zero_exp() {
+    let rec = OutputRecord::unspent(546, vec![0x51]);
+    let enc = rec.encode();
+    assert_eq!(enc[0] >> 4, 0);
+    let (v, n) = crate::compact::read_uleb128(&enc[1..]).unwrap();
+    assert_eq!(v, 546);
+    assert_eq!(n + 1, enc.len());
+    assert_eq!(OutputRecord::decode(&enc).unwrap().value, 546);
+}
+
+#[test]
+fn output_zero_and_50btc_exp() {
+    let zero = OutputRecord::unspent(0, vec![0x51]).encode();
+    assert_eq!(zero[0] >> 4, 0);
+    assert_eq!(zero[1], 0);
+    assert_eq!(OutputRecord::decode(&zero).unwrap().value, 0);
+
+    let rec = OutputRecord::unspent(5_000_000_000, vec![0x51]);
+    let enc = rec.encode();
+    assert_eq!(enc[0] >> 4, 9);
+    assert_eq!(enc[1], 5);
+    assert_eq!(OutputRecord::decode(&enc).unwrap().value, 5_000_000_000);
+}
+
+#[test]
+fn output_exp_nibble_10_is_corrupt() {
+    let mut enc = OutputRecord::unspent(1, vec![0x51]).encode();
+    enc[0] = SCRIPT_KIND_V17_OP_TRUE | (10 << 4);
+    let err = OutputRecord::decode(&enc).unwrap_err();
+    assert!(format!("{err}").contains("amount exp"), "{err}");
+    let skip = OutputRecord::skip_at(&enc).unwrap_err();
+    assert!(format!("{skip}").contains("amount exp"), "{skip}");
+}
+
+#[test]
+fn output_noncanonical_mantissa_is_corrupt() {
+    let mut enc = Vec::new();
+    enc.push(SCRIPT_KIND_V17_OP_TRUE | (1 << 4));
+    write_uleb128(&mut enc, 10);
+    let err = OutputRecord::decode(&enc).unwrap_err();
+    assert!(format!("{err}").contains("amount exp"), "{err}");
 }
 
 #[test]

@@ -906,6 +906,27 @@ mod scan_p2tr_tests {
     }
 
     #[test]
+    fn scan_packed_p2tr_outs_exp_mantissa_is_sats() {
+        let meta = TxRecord {
+            txid: [0u8; 32],
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let mut raw = Vec::new();
+        meta.encode_body_meta_into(&mut raw);
+        raw.push(SCRIPT_KIND_V17_P2TR | (8 << 4));
+        raw.push(1);
+        raw.extend_from_slice(&[0u8; 32]);
+        let rows = scan_packed_p2tr_outs(&raw, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, 100_000_000);
+    }
+
+    #[test]
     fn scan_packed_p2tr_outs_overflow_is_corrupt() {
         let raw = packed_p2tr_body(i64::MAX as u64 + 1);
         let err = scan_packed_p2tr_outs(&raw, 1, None).unwrap_err();
