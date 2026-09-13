@@ -43,16 +43,18 @@ assert_ok "dry-run lists pool session tests" \
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=MINGW64_NT-10.0-20348 "$RUN")"
 assert_ok "Windows dry-run skips concurrent grow/read abort" \
   grep -qx "skip=concurrent_readers_during_append_and_grow" <<<"$out"
+assert_ok "Windows dry-run pins loc SIMD vs scalar" \
+  grep -q "create_loc::tests::prefix_sum" <<<"$out"
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Darwin "$RUN")"
 assert_ok "Darwin dry-run runs concurrent grow/read" \
   grep -qx "skip=" <<<"$out"
 assert_ok "Darwin dry-run pins loc SIMD vs scalar" \
-  grep -q "create_loc::tests::prefix_sum_fast_matches_scalar" <<<"$out"
+  grep -q "create_loc::tests::prefix_sum" <<<"$out"
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Linux "$RUN")"
 assert_ok "Linux dry-run leaves loc SIMD to the full suite" \
-  test "$(grep -c 'prefix_sum_fast_matches_scalar' <<<"$out" || true)" = "0"
+  test "$(grep -c 'create_loc::tests::prefix_sum' <<<"$out" || true)" = "0"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ci-os-smoke.test.sh: $PASS passed, $FAIL failed"

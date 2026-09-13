@@ -423,6 +423,8 @@ pub(crate) fn prefix_sum_create_no_ovf(buf: &[u8], n: usize, tx0: u64, sp0: u64)
     (tx_ps, sp_ps, n_outs)
 }
 
+/// Independent scalar prefix: test golden, and the production path off x86_64/aarch64.
+/// Test binaries on those arches still run [`prefix_sum_create_no_ovf`] through SIMD.
 #[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub(crate) fn prefix_sum_create_no_ovf_scalar(
     buf: &[u8],
@@ -799,6 +801,29 @@ mod tests {
                 "fat n={n}"
             );
         }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn prefix_sum_u8x8_scan_matches_scalar() {
+        let p = [255u8, 1, 0, 8, 255, 9, 2, 3];
+        let mut expect = [0u32; 8];
+        let mut acc = 0u32;
+        for (i, b) in p.iter().enumerate() {
+            acc += u32::from(*b) << 3;
+            expect[i] = acc;
+        }
+        let got = unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                sse2_u8x8_times_8_inclusive(p.as_ptr())
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                neon_u8x8_times_8_inclusive(p.as_ptr())
+            }
+        };
+        assert_eq!(got, expect);
     }
 
     #[test]
