@@ -115,11 +115,17 @@ Suite, budgets, coverage: [`TESTING.md`](TESTING.md).
 | When | Run |
 |------|-----|
 | **Each plan step / single-shot** | Targeted `cargo test -p <crate> …` (or slim scenario). `cargo fmt --all` if dirty. |
+| **Compile inner loop** | `cargo check -p <crate> --lib` (or that same `--lib` test filter). **Not** `cargo check --tests` / multi-crate `--tests` after every edit. `--tests` once per green slice. |
 | **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, workspace clippy, `nix build .#rbitcoin-musl` |
 | **Exception** | User asked for a local full suite, or you cannot push and must prove gates offline |
 
 Do **not** wait out a host IBD or a 90% coverage run in the agent VM. GitHub
 Actions is the workspace/coverage/clippy gate.
+
+Do **not** delete a large type/module and chase `dead_code` / unresolved
+across crates. Wrap the old API around the new one, switch one caller, delete
+the leftover in **Refactor**. Checkpoint when `--lib` is green.
+[`docs/how-we-plan.md`](docs/how-we-plan.md) (Keep the tree compiling).
 
 ### Push, PR, poll CI
 
@@ -227,7 +233,7 @@ the agent VM. Perf A/B is operator-host only.
 | Phase | Goal | Rules |
 |-------|------|--------|
 | **Red** | Encode the contract | Failing test only. No production edit yet. |
-| **Green** | Make it pass | **Smallest surgical** change. One-offs OK *temporarily*. |
+| **Green** | Make it pass | **Smallest surgical** change. One-offs OK *temporarily*. Keep `--lib` compiling: wrap old APIs; do not delete them until callers have moved. |
 | **Refactor** | Remove the one-off | Still green: fold into the real shape; delete dual paths. |
 
 Planning anatomy, INVEST, step template: [`docs/how-we-plan.md`](docs/how-we-plan.md).

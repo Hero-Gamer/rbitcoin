@@ -245,6 +245,27 @@ Each step is independently green and shippable.
 | Plan ignores test runtime | Explicit unit vs scenario choice per step |
 | Core functional as the default-CI Red | In-tree catalog journey; Core stays nightly |
 | Step done = “code compiles” | Step done = Red→Green→Refactor verify checklist |
+| Delete a large type/module then `cargo check --tests` until the workspace builds | Keep-compiling facade (below) |
+| Inner loop = `cargo check --tests` (or several crates `--tests`) after every edit | `--lib` until that crate’s lib is green; `--tests` once as Verify |
+
+### Keep the tree compiling
+
+Schema/API rewires stall when a session deletes the old type (`TxIdx`, a body
+meta field, …) and then spends the rest of the turn on `unresolved` /
+`dead_code` across store tests, query, consensus, and net. That is not TDD;
+it is a compile-doom loop. `rbitcoin-store --tests` is a fat rustc unit — do
+not use it as the edit cycle.
+
+| Do | Do not |
+|----|--------|
+| New type + its unit tests green, **then** a thin wrap on the old API | Delete the old module in the same dirty tree as all callers |
+| Switch **one** caller crate per step; `--lib` stays green | One uncommitted tree spanning store + confirm + query + net + docs |
+| Checkpoint commit when `--lib` is green | Hours of WIP so a crash loses the only compiling snapshot |
+| `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
+
+`--tests` / multi-crate check is **Verify** at the end of a slice, not the
+inner loop. Full text of the cargo table: [`AGENTS.md`](../AGENTS.md)
+(Local tests).
 
 ---
 
