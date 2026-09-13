@@ -125,6 +125,19 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
 /// Nibble values 10–15 are Corrupt (soft-extend), not extra exponent.
 pub const AMOUNT_EXP_MAX: u8 = 9;
 
+const POW10: [u64; (AMOUNT_EXP_MAX as usize) + 1] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
 pub fn amount_exp_mantissa(sats: u64) -> (u8, u64) {
     if sats == 0 {
         return (0, 0);
@@ -159,13 +172,9 @@ pub fn scale_amount_exp(exp: u8, mantissa: u64) -> Result<u64, StoreError> {
     if exp < AMOUNT_EXP_MAX && mantissa.is_multiple_of(10) {
         return Err(StoreError::Corrupt("txout amount exp"));
     }
-    let mut v = mantissa;
-    for _ in 0..exp {
-        v = v
-            .checked_mul(10)
-            .ok_or(StoreError::Corrupt("output value too large"))?;
-    }
-    Ok(v)
+    mantissa
+        .checked_mul(POW10[exp as usize])
+        .ok_or(StoreError::Corrupt("output value too large"))
 }
 
 /// `(sats, uleb bytes)`. `buf` starts at the mantissa ULEB. Above `i64::MAX` is Corrupt.
@@ -493,6 +502,14 @@ mod tests {
             assert_eq!(scale_amount_exp(e, m).unwrap(), sats, "{sats}");
         }
         assert_eq!(scale_amount_exp(8, 1).unwrap(), 100_000_000);
+        for e in 0..=AMOUNT_EXP_MAX {
+            assert_eq!(
+                scale_amount_exp(e, 1).unwrap(),
+                10u64.pow(u32::from(e)),
+                "{e}"
+            );
+        }
+        assert!(scale_amount_exp(9, u64::MAX).is_err());
         assert!(scale_amount_exp(10, 1).is_err());
         assert!(scale_amount_exp(1, 10).is_err());
         assert!(scale_amount_exp(3, 0).is_err());
