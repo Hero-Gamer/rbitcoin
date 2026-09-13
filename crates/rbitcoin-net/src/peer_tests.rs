@@ -5212,133 +5212,112 @@ fn pending_header_walk_is_ram_then_one_store_lookup() {
 }
 
 #[tokio::test]
-async fn inbound_handshake_timeout_after_silence() {
+async fn handshake_timeout_after_silence() {
+    use std::net::SocketAddr;
     use tokio::net::{TcpListener, TcpStream};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let _silent = TcpStream::connect(addr).await.unwrap();
-    let (stream, peer) = listener.accept().await.unwrap();
-
-    let handle = tokio::spawn(async move {
-        connect_and_handshake_timed(
-            Duration::from_millis(50),
-            stream,
-            Magic::REGTEST,
-            addr,
-            peer,
-            0,
-            true,
-            "/rbitcoin:test/",
-            HandshakePolicy::plain(),
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!handle.is_finished(), "must still wait during handshake");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        handle.is_finished(),
-        "silence past the bound must end handshake"
-    );
-    match handle.await.unwrap() {
-        Err(NetError::Timeout) => {}
-        Err(e) => panic!("expected Timeout, got {e}"),
-        Ok(_) => panic!("handshake succeeded on a silent peer"),
-    }
-}
-
-#[test]
-fn inbound_handshake_timeout_is_core_60s() {
     assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(60));
-}
 
-#[tokio::test]
-async fn outbound_handshake_timeout_after_silence() {
-    use tokio::net::{TcpListener, TcpStream};
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let _accepted = listener.accept().await.unwrap();
-
-    let handle = tokio::spawn(async move {
-        connect_and_handshake_timed(
-            Duration::from_millis(50),
-            stream,
-            Magic::REGTEST,
-            addr,
-            addr,
-            0,
-            false,
-            "/rbitcoin:test/",
-            HandshakePolicy::plain(),
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!handle.is_finished(), "must still wait during handshake");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        handle.is_finished(),
-        "silence past the bound must end handshake"
-    );
-    match handle.await.unwrap() {
-        Err(NetError::Timeout) => {}
-        Err(e) => panic!("expected Timeout, got {e}"),
-        Ok(_) => panic!("handshake succeeded on a silent peer"),
+    async fn bind_pair() -> (TcpStream, TcpStream, SocketAddr, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        (client, server, addr, peer)
     }
-}
 
-#[tokio::test]
-async fn outbound_regtest_plain_session_timeout_after_silence() {
-    use tokio::net::{TcpListener, TcpStream};
+    async fn join_timeout<T>(
+        handle: tokio::task::JoinHandle<Result<T, NetError>>,
+        still: &str,
+        done: &str,
+        succeeded: &str,
+    ) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!handle.is_finished(), "{still}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(handle.is_finished(), "{done}");
+        match handle.await.unwrap() {
+            Err(NetError::Timeout) => {}
+            Err(e) => panic!("expected Timeout, got {e}"),
+            Ok(_) => panic!("{succeeded}"),
+        }
+    }
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let _accepted = listener.accept().await.unwrap();
-    match V2PlainSession::outbound_regtest(stream, "/rbitcoin:test/", Duration::from_millis(50))
+    let (client, server, addr, peer) = bind_pair().await;
+    let _silent_in = client;
+    join_timeout(
+        tokio::spawn(async move {
+            connect_and_handshake_timed(
+                Duration::from_millis(50),
+                server,
+                Magic::REGTEST,
+                addr,
+                peer,
+                0,
+                true,
+                "/rbitcoin:test/",
+                HandshakePolicy::plain(),
+            )
+            .await
+        }),
+        "must still wait during inbound handshake",
+        "silence past the bound must end inbound handshake",
+        "inbound handshake succeeded on a silent peer",
+    )
+    .await;
+
+    let (client, server, addr, _) = bind_pair().await;
+    let _silent_out = server;
+    join_timeout(
+        tokio::spawn(async move {
+            connect_and_handshake_timed(
+                Duration::from_millis(50),
+                client,
+                Magic::REGTEST,
+                addr,
+                addr,
+                0,
+                false,
+                "/rbitcoin:test/",
+                HandshakePolicy::plain(),
+            )
+            .await
+        }),
+        "must still wait during outbound handshake",
+        "silence past the bound must end outbound handshake",
+        "outbound handshake succeeded on a silent peer",
+    )
+    .await;
+
+    let (client, server, addr, _) = bind_pair().await;
+    let _silent_feeler = server;
+    join_timeout(
+        tokio::spawn(async move {
+            run_feeler_timed(
+                Duration::from_millis(50),
+                client,
+                Magic::REGTEST,
+                addr,
+                addr,
+                0,
+                "/rbitcoin:test/",
+            )
+            .await
+        }),
+        "must still wait during feeler",
+        "silence past the bound must end feeler",
+        "feeler succeeded on a silent peer",
+    )
+    .await;
+
+    let (client, server, _, _) = bind_pair().await;
+    let _silent_plain = server;
+    match V2PlainSession::outbound_regtest(client, "/rbitcoin:test/", Duration::from_millis(50))
         .await
     {
         Err(NetError::Timeout) => {}
         Err(e) => panic!("expected Timeout, got {e}"),
         Ok(_) => panic!("plain session succeeded on a silent peer"),
-    }
-}
-
-#[tokio::test]
-async fn feeler_handshake_timeout_after_silence() {
-    use tokio::net::{TcpListener, TcpStream};
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let _accepted = listener.accept().await.unwrap();
-
-    let handle = tokio::spawn(async move {
-        run_feeler_timed(
-            Duration::from_millis(50),
-            stream,
-            Magic::REGTEST,
-            addr,
-            addr,
-            0,
-            "/rbitcoin:test/",
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!handle.is_finished(), "must still wait during feeler");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        handle.is_finished(),
-        "silence past the bound must end feeler"
-    );
-    match handle.await.unwrap() {
-        Err(NetError::Timeout) => {}
-        Err(e) => panic!("expected Timeout, got {e}"),
-        Ok(_) => panic!("feeler succeeded on a silent peer"),
     }
 }
 
