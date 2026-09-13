@@ -18,6 +18,7 @@ cargo test -p rbitcoin-consensus --lib core_tx_ -- --nocapture
 cargo test -p rbitcoin-consensus --lib core_sighash -- --nocapture
 cargo test -p rbitcoin-consensus --lib core_bip341 -- --nocapture
 cargo test -p rbitcoin-consensus --lib block_866342 -- --nocapture
+cargo test -p rbitcoin-consensus --test script_edge_fixtures
 # broader integration still covers connect success paths:
 cargo test -p rbitcoin-test --test scenarios consensus_
 ```
@@ -103,11 +104,11 @@ Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
 
 | ID | Rule | Error signal | Test |
 |----|------|--------------|------|
-| H1 | Genesis hash matches params | `BadHeader("genesis hash mismatch")` | `h1_rejects_wrong_genesis_hash` |
-| H2 | `prev` links to height−1 | `BadPrev` | `h2_rejects_bad_prev_link` |
+| H1 | Genesis hash matches params | `BadHeader("genesis hash mismatch")` | `header_and_spending_boundaries` |
+| H2 | `prev` links to height−1 | `BadPrev` | `header_and_spending_boundaries` |
 | H3 | `time > median_time_past` | `timestamp <= median-time-past` | `header_and_spending_boundaries` (`time==mtp` / `mtp+1`) |
 | H4 | Checkpoint hash at height | `checkpoint mismatch` | `h4_rejects_checkpoint_mismatch` |
-| H5 | `bits == expected_next_bits` | `incorrect proof of work bits` | `h5_regtest_rejects_wrong_bits` (regtest: must equal prev) |
+| H5 | `bits == expected_next_bits` | `incorrect proof of work bits` | `header_and_spending_boundaries` (regtest: must equal prev) |
 | H6 | Target ≤ `pow_limit` | `target above pow limit` | `h6_target_above_pow_limit_is_detectable` |
 | H7 | PoW valid for claimed bits | `InvalidPow` | `h7_rejects_header_hash_above_target` + smoke via `mine_regtest_block` accept |
 | H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` + `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` |
@@ -134,6 +135,7 @@ version floors and exact +2h).
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
 | C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings` |
+| C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
 
 ## Adding a new rule
 

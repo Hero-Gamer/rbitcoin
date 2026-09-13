@@ -105,9 +105,9 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 
 | ID | Hornet rule (`spec.h` / spec.html) | Happy | Boundary / reject |
 |----|-------------------------------------|-------|-------------------|
-| **H01** | Parent hash is a valid header | `header_and_spending_boundaries` (`validate_header` height 1) | `h2_rejects_bad_prev_link` |
+| **H01** | Parent hash is a valid header | `header_and_spending_boundaries` (`validate_header` height 1) | `header_and_spending_boundaries` (`BadPrev`) |
 | **H02** | Header hash `<=` claimed target | same journey (regtest grind) | `h7_rejects_header_hash_above_target` (mainnet bits, nonce misses) |
-| **H03** | `nBits` matches difficulty adjust | same journey | `h5_regtest_rejects_wrong_bits`; testnet 20 min min-diff: `testnet_min_difficulty_after_20_minute_gap` |
+| **H03** | `nBits` matches difficulty adjust | same journey | `header_and_spending_boundaries` (wrong bits); testnet 20 min min-diff: `testnet_min_difficulty_after_20_minute_gap` |
 | **H04** | `time > MTP(11)` | journey: `mtp+1` accepts | journey: `time == mtp` rejects |
 | **H05** | `time <= now + 2h` | `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (`now+7200`) | same test (`now+7201`); `h8_rejects_timestamp_too_far_in_future` |
 | **H06** | Version not retired by BIP34/66/65 | `h9_version_floors_at_bip34_66_65` (v2 @ BIP34, v3 @ BIP66, v4 @ BIP65 / regtest h=1) | same test (v1 @ BIP34, v2 @ BIP66, v3 @ BIP65 / regtest v3) |
