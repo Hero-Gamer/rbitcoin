@@ -338,9 +338,14 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        crate::tx_table::unlink_leftover_spent_idx(&path)?;
-        if meta_ver == 20 && SCHEMA_VERSION >= 21 {
-            rewrite_meta_current(&path)?;
+        unlink_leftover_spent_off(&path)?;
+        if class_a_has_creates(&path) && txout_meta_lacks_layout17(&path) {
+            return Err(StoreError::Corrupt(
+                "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
+            ));
+        }
+        if meta_ver < SCHEMA_VERSION && meta_ver >= 15 && class_a_has_creates(&path) {
+            return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
         }
         if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
             if crate::segmented_head::SegmentedTxHead::disk_occupied(&path)
@@ -406,11 +411,6 @@ impl Store {
             let _ = std::fs::remove_file(&leftover_h);
         }
         crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
-        if class_a_has_creates(&path) && txout_meta_lacks_layout17(&path) {
-            return Err(StoreError::Corrupt(
-                "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
-            ));
-        }
         if meta_ver == 15 && SCHEMA_VERSION >= 16 {
             rewrite_meta_current(&path)?;
         }
@@ -421,6 +421,9 @@ impl Store {
             if schema17_index_data_present(&path) {
                 return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
             }
+            rewrite_meta_current(&path)?;
+        }
+        if meta_ver < SCHEMA_VERSION {
             rewrite_meta_current(&path)?;
         }
         let inwit_dir = resolve_inwit_dir(&layout)?;
@@ -794,13 +797,13 @@ impl Store {
 
     /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
     ///
-    /// `pin` is `(TxRecord, outs)`. `spent_overlay` is per-item `(vout, spend_fk)`
+    /// `pin` is `(TxRecord, outs)`. `spent_overlay` is per-item `(vout, spend_fk, vin)`
     /// (empty = all zeros).
     pub fn put_tx_full_batch_from_pins(
         &self,
         items: &[crate::tx_table::PinInItem],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk)>],
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<Vec<Fk>, StoreError> {
         self.txs
             .put_full_batch_from_pins(items, index, spent_overlay)
@@ -810,12 +813,13 @@ impl Store {
         self.txs.get_by_txid(txid)
     }
 
-    /// Annotate create outpoint as spent by `spending_tx_fk` (by create Class A fk).
+    /// Annotate create outpoint as spent by `spending_tx_fk` at `spending_vin`.
     pub fn put_spend_create(
         &self,
         create_tx_fk: Fk,
         out_index: u32,
         spending_tx_fk: Fk,
+        spending_vin: u32,
     ) -> Result<(), StoreError> {
         point_table::put_spend_on_create(
             &self.txs,
@@ -823,6 +827,7 @@ impl Store {
             create_tx_fk,
             out_index,
             spending_tx_fk,
+            spending_vin,
         )
     }
 
@@ -832,6 +837,7 @@ impl Store {
         out_txid: &[u8; 32],
         out_index: u32,
         spending_tx_fk: Fk,
+        spending_vin: u32,
     ) -> Result<Fk, StoreError> {
         let create_fk = if let Some(fk) = self.txs.queued_pending_fk(out_txid) {
             fk
@@ -841,15 +847,18 @@ impl Store {
                 .map(|(fk, _)| fk)
                 .ok_or(StoreError::NotFound)?
         };
-        self.put_spend_create(create_fk, out_index, spending_tx_fk)?;
+        self.put_spend_create(create_fk, out_index, spending_tx_fk, spending_vin)?;
         Ok(spending_tx_fk)
     }
 
     /// Bulk annotate by out_txid (resolves each create via `tx.head`).
-    pub fn put_spend_batch(&self, edges: &[([u8; 32], u32, Fk)]) -> Result<Vec<Fk>, StoreError> {
+    pub fn put_spend_batch(
+        &self,
+        edges: &[([u8; 32], u32, Fk, u32)],
+    ) -> Result<Vec<Fk>, StoreError> {
         let mut out = Vec::with_capacity(edges.len());
-        for &(txid, vout, spend_fk) in edges {
-            self.put_spend(&txid, vout, spend_fk)?;
+        for &(txid, vout, spend_fk, vin) in edges {
+            self.put_spend(&txid, vout, spend_fk, vin)?;
             out.push(spend_fk);
         }
         Ok(out)
@@ -912,14 +921,14 @@ impl Store {
 
     /// Annotate spends using absolute 8-byte spender-meta offsets (pin layout).
     ///
-    /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
+    /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
     /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
     /// go to `spent.ovf` inline on read completion. Returns edges that still
     /// need a full cold path (OOB abs).
     pub fn put_spend_batch_by_abs_meta(
         &self,
-        abs_edges: &[(u64, Fk, u32, Fk)],
-    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         self.txs
             .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
     }
@@ -1036,7 +1045,7 @@ impl Store {
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         self.txs.get_spender_meta_at_abs_batch(abs_offs)
     }
 
@@ -1045,21 +1054,21 @@ impl Store {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         self.txs
             .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
 
     /// Pure-write annotate with structural-known meta (no body pread).
     ///
-    /// `abs_edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
-    /// `known`: parallel `(field, flags)` from structural spentness.
+    /// `abs_edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
+    /// `known`: parallel `(field, flags, vin)` from structural spentness.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
-        abs_edges: &[(u64, Fk, u32, Fk)],
-        known: &[(Fk, u8)],
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+        known: &[(Fk, u8, u32)],
         backend: crate::io_backend::WriteIoBackend,
-    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         self.txs
             .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
     }
@@ -1086,7 +1095,7 @@ impl Store {
         body_range: Option<(u64, u64)>,
         tip: Option<u32>,
     ) -> Result<bool, StoreError> {
-        let (multi, field) = match body_range {
+        let (multi, field, _vin) = match body_range {
             Some((off, len)) => self.txs.get_output_spender_meta_at(off, len, out_index)?,
             None => self.txs.get_output_spender_meta(create_tx_fk, out_index)?,
         };
@@ -1102,7 +1111,7 @@ impl Store {
             &self.spenders,
             create_tx_fk,
             out_index,
-            |spending_tx_fk| {
+            |spending_tx_fk, _vin| {
                 if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
                     found = true;
                     return Ok(false);
@@ -1127,7 +1136,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let tip = self.confirmed.tip_height().map(|t| t.0);
-        let metas: Vec<(u32, bool, Fk)> = match body_range {
+        let metas: Vec<(u32, bool, Fk, u32)> = match body_range {
             // `body_range` here is the create's **spent.body** span (schema 15).
             Some((off, len)) => self.txs.get_output_spender_metas_at(off, len, vouts)?,
             None => {
@@ -1136,15 +1145,16 @@ impl Store {
                 } else {
                     let mut out = Vec::with_capacity(vouts.len());
                     for &v in vouts {
-                        let (multi, field) = self.txs.get_output_spender_meta(create_tx_fk, v)?;
-                        out.push((v, multi, field));
+                        let (multi, field, vin) =
+                            self.txs.get_output_spender_meta(create_tx_fk, v)?;
+                        out.push((v, multi, field, vin));
                     }
                     out
                 }
             }
         };
         let mut unspent = Vec::with_capacity(metas.len());
-        for (v, multi, field) in metas {
+        for (v, multi, field, _vin) in metas {
             if field.is_null() {
                 unspent.push(v);
                 continue;
@@ -1242,7 +1252,7 @@ impl Store {
             &self.spenders,
             create_fk,
             out_index,
-            |spending_tx_fk| {
+            |spending_tx_fk, _vin| {
                 if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
                     found = true;
                     return Ok(false);
@@ -1294,11 +1304,12 @@ impl Store {
             &self.spenders,
             create_fk,
             out_index,
-            |spending_tx_fk| {
+            |spending_tx_fk, spending_vin| {
                 out.push(PointRecord {
                     out_txid: *out_txid,
                     out_index,
                     spending_tx_fk,
+                    spending_vin,
                     next: Fk::NULL,
                 });
                 Ok(true)
@@ -1315,7 +1326,7 @@ impl Store {
             &self.spenders,
             create_tx_fk,
             out_index,
-            |spending_tx_fk| {
+            |spending_tx_fk, _vin| {
                 out.push(spending_tx_fk);
                 Ok(true)
             },
@@ -1574,11 +1585,29 @@ fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
+    let path = dir.join("spent.off");
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        std::fs::remove_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
+    } else {
+        std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+    }
+    rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses spent.idx)");
+    Ok(())
+}
+
 /// One-line 17→18 index refuse (`Store::open` + tests).
 const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
 
 /// One-line 18/19→20 index refuse (`Store::open` + tests).
 const SCHEMA20_INDEX_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)";
+
+/// Occupied schema ≤21 Class A (spent slot layout / no vin pack).
+const SCHEMA22_CLASS_A_REFUSE: &str =
+    "schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD";
 
 fn schema17_index_data_present(dir: &Path) -> bool {
     crate::segmented_head::SegmentedTxHead::disk_occupied(dir) || scripthash_index_data_present(dir)
@@ -1981,9 +2010,9 @@ mod tests {
             vec![OutputRecord::unspent(49, vec![0x51])],
         );
         let spend_fk = s.put_tx_full_batch_indexed(&[spend], true).unwrap()[0];
-        s.put_spend_create(create_fk, 0, spend_fk).unwrap();
+        s.put_spend_create(create_fk, 0, spend_fk, 0).unwrap();
         // Idempotent re-annotate same sole spender.
-        s.put_spend_create(create_fk, 0, spend_fk).unwrap();
+        s.put_spend_create(create_fk, 0, spend_fk, 0).unwrap();
         // Multi promote: second spender.
         let spend2 = (
             TxRecord {
@@ -2006,7 +2035,7 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
         let spend2_fk = s.put_tx_full_batch_indexed(&[spend2], true).unwrap()[0];
-        s.put_spend_create(create_fk, 0, spend2_fk).unwrap();
+        s.put_spend_create(create_fk, 0, spend2_fk, 0).unwrap();
         assert!(s.spender_list_count() >= 2);
 
         // Third spender prepends multi list.
@@ -2031,9 +2060,9 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
         let spend3_fk = s.put_tx_full_batch_indexed(&[spend3], true).unwrap()[0];
-        s.put_spend(&[10u8; 32], 0, spend3_fk).unwrap();
-        s.put_spend_batch(&[([10u8; 32], 1, spend_fk)]).unwrap();
-        s.put_spend_create(create_fk, 1, spend2_fk).unwrap();
+        s.put_spend(&[10u8; 32], 0, spend3_fk, 0).unwrap();
+        s.put_spend_batch(&[([10u8; 32], 1, spend_fk, 0)]).unwrap();
+        s.put_spend_create(create_fk, 1, spend2_fk, 0).unwrap();
         let (soff, slen) = s.tx_spent_range(create_fk).unwrap();
         point_table::put_spend_on_create_at(
             &s.txs,
@@ -2041,6 +2070,7 @@ mod tests {
             create_fk,
             1,
             spend3_fk,
+            0,
             Some((soff, slen)),
         )
         .unwrap();
@@ -2051,6 +2081,7 @@ mod tests {
             create_fk,
             1,
             spend_fk,
+            0,
             Some((soff, slen)),
         )
         .unwrap();
@@ -2160,13 +2191,12 @@ mod tests {
     }
 
     #[test]
-    fn open_schema20_unlinks_spent_idx_and_rewrites_meta() {
+    fn open_schema20_empty_rewrites_meta() {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
             s.flush().unwrap();
         }
-        crate::tx_idx::TxIdx::create(&dir, "spent").unwrap();
         assert!(dir.join("spent.idx").is_dir());
         write_store_meta_ver(&dir, 20);
         assert_eq!(read_store_meta_ver(&dir), 20);
@@ -2174,14 +2204,65 @@ mod tests {
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert!(
-            !dir.join("spent.idx").exists(),
-            "schema 21 open must unlink leftover spent.idx"
+            dir.join("spent.idx").is_dir(),
+            "schema 22 open must keep spent.idx"
         );
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 21);
+        assert_eq!(SCHEMA_VERSION, 22);
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema21_occupied_refuses_wipe_ibd() {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            let tx = TxRecord {
+                txid: [0x21u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
+            let outs = vec![OutputRecord::unspent(1, vec![0x51])];
+            s.put_tx_full_batch_indexed(&[(tx, ins, outs)], false)
+                .unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 21);
+        match Store::open_tiny(&dir) {
+            Ok(_) => panic!("expected refuse for occupied schema-21 Class A"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema21_empty_rewrites_meta_and_unlinks_spent_off() {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        write_store_meta_ver(&dir, 21);
+        std::fs::write(dir.join("spent.off"), b"leftover").unwrap();
+        let s = Store::open_tiny(&dir).unwrap();
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 22);
+        assert!(
+            !dir.join("spent.off").exists(),
+            "empty 21 open must unlink leftover spent.off"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2498,9 +2579,9 @@ mod tests {
         }
         write_store_meta_ver(&dir, 17);
         match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-17 tx.head occupancy"),
+            Ok(_) => panic!("expected refuse for occupied schema-17 Class A"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA18_INDEX_REFUSE);
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2509,10 +2590,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Wiped 17 indexes + Class A: bump meta to 18 *before* head rebuild.
-    /// Occupancy after rebuild must not trip the 17-index refuse.
+    /// Occupied 17 Class A cannot rebuild after wiping indexes (vin pack).
     #[test]
-    fn open_schema17_wiped_indexes_rebuilds_head_and_bumps_meta() {
+    fn open_schema17_wiped_indexes_occupied_class_a_refused() {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
@@ -2522,10 +2602,13 @@ mod tests {
         }
         crate::segmented_head::wipe_segmented_head_files(&dir);
         write_store_meta_ver(&dir, 17);
-        let s = Store::open_tiny(&dir).unwrap();
-        assert_eq!(s.get_fk_by_txid(&[0x22u8; 32]).unwrap(), Some(Fk(1)));
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        match Store::open_tiny(&dir) {
+            Ok(_) => panic!("expected refuse for occupied schema-17 Class A"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2540,9 +2623,9 @@ mod tests {
         }
         write_store_meta_ver(&dir, 19);
         match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-19 tx.head occupancy"),
+            Ok(_) => panic!("expected refuse for occupied schema-19 Class A"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2562,9 +2645,9 @@ mod tests {
         }
         write_store_meta_ver(&dir, 18);
         match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-18 tx.head occupancy"),
+            Ok(_) => panic!("expected refuse for occupied schema-18 Class A"),
             Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
             }
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
@@ -2573,7 +2656,7 @@ mod tests {
     }
 
     #[test]
-    fn open_schema19_empty_tx_head_upgrades_and_rebuilds() {
+    fn open_schema19_wiped_head_occupied_class_a_refused() {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
@@ -2583,10 +2666,13 @@ mod tests {
         }
         crate::segmented_head::wipe_segmented_head_files(&dir);
         write_store_meta_ver(&dir, 19);
-        let s = Store::open_tiny(&dir).unwrap();
-        assert_eq!(s.get_fk_by_txid(&[0x22u8; 32]).unwrap(), Some(Fk(1)));
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        match Store::open_tiny(&dir) {
+            Ok(_) => panic!("expected refuse for occupied schema-19 Class A"),
+            Err(StoreError::Corrupt(m)) => {
+                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
+            }
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -76,15 +76,17 @@ pub struct IdxBodyIoStats {
 const BODY_OS_PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
 /// Cap a coalesced span at two OS pages (one straddle). Do not chain into SH-sized reads.
 const BODY_GROUP_MAX_PAGES: u64 = 2;
-/// Typical packed out (P2TR-ish) for the first-wave spill guess.
-const OUTS_GUESS_PER_VOUT: u64 = 40;
+const OUTS_META_GUESS: u64 = 4;
+/// Kind + 5-byte amount uleb + P2TR payload (not RAW/OP_RETURN fat scripts).
+const OUTS_GUESS_PER_VOUT: u64 = 38;
 
 /// First-wave Outs pread length.
 ///
 /// Records are 8-aligned, not OS-page aligned. `room` is bytes from `off` to
 /// the next OS page. Empty need uses the idx span; sparse need uses
-/// `(max_vout+1)*40`. If that estimate is likely to spill, read the full span;
-/// otherwise only the remainder of this page.
+/// `4 + (max_vout+1)*38` (LAYOUT17 typical meta + kind + 5-byte amount + P2TR).
+/// If that estimate is likely to spill, read the full span; otherwise only the
+/// remainder of this page.
 pub(crate) fn outs_first_wave_len(off: u64, full_len: u64, need_vouts: &[u32]) -> u64 {
     if full_len == 0 {
         return 0;
@@ -94,7 +96,7 @@ pub(crate) fn outs_first_wave_len(off: u64, full_len: u64, need_vouts: &[u32]) -
         full_len
     } else {
         let k = u64::from(need_vouts.iter().copied().max().unwrap_or(0));
-        k.saturating_add(1).saturating_mul(OUTS_GUESS_PER_VOUT)
+        OUTS_META_GUESS.saturating_add(k.saturating_add(1).saturating_mul(OUTS_GUESS_PER_VOUT))
     };
     if est > room {
         full_len
@@ -445,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn outs_first_wave_full_when_k_times_40_exceeds_room() {
+    fn outs_first_wave_full_when_k_times_38_plus_meta_exceeds_room() {
         assert_eq!(outs_first_wave_len(0, 8000, &[120]), 8000);
     }
 
@@ -455,8 +457,26 @@ mod tests {
     }
 
     #[test]
+    fn outs_first_wave_vout0_room_41_guesses_full() {
+        assert_eq!(outs_first_wave_len(4055, 8000, &[0]), 8000);
+    }
+
+    #[test]
     fn outs_first_wave_k0_fits_remainder_peeks_only_this_page() {
         assert_eq!(outs_first_wave_len(3840, 8000, &[0]), 256);
+    }
+
+    #[test]
+    fn outs_first_wave_vout0_p2tr_coinbase_fits_est() {
+        use crate::tx_table::OutputRecord;
+        let mut script = vec![0x51, 0x20];
+        script.extend_from_slice(&[0x11u8; 32]);
+        let rec = OutputRecord::unspent(6_2500_0000, script);
+        let out_len = rec.encoded_len_exact() as u64;
+        assert!(out_len > 40, "amount+P2TR exceeds old 40 guess: {out_len}");
+        let with_meta = 3 + out_len;
+        assert!(with_meta > 40 && with_meta <= 42, "got {with_meta}");
+        assert_eq!(outs_first_wave_len(0, 8000, &[0]), 4096);
     }
 
     #[test]

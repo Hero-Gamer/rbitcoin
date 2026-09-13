@@ -62,6 +62,9 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **22:** Restore `spent.idx`. Spent slot is flags + u40 spend fk + u16 vin.
+///         Occupied 21 Class A refused (wipe + IBD). Empty 21 rewrites `meta`
+///         and unlinks leftover `spent.off`.
 /// **21:** Drop `spent.idx`; leftover unlinked; rewrite `meta` 20→21. Spent
 ///         ranges are `n_out` prefix of `txout` (sparse `spent.off`).
 /// **20:** Sealed `tx.head` value-assigned packed BDZ (no `.rel`). Occupied
@@ -80,18 +83,19 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 21;
+pub const SCHEMA_VERSION: u16 = 22;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **21** is current (`spent.idx` gone; leftover unlinked; `meta` rewritten).
-/// Schema **20** table headers still open. Schema **18/19** with occupied `tx.head`
+/// Schema **22** is current (`spent.idx` restored; occupied 21 Class A refused).
+/// Schema **21** empty Class A rewrites `meta`. Schema **20** table headers still
+/// open when Class A is empty. Schema **18/19** with occupied `tx.head`
 /// or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`. Schema **17**
 /// still refuses populated `tx.head` / `scripthash*` or rewrites empty indexes.
 /// Schema **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 21 && matches!(ver, 13..=20))
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 22 && matches!(ver, 13..=21))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -313,8 +317,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 21);
+        assert_eq!(SCHEMA_VERSION, 22);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(22));
         assert!(schema_file_openable(21));
         assert!(schema_file_openable(20));
         assert!(schema_file_openable(19));

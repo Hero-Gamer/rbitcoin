@@ -11,9 +11,12 @@ before 1.0).
 
 ### Changed
 
-- **Schema 21:** no `spent.idx`. Spent ranges are `8 × max(n_out,1)` from
-  txout meta (sparse `spent.off`). Open of `meta=20` unlinks leftover
-  `spent.idx` and rewrites `store/meta` to 21. A 20 binary refuses 21 `meta`.
+- **Schema 22:** restore `spent.idx` (u32 stride-8). Spent slot is flags +
+  u40 spend fk + u16 vin. Occupied 15–21 Class A with creates refuses
+  (`wipe datadir and redo IBD`). Empty 15–21 rewrite `meta` to 22 and
+  unlink leftover `spent.off`. A 21 binary refuses 22 `meta`. Esplora
+  `/outspend(s)` emits `vin` from the slot (mempool overlay uses the hub
+  tx input index). First-wave Outs guess is `4+(max_vout+1)×38`.
 
 ### Added
 
@@ -190,10 +193,11 @@ before 1.0).
   Core-functional `bitcoind` shim still ignores `-permitbaremultisig`.
   `getnetworkhashps` is labeled dummy 2-work-per-block / elapsed (not Core
   chainwork hashrate). [`docs/rpc.md`](docs/rpc.md) / [`OPERATOR.md`](OPERATOR.md).
-- **Esplora outspend omits `vin`:** `/tx/:txid/outspend/:vout` and
-  `/outspends` no longer emit always-zero `vin`. `PointRecord` /
-  `put_spend` / `put_spend_batch` no longer take a dummy spending input
-  index (`spent.body` never stored it). [`COMPAT.md`](COMPAT.md).
+- **Esplora outspend includes `vin`:** `/tx/:txid/outspend/:vout` and
+  `/outspends` emit the spending input index from the schema-22 spent
+  slot (`PointRecord.spending_vin`). Mempool overlay uses the hub tx’s
+  input index. Unspent remains `{spent:false}` with no `vin`.
+  [`COMPAT.md`](COMPAT.md).
 - **Leftover index layouts refuse on open:** fuse8 **v1** sealed filters, flat
   `tx.head.meta`, flat `*.idx.meta`, Shared (file) `scripthash.body`, and pack8
   **Paged** (mode 10) fail closed with a one-line wipe/rebuild message (Class A

@@ -826,13 +826,15 @@ fn fill_edges_from_packed(plan: &mut rbitcoin_query::ArchiveWritePlan) {
     for ((_, ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
         let Some(sid) = fk.get() else { continue };
         let mut edges = Vec::with_capacity(ins.len());
-        for inp in ins {
+        for (vin, inp) in ins.iter().enumerate() {
+            let vin = vin as u32;
             if inp.is_coinbase() || inp.prev_index == u32::MAX {
                 edges.push(SpendEdge {
                     prev_txid: [0u8; 32],
                     vout: u32::MAX,
                     spend_fk: *fk,
                     create_fk: Fk::NULL,
+                    vin,
                 });
             } else {
                 edges.push(SpendEdge {
@@ -840,6 +842,7 @@ fn fill_edges_from_packed(plan: &mut rbitcoin_query::ArchiveWritePlan) {
                     vout: inp.prev_index,
                     spend_fk: *fk,
                     create_fk: inp.create_fk,
+                    vin,
                 });
             }
         }
@@ -902,7 +905,7 @@ fn pin_and_ensure_journey() {
         header_fk: Fk(1),
         tx_fks: vec![Fk(10)],
         jobs: vec![],
-        spends: vec![([9u8; 32], 0, Fk(10), Fk(999_999))],
+        spends: vec![([9u8; 32], 0, Fk(10), Fk(999_999), 0)],
         fees: 0,
         check_scripts: false,
         time: 1,
@@ -999,7 +1002,7 @@ fn pin_and_ensure_journey() {
         header_fk: Fk(1),
         tx_fks: vec![Fk(2)],
         jobs: vec![],
-        spends: vec![([0x11u8; 32], 0, Fk(2), pfk)],
+        spends: vec![([0x11u8; 32], 0, Fk(2), pfk, 0)],
         fees: 0,
         check_scripts: false,
         time: 1,
@@ -1039,7 +1042,7 @@ fn pin_and_ensure_journey() {
         header_fk: Fk(1),
         tx_fks: vec![Fk(3)],
         jobs: vec![],
-        spends: vec![([0x33u8; 32], 0, Fk(3), cfk)],
+        spends: vec![([0x33u8; 32], 0, Fk(3), cfk, 0)],
         fees: 0,
         check_scripts: false,
         time: 1,
@@ -1139,7 +1142,7 @@ fn pin_and_ensure_journey() {
         header_fk: Fk(1),
         tx_fks: vec![Fk(4)],
         jobs: vec![],
-        spends: vec![([0x42u8; 32], 0, Fk(4), ghost)],
+        spends: vec![([0x42u8; 32], 0, Fk(4), ghost, 0)],
         fees: 0,
         check_scripts: false,
         time: 1,
@@ -1485,6 +1488,7 @@ fn pin_plan_edges_without_packed_ins() {
             vout: 0,
             spend_fk: Fk(2),
             create_fk: Fk(1),
+            vin: 0,
         }],
     );
     let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
@@ -2159,7 +2163,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
         vec![], // no denserels
     );
 
-    let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk)];
+    let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk, 0)];
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
@@ -2366,7 +2370,7 @@ fn already_at_height_retries_post_commit_spend_annotate() {
     q.connect_block(Height(1), &h1, &[ta1]).unwrap();
     let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
 
-    let (multi, field) = q.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
+    let (multi, field, _vin) = q.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
     assert!(!multi);
     assert!(
         field.is_null(),
@@ -2399,7 +2403,7 @@ fn already_at_height_retries_post_commit_spend_annotate() {
     )
     .expect("already-at-height retry");
 
-    let (multi2, field2) = q.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
+    let (multi2, field2, _vin2) = q.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
     assert!(!multi2);
     assert_eq!(field2, spend_fk, "post_commit must annotate after Class C");
     let _ = std::fs::remove_dir_all(&path);

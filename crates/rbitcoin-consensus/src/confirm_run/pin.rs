@@ -74,13 +74,15 @@ fn spend_edges_from_stamp(
                 continue;
             };
             let mut edges = Vec::with_capacity(tx.input.len());
-            for inp in &tx.input {
+            for (vin, inp) in tx.input.iter().enumerate() {
+                let vin = vin as u32;
                 if inp.previous_output.is_null() {
                     edges.push(rbitcoin_query::SpendEdge {
                         prev_txid: [0u8; 32],
                         vout: u32::MAX,
                         spend_fk: rbitcoin_primitives::Fk(sfk),
                         create_fk: rbitcoin_primitives::Fk::NULL,
+                        vin,
                     });
                     continue;
                 }
@@ -92,6 +94,7 @@ fn spend_edges_from_stamp(
                         vout,
                         spend_fk: rbitcoin_primitives::Fk(sfk),
                         create_fk: rbitcoin_primitives::Fk(pid),
+                        vin,
                     });
                     parent_vouts.entry(pid).or_default().push(vout);
                     continue;
@@ -101,6 +104,7 @@ fn spend_edges_from_stamp(
                     vout,
                     spend_fk: rbitcoin_primitives::Fk(sfk),
                     create_fk: rbitcoin_primitives::Fk::NULL,
+                    vin,
                 });
             }
             spend_edges.insert(sfk, edges);
@@ -469,7 +473,7 @@ pub(super) fn ensure_spend_abs_layouts(
 
     let mut need: U64Map<Vec<u32>> = U64Map::default();
     for p in prepared {
-        for &(_txid, vout, sfk, cfk) in &p.spends {
+        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
             if sfk.is_null() || cfk.is_null() {
                 continue;
             }
@@ -597,7 +601,7 @@ pub(super) fn ensure_spend_abs_layouts(
     }
 
     for p in prepared {
-        for &(_txid, vout, sfk, cfk) in &p.spends {
+        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
             if sfk.is_null() || cfk.is_null() {
                 continue;
             }

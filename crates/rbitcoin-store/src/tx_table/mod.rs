@@ -351,10 +351,8 @@ impl OutputRecord {
 
 mod packed;
 mod pending_head;
-mod spent_off;
 pub use packed::*;
 pub(crate) use pending_head::PENDING_HEAD_CAP;
-pub(crate) use spent_off::unlink_leftover_spent_idx;
 
 fn span_rec(span: &[u8], span_off: u64, rec_off: u64, rec_len: u64) -> Result<&[u8], StoreError> {
     let start = rec_off
@@ -401,7 +399,6 @@ pub struct TxTable {
     pub(crate) inwit: VarTable,
     /// `spent.body` — 8 B × n_out sole-spender slots.
     pub(crate) spent: VarTable,
-    spent_off: spent_off::SpentOff,
     /// Segmented fixed-bits heads + seal-time fuse8.
     pub(crate) head: SegmentedTxHead,
     /// Dense create_fk-ordered txids (schema 13+).
@@ -477,8 +474,13 @@ impl TxTable {
                 opts.idx_soft_span,
                 soft_span,
             )?,
-            spent: VarTable::create_body_only(dir, "spent", TableKind::Spent)?,
-            spent_off: spent_off::SpentOff::new(dir),
+            spent: Self::create_var(
+                dir,
+                "spent",
+                TableKind::Spent,
+                opts.idx_soft_span,
+                soft_span,
+            )?,
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
             secret,
@@ -622,12 +624,32 @@ impl TxTable {
             )?
         };
         let spent = if had_spent {
-            VarTable::open_body_only(dir, "spent", TableKind::Spent)?
+            if dir.join("spent.idx").exists() {
+                Self::open_var(
+                    dir,
+                    "spent",
+                    TableKind::Spent,
+                    opts.idx_soft_span,
+                    soft_span,
+                )?
+            } else {
+                VarTable::open_empty_body_create_idx(
+                    dir,
+                    "spent",
+                    TableKind::Spent,
+                    opts.idx_soft_span,
+                    soft_span,
+                )?
+            }
         } else {
-            VarTable::create_body_only(dir, "spent", TableKind::Spent)?
+            Self::create_var(
+                dir,
+                "spent",
+                TableKind::Spent,
+                opts.idx_soft_span,
+                soft_span,
+            )?
         };
-        let spent_off = spent_off::SpentOff::load(dir)?;
-        spent_off::unlink_leftover_spent_idx(dir)?;
         let txids = if dir.join("txid.body").exists() {
             crate::txid_body::TxidBody::open(dir)?
         } else {
@@ -636,10 +658,11 @@ impl TxTable {
         let n_bodies = body.count();
         let n_txids = txids.count();
         let n_inwit = inwit.count();
-        if n_txids != n_bodies || n_inwit != n_bodies {
-            let n = n_bodies.min(n_txids).min(n_inwit);
+        let n_spent = spent.count();
+        if n_txids != n_bodies || n_inwit != n_bodies || n_spent != n_bodies {
+            let n = n_bodies.min(n_txids).min(n_inwit).min(n_spent);
             rbitcoin_log::warn!(
-                "store: Class A count skew txout={n_bodies} inwit={n_inwit} \
+                "store: Class A count skew txout={n_bodies} inwit={n_inwit} spent={n_spent} \
                  txid.body={n_txids} — truncating to {n}"
             );
             if n_bodies > n {
@@ -648,23 +671,22 @@ impl TxTable {
             if n_inwit > n {
                 inwit.truncate_to_count(n)?;
             }
+            if n_spent > n {
+                spent.truncate_to_count(n)?;
+            }
             if n_txids > n {
                 txids.truncate_to_count(n)?;
             }
-            spent_off.truncate_to_count(n);
-            if body.count() != txids.count() || body.count() != inwit.count() {
+            if body.count() != txids.count()
+                || body.count() != inwit.count()
+                || body.count() != spent.count()
+            {
                 return Err(StoreError::Corrupt(
                     "Class A stem counts still mismatch after repair (reindex required)",
                 ));
             }
         }
         let n_bodies = body.count();
-        spent_off.ensure_covering(&body, n_bodies)?;
-        let spent_end = spent_off.end_for(&body, n_bodies)?;
-        if spent.body_logical_len() < spent_end {
-            return Err(StoreError::Corrupt("spent.body short for n_out prefix"));
-        }
-        spent.truncate_body_to(n_bodies, spent_end)?;
         let mut need_rebuild = false;
         let head = if !crate::segmented_head::head_meta_exists(dir) {
             need_rebuild = n_bodies > 0;
@@ -735,7 +757,6 @@ impl TxTable {
             body,
             inwit,
             spent,
-            spent_off,
             head,
             txids,
             secret,
@@ -1052,13 +1073,12 @@ impl TxTable {
 
     /// `spent.body` range for one create.
     pub fn spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        self.spent_off.range_for(&self.body, fk, self.spent.count())
+        self.spent.record_range(fk)
     }
 
     /// `spent.body` ranges (same fk order as [`Self::body_range_batch`]).
     pub fn spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        self.spent_off
-            .ranges_batch(&self.body, fks, self.spent.count())
+        self.spent.record_range_batch(fks)
     }
 
     /// Annotate spends at known absolute spender-meta offsets (confirm write).
@@ -1072,13 +1092,13 @@ impl TxTable {
     pub fn put_spend_batch_by_abs_meta(
         &self,
         spenders: &crate::spender_table::SpenderTable,
-        abs_edges: &[(u64, Fk, u32, Fk)],
-    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         const META_LEN: u64 = OutputRecord::SPENT_SLOT_LEN as u64;
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
-        for &(_, _, _, sfk) in abs_edges {
+        for &(_, _, _, sfk, _) in abs_edges {
             if sfk.is_null() {
                 return Err(StoreError::InvalidFk);
             }
@@ -1097,41 +1117,41 @@ impl TxTable {
         }
 
         let body_pub = self.spent.body_published_len();
-        let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
-        for &(abs, create_fk, vout, spend_fk) in abs_edges {
+        let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
+        for &(abs, create_fk, vout, spend_fk, spend_vin) in abs_edges {
             if abs.saturating_add(META_LEN) > body_pub {
-                cold.push((create_fk, vout, spend_fk));
+                cold.push((create_fk, vout, spend_fk, spend_vin));
                 continue;
             }
             let cur = self.spent.with_bytes_at(abs, META_LEN, |raw| {
-                let (flags, field) = decode_spent_slot_v17(raw)?;
-                Ok((field, flags))
+                let (flags, field, field_vin) = decode_spent_slot(raw)?;
+                Ok((field, flags, field_vin))
             });
-            let Ok((field, flags)) = cur else {
-                cold.push((create_fk, vout, spend_fk));
+            let Ok((field, flags, field_vin)) = cur else {
+                cold.push((create_fk, vout, spend_fk, spend_vin));
                 continue;
             };
             let multi = flags & output_flags::MULTI_SPENDER != 0;
-            let (new_multi, new_field) = if !multi && field.is_null() {
-                (false, spend_fk)
-            } else if !multi && field == spend_fk {
+            let (new_multi, new_field, new_vin) = if !multi && field.is_null() {
+                (false, spend_fk, spend_vin)
+            } else if !multi && field == spend_fk && field_vin == spend_vin {
                 continue;
             } else if !multi {
-                let e1 = spenders.append(field, Fk::NULL)?;
-                let e2 = spenders.append(spend_fk, e1)?;
-                (true, e2)
+                let e1 = spenders.append(field, field_vin, Fk::NULL)?;
+                let e2 = spenders.append(spend_fk, spend_vin, e1)?;
+                (true, e2, 0)
             } else {
-                let e = spenders.append(spend_fk, field)?;
-                (true, e)
+                let e = spenders.append(spend_fk, spend_vin, field)?;
+                (true, e, 0)
             };
             let new_flags = if new_multi {
                 flags | output_flags::MULTI_SPENDER
             } else {
                 flags & !output_flags::MULTI_SPENDER
             };
-            let meta = encode_spent_slot_v17(new_flags, new_field)?;
+            let meta = encode_spent_slot(new_flags, new_field, new_vin)?;
             if self.spent.write_body_abs(abs, &meta).is_err() {
-                cold.push((create_fk, vout, spend_fk));
+                cold.push((create_fk, vout, spend_fk, spend_vin));
             }
         }
         Ok(cold)
@@ -1145,7 +1165,7 @@ impl TxTable {
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend())
     }
 
@@ -1154,7 +1174,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         if abs_offs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1180,7 +1200,7 @@ impl TxTable {
     fn get_spender_meta_at_abs_batch_uring(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Uring)
     }
 
@@ -1188,7 +1208,7 @@ impl TxTable {
     fn get_spender_meta_at_abs_batch_pread(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Pread)
     }
 
@@ -1196,7 +1216,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
         let body_fd = self.spent.body_read_fd();
@@ -1230,7 +1250,7 @@ impl TxTable {
         }
         bulk_io::pread_batch_backend(&mut ops, backend);
 
-        let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
+        let mut out: Vec<Option<(Fk, u8, u32)>> = vec![None; abs_offs.len()];
         for (ro, &i) in ops.iter().zip(submitted.iter()) {
             if ro.result < 0 {
                 return Err(StoreError::io(
@@ -1242,26 +1262,26 @@ impl TxTable {
                 continue;
             }
             let b = &bufs[i];
-            let Ok((flags, field)) = decode_spent_slot_v17(b) else {
+            let Ok((flags, field, vin)) = decode_spent_slot(b) else {
                 continue;
             };
-            out[i] = Some((field, flags));
+            out[i] = Some((field, flags, vin));
         }
         Ok(out)
     }
 
     /// Pure-write spend annotate using structural-known meta (no body pread).
     ///
-    /// `known[i]` is `(field, flags)` at `abs_edges[i].0` from structural spentness.
+    /// `known[i]` is `(field, flags, vin)` at `abs_edges[i].0` from structural spentness.
     /// Backend: `pwrite` or `uring`. Returns cold edges
     /// (OOB) — production callers must treat non-empty as hard error.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         spenders: &crate::spender_table::SpenderTable,
-        abs_edges: &[(u64, Fk, u32, Fk)],
-        known: &[(Fk, u8)],
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+        known: &[(Fk, u8, u32)],
         backend: crate::io_backend::WriteIoBackend,
-    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
             self, spenders, abs_edges, known, backend,
         )
@@ -1272,7 +1292,7 @@ impl TxTable {
         &self,
         create_tx_fk: Fk,
         vout: u32,
-    ) -> Result<(bool, Fk), StoreError> {
+    ) -> Result<(bool, Fk, u32), StoreError> {
         let (off, len) = self.spent_range(create_tx_fk)?;
         self.get_output_spender_meta_at(off, len, vout)
     }
@@ -1283,7 +1303,7 @@ impl TxTable {
         body_off: u64,
         body_len: u64,
         vout: u32,
-    ) -> Result<(bool, Fk), StoreError> {
+    ) -> Result<(bool, Fk, u32), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
@@ -1291,8 +1311,8 @@ impl TxTable {
         }
         self.spent
             .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
-                let (flags, field) = decode_spent_slot_v17(raw)?;
-                Ok((flags & output_flags::MULTI_SPENDER != 0, field))
+                let (flags, field, vin) = decode_spent_slot(raw)?;
+                Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin))
             })
     }
 
@@ -1304,7 +1324,7 @@ impl TxTable {
         body_off: u64,
         body_len: u64,
         vouts: &[u32],
-    ) -> Result<Vec<(u32, bool, Fk)>, StoreError> {
+    ) -> Result<Vec<(u32, bool, Fk, u32)>, StoreError> {
         if vouts.is_empty() {
             return Ok(Vec::new());
         }
@@ -1317,10 +1337,10 @@ impl TxTable {
                 if end > raw.len() {
                     continue;
                 }
-                let Ok((flags, field)) = decode_spent_slot_v17(&raw[start..end]) else {
+                let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..end]) else {
                     continue;
                 };
-                out.push((v, flags & output_flags::MULTI_SPENDER != 0, field));
+                out.push((v, flags & output_flags::MULTI_SPENDER != 0, field, vin));
             }
             Ok(out)
         })
@@ -1333,9 +1353,10 @@ impl TxTable {
         vout: u32,
         multi: bool,
         field: Fk,
+        vin: u32,
     ) -> Result<(), StoreError> {
         let (off, len) = self.spent_range(create_tx_fk)?;
-        self.set_output_spender_meta_at(off, len, vout, multi, field)
+        self.set_output_spender_meta_at(off, len, vout, multi, field, vin)
     }
 
     /// Patch spender meta using a cache-held body range (no idx read on the hot path).
@@ -1346,6 +1367,7 @@ impl TxTable {
         vout: u32,
         multi: bool,
         field: Fk,
+        vin: u32,
     ) -> Result<(), StoreError> {
         let abs = spent_abs(body_off, vout);
         let end = body_off.saturating_add(body_len);
@@ -1357,7 +1379,8 @@ impl TxTable {
         } else {
             0
         };
-        let slot = encode_spent_slot_v17(flags, field)?;
+        let slot_vin = if multi { 0 } else { vin };
+        let slot = encode_spent_slot(flags, field, slot_vin)?;
         self.spent.write_body_abs(abs, &slot)?;
         Ok(())
     }
@@ -1544,14 +1567,14 @@ impl TxTable {
     /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin Arc
     /// (tx + outs + denserels). Encode borrows pin fields — no outs deep clone.
     ///
-    /// `spent_overlay` is per-item `(vout, spend_fk)` sole spenders written into
+    /// `spent_overlay` is per-item `(vout, spend_fk, vin)` sole spenders written into
     /// the Class A spent stem. Empty slice = all zeros. Non-empty must be one
     /// inner vec per item.
     pub fn put_full_batch_from_pins(
         &self,
         items: &[PinInItem],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk)>],
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<Vec<Fk>, StoreError> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -1574,7 +1597,7 @@ impl TxTable {
             .iter()
             .map(|(pin, _ins)| {
                 let (_tx, outs) = pin.as_ref();
-                16 + outs.len() * OutputRecord::SPENT_SLOT_LEN
+                16 + spent_record_len(outs.len() as u32) as usize
             })
             .sum();
         let base = self.body.count();
@@ -1584,11 +1607,11 @@ impl TxTable {
         for (i, (pin, _)) in items.iter().enumerate() {
             let n_out = pin.as_ref().1.len() as u32;
             let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            for &(vout, fk) in pairs {
+            for &(vout, fk, vin) in pairs {
                 if vout >= n_out {
                     return Err(StoreError::Corrupt("spent overlay vout"));
                 }
-                encode_spent_slot_v17(0, fk)?;
+                encode_spent_slot(0, fk, vin)?;
             }
         }
         let fks = self.append_stems_one_wave(
@@ -1645,8 +1668,6 @@ impl TxTable {
         let Some(p_sp) = self.spent.prepare_batch_encode(n, est_spent, encode_sp)? else {
             return Err(StoreError::Corrupt("Class A spent prepare empty"));
         };
-        let sp_base = p_sp.base_count;
-        let sp_starts = p_sp.starts.clone();
         crate::var_table::write_prepared_bodies_one_wave(&[
             (&self.body, &p_out),
             (&self.inwit, &p_in),
@@ -1660,7 +1681,6 @@ impl TxTable {
                 "Class A append fk mismatch across stems",
             ));
         }
-        self.spent_off.note_starts(sp_base, &sp_starts);
         Ok(fks)
     }
 
@@ -1699,31 +1719,34 @@ impl TxTable {
         spenders: &crate::spender_table::SpenderTable,
         spent_off: u64,
         spent_len: u64,
-        edges: &[(u32, Fk)],
+        edges: &[(u32, Fk, u32)],
     ) -> Result<(), StoreError> {
         if edges.is_empty() {
             return Ok(());
         }
-        for &(_, sfk) in edges {
+        for &(_, sfk, _) in edges {
             if sfk.is_null() {
                 return Err(StoreError::InvalidFk);
             }
         }
-        for &(vout, spend_fk) in edges {
-            let (multi, field) = self.get_output_spender_meta_at(spent_off, spent_len, vout)?;
-            let (new_multi, new_field) = if !multi && field.is_null() {
-                (false, spend_fk)
-            } else if !multi && field == spend_fk {
+        for &(vout, spend_fk, spend_vin) in edges {
+            let (multi, field, field_vin) =
+                self.get_output_spender_meta_at(spent_off, spent_len, vout)?;
+            let (new_multi, new_field, new_vin) = if !multi && field.is_null() {
+                (false, spend_fk, spend_vin)
+            } else if !multi && field == spend_fk && field_vin == spend_vin {
                 continue;
             } else if !multi {
-                let e1 = spenders.append(field, Fk::NULL)?;
-                let e2 = spenders.append(spend_fk, e1)?;
-                (true, e2)
+                let e1 = spenders.append(field, field_vin, Fk::NULL)?;
+                let e2 = spenders.append(spend_fk, spend_vin, e1)?;
+                (true, e2, 0)
             } else {
-                let e = spenders.append(spend_fk, field)?;
-                (true, e)
+                let e = spenders.append(spend_fk, spend_vin, field)?;
+                (true, e, 0)
             };
-            self.set_output_spender_meta_at(spent_off, spent_len, vout, new_multi, new_field)?;
+            self.set_output_spender_meta_at(
+                spent_off, spent_len, vout, new_multi, new_field, new_vin,
+            )?;
         }
         Ok(())
     }
@@ -2091,7 +2114,6 @@ impl TxTable {
         self.body.flush()?;
         self.inwit.flush()?;
         self.spent.flush()?;
-        self.spent_off.flush()?;
         self.head.flush()?;
         Ok(())
     }
@@ -2100,7 +2122,6 @@ impl TxTable {
         self.body.flush_async()?;
         self.inwit.flush_async()?;
         self.spent.flush_async()?;
-        self.spent_off.flush()?;
         self.head.flush_async()?;
         Ok(())
     }

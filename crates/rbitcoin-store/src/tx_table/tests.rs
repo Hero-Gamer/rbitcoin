@@ -237,7 +237,7 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         script_sig: vec![0x01],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2))], vec![]];
+    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
     let fks = t
         .put_full_batch_from_pins(
             &[(parent_pin, parent_ins), (child_pin, child_ins)],
@@ -1427,15 +1427,15 @@ fn get_output_spender_metas_at_one_walk() {
         .unwrap();
     let (off, len) = t.spent_range(fks[0]).unwrap();
     let s1 = Fk(10);
-    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, Fk(20))])
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 0), (2, Fk(20), 1)])
         .unwrap();
     let metas = t
         .get_output_spender_metas_at(off, len, &[0, 1, 2, 99])
         .unwrap();
     assert_eq!(metas.len(), 3);
-    assert!(!metas[0].1 && metas[0].2 == s1);
+    assert!(!metas[0].1 && metas[0].2 == s1 && metas[0].3 == 0);
     assert!(!metas[1].1 && metas[1].2.is_null());
-    assert!(!metas[2].1 && metas[2].2 == Fk(20));
+    assert!(!metas[2].1 && metas[2].2 == Fk(20) && metas[2].3 == 1);
 
     // Bulk 8-byte abs preads match spent_abs (pin → write spentness path).
     let (_meta, outs) = t.get_meta_and_outputs(fks[0]).unwrap();
@@ -1447,15 +1447,15 @@ fn get_output_spender_metas_at_one_walk() {
     let bulk = t.get_spender_meta_at_abs_batch(&abs).unwrap();
     assert_eq!(bulk.len(), 3);
     assert_eq!(
-        bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        bulk[0].map(|(f, fl, _vin)| (f, fl & output_flags::MULTI_SPENDER != 0)),
         Some((s1, false))
     );
     assert_eq!(
-        bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        bulk[1].map(|(f, fl, _vin)| (f, fl & output_flags::MULTI_SPENDER != 0)),
         Some((Fk::NULL, false))
     );
     assert_eq!(
-        bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)),
+        bulk[2].map(|(f, fl, _vin)| (f, fl & output_flags::MULTI_SPENDER != 0)),
         Some((Fk(20), false))
     );
     // Both backends must agree.
@@ -1512,14 +1512,14 @@ fn put_spends_on_create_at_batch_patches_all_vouts() {
     let (off, len) = t.spent_range(fk).unwrap();
     let s1 = Fk(100);
     let s2 = Fk(200);
-    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, s2)])
+    t.put_spends_on_create_at(&spenders, off, len, &[(0, s1, 4), (2, s2, 5)])
         .unwrap();
-    let (m0, f0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
-    let (m2, f2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
-    assert!(!m0 && f0 == s1);
-    assert!(!m2 && f2 == s2);
-    let (m1, f1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
-    assert!(!m1 && f1.is_null());
+    let (m0, f0, v0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+    let (m2, f2, v2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
+    assert!(!m0 && f0 == s1 && v0 == 4);
+    assert!(!m2 && f2 == s2 && v2 == 5);
+    let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
+    assert!(!m1 && f1.is_null() && v1 == 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3291,43 +3291,55 @@ fn script_kind_v17_op_return_pushdata1_stays_raw() {
 }
 
 #[test]
-fn spent_slot_v17_unspent_is_eight_zero_bytes() {
-    let slot = encode_spent_slot_v17(0, Fk::NULL).unwrap();
+fn spent_slot_unspent_is_eight_zero_bytes() {
+    let slot = encode_spent_slot(0, Fk::NULL, 0).unwrap();
     assert_eq!(slot, [0u8; 8]);
-    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    let (flags, field, vin) = decode_spent_slot(&slot).unwrap();
     assert_eq!(flags, 0);
     assert!(field.is_null());
+    assert_eq!(vin, 0);
 }
 
 #[test]
-fn spent_slot_v17_sole_fk_roundtrip() {
-    let fk = Fk(0x0001_0203_0405_0607);
-    let slot = encode_spent_slot_v17(0, fk).unwrap();
+fn spent_slot_sole_fk_vin_roundtrip() {
+    let fk = Fk(0x0000_0001_0203_0405);
+    let slot = encode_spent_slot(0, fk, 0x1122).unwrap();
     assert_eq!(slot[0], 0, "flags first");
-    assert_eq!(&slot[1..], &[0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
-    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    let (flags, field, vin) = decode_spent_slot(&slot).unwrap();
     assert_eq!(flags, 0);
     assert_eq!(field, fk);
+    assert_eq!(vin, 0x1122);
 }
 
 #[test]
-fn spent_slot_v17_multi_list_head_roundtrip() {
+fn spent_slot_multi_list_head_roundtrip_vin_zero() {
     let head = Fk(42);
-    let slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, head).unwrap();
+    let slot = encode_spent_slot(output_flags::MULTI_SPENDER, head, 0).unwrap();
     assert_eq!(slot[0], output_flags::MULTI_SPENDER);
-    let (flags, field) = decode_spent_slot_v17(&slot).unwrap();
+    let (flags, field, vin) = decode_spent_slot(&slot).unwrap();
     assert_eq!(
         flags & output_flags::MULTI_SPENDER,
         output_flags::MULTI_SPENDER
     );
     assert_eq!(field, head);
+    assert_eq!(vin, 0);
 }
 
 #[test]
-fn spent_slot_v17_fk_at_2pow56_is_corrupt() {
-    match encode_spent_slot_v17(0, Fk(1u64 << 56)) {
+fn spent_slot_fk_at_2pow40_is_corrupt() {
+    match encode_spent_slot(0, Fk(1u64 << 40), 0) {
         Err(StoreError::Corrupt(m)) => {
-            assert!(m.contains("56") || m.contains("u56"), "{m}");
+            assert!(m.contains("40") || m.contains("u40"), "{m}");
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn spent_slot_vin_at_2pow16_is_corrupt() {
+    match encode_spent_slot(0, Fk(1), 1u32 << 16) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("16") || m.contains("u16"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }
@@ -3341,15 +3353,17 @@ fn spent_slot_v17_len_constant_is_eight() {
 #[test]
 fn encode_spent_slots_overlays_one_vout() {
     let mut buf = Vec::new();
-    encode_spent_slots(3, &[(1, Fk(9))], &mut buf).unwrap();
+    encode_spent_slots(3, &[(1, Fk(9), 3)], &mut buf).unwrap();
     assert_eq!(buf.len(), 24);
-    let (f0, field0) = decode_spent_slot_v17(&buf[0..8]).unwrap();
+    let (f0, field0, v0) = decode_spent_slot(&buf[0..8]).unwrap();
     assert_eq!(f0, 0);
     assert!(field0.is_null());
-    let (f1, field1) = decode_spent_slot_v17(&buf[8..16]).unwrap();
+    assert_eq!(v0, 0);
+    let (f1, field1, v1) = decode_spent_slot(&buf[8..16]).unwrap();
     assert_eq!(f1, 0);
     assert_eq!(field1, Fk(9));
-    let (f2, field2) = decode_spent_slot_v17(&buf[16..24]).unwrap();
+    assert_eq!(v1, 3);
+    let (f2, field2, _v2) = decode_spent_slot(&buf[16..24]).unwrap();
     assert_eq!(f2, 0);
     assert!(field2.is_null());
 }
@@ -3366,7 +3380,7 @@ fn encode_spent_slots_empty_matches_zeros() {
 #[test]
 fn encode_spent_slots_vout_oob_is_corrupt() {
     let mut buf = Vec::new();
-    match encode_spent_slots(1, &[(1, Fk(2))], &mut buf) {
+    match encode_spent_slots(1, &[(1, Fk(2), 0)], &mut buf) {
         Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
         other => panic!("expected Corrupt vout, got {other:?}"),
     }
@@ -3375,8 +3389,9 @@ fn encode_spent_slots_vout_oob_is_corrupt() {
 #[test]
 fn encode_spent_slots_duplicate_vout_last_wins() {
     let mut buf = Vec::new();
-    encode_spent_slots(1, &[(0, Fk(1)), (0, Fk(2))], &mut buf).unwrap();
-    assert_eq!(decode_spent_slot_v17(&buf).unwrap().1, Fk(2));
+    encode_spent_slots(1, &[(0, Fk(1), 0), (0, Fk(2), 1)], &mut buf).unwrap();
+    assert_eq!(decode_spent_slot(&buf).unwrap().1, Fk(2));
+    assert_eq!(decode_spent_slot(&buf).unwrap().2, 1);
 }
 
 #[test]
@@ -3421,15 +3436,15 @@ fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
 
 #[test]
 fn reserved_flag_v17_spent_unknown_bits_are_corrupt() {
-    match encode_spent_slot_v17(1, Fk::NULL) {
+    match encode_spent_slot(1, Fk::NULL, 0) {
         Err(StoreError::Corrupt(m)) => {
             assert!(m.contains("spent") || m.contains("flag"), "{m}");
         }
         other => panic!("expected Corrupt on encode, got {other:?}"),
     }
-    let mut slot = encode_spent_slot_v17(output_flags::MULTI_SPENDER, Fk(3)).unwrap();
+    let mut slot = encode_spent_slot(output_flags::MULTI_SPENDER, Fk(3), 0).unwrap();
     slot[0] |= 1 << 0;
-    match decode_spent_slot_v17(&slot) {
+    match decode_spent_slot(&slot) {
         Err(StoreError::Corrupt(m)) => {
             assert!(m.contains("spent") || m.contains("flag"), "{m}");
         }
@@ -3496,8 +3511,8 @@ fn idx_roll_independent_of_inwit_span() {
             "txout.idx must not roll when only inwit crosses the soft span"
         );
         assert!(
-            !dir.join("spent.idx").exists(),
-            "spent.idx is derived; Class A must not write it"
+            dir.join("spent.idx").is_dir(),
+            "spent.idx rolls independently of inwit"
         );
         let last = t.get(Fk(6)).unwrap();
         assert_eq!(last.output_count, 1);
@@ -3533,16 +3548,13 @@ fn put_n_out(t: &TxTable, tag: u8, n_out: u32) -> Fk {
 }
 
 #[test]
-fn class_a_append_does_not_write_spent_idx() {
-    let dir = tempfile_dir("spent-no-idx");
+fn class_a_append_writes_spent_idx() {
+    let dir = tempfile_dir("spent-idx");
     let t = create_tiny(&dir);
     let f0 = put_n_out(&t, 1, 0);
     let f1 = put_n_out(&t, 2, 1);
     let f3 = put_n_out(&t, 3, 3);
-    assert!(
-        !dir.join("spent.idx").exists(),
-        "spent.idx must not be created"
-    );
+    assert!(dir.join("spent.idx").is_dir(), "spent.idx must be created");
     let (o0, l0) = t.spent_range(f0).unwrap();
     let (o1, l1) = t.spent_range(f1).unwrap();
     let (o3, l3) = t.spent_range(f3).unwrap();
@@ -3559,10 +3571,7 @@ fn class_a_append_does_not_write_spent_idx() {
     t.flush().unwrap();
     drop(t);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert!(
-        !dir.join("spent.idx").exists(),
-        "reopen must not recreate spent.idx"
-    );
+    assert!(dir.join("spent.idx").is_dir(), "reopen must keep spent.idx");
     assert_eq!(t.spent_range(f0).unwrap(), (o0, l0));
     assert_eq!(t.spent_range(f1).unwrap(), (o1, l1));
     assert_eq!(t.spent_range(f3).unwrap(), (o3, l3));
@@ -3570,22 +3579,22 @@ fn class_a_append_does_not_write_spent_idx() {
 }
 
 #[test]
-fn open_unlinks_leftover_spent_idx() {
-    let dir = tempfile_dir("spent-idx-leftover");
+fn spent_range_uses_idx_not_txout_body() {
+    let dir = tempfile_dir("spent-idx-not-body");
     let t = create_tiny(&dir);
-    let fk = put_n_out(&t, 1, 2);
-    let (off, len) = t.spent_range(fk).unwrap();
+    let f0 = put_n_out(&t, 1, 0);
+    let f1 = put_n_out(&t, 2, 1);
+    let f3 = put_n_out(&t, 3, 3);
+    let want = t.spent_range_batch(&[f3, f0, f1]).unwrap();
     t.flush().unwrap();
-    drop(t);
-    let idx = crate::tx_idx::TxIdx::create(&dir, "spent").unwrap();
-    idx.append_starts(0, &[off]).unwrap();
-    drop(idx);
-    assert!(dir.join("spent.idx").is_dir());
-    let t = TxTable::open_tiny(&dir).unwrap();
-    assert!(
-        !dir.join("spent.idx").exists(),
-        "leftover spent.idx must be unlinked"
-    );
-    assert_eq!(t.spent_range(fk).unwrap(), (off, len));
+    // Truncate txout.body after header; spent ranges must still resolve from idx.
+    {
+        use crate::file::FILE_HEADER_LEN;
+        let p = dir.join("txout.body");
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len(FILE_HEADER_LEN as u64).unwrap();
+    }
+    let got = t.spent_range_batch(&[f3, f0, f1]).unwrap();
+    assert_eq!(got, want);
     let _ = std::fs::remove_dir_all(&dir);
 }

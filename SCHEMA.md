@@ -1,15 +1,16 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 21` (`rbitcoin_primitives`).  
-**Status:** 21 drops `spent.idx`. Spent `(off,len)` is `8 × max(n_out,1)` from
-txout meta; sparse `spent.off` (u64/1024 creates). A 21 binary unlinks leftover
-`spent.idx` (dir and flat `spent.idx.meta`) and rewrites `store/meta` 20→21.
-A 20 binary refuses 21 `meta`. Occupied schema 18/19 `tx.head` or
-`scripthash*` is **refused** (wipe those index dirs, keep Class A). Empty
-18/19 indexes rewrite `meta` to 21; `tx.head` rebuilds from Class A; SH
-rematerializes with `--shindex`. An 19 binary refuses 20+ `meta`. A 17
-datadir with populated `tx.head` or `scripthash*` is **refused**. Empty 17
-indexes rewrite `meta` to 21.
+**Version:** `SCHEMA_VERSION = 22` (`rbitcoin_primitives`).  
+**Status:** 22 restores `spent.idx` (u32 stride-8, same as `txout`/`inwit`).
+Spent slot is flags + u40 spend fk + u16 vin (still 8 bytes). Occupied
+15–21 LAYOUT17 Class A with creates is **refused** (wipe datadir and redo
+IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover `spent.off`.
+A 21 binary refuses 22 `meta`. Occupied schema 18/19 `tx.head` or
+`scripthash*` (empty Class A) is **refused** (wipe those index dirs, keep
+Class A). Empty 18/19 indexes rewrite `meta` to 22; `tx.head` rebuilds from
+Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
+`meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
+Class A is **refused**. Empty 17 indexes rewrite `meta` to 22.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -42,15 +43,17 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
 **17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 21 **before** `TxTable::open` (so a following
-head rebuild cannot trip the refuse).  
-**18/19→20/21 open:** If `tx.head` occupancy or any `scripthash*` data exists:
+Empty 17 indexes rewrite `meta` to 22 **before** `TxTable::open` (so a following
+head rebuild cannot trip the refuse). Occupied 17 Class A with creates is the
+schema-22 Class A refuse (not an index wipe).  
+**18/19→22 open:** Occupied Class A with creates is the schema-22 Class A refuse.
+If Class A is empty and `tx.head` occupancy or any `scripthash*` data exists:
 `schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)`.
-Empty 18/19 indexes rewrite `meta` to 21 **before** `ScriptHashTable::open` /
-`TxTable::open`. `meta=21` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
+Empty 18/19 indexes rewrite `meta` to 22 **before** `ScriptHashTable::open` /
+`TxTable::open`. `meta=22` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
 **18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
 A **20** binary refuses leftover pack8 Paged (mode 10).  
-**Schema-20 leftover index layouts (occupied `meta=20`):** fuse8 **v1**, flat `tx.head.meta`, flat `*.idx.meta`, Shared file `scripthash.body`, and pack8 **Paged** (mode 10) **refuse** (no always-probe, no rename, no Shared read). Errors:
+**Schema-20 leftover index layouts (empty Class A, occupied `meta=20`):** fuse8 **v1**, flat `tx.head.meta`, flat `*.idx.meta`, Shared file `scripthash.body`, and pack8 **Paged** (mode 10) **refuse** (no always-probe, no rename, no Shared read). Occupied 20 Class A with creates is the schema-22 Class A refuse. Errors:
 
 ```text
 index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)
@@ -59,7 +62,11 @@ index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNN
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
 ```  
-**20→21 open:** unlink leftover `spent.idx` (dir and flat `spent.idx.meta`). Spent `(off,len)` is `8 × max(n_out,1)` from txout meta; sparse `spent.off` (u64/1024 creates). Rewrite `store/meta` to 21. Table file headers 13–20 remain `schema_file_openable`. A 20 binary refuses 21 `meta`.
+**21→22 open:** occupied Class A with creates:
+`schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.
+Empty 21 rewrites `store/meta` to 22 and unlinks leftover `spent.off`.
+Table file headers 13–21 remain `schema_file_openable`. A 21 binary refuses 22 `meta`.
+Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 22.
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -74,7 +81,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |--------|----------------|
 | Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
-| Idx | `txout.idx/` + `inwit.idx/` directories; **u32 stride-8**; hard span `2^32 × 8` ≈ 32 GiB; soft roll default 16 GiB. Flat `*.idx.meta` **refused**. Leftover `spent.idx` unlinked. |
+| Idx | `txout.idx/` + `inwit.idx/` + `spent.idx/` directories; **u32 stride-8**; hard span `2^32 × 8` ≈ 32 GiB; soft roll default 16 GiB. Flat `*.idx.meta` **refused**. Leftover `spent.off` unlinked. |
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **dir** (sharded). Leftover file body **refused**. Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
@@ -88,7 +95,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 
 | Policy | Choice |
 |--------|--------|
-| Idx rolls | Each Class A stem rolls independently at **that** stem’s soft span. `inwit` is the fat stem and must not force `txout` splits. `spent` has no idx. |
+| Idx rolls | Each Class A stem rolls independently at **that** stem’s soft span. `inwit` is the fat stem and must not force `txout` splits. `spent.idx` rolls with the spent stem. |
 | `strong_tx` | Always L2. `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) still caps **`confirmed`** and **`header_txs_*`** only. |
 | `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
 
@@ -115,7 +122,8 @@ Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
 | Field | Width | Headroom |
 |-------|-------|----------|
 | `create_fk` / `header_fk` | u64 | 1e18-class; not a 10y issue |
-| Spent `spender_field` | u56 | Same; 2^56 creates is not a Bitcoin problem |
+| Spent spend fk | u40 | 2^40 ids ≈ 1.1e12 creates; census ~1.42e9 at h=962k. `fk ≥ 2^40` is Corrupt (no wrap) |
+| Spent vin | u16 | Consensus max inputs at 400 kWU is ~2.4k. `vin ≥ 2^16` is Corrupt |
 | Height / `confirmed[]` index | u32 | ~1e6 heights now; 10y adds ~0.5e6; year 2106 is **timestamp**, not height |
 | Idx relative | u32 × stride 8 | 32 GiB **per segment**. Soft 16 GiB rolls first. |
 | `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
@@ -178,7 +186,7 @@ itself changed.
     txout.body / txout.idx/                         # Class A outs (hot)
     inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
     inwit.reloc                  # optional: inwit lives under --datadir-cold/store
-    spent.body / spent.off                          # sole-spender 8 B × n_out; leftover spent.idx unlinked
+    spent.body / spent.idx/                         # sole-spender 8 B × max(n_out,1); leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
@@ -311,14 +319,15 @@ are independent when that stem’s next start would exceed the soft span):
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
 inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
-spent.body Ss:  8 B × out_count  (flags + u56 field). Multi overflow → spent.ovf
+spent.body Ss:  8 B × max(n_out,1)  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
 ```
 
 Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
 Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `inwit`. First-wave Outs reads stay on the starting
-OS page unless `(max_need+1)×40` (empty need: the idx span) is likely to spill;
-then the first wave is the full idx span. Extend still covers a missed need.
+OS page unless `4+(max_need+1)×38` (LAYOUT17 meta + kind + 5 B uleb amount + P2TR;
+empty need: the idx span) is likely to spill; then the first wave is the full idx
+span. Extend still covers a missed need.
 
 Packed `tx.body` (schema 13–14: 32 B meta | inputs+witness | outputs) is **refused** if it contains creates.
 
@@ -337,11 +346,11 @@ v2+locktime 0 is **3 B**. Schema-15 16-byte prefixes (v1 starts `01 00 00 00`)
 are not accepted. `input_start_fk` / `output_start_fk` stay null in RAM.
 Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-### Segmented body index (`txout.idx.*` / `inwit.idx.*`)
+### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
 
 ```text
-{txout,inwit}.idx/meta     # per-stem segment map (first_fk / file_id)
-{txout,inwit}.idx/000000   # dense u32 LE stride units
+{txout,inwit,spent}.idx/meta     # per-stem segment map (first_fk / file_id)
+{txout,inwit,spent}.idx/000000   # dense u32 LE stride units
 …
 ```
 
@@ -361,7 +370,7 @@ i = fk - first_fk
 
 Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). **Each stem rolls independently** when that stem’s next start would exceed the soft span (`inwit` no longer forces `txout` idx splits). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
 
-**`spent.body` has no `spent.idx`.** Record length is `8 × max(n_out, 1)` (zero-out still pays one stride so starts stay monotone). `spent_abs(off, vout) = off + 8×vout`. `n_out` is txout LAYOUT17 meta. Sparse `spent.off` stores absolute starts every 1024 creates (`ArrayLink` u64 LE). Leftover `spent.idx/` (and flat `spent.idx.meta`) is unlinked on open; `store/meta` is rewritten to 21.
+**`spent.idx` is the spent-range authority.** Record length is `8 × max(n_out, 1)` (zero-out still pays one stride so starts stay monotone). Lookup stamps `(off,len)` from `spent.idx` only — not `txout.body`. `spent_abs(off, vout) = off + 8×vout`. LAYOUT17 `output_count` stays the authority for true `n_out==0` (0-out and 1-out both have spent `len=8`). Leftover `spent.off` is unlinked on open; occupied 21 Class A is refused.
 
 ### Input encoding (embedded)
 
@@ -409,18 +418,19 @@ binary refuses 18 / unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 | Offset | Field |
 |--------|-------|
 | 0 | flags (`MULTI_SPENDER` bit 2; other bits reserved, Corrupt) |
-| 1–7 | `spender_field` u56 LE (0 = unspent; else sole `spending_tx_fk` or multi-list head) |
+| 1–7 | u56 LE = `(vin as u64) << 40 | (fk.0 & (2^40-1))`. `fk ≥ 2^40` or `vin ≥ 2^16` is Corrupt (no wrap). |
 
-| `MULTI_SPENDER` | `spender_field` |
-|-----------------|-----------------|
-| 0 | 0 = unspent; else sole **spending_tx_fk** |
-| 1 | head fk into `spent.ovf` |
+| `MULTI_SPENDER` | packed field |
+|-----------------|--------------|
+| 0 | 0 = unspent (`fk=0`, `vin=0`); else sole **spending_tx_fk** + spending **vin** |
+| 1 | head fk into `spent.ovf` (`vin` in the sole slot is 0; vins live on ovf nodes) |
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 
 ### Multi-spender overflow (`spent.ovf`)
 
-Fixed 16 B records, append-only: `spending_tx_fk:u64 | next:u64`.  
+Fixed 16 B records, append-only: packed `(fk:u40, vin:u16)` | `next:u64`.
+Promote sole→multi copies the old `(fk,vin)` onto the first node.  
 Only when an outpoint has **≥2** annotated spenders.
 
 **Decision:** sole spends stay on the create output (no giant spend multimap head).
@@ -686,11 +696,11 @@ Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
 | `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (schema 15; 17 thin meta + templates cut ~18–26 GiB) |
 | `inwit.body` | — | **~486 GiB** (ins + witness; cold) |
 | `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** schema 15; **~21 GiB** after 8 B slots |
-| `{stem}.idx` | 5.28 GiB (`tx.idx`) | 5.28 GiB × **2** (`txout`/`inwit`; leftover `spent.idx` dropped) |
+| `{stem}.idx` | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** (`txout`/`inwit`/`spent`) |
 | `txid.body` / `tx.head` | 42.23 / 8.23 GiB | unchanged |
 
-Hot pin+annotate working set: **txout + spent + two idx + txid + tx.head**
-(~129+32+16+42+8 ≈ **227 GiB**) vs packed **tx.body + idx + txid + head**
+Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
+(~129+21+16+42+8 ≈ **216 GiB**) vs packed **tx.body + idx + txid + head**
 (~663+5+42+8 ≈ **718 GiB**). Reconstruct / `getrawtransaction` also needs
 `inwit` (~486 GiB), which pin/SH/tweaks do **not** open.
 

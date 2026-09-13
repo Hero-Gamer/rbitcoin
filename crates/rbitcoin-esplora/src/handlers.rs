@@ -524,6 +524,7 @@ fn outspend_json(
             return Ok(json!({
                 "spent": true,
                 "txid": block_hash_hex(&spend_txid),
+                "vin": p.spending_vin,
                 "status": status,
             }));
         }
@@ -534,9 +535,16 @@ fn outspend_json(
             vout,
         };
         if let Some(spend) = mp.spending_txid(&op) {
+            let vin = mp.get_tx(&spend).and_then(|tx| {
+                tx.input
+                    .iter()
+                    .position(|i| i.previous_output == op)
+                    .map(|i| i as u32)
+            });
             return Ok(json!({
                 "spent": true,
                 "txid": block_hash_hex(&spend.to_byte_array()),
+                "vin": vin.unwrap_or(0),
                 "status": { "confirmed": false },
             }));
         }
@@ -1221,7 +1229,7 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn outspend_json_spent_omits_vin() {
+    fn outspend_json_spent_includes_vin() {
         let (dir, q) = temp_query();
         let _hash = seed_genesis(&q);
         let create_fk = q.tx_fk_by_txid(&[0xcb; 32]).unwrap().unwrap();
@@ -1246,7 +1254,9 @@ mod pure_helper_tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         );
         let spend_fk = q.store().put_tx_full_batch_indexed(&[spend], true).unwrap()[0];
-        q.store().put_spend_create(create_fk, 0, spend_fk).unwrap();
+        q.store()
+            .put_spend_create(create_fk, 0, spend_fk, 0)
+            .unwrap();
         let view = q.pin_chain_view().unwrap().expect("tip");
         q.store()
             .header_txs
@@ -1260,10 +1270,7 @@ mod pure_helper_tests {
         let v = outspend_json(&q, None, &[0xcb; 32], 0, Some(&view)).unwrap();
         assert_eq!(v["spent"], true, "{v}");
         assert!(v.get("txid").is_some(), "{v}");
-        assert!(
-            v.get("vin").is_none(),
-            "outspend vin is an explorer gap, not stored: {v}"
-        );
+        assert_eq!(v["vin"], 0, "outspend vin from spent slot: {v}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

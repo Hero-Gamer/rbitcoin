@@ -672,7 +672,7 @@ impl Query {
             let Some(mi) = abs_at[i] else {
                 continue;
             };
-            let Some((field, flags)) = metas.get(mi).copied().flatten() else {
+            let Some((field, flags, _vin)) = metas.get(mi).copied().flatten() else {
                 continue;
             };
             if field.is_null() {

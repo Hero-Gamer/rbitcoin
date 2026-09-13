@@ -178,6 +178,7 @@ mod tests {
             vout: u32::MAX,
             spend_fk: Fk(9),
             create_fk: Fk::NULL,
+            vin: 0,
         }];
         let ins = rbitcoin_query::input_records_from_wire(&tx, Fk(9), &edges).unwrap();
         assert_eq!(ins, apply.inputs);
@@ -272,6 +273,7 @@ mod tests {
             vout,
             spend_fk: Fk(9),
             create_fk: Fk(5),
+            vin: 0,
         };
         let ok =
             rbitcoin_query::input_records_from_wire(&tx, Fk(9), &[edge([1u8; 32], 3)]).unwrap();

@@ -40,7 +40,6 @@ fn next_aligned_tx_start(cursor: u64) -> u64 {
 
 pub struct VarTable {
     body: TableFile,
-    /// `None` for `spent.body` (ranges are `n_out` prefix, not a stem idx).
     idx: Option<TxIdx>,
     count: AtomicU64,
     /// Body exclusive-end of the last **published** record.
@@ -66,16 +65,32 @@ impl VarTable {
         })
     }
 
-    /// `spent.body` only — no `{stem}.idx`.
-    pub fn create_body_only(
+    /// Existing empty `{stem}.body` (header only) plus a new `{stem}.idx`.
+    ///
+    /// Schema 21 leftover: `spent.body` with no idx. Occupied 21 never reaches
+    /// this (Store refuse). Body past the file header is Corrupt.
+    pub fn open_empty_body_create_idx(
         dir: &Path,
         stem: &str,
         body_kind: TableKind,
+        explicit: Option<u64>,
+        resolved: u64,
     ) -> Result<Self, StoreError> {
-        let body = TableFile::create(Self::body_path(dir, stem), body_kind)?;
+        let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
+        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
+        if body_end > FILE_HEADER_LEN as u64 {
+            return Err(StoreError::Corrupt(
+                "spent.body leftover without spent.idx; wipe datadir and redo IBD",
+            ));
+        }
+        let idx = if explicit.is_some() {
+            TxIdx::create_with_soft_span(dir, stem, resolved)?
+        } else {
+            TxIdx::create(dir, stem)?
+        };
         Ok(Self {
             body,
-            idx: None,
+            idx: Some(idx),
             count: AtomicU64::new(0),
             published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
             publish_seq: AtomicU64::new(0),
@@ -108,23 +123,6 @@ impl VarTable {
             body,
             idx: Some(idx),
             count: AtomicU64::new(count),
-            published_body_end: AtomicU64::new(body_end),
-            publish_seq: AtomicU64::new(0),
-        })
-    }
-
-    /// `spent.body` only — count is adopted from txout after open.
-    pub fn open_body_only(
-        dir: &Path,
-        stem: &str,
-        body_kind: TableKind,
-    ) -> Result<Self, StoreError> {
-        let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
-        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
-        Ok(Self {
-            body,
-            idx: None,
-            count: AtomicU64::new(0),
             published_body_end: AtomicU64::new(body_end),
             publish_seq: AtomicU64::new(0),
         })

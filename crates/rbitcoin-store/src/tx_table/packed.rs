@@ -484,20 +484,20 @@ pub fn encode_inwit_with_secret(
 
 /// Encode a `spent.body` run (`8 × n_out` bytes) with optional sole-spender overlays.
 ///
-/// Duplicate `vout` last-wins. `vout >= n_out` or `fk ≥ 2^56` is Corrupt.
+/// Duplicate `vout` last-wins. `vout >= n_out`, `fk ≥ 2^40`, or `vin ≥ 2^16` is Corrupt.
 pub fn encode_spent_slots(
     n_out: u32,
-    pairs: &[(u32, Fk)],
+    pairs: &[(u32, Fk, u32)],
     out: &mut Vec<u8>,
 ) -> Result<(), StoreError> {
     let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
     let start = out.len();
     out.resize(start.saturating_add(n), 0);
-    for &(vout, fk) in pairs {
+    for &(vout, fk, vin) in pairs {
         if vout >= n_out {
             return Err(StoreError::Corrupt("spent overlay vout"));
         }
-        let slot = encode_spent_slot_v17(0, fk)?;
+        let slot = encode_spent_slot(0, fk, vin)?;
         let off =
             start.saturating_add((vout as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
         out[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
@@ -516,9 +516,8 @@ pub fn spent_record_len(n_out: u32) -> u64 {
     u64::from(n_out.max(1)).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
 }
 
-/// Schema-17 spent slot width (same as [`OutputRecord::SPENT_SLOT_LEN`]).
-pub const SPENT_SLOT_V17_LEN: usize = 8;
-const SPENT_FIELD_V17_MAX: u64 = (1u64 << 56) - 1;
+const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
+const SPENT_VIN_U16_MAX: u32 = (1u32 << 16) - 1;
 
 fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
     if flags & (input_flags::RESERVED4 | input_flags::RESERVED_HIGH) != 0 {
@@ -529,34 +528,52 @@ fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
 
 fn check_spent_flags(flags: u8) -> Result<(), StoreError> {
     if flags & !output_flags::MULTI_SPENDER != 0 {
-        return Err(StoreError::Corrupt("v17 spent reserved flags"));
+        return Err(StoreError::Corrupt("spent reserved flags"));
     }
     Ok(())
 }
 
-/// Encode flags + u56 spender field. `fk ≥ 2^56` is Corrupt.
-pub fn encode_spent_slot_v17(flags: u8, field: Fk) -> Result<[u8; 8], StoreError> {
-    check_spent_flags(flags)?;
-    if field.0 > SPENT_FIELD_V17_MAX {
-        return Err(StoreError::Corrupt("v17 spent field exceeds u56"));
+/// Pack spender fk + vin into 56 bits: `(vin as u64) << 40 | (fk.0 & (2^40-1))`.
+pub fn pack_spent_field(fk: Fk, vin: u32) -> Result<u64, StoreError> {
+    if fk.0 > SPENT_FK_U40_MAX {
+        return Err(StoreError::Corrupt("spent fk exceeds u40"));
     }
+    if vin > SPENT_VIN_U16_MAX {
+        return Err(StoreError::Corrupt("spent vin exceeds u16"));
+    }
+    Ok(((vin as u64) << 40) | fk.0)
+}
+
+/// Unpack [`pack_spent_field`]. High 8 bits of the u64 must be zero.
+pub fn unpack_spent_field(packed: u64) -> Result<(Fk, u32), StoreError> {
+    if packed >> 56 != 0 {
+        return Err(StoreError::Corrupt("spent field exceeds u56"));
+    }
+    Ok((Fk(packed & SPENT_FK_U40_MAX), (packed >> 40) as u32))
+}
+
+/// Encode flags + u40 spender field + u16 vin. Caps are Corrupt (no wrap).
+pub fn encode_spent_slot(flags: u8, field: Fk, vin: u32) -> Result<[u8; 8], StoreError> {
+    check_spent_flags(flags)?;
+    let packed = pack_spent_field(field, vin)?;
     let mut slot = [0u8; 8];
     slot[0] = flags;
-    let le = field.0.to_le_bytes();
+    let le = packed.to_le_bytes();
     slot[1..8].copy_from_slice(&le[..7]);
     Ok(slot)
 }
 
-/// Decode an 8-byte v17 spent slot.
-pub fn decode_spent_slot_v17(raw: &[u8]) -> Result<(u8, Fk), StoreError> {
-    if raw.len() < SPENT_SLOT_V17_LEN {
-        return Err(StoreError::Corrupt("short v17 spent slot"));
+/// Decode an 8-byte spent slot: `(flags, fk, vin)`.
+pub fn decode_spent_slot(raw: &[u8]) -> Result<(u8, Fk, u32), StoreError> {
+    if raw.len() < OutputRecord::SPENT_SLOT_LEN {
+        return Err(StoreError::Corrupt("short spent slot"));
     }
     let flags = raw[0];
     check_spent_flags(flags)?;
     let mut le = [0u8; 8];
     le[..7].copy_from_slice(&raw[1..8]);
-    Ok((flags, Fk(u64::from_le_bytes(le))))
+    let (field, vin) = unpack_spent_field(u64::from_le_bytes(le))?;
+    Ok((flags, field, vin))
 }
 
 /// Spent abs for `vout` given the create's `spent.body` range start.

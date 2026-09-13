@@ -991,6 +991,7 @@ pub(crate) fn assemble_block_prevouts(
             u32,
             rbitcoin_primitives::Fk,
             rbitcoin_primitives::Fk,
+            u32,
         )>,
         i64,
     ),
@@ -1045,6 +1046,7 @@ pub(crate) fn assemble_block_prevouts(
         u32,
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
+        u32,
     )> = Vec::with_capacity(n_tx.saturating_mul(2));
 
     use std::time::Instant;
@@ -1131,6 +1133,7 @@ pub(crate) fn assemble_block_prevouts(
                     key.1,
                     spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL),
                     create_fk,
+                    ii as u32,
                 ));
                 value_in = value_in
                     .checked_add(prev_out.txout.value.to_sat() as i64)
@@ -1257,9 +1260,11 @@ pub(crate) struct SpendAnnotateJob {
     pub abs: u64,
     pub field: rbitcoin_primitives::Fk,
     pub flags: u8,
+    pub field_vin: u32,
     pub create_fk: rbitcoin_primitives::Fk,
     pub vout: u32,
     pub spend_fk: rbitcoin_primitives::Fk,
+    pub vin: u32,
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -1278,6 +1283,7 @@ pub(crate) fn structural_validate_spends(
         u32,
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
+        u32,
     )],
     fees: i64,
     pending_spent: &mut rbitcoin_query::OutPointSet,
@@ -1301,12 +1307,16 @@ pub(crate) fn structural_validate_spends(
     // not a soft cold spentness path.
     let t_abs = Instant::now();
     let abs_jobs = batch_parents
-        .spend_abs_jobs(spends.iter().map(|&(_, vout, sfk, cfk)| (cfk, vout, sfk)))
+        .spend_abs_jobs(
+            spends
+                .iter()
+                .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+        )
         .map_err(ConsensusError::from)?;
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
         let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
             .iter()
-            .map(|(id, _, _, _)| rbitcoin_primitives::Fk(*id))
+            .map(|(id, _, _, _, _)| rbitcoin_primitives::Fk(*id))
             .collect();
         v.sort_unstable_by_key(|f| f.0);
         v.dedup();
@@ -1334,7 +1344,7 @@ pub(crate) fn structural_validate_spends(
 
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
-        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a, _)| *a).collect();
+        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a, _, _)| *a).collect();
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
         let metas = query
@@ -1354,7 +1364,7 @@ pub(crate) fn structural_validate_spends(
         let mut field_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
         let mut field_seen = rbitcoin_query::U64Set::default();
         for row in &metas {
-            let Some((field, _)) = row else {
+            let Some((field, _, _)) = row else {
                 continue;
             };
             if field.is_null() {
@@ -1375,8 +1385,8 @@ pub(crate) fn structural_validate_spends(
             .zip(field_heights)
             .filter_map(|(fk, h)| Some((fk.get()?, h?)))
             .collect();
-        for (i, &(id, vout, abs, sfk)) in abs_jobs.iter().enumerate() {
-            let Some((field, flags)) = metas[i] else {
+        for (i, &(id, vout, abs, sfk, vin)) in abs_jobs.iter().enumerate() {
+            let Some((field, flags, field_vin)) = metas[i] else {
                 return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
                     "invariant: structural spender meta short/OOB (cold forbidden)",
                 )));
@@ -1385,9 +1395,11 @@ pub(crate) fn structural_validate_spends(
                 abs,
                 field,
                 flags,
+                field_vin,
                 create_fk: rbitcoin_primitives::Fk(id),
                 vout,
                 spend_fk: sfk,
+                vin,
             });
             let multi = flags & rbitcoin_store::output_flags::MULTI_SPENDER != 0;
             if multi {
@@ -1442,7 +1454,7 @@ pub(crate) fn structural_validate_spends(
     let spent_cold_ns = multi_list_ns;
 
     let t_pending = Instant::now();
-    for &(prev_txid, vout, _spend_fk, create_fk) in spends {
+    for &(prev_txid, vout, _spend_fk, create_fk, _vin) in spends {
         let key = (prev_txid, vout);
         if pending_spent.contains(&key) {
             return Err(ConsensusError::PrevoutSpent);
@@ -1527,7 +1539,9 @@ pub(crate) fn structural_validate_spends(
             coin_mtps.clear();
             prev_heights.reserve(n_in);
             coin_mtps.reserve(n_in);
-            for (inp, &(_ptid, _vout, _sfk, create_fk)) in tx.input.iter().zip(tx_spends.iter()) {
+            for (inp, &(_ptid, _vout, _sfk, create_fk, _vin)) in
+                tx.input.iter().zip(tx_spends.iter())
+            {
                 let ch = if create_fk.is_null() {
                     // Same-block create (no Class A fk yet): Core uses spend height.
                     ctx.height.0

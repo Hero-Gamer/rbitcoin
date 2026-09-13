@@ -23,8 +23,8 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 **Killed dual paths (do not reintroduce):** soft spentness recovery for wrong/missing
 pin identity; unpinned wire-corrected create_fk spentness; load-stage `txid.body`
 identity fill after lookup promised stamp; `ColdPinMode` Allow/Forbid cold denserels
-split on load (load is range **outs** only); denserels-as-spender-abs (schema 15
-abs is `spent_off+9×vout` only); `AssembleMode::Full` / `validate_block_connect`
+split on load (load is range **outs** only); denserels-as-spender-abs (schema 22
+abs is `spent.idx` off + `8×vout` only); `AssembleMode::Full` / `validate_block_connect`
 (confirm is optimistic assemble then `structural_validate_spends`);
 `archive_plan_batch_from_store` and production `Query` TxApply→dummy `Block`
 (`tx_apply_to_tx` / `connect_block` / `commit_class_a_only` are
@@ -72,8 +72,8 @@ not head/idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
-| **lookup** | `tx.head`, `txout.idx` (fk + ranges), `txid.body`, headers; leftover spent_range peeks txout **meta** (`n_out` only) | **`txout` outs / `inwit` decode** |
-| **load** | **`txout.body` outs by range** (from lookup stamp) | head, idx (`txout`), `txid.body`, `inwit` |
+| **lookup** | `tx.head`, `txout.idx` (fk + ranges), `spent.idx` (spent ranges), `txid.body`, headers | **`txout.body`** (outs or spent-range peeks) / **`inwit` decode** |
+| **load** | **`txout.body` outs by range** (from lookup stamp) | head, idx (`txout` / `spent`), `txid.body`, `inwit` |
 | **scripts** | none | any store IO |
 
 | Stage | Invariant | Soft path allowed? |
@@ -81,13 +81,13 @@ not head/idx.
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (in-flight outs skip) | Missing → hard Err at stamp / pin contract |
 | Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (**engine fault**: requeue once, then halt IBD; never blacklist). Identity without idx range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
 | io_uring harvest | TLS session fail-closed ([`io-modality.md`](./io-modality.md)) | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Ring-unavailable still pread-fallback |
-| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no idx IO) | **No** idx cold outs on load; **no** `spent.idx`; **no** `inwit` on pin |
-| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup already stamped archived parents; write `tx_spent_range_batch` only for unstamped fks (same-batch after Class A, holes) | Stamp remaining `spent.body` ranges from n_out; incomplete → `invariant:` |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no idx IO) | **No** idx cold outs on load; **no** `spent.idx` on load; **no** `inwit` on pin |
+| Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup already stamped archived parents; write `tx_spent_range_batch` only for unstamped fks (same-batch after Class A, holes) | Stamp remaining ranges from `spent.idx`; incomplete → `invariant:` |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
 | Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
-| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Cold OOB/IO is hard Err | No ranged/by_create annotate tiers; no second spend walk |
+| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Cold OOB/IO is hard Err. Annotate RMW is **`spent.body` only** (no `RWF_DONTCACHE`) | No ranged/by_create annotate tiers; no second spend walk; **no** `txout.body` annotate |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
 

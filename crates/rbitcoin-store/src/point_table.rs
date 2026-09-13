@@ -16,18 +16,28 @@ pub struct PointRecord {
     pub out_txid: [u8; 32],
     pub out_index: u32,
     pub spending_tx_fk: Fk,
+    pub spending_vin: u32,
     pub next: Fk,
 }
 
-/// Mark create outpoint spent by `spending_tx_fk` (promote to multi-list if needed).
+/// Mark create outpoint spent by `spending_tx_fk` at `spending_vin` (promote to multi-list if needed).
 pub fn put_spend_on_create(
     txs: &TxTable,
     spenders: &SpenderTable,
     create_tx_fk: Fk,
     vout: u32,
     spending_tx_fk: Fk,
+    spending_vin: u32,
 ) -> Result<(), StoreError> {
-    put_spend_on_create_at(txs, spenders, create_tx_fk, vout, spending_tx_fk, None)
+    put_spend_on_create_at(
+        txs,
+        spenders,
+        create_tx_fk,
+        vout,
+        spending_tx_fk,
+        spending_vin,
+        None,
+    )
 }
 
 /// Like [`put_spend_on_create`] with optional cache-held body `(offset, len)` — **no idx**.
@@ -37,40 +47,55 @@ pub fn put_spend_on_create_at(
     create_tx_fk: Fk,
     vout: u32,
     spending_tx_fk: Fk,
+    spending_vin: u32,
     body_range: Option<(u64, u64)>,
 ) -> Result<(), StoreError> {
     if create_tx_fk.is_null() || spending_tx_fk.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    let (multi, field) = match body_range {
+    let (multi, field, field_vin) = match body_range {
         Some((off, len)) => txs.get_output_spender_meta_at(off, len, vout)?,
         None => txs.get_output_spender_meta(create_tx_fk, vout)?,
     };
 
-    let set = |multi: bool, field: Fk| -> Result<(), StoreError> {
+    let set = |multi: bool, field: Fk, vin: u32| -> Result<(), StoreError> {
         match body_range {
-            Some((off, len)) => txs.set_output_spender_meta_at(off, len, vout, multi, field),
-            None => txs.set_output_spender_meta(create_tx_fk, vout, multi, field),
+            Some((off, len)) => txs.set_output_spender_meta_at(off, len, vout, multi, field, vin),
+            None => txs.set_output_spender_meta(create_tx_fk, vout, multi, field, vin),
         }
     };
 
     if !multi && field.is_null() {
-        return set(false, spending_tx_fk);
+        return set(false, spending_tx_fk, spending_vin);
     }
-    if !multi && field == spending_tx_fk {
+    if !multi && field == spending_tx_fk && field_vin == spending_vin {
         return Ok(());
     }
     if !multi {
         // IBD first-spend path is sole-only; multi is rare (reorg / double annotate).
-        let e1 = spenders.append(field, Fk::NULL)?;
-        let e2 = spenders.append(spending_tx_fk, e1)?;
-        return set(true, e2);
+        let e1 = spenders.append(field, field_vin, Fk::NULL)?;
+        let e2 = spenders.append(spending_tx_fk, spending_vin, e1)?;
+        return set(true, e2, 0);
     }
-    let e = spenders.append(spending_tx_fk, field)?;
-    set(true, e)
+    let cap = spenders.count();
+    let mut cur = Some(field);
+    let mut steps = 0u64;
+    while let Some(fk) = cur {
+        steps = steps.saturating_add(1);
+        if steps > cap {
+            return Err(StoreError::Corrupt("invariant: spender multi-list cycle"));
+        }
+        let (spend_tx, spend_vin, next) = spenders.get(fk)?;
+        if spend_tx == spending_tx_fk && spend_vin == spending_vin {
+            return Ok(());
+        }
+        cur = if next.is_null() { None } else { Some(next) };
+    }
+    let e = spenders.append(spending_tx_fk, spending_vin, field)?;
+    set(true, e, 0)
 }
 
-/// Visit spending_tx_fks for a create outpoint (no Class C filter).
+/// Visit `(spending_tx_fk, vin)` for a create outpoint (no Class C filter).
 pub fn for_each_spender_create<F>(
     txs: &TxTable,
     spenders: &SpenderTable,
@@ -79,12 +104,12 @@ pub fn for_each_spender_create<F>(
     mut visit: F,
 ) -> Result<(), StoreError>
 where
-    F: FnMut(Fk) -> Result<bool, StoreError>,
+    F: FnMut(Fk, u32) -> Result<bool, StoreError>,
 {
     if create_tx_fk.is_null() {
         return Ok(());
     }
-    let (multi, field) = match txs.get_output_spender_meta(create_tx_fk, vout) {
+    let (multi, field, vin) = match txs.get_output_spender_meta(create_tx_fk, vout) {
         Ok(m) => m,
         Err(StoreError::NotFound) => return Ok(()),
         Err(e) => return Err(e),
@@ -93,7 +118,7 @@ where
         return Ok(());
     }
     if !multi {
-        let _ = visit(field)?;
+        let _ = visit(field, vin)?;
         return Ok(());
     }
     let cap = spenders.count();
@@ -104,8 +129,8 @@ where
         if steps > cap {
             return Err(StoreError::Corrupt("invariant: spender multi-list cycle"));
         }
-        let (spend_tx, next) = spenders.get(fk)?;
-        if !visit(spend_tx)? {
+        let (spend_tx, spend_vin, next) = spenders.get(fk)?;
+        if !visit(spend_tx, spend_vin)? {
             return Ok(());
         }
         cur = if next.is_null() { None } else { Some(next) };
@@ -166,54 +191,56 @@ mod tests {
         let s3 = put_create(&txs, [4u8; 32], 1);
 
         assert!(matches!(
-            put_spend_on_create(&txs, &spenders, Fk::NULL, 0, s1),
+            put_spend_on_create(&txs, &spenders, Fk::NULL, 0, s1, 0),
             Err(StoreError::InvalidFk)
         ));
         assert!(matches!(
-            put_spend_on_create(&txs, &spenders, create, 0, Fk::NULL),
+            put_spend_on_create(&txs, &spenders, create, 0, Fk::NULL, 0),
             Err(StoreError::InvalidFk)
         ));
 
         // Sole first spend.
-        put_spend_on_create(&txs, &spenders, create, 0, s1).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s1, 0).unwrap();
         // Idempotent.
-        put_spend_on_create(&txs, &spenders, create, 0, s1).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s1, 0).unwrap();
         // Promote to multi.
-        put_spend_on_create(&txs, &spenders, create, 0, s2).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s2, 1).unwrap();
         // Prepend multi.
-        put_spend_on_create(&txs, &spenders, create, 0, s3).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s3, 2).unwrap();
 
         let mut visited = Vec::new();
-        for_each_spender_create(&txs, &spenders, create, 0, |fk| {
-            visited.push(fk);
+        for_each_spender_create(&txs, &spenders, create, 0, |fk, vin| {
+            visited.push((fk, vin));
             Ok(true)
         })
         .unwrap();
         assert_eq!(visited.len(), 3);
-        assert_eq!(visited[0], s3); // newest head
-                                    // Early stop.
+        assert_eq!(visited[0], (s3, 2)); // newest head
+        assert_eq!(visited[1], (s2, 1));
+        assert_eq!(visited[2], (s1, 0));
+        // Early stop.
         let mut n = 0;
-        for_each_spender_create(&txs, &spenders, create, 0, |_| {
+        for_each_spender_create(&txs, &spenders, create, 0, |_, _| {
             n += 1;
             Ok(false)
         })
         .unwrap();
         assert_eq!(n, 1);
         // Null create / missing / unspent.
-        for_each_spender_create(&txs, &spenders, Fk::NULL, 0, |_| unreachable!()).unwrap();
-        for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_| unreachable!()).unwrap();
-        for_each_spender_create(&txs, &spenders, create, 1, |_| unreachable!()).unwrap();
+        for_each_spender_create(&txs, &spenders, Fk::NULL, 0, |_, _| unreachable!()).unwrap();
+        for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_, _| unreachable!()).unwrap();
+        for_each_spender_create(&txs, &spenders, create, 1, |_, _| unreachable!()).unwrap();
 
         // spent.body range path
         let (off, len) = txs.spent_range(create).unwrap();
-        put_spend_on_create_at(&txs, &spenders, create, 1, s1, Some((off, len))).unwrap();
+        put_spend_on_create_at(&txs, &spenders, create, 1, s1, 7, Some((off, len))).unwrap();
         let mut one = None;
-        for_each_spender_create(&txs, &spenders, create, 1, |fk| {
-            one = Some(fk);
+        for_each_spender_create(&txs, &spenders, create, 1, |fk, vin| {
+            one = Some((fk, vin));
             Ok(true)
         })
         .unwrap();
-        assert_eq!(one, Some(s1));
+        assert_eq!(one, Some((s1, 7)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -226,10 +253,10 @@ mod tests {
         let create = put_create(&txs, [1u8; 32], 1);
         let s1 = put_create(&txs, [2u8; 32], 1);
         let s2 = put_create(&txs, [3u8; 32], 1);
-        put_spend_on_create(&txs, &spenders, create, 0, s1).unwrap();
-        put_spend_on_create(&txs, &spenders, create, 0, s2).unwrap();
-        let (_multi, head) = txs.get_output_spender_meta(create, 0).unwrap();
-        let (_sfk, older) = spenders.get(head).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s1, 0).unwrap();
+        put_spend_on_create(&txs, &spenders, create, 0, s2, 0).unwrap();
+        let (_multi, head, _vin) = txs.get_output_spender_meta(create, 0).unwrap();
+        let (_sfk, _vin, older) = spenders.get(head).unwrap();
         let older_id = older.get().unwrap();
         let off = crate::file::FILE_HEADER_LEN as u64
             + (older_id - 1) * crate::spender_table::SPENDER_RECORD_LEN as u64;
@@ -242,7 +269,7 @@ mod tests {
         ovf.read_at(off, &mut rec).unwrap();
         rec[8..16].copy_from_slice(&head.0.to_le_bytes());
         ovf.write_at(off, &rec).unwrap();
-        match for_each_spender_create(&txs, &spenders, create, 0, |_| Ok(true)) {
+        match for_each_spender_create(&txs, &spenders, create, 0, |_, _| Ok(true)) {
             Err(StoreError::Corrupt(m)) => {
                 assert!(m.contains("cycle"), "{m}");
             }

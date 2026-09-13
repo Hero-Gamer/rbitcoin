@@ -1331,6 +1331,7 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
             vout: 0,
             spend_fk,
             create_fk: Fk(7),
+            vin: 0,
         }],
     );
     let mut spent = OutPointSet::default();
@@ -1775,7 +1776,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
         use rbitcoin_primitives::Fk;
         use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
-        let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk)];
+        let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk, 0)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
         let mut pending = OutPointSet::default();

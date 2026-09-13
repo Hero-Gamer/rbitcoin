@@ -581,7 +581,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](./SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 21`). This section is
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 22`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -591,15 +591,26 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **21** | Open. |
-| **20** | Unlink leftover `spent.idx`, rewrite `meta` to 21, then open. |
-| **19** or **18**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 21, then open. |
-| **19** or **18**, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
-| **17**, empty `tx.head` and no `scripthash*` data | Rewrite `meta` to 21, then open. |
-| **17**, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
+| **22** | Open. |
+| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 22, then open. |
+| **21**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
+| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 22, then open. |
+| **20**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
+| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 22, then open. |
+| **19** or **18**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
+| **19** or **18**, empty Class A, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
+| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 22, then open. |
+| **17**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
+| **17**, empty Class A, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
-A **20 binary** refuses 21 `meta` (do not downgrade in place). A **19 binary** refuses 20+ `meta`.
+A **21 binary** refuses 22 `meta` (do not downgrade in place). A **19 binary** refuses 20+ `meta`.
+
+When the schema-22 Class A refuse fires, the log line is:
+
+```text
+schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD
+```
 
 When the 20 index refuse fires, the log line is:
 
@@ -630,10 +641,10 @@ rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 #   mkdir -p "$DATADIR/store/txout.idx"
 #   mv "$DATADIR/store/txout.idx.meta" "$DATADIR/store/txout.idx/meta"
 #   mv "$DATADIR/store/txout.idx."[0-9][0-9][0-9][0-9][0-9][0-9] "$DATADIR/store/txout.idx/"
-# same for inwit.idx (spent.idx is unlinked on open)
+# same for inwit.idx and spent.idx
 ```
 
-Keep Class A (`txout` / `inwit` / `spent` + `txout.idx` / `inwit.idx`, `txid.body`, headers) and
+Keep Class A (`txout` / `inwit` / `spent` + `txout.idx` / `inwit.idx` / `spent.idx`, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--shindex`, SH rematerializes. Do **not** `rm -rf store/`.
 

@@ -348,7 +348,7 @@ fn annotate_jobs_from_connected_hash(
             .store()
             .get_tx_full(spend_fk)
             .map_err(ConsensusError::from)?;
-        for inp in ins {
+        for (inp_i, inp) in ins.into_iter().enumerate() {
             if inp.is_coinbase() {
                 continue;
             }
@@ -376,7 +376,7 @@ fn annotate_jobs_from_connected_hash(
                     "invariant: finish_post_commit spent slot OOB",
                 )));
             }
-            let (multi, field) = query
+            let (multi, field, field_vin) = query
                 .store()
                 .txs
                 .get_output_spender_meta(create_fk, inp.prev_index)
@@ -390,9 +390,11 @@ fn annotate_jobs_from_connected_hash(
                 abs,
                 field,
                 flags,
+                field_vin,
                 create_fk,
                 vout: inp.prev_index,
                 spend_fk,
+                vin: inp_i as u32,
             });
         }
     }
@@ -530,7 +532,7 @@ fn records_from_wire(
     }
     let mut spend_fk: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> =
         HashMap::with_capacity(p.spends.len());
-    for &(pt, pv, _, cfk) in &p.spends {
+    for &(pt, pv, _, cfk, _) in &p.spends {
         spend_fk.entry((pt, pv)).or_insert(cfk);
     }
 
@@ -639,7 +641,7 @@ mod records_from_wire_tests {
 
     fn prepared(
         height: u32,
-        spends: Vec<([u8; 32], u32, Fk, Fk)>,
+        spends: Vec<([u8; 32], u32, Fk, Fk, u32)>,
         txids: Vec<[u8; 32]>,
     ) -> Prepared {
         Prepared {
@@ -685,7 +687,7 @@ mod records_from_wire_tests {
         };
         let p = prepared(
             10,
-            vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL)],
+            vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL, 0)],
             vec![],
         );
         let parents = rbitcoin_query::BatchParents::new();
