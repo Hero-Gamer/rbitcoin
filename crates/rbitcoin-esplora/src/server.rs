@@ -775,6 +775,32 @@ mod tests {
         (status, text, body)
     }
 
+    async fn http_post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (status, body)
+    }
+
     #[tokio::test]
     async fn tip_endpoints_and_unknown_404() {
         let (dir, q) = temp_query("tip");
@@ -901,6 +927,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[allow(clippy::cognitive_complexity)] // one listener, path/asof/POST junk table
+    #[tokio::test]
+    async fn http_junk_paths_asof_and_post() {
+        use rbitcoin_net::MempoolHub;
+
+        let (dir, q) = temp_query("api-junk");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        let hash0 = h0.hash;
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let mp_dir = dir.join("mp");
+        std::fs::create_dir_all(&mp_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(hub), None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let h0hex = block_hash_hex(&hash0);
+
+        let (st, _) = http_get(addr, "/block/zz").await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, "/tx/aa").await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, "/scripthash/aa").await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, "/block-height/nope").await;
+        assert_eq!(st, 400);
+        let (st, _) = http_get(addr, "/address/not-an-address").await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, &format!("/tx/{h0hex}/outspend/nope")).await;
+        assert_eq!(st, 400);
+        let (st, _) = http_get(addr, "/blocks/nope").await;
+        assert_eq!(st, 400);
+
+        let (st, _) = http_get(addr, &format!("/tx/{h0hex}?asof={h0hex}")).await;
+        assert_eq!(st, 404, "asof on full tx JSON is ungated");
+        let (st, _) = http_get(addr, &format!("/mempool?asof={h0hex}")).await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, &format!("/tx/{h0hex}/status?asof=zz")).await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, &format!("/tx/{h0hex}/status?asof=")).await;
+        assert_eq!(st, 404);
+        let (st, _) = http_get(addr, "/tx/aa/status?asof=nothex").await;
+        assert_eq!(st, 404);
+
+        let (st, body) = http_post(addr, "/tx", b"zz").await;
+        assert_eq!(st, 400, "{body}");
+        assert!(body.contains("invalid hex"), "{body}");
+        let (st, body) = http_post(addr, "/tx", b"").await;
+        assert_eq!(st, 400, "{body}");
+        let (st, body) = http_post(addr, "/txs/package", b"{}").await;
+        assert_eq!(st, 400, "{body}");
+        assert!(body.contains("JSON array"), "{body}");
+        let (st, body) = http_post(addr, "/txs/package", b"not-json").await;
+        assert_eq!(st, 400, "{body}");
+        assert!(body.contains("invalid json"), "{body}");
+        let (st, body) = http_post(addr, "/txs/package", b"[1]").await;
+        assert_eq!(st, 400, "{body}");
+        assert!(body.contains("hex string"), "{body}");
+        let too_big = format!(
+            "[{}]",
+            (0..26).map(|_| "\"00\"").collect::<Vec<_>>().join(",")
+        );
+        let (st, body) = http_post(addr, "/txs/package", too_big.as_bytes()).await;
+        assert_eq!(st, 400, "{body}");
+        assert!(body.contains("package too large"), "{body}");
+
+        let (st, _) = http_get(addr, "/tx").await;
+        assert_eq!(st, 405);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn empty_chain_tip_is_unavailable() {
         let (dir, q) = temp_query("empty");
@@ -944,6 +1046,19 @@ mod tests {
         assert!(path_never_pins("/fee-estimates"));
         assert!(path_never_pins("/tx"));
         assert!(!path_never_pins("/tx/ab"));
+        assert!(parse_asof_param(&AsOfQuery { asof: None })
+            .unwrap()
+            .is_none());
+        assert!(parse_asof_param(&AsOfQuery {
+            asof: Some(String::new())
+        })
+        .is_err());
+        assert!(parse_asof_param(&AsOfQuery {
+            asof: Some("zz".into())
+        })
+        .is_err());
+        assert!(parse_hash32("aa").is_err());
+        assert!(parse_hash32("zz".repeat(32).as_str()).is_err());
     }
 
     /// Phase A: block-height, header, tx hex, tx status on one fixture store.

@@ -702,5 +702,24 @@ mod tests {
     fn parse_noop_and_bad_json() {
         assert_eq!(parse_client_msg(r#"{"foo":1}"#).unwrap(), ClientMsg::Noop);
         assert!(parse_client_msg("not-json").is_err());
+        assert!(parse_client_msg("[]").is_err());
+        assert!(parse_client_msg("null").is_err());
+        assert!(parse_client_msg("1").is_err());
+        assert_eq!(
+            parse_client_msg(r#"{"track-address":1}"#).unwrap(),
+            ClientMsg::Noop
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-tx":false}"#).unwrap(),
+            ClientMsg::StopTrackTxs
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-address":null}"#).unwrap(),
+            ClientMsg::StopTrackAddresses
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"stop-track-address":1}"#).unwrap(),
+            ClientMsg::Noop
+        );
     }
 }
