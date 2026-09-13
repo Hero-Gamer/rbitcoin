@@ -924,7 +924,7 @@ mod scan_p2tr_tests {
         raw.push(SCRIPT_KIND_V17_P2TR | (8 << 4));
         raw.push(1);
         raw.extend_from_slice(&[0u8; 32]);
-        let rows = scan_packed_p2tr_outs(&raw, None).unwrap();
+        let rows = scan_packed_p2tr_outs(&raw, 1, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, 100_000_000);
     }
