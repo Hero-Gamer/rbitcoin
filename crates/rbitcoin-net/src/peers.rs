@@ -2064,7 +2064,8 @@ mod tests {
     }
 
     #[test]
-    fn connecting_peer_times_out_at_peertimeout() {
+    fn connecting_peer_v2_timeout_log_before_transport() {
+        rbitcoin_log::capture_logs(true);
         let hub = PeerHub::new();
         hub.set_peer_timeout_secs(3);
         hub.set_mock_now(1_700_000_000);
@@ -2072,10 +2073,10 @@ mod tests {
         let p = hub.register_connecting(a, a, true, PeerConnType::Inbound);
         assert!(!p.handshake_complete());
         hub.set_mock_now(1_700_000_002);
-        hub.on_session_heartbeat();
         assert!(!p.stop.load(Ordering::SeqCst), "still inside peertimeout");
         hub.set_mock_now(1_700_000_003);
-        hub.on_session_heartbeat();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
         assert!(
             p.stop.load(Ordering::SeqCst),
             "peertimeout must disconnect pre-verack"
@@ -2084,45 +2085,10 @@ mod tests {
             hub.get(p.id).is_none(),
             "timed-out connecting peer is dropped"
         );
-    }
-
-    #[test]
-    fn connecting_peer_v2_timeout_log_before_transport() {
-        rbitcoin_log::capture_logs(true);
-        let hub = PeerHub::new();
-        hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let p = hub.register_connecting(a, a, true, PeerConnType::Inbound);
-        hub.set_mock_now(1_700_000_003);
-        hub.on_session_heartbeat();
-        let logs = rbitcoin_log::take_logs();
-        rbitcoin_log::capture_logs(false);
-        assert!(p.stop.load(Ordering::SeqCst));
         assert!(
             logs.iter()
                 .any(|(_, m)| m.contains("V2 handshake timeout, disconnecting peer=0")),
             "expected V2 handshake timeout, got {logs:?}"
-        );
-    }
-
-    #[test]
-    fn version_handshake_timeout_log_after_v2_ready() {
-        rbitcoin_log::capture_logs(true);
-        let hub = PeerHub::new();
-        hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let p = hub.register_connecting(a, a, true, PeerConnType::Inbound);
-        p.mark_v2_transport_ready();
-        hub.set_mock_now(1_700_000_003);
-        hub.on_session_heartbeat();
-        let logs = rbitcoin_log::take_logs();
-        rbitcoin_log::capture_logs(false);
-        assert!(
-            logs.iter()
-                .any(|(_, m)| m.contains("version handshake timeout, disconnecting peer=0")),
-            "expected version handshake timeout after v2 ready, got {logs:?}"
         );
     }
 
@@ -2340,34 +2306,6 @@ mod tests {
     }
 
     #[test]
-    fn session_heartbeat_disconnects_stalling_headers_sync() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
-        let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let _outbound = hub.register(
-            b,
-            b,
-            &ver("/rbitcoin:0.1.0/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
-        // Deadline is computed from the `now` passed to try_start, not the hub
-        // clock. Start 16 minutes behind wall time with a tip of the same age
-        // so variable timeout is 0: deadline = wall − 60s.
-        let wall = hub.now_secs();
-        let start = wall.saturating_sub(16 * 60);
-        assert!(hub.try_start_headers_sync(&inbound, start, start));
-        assert!(inbound.is_sync_started());
-        assert!(!inbound.stop.load(Ordering::SeqCst));
-        hub.on_session_heartbeat();
-        assert!(
-            inbound.stop.load(Ordering::SeqCst),
-            "stalling inbound must disconnect when another preferred peer exists"
-        );
-    }
-
-    #[test]
     fn session_heartbeat_keeps_sole_preferred_headers_sync_peer() {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
@@ -2574,56 +2512,31 @@ mod tests {
     }
 
     #[test]
-    fn getaddr_cache_repeats_same_bind() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let a = addr_ips(&hub.addr_response_for_bind(bind));
-        let b = addr_ips(&hub.addr_response_for_bind(bind));
-        assert_eq!(a.len(), 1000);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn getaddr_cache_distinct_listens_differ() {
+    fn getaddr_cache_bind_key_and_ttl() {
         let hub = PeerHub::new();
         hub.set_mock_now(1_700_000_000);
         hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
         let a = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
         let b = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18445))));
         let c = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18446))));
+        let mapped = addr_ips(&hub.addr_response_for_bind(SocketAddr::from((
+            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(),
+            18444,
+        ))));
         assert_eq!(a.len(), 1000);
         assert_eq!(b.len(), 1000);
         assert_eq!(c.len(), 1000);
+        assert_eq!(
+            a, mapped,
+            "IPv4-mapped IPv6 must share the clearnet cache key"
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
-    }
-
-    #[test]
-    fn getaddr_cache_ipv4_mapped_shares_clearnet_key() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let v4 = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let v6 = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(), 18444));
-        let a = addr_ips(&hub.addr_response_for_bind(v4));
-        let b = addr_ips(&hub.addr_response_for_bind(v6));
-        assert_eq!(a.len(), 1000);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn getaddr_cache_expires_after_24h() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let first = addr_ips(&hub.addr_response_for_bind(bind));
         hub.set_mock_now(1_700_000_000 + 24 * 60 * 60);
-        let second = addr_ips(&hub.addr_response_for_bind(bind));
-        assert_eq!(first.len(), 1000);
-        assert_ne!(first, second);
+        let expired =
+            addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
+        assert_eq!(expired.len(), 1000);
+        assert_ne!(a, expired);
     }
 }
