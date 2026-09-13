@@ -121,7 +121,8 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
     Err(StoreError::Corrupt("uleb128 truncated"))
 }
 
-/// Trailing decimal zeros in a satoshi amount, capped at 9 (fits flags bits 4–7).
+/// Trailing decimal zeros stripped from a satoshi amount, capped at 9.
+/// Nibble values 10–15 are Corrupt (soft-extend), not extra exponent.
 pub const AMOUNT_EXP_MAX: u8 = 9;
 
 pub fn amount_exp_mantissa(sats: u64) -> (u8, u64) {

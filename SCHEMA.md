@@ -4,7 +4,9 @@
 **Status:** 22 is `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`),
 LAYOUT17 without `output_count`, and spent slots flags + u40 spend fk + u16 vin
 (still 8 bytes). `txout` amount is flags bits 4–7 = decimal exponent (0–9) +
-ULEB mantissa (`sats = mantissa × 10^e`; `e=0` is a raw satoshi ULEB). Occupied
+ULEB mantissa (`sats = mantissa × 10^e`). Encoding is canonical compact: strip
+trailing tens up to `e=9` (`e<9` and mantissa divisible by 10 is Corrupt; zero
+is `e=0`, mantissa 0). Occupied
 15–21 LAYOUT17 Class A with creates is **refused**
 (wipe datadir and redo IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover
 `spent.off` and leftover `*.idx`. A 21 binary refuses 22 `meta`. Occupied schema
@@ -400,8 +402,8 @@ Legacy `LOCAL_PREV` is **rejected** on decode.
 flags:u8 (bits 0–3 SCRIPT_KIND, bits 4–7 amount exp 0–9; 10–15 Corrupt)
 uleb128 mantissa
   sats = mantissa × 10^e
-  e < 9 and mantissa divisible by 10 (except 0) is Corrupt
-  zero amount is e=0, mantissa 0
+  canonical compact: largest e ≤ 9; e < 9 and mantissa divisible by 10 (except 0) is Corrupt
+  zero amount is e=0, mantissa 0 (messy amounts stay e=0: no trailing factor of 10)
 kind payload:
   0 RAW            CompactSize + bytes
   1 EMPTY          none
@@ -428,6 +430,7 @@ one code to “extension follows” and still read `e=0..=9` records).
 | Core `CompressAmount` packed into one integer | Can *grow* the following ULEB vs raw sats |
 | 3-bit `e` (`0..=7`) + reserved bit 7 | 25/50 BTC become 2-byte mantissas; one boolean is already an unused nibble value |
 | Cap `e` at 8, leave `9..=15` unused | Extra headroom we do not need; `e=9` is cheap (50 BTC is already `50×10^8`) and matches kind’s `0..=9` live |
+| Use `e=0..=15` | 100 BTC is already `(9,10)` = 1 ULEB byte. A byte comes back only for round ≥10000 BTC (`(9,1000)` is 2 bytes). Occupying `10–15` spends the amount-nibble soft-extend hook for that |
 | 1 flag bit `multi` + first amount byte `exp:4\|mant:4` + ULEB rest | Buys 3 flag bits. Pays +1 byte whenever leftover `m` is `16..=127` (see above). Continuation on the amount byte instead steals an `e` or `m` bit and cannot keep 4+4 |
 
 Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest

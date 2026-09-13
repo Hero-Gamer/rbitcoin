@@ -45,11 +45,13 @@ meta is flags + version/locktime + uleb `input_count` only; decode takes
 `n_out` from loc (`n_out ≥ 1`). Spent length is `8 × n_out` (no zero-out pad).
 Spent slot is still 8 bytes: flags + u40 spend fk + u16 vin. `spent.ovf`
 nodes use the same pack. `txout` amount uses flags bits 4–7 as a decimal
-exponent (0–9) and a ULEB mantissa (`sats = mantissa × 10^e`). `e=0` is the
-old raw satoshi ULEB (messy amounts). `e>9` or a non-canonical mantissa
-(`e<9` and `mantissa` divisible by 10, except zero) is Corrupt. Amount
-nibble `10–15` is the soft-extend hook; do not spend a dedicated flag bit
-on continuation (live UTXO `m` in `16..=127` would pay an extra byte).
+exponent (0–9) and a ULEB mantissa (`sats = mantissa × 10^e`). Encoding is
+canonical compact (strip trailing tens up to `e=9`). Messy amounts stay `e=0`
+(same ULEB as LAYOUT17). `e>9` or a non-canonical mantissa (`e<9` and
+`mantissa` divisible by 10, except zero) is Corrupt. Amount nibble `10–15` is
+the soft-extend hook; `e=10..=15` would not shrink 100 BTC (already `(9,10)` = 1
+byte) and only helps round ≥10000 BTC. Do not spend a dedicated flag bit on
+continuation (live UTXO `m` in `16..=127` would pay an extra byte).
 Rejected alternatives: [`SCHEMA.md`](./SCHEMA.md) (Output encoding).
 Occupied 15–21 LAYOUT17 Class A with creates refuses
 (`schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`)
