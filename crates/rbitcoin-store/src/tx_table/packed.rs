@@ -937,6 +937,13 @@ mod scan_p2tr_tests {
         let meta_n = TxRecord::decode_body_meta(&raw).unwrap().1;
         let dec = OutputRecord::decode_at_secret(&raw[meta_n..], None).unwrap_err();
         assert!(format!("{dec}").contains("output value too large"), "{dec}");
+        let skip = OutputRecord::skip_at(&raw[meta_n..]).unwrap_err();
+        assert!(format!("{skip}").contains("output value too large"), "{skip}");
+        let visit = visit_packed_script_hashes(&raw, 1, None, |_| Ok(())).unwrap_err();
+        assert!(
+            format!("{visit}").contains("output value too large"),
+            "{visit}"
+        );
     }
 
     fn three_out_packed() -> (Vec<u8>, usize) {

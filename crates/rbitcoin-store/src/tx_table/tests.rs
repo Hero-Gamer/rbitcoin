@@ -1698,6 +1698,25 @@ fn output_noncanonical_mantissa_is_corrupt() {
     write_uleb128(&mut enc, 10);
     let err = OutputRecord::decode(&enc).unwrap_err();
     assert!(format!("{err}").contains("amount exp"), "{err}");
+    let skip = OutputRecord::skip_at(&enc).unwrap_err();
+    assert!(format!("{skip}").contains("amount exp"), "{skip}");
+}
+
+#[test]
+fn skip_at_overflow_amount_is_corrupt() {
+    let mut raw = Vec::new();
+    raw.push(SCRIPT_KIND_V17_OP_TRUE);
+    write_uleb128(&mut raw, i64::MAX as u64 + 1);
+    let err = OutputRecord::skip_at(&raw).unwrap_err();
+    assert!(format!("{err}").contains("output value too large"), "{err}");
+
+    let mut scaled = Vec::new();
+    scaled.push(SCRIPT_KIND_V17_OP_TRUE | (9 << 4));
+    write_uleb128(&mut scaled, i64::MAX as u64 / 1_000_000_000 + 1);
+    let err = OutputRecord::skip_at(&scaled).unwrap_err();
+    assert!(format!("{err}").contains("output value too large"), "{err}");
+    let dec = OutputRecord::decode(&scaled).unwrap_err();
+    assert!(format!("{dec}").contains("output value too large"), "{dec}");
 }
 
 #[test]
