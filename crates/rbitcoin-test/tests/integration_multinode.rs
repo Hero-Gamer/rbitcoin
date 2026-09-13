@@ -1,14 +1,10 @@
-//! Multi-node P2P integration tests.
+//! Multi-node P2P integration tests (all default `cargo test` + coverage).
 //!
-//! **Tier A (default `cargo test` + coverage):** single-hop IBD (8 blocks), cold
-//! reconstruct serve (10 blocks), dead-peer skip. Hard wall timeouts; hang-free
-//! on CI-class hosts.
-//! **Tier B (default suite):** handshake timeout / GetAddr cache / keepalive ping,
-//! compact HB + missing-tx `getblocktxn` + orphan child→parent on one mature pad,
-//! outbound feeler complete-and-close + inbound-full reject, hub reorg
-//! (leftover/BadPrev orphan that must not blacklist).
-//! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
-//! `scripts/integration.sh` or `-- --ignored` only.
+//! Single-hop IBD (8 blocks), cold reconstruct serve (10 blocks), dead-peer
+//! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
+//! fill, product `run_p2p --connect`. Hard wall timeouts; hang-free on
+//! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
+//! live in the same binary.
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -985,66 +981,74 @@ async fn serve_after_restart_via_reconstruct() {
         .unwrap_or_else(|_| panic!("serve_after_restart_via_reconstruct wall timeout ({wall:?})"));
 }
 
-/// Multi-hop serve after sync (mid → leaf). Ignored: longer wall + parallel IBD flakiness.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multi-hop P2P; run via scripts/integration.sh"]
+/// Mid-node serve after IBD: leaf syncs from mid, not the original seeder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_relay_path() {
-    let d0 = TempDir::new().unwrap();
-    let d1 = TempDir::new().unwrap();
-    let d2 = TempDir::new().unwrap();
+    let fut = async {
+        let d0 = TempDir::new().unwrap();
+        let d1 = TempDir::new().unwrap();
+        let d2 = TempDir::new().unwrap();
 
-    let seed = start_node(&d0).await;
-    seed_chain(&seed, 5).await;
+        let seed = start_node(&d0).await;
+        seed_chain(&seed, 5).await;
 
-    let mid = start_node(&d1).await;
-    sync_ibd(&mid, seed.local_addr).await;
-    mid.wait_height(5, Duration::from_secs(5)).await.unwrap();
+        let mid = start_node(&d1).await;
+        sync_ibd(&mid, seed.local_addr).await;
+        mid.wait_height(5, Duration::from_secs(5)).await.unwrap();
 
-    let leaf = start_node(&d2).await;
-    // Sync from mid (not original seed) — exercises serve after sync.
-    sync_ibd(&leaf, mid.local_addr).await;
-    leaf.wait_height(5, Duration::from_secs(5)).await.unwrap();
+        let leaf = start_node(&d2).await;
+        sync_ibd(&leaf, mid.local_addr).await;
+        leaf.wait_height(5, Duration::from_secs(5)).await.unwrap();
 
-    assert_eq!(leaf.hub.tip_hash(), seed.hub.tip_hash());
-    assert_eq!(leaf.query.tip_height(), Some(Height(5)));
+        assert_eq!(leaf.hub.tip_hash(), seed.hub.tip_hash());
+        assert_eq!(leaf.query.tip_height(), Some(Height(5)));
 
-    seed.shutdown().await;
-    mid.shutdown().await;
-    leaf.shutdown().await;
+        seed.shutdown().await;
+        mid.shutdown().await;
+        leaf.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut)
+        .await
+        .unwrap_or_else(|_| panic!("three_node_relay_path wall timeout ({wall:?})"));
 }
 
-/// IBD with two seeder peers (48-block seed). Ignored: multi-minute under load.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "dual-seeder 48-block IBD; run via scripts/integration.sh"]
+/// IBD with two live seeder peers (8-block seed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ibd_two_peers() {
-    let seed_dir = TempDir::new().unwrap();
-    let mid_dir = TempDir::new().unwrap();
-    let peer_dir = TempDir::new().unwrap();
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let mid_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 48).await;
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 8).await;
 
-    // Second server: hop-sync then both serve the client.
-    let mid = start_node(&mid_dir).await;
-    sync_ibd(&mid, seed.local_addr).await;
-    mid.wait_height(48, Duration::from_secs(15)).await.unwrap();
+        let mid = start_node(&mid_dir).await;
+        sync_ibd(&mid, seed.local_addr).await;
+        mid.wait_height(8, Duration::from_secs(10)).await.unwrap();
 
-    let client = start_node(&peer_dir).await;
-    let n = client
-        .sync(&[seed.local_addr, mid.local_addr], IbdConfig::for_test())
+        let client = start_node(&peer_dir).await;
+        let n = client
+            .sync(&[seed.local_addr, mid.local_addr], IbdConfig::for_test())
+            .await
+            .expect("ibd");
+        assert!(n >= 8, "accepted {n}");
+        client
+            .wait_height(8, Duration::from_secs(10))
+            .await
+            .expect("tip");
+        assert_eq!(client.query.tip_height(), Some(Height(8)));
+        assert_eq!(client.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
+
+        seed.shutdown().await;
+        mid.shutdown().await;
+        client.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut)
         .await
-        .expect("ibd");
-    assert!(n >= 40, "accepted {n}");
-    client
-        .wait_height(48, Duration::from_secs(15))
-        .await
-        .expect("tip");
-    assert_eq!(client.query.tip_height(), Some(Height(48)));
-    assert_eq!(client.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
-
-    seed.shutdown().await;
-    mid.shutdown().await;
-    client.shutdown().await;
+        .unwrap_or_else(|_| panic!("ibd_two_peers wall timeout ({wall:?})"));
 }
 
 /// Multi-peer IBD: dead address + live seeder (dial book tries both). Slim (4 blocks).
@@ -1069,175 +1073,106 @@ async fn ibd_skips_dead_peer() {
     peer.shutdown().await;
 }
 
-/// Phase 5: after IBD, seed announces a new tip; follower picks it up via inv/headers.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "tip-follow after IBD; run via scripts/integration.sh"]
+/// After IBD, seed announces a new tip; follower picks it up via inv/headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
-    let seed_dir = TempDir::new().unwrap();
-    let peer_dir = TempDir::new().unwrap();
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 5).await;
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 5).await;
 
-    let mut peer = start_node(&peer_dir).await;
-    // Catch-up via IBD, then long-lived follow for tip announce.
-    sync_ibd(&peer, seed.local_addr).await;
-    peer.wait_height(5, Duration::from_secs(10))
+        let mut peer = start_node(&peer_dir).await;
+        sync_ibd(&peer, seed.local_addr).await;
+        peer.wait_height(5, Duration::from_secs(10))
+            .await
+            .expect("ibd");
+        peer.follow_from(seed.local_addr).await.expect("follow");
+        assert!(
+            peer.follow_live_count() >= 1,
+            "outbound follow session should be live"
+        );
+
+        let tip = seed.cache.tip_hash().unwrap();
+        let tip_time = seed
+            .query
+            .header_at_height(Height(5))
+            .unwrap()
+            .unwrap()
+            .1
+            .timestamp;
+        let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
+        let h6 = b6.block_hash();
+        seed.ingest_block(6, b6).unwrap();
+
+        peer.wait_tip_hash(h6, Duration::from_secs(10))
+            .await
+            .expect("tip follow");
+        assert_eq!(peer.query.tip_height(), Some(Height(6)));
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut)
         .await
-        .expect("ibd");
-    peer.follow_from(seed.local_addr).await.expect("follow");
-    assert!(
-        peer.follow_live_count() >= 1,
-        "outbound follow session should be live"
-    );
-
-    // Seed mines block 6 — inbound peer_session should announce to follower.
-    let tip = seed.cache.tip_hash().unwrap();
-    let tip_time = seed
-        .query
-        .header_at_height(Height(5))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
-    let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
-    let h6 = b6.block_hash();
-    seed.ingest_block(6, b6).unwrap();
-
-    peer.wait_tip_hash(h6, Duration::from_secs(10))
-        .await
-        .expect("tip follow");
-    assert_eq!(peer.query.tip_height(), Some(Height(6)));
-
-    seed.shutdown().await;
-    peer.shutdown().await;
+        .unwrap_or_else(|_| panic!("tip_follow_after_ibd wall timeout ({wall:?})"));
 }
 
-/// Regression: blocks mined while disconnected are pulled via post-connect
-/// `getheaders` (not only unsolicited inv/headers announces).
-///
-/// Models post-IBD SH materialize gap: follow peers connect after tip advanced
-/// on the network; without getheaders the follower would stall forever.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "getheaders gap fill; run via scripts/integration.sh"]
+/// Blocks mined while disconnected are pulled via post-connect `getheaders`
+/// (not only unsolicited inv/headers announces).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_getheaders_catches_missed_blocks() {
-    let seed_dir = TempDir::new().unwrap();
-    let peer_dir = TempDir::new().unwrap();
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 5).await;
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 5).await;
 
-    let mut peer = start_node(&peer_dir).await;
-    sync_ibd(&peer, seed.local_addr).await;
-    peer.wait_height(5, Duration::from_secs(10))
-        .await
-        .expect("ibd");
+        let mut peer = start_node(&peer_dir).await;
+        sync_ibd(&peer, seed.local_addr).await;
+        peer.wait_height(5, Duration::from_secs(10))
+            .await
+            .expect("ibd");
 
-    // Peer is NOT following yet — mine several tips on the seed only.
-    let mut tip = seed.hub.tip_hash().unwrap();
-    let mut tip_time = seed
-        .query
-        .header_at_height(Height(5))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
-    let mut last = tip;
-    for h in 6..=9 {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        tip = b.block_hash();
-        tip_time = b.header.time;
-        last = tip;
-        seed.ingest_block(h, b).unwrap();
-    }
-    assert_eq!(peer.query.tip_height(), Some(Height(5)));
-    assert_eq!(seed.query.tip_height(), Some(Height(9)));
+        let mut tip = seed.hub.tip_hash().unwrap();
+        let mut tip_time = seed
+            .query
+            .header_at_height(Height(5))
+            .unwrap()
+            .unwrap()
+            .1
+            .timestamp;
+        let mut last = tip;
+        for h in 6..=9 {
+            let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+            tip = b.block_hash();
+            tip_time = b.header.time;
+            last = tip;
+            seed.ingest_block(h, b).unwrap();
+        }
+        assert_eq!(peer.query.tip_height(), Some(Height(5)));
+        assert_eq!(seed.query.tip_height(), Some(Height(9)));
 
-    // Connect follow — session must getheaders + getdata the gap.
-    peer.follow_from(seed.local_addr).await.expect("follow");
-    peer.wait_tip_hash(last, Duration::from_secs(15))
-        .await
-        .expect("getheaders gap fill");
-    assert_eq!(peer.query.tip_height(), Some(Height(9)));
-    assert_eq!(peer.follow_live_count(), 1);
+        peer.follow_from(seed.local_addr).await.expect("follow");
+        peer.wait_tip_hash(last, Duration::from_secs(15))
+            .await
+            .expect("getheaders gap fill");
+        assert_eq!(peer.query.tip_height(), Some(Height(9)));
+        assert_eq!(peer.follow_live_count(), 1);
 
-    seed.shutdown().await;
-    peer.shutdown().await;
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut).await.unwrap_or_else(|_| {
+        panic!("tip_follow_getheaders_catches_missed_blocks wall timeout ({wall:?})")
+    });
 }
 
-/// IBD to seeder tip → long-lived follow → new tip via announce, and
-/// a third peer can download history from the client (block relay / serve).
-///
-/// Guards the post-IBD transition: once at peer tip we must leave IBD
-/// and stay in tip-tracking + serve mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "IBD→follow + third-peer relay; run via scripts/integration.sh"]
-async fn ibd_to_tip_tracking_and_block_relay() {
-    let seed_dir = TempDir::new().unwrap();
-    let client_dir = TempDir::new().unwrap();
-    let third_dir = TempDir::new().unwrap();
-
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 20).await;
-    let seed_tip_hash = seed.hub.tip_hash().unwrap();
-
-    // 1) Catch-up to the highest tip the seeder has.
-    let mut client = start_node(&client_dir).await;
-    let n = client
-        .sync(&[seed.local_addr], IbdConfig::for_test())
-        .await
-        .expect("ibd");
-    assert!(n >= 20, "accepted {n}");
-    client
-        .wait_height(20, Duration::from_secs(15))
-        .await
-        .expect("client tip after ibd");
-    assert_eq!(client.query.tip_height(), Some(Height(20)));
-    assert_eq!(client.hub.tip_hash().unwrap(), seed_tip_hash);
-
-    // 2) Transition: persistent follow (tip tracking).
-    client
-        .follow_from(seed.local_addr)
-        .await
-        .expect("follow after ibd");
-
-    // 3) Seeder extends tip — client must pick it up via inv/headers on the
-    //    follow session (steady-state path).
-    let tip = seed.hub.tip_hash().unwrap();
-    let tip_time = seed
-        .query
-        .header_at_height(Height(20))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
-    let b21 = mine_regtest_block(tip, tip_time + 600, 21, vec![]);
-    let h21 = b21.block_hash();
-    seed.ingest_block(21, b21).unwrap();
-
-    client
-        .wait_tip_hash(h21, Duration::from_secs(15))
-        .await
-        .expect("tip tracking after ibd");
-    assert_eq!(client.query.tip_height(), Some(Height(21)));
-
-    // 4) Block relay / serve: a third node IBD-syncs **from the client** (not
-    //    the original seeder), proving post-IBD history serve works.
-    let third = start_node(&third_dir).await;
-    let n3 = sync_ibd(&third, client.local_addr).await;
-    assert!(n3 >= 20, "third downloaded {n3}");
-    third
-        .wait_height(21, Duration::from_secs(15))
-        .await
-        .expect("third tip");
-    assert_eq!(third.hub.tip_hash().unwrap(), h21);
-
-    seed.shutdown().await;
-    client.shutdown().await;
-    third.shutdown().await;
-}
-
-/// Phase 5: most-work reorg — longer branch wins after disconnect/connect.
+/// Most-work reorg — longer branch wins after disconnect/connect.
 #[tokio::test]
 async fn reorg_to_longer_branch() {
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -1552,74 +1487,38 @@ fn reorg_same_height_then_multi_block_branch() {
     ));
 }
 
-/// Full `run_p2p` entry: listen, connect to seeder, exit via max_run_secs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "full run_p2p entry; run via scripts/integration.sh"]
+/// Product `run_p2p`: listen, `--connect` to a live seeder, exit via `max_run_secs=0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
-    use rbitcoin_node::{run_p2p, NodeConfig};
-    use rbitcoin_primitives::Network;
+    let fut = async {
+        use rbitcoin_node::{run_p2p, NodeConfig};
+        use rbitcoin_primitives::Network;
 
-    let seed_dir = TempDir::new().unwrap();
-    let node_dir = TempDir::new().unwrap();
+        let seed_dir = TempDir::new().unwrap();
+        let node_dir = TempDir::new().unwrap();
 
-    let seed = start_node(&seed_dir).await;
-    seed_chain(&seed, 3).await;
-    let seed_addr = seed.local_addr;
+        let seed = start_node(&seed_dir).await;
+        seed_chain(&seed, 3).await;
+        let seed_addr = seed.local_addr;
 
-    let mut cfg = NodeConfig::default()
-        .with_datadir(node_dir.path())
-        .with_network(Network::Regtest)
-        .with_p2p_listen("127.0.0.1:0".parse().unwrap())
-        .with_tiny_heads();
-    cfg.listen.connect = vec![seed_addr];
-    cfg.listen.use_seeds = false;
-    cfg.max_run_secs = Some(0); // sync then exit immediately
+        let mut cfg = NodeConfig::default()
+            .with_datadir(node_dir.path())
+            .with_network(Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap())
+            .with_tiny_heads();
+        cfg.listen.connect = vec![seed_addr];
+        cfg.listen.use_seeds = false;
+        cfg.max_run_secs = Some(0);
 
-    run_p2p(cfg).await.expect("run_p2p");
+        run_p2p(cfg).await.expect("run_p2p");
 
-    // Reopen store — should have synced chain
-    let q = Query::open_or_create_tiny(node_dir.path().join("store")).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(3)));
+        let q = Query::open_or_create_tiny(node_dir.path().join("store")).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(3)));
 
-    seed.shutdown().await;
-}
-
-/// Periodic / holistic mesh: larger chain, multi-hop, concurrent peers.
-/// Run: `cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture`
-#[tokio::test]
-#[ignore = "periodic multi-node mesh; run via scripts/integration.sh"]
-async fn multinode_mesh_periodic() {
-    const HEIGHT: u32 = 40;
-    let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
-
-    let seed = start_node(&dirs[0]).await;
-    seed_chain(&seed, HEIGHT).await;
-
-    // Fan-out: three peers IBD-sync from seed.
-    let mut peers = Vec::new();
-    for d in dirs.iter().skip(1) {
-        peers.push(start_node(d).await);
-    }
-
-    let addr = seed.local_addr;
-    for p in &peers {
-        sync_ibd(p, addr).await;
-        p.wait_height(HEIGHT, Duration::from_secs(30))
-            .await
-            .expect("height");
-        assert_eq!(p.hub.tip_hash(), seed.hub.tip_hash());
-    }
-
-    // Cross-link: peer[1] re-syncs from peer[0] (idempotent / already at tip).
-    let n = peers[1]
-        .sync(&[peers[0].local_addr], IbdConfig::for_test())
+        seed.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut)
         .await
-        .unwrap();
-    let _ = n;
-    assert_eq!(peers[1].query.tip_height(), Some(Height(HEIGHT)));
-
-    seed.shutdown().await;
-    for p in peers {
-        p.shutdown().await;
-    }
+        .unwrap_or_else(|_| panic!("node_run_p2p_short wall timeout ({wall:?})"));
 }

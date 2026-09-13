@@ -112,8 +112,7 @@ reads it; rustup users export it). Override coverage dir:
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **8-block** `two_node` IBD + restart reconstruct + slim dead-peer + hub reorgs. Agents use targeted `-p` tests locally; this suite runs on the PR. |
-| **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
+| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + live P2P (8-block `two_node`, restart reconstruct, dead-peer, hop serve, dual live seeders, post-IBD tip follow, getheaders gap fill, product `run_p2p --connect`) + hub reorgs. Agents use targeted `-p` tests locally; this suite runs on the PR. |
 
 ### Suite speed budgets (default tier)
 
@@ -129,7 +128,7 @@ reads it; rustup users export it). Override coverage dir:
 | `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
 | `rbitcoin-query --lib` | **&lt;20 s** | |
 | `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
-| **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min**; ignore-tier IBD stays out |
+| **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min** |
 
 **New default-suite test rule:** if a new or expanded default test routinely takes **&gt;2 s wall** on a warm tree, the PR must **justify** it (what contract needs that cost, why a smaller N / unit cannot hit the branch). Prefer `#[ignore]` + reason string for true microbenches / host-only forensics.
 
@@ -142,7 +141,7 @@ reads it; rustup users export it). Override coverage dir:
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (180s under `coverage.sh` / llvm-cov). `serve_after_restart_via_reconstruct` 90s wall (180s under llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
+**P2P walls:** `two_node_header_and_block_sync`, `three_node_relay_path`, `ibd_two_peers`, `tip_follow_after_ibd`, `tip_follow_getheaders_catches_missed_blocks`, and `node_run_p2p_short` 60s wall (180s under `coverage.sh` / llvm-cov). `serve_after_restart_via_reconstruct` 90s wall (180s under llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall.
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -292,27 +291,23 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
-| `three_node_relay_path` | P2P (**ignored**) | Hop serve — `scripts/integration.sh` |
-
-| `ibd_two_peers` | P2P (**ignored**) | Dual-seeder 48-block IBD |
-| `tip_follow_after_ibd` / `tip_follow_getheaders_*` / `ibd_to_tip_tracking_*` | P2P (**ignored**) | Tip follow / relay |
-| `node_run_p2p_short` | Node (**ignored**) | Full `run_p2p` entry |
-| `multinode_mesh_periodic` | P2P (**ignored**) | Larger mesh |
+| `three_node_relay_path` | P2P (**default**) | Leaf IBD-syncs from a mid node that already synced (hop serve) |
+| `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |
+| `tip_follow_after_ibd` | P2P (**default**) | After IBD, follow + one new tip via inv/headers |
+| `tip_follow_getheaders_catches_missed_blocks` | P2P (**default**) | Blocks mined while disconnected fill via post-connect `getheaders` |
+| `node_run_p2p_short` | Node (**default**) | Product `run_p2p` `--connect` to a live seeder, `max_run_secs=0` |
 
 Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_head`,
 `double_archive_keeps_tx_height_for_coinbase_maturity`, `mega_batch_duplicate_header_is_idempotent`,
-`archive_local_prev_fk_and_reconstruct`.
+`archive_local_prev_fk_and_reconstruct`, `ibd_to_tip_tracking_and_block_relay`,
+`multinode_mesh_periodic`.
 
 ### Integration / multi-node
 
-Default `cargo test` runs `two_node_header_and_block_sync` (8-block), `serve_after_restart_via_reconstruct`, `ibd_skips_dead_peer`, `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, `p2p_inbound_full_rejects_extra`, and `badprev_orphan_does_not_blacklist_then_reorg_reconstructs`.
-Heavy topology (3-hop, 48-block, mesh, `run_p2p`) stays `#[ignore]` for `scripts/integration.sh`:
-
-```bash
-./scripts/integration.sh   # default suite + --ignored
-# or only heavy:
-cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
-```
+Default `cargo test` runs the live P2P catalog above (`two_node`, reconstruct,
+dead-peer, hop serve, dual seeder, tip follow, getheaders gap, `run_p2p --connect`,
+compact/feeler/inbound-full, hub reorg). There is no ignored topology tier and
+no `scripts/integration.sh`.
 
 New features: add a high-level scenario; remove obsolete lower-level tests in the same PR.
 
