@@ -296,7 +296,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |
 | `tip_follow_after_ibd` | P2P (**default**) | After IBD, follow + one new tip via inv/headers |
 | `tip_follow_getheaders_catches_missed_blocks` | P2P (**default**) | Blocks mined while disconnected fill via post-connect `getheaders` |
-| `node_run_p2p_short` | Node (**default**) | Product `run_p2p` `--connect` to a live seeder, `max_run_secs=0` |
+| `node_run_p2p_short` | Node (**default**) | Product `run_p2p` `--connect` to a live seeder; process `getpeerinfo` / `getconnectioncount` / `getnetworkinfo` / `getnettotals` / `ping` while connected (v2 outbound-full-relay); `addconnection inbound` refuses; `disconnectnode` clears `getpeerinfo`; `addnode onetry` reconnects as `manual`. Exit via `stop`. `max_run_secs=0` stays a node-crate unit |
 
 Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_head`,
 `double_archive_keeps_tx_height_for_coinbase_maturity`, `mega_batch_duplicate_header_is_idempotent`,

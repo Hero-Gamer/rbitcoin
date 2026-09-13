@@ -11,6 +11,12 @@ before 1.0).
 
 ### Added
 
+- **Process `getpeerinfo` on live `run_p2p`:** `node_run_p2p_short` `--connect`s to a
+  seeder, then JSON-RPC `getpeerinfo` (v2 outbound-full-relay), `getconnectioncount` /
+  `getnetworkinfo` / `getnettotals` / `ping`, `addconnection inbound` refuses,
+  `disconnectnode` clears the session, and `addnode onetry` reconnects as `manual`.
+  Exit via `stop`. `max_run_secs=0` stays a node-crate unit.
+
 - **Process package + live mempool HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
   pins Esplora `POST /txs/package` 1p1c success, process `gettxout` (confirmed,
   mempool create, mempool-spent hide), `getchaintips`, live `GET /mempool` /
