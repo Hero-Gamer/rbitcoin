@@ -663,13 +663,12 @@ async fn p2p_inbound_full_rejects_extra() {
 
         let second =
             tokio::time::timeout(Duration::from_secs(5), b.follow_from(seed.local_addr)).await;
-        match second {
-            Ok(Ok(())) => panic!(
+        if let Ok(Ok(())) = second {
+            panic!(
                 "second follow must not complete handshake at max_inbound=1 (seed={:?} b={:?})",
                 seed.peers.snapshot(),
                 b.peers.snapshot()
-            ),
-            Ok(Err(_)) | Err(_) => {}
+            );
         }
 
         let n = seed
