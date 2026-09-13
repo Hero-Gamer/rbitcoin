@@ -95,6 +95,21 @@ async fn wait_ms_until(
     }
 }
 
+async fn wait_v2_eof(sess: &mut rbitcoin_net::V2PlainSession, label: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), sess.read_contents()).await {
+            Ok(Err(_)) => return,
+            Ok(Ok(_)) => {}
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("{label}");
+                }
+            }
+        }
+    }
+}
+
 async fn seed_chain(node: &P2PNode, blocks: u32) {
     let genesis = regtest_genesis();
     node.ingest_block(0, genesis.clone()).unwrap();
@@ -152,8 +167,9 @@ async fn two_node_header_and_block_sync() {
 }
 
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,
-/// full-relay GetAddr cache (1000 / 23%), AddrFetch GetAddr (no getheaders),
-/// one post-verack keepalive ping/pong, and headers-sync stall replace.
+/// obsolete VERSION / pre-verack ping disconnect, full-relay GetAddr cache
+/// (1000 / 23%), AddrFetch GetAddr (no getheaders), one post-verack keepalive
+/// ping/pong, and headers-sync stall replace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use bitcoin::p2p::message::NetworkMessage;
@@ -352,6 +368,81 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(raw);
+
+        let seed_addr = seed.local_addr;
+        let mut obsolete = rbitcoin_net::V2PlainSession::outbound_bip324(
+            tokio::net::TcpStream::connect(seed_addr)
+                .await
+                .expect("obsolete VERSION dial"),
+        )
+        .await
+        .expect("obsolete VERSION BIP324");
+        let obsolete_ver = {
+            use bitcoin::p2p::address::Address;
+            use bitcoin::p2p::message_network::VersionMessage;
+            use bitcoin::p2p::ServiceFlags;
+            VersionMessage {
+                version: 31799,
+                services: ServiceFlags::NONE,
+                timestamp: 0,
+                receiver: Address::new(&seed_addr, ServiceFlags::NONE),
+                sender: Address::new(&seed_addr, ServiceFlags::NONE),
+                nonce: 1,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            }
+        };
+        obsolete
+            .write_contents(
+                &rbitcoin_net::encode_v2_contents(NetworkMessage::Version(obsolete_ver))
+                    .expect("encode obsolete VERSION"),
+            )
+            .await
+            .expect("write obsolete VERSION");
+        wait_v2_eof(&mut obsolete, "obsolete VERSION must close the peer").await;
+
+        let mut pre_verack = rbitcoin_net::V2PlainSession::outbound_bip324(
+            tokio::net::TcpStream::connect(seed_addr)
+                .await
+                .expect("pre-verack ping dial"),
+        )
+        .await
+        .expect("pre-verack BIP324");
+        let ok_ver = {
+            use bitcoin::p2p::address::Address;
+            use bitcoin::p2p::message_network::VersionMessage;
+            use bitcoin::p2p::ServiceFlags;
+            VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NONE,
+                timestamp: 0,
+                receiver: Address::new(&seed_addr, ServiceFlags::NONE),
+                sender: Address::new(&seed_addr, ServiceFlags::NONE),
+                nonce: 2,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            }
+        };
+        pre_verack
+            .write_contents(
+                &rbitcoin_net::encode_v2_contents(NetworkMessage::Version(ok_ver))
+                    .expect("encode VERSION"),
+            )
+            .await
+            .expect("write VERSION");
+        pre_verack
+            .write_contents(
+                &rbitcoin_net::encode_v2_contents(NetworkMessage::Ping(1)).expect("encode ping"),
+            )
+            .await
+            .expect("write ping prior to verack");
+        wait_v2_eof(
+            &mut pre_verack,
+            "pre-verack ping must close at peertimeout=1",
+        )
+        .await;
 
         for id in peer
             .peers
