@@ -3,7 +3,7 @@
 What an operator or library user should be able to **count on** at **1.0**.
 Day-to-day ranked work stays in [`quality.md`](./quality.md).
 
-**Today (0.6.99):** in-tree toward **0.7.0**. Last published tag is **0.6.0**
+**Today (0.6.99):** in-tree toward **0.7.0**. Last published tag is **0.6.1**
 (`v0.6.x` patch line). Schema **20**
 (BDZ2 `tx.head` / BDZ3 SH) can still refuse a named index wipe.
 Electrum/Esplora need `--shindex` (default off). BIP324 v2-only. Install is
