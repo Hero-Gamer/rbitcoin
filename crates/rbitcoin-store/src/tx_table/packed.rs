@@ -510,10 +510,14 @@ pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     encode_spent_slots(n_out, &[], out).expect("empty spent overlay");
 }
 
-/// Published `spent.body` span for one create (zero-out still pays 8 B pad).
+/// Published `spent.body` span for one create (`8 × n_out`, `n_out ≥ 1`).
 #[inline]
 pub fn spent_record_len(n_out: u32) -> u64 {
-    u64::from(n_out.max(1)).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
+    if n_out == 0 {
+        0
+    } else {
+        u64::from(n_out).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
+    }
 }
 
 const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
@@ -624,9 +628,10 @@ pub(super) fn check_trailing_zero_pad(raw: &[u8], logical_end: usize) -> Result<
 /// Decode `txout` with optional de-obfuscation of scriptPubKey.
 pub fn decode_packed_tx_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<super::PackedTxRels, StoreError> {
-    let (meta, outputs, rels) = decode_packed_tx_outs_with_spender_rels_secret(raw, secret)?;
+    let (meta, outputs, rels) = decode_packed_tx_outs_with_spender_rels_secret(raw, n_out, secret)?;
     Ok((meta, Vec::new(), outputs, rels))
 }
 
@@ -634,13 +639,14 @@ pub fn decode_packed_tx_with_spender_rels_secret(
 ///
 /// Empty need is all outs. Stops after the last needed vout so a truncated
 /// first page can skip a full-span extend.
-pub fn txout_first_page_covers_need(raw: &[u8], need_vouts: &[u32]) -> bool {
+pub fn txout_first_page_covers_need(raw: &[u8], n_out: u32, need_vouts: &[u32]) -> bool {
     let Ok((meta, mut off)) = TxRecord::decode_body_meta(raw) else {
         return false;
     };
+    let _ = meta;
     let take_all = need_vouts.is_empty();
     let mut need_i = 0usize;
-    for vout in 0..meta.output_count {
+    for vout in 0..n_out {
         if !take_all && need_i == need_vouts.len() {
             return true;
         }
@@ -673,18 +679,23 @@ pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, 
 /// output's start within the packed txout payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
+    n_out: u32,
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    decode_packed_tx_outs_with_spender_rels_secret(raw, None)
+    decode_packed_tx_outs_with_spender_rels_secret(raw, n_out, None)
 }
 
 pub fn decode_packed_tx_outs_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
-    let n_out = meta.output_count as usize;
-    let mut outputs = Vec::with_capacity(n_out);
-    let mut spender_rels = Vec::with_capacity(n_out);
+    let (mut meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    if n_out == 0 {
+        return Err(StoreError::Corrupt("invariant: create n_out"));
+    }
+    meta.output_count = n_out;
+    let mut outputs = Vec::with_capacity(n_out as usize);
+    let mut spender_rels = Vec::with_capacity(n_out as usize);
     for _ in 0..n_out {
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
@@ -708,11 +719,12 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
 /// `(vout, x-only, value_sats)`. Used by thin BIP-352 serve.
 pub fn scan_packed_p2tr_outs(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<(u32, [u8; 32], u64)>, StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut out = Vec::new();
-    for vout in 0..meta.output_count {
+    for vout in 0..n_out {
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
@@ -746,12 +758,13 @@ pub fn scan_packed_p2tr_outs(
 /// SHA256(scriptPubKey) for every packed out. No `OutputRecord` vec.
 pub fn visit_packed_script_hashes(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
     mut f: impl FnMut([u8; 32]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut payload = Vec::new();
-    for _ in 0..meta.output_count {
+    for _ in 0..n_out {
         if off >= raw.len() || raw.len() - off < 1 {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
@@ -784,11 +797,15 @@ pub fn visit_packed_script_hashes(
 /// walks every out and checks trailing zero pad (same as full denserels).
 pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     need_vouts: &[u32],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<super::SparseOutsRow, StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
-    let n_out = meta.output_count;
+    let (mut meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    if n_out == 0 {
+        return Err(StoreError::Corrupt("invariant: create n_out"));
+    }
+    meta.output_count = n_out;
     // Empty need → all vouts (full materialize path without a second full decode).
     let take_all = need_vouts.is_empty();
     let mut need_i = 0usize;
@@ -880,7 +897,7 @@ mod scan_p2tr_tests {
     #[test]
     fn scan_packed_p2tr_outs_ok_value() {
         let raw = packed_p2tr_body(50_000);
-        let rows = scan_packed_p2tr_outs(&raw, None).unwrap();
+        let rows = scan_packed_p2tr_outs(&raw, 1, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 0);
         assert_eq!(rows[0].2, 50_000);
@@ -891,7 +908,7 @@ mod scan_p2tr_tests {
     #[test]
     fn scan_packed_p2tr_outs_overflow_is_corrupt() {
         let raw = packed_p2tr_body(i64::MAX as u64 + 1);
-        let err = scan_packed_p2tr_outs(&raw, None).unwrap_err();
+        let err = scan_packed_p2tr_outs(&raw, 1, None).unwrap_err();
         assert!(format!("{err}").contains("output value too large"), "{err}");
         let meta_n = TxRecord::decode_body_meta(&raw).unwrap().1;
         let dec = OutputRecord::decode_at_secret(&raw[meta_n..], None).unwrap_err();
@@ -926,31 +943,37 @@ mod scan_p2tr_tests {
         let (raw, after_vout0) = three_out_packed();
         let truncated = &raw[..after_vout0];
         let (meta, live, sparse) =
-            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, &[0], None).unwrap();
+            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, 3, &[0], None).unwrap();
         assert_eq!(meta.output_count, 3);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);
         assert_eq!(live[0].1.script, vec![0x51]);
         assert_eq!(sparse.len(), 1);
         assert_eq!(sparse[0].0, 0);
-        let empty_need = decode_packed_tx_need_outs_with_spender_rels_secret(truncated, &[], None);
+        let empty_need =
+            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, 3, &[], None);
         assert!(
             empty_need.is_err(),
             "empty need still requires a full outs walk"
         );
-        assert!(txout_first_page_covers_need(truncated, &[0]));
-        assert!(!txout_first_page_covers_need(truncated, &[]));
+        assert!(txout_first_page_covers_need(truncated, 3, &[0]));
+        assert!(!txout_first_page_covers_need(truncated, 3, &[]));
     }
 
     #[test]
     fn decode_packed_tx_need_outs_empty_need_still_pad_checks() {
         let (mut raw, _) = three_out_packed();
         raw.push(0x01);
-        let err = decode_packed_tx_need_outs_with_spender_rels_secret(&raw, &[], None).unwrap_err();
+        let err =
+            decode_packed_tx_need_outs_with_spender_rels_secret(&raw, 3, &[], None).unwrap_err();
         assert!(format!("{err}").contains("trailing non-zero"), "{err}");
-        let (meta, live, _) =
-            decode_packed_tx_need_outs_with_spender_rels_secret(&raw[..raw.len() - 1], &[0], None)
-                .unwrap();
+        let (meta, live, _) = decode_packed_tx_need_outs_with_spender_rels_secret(
+            &raw[..raw.len() - 1],
+            3,
+            &[0],
+            None,
+        )
+        .unwrap();
         assert_eq!(meta.output_count, 3);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);

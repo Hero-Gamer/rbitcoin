@@ -12,14 +12,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.idx/` live under
+/// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.loc` live under
 /// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
 pub const INWIT_RELOC_NAME: &str = "inwit.reloc";
 
 /// Where a store’s files live, plus open-time head geometry.
 ///
 /// `dir` is `{datadir}/store`. When `cold_dir` is set and distinct, Class A
-/// `inwit.body` + `inwit.idx/` live there (bulk / HDD). Everything else stays
+/// `inwit.body` + `inwit.loc` live there (bulk / HDD). Everything else stays
 /// in `dir`.
 ///
 /// [`Self::single`] / [`Self::with_cold`] are **Mainnet** scale (production).
@@ -131,7 +131,9 @@ impl StoreLayout {
 }
 
 fn inwit_files_present(dir: &Path) -> bool {
-    dir.join("inwit.body").exists() || dir.join("inwit.idx").exists()
+    dir.join("inwit.body").exists()
+        || dir.join("inwit.loc").exists()
+        || dir.join("inwit.idx").exists()
 }
 
 fn inwit_reloc_path(hot: &Path) -> PathBuf {
@@ -165,7 +167,7 @@ fn resolve_inwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
             cold.display()
         ))),
         (true, false) => Err(StoreError::Layout(format!(
-            "inwit is still in {}; move inwit.body and inwit.idx/ to {} \
+            "inwit is still in {}; move inwit.body and inwit.loc to {} \
              (copy+remove if cross-device)",
             layout.dir.display(),
             cold.display()
@@ -783,7 +785,13 @@ impl Store {
 
     /// Absolute `inwit.body` `(offset, len)` for `fk`.
     pub fn tx_inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        self.txs.inwit.record_range(fk)
+        self.txs
+            .inwit_loc
+            .range_batch(&[fk])?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(StoreError::NotFound)
     }
 
     /// Append packed full-tx Class A rows (preferred archive path).
@@ -999,15 +1007,14 @@ impl Store {
         self.txs.get_outs_by_range_batch(items)
     }
 
-    /// Bulk Class A body ranges (confirm load / reconstruct).
+    /// Bulk Class A `create.loc` pairs (txout range + spent range + `n_out`).
     ///
-    /// Sorted walk of `tx.idx` (FdOnly pread; contiguous runs coalesced). Prefer
-    /// [`Self::idx_body_pipeline`] when the caller also needs body bytes.
-    pub fn tx_body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        self.txs.body_range_batch(fks)
-    }
-
-    pub fn tx_spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+    /// Dual-need callers must use this once. [`Self::tx_body_range_batch`] and
+    /// [`Self::tx_spent_range_batch`] are thin wrappers for single-stem paths.
+    pub fn tx_create_loc_range_batch(
+        &self,
+        fks: &[Fk],
+    ) -> Result<Vec<Option<crate::create_loc::CreateLocPair>>, StoreError> {
         #[cfg(debug_assertions)]
         {
             let mut log = self.spent_range_batch_log.lock().unwrap();
@@ -1017,7 +1024,23 @@ impl Store {
                 }
             }
         }
-        self.txs.spent_range_batch(fks)
+        self.txs.create_loc_range_batch(fks)
+    }
+
+    pub fn tx_body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        Ok(self
+            .tx_create_loc_range_batch(fks)?
+            .into_iter()
+            .map(|p| p.map(|x| x.txout))
+            .collect())
+    }
+
+    pub fn tx_spent_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        Ok(self
+            .tx_create_loc_range_batch(fks)?
+            .into_iter()
+            .map(|p| p.map(|x| x.spent))
+            .collect())
     }
 
     /// Completion-driven idx→body io_uring pipeline (confirm load / prep).
@@ -1028,6 +1051,7 @@ impl Store {
         jobs: &mut [crate::IdxBodyJob],
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
+        self.fill_txout_job_ranges(jobs)?;
         crate::run_idx_body_pipeline(&self.txs.body, jobs, mode).map(|_| ())
     }
 
@@ -1036,7 +1060,49 @@ impl Store {
         jobs: &mut [crate::IdxBodyJob],
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
+        self.fill_inwit_job_ranges(jobs)?;
         crate::run_idx_body_pipeline(&self.txs.inwit, jobs, mode).map(|_| ())
+    }
+
+    fn fill_txout_job_ranges(&self, jobs: &mut [crate::IdxBodyJob]) -> Result<(), StoreError> {
+        let mut need = Vec::new();
+        let mut slots = Vec::new();
+        for (i, j) in jobs.iter().enumerate() {
+            if j.range.is_none() && j.id > 0 {
+                need.push(Fk(j.id));
+                slots.push(i);
+            }
+        }
+        if need.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.txs.create_loc_range_batch(&need)?;
+        for (slot, p) in slots.into_iter().zip(pairs) {
+            if let Some(p) = p {
+                jobs[slot].range = Some(p.txout);
+                jobs[slot].n_out = p.n_out;
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_inwit_job_ranges(&self, jobs: &mut [crate::IdxBodyJob]) -> Result<(), StoreError> {
+        let mut need = Vec::new();
+        let mut slots = Vec::new();
+        for (i, j) in jobs.iter().enumerate() {
+            if j.range.is_none() && j.id > 0 {
+                need.push(Fk(j.id));
+                slots.push(i);
+            }
+        }
+        if need.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.txs.inwit_loc.range_batch(&need)?;
+        for (slot, p) in slots.into_iter().zip(pairs) {
+            jobs[slot].range = p;
+        }
+        Ok(())
     }
 
     /// Bulk 8-byte spender meta at absolute `spent.body` offsets.
@@ -1595,7 +1661,7 @@ fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
     } else {
         std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
     }
-    rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses spent.idx)");
+    rbitcoin_log::warn!("store: dropping leftover spent.off (schema 22 uses create.loc)");
     Ok(())
 }
 
@@ -2197,15 +2263,15 @@ mod tests {
             let s = Store::create_tiny(&dir).unwrap();
             s.flush().unwrap();
         }
-        assert!(dir.join("spent.idx").is_dir());
+        assert!(dir.join("create.loc").is_file());
         write_store_meta_ver(&dir, 20);
         assert_eq!(read_store_meta_ver(&dir), 20);
 
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert!(
-            dir.join("spent.idx").is_dir(),
-            "schema 22 open must keep spent.idx"
+            dir.join("create.loc").is_file(),
+            "schema 22 open must keep create.loc"
         );
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         assert_eq!(SCHEMA_VERSION, 22);
@@ -2255,6 +2321,9 @@ mod tests {
         }
         write_store_meta_ver(&dir, 21);
         std::fs::write(dir.join("spent.off"), b"leftover").unwrap();
+        std::fs::create_dir_all(dir.join("txout.idx")).unwrap();
+        std::fs::create_dir_all(dir.join("spent.idx")).unwrap();
+        std::fs::create_dir_all(dir.join("inwit.idx")).unwrap();
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
@@ -2263,6 +2332,11 @@ mod tests {
             !dir.join("spent.off").exists(),
             "empty 21 open must unlink leftover spent.off"
         );
+        assert!(!dir.join("txout.idx").exists());
+        assert!(!dir.join("spent.idx").exists());
+        assert!(!dir.join("inwit.idx").exists());
+        assert!(dir.join("create.loc").is_file());
+        assert!(dir.join("inwit.loc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2822,7 +2896,8 @@ mod tests {
             .unwrap();
         assert_eq!(fks.len(), 4);
 
-        let raw = s.txs.body.get_raw(fks[0]).unwrap();
+        let (off, len) = s.txs.body_range(fks[0]).unwrap();
+        let raw = s.txs.with_body_span(off, len, |b| Ok(b.to_vec())).unwrap();
         assert_eq!(raw[0] & 0x80, 0x80, "LAYOUT17 on first create");
         let (rec1, outs1) = s.get_tx_meta_and_outputs(fks[0]).unwrap();
         assert_eq!(rec1.version, 1);
@@ -2832,7 +2907,11 @@ mod tests {
         assert_eq!(rec2.version, 2);
         assert_eq!(outs2[0].script, p2tr);
         assert_eq!(outs2[1].script, p2wsh);
-        let raw2 = s.txs.body.get_raw(fks[1]).unwrap();
+        let (off2, len2) = s.txs.body_range(fks[1]).unwrap();
+        let raw2 = s
+            .txs
+            .with_body_span(off2, len2, |b| Ok(b.to_vec()))
+            .unwrap();
         let (_, meta_n) = TxRecord::decode_body_meta(&raw2).unwrap();
         assert_eq!(raw2[meta_n] & 0x0f, crate::compact::SCRIPT_KIND_V17_P2TR);
 
@@ -3752,9 +3831,9 @@ mod tests {
         assert!(hot.join("txout.body").is_file());
         assert!(hot.join("spent.body").is_file());
         assert!(!hot.join("inwit.body").exists());
-        assert!(!hot.join("inwit.idx").exists());
+        assert!(!hot.join("inwit.loc").exists());
         assert!(cold.join("inwit.body").is_file());
-        assert!(cold.join("inwit.idx").is_dir());
+        assert!(cold.join("inwit.loc").is_file());
         assert!(hot.join(INWIT_RELOC_NAME).is_file());
         drop(s);
         let s = Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
@@ -3795,7 +3874,7 @@ mod tests {
             Err(err) => {
                 let msg = err.to_string();
                 assert!(msg.contains("move inwit.body"), "{msg}");
-                assert!(msg.contains("inwit.idx"), "{msg}");
+                assert!(msg.contains("inwit.loc"), "{msg}");
             }
         }
         let _ = std::fs::remove_dir_all(&root);

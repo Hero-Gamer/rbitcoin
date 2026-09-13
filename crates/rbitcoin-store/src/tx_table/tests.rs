@@ -49,7 +49,10 @@ fn open_tiny_rebuild(dir: &Path, bits: u32, workers: usize) -> TxTable {
 fn meta_only_items(recs: &[TxRecord]) -> Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> {
     recs.iter()
         .cloned()
-        .map(|tx| (tx, Vec::new(), Vec::new()))
+        .map(|mut tx| {
+            tx.output_count = 1;
+            (tx, Vec::new(), vec![OutputRecord::unspent(0, vec![0x51])])
+        })
         .collect()
 }
 
@@ -550,7 +553,7 @@ fn packed_output_spender_rels_multi_vout_one_walk() {
     let mut raw = Vec::new();
     encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
     // Schema 15: decode rels are txout output starts (not spent denserels).
-    let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+    let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw, 4).unwrap();
     assert_eq!(decode_rels.len(), 4);
     let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
     for (i, _) in outputs.iter().enumerate() {
@@ -637,7 +640,7 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
         }
         let mut raw = Vec::new();
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
-        let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+        let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw, 1).unwrap();
         assert_eq!(decode_rels.len(), outputs.len());
         let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
         for (i, _) in outputs.iter().enumerate() {
@@ -744,7 +747,7 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
         .unwrap()[0];
     let from_thin = t.body_txid(fk).unwrap();
     assert_eq!(from_thin, txid, "sidefile thin identity");
-    let (_off, len) = t.inwit.record_range(fk).unwrap();
+    let (_off, len) = t.inwit_range(fk).unwrap();
     assert!(len > 50_000, "inwit should hold the fat witness");
     // Head resolve still works.
     assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(fk));
@@ -893,7 +896,7 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let (fk, range) = multi.1.expect("multi-cand hit");
     assert_eq!(fk, fk_new);
     let (outs_rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk, range, txid, vec![0])])
+        .get_outs_by_range_batch(&[(fk, range.txout, txid, range.n_out, vec![0])])
         .unwrap();
     let (tx, outs, dens) = outs_rows[0].as_ref().expect("outs for winner");
     assert_eq!(tx.txid, txid);
@@ -905,7 +908,7 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let (fk_s, range_s) = single.1.expect("single-cand hit");
     assert_eq!(fk_s, fk_solo);
     let (solo_rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk_s, range_s, solo, vec![0])])
+        .get_outs_by_range_batch(&[(fk_s, range_s.txout, solo, range_s.n_out, vec![0])])
         .unwrap();
     let (tx_s, outs_s, _) = solo_rows[0].as_ref().expect("single outs");
     assert_eq!(tx_s.txid, solo);
@@ -963,8 +966,8 @@ fn streaming_resolve_early_exit_fewer_body_lookups() {
     let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
     let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
     assert_eq!(batch[0].1.map(|(f, _)| f), Some(fk2));
-    let range = batch[0].1.unwrap().1;
-    assert!(range.1 > 0, "body range from idx on winner");
+    let pair = batch[0].1.unwrap().1;
+    assert!(pair.txout.1 > 0, "body range from loc on winner");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1110,9 +1113,9 @@ fn get_fk_by_txid_batch_matches_single() {
         let single = t.probe_body_match_fk(txid).unwrap();
         assert_eq!(row.map(|(f, _)| f), single);
         assert!(row.is_some());
-        let (fk, range) = row.unwrap();
-        let known = t.body.record_range(fk).unwrap();
-        assert_eq!(range, known, "returned range must match tx.idx");
+        let (fk, pair) = row.unwrap();
+        let known = t.body_range(fk).unwrap();
+        assert_eq!(pair.txout, known, "returned range must match create.loc");
     }
     // Miss
     let miss = t.get_fk_by_txid_batch(&[[0xff; 32]]).unwrap();
@@ -1166,10 +1169,10 @@ fn get_outs_denserels_by_range_sparse_need() {
     let fk = t
         .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
         .unwrap()[0];
-    let range = t.body.record_range(fk).unwrap();
+    let range = t.body_range(fk).unwrap();
     // Only need vout 1 — skip allocating big scripts on 0 and 2.
     let (rows, _, _, _, _, _) = t
-        .get_outs_by_range_batch(&[(fk, range, want_txid, vec![1])])
+        .get_outs_by_range_batch(&[(fk, range, want_txid, 3, vec![1])])
         .unwrap();
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, want_txid);
@@ -1180,7 +1183,11 @@ fn get_outs_denserels_by_range_sparse_need() {
     assert_eq!(sparse[0].0, 1);
     // Full decode for comparison.
     let full = decode_packed_tx_outs_with_spender_rels_secret(
-        &t.body.get_raw(fk).unwrap(),
+        &{
+            let (off, len) = t.body_range(fk).unwrap();
+            t.with_body_span(off, len, |b| Ok(b.to_vec())).unwrap()
+        },
+        3,
         Some(t.store_secret()),
     )
     .unwrap();
@@ -1213,10 +1220,10 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     let fk = t
         .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
         .unwrap()[0];
-    let range = t.body.record_range(fk).unwrap();
+    let range = t.body_range(fk).unwrap();
     assert!(range.1 > 4096);
     let (rows, _, _, extend_n, _, guess_full_n) = t
-        .get_outs_by_range_batch(&[(fk, range, txid, vec![0])])
+        .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![0])])
         .unwrap();
     assert_eq!(extend_n, 0);
     assert_eq!(guess_full_n, 0);
@@ -1226,7 +1233,7 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);
     let (_, _, _, extend_all, _, guess_all) = t
-        .get_outs_by_range_batch(&[(fk, range, txid, vec![])])
+        .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![])])
         .unwrap();
     assert_eq!(extend_all, 0);
     assert_eq!(guess_all, 1);
@@ -1678,7 +1685,7 @@ fn packed_tx_roundtrip() {
     encode_packed_tx(&tx, &inputs, &outputs, &mut enc);
     assert!(TxRecord::decode_body_meta(&enc).is_ok());
     assert!(enc.len() >= 3, "thin LAYOUT17 meta");
-    let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&enc).unwrap();
+    let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&enc, 2).unwrap();
     assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
     assert_eq!(dtx.input_count, 1);
     assert_eq!(dtx.output_count, 2);
@@ -1720,11 +1727,11 @@ fn inwit_and_txout_secret_xor_roundtrip() {
         encode_inwit_with_secret(&inputs, &mut plain, None);
         plain
     });
-    let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout).unwrap();
+    let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout, 1).unwrap();
     // Without secret, script stays obfuscated.
     assert_ne!(douts[0].script, outputs[0].script);
     let (dtx2, douts2, _) =
-        decode_packed_tx_outs_with_spender_rels_secret(&txout, Some(&secret)).unwrap();
+        decode_packed_tx_outs_with_spender_rels_secret(&txout, 1, Some(&secret)).unwrap();
     assert_eq!(dtx2.input_count, dtx.input_count);
     assert_eq!(douts2[0].script, outputs[0].script);
     let dins = decode_inwit_secret(&inwit, dtx.input_count, Some(&secret)).unwrap();
@@ -1764,13 +1771,13 @@ fn visit_packed_script_hashes_matches_full_decode() {
     let mut raw = Vec::new();
     encode_packed_tx_with_secret(&tx, &inputs, &outputs, &mut raw, Some(&secret));
     let (_, decoded, _) =
-        decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(&secret)).unwrap();
+        decode_packed_tx_outs_with_spender_rels_secret(&raw, 3, Some(&secret)).unwrap();
     let expect: Vec<[u8; 32]> = decoded
         .iter()
         .map(|o| crate::scripthash::script_hash(&o.script))
         .collect();
     let mut got = Vec::new();
-    visit_packed_script_hashes(&raw, Some(&secret), |h| {
+    visit_packed_script_hashes(&raw, 3, Some(&secret), |h| {
         got.push(h);
         Ok(())
     })
@@ -1783,15 +1790,18 @@ fn short_or_truncated_packed_body_rejected() {
     assert!(TxRecord::decode_body_meta(&[]).is_err());
     assert!(TxRecord::decode_body_meta(&[0u8; 15]).is_err());
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&[0u8; 15]),
+        decode_packed_tx_outs_with_spender_rels(&[0u8; 15], 1),
         Err(StoreError::Corrupt(_))
     ));
-    // v17 empty tx (0 in / 0 out) is a valid packed payload.
+    // v17 empty meta (0 in) is valid; loc n_out 0 is Corrupt.
     let empty = rec_meta(1, 0, 0, 0);
     let mut empty_raw = Vec::new();
     empty.encode_body_meta_into(&mut empty_raw);
     assert!(TxRecord::decode_body_meta(&empty_raw).is_ok());
-    assert!(decode_packed_tx_outs_with_spender_rels(&empty_raw).is_ok());
+    assert!(matches!(
+        decode_packed_tx_outs_with_spender_rels(&empty_raw, 0),
+        Err(StoreError::Corrupt(_))
+    ));
     // Meta claims inputs/outputs but payload ends after body meta.
     let rec = TxRecord {
         txid: [1u8; 32],
@@ -1806,11 +1816,11 @@ fn short_or_truncated_packed_body_rejected() {
     rec.encode_body_meta_into(&mut raw);
     assert!(TxRecord::decode_body_meta(&raw).is_ok());
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&raw),
+        decode_packed_tx_outs_with_spender_rels(&raw, 1),
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&raw),
+        decode_packed_tx_outs_with_spender_rels(&raw, 1),
         Err(StoreError::Corrupt(_))
     ));
 }
@@ -2002,7 +2012,7 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert!(TxRecord::decode_body_meta(&[0u8; 15]).is_err());
     assert!(TxRecord::decode_body_meta(&[0u8; 20]).is_err());
     assert!(TxRecord::decode_body_meta(&[0u8; 64]).is_err());
-    let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+    let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
     assert_eq!(m.txid, [0u8; 32], "body decode: no leading txid");
     assert_eq!(m.input_start_fk, Fk::NULL);
     assert_eq!(outs.len(), 2);
@@ -2011,7 +2021,7 @@ fn packed_encode_decode_flags_and_error_arms() {
     let mut inwit = Vec::new();
     encode_inwit_with_secret(&inputs, &mut inwit, None);
     assert_eq!(scan_inwit_prevouts(&inwit, m.input_count).unwrap().len(), 2);
-    let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+    let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
     assert_eq!(m4.txid, [0u8; 32]);
     assert_eq!(outs_rels.len(), 2);
     assert_eq!(rels.len(), 2);
@@ -2027,11 +2037,11 @@ fn packed_encode_decode_flags_and_error_arms() {
 
     // Packed error arms (short / truncated)
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&[0x02, 0, 0]),
+        decode_packed_tx_outs_with_spender_rels(&[0x02, 0, 0], 1),
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&[0x01]),
+        decode_packed_tx_outs_with_spender_rels(&[0x01], 1),
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
@@ -2039,19 +2049,19 @@ fn packed_encode_decode_flags_and_error_arms() {
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&[0x01]),
+        decode_packed_tx_outs_with_spender_rels(&[0x01], 1),
         Err(StoreError::Corrupt(_))
     ));
     // trailing zero pad is accepted (schema 11 alignment gap)
     let mut trail_z = raw.clone();
     trail_z.extend_from_slice(&[0u8; 7]);
-    let (mz, _, _) = decode_packed_tx_outs_with_spender_rels(&trail_z).unwrap();
+    let (mz, _, _) = decode_packed_tx_outs_with_spender_rels(&trail_z, 1).unwrap();
     assert_eq!(mz.txid, [0u8; 32]);
     // non-zero trailing garbage is rejected
     let mut trail = raw.clone();
     trail.push(0x01);
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&trail),
+        decode_packed_tx_outs_with_spender_rels(&trail, 1),
         Err(StoreError::Corrupt(_))
     ));
     // run helpers
@@ -2164,7 +2174,7 @@ fn packed_encode_decode_flags_and_error_arms() {
         encode_output_run_secret(&outputs, &mut raw, None);
         // ends after 1 output but meta says 2
         assert!(matches!(
-            decode_packed_tx_outs_with_spender_rels(&raw),
+            decode_packed_tx_outs_with_spender_rels(&raw, 2),
             Err(StoreError::Corrupt(_))
         ));
         // short scan
@@ -2191,13 +2201,13 @@ fn packed_encode_decode_flags_and_error_arms() {
         let mut trail = good.clone();
         trail.push(0xee);
         assert!(matches!(
-            decode_packed_tx_outs_with_spender_rels(&trail),
+            decode_packed_tx_outs_with_spender_rels(&trail, 1),
             Err(StoreError::Corrupt(_))
         ));
         // zero pad accepted on outs path
         let mut zpad = good.clone();
         zpad.extend_from_slice(&[0u8; 5]);
-        let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&zpad).unwrap();
+        let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&zpad, 1).unwrap();
         assert_eq!(m.txid, [0u8; 32], "body decode leaves txid zero");
         assert_eq!(outs.len(), 1);
     }
@@ -2275,7 +2285,7 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
     let fks = t.put_full_batch_indexed(&items, true).unwrap();
     assert_eq!(fks.len(), 40);
     for (j, fk) in fks.iter().enumerate() {
-        let (off, len) = t.body.record_range(*fk).unwrap();
+        let (off, len) = t.body_range(*fk).unwrap();
         assert_eq!(off % 8, 0, "fk={} off={}", fk.0, off);
         assert!(len >= 3, "thin LAYOUT17 meta");
         let txid = t.body_txid(*fk).unwrap();
@@ -2310,7 +2320,7 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
     }
     let fks2 = t.put_full_batch_indexed(&more, true).unwrap();
     for (j, fk) in fks2.iter().enumerate() {
-        let (off, _) = t.body.record_range(*fk).unwrap();
+        let (off, _) = t.body_range(*fk).unwrap();
         assert_eq!(off % 8, 0);
         assert_eq!(t.body_txid(*fk).unwrap(), more[j].0.txid);
     }
@@ -2382,8 +2392,13 @@ fn pread_two_spans_parallel_matches_serial() {
     let fks = t.put_full_batch_indexed(&items, true).unwrap();
     let first = fks[0].get().unwrap();
     let last = fks[3].get().unwrap();
-    let txout_ranges = t.body.record_ranges(first, last).unwrap();
-    let inwit_ranges = t.inwit.record_ranges(first, last).unwrap();
+    let txout_ranges = t.body_ranges(first, last).unwrap();
+    let inwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
+    let inwit_pairs = t.inwit_loc.range_batch(&inwit_fks).unwrap();
+    let inwit_ranges: Vec<(u64, u64)> = inwit_pairs
+        .into_iter()
+        .map(|p| p.expect("inwit range"))
+        .collect();
     let (t0, _) = txout_ranges[0];
     let (tn, tln) = *txout_ranges.last().unwrap();
     let tspan = tn + tln - t0;
@@ -3096,15 +3111,15 @@ fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
     encode_body_meta_v17(&rec, &mut buf);
     assert_eq!(
         buf,
-        vec![0x89, 0x01, 0x01],
-        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb 1,1"
+        vec![0x89, 0x01],
+        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb input_count 1"
     );
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n, 2);
     assert_eq!(got.version, 1);
     assert_eq!(got.locktime, 0);
     assert_eq!(got.input_count, 1);
-    assert_eq!(got.output_count, 1);
+    assert_eq!(got.output_count, 0);
 }
 
 #[test]
@@ -3117,7 +3132,7 @@ fn body_meta_v17_v2_locktime_zero() {
     assert_eq!(n, buf.len());
     assert_eq!(got.version, 2);
     assert_eq!(got.locktime, 0);
-    assert_eq!(got.output_count, 2);
+    assert_eq!(got.output_count, 0);
 }
 
 #[test]
@@ -3465,17 +3480,12 @@ fn script_kind_v17_kind_ten_is_corrupt() {
     }
 }
 
-/// Fat inwit must not force a new `txout.idx` segment.
+/// Fat inwit uses `inwit.loc` (no `{stem}.idx` dirs).
 #[test]
-fn idx_roll_independent_of_inwit_span() {
+fn fat_inwit_uses_delta_loc_not_idx() {
     {
-        let dir = tempfile_dir("idx-indep");
-        let t = TxTable::create_with_head_layout_opts(
-            &dir,
-            tiny_layout(),
-            HeadOpenOpts::TINY.with_idx_soft_span(2048),
-        )
-        .unwrap();
+        let dir = tempfile_dir("inwit-loc");
+        let t = create_tiny(&dir);
         let fat_script = vec![0x6au8; 1800];
         for i in 0..6u8 {
             let mut txid = [0u8; 32];
@@ -3494,29 +3504,15 @@ fn idx_roll_independent_of_inwit_span() {
             t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
                 .unwrap();
         }
-        let idx_segs = |stem: &str| {
-            std::fs::read_dir(dir.join(format!("{stem}.idx")))
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    n.len() == 6 && n.chars().all(|c| c.is_ascii_digit())
-                })
-                .count()
-        };
-        assert!(idx_segs("inwit") >= 2, "inwit segs={}", idx_segs("inwit"));
-        assert_eq!(
-            idx_segs("txout"),
-            1,
-            "txout.idx must not roll when only inwit crosses the soft span"
-        );
-        assert!(
-            dir.join("spent.idx").is_dir(),
-            "spent.idx rolls independently of inwit"
-        );
+        assert!(dir.join("create.loc").is_file());
+        assert!(dir.join("inwit.loc").is_file());
+        assert!(!dir.join("txout.idx").exists());
+        assert!(!dir.join("spent.idx").exists());
+        assert!(!dir.join("inwit.idx").exists());
         let last = t.get(Fk(6)).unwrap();
         assert_eq!(last.output_count, 1);
-        let raw_in = t.inwit.get_raw(Fk(6)).unwrap();
+        let (off, len) = t.inwit_range(Fk(6)).unwrap();
+        let raw_in = t.inwit.with_bytes_at(off, len, |b| Ok(b.to_vec())).unwrap();
         assert!(raw_in.len() >= 1800, "len={}", raw_in.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3548,53 +3544,54 @@ fn put_n_out(t: &TxTable, tag: u8, n_out: u32) -> Fk {
 }
 
 #[test]
-fn class_a_append_writes_spent_idx() {
-    let dir = tempfile_dir("spent-idx");
+fn class_a_append_writes_create_loc() {
+    let dir = tempfile_dir("create-loc");
     let t = create_tiny(&dir);
-    let f0 = put_n_out(&t, 1, 0);
-    let f1 = put_n_out(&t, 2, 1);
+    let f1 = put_n_out(&t, 1, 1);
     let f3 = put_n_out(&t, 3, 3);
-    assert!(dir.join("spent.idx").is_dir(), "spent.idx must be created");
-    let (o0, l0) = t.spent_range(f0).unwrap();
+    assert!(
+        dir.join("create.loc").is_file(),
+        "create.loc must be created"
+    );
+    assert!(dir.join("create.off").is_file());
+    assert!(!dir.join("spent.idx").exists());
+    assert!(!dir.join("txout.idx").exists());
     let (o1, l1) = t.spent_range(f1).unwrap();
     let (o3, l3) = t.spent_range(f3).unwrap();
-    assert_eq!(l0, spent_record_len(0));
     assert_eq!(l1, spent_record_len(1));
     assert_eq!(l3, spent_record_len(3));
-    assert_eq!(o1, o0 + l0);
     assert_eq!(o3, o1 + l1);
     assert_eq!(spent_abs(o3, 2), o3 + 16);
-    let batch = t.spent_range_batch(&[f3, f0, f1]).unwrap();
+    let batch = t.spent_range_batch(&[f3, f1]).unwrap();
     assert_eq!(batch[0], Some((o3, l3)));
-    assert_eq!(batch[1], Some((o0, l0)));
-    assert_eq!(batch[2], Some((o1, l1)));
+    assert_eq!(batch[1], Some((o1, l1)));
     t.flush().unwrap();
     drop(t);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert!(dir.join("spent.idx").is_dir(), "reopen must keep spent.idx");
-    assert_eq!(t.spent_range(f0).unwrap(), (o0, l0));
+    assert!(
+        dir.join("create.loc").is_file(),
+        "reopen must keep create.loc"
+    );
     assert_eq!(t.spent_range(f1).unwrap(), (o1, l1));
     assert_eq!(t.spent_range(f3).unwrap(), (o3, l3));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn spent_range_uses_idx_not_txout_body() {
-    let dir = tempfile_dir("spent-idx-not-body");
+fn spent_range_uses_loc_not_txout_body() {
+    let dir = tempfile_dir("spent-loc-not-body");
     let t = create_tiny(&dir);
-    let f0 = put_n_out(&t, 1, 0);
-    let f1 = put_n_out(&t, 2, 1);
+    let f1 = put_n_out(&t, 1, 1);
     let f3 = put_n_out(&t, 3, 3);
-    let want = t.spent_range_batch(&[f3, f0, f1]).unwrap();
+    let want = t.spent_range_batch(&[f3, f1]).unwrap();
     t.flush().unwrap();
-    // Truncate txout.body after header; spent ranges must still resolve from idx.
     {
         use crate::file::FILE_HEADER_LEN;
         let p = dir.join("txout.body");
         let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
         f.set_len(FILE_HEADER_LEN as u64).unwrap();
     }
-    let got = t.spent_range_batch(&[f3, f0, f1]).unwrap();
+    let got = t.spent_range_batch(&[f3, f1]).unwrap();
     assert_eq!(got, want);
     let _ = std::fs::remove_dir_all(&dir);
 }

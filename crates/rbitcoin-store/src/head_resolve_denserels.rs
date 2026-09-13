@@ -57,7 +57,7 @@ pub fn resolve_fk_and_range_batch_with_tip(
 
 fn note_first_leftover_miss(
     tip_only: bool,
-    winner: &[Option<(Fk, (u64, u64))>],
+    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &[bool],
     n_cands: &[usize],
     had_id: &[bool],
@@ -263,7 +263,7 @@ fn resolve_fk_and_range_core(
     let side = table.txid_sidefile();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
-    let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
+    let mut winner: Vec<Option<(Fk, crate::create_loc::CreateLocPair)>> = vec![None; txids.len()];
     let mut connected = vec![false; txids.len()];
     let mut n_cands = vec![0usize; txids.len()];
     let mut had_id = vec![false; txids.len()];
@@ -393,182 +393,19 @@ fn resolve_fk_and_range_pread(
     resolve_fk_and_range_core(table, txids, heights, tip_only, None)
 }
 
-/// Kind tag for idx-page SQEs on the held plan session (`pack_ud` kind byte).
-const UD_KIND_IDX: u8 = crate::uring_session::KIND_IDX;
-
-/// Fill idx page buffers via held session. Poison / leftover / undrained is
-/// `Err` — do not libc-fallback on this ring (BDZ g-pages share it).
-fn fill_idx_pages(
-    sess: &mut UringSession,
-    pages: &[crate::tx_idx::IdxPagePlan],
-    bufs: &mut [Vec<u8>],
-) -> Result<(), StoreError> {
-    if pages.is_empty() {
-        return Ok(());
-    }
-    sess.begin_batch()?;
-    let epoch = sess.epoch();
-    let run = (|| -> Result<(), StoreError> {
-        let mut results = vec![i32::MIN; pages.len()];
-        let need = pages.len();
-        let mut done = 0usize;
-        let mut next = 0usize;
-        let take_cqes = |sess: &mut UringSession,
-                         results: &mut [i32],
-                         done: &mut usize|
-         -> Result<(), StoreError> {
-            let mut cqes = sess.harvest_ready()?;
-            if cqes.is_empty() {
-                sess.submit_and_wait_one()?;
-                cqes = sess.harvest_ready()?;
-                if cqes.is_empty() {
-                    sess.poison();
-                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
-                }
-            } else {
-                sess.submit()?;
-            }
-            for (ud, res) in cqes {
-                let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
-                let slot = slot as usize;
-                if kind != UD_KIND_IDX
-                    || ep != epoch
-                    || slot >= results.len()
-                    || results[slot] != i32::MIN
-                {
-                    sess.poison();
-                    return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
-                }
-                results[slot] = res;
-                *done += 1;
-            }
-            Ok(())
-        };
-        while done < need {
-            while next < need && sess.free_sq() > 0 {
-                let i = next;
-                next += 1;
-                let ud = crate::uring_session::pack_ud(UD_KIND_IDX, epoch, i as u32);
-                sess.push_pread_flags(pages[i].fd, pages[i].page_off, &mut bufs[i], ud, 0)?;
-            }
-            sess.sync_submission();
-            if sess.in_flight() == 0 {
-                break;
-            }
-            take_cqes(sess, &mut results, &mut done)?;
-        }
-        for (i, &res) in results.iter().enumerate() {
-            if res < 0 || (res as usize) < pages[i].want {
-                let page = &pages[i];
-                let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
-                if rc < 0 || (rc as usize) < page.want {
-                    return Err(StoreError::Corrupt("invariant: idx page fill failed"));
-                }
-            }
-        }
-        Ok(())
-    })();
-    sess.drain_all()?;
-    run
-}
-
-/// Dedup idx OS pages by `(fd, page_off)` so a wave fills each page once.
-fn unique_idx_pages<'a, I>(pages: I) -> Vec<crate::tx_idx::IdxPagePlan>
-where
-    I: IntoIterator<Item = &'a crate::tx_idx::IdxPagePlan>,
-{
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for p in pages {
-        if seen.insert((p.fd, p.page_off)) {
-            out.push(p.clone());
-        }
-    }
-    out
-}
-
-fn fill_idx_pages_libc(pages: &[crate::tx_idx::IdxPagePlan], bufs: &mut [Vec<u8>]) -> bool {
-    for (i, page) in pages.iter().enumerate() {
-        let rc = page.fd.pread(page.page_off, &mut bufs[i][..page.want]);
-        if rc < 0 || (rc as usize) < page.want {
-            return false;
-        }
-    }
-    true
-}
-
-/// Body ranges for chosen fks: plan each, fill **unique** idx pages once
-/// (held session or libc), decode. No nested TLS uring.
+/// Body ranges for chosen fks: one `create.loc` batch (both stems + `n_out`).
 fn body_ranges_batched(
     table: &TxTable,
     fks: &[Fk],
-    ctx: &mut crate::IoCtx<'_>,
-) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-    if fks.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut plans: Vec<Option<crate::tx_idx::BodyRangeIdxPlan>> = Vec::with_capacity(fks.len());
-    for &fk in fks {
-        match table.body.plan_body_range_idx(fk) {
-            Ok(p) if !p.pages.is_empty() => plans.push(Some(p)),
-            Ok(_) => plans.push(None),
-            Err(StoreError::NotFound)
-            | Err(StoreError::Corrupt(_))
-            | Err(StoreError::InvalidFk) => plans.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    let uniq = unique_idx_pages(plans.iter().flatten().flat_map(|p| p.pages.iter()));
-    if uniq.is_empty() {
-        return Ok(vec![None; fks.len()]);
-    }
-    let mut bufs: Vec<Vec<u8>> = uniq.iter().map(|p| vec![0u8; p.want]).collect();
-    match ctx.session() {
-        Some(sess) => fill_idx_pages(sess, &uniq, &mut bufs)?,
-        None => {
-            if !fill_idx_pages_libc(&uniq, &mut bufs) {
-                return Err(StoreError::Corrupt("invariant: idx page fill failed"));
-            }
-        }
-    }
-    let mut page_ix = std::collections::HashMap::with_capacity(uniq.len());
-    for (i, p) in uniq.iter().enumerate() {
-        page_ix.insert((p.fd, p.page_off), i);
-    }
-    let mut out = Vec::with_capacity(fks.len());
-    for plan in &plans {
-        let Some(plan) = plan else {
-            out.push(None);
-            continue;
-        };
-        let mut page_refs: Vec<&[u8]> = Vec::with_capacity(plan.pages.len());
-        let mut ok = true;
-        for p in &plan.pages {
-            match page_ix.get(&(p.fd, p.page_off)) {
-                Some(&i) => page_refs.push(bufs[i].as_slice()),
-                None => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            out.push(None);
-            continue;
-        }
-        match plan.decode_range(&page_refs) {
-            Ok((off, len)) if len > 0 => out.push(Some((off, len))),
-            Ok(_) => out.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(out)
+    _ctx: &mut crate::IoCtx<'_>,
+) -> Result<Vec<Option<crate::create_loc::CreateLocPair>>, StoreError> {
+    table.create_loc.range_batch(fks)
 }
 
 /// Connected if a height fence is set, else any winner.
 fn key_finished(
     ki: usize,
-    winner: &[Option<(Fk, (u64, u64))>],
+    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
@@ -580,7 +417,7 @@ fn key_finished(
 }
 
 fn any_unfinished(
-    winner: &[Option<(Fk, (u64, u64))>],
+    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
@@ -588,7 +425,7 @@ fn any_unfinished(
 }
 
 fn unfinished_mask(
-    winner: &[Option<(Fk, (u64, u64))>],
+    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> Vec<bool> {
@@ -612,7 +449,7 @@ fn id_idx_wave(
     txids: &[[u8; 32]],
     cands_by_key: &[Vec<Fk>],
     side: &TxidBody,
-    winner: &mut [Option<(Fk, (u64, u64))>],
+    winner: &mut [Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &mut [bool],
     heights: Option<&HeightFence>,
     body_lookups: &mut u64,
@@ -733,8 +570,8 @@ fn id_idx_wave(
 fn record_chosen_idx_ranges(
     chosen_kis: &[usize],
     chosen_fks: &[Fk],
-    ranges: &[Option<(u64, u64)>],
-    winner: &mut [Option<(Fk, (u64, u64))>],
+    ranges: &[Option<crate::create_loc::CreateLocPair>],
+    winner: &mut [Option<(Fk, crate::create_loc::CreateLocPair)>],
     connected: &mut [bool],
     heights: Option<&HeightFence>,
     first_fks: &[u64],
@@ -873,30 +710,14 @@ mod tests {
         let mut pread_hits = 0u32;
         let out = map_uring_resolve(Err(StoreError::Unavailable), || {
             pread_hits += 1;
-            Ok(vec![([0u8; 32], None::<(Fk, (u64, u64))>)])
+            Ok(vec![(
+                [0u8; 32],
+                None::<(Fk, crate::create_loc::CreateLocPair)>,
+            )])
         })
         .unwrap();
         assert_eq!(pread_hits, 1);
         assert_eq!(out.len(), 1);
-    }
-
-    /// Held-session idx fill must not libc-succeed on a poisoned ring (that
-    /// leaves leftover CQEs for BDZ g-pages on the same TLS session).
-    #[test]
-    fn poisoned_held_idx_fill_fails_closed() {
-        let (dir, t, _txids) = seed_table(8);
-        let mut session = crate::uring_session::UringSession::try_open_kind(
-            crate::uring_session::SessionKind::Pool,
-            32,
-        )
-        .expect("pool");
-        session.poison();
-        let mut ctx = crate::IoCtx::held(&mut session);
-        match body_ranges_batched(&t, &[Fk(1)], &mut ctx) {
-            Err(StoreError::Corrupt("invariant: io_uring session poisoned")) => {}
-            other => panic!("poisoned held idx fill must fail closed, got {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -939,7 +760,11 @@ mod tests {
         record_chosen_idx_ranges(
             &[0],
             &[Fk(1)],
-            &[Some((8, 16))],
+            &[Some(crate::create_loc::CreateLocPair {
+                txout: (8, 16),
+                spent: (8, 8),
+                n_out: 1,
+            })],
             &mut winner,
             &mut connected,
             Some(&fence),
@@ -947,7 +772,8 @@ mod tests {
             &mut age,
         )
         .unwrap();
-        assert_eq!(winner[0], Some((Fk(1), (8, 16))));
+        assert_eq!(winner[0].unwrap().0, Fk(1));
+        assert_eq!(winner[0].unwrap().1.txout, (8, 16));
         assert!(connected[0]);
     }
 
@@ -966,7 +792,7 @@ mod tests {
         // Every hit has a non-empty body_range matching record_range.
         for (_tid, row) in &pread {
             if let Some((fk, range)) = row {
-                assert_eq!(t.body.record_range(*fk).unwrap(), *range);
+                assert_eq!(t.body_range(*fk).unwrap(), range.txout);
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1026,8 +852,8 @@ mod tests {
         assert_eq!(*got_tid, tid);
         let (fk, range) = row.expect("drained head must stamp fk+range");
         assert_eq!(fk, fks[0]);
-        assert_eq!(t.body.record_range(fk).unwrap(), range);
-        assert!(range.1 > 0);
+        assert_eq!(t.body_range(fk).unwrap(), range.txout);
+        assert!(range.txout.1 > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1254,119 +1080,22 @@ mod tests {
     }
 
     #[test]
-    fn plan_body_range_idx_matches_record_range() {
-        let (dir, t, _txids) = seed_table(20);
-        let count = t.body.count();
-        for id in 1..=count {
-            let fk = Fk(id);
-            let expected = t.body.record_range(fk).unwrap();
-            let plan = t.body.plan_body_range_idx(fk).unwrap();
-            assert!(!plan.pages.is_empty());
-            let bufs: Vec<Vec<u8>> = plan
-                .pages
-                .iter()
-                .map(|p| {
-                    let mut b = vec![0u8; p.want];
-                    let rc = p.fd.pread(p.page_off, &mut b);
-                    assert!(rc > 0, "pread idx page");
-                    b
-                })
-                .collect();
-            let refs: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-            let got = plan.decode_range(&refs).unwrap();
-            assert_eq!(got, expected, "fk={fk:?}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Batched idx fill: unique pages, decode equals serial `record_range`.
-    ///
-    /// Distant fks sit on distinct OS pages; adjacent fks share a page so the
-    /// helper's unique set is smaller than the per-fk page sum.
-    #[test]
-    fn id_idx_wave_batches_idx_pages() {
+    fn loc_batch_matches_serial_body_range() {
         let (dir, t, txids) = seed_table_n(1100);
         let first = Fk(1);
         let near = Fk(2);
         let far = Fk(1100);
-        let p0 = t.body.plan_body_range_idx(first).unwrap();
-        let p_near = t.body.plan_body_range_idx(near).unwrap();
-        let p_far = t.body.plan_body_range_idx(far).unwrap();
-        assert!(!p0.pages.is_empty() && !p_far.pages.is_empty());
-
-        let uniq_far = unique_idx_pages(p0.pages.iter().chain(p_far.pages.iter()));
-        let far_offs: std::collections::HashSet<u64> =
-            uniq_far.iter().map(|p| p.page_off).collect();
-        assert!(
-            far_offs.len() >= 2,
-            "fk 1 and 1100 must span distinct idx pages, offs={far_offs:?}"
-        );
-
-        let sum_near = p0.pages.len() + p_near.pages.len();
-        let uniq_near = unique_idx_pages(p0.pages.iter().chain(p_near.pages.iter()));
-        assert!(
-            uniq_near.len() < sum_near,
-            "adjacent fks must share an idx page: uniq={} sum={sum_near}",
-            uniq_near.len()
-        );
-
         let batch =
             body_ranges_batched(&t, &[first, near, far], &mut crate::IoCtx::none()).unwrap();
         for (fk, got) in [first, near, far].iter().zip(batch.iter()) {
-            let exp = t.body.record_range(*fk).unwrap();
-            assert_eq!(*got, Some(exp), "fk={}", fk.0);
+            let exp = t.body_range(*fk).unwrap();
+            assert_eq!(got.map(|p| p.txout), Some(exp), "fk={}", fk.0);
         }
-
         let got = resolve_fk_and_range_pread(&t, &[txids[0], txids[1], txids[1099]], None, false)
             .unwrap();
         assert_eq!(got[0].1, Some((first, batch[0].unwrap())));
         assert_eq!(got[1].1, Some((near, batch[1].unwrap())));
         assert_eq!(got[2].1, Some((far, batch[2].unwrap())));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Idx fill must submit/harvest in `free_sq` windows. Pushing every unique
-    /// page before any CQE trips `io_session SQ full` on a 1080-high leftover
-    /// wave (default-milestone IBD).
-    #[test]
-    fn fill_idx_pages_windows_past_ring_depth() {
-        use std::io::Write;
-        let n = 48usize;
-        let page = 64usize;
-        let path = tmp("idx-sq-window").join("idx.bin");
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        let mut blob = vec![0u8; n * page];
-        for i in 0..n {
-            blob[i * page] = i as u8;
-        }
-        f.write_all(&blob).unwrap();
-        f.sync_all().unwrap();
-        let fd = crate::io_handle::IoHandle::from_file(&f);
-        let pages: Vec<crate::tx_idx::IdxPagePlan> = (0..n)
-            .map(|i| crate::tx_idx::IdxPagePlan {
-                fd,
-                page_off: (i * page) as u64,
-                want: page,
-            })
-            .collect();
-        let mut bufs: Vec<Vec<u8>> = pages.iter().map(|p| vec![0u8; p.want]).collect();
-        let mut sess = crate::uring_session::UringSession::try_open(32).expect("session");
-        assert!(
-            n > sess.entries() as usize,
-            "fixture must exceed ring depth"
-        );
-        fill_idx_pages(&mut sess, &pages, &mut bufs)
-            .expect("idx fill must window SQ; SQ full is not store corruption");
-        for (i, b) in bufs.iter().enumerate() {
-            assert_eq!(b[0], i as u8, "page {i}");
-        }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

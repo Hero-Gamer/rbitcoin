@@ -154,6 +154,41 @@ impl DeltaLoc {
         self.count.load(Ordering::Acquire)
     }
 
+    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
+        let cur = self.count.load(Ordering::Acquire);
+        if new_count > cur {
+            return Err(StoreError::Corrupt("inwit.loc truncate past count"));
+        }
+        if new_count == cur {
+            return Ok(());
+        }
+        self.loc
+            .set_logical_len(FILE_HEADER_LEN as u64 + new_count * 2)?;
+        let n_win = new_count / LOC_WINDOW;
+        self.off
+            .set_logical_len(FILE_HEADER_LEN as u64 + n_win * 8)?;
+        {
+            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
+            cps.truncate(n_win as usize);
+        }
+        {
+            let mut rows = self.ovf_rows.write().unwrap_or_else(|e| e.into_inner());
+            rows.retain(|r| r.0 <= new_count);
+            let mut blob = Vec::with_capacity(rows.len() * 12);
+            for &(fk, st) in rows.iter() {
+                blob.extend_from_slice(&fk.to_le_bytes());
+                blob.extend_from_slice(&st.to_le_bytes());
+            }
+            self.ovf
+                .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
+            if !blob.is_empty() {
+                self.ovf.write_at(FILE_HEADER_LEN as u64, &blob)?;
+            }
+        }
+        self.count.store(new_count, Ordering::Release);
+        Ok(())
+    }
+
     /// Append `aligned_len` per record (8-aligned, ≥ 8). `starts[i]` is the body abs.
     pub fn append(&self, starts: &[u64], aligned_lens: &[u64]) -> Result<(), StoreError> {
         if starts.len() != aligned_lens.len() {
@@ -289,7 +324,7 @@ fn pack_u16_strides_inwit(strides: u32) -> Result<(u16, Option<u32>), StoreError
 
 fn load_u16_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32)>, StoreError> {
     let data = ovf.data_len();
-    if data % 12 != 0 {
+    if !data.is_multiple_of(12) {
         return Err(StoreError::Corrupt("invariant: loc ovf size"));
     }
     let n = (data / 12) as usize;
@@ -312,10 +347,12 @@ fn load_u16_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32)>, StoreError> {
     Ok(rows)
 }
 
+type PackedCreateSlot = (u8, u8, Option<(u16, u16)>);
+
 pub(crate) fn pack_create_pair(
     txout_strides: u32,
     n_out: u32,
-) -> Result<(u8, u8, Option<(u16, u16)>), StoreError> {
+) -> Result<PackedCreateSlot, StoreError> {
     if n_out == 0 {
         return Err(StoreError::Corrupt("invariant: create n_out"));
     }
@@ -357,7 +394,7 @@ pub(crate) fn decode_create_pair(
 
 pub(crate) fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, StoreError> {
     let data = ovf.data_len();
-    if data % 12 != 0 {
+    if !data.is_multiple_of(12) {
         return Err(StoreError::Corrupt("invariant: create.loc ovf size"));
     }
     let n = (data / 12) as usize;

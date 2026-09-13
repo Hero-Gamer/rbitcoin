@@ -98,6 +98,42 @@ impl CreateLoc {
         self.count.load(Ordering::Acquire)
     }
 
+    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
+        let cur = self.count.load(Ordering::Acquire);
+        if new_count > cur {
+            return Err(StoreError::Corrupt("create.loc truncate past count"));
+        }
+        if new_count == cur {
+            return Ok(());
+        }
+        let loc_end = FILE_HEADER_LEN as u64 + new_count * SLOT;
+        self.loc.set_logical_len(loc_end)?;
+        let n_win = new_count / LOC_WINDOW;
+        self.off
+            .set_logical_len(FILE_HEADER_LEN as u64 + n_win * OFF_SLOT)?;
+        {
+            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
+            cps.truncate(n_win as usize);
+        }
+        {
+            let mut rows = self.ovf_rows.write().unwrap_or_else(|e| e.into_inner());
+            rows.retain(|r| r.0 <= new_count);
+            let mut blob = Vec::with_capacity(rows.len() * OVF_SLOT as usize);
+            for &(fk, st, n_out) in rows.iter() {
+                blob.extend_from_slice(&fk.to_le_bytes());
+                blob.extend_from_slice(&(st as u16).to_le_bytes());
+                blob.extend_from_slice(&(n_out as u16).to_le_bytes());
+            }
+            self.ovf
+                .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
+            if !blob.is_empty() {
+                self.ovf.write_at(FILE_HEADER_LEN as u64, &blob)?;
+            }
+        }
+        self.count.store(new_count, Ordering::Release);
+        Ok(())
+    }
+
     pub fn append(&self, recs: &[CreateLocAppend]) -> Result<(), StoreError> {
         if recs.is_empty() {
             return Ok(());
@@ -435,8 +471,8 @@ mod tests {
 
     #[test]
     fn spent_len_is_8_times_n_out() {
-        assert_eq!(1u64 * IDX_STRIDE, 8);
-        assert_eq!(3u64 * IDX_STRIDE, 24);
-        assert_eq!(256u64 * IDX_STRIDE, 2048);
+        assert_eq!(IDX_STRIDE, 8);
+        assert_eq!(3u64.saturating_mul(IDX_STRIDE), 24);
+        assert_eq!(256u64.saturating_mul(IDX_STRIDE), 2048);
     }
 }

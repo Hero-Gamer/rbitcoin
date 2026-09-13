@@ -1,24 +1,18 @@
 //! Growable variable-length record table (schema v11+ Class A).
 //!
-//! Layout:
-//! - `{stem}.body` — file header + append-only **unframed** payloads
-//! - `{stem}.idx.meta` + `{stem}.idx.NNNNNN` — segmented **u32 stride-8**
-//!   offsets (see [`crate::tx_idx::TxIdx`])
-//!
-//! Record length is derived from the index: `len(i) = start(i+1) - start(i)`,
-//! and for the last record `logical_body_end - start`. Starts are **8-byte
-//! aligned** (and for Class A, txid does not straddle a 4 KiB page).
+//! Layout: `{stem}.body` — file header + append-only **unframed** payloads.
+//! Record ranges live on [`crate::create_loc::CreateLoc`] / [`crate::delta_loc::DeltaLoc`].
+//! Starts are **8-byte aligned**.
 //!
 //! # Publish order (lock-free)
 //!
-//! Single appender: **body bytes → idx slots → `(count, body_end)` via seqlock**.
+//! Single appender: **body bytes → loc append → `(count, body_end)` via seqlock**.
 //! Readers load a consistent `(count, published_body_end)` pair (never
 //! `(old_count, new_end)`).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::io_handle::IoHandle;
-use crate::tx_idx::TxIdx;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +26,20 @@ pub(crate) struct PreparedAppend {
     pub base_count: u64,
 }
 
+impl PreparedAppend {
+    pub(crate) fn aligned_lens(&self) -> Vec<u64> {
+        let end = self.start.saturating_add(self.body_blob.len() as u64);
+        self.starts
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let nxt = self.starts.get(i + 1).copied().unwrap_or(end);
+                nxt.saturating_sub(s)
+            })
+            .collect()
+    }
+}
+
 /// Next 8-byte-aligned body start (schema 13+: no body-txid page rule).
 #[inline]
 fn next_aligned_tx_start(cursor: u64) -> u64 {
@@ -40,7 +48,6 @@ fn next_aligned_tx_start(cursor: u64) -> u64 {
 
 pub struct VarTable {
     body: TableFile,
-    idx: Option<TxIdx>,
     count: AtomicU64,
     /// Body exclusive-end of the last **published** record.
     /// Must not use live `body.logical_len()` for last-record length: the single
@@ -54,129 +61,41 @@ pub struct VarTable {
 
 impl VarTable {
     pub fn create(dir: &Path, stem: &str, body_kind: TableKind) -> Result<Self, StoreError> {
+        Self::create_body_only(dir, stem, body_kind)
+    }
+
+    pub fn create_body_only(
+        dir: &Path,
+        stem: &str,
+        body_kind: TableKind,
+    ) -> Result<Self, StoreError> {
         let body = TableFile::create(Self::body_path(dir, stem), body_kind)?;
-        let idx = TxIdx::create(dir, stem)?;
         Ok(Self {
             body,
-            idx: Some(idx),
             count: AtomicU64::new(0),
             published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
             publish_seq: AtomicU64::new(0),
         })
     }
 
-    /// Existing empty `{stem}.body` (header only) plus a new `{stem}.idx`.
-    ///
-    /// Schema 21 leftover: `spent.body` with no idx. Occupied 21 never reaches
-    /// this (Store refuse). Body past the file header is Corrupt.
-    pub fn open_empty_body_create_idx(
+    pub fn open_body_only(
         dir: &Path,
         stem: &str,
         body_kind: TableKind,
-        explicit: Option<u64>,
-        resolved: u64,
+        count: u64,
     ) -> Result<Self, StoreError> {
         let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
         let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
-        if body_end > FILE_HEADER_LEN as u64 {
-            return Err(StoreError::Corrupt(
-                "spent.body leftover without spent.idx; wipe datadir and redo IBD",
-            ));
-        }
-        let idx = if explicit.is_some() {
-            TxIdx::create_with_soft_span(dir, stem, resolved)?
-        } else {
-            TxIdx::create(dir, stem)?
-        };
         Ok(Self {
             body,
-            idx: Some(idx),
-            count: AtomicU64::new(0),
-            published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
-            publish_seq: AtomicU64::new(0),
-        })
-    }
-
-    pub fn create_with_soft_span(
-        dir: &Path,
-        stem: &str,
-        body_kind: TableKind,
-        soft_span: u64,
-    ) -> Result<Self, StoreError> {
-        let body = TableFile::create(Self::body_path(dir, stem), body_kind)?;
-        let idx = TxIdx::create_with_soft_span(dir, stem, soft_span)?;
-        Ok(Self {
-            body,
-            idx: Some(idx),
-            count: AtomicU64::new(0),
-            published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
+            count: AtomicU64::new(count),
+            published_body_end: AtomicU64::new(body_end),
             publish_seq: AtomicU64::new(0),
         })
     }
 
     pub fn open(dir: &Path, stem: &str, body_kind: TableKind) -> Result<Self, StoreError> {
-        let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
-        let idx = TxIdx::open(dir, stem)?;
-        let count = idx.slot_count();
-        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
-        Ok(Self {
-            body,
-            idx: Some(idx),
-            count: AtomicU64::new(count),
-            published_body_end: AtomicU64::new(body_end),
-            publish_seq: AtomicU64::new(0),
-        })
-    }
-
-    pub fn open_with_soft_span(
-        dir: &Path,
-        stem: &str,
-        body_kind: TableKind,
-        soft_span: u64,
-    ) -> Result<Self, StoreError> {
-        let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
-        let idx = TxIdx::open_with_soft_span(dir, stem, soft_span)?;
-        let count = idx.slot_count();
-        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
-        Ok(Self {
-            body,
-            idx: Some(idx),
-            count: AtomicU64::new(count),
-            published_body_end: AtomicU64::new(body_end),
-            publish_seq: AtomicU64::new(0),
-        })
-    }
-
-    fn idx(&self) -> Result<&TxIdx, StoreError> {
-        self.idx
-            .as_ref()
-            .ok_or(StoreError::Corrupt("invariant: var table idx missing"))
-    }
-
-    /// Truncate published Class A count to `new_count` (idx + RAM count + body HWM).
-    ///
-    /// Body bytes past the new end may remain on disk (append-only); HWM rolls
-    /// back to the start of the first dropped record so the next append reuses
-    /// that region. Call only from sole Class A open/repair path.
-    pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
-        let cur = self.count.load(Ordering::Acquire);
-        if new_count > cur {
-            return Err(StoreError::Corrupt("var table truncate past count"));
-        }
-        if new_count == cur {
-            return Ok(());
-        }
-        // Body exclusive-end for kept prefix = start of first dropped record.
-        let new_end = if new_count == 0 {
-            FILE_HEADER_LEN as u64
-        } else if new_count < cur {
-            // record_start uses live idx count; still valid before idx truncate.
-            self.idx()?.record_start(new_count + 1)?
-        } else {
-            self.body.logical_len().max(FILE_HEADER_LEN as u64)
-        };
-        self.idx()?.truncate_to_count(new_count)?;
-        self.truncate_body_to(new_count, new_end)
+        Self::open_body_only(dir, stem, body_kind, 0)
     }
 
     /// Body-only truncate (`spent` has no idx).
@@ -218,133 +137,6 @@ impl VarTable {
         Ok(buf)
     }
 
-    /// Plan body_range idx page IO without reading (plan head-resolve STAGE_IDX).
-    ///
-    /// Caller submits page preads on an owned uring session and decodes via
-    /// [`crate::tx_idx::BodyRangeIdxPlan::decode_range`].
-    pub(crate) fn plan_body_range_idx(
-        &self,
-        fk: Fk,
-    ) -> Result<crate::tx_idx::BodyRangeIdxPlan, StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        if id == 0 {
-            return Err(StoreError::InvalidFk);
-        }
-        let (count, body_end) = self.published_meta();
-        if id > count {
-            return Err(StoreError::NotFound);
-        }
-        self.idx()?.plan_body_range(id, count, body_end)
-    }
-
-    /// Absolute `(offset, len)` of the unframed payload for `fk`.
-    ///
-    /// **Interior records (`id < count`):** starts of `id` and `id+1` (may span
-    /// idx segments).
-    ///
-    /// **Last record (`id == count`):** seqlock `(count, body_end)` + start.
-    ///
-    /// Corrupt idx (`start(id+1) < start(id)`) is a hard `Corrupt` — no live heal.
-    pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        if id == 0 {
-            return Err(StoreError::InvalidFk);
-        }
-        let count = self.count.load(Ordering::Acquire);
-        if id > count {
-            return Err(StoreError::NotFound);
-        }
-        if id < count {
-            return self.idx()?.record_range_interior(id);
-        }
-        let (count2, body_end) = self.published_meta();
-        if id > count2 {
-            return Err(StoreError::NotFound);
-        }
-        if id < count2 {
-            return self.idx()?.record_range_interior(id);
-        }
-        let start = self.record_start(id, count2)?;
-        if body_end < start {
-            return Err(StoreError::Corrupt("var record end < start"));
-        }
-        Ok((start, body_end - start))
-    }
-
-    /// Contiguous `(offset, len)` for Class A ids `first..=last` (1-based).
-    pub fn record_ranges(&self, first: u64, last: u64) -> Result<Vec<(u64, u64)>, StoreError> {
-        let (count, body_end) = self.published_meta();
-        self.idx()?.record_ranges(first, last, count, body_end)
-    }
-
-    /// Bulk body ranges for arbitrary fks — **sorted** walk of segmented idx.
-    ///
-    /// Output order matches `fks`. Null / OOB ids yield `None` (not an error).
-    /// Contiguous id runs use page-aligned sequential loads; sparse ids use
-    /// OS-page-coalesced bulk pread (`record_starts_batch_bulk`).
-    pub fn record_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        if fks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (count, body_end) = self.published_meta();
-        let mut out: Vec<Option<(u64, u64)>> = vec![None; fks.len()];
-        let mut jobs: Vec<(usize, u64)> = Vec::with_capacity(fks.len());
-        for (i, fk) in fks.iter().enumerate() {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            if id == 0 || id > count {
-                continue;
-            }
-            jobs.push((i, id));
-        }
-        if jobs.is_empty() {
-            return Ok(out);
-        }
-        jobs.sort_unstable_by_key(|(_, id)| *id);
-
-        let mut start_ids: Vec<u64> = Vec::with_capacity(jobs.len() * 2);
-        for &(_, id) in &jobs {
-            start_ids.push(id);
-            if id < count {
-                start_ids.push(id + 1);
-            }
-        }
-        start_ids.sort_unstable();
-        start_ids.dedup();
-
-        let starts = self
-            .idx()?
-            .record_starts_batch_bulk(&start_ids, crate::io_backend::read_io_backend())?;
-        let mut start_map: crate::U64Map<u64> =
-            crate::U64Map::with_capacity_and_hasher(start_ids.len(), Default::default());
-        for (id, s) in start_ids.iter().zip(starts.iter()) {
-            if let Some(abs) = s {
-                start_map.insert(*id, *abs);
-            }
-        }
-
-        for &(orig_i, id) in &jobs {
-            let Some(&start) = start_map.get(&id) else {
-                continue;
-            };
-            let end = if id < count {
-                match start_map.get(&(id + 1)) {
-                    Some(&e) => e,
-                    None => continue,
-                }
-            } else {
-                body_end
-            };
-            if end < start {
-                return Err(StoreError::Corrupt("var record end < start"));
-            }
-            out[orig_i] = Some((start, end - start));
-        }
-        Ok(out)
-    }
-
-    /// Segmented idx: resolve ranges via page-coalesced batch APIs, then body pread.
     #[inline]
     pub(crate) fn body_read_fd(&self) -> IoHandle {
         self.body.read_fd()
@@ -459,7 +251,7 @@ impl VarTable {
 
 /// Submit several prepared Class A body blobs as **one** `pwrite_batch` wave.
 ///
-/// Publish order is still body → idx → HWM: callers must [`VarTable::finish_prepared`]
+/// Publish order is still body → loc → HWM: callers must [`VarTable::finish_prepared`]
 /// after this returns. Falls back to per-stem [`VarTable::write_body_blob_bulk`]
 /// if the batched submit is short or fails.
 pub(crate) fn write_prepared_bodies_one_wave(
@@ -509,14 +301,10 @@ pub(crate) fn write_prepared_bodies_one_wave(
 }
 
 impl VarTable {
-    /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
-    /// remap mid-write.
-    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
+    /// Pre-grow body capacity so a following mega `put_batch` does not remap mid-write.
+    pub fn reserve_append(&self, body_bytes: u64, _n_records: u64) -> Result<(), StoreError> {
         let body_need = self.body.logical_len().saturating_add(body_bytes);
         self.body.ensure_capacity(body_need)?;
-        if let Some(idx) = &self.idx {
-            idx.reserve_slots(n_records)?;
-        }
         Ok(())
     }
 
@@ -555,6 +343,11 @@ impl VarTable {
             }
             cursor += (body_blob.len() - before) as u64;
         }
+        let aligned_end = next_aligned_tx_start(cursor);
+        let tail = aligned_end.saturating_sub(cursor) as usize;
+        if tail > 0 {
+            body_blob.resize(body_blob.len() + tail, 0);
+        }
         // Single appender: count must still equal base.
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
@@ -591,11 +384,8 @@ impl VarTable {
         self.body.set_logical_len(end.max(self.body.logical_len()))
     }
 
-    /// Idx + count publish after the body blob is already on disk (and HWM set).
+    /// Count + body-end publish after the body blob is already on disk (and HWM set).
     pub(crate) fn finish_prepared(&self, prep: PreparedAppend) -> Result<Vec<Fk>, StoreError> {
-        if let Some(idx) = &self.idx {
-            idx.append_starts(prep.base_count, &prep.starts)?;
-        }
         let new_end = prep.start.saturating_add(prep.body_blob.len() as u64);
         let new_count = prep.base_count + prep.fks.len() as u64;
         self.publish_begin();
@@ -603,14 +393,6 @@ impl VarTable {
         self.count.store(new_count, Ordering::Relaxed);
         self.publish_end();
         Ok(prep.fks)
-    }
-
-    /// Absolute start offset of record `fk` in body (for length-from-idx).
-    pub(crate) fn record_start(&self, id: u64, count: u64) -> Result<u64, StoreError> {
-        if id == 0 || id > count {
-            return Err(StoreError::NotFound);
-        }
-        self.idx()?.record_start(id)
     }
 
     #[inline]
@@ -644,39 +426,6 @@ impl VarTable {
                 return (count, end);
             }
         }
-    }
-
-    /// Exclusive end offset of record `id` given a consistent `(count, body_end)`.
-    fn record_end_with(
-        &self,
-        id: u64,
-        count: u64,
-        published_body_end: u64,
-    ) -> Result<u64, StoreError> {
-        if id < count {
-            self.record_start(id + 1, count)
-        } else if id == count {
-            Ok(published_body_end)
-        } else {
-            Err(StoreError::NotFound)
-        }
-    }
-
-    /// Raw unframed payload for `fk`.
-    pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let (count, body_end) = self.published_meta();
-        let start = self.record_start(id, count)?;
-        let end = self.record_end_with(id, count, body_end)?;
-        if end < start {
-            return Err(StoreError::Corrupt("var record end < start"));
-        }
-        let len = (end - start) as usize;
-        let mut buf = vec![0u8; len];
-        if len > 0 {
-            self.read_body_bulk(start, &mut buf)?;
-        }
-        Ok(buf)
     }
 
     /// Read only the first `buf.len()` bytes at absolute body `(offset, len)`.
@@ -743,18 +492,12 @@ impl VarTable {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
-        if let Some(idx) = &self.idx {
-            idx.flush()?;
-        }
         Ok(())
     }
 
     /// HWM + MS_ASYNC (no fdatasync) — host-friendly process exit.
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
-        if let Some(idx) = &self.idx {
-            idx.flush_async()?;
-        }
         Ok(())
     }
 }
@@ -772,12 +515,19 @@ mod tests {
         n: usize,
         estimate_bytes: usize,
         encode: impl FnMut(usize, &mut Vec<u8>),
-    ) -> Result<Vec<Fk>, StoreError> {
+    ) -> Result<(Vec<Fk>, Vec<u64>, u64), StoreError> {
         let Some(prep) = t.prepare_batch_encode(n, estimate_bytes, encode)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new(), 0));
         };
+        let start = prep.start;
+        let starts = prep.starts.clone();
         t.write_body_blob_bulk(prep.start, &prep.body_blob)?;
-        t.finish_prepared(prep)
+        let fks = t.finish_prepared(prep)?;
+        Ok((fks, starts, start))
+    }
+
+    fn read_at(t: &VarTable, off: u64, len: u64) -> Vec<u8> {
+        t.with_bytes_at(off, len, |b| Ok(b.to_vec())).unwrap()
     }
 
     #[test]
@@ -788,15 +538,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        let fks = put_batch(&t, 3, 64, |i, buf| {
+        let (fks, starts, _) = put_batch(&t, 3, 64, |i, buf| {
             buf.extend_from_slice(&[i as u8 + 1; 16]);
         })
         .unwrap();
         assert_eq!(fks.len(), 3);
         assert_eq!(t.count(), 3);
-        for (i, fk) in fks.iter().enumerate() {
-            let body = t.get_raw(*fk).unwrap();
-            // May include alignment pad as trailing zeros.
+        let (_c, end) = t.published_meta();
+        for (i, off) in starts.iter().enumerate() {
+            let nxt = starts.get(i + 1).copied().unwrap_or(end);
+            let body = read_at(&t, *off, nxt - *off);
             assert!(body.len() >= 16);
             assert_eq!(&body[..16], &[i as u8 + 1; 16]);
         }
@@ -847,15 +598,13 @@ mod tests {
                     if meta_c == 0 {
                         continue;
                     }
-                    let fk = Fk(meta_c);
-                    let raw = t.get_raw(fk).unwrap();
-                    // 128-byte payloads are 8-aligned; last record has no pad
-                    // until the next batch lands.
+                    let rec_len = 128u64;
+                    let start = FILE_HEADER_LEN as u64 + (meta_c - 1) * rec_len;
                     assert!(
-                        raw.len() >= 128,
-                        "torn publish meta_c={meta_c} meta_end={meta_end} count={c} len={}",
-                        raw.len()
+                        meta_end >= start + rec_len,
+                        "torn publish meta_c={meta_c} meta_end={meta_end} count={c}"
                     );
+                    let raw = read_at(&t, start, rec_len);
                     assert!(raw[..128].iter().all(|&b| b == raw[0]));
                 }
             }));
@@ -872,7 +621,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("concurrent var_table workers timed out (hang?)");
         assert_eq!(t.count(), 800);
-        let raw = t.get_raw(Fk(t.count())).unwrap();
+        let (c, end) = t.published_meta();
+        let start = FILE_HEADER_LEN as u64 + (c - 1) * 128;
+        let raw = read_at(&t, start, end - start);
         assert!(raw.len() >= 128);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -908,9 +659,8 @@ mod tests {
             if c == 0 {
                 continue;
             }
-            let start = t.record_start(c, c).unwrap();
+            let start = end.saturating_sub(64);
             assert!(end >= start + 64, "end={end} start={start} c={c}");
-            // 64-byte aligned records: last length is exactly 64 until next pad.
             assert_eq!(
                 end - start,
                 64,
@@ -922,213 +672,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn record_range_interior_matches_adjacent_starts() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-var-interior-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        put_batch(&t, 5, 256, |i, buf| {
-            buf.extend_from_slice(&vec![i as u8; 8 + i * 3]);
-        })
-        .unwrap();
-        assert_eq!(t.count(), 5);
-        for id in 1..=5u64 {
-            let (off, len) = t.record_range(Fk(id)).unwrap();
-            let raw = t.get_raw(Fk(id)).unwrap();
-            assert_eq!(raw.len() as u64, len, "id={id}");
-            assert_eq!(raw[0], (id - 1) as u8);
-            if id < 5 {
-                let (next_off, _) = t.record_range(Fk(id + 1)).unwrap();
-                assert_eq!(off + len, next_off, "interior abut id={id}");
-            }
-            assert_eq!(off % 8, 0, "id={id}");
-        }
-        let bulk = t.record_ranges(1, 5).unwrap();
-        for (i, &(off, len)) in bulk.iter().enumerate() {
-            assert_eq!(
-                (off, len),
-                t.record_range(Fk(1 + i as u64)).unwrap(),
-                "bulk vs single id={}",
-                1 + i
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Idx inversion is corrupt hard-fail — no live heal.
-    #[test]
-    fn record_range_idx_start_inversion_is_corrupt() {
-        use std::io::{Seek, SeekFrom, Write};
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-var-inv-hard-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        put_batch(&t, 6, 512, |i, buf| {
-            buf.extend_from_slice(&vec![0xA0 + i as u8; 32 + i * 8]);
-        })
-        .unwrap();
-        let idx_path = dir.join("tx.idx").join("000000");
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&idx_path)
-            .unwrap();
-        // slot 3 → fk 4: force start(4) << start(3)
-        let slot_off = FILE_HEADER_LEN as u64 + 3 * 4;
-        f.seek(SeekFrom::Start(slot_off)).unwrap();
-        f.write_all(&0u32.to_le_bytes()).unwrap();
-        f.sync_all().unwrap();
-        drop(f);
-        let err = t.record_range(Fk(3)).expect_err("inversion must hard-fail");
-        assert!(format!("{err}").contains("end < start"), "got {err}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn record_range_batch_sorted_mmap_matches_serial() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-var-range-batch-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        put_batch(&t, 20, 256, |i, buf| {
-            buf.extend_from_slice(&vec![i as u8; 10 + (i % 5)]);
-        })
-        .unwrap();
-        assert_eq!(t.count(), 20);
-
-        let fks = vec![
-            Fk(15),
-            Fk(3),
-            Fk(3),
-            Fk(1),
-            Fk::NULL,
-            Fk(20),
-            Fk(99),
-            Fk(10),
-            Fk(11),
-            Fk(12),
-        ];
-        let batch = t.record_range_batch(&fks).unwrap();
-        assert_eq!(batch.len(), fks.len());
-        assert_eq!(batch[4], None);
-        assert_eq!(batch[6], None);
-        for (i, fk) in fks.iter().enumerate() {
-            if batch[i].is_none() {
-                continue;
-            }
-            let seq = t.record_range(*fk).unwrap();
-            assert_eq!(batch[i], Some(seq), "fk={fk:?} i={i}");
-        }
-        assert_eq!(batch[1], batch[2]);
-        let contig = t.record_ranges(10, 12).unwrap();
-        assert_eq!(batch[7], Some(contig[0]));
-        assert_eq!(batch[8], Some(contig[1]));
-        assert_eq!(batch[9], Some(contig[2]));
-        assert!(t.record_range_batch(&[]).unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn record_ranges_matches_record_range() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-var-ranges-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        for batch in 0..10u8 {
-            let payload = vec![batch; 16 + batch as usize];
-            put_batch(&t, 3, 128, |_i, buf| {
-                buf.extend_from_slice(&payload);
-            })
-            .unwrap();
-        }
-        assert_eq!(t.count(), 30);
-        let bulk = t.record_ranges(5, 12).unwrap();
-        assert_eq!(bulk.len(), 8);
-        for (i, (off, len)) in bulk.iter().enumerate() {
-            let (o, l) = t.record_range(Fk(5 + i as u64)).unwrap();
-            assert_eq!((*off, *len), (o, l), "id={}", 5 + i);
-        }
-        let bulk_end = t.record_ranges(28, 30).unwrap();
-        for (i, (off, len)) in bulk_end.iter().enumerate() {
-            let (o, l) = t.record_range(Fk(28 + i as u64)).unwrap();
-            assert_eq!((*off, *len), (o, l));
-        }
-        assert!(t.record_ranges(4, 3).unwrap().is_empty());
-        assert_eq!(
-            t.record_ranges(1, 1).unwrap()[0],
-            t.record_range(Fk(1)).unwrap()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn multi_segment_via_soft_span() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-var-multiseg-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        {
-            let t = VarTable::create_with_soft_span(&dir, "tx", TableKind::TxOut, 128).unwrap();
-            // Each record ~100 B → soft 128 forces new segment often.
-            for i in 0..12u8 {
-                put_batch(&t, 1, 128, |_j, buf| {
-                    buf.extend_from_slice(&[i; 100]);
-                })
-                .unwrap();
-            }
-            let nseg = std::fs::read_dir(dir.join("tx.idx"))
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    n.len() == 6 && n.chars().all(|c| c.is_ascii_digit())
-                })
-                .count();
-            assert!(nseg >= 2, "segs={nseg}");
-            for id in 1..=12u64 {
-                let raw = t.get_raw(Fk(id)).unwrap();
-                assert_eq!(raw[0], (id - 1) as u8);
-                assert!(raw.len() >= 100);
-            }
-            drop(t);
-            let t = VarTable::open_with_soft_span(&dir, "tx", TableKind::TxOut, 128).unwrap();
-            assert_eq!(t.count(), 12);
-            assert_eq!(t.get_raw(Fk(12)).unwrap()[0], 11);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[allow(clippy::cognitive_complexity)] // one fixture, many error arms
+    #[allow(clippy::cognitive_complexity)] // one fixture, many surface arms
     #[test]
     fn var_table_surface_helpers_and_errors() {
         let dir = std::env::temp_dir().join(format!(
@@ -1144,18 +688,20 @@ mod tests {
         assert_eq!(t.count(), 0);
         assert!(t.body_logical_len() >= FILE_HEADER_LEN as u64);
         t.advise_body_dont_need(0, 0);
-        assert_eq!(put_batch(&t, 0, 0, |_, _| {}).unwrap().len(), 0);
+        assert_eq!(put_batch(&t, 0, 0, |_, _| {}).unwrap().0.len(), 0);
         t.reserve_append(1024, 8).unwrap();
-        let fks = put_batch(&t, 3, 64, |i, buf| {
+        let (fks, starts, _) = put_batch(&t, 3, 64, |i, buf| {
             buf.extend_from_slice(&[i as u8; 16]);
         })
         .unwrap();
         assert_eq!(fks.len(), 3);
         assert_eq!(t.count(), 3);
-        let raw = t.get_raw(fks[1]).unwrap();
+        let (_c, end) = t.published_meta();
+        let off1 = starts[1];
+        let len1 = starts.get(2).copied().unwrap_or(end) - off1;
+        let raw = read_at(&t, off1, len1);
         assert!(raw.len() >= 16);
         assert_eq!(raw[0], 1);
-        let (off1, len1) = t.record_range(fks[1]).unwrap();
         let via = t
             .with_bytes_at(off1, len1, |b| {
                 assert!(b.len() >= 16);
@@ -1163,7 +709,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(via, 1);
-        let (off, len) = t.record_range(fks[0]).unwrap();
+        let off = starts[0];
+        let len = starts[1] - off;
         assert_eq!(off % 8, 0);
         let mut prefix = [0u8; 4];
         assert_eq!(t.read_prefix_at(off, len, &mut prefix).unwrap(), 4);
@@ -1180,30 +727,12 @@ mod tests {
         })
         .unwrap();
         t.write_body_abs(off, &[0xff]).unwrap();
-        assert_eq!(t.get_raw(fks[0]).unwrap()[0], 0xff);
-        assert!(matches!(
-            t.record_range(Fk::NULL),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(matches!(t.record_range(Fk(99)), Err(StoreError::NotFound)));
-        assert!(matches!(t.record_ranges(0, 1), Err(StoreError::InvalidFk)));
-        assert!(matches!(t.record_ranges(1, 99), Err(StoreError::NotFound)));
-        assert!(matches!(t.get_raw(Fk::NULL), Err(StoreError::InvalidFk)));
+        assert_eq!(read_at(&t, off, len)[0], 0xff);
         t.flush().unwrap();
         t.flush_async().unwrap();
         drop(t);
         let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
-        assert_eq!(t.count(), 3);
-        assert!(t.get_raw(Fk(2)).unwrap().len() >= 16);
-        // Corrupt meta magic.
-        {
-            let meta = dir.join("tx.idx").join("meta");
-            std::fs::write(&meta, b"XXXX").unwrap();
-        }
-        assert!(matches!(
-            VarTable::open(&dir, "tx", TableKind::TxOut),
-            Err(StoreError::Corrupt(_)) | Err(StoreError::Io { .. })
-        ));
+        assert_eq!(t.count(), 0, "open_body_only without loc count is 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1219,11 +748,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        let fks = put_batch(&t, 2, 64, |i, buf| {
+        let (_fks, starts, _) = put_batch(&t, 2, 64, |i, buf| {
             buf.extend_from_slice(&[(i as u8).saturating_add(0x5a); 16]);
         })
         .unwrap();
-        let (off, len) = t.record_range(fks[1]).unwrap();
+        let (_c, end) = t.published_meta();
+        let off = starts[1];
+        let len = end - off;
         let mut buf = vec![0xFFu8; (len as usize).saturating_add(32)];
         buf.clear();
         t.with_bytes_at_into(off, len, &mut buf, |b| {
@@ -1244,48 +775,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        let fks = put_batch(&t, 5, 64, |i, buf| {
+        let (fks, starts, _) = put_batch(&t, 5, 64, |i, buf| {
             buf.extend_from_slice(&[i as u8; 16]);
         })
         .unwrap();
         assert_eq!(fks.len(), 5);
         assert_eq!(t.count(), 5);
-        // No-op truncate to same count.
-        t.truncate_to_count(5).unwrap();
+        t.truncate_body_to(5, t.published_meta().1).unwrap();
         assert_eq!(t.count(), 5);
-        // Shorten.
-        t.truncate_to_count(2).unwrap();
+        t.truncate_body_to(2, starts[2]).unwrap();
         assert_eq!(t.count(), 2);
-        assert!(t.get_raw(Fk(1)).unwrap().len() >= 16);
-        assert!(matches!(t.get_raw(Fk(3)), Err(StoreError::NotFound)));
-        // Past count is corrupt.
-        assert!(matches!(
-            t.truncate_to_count(9),
-            Err(StoreError::Corrupt(_))
-        ));
-        // Empty body helpers.
+        let raw = read_at(&t, starts[0], starts[1] - starts[0]);
+        assert!(raw.len() >= 16);
         t.advise_body_dont_need(0, 0);
         let _ = t.body_logical_len();
-        let nseg = std::fs::read_dir(dir.join("tx.idx"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                n.len() == 6 && n.chars().all(|c| c.is_ascii_digit())
-            })
-            .count();
-        assert!(nseg >= 1);
-        let ranges = t.record_range_batch(&[Fk(1), Fk(99)]).unwrap();
-        assert!(ranges[0].is_some());
-        assert!(ranges[1].is_none());
-        let (off, len) = t.record_range(Fk(1)).unwrap();
-        t.with_bytes_at(off, len, |b| {
-            assert!(b.len() >= 16);
-            Ok(())
-        })
-        .unwrap();
-        // Empty batch.
-        let empty = put_batch(&t, 0, 0, |_, _| {}).unwrap();
+        let empty = put_batch(&t, 0, 0, |_, _| {}).unwrap().0;
         assert!(empty.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
