@@ -106,7 +106,7 @@ reads it; rustup users export it). Override coverage dir:
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_hb_compact_tip_follow`, `p2p_orphan_child_getdatas_parent`, and `p2p_compact_getblocktxn_missing_extra_tx` 20s wall (default). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` also `--skip`s those names plus `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
+**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_hb_compact_tip_follow`, `p2p_orphan_child_getdatas_parent`, `p2p_compact_getblocktxn_missing_extra_tx`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall (default). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` also `--skip`s those names plus `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -240,6 +240,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `p2p_hb_compact_tip_follow` | P2P (**default**) | Genesis follow: first tip via headers/inv, then HB `sendcmpct` + `cmpctblock` reconstruct (coinbase-only, no `getblocktxn`) |
 | `p2p_compact_getblocktxn_missing_extra_tx` | P2P (**default**) | Follow session: 2-tx compact (coinbase prefilled, extra not in mempool) → `getblocktxn`. Does **not** pin depth-10 full-block serve |
 | `p2p_orphan_child_getdatas_parent` | P2P (**default**) | Follow session: missing-parent child parks; peer `GetData`s the parent. Does **not** pin log-not-reject or tokio-worker lock |
+| `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout |
+| `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
 | `serve_after_restart_via_reconstruct` | P2P (**multinode job only**) | Cold serve via reconstruct |
 | `ibd_skips_dead_peer` | P2P (**multinode job only**) | Live seeder + `127.0.0.1:1` |
@@ -257,7 +259,7 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 ### Integration / multi-node
 
-Default `cargo test` runs `two_node_header_and_block_sync` (8-block), `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_hb_compact_tip_follow`, `p2p_orphan_child_getdatas_parent`, `p2p_compact_getblocktxn_missing_extra_tx`, and `badprev_orphan_does_not_blacklist_then_reorg_reconstructs`. The required **multinode** job also runs reconstruct and slim dead-peer (`--ignored` filters in `ci.yml`).
+Default `cargo test` runs `two_node_header_and_block_sync` (8-block), `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_hb_compact_tip_follow`, `p2p_orphan_child_getdatas_parent`, `p2p_compact_getblocktxn_missing_extra_tx`, `p2p_feeler_completes_and_closes`, `p2p_inbound_full_rejects_extra`, and `badprev_orphan_does_not_blacklist_then_reorg_reconstructs`. The required **multinode** job also runs reconstruct and slim dead-peer (`--ignored` filters in `ci.yml`).
 Heavy topology (3-hop, 48-block, mesh, `run_p2p`) stays `#[ignore]` for `scripts/integration.sh`:
 
 ```bash
