@@ -40,6 +40,7 @@ jobs:
           - { bin: addrv2_wire, core: false }
           - { bin: inv_getdata_wire, core: false }
           - { bin: electrum_json, core: false }
+          - { bin: asmap, core: false }
           - { bin: store_reorg, core: false }
           - { bin: script_kernel_differential, core: false }
           - { bin: v2_session, core: true }

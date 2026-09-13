@@ -139,6 +139,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "asmap"
+path = "fuzz_targets/asmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "store_reorg"
 path = "fuzz_targets/store_reorg.rs"
 test = false

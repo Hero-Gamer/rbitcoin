@@ -77,7 +77,7 @@ BIP324 parser + live Core v2 session, header/block `submitblock`
 (height-1 / spend / fork / N-reorg / BIP68 CSV-age), compact reconstruct
 vs Core `getblocktxn`, compact reorg via `drain_pending`, mempool /
 script-verify vs `testmempoolaccept`, and ASan wire parsers (`block_wire`,
-`addrv2`, `inv`/`getdata`, Electrum JSON). Crashes →
+`addrv2`, `inv`/`getdata`, Electrum JSON, asmap bytecode). Crashes →
 `docs/external_findings/` + named regression. JSON corpora stay static.
 Frozen signet/mainnet **Electrum** packs are still **Q-31** (fuzz already
 merges tiny block bins).
