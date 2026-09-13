@@ -7,9 +7,7 @@ use std::sync::Mutex;
 use libfuzzer_sys::fuzz_target;
 use rbitcoin_consensus::Milestone;
 use rbitcoin_fuzz::tmp_dir;
-use rbitcoin_fuzz::{
-    check_diff_env, diff_regtest_params, store_reorg_apply, store_reorg_recycle_hub,
-};
+use rbitcoin_fuzz::{check_diff_env, diff_regtest_params, store_reorg_apply};
 use rbitcoin_net::ChainHub;
 use rbitcoin_query::Query;
 
@@ -19,7 +17,6 @@ struct Base {
 }
 
 static STATE: Mutex<Option<Base>> = Mutex::new(None);
-static APPLIES: AtomicU64 = AtomicU64::new(0);
 static COMPARISONS: AtomicU64 = AtomicU64::new(0);
 
 fn harness_failure(what: &str) -> ! {
@@ -54,9 +51,8 @@ fn open_base() -> Base {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let n = APPLIES.fetch_add(1, Ordering::Relaxed);
     let mut slot = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_none() || store_reorg_recycle_hub(n) {
+    if slot.is_none() {
         *slot = Some(open_base());
     }
     let b = slot.as_ref().unwrap();
