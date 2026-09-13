@@ -1,7 +1,8 @@
 # Peer full nodes: Hornet and satd
 
 Date: 2026-09-04. Research snapshot (Hornet `main` @ `151462fa`, satd `master`, public
-docs). Analysis only at write time.
+docs). Analysis only at write time. Not re-read for the 2026-09-13 0.7 docs
+pass — ranks 4–5 stay here, not quality.md Open.
 
 **Owner of these notes:** this file. Ranked later-consideration items stay
 here. Do **not** copy the tables into [`quality.md`](./quality.md) Open.
