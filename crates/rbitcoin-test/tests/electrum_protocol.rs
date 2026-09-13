@@ -970,27 +970,161 @@ async fn electrum_empty_chain_headers_subscribe_and_empty_scripthash() {
 }
 
 /// Cake isolate: JSON-RPC result is the first height, then one notification
-/// per following height, then `{"message":"done"}`. A multi-height result is
-/// treated as one event; no `done` leaves the isolate pinging forever.
+/// per following height, then `{"message":"done"}`. Height 2 hash-binds a
+/// P2WPKH→P2TR spend to `tweak_from_tx`.
 #[tokio::test]
 async fn electrum_tweaks_subscribe_streams_then_done() {
-    use rbitcoin_consensus::{accept_and_connect_block, Milestone};
-    use rbitcoin_primitives::Height;
+    use bitcoin::hashes::{hash160, Hash};
+    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{accept_and_connect_block, tweak_from_tx, Milestone};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::testutil::FixtureChain;
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
     let dir = TempDir::new().unwrap();
     let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let _ = rbitcoin_consensus::pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        4,
-        0,
-    );
+    let (fk0, rec0) = q.header_at_height(Height::GENESIS).unwrap().unwrap();
+
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+    let pk = PublicKey::from_secret_key(&secp, &sk);
+    let ser = pk.serialize();
+    let h160 = hash160::Hash::hash(&ser);
+    let mut p2wpkh = vec![0x00, 0x14];
+    p2wpkh.extend_from_slice(h160.as_ref());
+    let (xonly, _) = pk.x_only_public_key();
+    let mut p2tr = vec![0x51, 0x20];
+    p2tr.extend_from_slice(&xonly.serialize());
+
+    let mut create_txid = [0u8; 32];
+    create_txid[31] = 0xcb;
+    let mut merkle1 = [0u8; 32];
+    merkle1[0] = 1;
+    merkle1[5] = 0xec;
+    let hash1 = rbitcoin_store::block_header_hash(1, &rec0.hash, &merkle1, 2, 0x207fffff, 1);
+    let h1 = HeaderRecord {
+        prev_fk: fk0,
+        version: 1,
+        timestamp: 2,
+        bits: 0x207fffff,
+        nonce: 1,
+        merkle_root: merkle1,
+        hash: hash1,
+    };
+    let ta1 = TxApply {
+        tx: TxRecord {
+            txid: create_txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
+    };
+    let fk1 = q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+    let create_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+
+    let mut spend_txid = [0u8; 32];
+    spend_txid[0] = 0x11;
+    spend_txid[31] = 0xcd;
+    let merkle2 = [0x11; 32];
+    let hash2 = rbitcoin_store::block_header_hash(1, &hash1, &merkle2, 3, 0x207fffff, 2);
+    let h2 = HeaderRecord {
+        prev_fk: fk1,
+        version: 1,
+        timestamp: 3,
+        bits: 0x207fffff,
+        nonce: 2,
+        merkle_root: merkle2,
+        hash: hash2,
+    };
+    let ta2 = TxApply {
+        tx: TxRecord {
+            txid: spend_txid,
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: create_txid,
+            create_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![vec![0u8; 64], ser.to_vec()],
+        }],
+        outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr.clone())],
+    };
+    let fk2 = q.connect_block(Height(2), &h2, &[ta2]).unwrap();
+
+    let mut merkle3 = [0u8; 32];
+    merkle3[0] = 3;
+    merkle3[5] = 0xec;
+    let hash3 = rbitcoin_store::block_header_hash(1, &hash2, &merkle3, 4, 0x207fffff, 3);
+    let mut dummy_txid = [0u8; 32];
+    dummy_txid[0] = 3;
+    dummy_txid[31] = 0xcb;
+    let h3 = HeaderRecord {
+        prev_fk: fk2,
+        version: 1,
+        timestamp: 4,
+        bits: 0x207fffff,
+        nonce: 3,
+        merkle_root: merkle3,
+        hash: hash3,
+    };
+    let ta3 = TxApply {
+        tx: TxRecord {
+            txid: dummy_txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x03], vec![])],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(3), &h3, &[ta3]).unwrap();
+
+    let engine_tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(create_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[&[0u8; 64][..], &ser[..]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(p2tr.clone()),
+        }],
+    };
+    let engine_prev = vec![TxOut {
+        value: Amount::from_sat(50_0000_0000),
+        script_pubkey: ScriptBuf::from_bytes(p2wpkh),
+    }];
+    let expect = tweak_from_tx(&engine_tx, &engine_prev).unwrap();
+    let mut disp = spend_txid;
+    disp.reverse();
+    let spend_key = rbitcoin_primitives::hex_encode(disp);
+    let tweak_hex = rbitcoin_primitives::hex_encode(expect.tweak);
 
     let q = Arc::new(q);
     let (tip_tx, _) = broadcast::channel(4);
@@ -1021,13 +1155,29 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
         "JSON-RPC result must be one height, got {map:?}"
     );
     assert!(map.contains_key("1"), "{map:?}");
+    assert_eq!(
+        map["1"].as_object().map(|o| o.len()),
+        Some(0),
+        "height 1 is the P2WPKH create, not a tweak: {map:?}"
+    );
 
     read_line_timeout(&mut reader, &mut resp, "tweaks 2").await;
     let n2: Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(n2["method"], "blockchain.tweaks.subscribe");
     let p2 = n2["params"][0].as_object().expect("notify 2");
     assert_eq!(p2.len(), 1);
-    assert!(p2.contains_key("2"), "{p2:?}");
+    let h2_txs = p2["2"].as_object().expect("height 2 txs");
+    assert_eq!(h2_txs.len(), 1, "{h2_txs:?}");
+    assert_eq!(h2_txs[&spend_key]["tweak"], json!(tweak_hex), "{h2_txs:?}");
+    assert_eq!(
+        h2_txs[&spend_key]["output_pubkeys"]["0"][0],
+        json!(rbitcoin_primitives::hex_encode(xonly.serialize())),
+        "{h2_txs:?}"
+    );
+    assert_eq!(
+        h2_txs[&spend_key]["output_pubkeys"]["0"][1],
+        json!(49_0000_0000_u64)
+    );
 
     read_line_timeout(&mut reader, &mut resp, "tweaks 3").await;
     let n3: Value = serde_json::from_str(&resp).unwrap();
@@ -1035,6 +1185,11 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     let p3 = n3["params"][0].as_object().expect("notify 3");
     assert_eq!(p3.len(), 1);
     assert!(p3.contains_key("3"), "{p3:?}");
+    assert_eq!(
+        p3["3"].as_object().map(|o| o.len()),
+        Some(0),
+        "height 3 has no P2TR spend: {p3:?}"
+    );
 
     read_line_timeout(&mut reader, &mut resp, "tweaks done").await;
     let done: Value = serde_json::from_str(&resp).unwrap();
