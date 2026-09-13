@@ -2177,10 +2177,6 @@ impl TxTable {
         self.head.entry_bytes()
     }
 
-    pub fn head_reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
-        Ok(())
-    }
-
     pub fn head_segment_count(&self) -> usize {
         self.head.segment_count()
     }

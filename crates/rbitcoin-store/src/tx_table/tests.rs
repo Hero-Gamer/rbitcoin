@@ -2246,7 +2246,7 @@ fn packed_encode_decode_flags_and_error_arms() {
             Err(StoreError::Corrupt(_))
         ));
     }
-    // packed outs short / count mismatch / trailing on outs_with_spender
+    // packed outs short / trailing on outs_with_spender (loc n_out is the count)
     {
         let tx = TxRecord {
             txid: [0xcd; 32],
@@ -2255,15 +2255,12 @@ fn packed_encode_decode_flags_and_error_arms() {
             input_start_fk: Fk::NULL,
             input_count: 1,
             output_start_fk: Fk::NULL,
-            output_count: 2, // claim 2 outs but only encode 1
+            output_count: 2,
         };
         let inputs = [InputRecord::coinbase(u32::MAX, vec![], vec![])];
         let outputs = [OutputRecord::unspent(1, vec![0x51])];
         let mut raw = Vec::new();
-        // Manually pack body meta only (schema 13) with wrong meta count.
-        let mut meta = tx;
-        meta.output_count = 2;
-        meta.encode_body_meta_into(&mut raw);
+        tx.encode_body_meta_into(&mut raw);
         encode_input_run_secret(&inputs, &mut raw, None);
         encode_output_run_secret(&outputs, &mut raw, None);
         // ends after 1 output but meta says 2

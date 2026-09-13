@@ -628,10 +628,7 @@ impl Query {
         &self,
         create_fk: Fk,
     ) -> Result<Vec<OutputRecord>, QueryError> {
-        let (meta, outs) = self.store.get_tx_meta_and_outputs(create_fk)?;
-        if outs.len() as u32 != meta.output_count {
-            return Err(StoreError::Corrupt("packed output count mismatch"));
-        }
+        let (_meta, outs) = self.store.get_tx_meta_and_outputs(create_fk)?;
         Ok(outs)
     }
 
