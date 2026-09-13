@@ -1,7 +1,8 @@
 //! Multi-node P2P integration tests.
 //!
-//! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
-//! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
+//! **Tier A (default `cargo test` + coverage):** single-hop IBD (8 blocks), cold
+//! reconstruct serve (10 blocks), dead-peer skip. Hard wall timeouts; hang-free
+//! on CI-class hosts.
 //! **Tier B (default suite):** handshake timeout / GetAddr cache / keepalive ping,
 //! compact HB + missing-tx `getblocktxn` + orphan child→parent on one mature pad,
 //! outbound feeler complete-and-close + inbound-full reject, hub reorg
@@ -130,7 +131,7 @@ async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
         .expect("ibd sync")
 }
 
-/// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default + CI multinode).
+/// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default suite).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
     let fut = async {
@@ -161,17 +162,17 @@ async fn two_node_header_and_block_sync() {
         seed.shutdown().await;
         peer.shutdown().await;
     };
-    let wall = two_node_wall();
+    let wall = llvm_cov_wall(60, 180);
     tokio::time::timeout(wall, fut)
         .await
         .unwrap_or_else(|_| panic!("two_node_header_and_block_sync wall timeout ({wall:?})"));
 }
 
-fn two_node_wall() -> Duration {
+fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
     if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(180)
+        Duration::from_secs(llvm_secs)
     } else {
-        Duration::from_secs(60)
+        Duration::from_secs(default_secs)
     }
 }
 
@@ -921,10 +922,8 @@ async fn p2p_inbound_full_rejects_extra() {
         .expect("p2p_inbound_full_rejects_extra wall timeout (20s)");
 }
 
-/// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
-/// (CI **multinode** job only — `coverage.sh` also skips this name).
+/// Seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "multinode job"]
 async fn serve_after_restart_via_reconstruct() {
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
@@ -980,9 +979,10 @@ async fn serve_after_restart_via_reconstruct() {
         seed.shutdown().await;
         peer.shutdown().await;
     };
-    tokio::time::timeout(Duration::from_secs(90), fut)
+    let wall = llvm_cov_wall(90, 180);
+    tokio::time::timeout(wall, fut)
         .await
-        .expect("serve_after_restart_via_reconstruct wall timeout (90s)");
+        .unwrap_or_else(|_| panic!("serve_after_restart_via_reconstruct wall timeout ({wall:?})"));
 }
 
 /// Multi-hop serve after sync (mid → leaf). Ignored: longer wall + parallel IBD flakiness.
@@ -1047,10 +1047,8 @@ async fn ibd_two_peers() {
     client.shutdown().await;
 }
 
-/// Multi-peer IBD: dead address + live seeder (dial book tries both).
-/// Slim (4 blocks) — required **multinode** job (`coverage.sh` also skips).
+/// Multi-peer IBD: dead address + live seeder (dial book tries both). Slim (4 blocks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "multinode job"]
 async fn ibd_skips_dead_peer() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();

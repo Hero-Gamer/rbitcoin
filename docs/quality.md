@@ -225,7 +225,7 @@ Q-01–Q-14, findings 001–022, CI split, map-free README: [`CHANGELOG.md`](../
   and refuse messages: [`SCHEMA.md`](../SCHEMA.md). Soft-migrate durable
   side formats; no silent wipes.
 - External findings hygiene + Core corpora without allowlist.
-- Confirm dual-path kill + tier-A multinode in default/CI.
+- Confirm dual-path kill + tier-A IBD in default `cargo test` / coverage.
 - Tests assert shipped behavior, not repo text.
 - Sealed fuse8 fingerprints stay RAM; BDZ `g` is FdOnly.
 - Optional `sp_tweaks` leftover regenerate is not a Class A wipe.

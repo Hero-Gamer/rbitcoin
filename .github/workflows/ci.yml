@@ -22,7 +22,7 @@ env:
 #
 # Jobs are split so each gate is its own required check on the PR/push UI:
 #   fmt + deny + clippy + ast-grep + test + nixos-module-eval + windows + macos in parallel;
-#   coverage / multinode wait for fmt/clippy/test.
+#   coverage waits for fmt/clippy/test.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #
 # GitHub App often cannot push this file; operator `git push` if the branch
@@ -184,33 +184,6 @@ jobs:
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
 
-  # Multi-node IBD tier A (same cadence as coverage — every push/PR after gates).
-  # Budget: ~2 min wall for 8-block + 10-block cold reconstruct paths.
-  multinode:
-    runs-on: ubuntu-latest
-    needs: [fmt, clippy, test]
-    timeout-minutes: 15
-    env:
-      CARGO_TARGET_DIR: target/dev
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: ci-multinode
-          workspaces: ". -> target/dev"
-      - name: multi-node IBD (tier A)
-        # One TESTNAME per `cargo test` invocation (second free arg is an error on
-        # rustc 1.95+). Reconstruct / dead-peer are `#[ignore]` in the default
-        # suite so llvm-cov does not re-pay them; pass `--ignored` here.
-        run: |
-          set -euo pipefail
-          cargo test -p rbitcoin-test --test integration_multinode \
-            two_node_header_and_block_sync -- --nocapture
-          cargo test -p rbitcoin-test --test integration_multinode \
-            serve_after_restart_via_reconstruct -- --ignored --nocapture
-          cargo test -p rbitcoin-test --test integration_multinode \
-            ibd_skips_dead_peer -- --ignored --nocapture
   # Line-coverage gate (≥90% production-file LCOV LH/LF). Slow; waits for the
   # fast gates so a red fmt/clippy/test does not start this job. Required.
   coverage:

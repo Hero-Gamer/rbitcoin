@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Contract: LCOV gate ignores test files (not substring "test"), runs two_node,
-# writes Shields JSON. Does not run llvm-cov.
+# Contract: LCOV gate ignores test files (not substring "test"), runs default
+# workspace tests (Tier A IBD included), writes Shields JSON. Does not run llvm-cov.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -67,10 +67,12 @@ assert_ok "IGNORE drops test files and keeps production (incl. regtest_*)" true
 
 assert_ok "two_node is not skipped" \
   bash -c '! grep -q "skip two_node_header_and_block_sync" "$1"' _ "$COV"
-assert_ok "reconstruct remains skipped" \
-  grep -q "skip serve_after_restart_via_reconstruct" "$COV"
-assert_ok "dead-peer remains skipped" \
-  grep -q "skip ibd_skips_dead_peer" "$COV"
+assert_ok "reconstruct is not skipped" \
+  bash -c '! grep -q "skip serve_after_restart_via_reconstruct" "$1"' _ "$COV"
+assert_ok "dead-peer is not skipped" \
+  bash -c '! grep -q "skip ibd_skips_dead_peer" "$1"' _ "$COV"
+assert_ok "llvm-cov test has no --skip" \
+  bash -c '! grep -E "llvm-cov test" -A6 "$1" | grep -q -- "--skip"' _ "$COV"
 
 tmp="$(mktemp)"
 python3 "$ROOT/scripts/coverage-badge.py" \

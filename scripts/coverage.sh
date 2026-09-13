@@ -61,8 +61,7 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
   cargo llvm-cov test --workspace \
     --ignore-filename-regex "$IGNORE" \
     "${EXTRA[@]}" \
-    --html --output-dir "$ROOT/coverage" \
-    -- --skip serve_after_restart_via_reconstruct --skip ibd_skips_dead_peer
+    --html --output-dir "$ROOT/coverage"
 
   REPORT="$(cargo llvm-cov report --ignore-filename-regex "$IGNORE" 2>/dev/null || true)"
   echo "$REPORT"
