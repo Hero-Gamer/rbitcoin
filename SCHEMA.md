@@ -413,6 +413,23 @@ kind payload:
   10–15            reserved — decode **Corrupt** (no implicit width)
 ```
 
+**Amount nibble vs reserved flag bits.** `e` lives in flags so the first
+amount byte *is* the ULEB. That keeps canonical mantissa `16..=127` at one
+byte — 25 BTC, 12.5 BTC, 330 sat P2TR dust (`33×10`), 25-series fees/change.
+Those are the live UTXO set, not 2010 coinbases (the whole 50/25/12.5
+subsidy series is ~MB vs raw ULEB, ~420 KB vs a 1-flag prefix encoding).
+Spare **bits** do not skip a later occupied-Class-A wipe; unused nibble
+**values** `10–15` are the soft-extend hook (same pattern as kind `10–15`:
+old writers never emit them; this binary Corrupt; a later version may bind
+one code to “extension follows” and still read `e=0..=9` records).
+
+| Rejected | Why not |
+|---------|---------|
+| Core `CompressAmount` packed into one integer | Can *grow* the following ULEB vs raw sats |
+| 3-bit `e` (`0..=7`) + reserved bit 7 | 25/50 BTC become 2-byte mantissas; one boolean is already an unused nibble value |
+| Cap `e` at 8, leave `9..=15` unused | Extra headroom we do not need; `e=9` is cheap (50 BTC is already `50×10^8`) and matches kind’s `0..=9` live |
+| 1 flag bit `multi` + first amount byte `exp:4\|mant:4` + ULEB rest | Buys 3 flag bits. Pays +1 byte whenever leftover `m` is `16..=127` (see above). Continuation on the amount byte instead steals an `e` or `m` bit and cannot keep 4+4 |
+
 Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
 covers hash/data only. Spender flags live only on `spent`. A new consensus
 script type does **not** wipe a 17 datadir: encode it as kind 0 **RAW**, or
