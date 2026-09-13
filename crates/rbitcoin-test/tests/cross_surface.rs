@@ -14,6 +14,7 @@ use rbitcoin_query::Query;
 use rbitcoin_test::TestDatadir;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -183,6 +184,17 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     rpc_spend.consensus_encode(&mut rpc_raw).unwrap();
     let rpc_hex = rbitcoin_primitives::hex_encode(&rpc_raw);
     let rpc_txid = rpc_spend.compute_txid().to_string();
+    let mut zero_fee = rpc_spend.clone();
+    zero_fee.output[0].value = Amount::from_sat(50_0000_0000);
+    let mut zero_raw = Vec::new();
+    zero_fee.consensus_encode(&mut zero_raw).unwrap();
+    let zero_hex = rbitcoin_primitives::hex_encode(&zero_raw);
+    let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[zero_hex]])).await;
+    assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
+    assert_eq!(
+        tma["result"][0]["reject-reason"], "min relay fee not met",
+        "{tma}"
+    );
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[rpc_hex.clone()]])).await;
     assert_eq!(tma["result"][0]["allowed"], true, "{tma}");
     let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([rpc_hex])).await;
@@ -357,6 +369,60 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         child_mem_row["fee"].as_i64(),
         Some(child_fee),
         "{child_mem_row}"
+    );
+
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    assert_eq!(
+        mined["result"].as_array().map(|a| a.len()),
+        Some(1),
+        "{mined}"
+    );
+    let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+    assert_eq!(count["result"], 103, "{count}");
+    let empty = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert_eq!(empty["result"], json!([]), "{empty}");
+    let tip = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
+    let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
+    let txs = blk["result"]["tx"].as_array().expect("mined tx array");
+    assert!(
+        txs.len() >= 4,
+        "coinbase + sendraw + esplora parent + child: {blk}"
+    );
+    assert!(
+        txs.iter().any(|t| t["txid"] == rpc_txid),
+        "generate must include sendraw: {blk}"
+    );
+    let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
+    let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+    let immature = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_str(&cb_txid).expect("coinbase txid"),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_val.saturating_sub(1_000)),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut imm_raw = Vec::new();
+    immature.consensus_encode(&mut imm_raw).unwrap();
+    let imm = jsonrpc(
+        rpc_addr,
+        "sendrawtransaction",
+        json!([rbitcoin_primitives::hex_encode(&imm_raw)]),
+    )
+    .await;
+    assert_eq!(imm["error"]["code"], -26, "{imm}");
+    assert_eq!(
+        imm["error"]["message"], "bad-txns-premature-spend-of-coinbase",
+        "{imm}"
     );
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
