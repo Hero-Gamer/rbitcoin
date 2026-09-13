@@ -11,6 +11,38 @@
 
 **Fewer scenario functions / store opens, not less coverage** — put more asserts on one carefully designed multi-stage journey.
 
+### Default CI is the pin
+
+Default `cargo test` owns operator- and peer-visible contracts (JSON-RPC,
+Electrum TCP, Esplora HTTP, BIP324 P2P). Bitcoin Core’s Python functional
+suite is a **nightly / ship / `core-functional` label** oracle. It is **not**
+a required PR check and **not** required on PRs that merely touch net or RPC
+(too slow). Nightly Core is not a license to delete in-tree tests.
+
+When adding or folding a pin:
+
+| Do | Do not |
+|----|--------|
+| Extend an existing [catalog](#scenario-catalog) journey (same `/tmp` pad, more asserts) | A new skinny scenario that remine-pads the same chain |
+| Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
+| Keep guts the journey cannot hit | Delete handshake **format** needles, `decode_rpc_subset`, or BIP324 encode vectors waiting for Core |
+| Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
+| New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` (`coverage.sh` skips it) |
+
+Coverage (≥90% LCOV `LH`/`LF`) is a required PR job. If deleting a guts test
+drops the bar, the journey did not cover the path — keep the guts or hit
+those lines from the journey first.
+
+Keep until a **default** journey hits the same lines: store packed / v17 /
+fuse / SH machines, empty / truncated / v1 fuse refuse, unsorted pack/lag,
+IBD wave fence / 8×8000, SH writebehind / uring CAS, leftover identity,
+handshake format needles, `getaddr_cache_*`, eviction ranking, feeler silence
+timeout, sole-preferred stall KEEP, `stamp_reject_names_*`,
+`multi_hop_bad_prev_*`, structure s1–s18, rate-limiter, netgroup, subsidy
+table. Optional leftovers (more HTTP methods on `cross_surface`, a tiny
+legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
+are not a backlog.
+
 ### Parallel cargo test (same binary)
 
 `cargo test` / `cargo llvm-cov test` run **one process per test binary**. Do not:
