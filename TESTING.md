@@ -141,7 +141,7 @@ reads it; rustup users export it). Override coverage dir:
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**P2P walls:** `two_node_header_and_block_sync`, `three_node_relay_path`, `ibd_two_peers`, `tip_follow_after_ibd`, `tip_follow_getheaders_catches_missed_blocks`, and `node_run_p2p_short` 60s wall (180s under `coverage.sh` / llvm-cov). `serve_after_restart_via_reconstruct` 90s wall (180s under llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall.
+**P2P walls:** `two_node_header_and_block_sync`, `three_node_relay_path`, `ibd_two_peers`, `tip_follow_after_ibd`, `tip_follow_getheaders_catches_missed_blocks`, and `node_run_p2p_short` 60s wall (180s under `coverage.sh` / llvm-cov). `serve_after_restart_via_reconstruct` 90s wall (180s under llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall. Live `P2PNode` tests in `integration_multinode` take a process mutex (shared `rbtc-scripts` pool / confirm OS threads); hub-only reorgs do not.
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -306,8 +306,8 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 Default `cargo test` runs the live P2P catalog above (`two_node`, reconstruct,
 dead-peer, hop serve, dual seeder, tip follow, getheaders gap, `run_p2p --connect`,
-compact/feeler/inbound-full, hub reorg). There is no ignored topology tier and
-no `scripts/integration.sh`.
+compact/feeler/inbound-full, hub reorg). Live `P2PNode` tests serialize in-process.
+There is no ignored topology tier and no `scripts/integration.sh`.
 
 New features: add a high-level scenario; remove obsolete lower-level tests in the same PR.
 
