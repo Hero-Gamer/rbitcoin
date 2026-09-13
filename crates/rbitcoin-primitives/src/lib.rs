@@ -231,6 +231,8 @@ pub enum TableKind {
     Inwit = 16,
     /// Class A sole-spender slots (`spent.body`, 8 B × n_out).
     Spent = 17,
+    /// Create/inwit delta locators (`create.loc` / `inwit.loc` and `.ovf`).
+    DeltaLoc = 18,
 }
 
 impl TableKind {
@@ -251,6 +253,7 @@ impl TableKind {
             15 => Some(TableKind::SpTweaks),
             16 => Some(TableKind::Inwit),
             17 => Some(TableKind::Spent),
+            18 => Some(TableKind::DeltaLoc),
             _ => None,
         }
     }
@@ -296,7 +299,7 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in [1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17] {
+        for v in [1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18] {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
@@ -312,6 +315,7 @@ mod tests {
         assert_eq!(TableKind::SpTweaks.as_u16(), 15);
         assert_eq!(TableKind::Inwit.as_u16(), 16);
         assert_eq!(TableKind::Spent.as_u16(), 17);
+        assert_eq!(TableKind::DeltaLoc.as_u16(), 18);
     }
 
     #[test]

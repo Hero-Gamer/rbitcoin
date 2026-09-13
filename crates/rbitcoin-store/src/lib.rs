@@ -12,6 +12,8 @@ mod block_wire;
 mod bulk_io;
 mod chain;
 mod compact;
+mod create_loc;
+mod delta_loc;
 mod error;
 mod file;
 mod fuse8_filter;
