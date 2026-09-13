@@ -2677,7 +2677,7 @@ fn getblockstats_core_error_needles() {
 }
 
 #[test]
-fn testmempoolaccept_script_reject_maps_dersig_and_details() {
+fn testmempoolaccept_script_reject_maps_reason_and_details() {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -2714,10 +2714,7 @@ fn testmempoolaccept_script_reject_maps_dersig_and_details() {
         prev
     );
     assert_eq!(details, want);
-}
 
-#[test]
-fn testmempoolaccept_script_reject_maps_cltv_parens() {
     for (token, paren) in [
         (
             "stack empty",

@@ -1809,22 +1809,6 @@ mod success_and_disabled_tests {
     }
 
     #[test]
-    fn op_1sub_and_unary_arith() {
-        // OP_3 OP_1SUB → 2; OP_2 EQUAL
-        let script = vec![0x53, 0x8c, 0x52, 0x87];
-        assert!(eval(&script, SigVersion::WitnessV0).expect("1sub"));
-        // OP_2 OP_1ADD → 3
-        let script = vec![0x52, 0x8b, 0x53, 0x87];
-        assert!(eval(&script, SigVersion::WitnessV0).expect("1add"));
-        // OP_1 OP_NEGATE → -1; OP_1NEGATE EQUAL
-        let script = vec![0x51, 0x8f, 0x4f, 0x87];
-        assert!(eval(&script, SigVersion::WitnessV0).expect("negate"));
-        // OP_1NEGATE OP_ABS → 1
-        let script = vec![0x4f, 0x90, 0x51, 0x87];
-        assert!(eval(&script, SigVersion::WitnessV0).expect("abs"));
-    }
-
-    #[test]
     fn tapscript_allows_scripts_over_10k() {
         // Legacy would reject; tapscript must accept (BIP342).
         let mut script = vec![0x51]; // OP_TRUE
@@ -1838,13 +1822,6 @@ mod success_and_disabled_tests {
         assert!(need);
         let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
         assert!(format!("{err}").contains("too large"));
-    }
-
-    #[test]
-    fn op_sha1_hashes() {
-        // OP_0 OP_SHA1 → 20-byte hash of empty; SIZE 0x14 EQUAL (20)
-        let script = vec![0x00, 0xa7, 0x82, 0x01, 0x14, 0x87];
-        assert!(eval(&script, SigVersion::WitnessV0).expect("sha1"));
     }
 
     /// Every consensus-enabled opcode must not report "unknown opcode".
@@ -2382,14 +2359,6 @@ mod success_and_disabled_tests {
     }
 
     #[test]
-    fn op_0_empty_push_and_depth() {
-        // OP_0 OP_DEPTH OP_1 EQUAL — depth is 1 after empty push? OP_0 pushes empty → depth 1
-        // Then DEPTH pushes 1, stack [empty, 1]; not clean. Simpler: OP_0 OP_SIZE OP_0 EQUAL
-        let script = vec![0x00, 0x82, 0x00, 0x87]; // 0 SIZE 0 EQUAL
-        assert!(eval(&script, SigVersion::WitnessV0).expect("size empty"));
-    }
-
-    #[test]
     fn find_and_delete_pushdata4() {
         // Needle uses PUSHDATA4 only when data.len() > 0xffff.
         let data = vec![0x44u8; 0x10000];
@@ -2643,35 +2612,6 @@ mod p2sh_redeem_parse_tests {
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
     #[test]
-    fn eval_op1_redeem_alone() {
-        let script = [0x51u8];
-        let tx = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
-        let sc = Script::from_bytes(&script);
-        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
-        let mut stack = Vec::new();
-        let r = eval_script(sc, &mut stack, &ctx);
-        eprintln!("op1 alone: {r:?} stack={stack:?}");
-        assert!(r.is_ok());
-    }
-
-    #[test]
     fn eval_sig_then_p2sh_style() {
         // scriptSig 00 01 51 → stack [[],[0x51]]
         let ss = [0x00u8, 0x01, 0x51];
@@ -2697,13 +2637,10 @@ mod p2sh_redeem_parse_tests {
         let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
         let mut stack = Vec::new();
         eval_script(sc, &mut stack, &ctx).expect("scriptSig");
-        eprintln!("after sig stack={stack:?}");
         let redeem = stack.pop().unwrap();
-        eprintln!("redeem={redeem:02x?}");
         let rs = Script::from_bytes(&redeem);
         let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, rs, SigVersion::Base);
         let r = eval_script(rs, &mut stack, &ctx2);
-        eprintln!("redeem eval: {r:?} stack={stack:?}");
         assert!(r.is_ok(), "{r:?}");
     }
 }

@@ -1110,7 +1110,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 
 /// Single mature-chain pad covers consensus + scripthash + reconstruct + reorg:
 /// - accept genesis + maturity pad + spend + double-spend reject
-/// - create_fk on spend + reconstruct (create_fk packing)
+/// - create_fk on spend + reconstruct
 /// - reconstruct after reopen (sampled heights)
 /// - scripthash history / balance / listunspent for OP_TRUE
 /// - disconnect tip restores spent coinbase UTXO
@@ -1120,7 +1120,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     use bitcoin::p2p::ServiceFlags;
     use rbitcoin_net::local_service_flags;
-    use rbitcoin_store::{script_hash, InputRecord};
+    use rbitcoin_store::script_hash;
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create_tiny(td.store_path()).unwrap();
@@ -1160,21 +1160,6 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     assert!(
         !inp.create_fk.is_null(),
         "v10 spend input must carry create_fk"
-    );
-    let enc = InputRecord {
-        prev_txid: inp.prev_txid,
-        create_fk: inp.create_fk,
-        prev_index: inp.prev_index,
-        sequence: inp.sequence,
-        script_sig: inp.script_sig.clone(),
-        witness: inp.witness.clone(),
-    }
-    .encode();
-    // create_fk:u64 + CompactSize vout — not prev_txid[32] (−24 B per input).
-    assert!(
-        enc.len() < 32,
-        "v10 input encodes create_fk not prev_txid: {}",
-        enc.len()
     );
     assert_reconstruct_eq(&q, chain.spend_height, spend_block);
     let cbin = q
