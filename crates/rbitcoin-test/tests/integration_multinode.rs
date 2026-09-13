@@ -4,8 +4,9 @@
 //! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
 //! **Tier B (default suite):** handshake timeout / GetAddr / keepalive ping,
 //! HB compact tip-follow, compact `getblocktxn` for a missing extra tx,
-//! mempool orphan child GetData of parent, hub reorg (including leftover/BadPrev
-//! orphan that must not blacklist).
+//! mempool orphan child GetData of parent, outbound feeler complete-and-close,
+//! inbound-full reject, hub reorg (including leftover/BadPrev orphan that must not
+//! blacklist).
 //! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
 //! `scripts/integration.sh` or `-- --ignored` only.
 
@@ -27,6 +28,20 @@ async fn start_node(dir: &TempDir) -> P2PNode {
         q,
         ChainParams::regtest(),
         Milestone::NONE,
+    )
+    .await
+    .expect("listen")
+}
+
+async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
+    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    P2PNode::start_with_agent(
+        "127.0.0.1:0".parse().unwrap(),
+        q,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:test/".into(),
+        max_inbound,
     )
     .await
     .expect("listen")
@@ -551,6 +566,140 @@ async fn p2p_compact_getblocktxn_missing_extra_tx() {
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
         .expect("p2p_compact_getblocktxn_missing_extra_tx wall timeout (20s)");
+}
+
+/// Outbound feeler: VERSION completes, then the session closes (no live follow).
+#[tokio::test]
+async fn p2p_feeler_completes_and_closes() {
+    use rbitcoin_net::PeerConnType;
+
+    let fut = async {
+        rbitcoin_log::capture_logs(true);
+        let seed_dir = TempDir::new().unwrap();
+        let dummy_dir = TempDir::new().unwrap();
+        let seed = start_node(&seed_dir).await;
+        let dummy = start_node(&dummy_dir).await;
+        seed.peers
+            .addconnection(dummy.local_addr, PeerConnType::Feeler)
+            .expect("feeler dial");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if rbitcoin_log::take_logs()
+                .iter()
+                .any(|(_, m)| m.contains("feeler connection completed"))
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                rbitcoin_log::capture_logs(false);
+                panic!(
+                    "feeler must complete VERSION then close \
+                     (seed_live={} dummy={:?})",
+                    seed.follow_live_count(),
+                    dummy.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(
+            seed.follow_live_count(),
+            0,
+            "feeler must not stay as a follow session"
+        );
+        assert!(
+            !dummy
+                .peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.inbound && !p.subver.is_empty()),
+            "feeler must not leave a completed inbound on the dummy: {:?}",
+            dummy.peers.snapshot()
+        );
+
+        seed.shutdown().await;
+        dummy.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_feeler_completes_and_closes wall timeout (20s)");
+}
+
+/// `max_inbound=1`: a second outbound follow is refused; the first session stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_inbound_full_rejects_extra() {
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let seed = start_node_inbound(&seed_dir, 1).await;
+        let mut a = start_node(&a_dir).await;
+        let mut b = start_node(&b_dir).await;
+
+        tokio::time::timeout(Duration::from_secs(5), a.follow_from(seed.local_addr))
+            .await
+            .expect("first follow handshake")
+            .expect("first follow");
+        let wait = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let n = seed
+                .peers
+                .snapshot()
+                .into_iter()
+                .filter(|p| p.inbound && !p.subver.is_empty())
+                .count();
+            if n >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() >= wait {
+                panic!(
+                    "first follow must occupy the inbound slot (seed={:?})",
+                    seed.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let second =
+            tokio::time::timeout(Duration::from_secs(5), b.follow_from(seed.local_addr)).await;
+        if let Ok(Ok(())) = second {
+            panic!(
+                "second follow must not complete handshake at max_inbound=1 (seed={:?} b={:?})",
+                seed.peers.snapshot(),
+                b.peers.snapshot()
+            );
+        }
+
+        let n = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .filter(|p| p.inbound && !p.subver.is_empty())
+            .count();
+        assert_eq!(
+            n,
+            1,
+            "first inbound must stay; extra must be refused: {:?}",
+            seed.peers.snapshot()
+        );
+        assert!(
+            a.follow_live_count() >= 1,
+            "first outbound follow must stay live"
+        );
+        assert_eq!(
+            b.follow_live_count(),
+            0,
+            "rejected follow must not stay live"
+        );
+
+        seed.shutdown().await;
+        a.shutdown().await;
+        b.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_inbound_full_rejects_extra wall timeout (20s)");
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
