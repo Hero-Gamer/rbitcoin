@@ -266,9 +266,6 @@ impl OutputRecord {
         let mut off = 1usize;
         let (v, n) = decode_output_amount(exp, &buf[off..])?;
         off += n;
-        if v > i64::MAX as u64 {
-            return Err(StoreError::Corrupt("output value too large"));
-        }
         let value = v as i64;
         let used = script_kind_v17_disk_used(kind, &buf[off..])?;
         let script = if let Some(sec) = secret {

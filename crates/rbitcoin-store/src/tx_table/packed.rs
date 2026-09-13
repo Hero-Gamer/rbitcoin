@@ -735,11 +735,6 @@ pub fn scan_packed_p2tr_outs(
         let mut o = off + 1;
         let (v, n) = decode_output_amount(exp, &raw[o..])?;
         o += n;
-        let value = if v > i64::MAX as u64 {
-            return Err(StoreError::Corrupt("output value too large"));
-        } else {
-            v
-        };
         let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
         if kind == crate::compact::SCRIPT_KIND_V17_P2TR && used == 32 {
             let mut xonly = [0u8; 32];
@@ -747,7 +742,7 @@ pub fn scan_packed_p2tr_outs(
             if let Some(sec) = secret {
                 sec.xor_bytes(0, &mut xonly);
             }
-            out.push((vout, xonly, value));
+            out.push((vout, xonly, v));
         }
         off = o + used;
     }
@@ -938,7 +933,10 @@ mod scan_p2tr_tests {
         let dec = OutputRecord::decode_at_secret(&raw[meta_n..], None).unwrap_err();
         assert!(format!("{dec}").contains("output value too large"), "{dec}");
         let skip = OutputRecord::skip_at(&raw[meta_n..]).unwrap_err();
-        assert!(format!("{skip}").contains("output value too large"), "{skip}");
+        assert!(
+            format!("{skip}").contains("output value too large"),
+            "{skip}"
+        );
         let visit = visit_packed_script_hashes(&raw, 1, None, |_| Ok(())).unwrap_err();
         assert!(
             format!("{visit}").contains("output value too large"),

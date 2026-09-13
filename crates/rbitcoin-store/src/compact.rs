@@ -167,10 +167,14 @@ pub fn scale_amount_exp(exp: u8, mantissa: u64) -> Result<u64, StoreError> {
     Ok(v)
 }
 
-/// `(sats, uleb bytes)`. `buf` starts at the mantissa ULEB.
+/// `(sats, uleb bytes)`. `buf` starts at the mantissa ULEB. Above `i64::MAX` is Corrupt.
 pub fn decode_output_amount(exp: u8, buf: &[u8]) -> Result<(u64, usize), StoreError> {
     let (mantissa, n) = read_uleb128(buf)?;
-    Ok((scale_amount_exp(exp, mantissa)?, n))
+    let v = scale_amount_exp(exp, mantissa)?;
+    if v > i64::MAX as u64 {
+        return Err(StoreError::Corrupt("output value too large"));
+    }
+    Ok((v, n))
 }
 
 /// Input record flags (schema v10).
