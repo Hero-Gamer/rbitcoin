@@ -137,6 +137,20 @@ out="$(FUZZ_DRY_RUN=1 "$RUN" electrum_json)"
 assert_ok "electrum_json dry-run dict" \
   grep -qx "FUZZ_DICT=fuzz/dict/electrum.dict" <<<"$out"
 
+out="$(FUZZ_DRY_RUN=1 "$RUN" asmap)"
+assert_ok "asmap dry-run bin" \
+  grep -qx "FUZZ_BIN=asmap" <<<"$out"
+assert_ok "asmap dry-run sanitizer address" \
+  grep -qx "FUZZ_SANITIZER=address" <<<"$out"
+assert_ok "asmap dry-run no Core" \
+  grep -qx "FUZZ_NO_CORE=1" <<<"$out"
+assert_ok "asmap listed in fuzz Cargo.toml" \
+  grep -q 'name = "asmap"' "$ROOT/fuzz/Cargo.toml"
+assert_ok "asmap fuzz target exists" \
+  test -f "$ROOT/fuzz/fuzz_targets/asmap.rs"
+assert_ok "asmap two-prefix-plus-ip seed" \
+  test -s "$ROOT/crates/rbitcoin-net/tests/fixtures/asmap_two_prefix_plus_ip.bin"
+
 t6="$(FUZZ_WEEKDAY=6 "$RUN" --default-time)"
 assert_ok "FUZZ_WEEKDAY=6 is 600" \
   test "$t6" = "600"
