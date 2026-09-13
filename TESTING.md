@@ -215,7 +215,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 
 | ID | Layer | Description |
 |----|-------|-------------|
-| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peertimeout=0`, log-level/mempool/electrum/inhibit), help/version |
+| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peertimeout=0`, log-level/mempool/electrum/inhibit), help/version. Signet: genesis header plus height-1 BIP325 connect |
 | `three_stage_confirm_and_parent_pin_surface` | Consensus+query | Split load→scripts→write; parent pin; load ready timeout/cancel; instance-owned `last_write` / `last_pin` / `take_window` meters |
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. `DEFAULT_BODY_DEPTH == 16` stays a unit. |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
@@ -237,7 +237,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `electrum_tweaks_subscribe_streams_then_done` | Electrum | Cake `tweaks.subscribe`: one-height result, per-height notifies, then `done` |
 | `electrum_max_connections_rejects_extra_client` | Electrum | TCP cap drops the extra client |
 | `electrum_idle_timeout_disconnects_quiet_client` | Electrum | Idle timeout closes a quiet socket |
-| `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`) |
+| `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: HTTP `sendrawtransaction` / `testmempoolaccept` (allowed + missing-or-spent), Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`). Keep `accept.rs` reject units and RPC dry-run orphan-count |
 | `two_node_header_and_block_sync` | P2P (**default + multinode CI**) | Seeder → peer 8-block IBD; peer `last_write` meter. **Not** re-run under `coverage.sh`. |
 | `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Sole-preferred stall KEEP stays a PeerHub unit. |
 | `p2p_compact_hb_getblocktxn_and_orphan` | P2P (**default**) | One mature pad: HB coinbase `cmpctblock`, 2-tx compact → `getblocktxn` + connect, orphan child GetData then parent accept (INV AlreadyHave). Does **not** pin depth-10 full-block serve, tokio-worker lock, or park-not-reject logs |

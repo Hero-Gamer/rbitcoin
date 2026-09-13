@@ -3,10 +3,11 @@
 //! Prefer fewer tests at the highest layer that still hit production paths.
 //! Mature regtest chains are built once per test that needs them (not thrice).
 
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, BlockHash};
+use bitcoin::{Amount, Block, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
-use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+use rbitcoin_consensus::{accept_and_connect_block, genesis_block, ChainParams, Milestone};
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, VERSION};
 use rbitcoin_query::testutil::FixtureChain;
@@ -16,6 +17,7 @@ use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_
 use rbitcoin_test::{
     assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, TestDatadir,
 };
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// This toolchain's `ExitCode` lacks `PartialEq`; compare via Debug.
@@ -42,6 +44,39 @@ fn node_cli_and_surface_smoke() {
             .with_tiny_heads();
         let handle = run_node(cfg).unwrap();
         assert_eq!(handle.network_name(), net.as_str());
+        if net == Network::Signet {
+            let params = ChainParams::signet();
+            let genesis = genesis_block(&params);
+            handle.query.enter_direct_index_mode().unwrap();
+            accept_and_connect_block(
+                &handle.query,
+                &params,
+                Height::GENESIS,
+                &genesis,
+                Milestone::NONE,
+            )
+            .unwrap();
+            let (_fk, rec) = handle
+                .query
+                .header_at_height(Height::GENESIS)
+                .unwrap()
+                .expect("signet genesis header");
+            assert_eq!(rec.hash, genesis.block_hash().to_byte_array());
+            assert_eq!(rec.hash, params.genesis_hash.to_byte_array());
+            let raw = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../rbitcoin-consensus/tests/fixtures/signet_block_1.bin"),
+            )
+            .expect("signet_block_1.bin");
+            let block1: Block = deserialize(&raw).expect("signet height 1");
+            assert_eq!(
+                block1.block_hash().to_string(),
+                "00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53"
+            );
+            accept_and_connect_block(&handle.query, &params, Height(1), &block1, Milestone::NONE)
+                .unwrap();
+            assert_eq!(handle.query.tip_height(), Some(Height(1)));
+        }
         handle.shutdown().unwrap();
     }
     assert!(Network::parse("nope").is_err());

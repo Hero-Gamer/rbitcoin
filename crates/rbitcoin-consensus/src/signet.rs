@@ -400,23 +400,6 @@ mod tests {
         assert_eq!(stripped[0], 0x6a);
     }
 
-    /// Regression: height-1 global signet block must accept under BIP325.
-    ///
-    /// Bug class: `to_spend.scriptSig` missing leading `OP_0` before block_data push
-    /// produced a wrong txid → CHECKMULTISIG failed → tip stuck at 0.
-    #[test]
-    fn signet_block_1_solution_valid() {
-        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
-        let block: Block = deserialize(raw).expect("decode signet block 1");
-        assert_eq!(
-            block.header.block_hash().to_string(),
-            "00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53"
-        );
-        let challenge = default_signet_challenge();
-        validate_signet_block_solution(&block, challenge.as_script())
-            .expect("BIP325 solution for real signet height 1");
-    }
-
     #[test]
     fn custom_challenge_derives_expected_wire_magic() {
         let challenge = ScriptBuf::from_bytes(vec![0x51]);
