@@ -133,6 +133,6 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 ## Related docs
 
 - Architecture (store / IO / consensus uniqueness): [`architecture.md`](./architecture.md)
-- Operator knobs and IBD log lines: [`OPERATOR.md`](../OPERATOR.md)
+- Operator knobs, custom Signet flags, 16 GiB RAM, consensus notes: [`OPERATOR.md`](../OPERATOR.md)
 - Product scope / Electrum methods: [`COMPAT.md`](../COMPAT.md)
 - Security reporting: [`SECURITY.md`](../SECURITY.md)

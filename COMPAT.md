@@ -1,7 +1,9 @@
 # Compatibility with Bitcoin Core
 
-Pinned reference version: **target Core ≥27** for BIP324 v2 interop; package wire
-tracks BIP331 when rust-bitcoin exposes the messages.
+Pinned reference version: **Bitcoin Core v31.1** (same pin as
+[`docs/core-functional.md`](./docs/core-functional.md) and nightly fuzz).
+BIP324 v2 interop. Package wire tracks BIP331 when rust-bitcoin exposes the
+messages (**Q-48** / RB-007).
 
 **Experimental 0.x** — not a production Core or Fulcrum replacement. Design
 contrasts: [`docs/architecture.md`](./docs/architecture.md). Lab mainnet:
@@ -58,24 +60,23 @@ is not on disk. Serving it would cold-read the spending tx’s `inwit`. Full
 
 ## Core-class JSON-RPC (subset)
 
-| Method group | Status | Notes |
-|--------------|--------|-------|
-| Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done | Queue RPC is a no-op `null` |
-| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done | Archive reconstruct. `getblock` verbosity **1** is `txid.body` identities (no packed reconstruct). v0/v2 share one prev_txid cache. `chainwork` is real. `size_on_disk` is a store file walk; `verificationprogress` is `blocks/headers` (see [`docs/rpc.md`](./docs/rpc.md)) |
-| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done | BIP324 v2-only; live session table. `version` is rbitcoin, not Core 27.0; services match wire. Learned `addr`/`addrv2` must advertise `P2P_V2` |
-| Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done | Libre policy. `testmempoolaccept` is dry-run (no live-set mutation, does not park orphans). `maxmempool` is the hub weight budget. RPC-submit `maxfeerate` / `maxburnamount` (not P2P) |
-| Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done | Class A unspent walk — **not** a coins-DB / HD-range scan. `gettxout` default hides mempool-spent confirmed outs |
-| Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done | `txindex` means Class A reconstruct; `getchaintips` is the active tip |
-| Fee (`estimatesmartfee`) | done | **10-minute inclusion** product — not Core historical |
-| Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done | Node **subset** ([`docs/rpc.md`](./docs/rpc.md)): decode hex, script type/address, validate happy path. No miniscript wrap, no `error_locations`. Core-functional scripts still hit the harness proxy. |
-| Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness | **Regtest only** (except `submitblock`). Same confirm/accept path as P2P. `setmocktime` is not a wall-clock hook. |
-| `invalidateblock` / `reconsiderblock` / `preciousblock` | done | Disconnect/re-accept; precious = equal-work preference |
-| Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster` / feerate diagram) | done | Cluster-chunk selector. `rules` must include `segwit`. No stratum, no BIP9 testdummy, no wallet keys |
-| Wallet RPC | **never** | No keystore |
-| `createrawtransaction` / `combinerawtransaction` | **never** | External tools |
-| Full `scantxoutset` / `gettxoutsetinfo` | **never** | No UTXO-set coins DB; `raw()` MiniWallet subset is the only scan |
+Per-method notes, auth, and the shindex matrix live in
+**[`docs/rpc.md`](./docs/rpc.md)**. Group status (intentional scope):
 
-Full method list, auth, and shindex matrix: **[`docs/rpc.md`](./docs/rpc.md)**.
+| Method group | Status |
+|--------------|--------|
+| Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`, `syncwithvalidationinterfacequeue`) | done (queue RPC is a no-op) |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (archive reconstruct; disk/progress real) |
+| Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done (BIP324 v2-only) |
+| Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done (Libre; RPC `maxfeerate` / `maxburnamount` only) |
+| Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done (Class A unspent walk — not a coins-DB) |
+| Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done (`txindex` = Class A reconstruct) |
+| Fee (`estimatesmartfee`) | done (**10-minute inclusion** — not Core historical) |
+| Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done (node subset; Core-functional scripts still hit the harness proxy) |
+| Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness (regtest only except `submitblock`) |
+| `invalidateblock` / `reconsiderblock` / `preciousblock` | done |
+| Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster`) | done (no stratum / BIP9 testdummy / wallet keys) |
+| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; full `scantxoutset` / `gettxoutsetinfo` | **never** |
 
 ## Electrum surface
 

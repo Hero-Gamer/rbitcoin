@@ -1065,15 +1065,10 @@ with default HTTP/1.1 upgrade support to the same listen.
 
 ## Signet lab
 
-```bash
-mkdir -p ./datadir-signet
-./target/release/rbitcoin-node \
-  --datadir ./datadir-signet \
-  --network signet \
-  --listen 0.0.0.0:38333 \
-  --max-outbound 16 \
-  --log-level info
-```
+Default signet catch-up, Electrum-after-tip, and SIGTERM resume:
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Prefer
+SIGTERM over `kill -9` (last uncommitted mempool batch may be lost on hard
+kill). Same `--datadir` resumes tip from the relational archive.
 
 ### Custom Signet
 
@@ -1098,34 +1093,11 @@ The equivalent conf-file keys are `signetchallenge` and `signetblocktime`.
 Replace the illustrative `OP_TRUE` challenge and documentation-only peer with
 the parameters supplied by the custom Signet operator.
 
-### Resume / clean stop
-
-Same `--datadir` resumes tip from the relational archive.
-
-```bash
-kill <pid>   # SIGTERM — flush store + mempool, exit 0
-```
-
-Prefer SIGTERM over `kill -9` (last uncommitted mempool batch may be lost on hard kill).
-
 ## Mainnet experimental
 
-```bash
-mkdir -p ./datadir-mainnet
-./target/release/rbitcoin-node \
-  --datadir ./datadir-mainnet \
-  --network mainnet \
-  --listen 0.0.0.0:8333 \
-  --max-outbound 16 \
-  --mempool-size-mb 300 \
-  --log-level info
-```
-
-Full script validation (slow, used for consensus parity labs):
-
-```bash
-  --milestone 0
-```
+Catch-up command, milestone table, and Electrum-after-tip:
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). 16 GiB /
+sluggish-disk knobs stay in this file (below).
 
 ### Before trusting mainnet
 
