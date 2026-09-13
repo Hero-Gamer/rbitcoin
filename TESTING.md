@@ -66,6 +66,11 @@ Shared Tiny on-disk fixtures live in `rbitcoin_store::testutil` (`TempDir`, `tin
 | **xorf + bincode + serde** removed from store | Sealed fuse8 is in-tree (`binary_fuse8` + hand LE layout **v2**). Drops a serde-heavy path from store rebuilds. |
 | **fuse8 v1 on open** | Leftover v1 fuse **refuses**; wipe `store/tx.head` (Class A kept). Current writes are v2. |
 
+`cargo check -p rbitcoin-store --tests` (and stacking `--tests` on query /
+consensus / net) is a **fat** rustc unit. Agents: that is Verify at the end of
+a slice, not the inner loop. Inner loop and keep-compiling facade:
+[`docs/how-we-plan.md`](docs/how-we-plan.md) (Keep the tree compiling).
+
 Host forensics and `cargo bench` one-offs are **not** in the default compile
 graph (`scripts/check_default_targets.test.sh`). Optional **client** comparison
 is `rbitcoin-bench` (`cargo run -p rbitcoin-bench --features cli --release`);
