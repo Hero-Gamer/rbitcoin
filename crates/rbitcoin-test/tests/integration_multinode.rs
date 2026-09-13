@@ -775,12 +775,140 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         )
         .await;
 
+        use bitcoin::p2p::message_blockdata::GetBlocksMessage;
+        use bitcoin::p2p::message_bloom::{BloomFlags, FilterLoad};
+        let genesis = seed
+            .query
+            .reconstruct_block_at_height(Height::GENESIS)
+            .unwrap()
+            .block_hash();
+        let inv_before = peer
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| !p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("inv").copied().unwrap_or(0))
+            .unwrap_or(0);
+        let gb = GetBlocksMessage::new(vec![genesis], BlockHash::from_byte_array([0u8; 32]));
+        wait_ms_until(
+            3_000,
+            || {
+                peer.peers.live_peers().into_iter().any(|p| {
+                    !p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::GetBlocks(gb.clone()))
+                })
+            },
+            || {
+                format!(
+                    "follower outbound must queue getblocks (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            3_000,
+            || {
+                peer.peers.snapshot().into_iter().any(|p| {
+                    !p.inbound
+                        && p.bytesrecv_per_msg.get("inv").copied().unwrap_or(0) > inv_before
+                })
+            },
+            || {
+                format!(
+                    "getblocks must be answered with inv (seed={:?} peer={:?} inv_before={inv_before})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            3_000,
+            || {
+                peer.peers.live_peers().into_iter().any(|p| {
+                    !p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::FeeFilter(1_234))
+                })
+            },
+            || {
+                format!(
+                    "follower outbound must queue feefilter (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.inbound && p.minfeefilter_sat_kvb == 1_234)
+            },
+            || {
+                format!(
+                    "seed inbound must record feefilter (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        let bloom = FilterLoad {
+            filter: vec![],
+            hash_funcs: 1,
+            tweak: 0,
+            flags: BloomFlags::None,
+        };
+        wait_ms_until(
+            3_000,
+            || {
+                peer.peers.live_peers().into_iter().any(|p| {
+                    !p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::FilterLoad(bloom.clone()))
+                })
+            },
+            || {
+                format!(
+                    "follower outbound must queue filterload (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            3_000,
+            || {
+                !seed
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.inbound && !p.subver.is_empty())
+            },
+            || {
+                format!(
+                    "filterload must disconnect the seeder inbound (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+
         seed.shutdown().await;
         peer.shutdown().await;
     };
-    tokio::time::timeout(Duration::from_secs(20), fut)
+    tokio::time::timeout(llvm_cov_wall(30, 90), fut)
         .await
-        .expect("p2p_compact_hb_getblocktxn_and_orphan wall timeout (20s)");
+        .expect("p2p_compact_hb_getblocktxn_and_orphan wall timeout");
 }
 
 fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {

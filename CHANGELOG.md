@@ -11,6 +11,11 @@ before 1.0).
 
 ### Added
 
+- **P2P getblocks / feefilter / bloom:** live follower `getblocks` is answered
+  with `inv`, inbound BIP133 `feefilter` is recorded, and `filterload`
+  disconnects (bloom off). Oversize locator and MemPool/`filteradd`/`filterclear`
+  stay units.
+
 - **IBD BQ residue:** same-process `rehydrate_block_queue_into_confirm` drops
   at/below tip, keeps above-tip wire even if `has_block` / known-archived,
   skips empty payloads, and marks unknown-height plus tip+1 gaps missing

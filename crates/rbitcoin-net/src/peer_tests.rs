@@ -3774,7 +3774,7 @@ fn inv_of_already_asked_block_does_not_getdata() {
 fn bloom_disabled_messages_request_disconnect() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::p2p::message::RawNetworkMessage;
-    use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
+    use bitcoin::p2p::message_bloom::FilterAdd;
     use bitcoin::Network;
 
     fn frame_for(msg: NetworkMessage) -> FramedMessage {
@@ -3812,12 +3812,6 @@ fn bloom_disabled_messages_request_disconnect() {
         NetworkMessage::MemPool,
         NetworkMessage::FilterClear,
         NetworkMessage::FilterAdd(FilterAdd { data: vec![0xcc] }),
-        NetworkMessage::FilterLoad(FilterLoad {
-            filter: vec![],
-            hash_funcs: 1,
-            tweak: 0,
-            flags: BloomFlags::None,
-        }),
     ];
     for msg in msgs {
         follow.ban_score = 0;
