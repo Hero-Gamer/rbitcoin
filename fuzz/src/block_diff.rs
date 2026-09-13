@@ -204,6 +204,7 @@ pub fn store_reorg_step(hub: &ChainHub, op: StoreReorgOp) -> Result<bool, String
     let height = hub.tip_height().ok_or("no tip height")?;
     let hash = hub.tip_hash().ok_or("no tip hash")?;
     match op {
+        StoreReorgOp::Sibling if hub.held_body_count() >= STORE_REORG_HELD_CAP => Ok(false),
         StoreReorgOp::Rewind => {
             if height == 0 {
                 return Ok(false);
@@ -250,14 +251,11 @@ pub fn store_reorg_apply(hub: &ChainHub, data: &[u8]) -> Result<u32, String> {
     Ok(n)
 }
 
-/// Equal-work siblings are parked in `held_bodies`; `try_apply_held` walks
-/// all of them. Overnight ASan `-timeout=30` fires once the persistent hub
-/// has accumulated too many. Recycle the fuzz hub this often.
-pub const STORE_REORG_RECYCLE_EVERY: u64 = 16;
-
-pub fn store_reorg_recycle_hub(apply_n: u64) -> bool {
-    apply_n > 0 && apply_n.is_multiple_of(STORE_REORG_RECYCLE_EVERY)
-}
+/// Fuzz-only cap on parked equal-work siblings. Production `HeldBodies` is 320;
+/// walking that many under ASan exceeds `-timeout=30`. Keep this small so one
+/// tiny hub lasts a 1h job (reopening the store every 16 applies grew RSS to
+/// libFuzzer's 2 GiB limit).
+pub const STORE_REORG_HELD_CAP: usize = 16;
 
 pub fn mine_diff_pad(hub: &ChainHub, last: u32) -> Result<DiffPad, &'static str> {
     if last < 1 {
@@ -2141,12 +2139,17 @@ mod tests {
     }
 
     #[test]
-    fn store_reorg_recycle_hub_every_sixteen_applies() {
-        assert!(!store_reorg_recycle_hub(0));
-        assert!(!store_reorg_recycle_hub(15));
-        assert!(store_reorg_recycle_hub(STORE_REORG_RECYCLE_EVERY));
-        assert!(store_reorg_recycle_hub(STORE_REORG_RECYCLE_EVERY * 2));
-        assert!(!store_reorg_recycle_hub(STORE_REORG_RECYCLE_EVERY + 1));
+    fn store_reorg_sibling_ops_stop_at_held_cap() {
+        let (dir, hub, _tip) = tmp_diff_hub();
+        store_reorg_apply(&hub, &[0]).expect("h1");
+        store_reorg_apply(&hub, &[1u8; 32]).expect("sib1");
+        store_reorg_apply(&hub, &[1u8; 32]).expect("sib2");
+        let n = hub.held_body_count();
+        assert!(
+            n <= STORE_REORG_HELD_CAP,
+            "held_body_count {n} > fuzz cap {STORE_REORG_HELD_CAP}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

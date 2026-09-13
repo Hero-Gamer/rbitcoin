@@ -26,6 +26,11 @@ before 1.0).
 
 ### Fixed
 
+- **`store_reorg` overnight ASan OOM:** sibling ops no-op at 16 parked
+  `held_bodies` and the tiny hub is not reopened. Recycle-every-16 grew
+  libFuzzer RSS to the 2048 MiB cap (~45 min into the Sunday 1h job)
+  with a 48 MiB live heap.
+
 - **Compact reconstruct merkle-checks before `Ok`:** a unique short-id (or
   `blocktxn`) fill is not a block until the txs match the compact header
   merkle (BIP152 `FinishBlock`). Empty missing → `getdata`, not

@@ -11,9 +11,9 @@ pub use block_diff::{
     compare_script_one, compare_script_verify_one, compare_spend_one, diff_regtest_params,
     genesis_diff_tip, mine_diff_pad, mine_diff_stem, parse_submitblock_json,
     parse_testmempoolaccept_json, rewind_oracle_until, split_http_body, store_reorg_apply,
-    store_reorg_corrupt_is_finding, store_reorg_recycle_hub, store_reorg_step,
-    submit_pad_to_oracle, wait_for_file, BlockOracle, CompareOne, DiffPad, DiffTip, OracleReply,
-    StoreReorgOp, DIFF_MATURE_PAD_HEIGHT, DIFF_REORG_N, DIFF_TEST_PAD_HEIGHT,
+    store_reorg_corrupt_is_finding, store_reorg_step, submit_pad_to_oracle, wait_for_file,
+    BlockOracle, CompareOne, DiffPad, DiffTip, OracleReply, StoreReorgOp, DIFF_MATURE_PAD_HEIGHT,
+    DIFF_REORG_N, DIFF_TEST_PAD_HEIGHT,
 };
 pub use cmpct_fuzz::{
     cmpct_missing_for_case, encode_cmpctblock_v2, encode_getheaders_empty_v2, encode_ping_v2,
