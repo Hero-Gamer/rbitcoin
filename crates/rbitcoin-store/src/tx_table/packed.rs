@@ -484,20 +484,20 @@ pub fn encode_inwit_with_secret(
 
 /// Encode a `spent.body` run (`8 × n_out` bytes) with optional sole-spender overlays.
 ///
-/// Duplicate `vout` last-wins. `vout >= n_out` or `fk ≥ 2^56` is Corrupt.
+/// Duplicate `vout` last-wins. `vout >= n_out`, `fk ≥ 2^40`, or `vin ≥ 2^16` is Corrupt.
 pub fn encode_spent_slots(
     n_out: u32,
-    pairs: &[(u32, Fk)],
+    pairs: &[(u32, Fk, u32)],
     out: &mut Vec<u8>,
 ) -> Result<(), StoreError> {
     let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
     let start = out.len();
     out.resize(start.saturating_add(n), 0);
-    for &(vout, fk) in pairs {
+    for &(vout, fk, vin) in pairs {
         if vout >= n_out {
             return Err(StoreError::Corrupt("spent overlay vout"));
         }
-        let slot = encode_spent_slot_v17(0, fk)?;
+        let slot = encode_spent_slot(0, fk, vin)?;
         let off =
             start.saturating_add((vout as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
         out[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
@@ -510,15 +510,18 @@ pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     encode_spent_slots(n_out, &[], out).expect("empty spent overlay");
 }
 
-/// Published `spent.body` span for one create (zero-out still pays 8 B pad).
+/// Published `spent.body` span for one create (`8 × n_out`, `n_out ≥ 1`).
 #[inline]
 pub fn spent_record_len(n_out: u32) -> u64 {
-    u64::from(n_out.max(1)).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
+    if n_out == 0 {
+        0
+    } else {
+        u64::from(n_out).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
+    }
 }
 
-/// Schema-17 spent slot width (same as [`OutputRecord::SPENT_SLOT_LEN`]).
-pub const SPENT_SLOT_V17_LEN: usize = 8;
-const SPENT_FIELD_V17_MAX: u64 = (1u64 << 56) - 1;
+const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
+const SPENT_VIN_U16_MAX: u32 = (1u32 << 16) - 1;
 
 fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
     if flags & (input_flags::RESERVED4 | input_flags::RESERVED_HIGH) != 0 {
@@ -529,34 +532,52 @@ fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
 
 fn check_spent_flags(flags: u8) -> Result<(), StoreError> {
     if flags & !output_flags::MULTI_SPENDER != 0 {
-        return Err(StoreError::Corrupt("v17 spent reserved flags"));
+        return Err(StoreError::Corrupt("spent reserved flags"));
     }
     Ok(())
 }
 
-/// Encode flags + u56 spender field. `fk ≥ 2^56` is Corrupt.
-pub fn encode_spent_slot_v17(flags: u8, field: Fk) -> Result<[u8; 8], StoreError> {
-    check_spent_flags(flags)?;
-    if field.0 > SPENT_FIELD_V17_MAX {
-        return Err(StoreError::Corrupt("v17 spent field exceeds u56"));
+/// Pack spender fk + vin into 56 bits: `(vin as u64) << 40 | (fk.0 & (2^40-1))`.
+pub fn pack_spent_field(fk: Fk, vin: u32) -> Result<u64, StoreError> {
+    if fk.0 > SPENT_FK_U40_MAX {
+        return Err(StoreError::Corrupt("spent fk exceeds u40"));
     }
+    if vin > SPENT_VIN_U16_MAX {
+        return Err(StoreError::Corrupt("spent vin exceeds u16"));
+    }
+    Ok(((vin as u64) << 40) | fk.0)
+}
+
+/// Unpack [`pack_spent_field`]. High 8 bits of the u64 must be zero.
+pub fn unpack_spent_field(packed: u64) -> Result<(Fk, u32), StoreError> {
+    if packed >> 56 != 0 {
+        return Err(StoreError::Corrupt("spent field exceeds u56"));
+    }
+    Ok((Fk(packed & SPENT_FK_U40_MAX), (packed >> 40) as u32))
+}
+
+/// Encode flags + u40 spender field + u16 vin. Caps are Corrupt (no wrap).
+pub fn encode_spent_slot(flags: u8, field: Fk, vin: u32) -> Result<[u8; 8], StoreError> {
+    check_spent_flags(flags)?;
+    let packed = pack_spent_field(field, vin)?;
     let mut slot = [0u8; 8];
     slot[0] = flags;
-    let le = field.0.to_le_bytes();
+    let le = packed.to_le_bytes();
     slot[1..8].copy_from_slice(&le[..7]);
     Ok(slot)
 }
 
-/// Decode an 8-byte v17 spent slot.
-pub fn decode_spent_slot_v17(raw: &[u8]) -> Result<(u8, Fk), StoreError> {
-    if raw.len() < SPENT_SLOT_V17_LEN {
-        return Err(StoreError::Corrupt("short v17 spent slot"));
+/// Decode an 8-byte spent slot: `(flags, fk, vin)`.
+pub fn decode_spent_slot(raw: &[u8]) -> Result<(u8, Fk, u32), StoreError> {
+    if raw.len() < OutputRecord::SPENT_SLOT_LEN {
+        return Err(StoreError::Corrupt("short spent slot"));
     }
     let flags = raw[0];
     check_spent_flags(flags)?;
     let mut le = [0u8; 8];
     le[..7].copy_from_slice(&raw[1..8]);
-    Ok((flags, Fk(u64::from_le_bytes(le))))
+    let (field, vin) = unpack_spent_field(u64::from_le_bytes(le))?;
+    Ok((flags, field, vin))
 }
 
 /// Spent abs for `vout` given the create's `spent.body` range start.
@@ -607,9 +628,10 @@ pub(super) fn check_trailing_zero_pad(raw: &[u8], logical_end: usize) -> Result<
 /// Decode `txout` with optional de-obfuscation of scriptPubKey.
 pub fn decode_packed_tx_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<super::PackedTxRels, StoreError> {
-    let (meta, outputs, rels) = decode_packed_tx_outs_with_spender_rels_secret(raw, secret)?;
+    let (meta, outputs, rels) = decode_packed_tx_outs_with_spender_rels_secret(raw, n_out, secret)?;
     Ok((meta, Vec::new(), outputs, rels))
 }
 
@@ -617,13 +639,14 @@ pub fn decode_packed_tx_with_spender_rels_secret(
 ///
 /// Empty need is all outs. Stops after the last needed vout so a truncated
 /// first page can skip a full-span extend.
-pub fn txout_first_page_covers_need(raw: &[u8], need_vouts: &[u32]) -> bool {
+pub fn txout_first_page_covers_need(raw: &[u8], n_out: u32, need_vouts: &[u32]) -> bool {
     let Ok((meta, mut off)) = TxRecord::decode_body_meta(raw) else {
         return false;
     };
+    let _ = meta;
     let take_all = need_vouts.is_empty();
     let mut need_i = 0usize;
-    for vout in 0..meta.output_count {
+    for vout in 0..n_out {
         if !take_all && need_i == need_vouts.len() {
             return true;
         }
@@ -656,18 +679,23 @@ pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, 
 /// output's start within the packed txout payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
+    n_out: u32,
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    decode_packed_tx_outs_with_spender_rels_secret(raw, None)
+    decode_packed_tx_outs_with_spender_rels_secret(raw, n_out, None)
 }
 
 pub fn decode_packed_tx_outs_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
-    let n_out = meta.output_count as usize;
-    let mut outputs = Vec::with_capacity(n_out);
-    let mut spender_rels = Vec::with_capacity(n_out);
+    let (mut meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    if n_out == 0 {
+        return Err(StoreError::Corrupt("invariant: create n_out"));
+    }
+    meta.output_count = n_out;
+    let mut outputs = Vec::with_capacity(n_out as usize);
+    let mut spender_rels = Vec::with_capacity(n_out as usize);
     for _ in 0..n_out {
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
@@ -691,26 +719,22 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
 /// `(vout, x-only, value_sats)`. Used by thin BIP-352 serve.
 pub fn scan_packed_p2tr_outs(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<(u32, [u8; 32], u64)>, StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut out = Vec::new();
-    for vout in 0..meta.output_count {
+    for vout in 0..n_out {
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
         if raw.len() - off < 2 {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let kind = raw[off] & 0x0f;
+        let (kind, exp) = split_output_flags(raw[off])?;
         let mut o = off + 1;
-        let (v, n) = read_uleb128(&raw[o..])?;
+        let (v, n) = decode_output_amount(exp, &raw[o..])?;
         o += n;
-        let value = if v > i64::MAX as u64 {
-            return Err(StoreError::Corrupt("output value too large"));
-        } else {
-            v
-        };
         let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
         if kind == crate::compact::SCRIPT_KIND_V17_P2TR && used == 32 {
             let mut xonly = [0u8; 32];
@@ -718,7 +742,7 @@ pub fn scan_packed_p2tr_outs(
             if let Some(sec) = secret {
                 sec.xor_bytes(0, &mut xonly);
             }
-            out.push((vout, xonly, value));
+            out.push((vout, xonly, v));
         }
         off = o + used;
     }
@@ -729,22 +753,20 @@ pub fn scan_packed_p2tr_outs(
 /// SHA256(scriptPubKey) for every packed out. No `OutputRecord` vec.
 pub fn visit_packed_script_hashes(
     raw: &[u8],
+    n_out: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
     mut f: impl FnMut([u8; 32]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut payload = Vec::new();
-    for _ in 0..meta.output_count {
+    for _ in 0..n_out {
         if off >= raw.len() || raw.len() - off < 1 {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
         let flags = raw[off];
-        if flags & 0xf0 != 0 {
-            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
-        }
-        let kind = flags & 0x0f;
+        let (kind, exp) = split_output_flags(flags)?;
         let mut o = off + 1;
-        let (_v, n) = read_uleb128(&raw[o..])?;
+        let (_v, n) = decode_output_amount(exp, &raw[o..])?;
         o += n;
         let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
         payload.clear();
@@ -767,11 +789,15 @@ pub fn visit_packed_script_hashes(
 /// walks every out and checks trailing zero pad (same as full denserels).
 pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
     raw: &[u8],
+    n_out: u32,
     need_vouts: &[u32],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<super::SparseOutsRow, StoreError> {
-    let (meta, mut off) = TxRecord::decode_body_meta(raw)?;
-    let n_out = meta.output_count;
+    let (mut meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    if n_out == 0 {
+        return Err(StoreError::Corrupt("invariant: create n_out"));
+    }
+    meta.output_count = n_out;
     // Empty need → all vouts (full materialize path without a second full decode).
     let take_all = need_vouts.is_empty();
     let mut need_i = 0usize;
@@ -840,7 +866,7 @@ pub struct HeadResizeSizeSnapshot {
 #[cfg(test)]
 mod scan_p2tr_tests {
     use super::*;
-    use crate::compact::{write_uleb128, SCRIPT_KIND_V17_P2TR};
+    use crate::compact::{amount_exp_mantissa, write_uleb128, SCRIPT_KIND_V17_P2TR};
 
     fn packed_p2tr_body(value: u64) -> Vec<u8> {
         let meta = TxRecord {
@@ -854,8 +880,14 @@ mod scan_p2tr_tests {
         };
         let mut raw = Vec::new();
         meta.encode_body_meta_into(&mut raw);
-        raw.push(SCRIPT_KIND_V17_P2TR);
-        write_uleb128(&mut raw, value);
+        if value > i64::MAX as u64 {
+            raw.push(SCRIPT_KIND_V17_P2TR);
+            write_uleb128(&mut raw, value);
+        } else {
+            let (exp, mantissa) = amount_exp_mantissa(value);
+            raw.push(SCRIPT_KIND_V17_P2TR | (exp << 4));
+            write_uleb128(&mut raw, mantissa);
+        }
         raw.extend_from_slice(&[0u8; 32]);
         raw
     }
@@ -863,7 +895,7 @@ mod scan_p2tr_tests {
     #[test]
     fn scan_packed_p2tr_outs_ok_value() {
         let raw = packed_p2tr_body(50_000);
-        let rows = scan_packed_p2tr_outs(&raw, None).unwrap();
+        let rows = scan_packed_p2tr_outs(&raw, 1, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 0);
         assert_eq!(rows[0].2, 50_000);
@@ -872,13 +904,44 @@ mod scan_p2tr_tests {
     }
 
     #[test]
+    fn scan_packed_p2tr_outs_exp_mantissa_is_sats() {
+        let meta = TxRecord {
+            txid: [0u8; 32],
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let mut raw = Vec::new();
+        meta.encode_body_meta_into(&mut raw);
+        raw.push(SCRIPT_KIND_V17_P2TR | (8 << 4));
+        raw.push(1);
+        raw.extend_from_slice(&[0u8; 32]);
+        let rows = scan_packed_p2tr_outs(&raw, 1, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, 100_000_000);
+    }
+
+    #[test]
     fn scan_packed_p2tr_outs_overflow_is_corrupt() {
         let raw = packed_p2tr_body(i64::MAX as u64 + 1);
-        let err = scan_packed_p2tr_outs(&raw, None).unwrap_err();
+        let err = scan_packed_p2tr_outs(&raw, 1, None).unwrap_err();
         assert!(format!("{err}").contains("output value too large"), "{err}");
         let meta_n = TxRecord::decode_body_meta(&raw).unwrap().1;
         let dec = OutputRecord::decode_at_secret(&raw[meta_n..], None).unwrap_err();
         assert!(format!("{dec}").contains("output value too large"), "{dec}");
+        let skip = OutputRecord::skip_at(&raw[meta_n..]).unwrap_err();
+        assert!(
+            format!("{skip}").contains("output value too large"),
+            "{skip}"
+        );
+        let visit = visit_packed_script_hashes(&raw, 1, None, |_| Ok(())).unwrap_err();
+        assert!(
+            format!("{visit}").contains("output value too large"),
+            "{visit}"
+        );
     }
 
     fn three_out_packed() -> (Vec<u8>, usize) {
@@ -909,31 +972,37 @@ mod scan_p2tr_tests {
         let (raw, after_vout0) = three_out_packed();
         let truncated = &raw[..after_vout0];
         let (meta, live, sparse) =
-            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, &[0], None).unwrap();
+            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, 3, &[0], None).unwrap();
         assert_eq!(meta.output_count, 3);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);
         assert_eq!(live[0].1.script, vec![0x51]);
         assert_eq!(sparse.len(), 1);
         assert_eq!(sparse[0].0, 0);
-        let empty_need = decode_packed_tx_need_outs_with_spender_rels_secret(truncated, &[], None);
+        let empty_need =
+            decode_packed_tx_need_outs_with_spender_rels_secret(truncated, 3, &[], None);
         assert!(
             empty_need.is_err(),
             "empty need still requires a full outs walk"
         );
-        assert!(txout_first_page_covers_need(truncated, &[0]));
-        assert!(!txout_first_page_covers_need(truncated, &[]));
+        assert!(txout_first_page_covers_need(truncated, 3, &[0]));
+        assert!(!txout_first_page_covers_need(truncated, 3, &[]));
     }
 
     #[test]
     fn decode_packed_tx_need_outs_empty_need_still_pad_checks() {
         let (mut raw, _) = three_out_packed();
         raw.push(0x01);
-        let err = decode_packed_tx_need_outs_with_spender_rels_secret(&raw, &[], None).unwrap_err();
+        let err =
+            decode_packed_tx_need_outs_with_spender_rels_secret(&raw, 3, &[], None).unwrap_err();
         assert!(format!("{err}").contains("trailing non-zero"), "{err}");
-        let (meta, live, _) =
-            decode_packed_tx_need_outs_with_spender_rels_secret(&raw[..raw.len() - 1], &[0], None)
-                .unwrap();
+        let (meta, live, _) = decode_packed_tx_need_outs_with_spender_rels_secret(
+            &raw[..raw.len() - 1],
+            3,
+            &[0],
+            None,
+        )
+        .unwrap();
         assert_eq!(meta.output_count, 3);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);

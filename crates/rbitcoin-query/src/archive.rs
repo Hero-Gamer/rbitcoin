@@ -50,7 +50,7 @@ pub struct ArchiveWritePlan {
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
     pub edges: crate::SpendEdges,
-    pub spends: Vec<([u8; 32], u32, Fk)>,
+    pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
     /// External parent identity stamped at lookup (`txid` + optional body/spent/pin).
@@ -187,8 +187,8 @@ impl ArchiveWritePlan {
     ///
     /// Coinbase / external parents are omitted — those slots stay zero until
     /// annotate after tip.
-    pub fn same_batch_spent_overlay(&self) -> Vec<Vec<(u32, Fk)>> {
-        let mut overlay: Vec<Vec<(u32, Fk)>> = vec![Vec::new(); self.packed.len()];
+    pub fn same_batch_spent_overlay(&self) -> Vec<Vec<(u32, Fk, u32)>> {
+        let mut overlay: Vec<Vec<(u32, Fk, u32)>> = vec![Vec::new(); self.packed.len()];
         if overlay.is_empty() {
             return overlay;
         }
@@ -206,7 +206,7 @@ impl ArchiveWritePlan {
                 let Some(&i) = idx.get(&cid) else {
                     continue;
                 };
-                overlay[i].push((e.vout, e.spend_fk));
+                overlay[i].push((e.vout, e.spend_fk, e.vin));
             }
         }
         overlay
@@ -300,7 +300,7 @@ impl ArchiveWritePlan {
         self.per_header_ranges = new_ranges;
         self.edges.retain(|id, _| keep_fks.contains(id));
         self.spends
-            .retain(|(_, _, spend_fk)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
+            .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
         self.batch_creates
             .retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
         // body_est is an upper bound; leave as-is (overestimate is safe for reserve).
@@ -629,7 +629,7 @@ impl Query {
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::time::Instant;
 
-        let mut spends: Vec<([u8; 32], u32, Fk)> = Vec::new();
+        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         let archive_spends = self.writes_archive_spends();
         let index_tx = self.tx_index_enabled();
 
@@ -695,6 +695,7 @@ impl Query {
                         vout: u32::MAX,
                         spend_fk: tx_fk,
                         create_fk: Fk::NULL,
+                        vin: i as u32,
                     });
                     continue;
                 }
@@ -731,7 +732,7 @@ impl Query {
                     }
                 }
                 if archive_spends {
-                    spends.push((inp.prev_txid, inp.prev_index, tx_fk));
+                    spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                 }
                 if inp.prev_index == u32::MAX {
                     tx_edges.push(crate::SpendEdge {
@@ -739,6 +740,7 @@ impl Query {
                         vout: u32::MAX,
                         spend_fk: tx_fk,
                         create_fk: Fk::NULL,
+                        vin: i as u32,
                     });
                 } else {
                     tx_edges.push(crate::SpendEdge {
@@ -746,6 +748,7 @@ impl Query {
                         vout: inp.prev_index,
                         spend_fk: tx_fk,
                         create_fk,
+                        vin: i as u32,
                     });
                 }
             }
@@ -1111,7 +1114,7 @@ mod tests {
             let mut raw = Vec::new();
             rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
             let (meta, dec_outs, _) =
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw, 1).unwrap();
             assert_eq!(meta.output_count as usize, dec_outs.len());
             assert_eq!(outs.len(), dec_outs.len());
         }
@@ -1561,7 +1564,7 @@ mod tests {
         let known = plan.external_parent_txid(pid).expect("reverse map");
         let (rows, _body_ns, _dec_ns, _extend_n, _sqe_n, _guess_n) = q
             .store
-            .get_outs_by_range_batch(&[(parent_fk, range, known, vec![0])])
+            .get_outs_by_range_batch(&[(parent_fk, range, known, 1, vec![0])])
             .unwrap();
         let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
         assert_eq!(
@@ -1923,7 +1926,7 @@ mod tests {
         assert_eq!(edges[0].create_fk, Fk(1));
         let overlay = plan.same_batch_spent_overlay();
         assert_eq!(overlay.len(), 2);
-        assert_eq!(overlay[0], vec![(0, Fk(2))]);
+        assert_eq!(overlay[0], vec![(0, Fk(2), 0)]);
         assert!(overlay[1].is_empty());
         q.archive_commit_plan(plan).unwrap();
         let (off, _) = q.store().tx_spent_range(Fk(1)).unwrap();
@@ -2107,6 +2110,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
         let child = child_spend(parent_txid, 0x66);
@@ -2143,6 +2147,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
         let child = child_spend(parent_txid, 0x66);
@@ -2195,6 +2200,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
 
@@ -2458,7 +2464,7 @@ mod tests {
             (dummy_pin(3), Vec::new()),
         ];
         plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
-        plan.spends = vec![([0u8; 32], 0, Fk(1)), ([0u8; 32], 0, Fk(3))];
+        plan.spends = vec![([0u8; 32], 0, Fk(1), 0), ([0u8; 32], 0, Fk(3), 0)];
         // Header 10 already has body; 20 needs body.
         let keep = plan
             .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))

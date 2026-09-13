@@ -1,7 +1,7 @@
-//! **idx → body** pipeline for confirm load (`txout` / `inwit` / `spent` stems).
+//! **loc → body** pipeline for confirm load (`txout` / `inwit` stems).
 //!
-//! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
-//! fd pread). Body backend from
+//! Ranges from [`crate::create_loc::CreateLoc`] / [`crate::delta_loc::DeltaLoc`]
+//! (FdOnly). Body backend from
 //! [`crate::io_backend::read_io_backend`] (global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!
@@ -32,7 +32,7 @@ pub enum BodyMode {
 pub struct IdxBodyJob {
     /// 1-based create id (`Fk.0` when non-null).
     pub id: u64,
-    /// Known `(body_off, body_len)` skips idx; filled by pipeline when resolved.
+    /// Known `(body_off, body_len)` skips loc fill when `n_out` is set.
     pub range: Option<(u64, u64)>,
     /// Body bytes (mode-sized) when `ok`.
     pub body: Vec<u8>,
@@ -40,6 +40,8 @@ pub struct IdxBodyJob {
     pub ok: bool,
     /// Sparse Outs need (sorted unique). Empty = all outs (SH / ensure).
     pub need_vouts: Vec<u32>,
+    /// Loc `n_out` (≥ 1) for txout decode. Unused for inwit/full.
+    pub n_out: u32,
 }
 
 impl IdxBodyJob {
@@ -50,6 +52,7 @@ impl IdxBodyJob {
             body: Vec::new(),
             ok: false,
             need_vouts: Vec::new(),
+            n_out: 0,
         }
     }
 
@@ -76,15 +79,17 @@ pub struct IdxBodyIoStats {
 const BODY_OS_PAGE: u64 = crate::tx_table::BODY_PAGE_SIZE;
 /// Cap a coalesced span at two OS pages (one straddle). Do not chain into SH-sized reads.
 const BODY_GROUP_MAX_PAGES: u64 = 2;
-/// Typical packed out (P2TR-ish) for the first-wave spill guess.
-const OUTS_GUESS_PER_VOUT: u64 = 40;
+const OUTS_META_GUESS: u64 = 4;
+/// Kind + 5-byte amount uleb + P2TR payload (not RAW/OP_RETURN fat scripts).
+const OUTS_GUESS_PER_VOUT: u64 = 38;
 
 /// First-wave Outs pread length.
 ///
 /// Records are 8-aligned, not OS-page aligned. `room` is bytes from `off` to
 /// the next OS page. Empty need uses the idx span; sparse need uses
-/// `(max_vout+1)*40`. If that estimate is likely to spill, read the full span;
-/// otherwise only the remainder of this page.
+/// `4 + (max_vout+1)*38` (LAYOUT17 typical meta + kind + 5-byte amount + P2TR).
+/// If that estimate is likely to spill, read the full span; otherwise only the
+/// remainder of this page.
 pub(crate) fn outs_first_wave_len(off: u64, full_len: u64, need_vouts: &[u32]) -> u64 {
     if full_len == 0 {
         return 0;
@@ -94,7 +99,7 @@ pub(crate) fn outs_first_wave_len(off: u64, full_len: u64, need_vouts: &[u32]) -
         full_len
     } else {
         let k = u64::from(need_vouts.iter().copied().max().unwrap_or(0));
-        k.saturating_add(1).saturating_mul(OUTS_GUESS_PER_VOUT)
+        OUTS_META_GUESS.saturating_add(k.saturating_add(1).saturating_mul(OUTS_GUESS_PER_VOUT))
     };
     if est > room {
         full_len
@@ -296,22 +301,7 @@ pub fn run_idx_body_pipeline_backend(
     if jobs.is_empty() {
         return Ok(IdxBodyIoStats::default());
     }
-    let mut need_fk: Vec<Fk> = Vec::new();
-    let mut need_slot: Vec<usize> = Vec::new();
-    for (i, j) in jobs.iter().enumerate() {
-        if j.range.is_none() && j.id > 0 {
-            need_fk.push(Fk(j.id));
-            need_slot.push(i);
-        }
-    }
-    // Page-coalesced idx (one OS-page / uring SQE per distinct page), then body.
-    // Contiguous runs still use record_range_batch (page-aligned collect_starts).
-    if !need_fk.is_empty() {
-        let ranges = table.record_range_batch(&need_fk)?;
-        for (slot, r) in need_slot.into_iter().zip(ranges) {
-            jobs[slot].range = r;
-        }
-    }
+    // Callers stamp `range` from create.loc / inwit.loc. Missing range → skip.
 
     let body_fd = table.body_read_fd();
     let body_pub = table.body_published_len();
@@ -389,7 +379,7 @@ fn extend_truncated_txout_jobs(
         if (j.body.len() as u64) >= full_len {
             continue;
         }
-        if crate::tx_table::txout_first_page_covers_need(&j.body, &j.need_vouts) {
+        if crate::tx_table::txout_first_page_covers_need(&j.body, j.n_out, &j.need_vouts) {
             continue;
         }
         if off.saturating_add(full_len) > body_pub {
@@ -445,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn outs_first_wave_full_when_k_times_40_exceeds_room() {
+    fn outs_first_wave_full_when_k_times_38_plus_meta_exceeds_room() {
         assert_eq!(outs_first_wave_len(0, 8000, &[120]), 8000);
     }
 
@@ -455,8 +445,33 @@ mod tests {
     }
 
     #[test]
+    fn outs_first_wave_vout0_room_41_guesses_full() {
+        assert_eq!(outs_first_wave_len(4055, 8000, &[0]), 8000);
+    }
+
+    #[test]
     fn outs_first_wave_k0_fits_remainder_peeks_only_this_page() {
         assert_eq!(outs_first_wave_len(3840, 8000, &[0]), 256);
+    }
+
+    #[test]
+    fn outs_first_wave_vout0_p2tr_coinbase_fits_est() {
+        use crate::tx_table::OutputRecord;
+        let mut script = vec![0x51, 0x20];
+        script.extend_from_slice(&[0x11u8; 32]);
+        let rec = OutputRecord::unspent(6_2500_0000, script.clone());
+        assert_eq!(
+            rec.encoded_len_exact() as u64,
+            35,
+            "6.25 BTC exp+mantissa+P2TR"
+        );
+        let fat = OutputRecord::unspent(2_6843_5456, script);
+        assert_eq!(
+            fat.encoded_len_exact() as u64,
+            OUTS_GUESS_PER_VOUT,
+            "messy 5-byte amount + P2TR is the 38 guess"
+        );
+        assert_eq!(outs_first_wave_len(0, 8000, &[0]), 4096);
     }
 
     #[test]
@@ -512,6 +527,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let t = TxTable::create_tiny(&dir).unwrap();
         (dir, t)
+    }
+
+    fn stamp_txout(t: &TxTable, jobs: &mut [IdxBodyJob]) {
+        let fks: Vec<Fk> = jobs.iter().map(|j| Fk(j.id)).collect();
+        let pairs = t.create_loc_range_batch(&fks).unwrap();
+        for (j, p) in jobs.iter_mut().zip(pairs) {
+            if let Some(p) = p {
+                if j.range.is_none() {
+                    j.range = Some(p.txout);
+                }
+                j.n_out = p.n_out;
+            }
+        }
     }
 
     fn put_n(t: &TxTable, n: u8) -> Vec<Fk> {
@@ -592,6 +620,7 @@ mod tests {
         let (dir, t) = temp_tx();
         let fks = put_n(&t, 8);
         let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(stats.body_sqe_n >= 1);
         assert!(
@@ -623,16 +652,18 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (_off, full_len) = t.body.record_range(fk).unwrap();
+        let (_off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(jobs[0].body.len() as u64, full_len);
         assert_eq!(stats.extend_n, 0);
         assert_eq!(stats.guess_full_n, 1);
         let (meta, decoded, _) =
-            crate::tx_table::decode_packed_tx_outs_with_spender_rels(&jobs[0].body).unwrap();
+            crate::tx_table::decode_packed_tx_outs_with_spender_rels(&jobs[0].body, jobs[0].n_out)
+                .unwrap();
         assert_eq!(meta.output_count, 1);
         assert_eq!(decoded[0].script.len(), 6000);
         let _ = std::fs::remove_dir_all(&dir);
@@ -709,11 +740,12 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (off, full_len) = t.body.record_range(fk).unwrap();
+        let (off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         assert_eq!(outs_first_wave_len(off, full_len, &[119]), full_len);
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
         jobs[0].need_vouts = vec![119];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(jobs[0].body.len() as u64, full_len);
@@ -722,6 +754,7 @@ mod tests {
         let (_meta, live, _) =
             crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
                 &jobs[0].body,
+                jobs[0].n_out,
                 &[119],
                 None,
             )
@@ -739,13 +772,14 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (off, full_len) = t.body.record_range(fk).unwrap();
+        let (off, full_len) = t.body_range(fk).unwrap();
         let room = BODY_OS_PAGE - (off % BODY_OS_PAGE);
         assert!(room < 40, "room={room}");
         assert!(full_len > 4096);
         assert_eq!(outs_first_wave_len(off, full_len, &[0]), full_len);
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
         jobs[0].need_vouts = vec![0];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(jobs[0].body.len() as u64, full_len);
@@ -754,6 +788,7 @@ mod tests {
         let (_meta, live, _) =
             crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
                 &jobs[0].body,
+                jobs[0].n_out,
                 &[0],
                 None,
             )
@@ -770,7 +805,7 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (off, full_len) = t.body.record_range(fk).unwrap();
+        let (off, full_len) = t.body_range(fk).unwrap();
         let room = BODY_OS_PAGE - (off % BODY_OS_PAGE);
         assert!((200..=400).contains(&room), "room={room}");
         assert!(full_len > 4096);
@@ -779,6 +814,7 @@ mod tests {
         assert!(want < full_len);
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
         jobs[0].need_vouts = vec![0];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(jobs[0].body.len() as u64, want);
@@ -787,6 +823,7 @@ mod tests {
         let (_meta, live, _) =
             crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
                 &jobs[0].body,
+                jobs[0].n_out,
                 &[0],
                 None,
             )
@@ -802,10 +839,11 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (off, full_len) = t.body.record_range(fk).unwrap();
+        let (off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
         jobs[0].need_vouts = vec![0];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(
@@ -816,6 +854,7 @@ mod tests {
         assert_eq!(stats.guess_full_n, 0);
         let (meta, live, _) = crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
             &jobs[0].body,
+            jobs[0].n_out,
             &[0],
             None,
         )
@@ -833,10 +872,11 @@ mod tests {
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outs)], true)
             .unwrap()[0];
-        let (_off, full_len) = t.body.record_range(fk).unwrap();
+        let (_off, full_len) = t.body_range(fk).unwrap();
         assert!(full_len > 4096, "fixture must exceed first-page cap");
         let mut jobs = vec![IdxBodyJob::new(fk.0, None)];
         jobs[0].need_vouts = vec![79];
+        stamp_txout(&t, &mut jobs);
         let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         assert!(jobs[0].ok);
         assert_eq!(jobs[0].body.len() as u64, full_len);
@@ -845,6 +885,7 @@ mod tests {
         let (_meta, live, _) =
             crate::tx_table::decode_packed_tx_need_outs_with_spender_rels_secret(
                 &jobs[0].body,
+                jobs[0].n_out,
                 &[79],
                 None,
             )
@@ -864,6 +905,7 @@ mod tests {
         for backend in [ReadIoBackend::Uring, ReadIoBackend::Pread] {
             let mut jobs: Vec<IdxBodyJob> =
                 fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+            stamp_txout(&t, &mut jobs);
             run_idx_body_pipeline_backend(&t.body, &mut jobs, BodyMode::Full, backend).unwrap();
             let mut batch = Vec::new();
             for j in &jobs {
@@ -881,7 +923,7 @@ mod tests {
         let (dir, t) = temp_tx();
         let fks = put_n(&t, 12);
         // Unsorted + one pre-known range.
-        let (known_off, known_len) = t.body.record_range(fks[3]).unwrap();
+        let (known_off, known_len) = t.body_range(fks[3]).unwrap();
         let mut jobs: Vec<IdxBodyJob> = fks
             .iter()
             .enumerate()
@@ -897,12 +939,14 @@ mod tests {
         // Shuffle order.
         jobs.swap(0, 7);
         jobs.swap(2, 10);
+        stamp_txout(&t, &mut jobs);
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         for j in &jobs {
             assert!(j.ok, "id={}", j.id);
-            let seq = t.body.record_range(Fk(j.id)).unwrap();
+            let seq = t.body_range(Fk(j.id)).unwrap();
             assert_eq!(j.range, Some(seq));
-            let (tx, outs, rels) = decode_packed_tx_outs_with_spender_rels(&j.body).unwrap();
+            let (tx, outs, rels) =
+                decode_packed_tx_outs_with_spender_rels(&j.body, j.n_out).unwrap();
             assert_eq!(outs.len(), rels.len());
             assert_eq!(tx.output_count as usize, outs.len());
         }
@@ -914,11 +958,12 @@ mod tests {
         let (dir, t) = temp_tx();
         let fks = put_n(&t, 5);
         let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        stamp_txout(&t, &mut jobs);
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Outs).unwrap();
         for j in &jobs {
             assert!(j.ok);
             let (_tx, outs, rels) =
-                crate::tx_table::decode_packed_tx_outs_with_spender_rels(&j.body).unwrap();
+                crate::tx_table::decode_packed_tx_outs_with_spender_rels(&j.body, j.n_out).unwrap();
             assert_eq!(outs.len(), rels.len());
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -935,30 +980,50 @@ mod tests {
             .enumerate()
             .map(|(i, fk)| {
                 let range = if i % 2 == 0 {
-                    Some(t.body.record_range(*fk).unwrap())
+                    Some(t.body_range(*fk).unwrap())
                 } else {
                     None
                 };
                 IdxBodyJob::new(fk.0, range)
             })
             .collect();
+        stamp_txout(&t, &mut jobs);
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         for j in &jobs {
             assert!(j.ok, "id={}", j.id);
-            let seq = t.body.record_range(Fk(j.id)).unwrap();
+            let seq = t.body_range(Fk(j.id)).unwrap();
             assert_eq!(j.range, Some(seq));
-            let (tx, outs, rels) = decode_packed_tx_outs_with_spender_rels(&j.body).unwrap();
+            let (tx, outs, rels) =
+                decode_packed_tx_outs_with_spender_rels(&j.body, j.n_out).unwrap();
             assert_eq!(outs.len(), rels.len());
             assert_eq!(tx.output_count as usize, outs.len());
         }
         // Second wave reuses bulk_io TL ring; results stable.
         let mut jobs2: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        stamp_txout(&t, &mut jobs2);
         run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();
         for (a, b) in jobs.iter().zip(jobs2.iter()) {
             assert_eq!(a.range, b.range);
             assert_eq!(a.body, b.body);
             assert!(b.ok);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_stamped_range_fills_n_out_from_loc() {
+        let (dir, t) = temp_tx();
+        let fks = put_n(&t, 3);
+        let pair = t.create_loc_range_batch(&[fks[1]]).unwrap()[0].unwrap();
+        let mut jobs = [IdxBodyJob::new(fks[1].0, Some(pair.txout))];
+        assert_eq!(jobs[0].n_out, 0);
+        t.fill_txout_job_ranges(&mut jobs).unwrap();
+        assert_eq!(jobs[0].n_out, pair.n_out);
+        assert!(jobs[0].n_out >= 1);
+        run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
+        let (tx, outs, _) =
+            decode_packed_tx_outs_with_spender_rels(&jobs[0].body, jobs[0].n_out).unwrap();
+        assert_eq!(tx.output_count as usize, outs.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -971,6 +1036,7 @@ mod tests {
             IdxBodyJob::new(fks[0].0, None),
             IdxBodyJob::new(99_999, None),
         ];
+        stamp_txout(&t, &mut jobs);
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         assert!(!jobs[0].ok);
         assert!(jobs[1].ok);
@@ -988,6 +1054,7 @@ mod tests {
         // Wave 1: cold idx+body for all
         let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
         let t0 = Instant::now();
+        stamp_txout(&t, &mut jobs);
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         let cold_us = t0.elapsed().as_micros();
         assert_eq!(jobs.iter().filter(|j| j.ok).count(), fks.len());
@@ -1001,6 +1068,7 @@ mod tests {
             .map(|(fk, r)| IdxBodyJob::new(fk.0, *r))
             .collect();
         let t1 = Instant::now();
+        stamp_txout(&t, &mut jobs2);
         run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();
         let warm_us = t1.elapsed().as_micros();
         for (i, j) in jobs2.iter().enumerate() {

@@ -74,13 +74,15 @@ fn spend_edges_from_stamp(
                 continue;
             };
             let mut edges = Vec::with_capacity(tx.input.len());
-            for inp in &tx.input {
+            for (vin, inp) in tx.input.iter().enumerate() {
+                let vin = vin as u32;
                 if inp.previous_output.is_null() {
                     edges.push(rbitcoin_query::SpendEdge {
                         prev_txid: [0u8; 32],
                         vout: u32::MAX,
                         spend_fk: rbitcoin_primitives::Fk(sfk),
                         create_fk: rbitcoin_primitives::Fk::NULL,
+                        vin,
                     });
                     continue;
                 }
@@ -92,6 +94,7 @@ fn spend_edges_from_stamp(
                         vout,
                         spend_fk: rbitcoin_primitives::Fk(sfk),
                         create_fk: rbitcoin_primitives::Fk(pid),
+                        vin,
                     });
                     parent_vouts.entry(pid).or_default().push(vout);
                     continue;
@@ -101,6 +104,7 @@ fn spend_edges_from_stamp(
                     vout,
                     spend_fk: rbitcoin_primitives::Fk(sfk),
                     create_fk: rbitcoin_primitives::Fk::NULL,
+                    vin,
                 });
             }
             spend_edges.insert(sfk, edges);
@@ -218,10 +222,15 @@ fn denserels_by_stamped_range(
     still_need: &mut U64Map<Vec<u32>>,
     batch_parents: &mut rbitcoin_query::BatchParents,
 ) -> Result<(u64, u64), ConsensusError> {
-    let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], Vec<u32>)> = Vec::new();
+    let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], u32, Vec<u32>)> =
+        Vec::new();
     let pending = std::mem::take(still_need);
     for (id, need) in pending {
         let Some(range) = parent_pin.body_range(id) else {
+            still_need.insert(id, need);
+            continue;
+        };
+        let Some(n_out) = parent_pin.n_out(id) else {
             still_need.insert(id, need);
             continue;
         };
@@ -231,7 +240,7 @@ fn denserels_by_stamped_range(
                 "invariant: lookup stage miss (load parent create identity not stamped)",
             )));
         };
-        range_jobs.push((rbitcoin_primitives::Fk(id), range, tid, need));
+        range_jobs.push((rbitcoin_primitives::Fk(id), range, tid, n_out, need));
     }
     if range_jobs.is_empty() {
         return Ok((0, 0));
@@ -259,7 +268,7 @@ fn denserels_by_stamped_range(
     rbitcoin_query::note_confirm(&query.confirm_stats().body_tx_reads, n_range);
     rbitcoin_query::note_confirm(&query.confirm_stats().pin_new, n_range);
     let t_range_fill = Instant::now();
-    for ((fk, range, _tid, need), row) in range_jobs.into_iter().zip(decoded) {
+    for ((fk, range, _tid, _n_out, need), row) in range_jobs.into_iter().zip(decoded) {
         let Some(id) = fk.get() else {
             continue;
         };
@@ -440,16 +449,19 @@ fn stamp_spent_ranges(
         ids.into_iter().map(rbitcoin_primitives::Fk).collect();
     spent_fks.sort_unstable_by_key(|f| f.0);
     spent_fks.dedup();
+    spent_fks.retain(|fk| !batch_parents.has_abs_layout(*fk));
     if spent_fks.is_empty() {
         return Ok(());
     }
-    let spent = query
+    let loc = query
         .store()
-        .tx_spent_range_batch(&spent_fks)
+        .tx_create_loc_range_batch(&spent_fks)
         .map_err(ConsensusError::from)?;
-    for (fk, opt) in spent_fks.iter().zip(spent) {
-        if let Some(sr) = opt {
-            batch_parents.set_spent_range_only(*fk, sr);
+    for (fk, opt) in spent_fks.iter().zip(loc) {
+        let Some(p) = opt else { continue };
+        batch_parents.set_spent_range_only(*fk, p.spent);
+        if batch_parents.get_body_range(*fk).is_none() {
+            batch_parents.set_body_range_only(*fk, p.txout);
         }
     }
     Ok(())
@@ -458,7 +470,7 @@ fn stamp_spent_ranges(
 /// Ensure spend abs for every spend edge on the write batch.
 ///
 /// Lookup stamps archived-parent spent ranges; load copies them onto
-/// the pin. This idx-stamps remaining holes (same-batch creates after Class A,
+/// the pin. This loc-stamps remaining holes (same-batch creates after Class A,
 /// missing stamp). Missing abs after that is `Corrupt`. Never `put_spend*`.
 pub(super) fn ensure_spend_abs_layouts(
     query: &Query,
@@ -469,7 +481,7 @@ pub(super) fn ensure_spend_abs_layouts(
 
     let mut need: U64Map<Vec<u32>> = U64Map::default();
     for p in prepared {
-        for &(_txid, vout, sfk, cfk) in &p.spends {
+        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
             if sfk.is_null() || cfk.is_null() {
                 continue;
             }
@@ -541,12 +553,16 @@ pub(super) fn ensure_spend_abs_layouts(
             let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
                 dec
             } else {
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
-                    .map_err(|_| {
-                        ConsensusError::Store(StoreError::Corrupt(
-                            "invariant: ensure denserels decode failed",
-                        ))
-                    })?
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    &c.raw,
+                    c.n_out,
+                    Some(secret),
+                )
+                .map_err(|_| {
+                    ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: ensure denserels decode failed",
+                    ))
+                })?
             };
             // Write ensure may read txid.body (not load stage).
             tx.txid = known_create_txid_lookup(query, id, None)?;
@@ -597,7 +613,7 @@ pub(super) fn ensure_spend_abs_layouts(
     }
 
     for p in prepared {
-        for &(_txid, vout, sfk, cfk) in &p.spends {
+        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
             if sfk.is_null() || cfk.is_null() {
                 continue;
             }

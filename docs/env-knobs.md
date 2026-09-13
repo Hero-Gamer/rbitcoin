@@ -28,7 +28,6 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
 | `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS` | 25 | Wipe/empty-head MPHF range `2^bits` (26 wider; clamp 6..=26) |
 | `RBITCOIN_TX_HEAD_REBUILD_WORKERS` | min(n-cpu, free-RAM/1 GiB) | Wipe/empty-head MPHF parallelism (`1` = serial). Unset = auto. **Not** SH pack's 2 GiB cap |
-| `RBITCOIN_TX_IDX_SOFT_SPAN` | 16 GiB | Per-stem idx soft rollover (do not set above 32 GiB hard span). Does **not** cut `tx.head`. |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
@@ -72,6 +71,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | Deleted; catalog recollect/spill is gone |
 | `RBITCOIN_SH_MERGE_FANIN` | Deleted; no fan-in reduce |
 | `RBITCOIN_HEAD_SCALE` | Deleted (was test-only). Tiny vs Mainnet is store open layout (`StoreLayout::tiny` / `single`). Do not reintroduce |
+| `RBITCOIN_TX_IDX_SOFT_SPAN` | Deleted; schema 22 loc has no Class A idx mmap span. Do not reintroduce |
 
 ## Related
 

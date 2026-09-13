@@ -103,13 +103,13 @@ struct Prepared {
     header_fk: rbitcoin_primitives::Fk,
     tx_fks: Vec<rbitcoin_primitives::Fk>,
     jobs: Vec<ScriptCheckJob>,
-    /// `(prev_txid, vout, spending_tx_fk, create_tx_fk)` — create_fk for Direct
-    /// spend annotate without `tx.head`.
+    /// `(prev_txid, vout, spending_tx_fk, create_tx_fk, vin)`.
     spends: Vec<(
         [u8; 32],
         u32,
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
+        u32,
     )>,
     /// Total fees from assemble (for structural coinbase subsidy check).
     fees: i64,

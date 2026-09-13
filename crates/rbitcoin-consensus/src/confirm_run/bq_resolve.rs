@@ -120,7 +120,7 @@ pub struct BqResolveWaveStats {
     pub collect_ns: u64,
     /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
     pub head_ns: u64,
-    /// `tx_spent_range_batch` for TipOnly hits (this wave).
+    /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`).
     pub spent_ns: u64,
 }
 
@@ -327,6 +327,8 @@ pub fn confirm_bq_resolve_wave_capped(
 
     stats.keys = all_keys.len() as u32;
     let mut layer = IdMap::default();
+    let mut spent = U64Map::default();
+    let mut n_out = U64Map::default();
     let mut need: Vec<[u8; 32]> = all_keys.into_iter().collect();
     let t_head = Instant::now();
     need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
@@ -342,32 +344,22 @@ pub fn confirm_bq_resolve_wave_capped(
             .get_fk_by_txid_batch(&need)
             .map_err(ConsensusError::from)?;
         for (txid, row) in rows {
-            if let Some((fk, range)) = row {
-                layer.insert(txid, (fk, range));
+            if let Some((fk, pair)) = row {
+                layer.insert(txid, (fk, pair.txout));
+                if let Some(id) = fk.get() {
+                    spent.insert(id, pair.spent);
+                    n_out.insert(id, pair.n_out);
+                }
             }
         }
     }
     stats.head_ns = t_head.elapsed().as_nanos() as u64;
     stats.hits = layer.len() as u32;
-
-    let t_spent = Instant::now();
-    let hit_fks: Vec<rbitcoin_primitives::Fk> = layer.values().map(|(fk, _)| *fk).collect();
-    let mut spent = U64Map::default();
-    if !hit_fks.is_empty() {
-        let rows = query
-            .store()
-            .tx_spent_range_batch(&hit_fks)
-            .map_err(ConsensusError::from)?;
-        for (fk, row) in hit_fks.iter().zip(rows) {
-            if let (Some(id), Some(sr)) = (fk.get(), row) {
-                spent.insert(id, sr);
-            }
-        }
-    }
-    stats.spent_ns = t_spent.elapsed().as_nanos() as u64;
+    stats.spent_ns = 0;
     let parent_ids = BatchParentIds {
         ids: Arc::new(layer),
         spent: Arc::new(spent),
+        n_out: Arc::new(n_out),
         need_vouts: U64Map::default(),
     };
 
@@ -706,7 +698,7 @@ mod tests {
             st.head_ns
         );
         let g = g_cb.to_byte_array();
-        let (fk, _body, spent) = wave
+        let (fk, _body, spent, n_out) = wave
             .parent_ids
             .get(&g)
             .expect("genesis coinbase must be a TipOnly skeleton hit");
@@ -715,6 +707,7 @@ mod tests {
             spent.is_some(),
             "archived parent must carry spent range on the skeleton"
         );
+        assert_eq!(n_out, Some(1), "loc n_out on TipOnly skeleton");
         take_emitted(&q, &wave);
         assert!(!q.block_queue_has_height(1));
         assert!(!q.block_queue_has_height(2));

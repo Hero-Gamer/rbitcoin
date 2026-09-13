@@ -121,15 +121,14 @@ pub fn confirm_write_phase(
                     create_map_ns = t_map.elapsed().as_nanos() as u64;
                 }
                 let t_ens = Instant::now();
-                let body_ranges = query
+                let loc = query
                     .store()
-                    .tx_body_range_batch(&planned_fks)
+                    .tx_create_loc_range_batch(&planned_fks)
                     .map_err(ConsensusError::from)?;
                 fill_planned_create_layout_after_commit(
-                    query,
                     &mut batch.batch_parents,
                     &planned_fks,
-                    &body_ranges,
+                    &loc,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
                 if let Some(last) = batch.prepared.last() {
@@ -348,7 +347,7 @@ fn annotate_jobs_from_connected_hash(
             .store()
             .get_tx_full(spend_fk)
             .map_err(ConsensusError::from)?;
-        for inp in ins {
+        for (inp_i, inp) in ins.into_iter().enumerate() {
             if inp.is_coinbase() {
                 continue;
             }
@@ -376,7 +375,7 @@ fn annotate_jobs_from_connected_hash(
                     "invariant: finish_post_commit spent slot OOB",
                 )));
             }
-            let (multi, field) = query
+            let (multi, field, field_vin) = query
                 .store()
                 .txs
                 .get_output_spender_meta(create_fk, inp.prev_index)
@@ -390,23 +389,23 @@ fn annotate_jobs_from_connected_hash(
                 abs,
                 field,
                 flags,
+                field_vin,
                 create_fk,
                 vout: inp.prev_index,
                 spend_fk,
+                vin: inp_i as u32,
             });
         }
     }
     Ok(jobs)
 }
 
-/// After Class A commit, set body_range (+ spent range) for **pinned** creates
-/// still missing layout. Body ranges come from the write's one `tx_body_range_batch`
-/// (same batch as layout fill). Spent holes use one `tx_spent_range_batch`.
+/// After Class A commit, set body+spent ranges for **pinned** creates still
+/// missing layout. One `create_loc_range_batch`.
 pub(super) fn fill_planned_create_layout_after_commit(
-    query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
     planned_fks: &[rbitcoin_primitives::Fk],
-    body_ranges: &[Option<(u64, u64)>],
+    loc: &[Option<rbitcoin_store::CreateLocPair>],
 ) -> Result<(), ConsensusError> {
     if planned_fks.is_empty() {
         return Ok(());
@@ -419,28 +418,14 @@ pub(super) fn fill_planned_create_layout_after_commit(
     if missing.is_empty() {
         return Ok(());
     }
-    let mut need_spent: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    for (i, fk) in planned_fks.iter().enumerate() {
+    for (fk, pair) in planned_fks.iter().zip(loc.iter()) {
         let Some(id) = fk.get() else { continue };
         if !missing.contains(&id) {
             continue;
         }
-        if let Some((off, len)) = body_ranges.get(i).copied().flatten() {
-            batch_parents.set_body_range_only(*fk, (off, len));
-        }
-        need_spent.push(*fk);
-    }
-    if need_spent.is_empty() {
-        return Ok(());
-    }
-    let spent = query
-        .store()
-        .tx_spent_range_batch(&need_spent)
-        .map_err(ConsensusError::from)?;
-    for (fk, spent_r) in need_spent.iter().zip(spent) {
-        if let Some(sr) = spent_r {
-            batch_parents.set_spent_range_only(*fk, sr);
-        }
+        let Some(p) = pair else { continue };
+        batch_parents.set_body_range_only(*fk, p.txout);
+        batch_parents.set_spent_range_only(*fk, p.spent);
     }
     Ok(())
 }
@@ -530,7 +515,7 @@ fn records_from_wire(
     }
     let mut spend_fk: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> =
         HashMap::with_capacity(p.spends.len());
-    for &(pt, pv, _, cfk) in &p.spends {
+    for &(pt, pv, _, cfk, _) in &p.spends {
         spend_fk.entry((pt, pv)).or_insert(cfk);
     }
 
@@ -639,7 +624,7 @@ mod records_from_wire_tests {
 
     fn prepared(
         height: u32,
-        spends: Vec<([u8; 32], u32, Fk, Fk)>,
+        spends: Vec<([u8; 32], u32, Fk, Fk, u32)>,
         txids: Vec<[u8; 32]>,
     ) -> Prepared {
         Prepared {
@@ -685,7 +670,7 @@ mod records_from_wire_tests {
         };
         let p = prepared(
             10,
-            vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL)],
+            vec![(cb_id.to_byte_array(), 0, Fk(2), Fk::NULL, 0)],
             vec![],
         );
         let parents = rbitcoin_query::BatchParents::new();

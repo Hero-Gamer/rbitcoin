@@ -4,7 +4,7 @@ use super::*;
 
 /// Lookup-stamped external parent material for load body denserels.
 ///
-/// **Lookup** fills this via `tx.head` / `tx.idx` / `txid.body` (never `tx.body`).
+/// **Lookup** fills this via `tx.head` / `create.loc` / `txid.body` (never `txout.body`).
 /// **Load** denserels by range using only [`rbitcoin_query::ParentIdent`] (+ plan offline pins).
 /// Integer create_fk map uses [`U64Map`] (identity hasher) — pack-scale win over SipHash.
 #[derive(Debug, Default, Clone)]
@@ -45,6 +45,11 @@ impl ParentPinStamp {
     #[inline]
     pub(super) fn spent_range(&self, create_fk_id: u64) -> Option<(u64, u64)> {
         self.idents.get(&create_fk_id).and_then(|p| p.spent)
+    }
+
+    #[inline]
+    pub(super) fn n_out(&self, create_fk_id: u64) -> Option<u32> {
+        self.idents.get(&create_fk_id).and_then(|p| p.n_out)
     }
 
     #[inline]
@@ -674,6 +679,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: std::sync::Arc::new(m),
             spent: std::sync::Arc::new(rbitcoin_query::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: rbitcoin_query::U64Map::default(),
         };
 

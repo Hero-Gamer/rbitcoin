@@ -1154,6 +1154,7 @@ pub fn with_thread_local<R>(
 /// Kind byte for [`pack_ud`]. Distinct per machine so a leftover CQE cannot
 /// complete a different stage's slot (probe slot `5` ≠ ID op `5`).
 pub const KIND_BULK_PREAD: u8 = 1;
+#[allow(dead_code)]
 pub const KIND_IDX: u8 = 2;
 pub const KIND_PROBE: u8 = 3;
 pub const KIND_BULK_PWRITE: u8 = 4;

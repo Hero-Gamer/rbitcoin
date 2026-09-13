@@ -63,7 +63,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatadirOpts {
     pub path: PathBuf,
-    /// When set, Class A `inwit.body` / `inwit.idx/` live under `{cold}/store`.
+    /// When set, Class A `inwit.body` / `inwit.loc` live under `{cold}/store`.
     pub cold: Option<PathBuf>,
 }
 

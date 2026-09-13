@@ -62,6 +62,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **22:** `create.loc` + `inwit.loc`; LAYOUT17 omits `output_count`. Spent
+///         slot is flags + u40 spend fk + u16 vin. Occupied 21 Class A
+///         refused (wipe + IBD). Empty 21 rewrites `meta` and unlinks
+///         leftover `spent.off` and `{txout,spent,inwit}.idx`.
 /// **21:** Drop `spent.idx`; leftover unlinked; rewrite `meta` 20→21. Spent
 ///         ranges are `n_out` prefix of `txout` (sparse `spent.off`).
 /// **20:** Sealed `tx.head` value-assigned packed BDZ (no `.rel`). Occupied
@@ -80,18 +84,20 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 21;
+pub const SCHEMA_VERSION: u16 = 22;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **21** is current (`spent.idx` gone; leftover unlinked; `meta` rewritten).
-/// Schema **20** table headers still open. Schema **18/19** with occupied `tx.head`
-/// or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`. Schema **17**
-/// still refuses populated `tx.head` / `scripthash*` or rewrites empty indexes.
-/// Schema **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
+/// Schema **22** is current (`create.loc` + `inwit.loc`; occupied 21 Class A
+/// refused). Schema **21** empty Class A rewrites `meta`. Schema **20** table
+/// headers still open when Class A is empty. Schema **18/19** with occupied
+/// `tx.head` or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`.
+/// Schema **17** still refuses populated `tx.head` / `scripthash*` or rewrites
+/// empty indexes. Schema **13**–**16** still soft-open empty Class A / empty SH
+/// (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 21 && matches!(ver, 13..=20))
+    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 22 && matches!(ver, 13..=21))
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -227,6 +233,8 @@ pub enum TableKind {
     Inwit = 16,
     /// Class A sole-spender slots (`spent.body`, 8 B × n_out).
     Spent = 17,
+    /// Create/inwit delta locators (`create.loc` / `inwit.loc` and `.ovf`).
+    DeltaLoc = 18,
 }
 
 impl TableKind {
@@ -247,6 +255,7 @@ impl TableKind {
             15 => Some(TableKind::SpTweaks),
             16 => Some(TableKind::Inwit),
             17 => Some(TableKind::Spent),
+            18 => Some(TableKind::DeltaLoc),
             _ => None,
         }
     }
@@ -292,7 +301,7 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in [1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17] {
+        for v in [1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18] {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
@@ -308,13 +317,15 @@ mod tests {
         assert_eq!(TableKind::SpTweaks.as_u16(), 15);
         assert_eq!(TableKind::Inwit.as_u16(), 16);
         assert_eq!(TableKind::Spent.as_u16(), 17);
+        assert_eq!(TableKind::DeltaLoc.as_u16(), 18);
     }
 
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 21);
+        assert_eq!(SCHEMA_VERSION, 22);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(22));
         assert!(schema_file_openable(21));
         assert!(schema_file_openable(20));
         assert!(schema_file_openable(19));

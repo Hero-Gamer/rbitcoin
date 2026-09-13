@@ -17,7 +17,7 @@ use crate::compact::output_flags;
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use crate::spender_table::SpenderTable;
-use crate::tx_table::{decode_spent_slot_v17, encode_spent_slot_v17, OutputRecord, TxTable};
+use crate::tx_table::{decode_spent_slot, encode_spent_slot, OutputRecord, TxTable};
 use crate::uring_session::{self, UringSession};
 use crate::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 
 const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
 const MAX_SLOTS: usize = 128;
+type SpentAbsWrite = (u64, Fk, u32, Fk, u32, [u8; META_LEN]);
 
 enum Phase {
     Reading,
@@ -46,12 +47,12 @@ struct Slot {
 pub fn put_spend_batch_by_abs_meta_uring(
     txs: &TxTable,
     spenders: &SpenderTable,
-    edges: &[(u64, Fk, u32, Fk)],
-) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    edges: &[(u64, Fk, u32, Fk, u32)],
+) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if edges.is_empty() {
         return Ok(Vec::new());
     }
-    for &(_, _, _, sfk) in edges {
+    for &(_, _, _, sfk, _) in edges {
         if sfk.is_null() {
             return Err(StoreError::InvalidFk);
         }
@@ -61,13 +62,13 @@ pub fn put_spend_batch_by_abs_meta_uring(
     let body_path = txs.spent.body_file_path().to_path_buf();
     let body_pub = txs.spent.body_published_len();
 
-    let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
-    let mut work: Vec<(u64, Fk, u32, Fk)> = Vec::with_capacity(edges.len());
-    for &(abs, cfk, vout, sfk) in edges {
+    let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
+    let mut work: Vec<(u64, Fk, u32, Fk, u32)> = Vec::with_capacity(edges.len());
+    for &(abs, cfk, vout, sfk, vin) in edges {
         if abs.saturating_add(META_LEN as u64) > body_pub {
-            cold.push((cfk, vout, sfk));
+            cold.push((cfk, vout, sfk, vin));
         } else {
-            work.push((abs, cfk, vout, sfk));
+            work.push((abs, cfk, vout, sfk, vin));
         }
     }
     if work.is_empty() {
@@ -92,7 +93,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                    pending: &mut VecDeque<usize>,
                    abs_busy: &mut U64Set,
                    abs_wait: &mut U64Map<VecDeque<usize>>,
-                   work: &[(u64, Fk, u32, Fk)],
+                   work: &[(u64, Fk, u32, Fk, u32)],
                    in_flight: &mut usize,
                    body_fd: IoHandle|
          -> Result<(), StoreError> {
@@ -163,7 +164,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 }
                 in_flight = in_flight.saturating_sub(1);
                 let edge_i = st.edge_i;
-                let (abs, _create_fk, _vout, spend_fk) = work[edge_i];
+                let (abs, _create_fk, _vout, spend_fk, spend_vin) = work[edge_i];
 
                 match st.phase {
                     Phase::Reading => {
@@ -173,42 +174,27 @@ pub fn put_spend_batch_by_abs_meta_uring(
                             return Err(e);
                         }
 
-                        let (flags0, field) = decode_spent_slot_v17(&st.buf)?;
-                        let multi = flags0 & output_flags::MULTI_SPENDER != 0;
-
-                        let (new_multi, new_field, skip_write) = if !multi && field.is_null() {
-                            (false, spend_fk, false)
-                        } else if !multi && field == spend_fk {
-                            (false, field, true)
-                        } else if !multi {
-                            let e1 = spenders.append(field, Fk::NULL)?;
-                            let e2 = spenders.append(spend_fk, e1)?;
-                            (true, e2, false)
-                        } else {
-                            let e = spenders.append(spend_fk, field)?;
-                            (true, e, false)
-                        };
-
-                        if skip_write {
-                            free_slots.push(slot);
-                            abs_busy.remove(&abs);
-                            if let Some(q) = abs_wait.get_mut(&abs) {
-                                if let Some(next_ei) = q.pop_front() {
-                                    pending.push_front(next_ei);
+                        let (flags0, field, field_vin) = decode_spent_slot(&st.buf)?;
+                        match decide_annotate(
+                            field, flags0, field_vin, spend_fk, spend_vin, spenders,
+                        )? {
+                            AnnotateOp::Skip => {
+                                free_slots.push(slot);
+                                abs_busy.remove(&abs);
+                                if let Some(q) = abs_wait.get_mut(&abs) {
+                                    if let Some(next_ei) = q.pop_front() {
+                                        pending.push_front(next_ei);
+                                    }
+                                    if q.is_empty() {
+                                        abs_wait.remove(&abs);
+                                    }
                                 }
-                                if q.is_empty() {
-                                    abs_wait.remove(&abs);
-                                }
+                                continue;
                             }
-                            continue;
+                            AnnotateOp::Write(meta) => {
+                                st.buf = meta;
+                            }
                         }
-
-                        let new_flags = if new_multi {
-                            flags0 | output_flags::MULTI_SPENDER
-                        } else {
-                            flags0 & !output_flags::MULTI_SPENDER
-                        };
-                        st.buf = encode_spent_slot_v17(new_flags, new_field)?;
                         st.phase = Phase::Writing;
                         // Keep slot occupied for write buffer stability.
                         slots[slot] = Some(st);
@@ -259,13 +245,13 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
 
         while let Some(ei) = pending.pop_front() {
-            let (_, cfk, vout, sfk) = work[ei];
-            cold.push((cfk, vout, sfk));
+            let (_, cfk, vout, sfk, vin) = work[ei];
+            cold.push((cfk, vout, sfk, vin));
         }
         for q in abs_wait.into_values() {
             for ei in q {
-                let (_, cfk, vout, sfk) = work[ei];
-                cold.push((cfk, vout, sfk));
+                let (_, cfk, vout, sfk, vin) = work[ei];
+                cold.push((cfk, vout, sfk, vin));
             }
         }
 
@@ -278,7 +264,7 @@ fn next_ready(
     pending: &mut VecDeque<usize>,
     abs_busy: &U64Set,
     abs_wait: &mut U64Map<VecDeque<usize>>,
-    work: &[(u64, Fk, u32, Fk)],
+    work: &[(u64, Fk, u32, Fk, u32)],
 ) -> Option<usize> {
     while let Some(ei) = pending.pop_front() {
         let abs = work[ei].0;
@@ -305,28 +291,30 @@ enum AnnotateOp {
 fn decide_annotate(
     field: Fk,
     flags: u8,
+    field_vin: u32,
     spend_fk: Fk,
+    spend_vin: u32,
     spenders: &SpenderTable,
 ) -> Result<AnnotateOp, StoreError> {
     let multi = flags & output_flags::MULTI_SPENDER != 0;
     if !multi && field.is_null() {
-        let meta = encode_spent_slot_v17(flags & !output_flags::MULTI_SPENDER, spend_fk)?;
+        let meta = encode_spent_slot(flags & !output_flags::MULTI_SPENDER, spend_fk, spend_vin)?;
         return Ok(AnnotateOp::Write(meta));
     }
-    if !multi && field == spend_fk {
+    if !multi && field == spend_fk && field_vin == spend_vin {
         return Ok(AnnotateOp::Skip);
     }
     if !multi {
-        let e1 = spenders.append(field, Fk::NULL)?;
-        let e2 = spenders.append(spend_fk, e1)?;
-        let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e2)?;
+        let e1 = spenders.append(field, field_vin, Fk::NULL)?;
+        let e2 = spenders.append(spend_fk, spend_vin, e1)?;
+        let meta = encode_spent_slot(flags | output_flags::MULTI_SPENDER, e2, 0)?;
         return Ok(AnnotateOp::Write(meta));
     }
-    if multi_list_contains(spenders, field, spend_fk)? {
+    if multi_list_contains(spenders, field, spend_fk, spend_vin)? {
         return Ok(AnnotateOp::Skip);
     }
-    let e = spenders.append(spend_fk, field)?;
-    let meta = encode_spent_slot_v17(flags | output_flags::MULTI_SPENDER, e)?;
+    let e = spenders.append(spend_fk, spend_vin, field)?;
+    let meta = encode_spent_slot(flags | output_flags::MULTI_SPENDER, e, 0)?;
     Ok(AnnotateOp::Write(meta))
 }
 
@@ -334,6 +322,7 @@ fn multi_list_contains(
     spenders: &SpenderTable,
     head: Fk,
     spend_fk: Fk,
+    spend_vin: u32,
 ) -> Result<bool, StoreError> {
     let mut cur = head;
     let mut n = 0u32;
@@ -342,8 +331,8 @@ fn multi_list_contains(
         if n > 1_000_000 {
             return Err(StoreError::Corrupt("invariant: spender multi-list cycle"));
         }
-        let (sfk, next) = spenders.get(Fk(id))?;
-        if sfk == spend_fk {
+        let (sfk, vin, next) = spenders.get(Fk(id))?;
+        if sfk == spend_fk && vin == spend_vin {
             return Ok(true);
         }
         cur = next;
@@ -356,7 +345,7 @@ fn multi_list_contains(
 struct SpentPageGroup {
     off: u64,
     len: usize,
-    writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>,
+    writes: Vec<SpentAbsWrite>,
 }
 
 /// Page span covering the 8-byte slot at `abs` (`[lo, hi)`).
@@ -384,19 +373,13 @@ fn clip_spent_page_window(span_lo: u64, span_hi: u64, body_pub: u64) -> Option<(
 /// Same-page slots share one RMW. An 8 B slot that straddles a page boundary
 /// extends the span so the next page's writes merge (no overlapping in-flight
 /// RMWs). Adjacent pages without a straddle stay separate.
-fn group_writes_by_spent_page(
-    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-    body_pub: u64,
-) -> Vec<SpentPageGroup> {
+fn group_writes_by_spent_page(writes: &[SpentAbsWrite], body_pub: u64) -> Vec<SpentPageGroup> {
     let mut groups = Vec::new();
     let mut cur_lo = 0u64;
     let mut cur_hi = 0u64;
-    let mut cur: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])> = Vec::new();
+    let mut cur: Vec<SpentAbsWrite> = Vec::new();
 
-    let flush = |groups: &mut Vec<SpentPageGroup>,
-                 lo: u64,
-                 hi: u64,
-                 cur: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])>| {
+    let flush = |groups: &mut Vec<SpentPageGroup>, lo: u64, hi: u64, cur: Vec<SpentAbsWrite>| {
         if cur.is_empty() {
             return;
         }
@@ -432,12 +415,8 @@ fn group_writes_by_spent_page(
     groups
 }
 
-fn poke_spent_page(
-    buf: &mut [u8],
-    off: u64,
-    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-) -> Result<(), StoreError> {
-    for &(abs, _, _, _, meta) in writes {
+fn poke_spent_page(buf: &mut [u8], off: u64, writes: &[SpentAbsWrite]) -> Result<(), StoreError> {
+    for &(abs, _, _, _, _, meta) in writes {
         let i = abs.saturating_sub(off) as usize;
         if i.saturating_add(META_LEN) > buf.len() {
             return Err(StoreError::Corrupt(
@@ -449,9 +428,9 @@ fn poke_spent_page(
     Ok(())
 }
 
-fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk)>, writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])]) {
-    for &(_, cfk, vout, sfk, _) in writes {
-        cold.push((cfk, vout, sfk));
+fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk, u32)>, writes: &[SpentAbsWrite]) {
+    for &(_, cfk, vout, sfk, vin, _) in writes {
+        cold.push((cfk, vout, sfk, vin));
     }
 }
 
@@ -462,17 +441,17 @@ fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk)>, writes: &[(u64, Fk, u32, Fk, 
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,
-    abs_edges: &[(u64, Fk, u32, Fk)],
-    known: &[(Fk, u8)],
+    abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    known: &[(Fk, u8, u32)],
     backend: crate::io_backend::WriteIoBackend,
-) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if abs_edges.is_empty() {
         return Ok(Vec::new());
     }
     if abs_edges.len() != known.len() {
         return Err(StoreError::Corrupt("spend annotate known length mismatch"));
     }
-    for &(_, _, _, sfk) in abs_edges {
+    for &(_, _, _, sfk, _) in abs_edges {
         if sfk.is_null() {
             return Err(StoreError::InvalidFk);
         }
@@ -482,19 +461,19 @@ pub fn put_spend_batch_by_abs_meta_known(
     order.sort_unstable_by_key(|&i| abs_edges[i].0);
 
     let body_pub = txs.spent.body_published_len();
-    let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
-    let mut writes: Vec<(u64, Fk, u32, Fk, [u8; META_LEN])> = Vec::with_capacity(order.len());
+    let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
+    let mut writes: Vec<SpentAbsWrite> = Vec::with_capacity(order.len());
 
     for &i in &order {
-        let (abs, cfk, vout, sfk) = abs_edges[i];
+        let (abs, cfk, vout, sfk, vin) = abs_edges[i];
         if abs.saturating_add(META_LEN as u64) > body_pub {
-            cold.push((cfk, vout, sfk));
+            cold.push((cfk, vout, sfk, vin));
             continue;
         }
-        let (field, flags) = known[i];
-        match decide_annotate(field, flags, sfk, spenders)? {
+        let (field, flags, field_vin) = known[i];
+        match decide_annotate(field, flags, field_vin, sfk, vin, spenders)? {
             AnnotateOp::Skip => {}
-            AnnotateOp::Write(meta) => writes.push((abs, cfk, vout, sfk, meta)),
+            AnnotateOp::Write(meta) => writes.push((abs, cfk, vout, sfk, vin, meta)),
         }
     }
 
@@ -515,9 +494,9 @@ pub fn put_spend_batch_by_abs_meta_known(
 /// libc page-RMW (pread + pwrite, no ring) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_pwrite(
     txs: &TxTable,
-    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-    mut cold: Vec<(Fk, u32, Fk)>,
-) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    writes: &[SpentAbsWrite],
+    mut cold: Vec<(Fk, u32, Fk, u32)>,
+) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     let body_pub = txs.spent.body_published_len();
     let groups = group_writes_by_spent_page(writes, body_pub);
     for g in &groups {
@@ -541,9 +520,9 @@ fn put_spend_batch_pure_write_pwrite(
 /// io_uring page-RMW (pread page → poke → pwrite page) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_uring(
     txs: &TxTable,
-    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
-    cold: Vec<(Fk, u32, Fk)>,
-) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    writes: &[SpentAbsWrite],
+    cold: Vec<(Fk, u32, Fk, u32)>,
+) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if writes.is_empty() {
         return Ok(cold);
     }
@@ -763,20 +742,20 @@ mod tests {
             let (cfk, off, _len) = put_one(&t);
             let abs = crate::tx_table::spent_abs(off, 0);
             let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-            let (field, flags) = bulk[0].expect("meta");
+            let (field, flags, _vin) = bulk[0].expect("meta");
             assert!(field.is_null());
             let sfk = Fk(99);
             let cold = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs, cfk, 0, sfk)],
-                &[(field, flags)],
+                &[(abs, cfk, 0, sfk, 0)],
+                &[(field, flags, 0)],
                 backend,
             )
             .unwrap();
             assert!(cold.is_empty());
             let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-            let (f2, fl2) = bulk2[0].unwrap();
+            let (f2, fl2, _vin) = bulk2[0].unwrap();
             assert_eq!(f2, sfk);
             assert_eq!(fl2 & output_flags::MULTI_SPENDER, 0);
             let _ = std::fs::remove_dir_all(&dir);
@@ -795,14 +774,14 @@ mod tests {
         let _ = len;
         let abs = crate::tx_table::spent_abs(off, 0);
         let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-        let (field, flags) = bulk[0].unwrap();
+        let (field, flags, _vin) = bulk[0].unwrap();
         let _ = uring_session::tls_take_sqe_n();
         let _ = uring_session::tls_take_sqe_rw_nonzero();
         let cold = put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, Fk(55))],
-            &[(field, flags)],
+            &[(abs, cfk, 0, Fk(55), 0)],
+            &[(field, flags, 0)],
             crate::io_backend::WriteIoBackend::Uring,
         )
         .unwrap();
@@ -824,11 +803,12 @@ mod tests {
                 let (cfk, off, _len) = put_one(&t);
                 let abs = crate::tx_table::spent_abs(off, 0);
                 let sfk = Fk(88);
-                let cold = put_spend_batch_by_abs_meta_uring(&t, &spenders, &[(abs, cfk, 0, sfk)])
-                    .expect("pool rmw");
+                let cold =
+                    put_spend_batch_by_abs_meta_uring(&t, &spenders, &[(abs, cfk, 0, sfk, 0)])
+                        .expect("pool rmw");
                 assert!(cold.is_empty());
                 let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-                let (field, flags) = bulk[0].unwrap();
+                let (field, flags, _vin) = bulk[0].unwrap();
                 assert_eq!(field, sfk);
                 assert_eq!(flags & output_flags::MULTI_SPENDER, 0);
                 let _ = std::fs::remove_dir_all(&dir);
@@ -844,12 +824,12 @@ mod tests {
         let abs = crate::tx_table::spent_abs(off, 0);
         let sfk = Fk(77);
         let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-        let (field, flags) = bulk[0].unwrap();
+        let (field, flags, _vin) = bulk[0].unwrap();
         put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, sfk)],
-            &[(field, flags)],
+            &[(abs, cfk, 0, sfk, 0)],
+            &[(field, flags, 0)],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
         .unwrap();
@@ -857,8 +837,8 @@ mod tests {
         put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, sfk)],
-            &[(sfk, 0)],
+            &[(abs, cfk, 0, sfk, 0)],
+            &[(sfk, 0, 0)],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
         .unwrap();
@@ -889,7 +869,7 @@ mod tests {
         let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
         let sfk = Fk(9);
         let fks = t
-            .put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk)]])
+            .put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk, 0)]])
             .unwrap();
         let cfk = fks[0];
         let (off, _) = t.spent_range(cfk).unwrap();
@@ -900,8 +880,8 @@ mod tests {
         let cold = put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, sfk)],
-            &[(sfk, 0)],
+            &[(abs, cfk, 0, sfk, 0)],
+            &[(sfk, 0, 0)],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
         .unwrap();
@@ -910,8 +890,8 @@ mod tests {
             let cold_u = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs, cfk, 0, sfk)],
-                &[(sfk, 0)],
+                &[(abs, cfk, 0, sfk, 0)],
+                &[(sfk, 0, 0)],
                 crate::io_backend::WriteIoBackend::Uring,
             )
             .unwrap();
@@ -941,7 +921,7 @@ mod tests {
         put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, a)],
+            &[(abs, cfk, 0, a, 0)],
             &[known0],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
@@ -950,19 +930,19 @@ mod tests {
         put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, b)],
+            &[(abs, cfk, 0, b, 0)],
             &[known1],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
         .unwrap();
-        let (field, flags) = t.get_spender_meta_at_abs_batch(&[abs]).unwrap()[0].unwrap();
+        let (field, flags, _vin) = t.get_spender_meta_at_abs_batch(&[abs]).unwrap()[0].unwrap();
         assert_ne!(flags & output_flags::MULTI_SPENDER, 0);
         let n0 = spenders.count();
         put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs, cfk, 0, b)],
-            &[(field, flags)],
+            &[(abs, cfk, 0, b, 0)],
+            &[(field, flags, 0)],
             crate::io_backend::WriteIoBackend::Pwrite,
         )
         .unwrap();
@@ -993,7 +973,7 @@ mod tests {
             let cold_s = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs1, cfk, 1, sentinel)],
+                &[(abs1, cfk, 1, sentinel, 0)],
                 &[known1],
                 backend,
             )
@@ -1009,7 +989,7 @@ mod tests {
             let cold = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs0, cfk, 0, Fk(10)), (abs2, cfk, 2, Fk(12))],
+                &[(abs0, cfk, 0, Fk(10), 0), (abs2, cfk, 2, Fk(12), 0)],
                 &[known0, known2],
                 backend,
             )
@@ -1061,7 +1041,7 @@ mod tests {
             let cold = put_spend_batch_by_abs_meta_known(
                 &t,
                 &spenders,
-                &[(abs0, cfk, 0, Fk(1)), (abs_last, cfk, 511, Fk(2))],
+                &[(abs0, cfk, 0, Fk(1), 0), (abs_last, cfk, 511, Fk(2), 0)],
                 &[k0, k1],
                 backend,
             )
@@ -1091,7 +1071,7 @@ mod tests {
         let cold = put_spend_batch_by_abs_meta_known(
             &t,
             &spenders,
-            &[(abs0, cfk, 0, Fk(3)), (abs2, cfk, 2, Fk(4))],
+            &[(abs0, cfk, 0, Fk(3), 0), (abs2, cfk, 2, Fk(4), 0)],
             &[k0, k2],
             crate::io_backend::WriteIoBackend::Uring,
         )
@@ -1114,8 +1094,8 @@ mod tests {
         let meta = [1u8; META_LEN];
         let slot = META_LEN as u64;
         let writes = [
-            (16u64, Fk(1), 0, Fk(10), meta),
-            (16 + 2 * slot, Fk(1), 2, Fk(12), meta),
+            (16u64, Fk(1), 0, Fk(10), 0, meta),
+            (16 + 2 * slot, Fk(1), 2, Fk(12), 0, meta),
         ];
         let rec = 3 * slot;
         let g = group_writes_by_spent_page(&writes, 16 + rec);
@@ -1129,8 +1109,8 @@ mod tests {
     fn group_writes_by_spent_page_keeps_distinct_pages() {
         let meta = [1u8; META_LEN];
         let writes = [
-            (16u64, Fk(1), 0, Fk(10), meta),
-            (4096u64 + 16, Fk(2), 0, Fk(12), meta),
+            (16u64, Fk(1), 0, Fk(10), 0, meta),
+            (4096u64 + 16, Fk(2), 0, Fk(12), 0, meta),
         ];
         let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
         assert_eq!(g.len(), 2);
@@ -1147,8 +1127,8 @@ mod tests {
         let second = first + slot;
         let end = second + slot;
         let writes = [
-            (first, Fk(1), 0, Fk(10), meta),
-            (second, Fk(1), 1, Fk(11), meta),
+            (first, Fk(1), 0, Fk(10), 0, meta),
+            (second, Fk(1), 1, Fk(11), 0, meta),
         ];
         let g = group_writes_by_spent_page(&writes, end);
         assert_eq!(g.len(), 1);

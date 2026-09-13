@@ -42,6 +42,7 @@ fn note_body_ok_read() {
 pub struct CombinedCreate {
     pub fk: Fk,
     pub body_range: (u64, u64),
+    pub n_out: u32,
     pub raw: Vec<u8>,
     /// When `mode == Full`, one full decode lives here so callers do not re-decode.
     pub decoded_full: Option<(
@@ -58,10 +59,10 @@ pub struct CombinedCreate {
     )>,
 }
 
-/// Load creates by fk via idx→body, decode once.
+/// Load creates by fk via loc→body, decode once.
 ///
 /// Each successful body fetch increments [`body_ok_reads`]. Ranges are always
-/// resolved from `tx.idx` (`range=None` on jobs). Callers fill schema-13 zero
+/// resolved from `create.loc` (`range=None` on jobs). Callers fill schema-13 zero
 /// body `TxRecord.txid` from plan RAM maps when needed — this path never seeds
 /// a process pin map and does not fill txid from `txid.body` for that purpose.
 ///
@@ -104,7 +105,7 @@ pub fn load_creates_once(
         match mode {
             IdxBodyMode::Full => {
                 if let Ok((tx, _empty_ins, outs, rels)) =
-                    decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
+                    decode_packed_tx_with_spender_rels_secret(&job.body, job.n_out, Some(secret))
                 {
                     let Some(ij) = inwit_jobs.get(i) else {
                         return Err(StoreError::Corrupt(
@@ -129,9 +130,11 @@ pub fn load_creates_once(
                 }
             }
             IdxBodyMode::Outs => {
-                if let Ok((tx, outs, rels)) =
-                    decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
-                {
+                if let Ok((tx, outs, rels)) = decode_packed_tx_outs_with_spender_rels_secret(
+                    &job.body,
+                    job.n_out,
+                    Some(secret),
+                ) {
                     // Leave txid zero; caller fills from plan
                     // `external_parents` / batch maps only.
                     decoded_outs = Some((tx, outs, rels));
@@ -145,6 +148,7 @@ pub fn load_creates_once(
         out.push(CombinedCreate {
             fk: *fk,
             body_range: range,
+            n_out: job.n_out,
             raw: job.body,
             decoded_full,
             decoded_outs,
@@ -628,6 +632,11 @@ mod tests {
         );
         let (_dtx, _ins, douts, _) = decode_packed_tx_with_spender_rels_secret(
             &creates[0].raw,
+            creates[0]
+                .decoded_full
+                .as_ref()
+                .map(|(tx, _, _, _)| tx.output_count)
+                .unwrap_or(1),
             Some(q.store().txs.store_secret()),
         )
         .unwrap();

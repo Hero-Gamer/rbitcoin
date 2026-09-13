@@ -454,6 +454,7 @@ fn chunk_parent_ids_vouts_are_per_chunk() {
     let wave = BatchParentIds {
         ids: Arc::new(ids),
         spent: Arc::new(rbitcoin_query::U64Map::default()),
+        n_out: Default::default(),
         need_vouts: rbitcoin_query::U64Map::default(),
     };
     let spend = Block {
@@ -1451,7 +1452,7 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
     };
     hub.query.connect_block(Height(1), &h1, &[ta1]).unwrap();
     let spend_fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
-    let (multi, field) = hub
+    let (multi, field, _vin) = hub
         .query
         .store()
         .txs
@@ -1475,7 +1476,7 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
 
     finish_connected_write_after_session_fault(&hub.query, &[(1, hash1)]).expect("in-place finish");
 
-    let (multi2, field2) = hub
+    let (multi2, field2, _vin2) = hub
         .query
         .store()
         .txs

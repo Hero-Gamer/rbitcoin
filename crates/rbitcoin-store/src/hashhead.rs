@@ -81,18 +81,16 @@ pub enum HeadScale {
     Mainnet,
 }
 
-/// Open-time head knobs (scale plus rebuild / idx-span). Copy so table
-/// constructors can take them without cloning [`crate::StoreLayout`].
+/// Open-time head knobs (scale plus wipe/empty-head MPHF rebuild). Copy so
+/// table constructors can take them without cloning [`crate::StoreLayout`].
 ///
 /// `None` on the optional fields means “read the documented unstable env at
-/// open” (`RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS`, `RBITCOIN_TX_HEAD_REBUILD_WORKERS`,
-/// `RBITCOIN_TX_IDX_SOFT_SPAN`).
+/// open” (`RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS`, `RBITCOIN_TX_HEAD_REBUILD_WORKERS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadOpenOpts {
     pub scale: HeadScale,
     pub rebuild_seal_bits: Option<u32>,
     pub rebuild_workers: Option<usize>,
-    pub idx_soft_span: Option<u64>,
 }
 
 impl HeadOpenOpts {
@@ -100,14 +98,12 @@ impl HeadOpenOpts {
         scale: HeadScale::Mainnet,
         rebuild_seal_bits: None,
         rebuild_workers: None,
-        idx_soft_span: None,
     };
 
     pub const TINY: Self = Self {
         scale: HeadScale::Tiny,
         rebuild_seal_bits: None,
         rebuild_workers: None,
-        idx_soft_span: None,
     };
 
     pub fn tiny() -> Self {
@@ -125,11 +121,6 @@ impl HeadOpenOpts {
 
     pub fn with_rebuild_workers(mut self, n: usize) -> Self {
         self.rebuild_workers = Some(n);
-        self
-    }
-
-    pub fn with_idx_soft_span(mut self, bytes: u64) -> Self {
-        self.idx_soft_span = Some(bytes);
         self
     }
 }

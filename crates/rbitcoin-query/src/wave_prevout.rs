@@ -7,4 +7,6 @@ pub struct SpendEdge {
     pub vout: u32,
     pub spend_fk: rbitcoin_primitives::Fk,
     pub create_fk: rbitcoin_primitives::Fk,
+    /// Spending input index on `spend_fk` (annotated into the spent slot).
+    pub vin: u32,
 }

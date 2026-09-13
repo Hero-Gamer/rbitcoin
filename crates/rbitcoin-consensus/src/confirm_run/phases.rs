@@ -325,12 +325,17 @@ pub(super) fn post_commit(
 ) -> Result<u64, ConsensusError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !annotate.is_empty() {
-        let mut abs_edges: Vec<(u64, rbitcoin_primitives::Fk, u32, rbitcoin_primitives::Fk)> =
-            Vec::with_capacity(annotate.len());
-        let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::with_capacity(annotate.len());
+        let mut abs_edges: Vec<(
+            u64,
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+            u32,
+        )> = Vec::with_capacity(annotate.len());
+        let mut known: Vec<(rbitcoin_primitives::Fk, u8, u32)> = Vec::with_capacity(annotate.len());
         for job in annotate {
-            abs_edges.push((job.abs, job.create_fk, job.vout, job.spend_fk));
-            known.push((job.field, job.flags));
+            abs_edges.push((job.abs, job.create_fk, job.vout, job.spend_fk, job.vin));
+            known.push((job.field, job.flags, job.field_vin));
         }
         let backend = spend_ann_backend_next();
         let t_ann = Instant::now();

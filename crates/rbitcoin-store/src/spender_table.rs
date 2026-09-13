@@ -1,12 +1,13 @@
-//! Multi-spender overflow (`spent.ovf`, schema 17).
+//! Multi-spender overflow (`spent.ovf`, schema 22).
 //!
-//! Common case stores a sole `spending_tx_fk` on the create output. Only when an
-//! outpoint has multiple annotated spenders do we allocate nodes here.
+//! Common case stores a sole `spending_tx_fk` + vin on the create output. Only
+//! when an outpoint has multiple annotated spenders do we allocate nodes here.
 //!
-//! Fixed 16 B records (1-based fk): `spending_tx_fk:u64 | next:u64`.
+//! Fixed 16 B records (1-based fk): packed `(fk:u40, vin:u16)` | `next:u64`.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::tx_table::{pack_spent_field, unpack_spent_field};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,21 +76,22 @@ impl SpenderTable {
     }
 
     /// Append one list node. Returns its fk.
-    pub fn append(&self, spending_tx_fk: Fk, next: Fk) -> Result<Fk, StoreError> {
+    pub fn append(&self, spending_tx_fk: Fk, vin: u32, next: Fk) -> Result<Fk, StoreError> {
         if spending_tx_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
+        let packed = pack_spent_field(spending_tx_fk, vin)?;
         // Single annotator role: load → write → publish count.
         let id = self.count.load(Ordering::Acquire) + 1;
         let mut buf = [0u8; SPENDER_RECORD_LEN];
-        buf[0..8].copy_from_slice(&spending_tx_fk.0.to_le_bytes());
+        buf[0..8].copy_from_slice(&packed.to_le_bytes());
         buf[8..16].copy_from_slice(&next.0.to_le_bytes());
         self.body.write_at(Self::offset(id), &buf)?;
         self.count.store(id, Ordering::Release);
         Ok(Fk(id))
     }
 
-    pub fn get(&self, fk: Fk) -> Result<(Fk, Fk), StoreError> {
+    pub fn get(&self, fk: Fk) -> Result<(Fk, u32, Fk), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let count = self.count.load(Ordering::Acquire);
         if id == 0 || id > count {
@@ -97,8 +99,11 @@ impl SpenderTable {
         }
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         self.body.read_at(Self::offset(id), &mut buf)?;
+        let packed = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let (spend_tx, vin) = unpack_spent_field(packed)?;
         Ok((
-            Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
+            spend_tx,
+            vin,
             Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
         ))
     }
@@ -134,13 +139,13 @@ mod tests {
             !dir.join("spenders.body").exists(),
             "legacy filename must not be created"
         );
-        let a = t.append(Fk(10), Fk::NULL).unwrap();
-        let b = t.append(Fk(11), a).unwrap();
-        assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
-        assert_eq!(t.get(b).unwrap(), (Fk(11), a));
+        let a = t.append(Fk(10), 3, Fk::NULL).unwrap();
+        let b = t.append(Fk(11), 4, a).unwrap();
+        assert_eq!(t.get(a).unwrap(), (Fk(10), 3, Fk::NULL));
+        assert_eq!(t.get(b).unwrap(), (Fk(11), 4, a));
         assert_eq!(t.count(), 2);
         assert!(matches!(
-            t.append(Fk::NULL, Fk::NULL),
+            t.append(Fk::NULL, 0, Fk::NULL),
             Err(StoreError::InvalidFk)
         ));
         assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
@@ -151,7 +156,7 @@ mod tests {
         // open existing
         let t = SpenderTable::open(&dir).unwrap();
         assert_eq!(t.count(), 2);
-        assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
+        assert_eq!(t.get(a).unwrap(), (Fk(10), 3, Fk::NULL));
         // open creates when body missing
         let dir2 = dir.with_extension("empty");
         let _ = std::fs::remove_dir_all(&dir2);
@@ -174,7 +179,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let t = SpenderTable::create(&dir).unwrap();
-        t.append(Fk(1), Fk::NULL).unwrap();
+        t.append(Fk(1), 0, Fk::NULL).unwrap();
         drop(t);
         // Shrink below HWM so open clamps logical_len to a non-multiple of 16.
         let body = dir.join("spent.ovf");
@@ -204,7 +209,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         {
             let t = SpenderTable::create(&dir).unwrap();
-            t.append(Fk(7), Fk::NULL).unwrap();
+            t.append(Fk(7), 9, Fk::NULL).unwrap();
             t.flush().unwrap();
         }
         std::fs::rename(dir.join("spent.ovf"), dir.join("spenders.body")).unwrap();
@@ -213,7 +218,30 @@ mod tests {
         assert!(dir.join("spent.ovf").exists());
         assert!(!dir.join("spenders.body").exists());
         assert_eq!(t.count(), 1);
-        assert_eq!(t.get(Fk(1)).unwrap(), (Fk(7), Fk::NULL));
+        assert_eq!(t.get(Fk(1)).unwrap(), (Fk(7), 9, Fk::NULL));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_fk_or_vin_overflow_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-spender-ovf-cap-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SpenderTable::create(&dir).unwrap();
+        match t.append(Fk(1u64 << 40), 0, Fk::NULL) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("u40"), "{m}"),
+            other => panic!("expected u40 Corrupt, got {other:?}"),
+        }
+        match t.append(Fk(1), 1u32 << 16, Fk::NULL) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("u16"), "{m}"),
+            other => panic!("expected u16 Corrupt, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -767,6 +767,7 @@ pub(crate) fn chunk_parent_ids(
     rbitcoin_query::BatchParentIds {
         ids: std::sync::Arc::clone(&wave.ids),
         spent: std::sync::Arc::clone(&wave.spent),
+        n_out: std::sync::Arc::clone(&wave.n_out),
         need_vouts,
     }
 }
