@@ -103,7 +103,7 @@ Cargo.toml). Those PRs run Core functional even without a label.
 
 | Check | Who |
 |-------|-----|
-| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `multinode` `coverage` | Every PR (`ci.yml`) |
+| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `coverage` | Every PR (`ci.yml`) |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**, label **`release`**, **or** ship version |
 | `release-extra` | Every PR. **Fails** if the PR is ship and `core-functional` is not success |
 

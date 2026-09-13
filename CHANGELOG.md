@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Tier A IBD in default CI:** `serve_after_restart_via_reconstruct` and
+  `ibd_skips_dead_peer` run in `cargo test --workspace` and `coverage.sh`.
+  The separate `multinode` job is gone. Mesh / 48-block / 3-hop stay
+  `#[ignore]` (**Q-38**). [`TESTING.md`](TESTING.md).
+
 - **Coverage gate:** LCOV `LH`/`LF` counts **production files** only (test
   modules / `rbitcoin-test` / `testutil` excluded).
   `two_node_header_and_block_sync` runs under `coverage.sh`.

@@ -27,7 +27,7 @@ When adding or folding a pin:
 | Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
 | Keep guts the journey cannot hit | Delete handshake **format** needles, `decode_rpc_subset`, or BIP324 encode vectors waiting for Core |
 | Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
-| New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` (`coverage.sh` skips it) |
+| New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` |
 
 Coverage (≥90% LCOV `LH`/`LF`) is a required PR job. If deleting a guts test
 drops the bar, the journey did not cover the path — keep the guts or hit
@@ -112,8 +112,7 @@ reads it; rustup users export it). Override coverage dir:
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **8-block** `two_node` IBD + hub reorgs. Reconstruct / dead-peer are the **multinode** job. Agents use targeted `-p` tests locally; this suite runs on the PR. |
-| **CI multinode job** | named filters + `--ignored` job-only cases | 8-block IBD, reconstruct, slim dead-peer |
+| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + **8-block** `two_node` IBD + restart reconstruct + slim dead-peer + hub reorgs. Agents use targeted `-p` tests locally; this suite runs on the PR. |
 | **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` | Multi-hop, tip-follow, 48-block dual seeder, mesh, `run_p2p` |
 
 ### Suite speed budgets (default tier)
@@ -143,7 +142,7 @@ reads it; rustup users export it). Override coverage dir:
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job; 180s under `coverage.sh` / llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall (default). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` `--skip`s those ignored names; it **does** run `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
+**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (180s under `coverage.sh` / llvm-cov). `serve_after_restart_via_reconstruct` 90s wall (180s under llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -233,7 +232,7 @@ complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
 |------|------------|----|
 | **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Required job `ast-grep` |
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`; report-only (no `--fail-above`) |
-| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, `two_node` not skipped, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
+| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
@@ -284,14 +283,14 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `electrum_max_connections_rejects_extra_client` | Electrum | TCP cap drops the extra client |
 | `electrum_idle_timeout_disconnects_quiet_client` | Electrum | Idle timeout closes a quiet socket |
 | `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: HTTP `sendrawtransaction` / `testmempoolaccept` (allowed, missing-or-spent, min-relay, RBF too-low reject + replacement), Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`); `generate` includes those txs; immature coinbase sendraw rejects. Keep `accept.rs` reject units and RPC dry-run orphan-count |
-| `two_node_header_and_block_sync` | P2P (**default + multinode CI + coverage**) | Seeder → peer 8-block IBD; peer `last_write` meter |
+| `two_node_header_and_block_sync` | P2P (**default**) | Seeder → peer 8-block IBD; peer `last_write` meter |
 | `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, obsolete VERSION and pre-verack ping close the peer, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Handshake **format** needles stay. Sole-preferred stall KEEP stays a PeerHub unit. |
 | `p2p_compact_hb_getblocktxn_and_orphan` | P2P (**default**) | One mature pad: HB coinbase `cmpctblock`, 2-tx compact → `getblocktxn` + connect, orphan child GetData then parent accept (INV AlreadyHave). Does **not** pin depth-10 full-block serve, tokio-worker lock, or park-not-reject logs |
 | `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |
 | `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
-| `serve_after_restart_via_reconstruct` | P2P (**multinode job only**) | Cold serve via reconstruct |
-| `ibd_skips_dead_peer` | P2P (**multinode job only**) | Live seeder + `127.0.0.1:1` |
+| `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct |
+| `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
 | `three_node_relay_path` | P2P (**ignored**) | Hop serve — `scripts/integration.sh` |
 
@@ -306,11 +305,11 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 ### Integration / multi-node
 
-Default `cargo test` runs `two_node_header_and_block_sync` (8-block), `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, `p2p_inbound_full_rejects_extra`, and `badprev_orphan_does_not_blacklist_then_reorg_reconstructs`. The required **multinode** job also runs reconstruct and slim dead-peer (`--ignored` filters in `ci.yml`).
+Default `cargo test` runs `two_node_header_and_block_sync` (8-block), `serve_after_restart_via_reconstruct`, `ibd_skips_dead_peer`, `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, `p2p_inbound_full_rejects_extra`, and `badprev_orphan_does_not_blacklist_then_reorg_reconstructs`.
 Heavy topology (3-hop, 48-block, mesh, `run_p2p`) stays `#[ignore]` for `scripts/integration.sh`:
 
 ```bash
-./scripts/integration.sh   # default multinode + --ignored
+./scripts/integration.sh   # default suite + --ignored
 # or only heavy:
 cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
 ```
