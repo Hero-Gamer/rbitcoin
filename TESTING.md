@@ -226,6 +226,9 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `resume_head_off_warms_cache_for_external_prev` | Query+consensus | Resume head-off: warm Class A cache fixes external-prev missing prevout |
 | `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md). Hornet-mapped subset: `./scripts/test-hornet-rules.sh` |
 | `core_analogs::analog_milestone_and_mempool_persist` | Consensus | Milestone skip-below/check-above, missing prevout under high milestone, mempool persist (one pad) |
+| `core_analogs::analog_reconstruct_after_lost_head` | Store+query | Wipe `tx.head/`, reopen, reconstruct height 1 and txid probe. Does **not** pin empty-head / truncated-head / v1 fuse refuse |
+| `unified_wire_pipeline_multi_block_to_tip` | Consensus+query | Class A archived ahead of tip then `confirm_wire_run` (no re-append + re-entry); then heights 2..=4 unified load/scripts/write |
+| `direct_indexes_then_sh_bulk_at_tip` | Query | Direct IBD fills `tx.head`; SH bulk at tip; wipe SH shards, reopen, history still works. Keep unsorted pack/lag guts |
 | `electrum_server_version_history_balance` | Electrum | One mature pad: version/history/balance/headers, ping/features/tx/errors, confirmed history omits `fee`, scripthash subscribe notify, skip restatus when a new block misses the SH |
 | `electrum_scripthash_sub_cap_unsubscribe_frees_slot` | Electrum | Per-connection subscribe cap + unsubscribe frees a slot |
 | `electrum_leftover_mempool_does_not_double_count` | Electrum | Relay-off leftover is confirmed, not a second mempool UTXO |

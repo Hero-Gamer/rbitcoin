@@ -1163,4 +1163,32 @@ fn direct_indexes_then_sh_bulk_at_tip() {
         !hist.is_empty(),
         "scripthash history non-empty after SH bulk"
     );
+    q.flush().unwrap();
+    drop(q);
+
+    let store = dir.path().join("store");
+    for name in [
+        "scripthash.body",
+        "scripthash.head",
+        "scripthash.runs",
+        "scripthash.ovf",
+        "scripthash.include_hwm",
+        "scripthash.cold_progress",
+    ] {
+        let p = store.join(name);
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    let q = Query::open_or_create_tiny(&store).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let n_rebuild = q.finalize_sh_runs().unwrap();
+    assert!(
+        n_rebuild > 0 || !q.scripthash_history(&sh).unwrap().is_empty(),
+        "wipe SH shards + reopen + finalize must restore history"
+    );
+    assert!(
+        !q.scripthash_history(&sh).unwrap().is_empty(),
+        "scripthash history must survive SH wipe + rematerialize"
+    );
 }
