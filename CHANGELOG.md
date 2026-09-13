@@ -16,6 +16,10 @@ before 1.0).
   The separate `multinode` job is gone. Mesh / 48-block / 3-hop stay
   `#[ignore]` (**Q-38**). [`TESTING.md`](TESTING.md).
 
+- **No loc-count echo:** packed decode already walks loc `n_out` / inwit
+  `input_count`; drop the tautological len==count Corrupt. `spent_record_len(0)`
+  is `0×8` (no special case). Delete unused no-op `head_reserve_additional`.
+
 - **Coverage gate:** LCOV `LH`/`LF` counts **production files** only (test
   modules / `rbitcoin-test` / `testutil` excluded).
   `two_node_header_and_block_sync` runs under `coverage.sh`.

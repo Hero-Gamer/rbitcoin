@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Encode a per-tx output run (concat of compact outputs; count lives on TxRecord).
+/// Encode a per-tx output run (concat of compact outputs; count is loc `n_out`).
 pub(super) fn encode_output_run_secret(
     recs: &[OutputRecord],
     out: &mut Vec<u8>,
@@ -12,7 +12,6 @@ pub(super) fn encode_output_run_secret(
         let start = out.len();
         r.encode_into(out);
         if let Some(sec) = secret {
-            // XOR only the scriptPubKey payload bytes (after spender/flags/value/len).
             xor_script_region_in_output(out, start, sec);
         }
     }
@@ -510,14 +509,10 @@ pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
     encode_spent_slots(n_out, &[], out).expect("empty spent overlay");
 }
 
-/// Published `spent.body` span for one create (`8 × n_out`, `n_out ≥ 1`).
+/// Published `spent.body` span for one create (`8 × n_out`).
 #[inline]
 pub fn spent_record_len(n_out: u32) -> u64 {
-    if n_out == 0 {
-        0
-    } else {
-        u64::from(n_out).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
-    }
+    u64::from(n_out).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64)
 }
 
 const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
@@ -606,9 +601,6 @@ pub fn decode_inwit_secret(
                 sec.xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, item);
             }
         }
-    }
-    if inputs.len() as u32 != in_count {
-        return Err(StoreError::Corrupt("inwit count mismatch"));
     }
     Ok(inputs)
 }
@@ -708,9 +700,6 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
         outputs.push(rec);
     }
     check_trailing_zero_pad(raw, off)?;
-    if outputs.len() as u32 != meta.output_count {
-        return Err(StoreError::Corrupt("packed Class A count mismatch"));
-    }
     Ok((meta, outputs, spender_rels))
 }
 
