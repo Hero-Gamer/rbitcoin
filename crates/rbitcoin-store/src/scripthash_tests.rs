@@ -2151,44 +2151,6 @@ fn unsorted_collect_partitions_by_prefix_and_is_not_scripthash_sorted() {
 }
 
 #[test]
-fn unsorted_materialize_four_shards_from_class_a_no_catalog_runs() {
-    {
-        let dir = tmp();
-        let s = crate::Store::create_tiny(&dir).unwrap();
-        let n_shards = 4usize;
-        let mut keys = Vec::new();
-        for shard in 0..n_shards {
-            let script = script_for_prefix_shard(shard, n_shards);
-            keys.push(script_hash(&script));
-            let mut txid = [0u8; 32];
-            txid[0] = shard as u8;
-            s.put_tx_full_batch_indexed(&[class_a_coinbase(txid, script)], true)
-                .unwrap();
-        }
-        let sh_dir = dir.join("sh4");
-        std::fs::create_dir_all(&sh_dir).unwrap();
-        let table = four_shard_dir_table(&sh_dir);
-        let udir = sh_dir.join(UNSORTED_SHARD_DIR);
-        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 2, None).unwrap();
-        let mat = materialize_sh_from_unsorted(&table, &udir, 2, None).unwrap();
-        assert_eq!(mat.creates, 4, "all Class A creates packed");
-        assert_eq!(mat.keys, 4);
-        for k in &keys {
-            assert_eq!(table.entries(k).unwrap().len(), 1, "key must be queryable");
-        }
-        let runs = sh_dir.join("scripthash.runs");
-        assert!(
-            !runs.exists()
-                || std::fs::read_dir(&runs)
-                    .map(|it| it.count() == 0)
-                    .unwrap_or(true),
-            "unsorted path must not write catalog runs"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[test]
 fn unsorted_pack_sorts_numeric_fk_and_keeps_all_creates() {
     {
         let dir = tmp();

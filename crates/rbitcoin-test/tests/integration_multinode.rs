@@ -1454,56 +1454,6 @@ fn reorg_same_height_then_multi_block_branch() {
     ));
 }
 
-/// Class A archived ahead of tip, then wire confirm: second confirm attempt
-/// must not grow Class A body count (idempotent commit after partial fail shape).
-#[test]
-fn confirm_wire_idempotent_when_class_a_already_present() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_wire_run, header_to_record,
-        ChainParams, Milestone,
-    };
-    use rbitcoin_primitives::Height as H;
-
-    let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let ms = Milestone { height: 1_000_000 };
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, H::GENESIS, &genesis, ms).unwrap();
-    let g_fk = q
-        .get_header_by_hash(&genesis.block_hash().to_byte_array())
-        .unwrap()
-        .unwrap()
-        .0;
-    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
-    let hfk = q
-        .ensure_header(&header_to_record(
-            g_fk,
-            &b1.header,
-            b1.header.block_hash().to_byte_array(),
-        ))
-        .unwrap();
-    commit_class_a_block(&q, &params, H(1), &b1, ms).unwrap();
-    assert!(q
-        .is_block_archived(&b1.block_hash().to_byte_array())
-        .unwrap());
-    let n_before = q.tx_body_count();
-
-    // Wire confirm with Class A already present — plan should be empty / no-op commit.
-    confirm_wire_run(&q, &params, ms, &[(H(1), b1.clone())]).unwrap();
-    assert_eq!(q.tip_height(), Some(H(1)));
-    let n_mid = q.tx_body_count();
-    assert_eq!(n_mid, n_before, "confirm must not re-append Class A");
-
-    // Idempotent re-entry (AlreadyHave / no tip change).
-    let tip = q.tip_height();
-    let _ = confirm_wire_run(&q, &params, ms, &[(H(1), b1)]);
-    assert_eq!(q.tip_height(), tip);
-    assert_eq!(q.tx_body_count(), n_before);
-    let _ = hfk;
-}
-
 /// Full `run_p2p` entry: listen, connect to seeder, exit via max_run_secs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "full run_p2p entry; run via scripts/integration.sh"]

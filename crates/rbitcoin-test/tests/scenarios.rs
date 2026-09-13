@@ -1788,8 +1788,8 @@ fn block_cache_and_mempool_hub_surface() {
 #[test]
 fn unified_wire_pipeline_multi_block_to_tip() {
     use rbitcoin_consensus::{
-        confirm_scripts_phase, confirm_wire_load_phase, confirm_write_phase, ChainParams,
-        Milestone, ScriptPreverified,
+        commit_class_a_block, confirm_scripts_phase, confirm_wire_load_phase, confirm_wire_run,
+        confirm_write_phase, ChainParams, Milestone, ScriptPreverified,
     };
 
     let td = TestDatadir::new().unwrap();
@@ -1803,8 +1803,27 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     let mut tip = genesis.block_hash();
     let mut tip_time = genesis.header.time;
 
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    commit_class_a_block(&q, &params, Height(1), &b1, ms).unwrap();
+    assert!(q
+        .is_block_archived(&b1.block_hash().to_byte_array())
+        .unwrap());
+    let n_before = q.tx_body_count();
+    confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert_eq!(
+        q.tx_body_count(),
+        n_before,
+        "confirm must not re-append Class A already on disk"
+    );
+    let _ = confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]);
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert_eq!(q.tx_body_count(), n_before);
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
     let mut batch: Vec<(Height, bitcoin::Block)> = Vec::new();
-    for h in 1u32..=4 {
+    for h in 2u32..=4 {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
         tip = b.block_hash();
         tip_time = b.header.time;
@@ -1814,7 +1833,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     rbitcoin_query::reset_body_ok_reads();
     let mat = confirm_wire_load_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
         .expect("wire prep");
-    assert_eq!(mat.batch.len(), 4);
+    assert_eq!(mat.batch.len(), 3);
     assert!(
         mat.batch.archive_plan.is_some(),
         "wire prep carries Class A plan for single commit era"
@@ -1829,7 +1848,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     let ok = confirm_scripts_phase(mat.batch).expect("scripts");
     assert!(ok.batch.archive_plan.is_some());
     let fks = confirm_write_phase(&q, &params, ms, ok.batch).expect("commit");
-    assert_eq!(fks.len(), 4);
+    assert_eq!(fks.len(), 3);
     // Commit must not re-pread Class A bodies for layout (offline denserels).
     assert_eq!(
         rbitcoin_query::body_ok_reads(),

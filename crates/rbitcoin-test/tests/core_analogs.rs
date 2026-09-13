@@ -6,8 +6,7 @@
 //! 1. `--milestone` skip-below / check-above + mempool persist + missing
 //!    prevout still fails when scripts are skipped (`feature_assumevalid.py`,
 //!    `mempool_persist.py`)
-//! 2. Reconstruct height 1 after process restart / lost RAM head
-//!    (`feature_reindex*.py`)
+//! 2. Reconstruct height 1 after wiping `tx.head/` (`feature_reindex*.py`)
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -123,7 +122,8 @@ fn analog_milestone_and_mempool_persist() {
     );
 }
 
-/// Archive reconstruct of height 1 after dropping RAM (reindex / lost-head analog).
+/// Archive reconstruct of height 1 after dropping RAM and wiping `tx.head/`
+/// (`feature_reindex*.py` / operator delete-head reopen).
 #[test]
 fn analog_reconstruct_after_lost_head() {
     let td = TestDatadir::new().unwrap();
@@ -131,6 +131,7 @@ fn analog_reconstruct_after_lost_head() {
     let genesis = regtest_genesis();
     let store = td.store_path();
     let b1;
+    let cb_txid;
     {
         let q = Query::open_or_create_tiny(&store).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
@@ -140,14 +141,26 @@ fn analog_reconstruct_after_lost_head() {
         accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
         q.flush().unwrap();
         assert_eq!(q.tip_height(), Some(Height(2)));
-        // Drop `q` — RAM cache / process head is gone; Class A archive stays.
+        cb_txid = b1.txdata[0].compute_txid().to_byte_array();
     }
+
+    let head = store.join("tx.head");
+    assert!(head.is_dir(), "tiny store writes segmented tx.head/");
+    std::fs::remove_dir_all(&head).expect("wipe tx.head");
 
     let q2 = Query::open_or_create_tiny(&store).unwrap();
     assert_eq!(q2.tip_height(), Some(Height(2)));
+    assert!(
+        q2.tx_head_occupied() >= 3,
+        "open must rebuild tx.head from Class A bodies"
+    );
+    assert!(
+        q2.get_tx_by_txid(&cb_txid).unwrap().is_some(),
+        "txid must resolve after head rebuild"
+    );
     assert_reconstruct_eq(&q2, 1, &b1);
     let rec = q2
         .reconstruct_block_at_height(Height(1))
-        .expect("reconstruct height 1 after lost RAM head");
+        .expect("reconstruct height 1 after wiped tx.head");
     assert_eq!(rec.block_hash(), b1.block_hash());
 }
