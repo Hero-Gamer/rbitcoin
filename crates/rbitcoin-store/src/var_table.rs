@@ -94,10 +94,6 @@ impl VarTable {
         })
     }
 
-    pub fn open(dir: &Path, stem: &str, body_kind: TableKind) -> Result<Self, StoreError> {
-        Self::open_body_only(dir, stem, body_kind, 0)
-    }
-
     /// Body-only truncate (`spent` has no idx).
     pub fn truncate_body_to(&self, new_count: u64, new_end: u64) -> Result<(), StoreError> {
         self.body.set_logical_len(new_end)?;
@@ -731,7 +727,7 @@ mod tests {
         t.flush().unwrap();
         t.flush_async().unwrap();
         drop(t);
-        let t = VarTable::open(&dir, "tx", TableKind::TxOut).unwrap();
+        let t = VarTable::open_body_only(&dir, "tx", TableKind::TxOut, 0).unwrap();
         assert_eq!(t.count(), 0, "open_body_only without loc count is 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
