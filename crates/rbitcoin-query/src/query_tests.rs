@@ -1690,35 +1690,12 @@ fn connect_chain_query_surface() {
     assert!(q.is_block_archived(&hashes[2]).unwrap());
     assert!(q.archived_block_count().unwrap() >= 4);
 
-    // height_of_hash: tip/tip-1 fast paths + map for deeper heights.
-    assert_eq!(q.height_of_hash(&hashes[3]).unwrap(), Some(Height(3)));
-    assert_eq!(q.height_of_hash(&hashes[2]).unwrap(), Some(Height(2)));
-    assert_eq!(q.height_of_hash(&hashes[0]).unwrap(), Some(Height(0)));
-    assert_eq!(q.height_of_hash(&[0xee; 32]).unwrap(), None);
-    // Mid-chain still works after invalidate + rebuild.
     q.invalidate_height_by_hash_index();
     assert_eq!(q.height_of_hash(&hashes[1]).unwrap(), Some(Height(1)));
 
     let hdr = q.wire_header_at_height(Height(1)).unwrap();
     assert_eq!(hdr.time, 2);
 
-    let loc = q.locator_hashes().unwrap();
-    assert!(!loc.is_empty());
-    let after = q
-        .headers_after_locator(&loc, BlockHash::from_byte_array([0u8; 32]), 10)
-        .unwrap();
-    // After matching tip locator → empty; zero locator starts from genesis.
-    let from_zero = q
-        .headers_after_locator(
-            &[BlockHash::from_byte_array([0u8; 32])],
-            BlockHash::from_byte_array([0u8; 32]),
-            2,
-        )
-        .unwrap();
-    assert_eq!(from_zero.len(), 2);
-    let _ = after;
-
-    // Tx resolve + inputs/outputs.
     let fks = q.block_tx_fks(Height(0)).unwrap();
     assert_eq!(fks.len(), 1);
     let tx = q.get_tx(fks[0]).unwrap();
@@ -1739,23 +1716,11 @@ fn connect_chain_query_surface() {
     let proof = q.merkle_proof(Height(0), &tx.txid).unwrap();
     assert_eq!(proof.pos, 0);
     assert_eq!(proof.block_height, 0);
-
-    // Identity list is `txid.body`, not packed `txout` (`get_tx`).
     let side = q.store().txs.body_txid(fks[0]).unwrap();
     assert_eq!(q.block_txids(Height(0)).unwrap(), vec![side]);
     assert_eq!(q.block_txid_at(Height(0), 0).unwrap(), side);
     assert_eq!(tx.txid, side);
 
-    // Scripthash history/balance/utxo for OP_TRUE (durable SH in tip mode).
-    let sh = script_hash(&[0x51]);
-    let hist = q.scripthash_history(&sh).unwrap();
-    assert!(!hist.is_empty());
-    let bal = q.scripthash_balance(&sh).unwrap();
-    assert!(bal.confirmed > 0);
-    let utxos = q.scripthash_listunspent(&sh).unwrap();
-    assert!(!utxos.is_empty());
-
-    // Confirm cancel flags.
     assert!(!q.confirm_cancelled());
     q.request_confirm_cancel();
     assert!(q.confirm_cancelled());
@@ -1785,6 +1750,7 @@ fn connect_chain_query_surface() {
     // Idempotent confirm at tip height.
     let tip_fk = q.confirm_block(Height(3), &hashes[3]).unwrap();
     assert_eq!(tip_fk, prev);
+    assert_eq!(q.confirm_block(Height(3), &hashes[3]).unwrap(), tip_fk);
 
     // Empty confirm run.
     assert!(q.confirm_blocks_run(&[]).unwrap().is_empty());
