@@ -30,6 +30,24 @@ fn config_helpers_and_param_parsers() {
     assert_eq!(param_u32(&json!([3]), 0).unwrap(), 3);
     assert_eq!(param_u32(&json!(["7"]), 0).unwrap(), 7);
     assert!(param_u32(&json!([]), 0).is_err());
+    assert!(param_u32(&json!([true]), 0).is_err());
+    assert!(param_u32(&json!([Value::Null]), 0).is_err());
+    assert!(param_u32(&json!({"0": 1}), 0).is_err());
+    assert!(param_u32(&json!([1.5]), 0).is_err());
+    assert!(
+        param_u32(&json!([1u64 << 32]), 0).is_err(),
+        "u32 overflow must not wrap"
+    );
+    assert_eq!(param_u32(&json!([u32::MAX as u64]), 0).unwrap(), u32::MAX);
+    assert!(param_i64(&json!([true]), 0).is_err());
+    assert!(param_str(&json!([false]), 0).is_err());
+    assert!(param_str(&json!({}), 0).is_err());
+    assert!(parse_electrum_request_line("{").is_none());
+    assert!(parse_electrum_request_line("").is_none());
+    assert!(parse_electrum_request_line("not-json").is_none());
+    let ping_line = parse_electrum_request_line(r#"{"id":1,"method":"server.ping"}"#).unwrap();
+    assert_eq!(ping_line["method"], "server.ping");
+    assert!(parse_electrum_request_line("[1]").unwrap().is_array());
     assert_eq!(param_i64(&json!([-1]), 0).unwrap(), -1);
     assert_eq!(param_i64(&json!(["10"]), 0).unwrap(), 10);
     assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");
@@ -129,6 +147,16 @@ fn config_helpers_and_param_parsers() {
     )
     .unwrap_err()
     .contains("asof:<32-byte hex>"));
+    let asof_tag = format!("asof:{}", "ab".repeat(32));
+    let (_, ignored) =
+        take_trailing_asof("blockchain.block.header", &json!([0, asof_tag]), true).unwrap();
+    assert!(
+        ignored.is_none(),
+        "asof tag on a method that does not accept asof is leftover params, not a view"
+    );
+    assert!(parse_get_history_window(&json!({}))
+        .unwrap_err()
+        .contains("array"));
 
     assert!(parse_get_history_window(&json!([sh_hex, 10, 5]))
         .unwrap_err()
@@ -2985,5 +3013,188 @@ async fn tweaks_subscribe_pre_taproot_collapses_empty_heights() {
     assert_eq!(done["params"][0]["message"], "done");
 
     handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[allow(clippy::cognitive_complexity)] // one store, every method's missing/wrong-type params
+#[test]
+fn dispatch_param_type_edges_and_subscribe_cap() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    cfg.max_scripthash_subs = 1;
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let sh2 = electrum_scripthash_hex(&[0x52]);
+
+    for (method, args, needle) in [
+        ("blockchain.block.header", json!([]), "expected number"),
+        ("blockchain.block.header", json!([true]), "expected number"),
+        ("blockchain.block.headers", json!([]), "expected number"),
+        (
+            "blockchain.scripthash.get_history",
+            json!([]),
+            "expected string",
+        ),
+        (
+            "blockchain.scripthash.get_history",
+            json!([1]),
+            "expected string",
+        ),
+        (
+            "blockchain.scripthash.get_balance",
+            json!(["aa"]),
+            "scripthash must be 32 bytes hex",
+        ),
+        (
+            "blockchain.scripthash.listunspent",
+            json!([true]),
+            "expected string",
+        ),
+        (
+            "blockchain.scripthash.subscribe",
+            json!([]),
+            "expected string",
+        ),
+        (
+            "blockchain.scripthash.unsubscribe",
+            json!(["zz".repeat(32)]),
+            "invalid hex",
+        ),
+        (
+            "blockchain.scripthash.get_mempool",
+            json!({}),
+            "expected string",
+        ),
+        (
+            "blockchain.transaction.get",
+            json!(["aabb"]),
+            "txid must be 32 bytes hex",
+        ),
+        (
+            "blockchain.transaction.get_merkle",
+            json!([sh]),
+            "expected number",
+        ),
+        (
+            "blockchain.transaction.broadcast",
+            json!([]),
+            "expected string",
+        ),
+        (
+            "blockchain.transaction.broadcast",
+            json!([1]),
+            "expected string",
+        ),
+        (
+            "blockchain.transaction.id_from_pos",
+            json!([]),
+            "expected number",
+        ),
+        ("no.such.method", json!([]), "unknown method"),
+    ] {
+        let err = dispatch(
+            method,
+            &args,
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(needle),
+            "{method} {args}: expected {needle:?} in {err}"
+        );
+    }
+
+    let asof = format!("asof:{}", "ab".repeat(32));
+    let err = dispatch(
+        "blockchain.scripthash.get_balance",
+        &json!([sh, asof]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(err.contains("1.4.2-asof"), "asof without dialect: {err}");
+
+    dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    let err = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh2]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(err.contains("too many scripthash"), "{err}");
+    let again = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert!(again.as_str().is_some());
+    let dropped = dispatch(
+        "blockchain.scripthash.unsubscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert_eq!(dropped, json!(true));
+    let missing = dispatch(
+        "blockchain.scripthash.unsubscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert_eq!(missing, json!(false));
+    dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh2]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+
     let _ = std::fs::remove_dir_all(&dir);
 }
