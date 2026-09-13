@@ -143,7 +143,7 @@ reads it; rustup users export it). Override coverage dir:
 | Remining 100-block maturity pads with `confirm_wire_run` | `pad_empty_from` / `build_mature_regtest_with_spend` **once per binary journey** (not once per skinny test) |
 | Wall-time multi-round microbenches in default suite | Deterministic structure / chunk-load asserts; demote wall arms to `#[ignore]` |
 
-**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall (default). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` also `--skip`s those names plus `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
+**Tier A timeouts:** `two_node_header_and_block_sync` 60s wall (default + job; 180s under `coverage.sh` / llvm-cov). `p2p_timeout_getaddr_and_keepalive_ping`, `p2p_compact_hb_getblocktxn_and_orphan`, `p2p_feeler_completes_and_closes`, and `p2p_inbound_full_rejects_extra` 20s wall (default). Reconstruct / dead-peer are **multinode job only** (`#[ignore]`; job passes `--ignored`). `coverage.sh` `--skip`s those ignored names; it **does** run `two_node`. Heavier topology stays `#[ignore]` (`scripts/integration.sh`).
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads; SH run-builder sleeps are 1 ms under `cfg(test)` (40 ms in production). `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by `reconstruct_and_connect_error_arms` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
@@ -151,11 +151,17 @@ reads it; rustup users export it). Override coverage dir:
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | **≥ 90%** of first-party executable lines (LCOV `LH`/`LF` from `./scripts/coverage.sh`) |
+| Line coverage | **≥ 90%** of **production** executable lines (LCOV `LH`/`LF` from `./scripts/coverage.sh`) |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
-CI fails if measured line coverage is **below 90%**. New and existing first-party
-code share this bar.
+CI fails if measured line coverage is **below 90%**. New and existing production
+files share this bar. Test modules (`*_tests.rs`, `/tests/`, `testutil.rs`,
+crate `rbitcoin-test`) are omitted from `LH`/`LF`. `#[cfg(test)]` arms inside
+production files still count.
+
+The README badge and rbitcoin.org figure are the last **green `master`**
+`coverage` job (`badges` branch `coverage.json`, Shields endpoint). A red PR
+does not publish.
 
 `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within
 a line* (for example match or-patterns) even when the line executed. The gate
@@ -192,8 +198,10 @@ All workspace members that contain production code:
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
 - `rbitcoin-bench` (lib only; bin is `--features cli`)
 
-**Excluded by default:** third-party crates and `src/main.rs` trampolines.
-Dependencies are not attributed to us.
+**Excluded by default:** third-party crates, `src/main.rs` trampolines, test
+modules (`*_tests.rs`, `tests.rs`, crate `/tests/`, `testutil.rs`,
+`tests_verify.rs`), and crate `rbitcoin-test`. Dependencies are not attributed
+to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 
 ### Philosophy
 
@@ -225,6 +233,7 @@ complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
 |------|------------|----|
 | **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Required job `ast-grep` |
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`; report-only (no `--fail-above`) |
+| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, `two_node` not skipped, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
@@ -275,7 +284,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `electrum_max_connections_rejects_extra_client` | Electrum | TCP cap drops the extra client |
 | `electrum_idle_timeout_disconnects_quiet_client` | Electrum | Idle timeout closes a quiet socket |
 | `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: HTTP `sendrawtransaction` / `testmempoolaccept` (allowed, missing-or-spent, min-relay, RBF too-low reject + replacement), Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`); `generate` includes those txs; immature coinbase sendraw rejects. Keep `accept.rs` reject units and RPC dry-run orphan-count |
-| `two_node_header_and_block_sync` | P2P (**default + multinode CI**) | Seeder → peer 8-block IBD; peer `last_write` meter. **Not** re-run under `coverage.sh`. |
+| `two_node_header_and_block_sync` | P2P (**default + multinode CI + coverage**) | Seeder → peer 8-block IBD; peer `last_write` meter |
 | `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, obsolete VERSION and pre-verack ping close the peer, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Handshake **format** needles stay. Sole-preferred stall KEEP stays a PeerHub unit. |
 | `p2p_compact_hb_getblocktxn_and_orphan` | P2P (**default**) | One mature pad: HB coinbase `cmpctblock`, 2-tx compact → `getblocktxn` + connect, orphan child GetData then parent accept (INV AlreadyHave). Does **not** pin depth-10 full-block serve, tokio-worker lock, or park-not-reject logs |
 | `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |

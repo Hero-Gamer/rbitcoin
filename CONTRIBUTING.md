@@ -153,7 +153,7 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
    new design notes.
 2. Prefer **high-level functional/integration tests** over unit tests
    ([`TESTING.md`](./TESTING.md)).
-3. Every PR must keep **≥90% line** coverage on first-party code (and ≥90%
+3. Every PR must keep **≥90% line** coverage on production files (and ≥90%
    branch when measured on nightly) via `./scripts/coverage.sh` — same bar as CI.
 4. Target is **production server-side** node software (wallet backends, etc.).
    Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/end-user wallet/

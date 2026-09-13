@@ -11,6 +11,11 @@ before 1.0).
 
 ### Changed
 
+- **Coverage gate:** LCOV `LH`/`LF` counts **production files** only (test
+  modules / `rbitcoin-test` / `testutil` excluded).
+  `two_node_header_and_block_sync` runs under `coverage.sh`.
+  [`TESTING.md`](TESTING.md).
+
 - **Schema 22:** `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`).
   LAYOUT17 omits `output_count` (decode `n_out` from loc). Spent slot is flags +
   u40 spend fk + u16 vin. `txout` amount is flags bits 4–7 = decimal
@@ -26,8 +31,8 @@ before 1.0).
 
 ### Added
 
-- **README coverage badge:** latest CI LCOV **91.93%** (gate **≥90%** on every
-  PR). Highest published line coverage among bitcoin full nodes.
+- **Live coverage badge:** Shields endpoint from the last green `master`
+  `coverage` job (`badges` branch `coverage.json`).
   [`TESTING.md`](TESTING.md).
 
 - **asmap ASan fuzz:** nightly `asmap` target runs Core `SanityCheckAsmap` then

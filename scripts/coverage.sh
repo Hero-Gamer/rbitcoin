@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Enforce ≥90% line coverage on first-party crates (LCOV LH/LF).
+# Enforce ≥90% line coverage on production files (LCOV LH/LF).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Line coverage gate (percent). New and existing first-party code share this bar.
+# Line coverage gate (percent). Production files only (not test modules).
 LINE_MIN_PCT=90
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
@@ -36,9 +36,12 @@ if [[ -z "${LLVM_PROFDATA:-}" ]] && command -v llvm-profdata >/dev/null 2>&1; th
 fi
 
 # main.rs trampolines are one-liners; logic is covered via cli_main in libs.
-IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$)'
+# Test files / rbitcoin-test / testutil are not production. Do not match the
+# substring "test" (regtest_rpc.rs / regtest_pad.rs stay in the denominator).
+IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/tests/|_tests\.rs$|/tests\.rs$|/testutil\.rs$|/tests_verify\.rs$|/crates/rbitcoin-test/)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then
+  ./scripts/coverage.test.sh
   # Default: do NOT clean instrumented artifacts. Incremental llvm-cov rebuilds
   # are much faster for iterative work and still re-run all tests with coverage.
   # Force a full clean when debugging stale counters: COVERAGE_CLEAN=1 ./scripts/coverage.sh
@@ -59,7 +62,7 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
     --ignore-filename-regex "$IGNORE" \
     "${EXTRA[@]}" \
     --html --output-dir "$ROOT/coverage" \
-    -- --skip two_node_header_and_block_sync --skip serve_after_restart_via_reconstruct --skip ibd_skips_dead_peer
+    -- --skip serve_after_restart_via_reconstruct --skip ibd_skips_dead_peer
 
   REPORT="$(cargo llvm-cov report --ignore-filename-regex "$IGNORE" 2>/dev/null || true)"
   echo "$REPORT"
@@ -92,8 +95,8 @@ PY
   # Display uses 2 decimals only; the gate uses unrounded LH/LF (integer cross-multiply).
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
-  echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS}"
-  echo "Line coverage gate: ≥${LINE_MIN_PCT}% (constant LINE_MIN_PCT=${LINE_MIN_PCT})"
+  echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files)"
+  echo "Line coverage gate: ≥${LINE_MIN_PCT}% production (constant LINE_MIN_PCT=${LINE_MIN_PCT})"
   echo "Gate math: pass iff LH*100 >= LF*LINE_MIN_PCT (unrounded; not display-rounded %)"
 
   # Optional HTML diagnostic (not the pass condition).
@@ -124,6 +127,11 @@ PY
     cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
     exit 1
   fi
+  SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
+  python3 "$ROOT/scripts/coverage-badge.py" \
+    --lh "$LCOV_HIT" --lf "$LCOV_TOT" --gate "$LINE_MIN_PCT" \
+    --sha "$SHA" --scope production --out "$ROOT/coverage/badge.json"
+  echo "Wrote coverage/badge.json (${LCOV_PCT}% production)"
   echo "Coverage OK: ${LCOV_PCT}% ≥ ${LINE_MIN_PCT}% (${LCOV_HIT}/${LCOV_TOT}; LH*100 >= LF*${LINE_MIN_PCT})"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
