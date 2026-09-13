@@ -482,29 +482,11 @@ impl TxTable {
         }
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let layout = HeadLayout::with_entry_bytes(layout.bits, 4)?;
-        let (seal_bits, workers, soft_span) = Self::resolve_open_opts(opts);
+        let (seal_bits, workers) = Self::resolve_open_opts(opts);
         Ok(Self {
-            body: Self::create_var(
-                dir,
-                "txout",
-                TableKind::TxOut,
-                opts.idx_soft_span,
-                soft_span,
-            )?,
-            inwit: Self::create_var(
-                inwit_dir,
-                "inwit",
-                TableKind::Inwit,
-                opts.idx_soft_span,
-                soft_span,
-            )?,
-            spent: Self::create_var(
-                dir,
-                "spent",
-                TableKind::Spent,
-                opts.idx_soft_span,
-                soft_span,
-            )?,
+            body: VarTable::create(dir, "txout", TableKind::TxOut)?,
+            inwit: VarTable::create(inwit_dir, "inwit", TableKind::Inwit)?,
+            spent: VarTable::create(dir, "spent", TableKind::Spent)?,
             create_loc: crate::create_loc::CreateLoc::create(dir)?,
             inwit_loc: crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")?,
             head: SegmentedTxHead::create(dir, layout)?,
@@ -516,7 +498,7 @@ impl TxTable {
         })
     }
 
-    fn resolve_open_opts(opts: HeadOpenOpts) -> (u32, usize, u64) {
+    fn resolve_open_opts(opts: HeadOpenOpts) -> (u32, usize) {
         let seal_bits = opts
             .rebuild_seal_bits
             .map(|b| b.clamp(6, 26))
@@ -544,18 +526,7 @@ impl TxTable {
                     )
                 }
             });
-        let _ = opts.idx_soft_span;
-        (seal_bits, workers, 0)
-    }
-
-    fn create_var(
-        dir: &Path,
-        stem: &str,
-        kind: TableKind,
-        _explicit: Option<u64>,
-        _resolved: u64,
-    ) -> Result<VarTable, StoreError> {
-        VarTable::create(dir, stem, kind)
+        (seal_bits, workers)
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
@@ -584,7 +555,7 @@ impl TxTable {
                 "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
             ));
         }
-        let (seal_bits, workers, _soft_span) = Self::resolve_open_opts(opts);
+        let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if inwit_dir != dir {
             unlink_leftover_class_a_idx(inwit_dir)?;
@@ -2126,7 +2097,7 @@ pub(crate) fn plan_rebuild_ranges(n: u64, seal_bits: u32) -> Vec<(u64, u64)> {
 impl TxTable {
     /// Class A cuts for a cold MPHF rebuild (`2^bits` keys, last range short).
     ///
-    /// Independent of live OA 80% load and of idx body soft-span.
+    /// Independent of live OA 80% load.
     pub fn plan_head_rebuild_ranges(&self) -> Result<Vec<(u64, u64)>, StoreError> {
         Ok(plan_rebuild_ranges(self.count(), self.rebuild_seal_bits()))
     }
@@ -2268,8 +2239,8 @@ impl TxTable {
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
     ///
-    /// Rolls the open OA at 80% slots (`max_keys`). Idx body soft-span does
-    /// not cut `tx.head` shards.
+    /// Rolls the open OA at 80% slots (`max_keys`). Class A loc/body size
+    /// does not cut `tx.head` shards.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());

@@ -31,7 +31,6 @@ pub struct StoreLayout {
     pub head_scale: HeadScale,
     pub tx_head_rebuild_seal_bits: Option<u32>,
     pub tx_head_rebuild_workers: Option<usize>,
-    pub tx_idx_soft_span: Option<u64>,
 }
 
 impl StoreLayout {
@@ -42,7 +41,6 @@ impl StoreLayout {
             head_scale: HeadScale::Mainnet,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
-            tx_idx_soft_span: None,
         }
     }
 
@@ -53,7 +51,6 @@ impl StoreLayout {
             head_scale: HeadScale::Tiny,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
-            tx_idx_soft_span: None,
         }
     }
 
@@ -64,7 +61,6 @@ impl StoreLayout {
             head_scale: HeadScale::Mainnet,
             tx_head_rebuild_seal_bits: None,
             tx_head_rebuild_workers: None,
-            tx_idx_soft_span: None,
         }
     }
 
@@ -88,11 +84,6 @@ impl StoreLayout {
         self
     }
 
-    pub fn with_idx_soft_span(mut self, bytes: u64) -> Self {
-        self.tx_idx_soft_span = Some(bytes);
-        self
-    }
-
     /// Header hash-head slot target (honors `RBITCOIN_HEAD_SLOTS_HEADER`).
     pub fn header_slots(&self) -> u64 {
         crate::hashhead::initial_slots_for(self.head_scale)
@@ -113,7 +104,6 @@ impl StoreLayout {
             scale: self.head_scale,
             rebuild_seal_bits: self.tx_head_rebuild_seal_bits,
             rebuild_workers: self.tx_head_rebuild_workers,
-            idx_soft_span: self.tx_idx_soft_span,
         }
     }
 

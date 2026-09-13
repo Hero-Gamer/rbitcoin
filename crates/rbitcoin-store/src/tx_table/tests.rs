@@ -2605,18 +2605,13 @@ fn reopen_refuses_legacy_v1_sealed_fuse() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fat Class A bodies must not roll `tx.head` (idx soft-span is not a head cut).
+/// Fat Class A bodies must not roll `tx.head` (OA 80% is the only head cut).
 #[test]
-fn fat_creates_do_not_roll_head_on_body_soft_span() {
+fn fat_creates_do_not_roll_head() {
     with_env_lock(|| {
         let dir = tempfile_dir("no-body-span-roll");
         let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
-        let t = TxTable::create_with_head_layout_opts(
-            &dir,
-            layout,
-            HeadOpenOpts::TINY.with_idx_soft_span(800),
-        )
-        .unwrap();
+        let t = TxTable::create_with_head_layout_opts(&dir, layout, HeadOpenOpts::TINY).unwrap();
         let mk = |i: u64| {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -2648,7 +2643,7 @@ fn fat_creates_do_not_roll_head_on_body_soft_span() {
             assert_eq!(
                 t.head.sealed_segment_count(),
                 0,
-                "body soft-span must not seal tx.head segs={}",
+                "fat Class A bodies must not seal tx.head segs={}",
                 t.head_segment_count()
             );
             assert_eq!(t.head_segment_count(), 1);
@@ -2930,9 +2925,7 @@ fn plan_head_rebuild_ranges_ignores_body_soft_span() {
         let t = TxTable::create_with_head_layout_opts(
             &dir,
             tiny_layout(),
-            HeadOpenOpts::TINY
-                .with_rebuild_seal_bits(8)
-                .with_idx_soft_span(800),
+            HeadOpenOpts::TINY.with_rebuild_seal_bits(8),
         )
         .unwrap();
         let mk = |i: u64| {

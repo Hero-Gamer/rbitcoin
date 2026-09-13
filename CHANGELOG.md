@@ -18,6 +18,9 @@ before 1.0).
   unlink leftover `spent.off` and leftover `*.idx`. A 21 binary refuses 22
   `meta`. Esplora `/outspend(s)` emits `vin` from the slot (mempool overlay uses
   the hub tx input index). First-wave Outs guess is `4+(max_vout+1)×38`.
+  Drop `HeadOpenOpts::idx_soft_span` / `StoreLayout::with_idx_soft_span` /
+  `RBITCOIN_TX_IDX_SOFT_SPAN` (unread after loc; `tx.head` still rolls at OA
+  80% only).
 
 ### Added
 

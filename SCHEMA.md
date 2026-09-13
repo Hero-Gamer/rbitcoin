@@ -81,7 +81,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |--------|----------------|
 | Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
-| Idx | `txout.idx/` + `inwit.idx/` + `spent.idx/` directories; **u32 stride-8**; hard span `2^32 × 8` ≈ 32 GiB; soft roll default 16 GiB. Flat `*.idx.meta` **refused**. Leftover `spent.off` unlinked. |
+| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21/22. Flat `*.idx.meta` **refused**. |
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **dir** (sharded). Leftover file body **refused**. Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
@@ -95,7 +95,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 
 | Policy | Choice |
 |--------|--------|
-| Idx rolls | Each Class A stem rolls independently at **that** stem’s soft span. `inwit` is the fat stem and must not force `txout` splits. `spent.idx` rolls with the spent stem. |
+| Loc | One loc pair per create; `inwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) still caps **`confirmed`** and **`header_txs_*`** only. |
 | `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
 
@@ -125,14 +125,14 @@ Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
 | Spent spend fk | u40 | 2^40 ids ≈ 1.1e12 creates; census ~1.42e9 at h=962k. `fk ≥ 2^40` is Corrupt (no wrap) |
 | Spent vin | u16 | Consensus max inputs at 400 kWU is ~2.4k. `vin ≥ 2^16` is Corrupt |
 | Height / `confirmed[]` index | u32 | ~1e6 heights now; 10y adds ~0.5e6; year 2106 is **timestamp**, not height |
-| Idx relative | u32 × stride 8 | 32 GiB **per segment**. Soft 16 GiB rolls first. |
+| Loc strides | u8 (create) / u16 (inwit) | Overflow sidecar when txout ≥ 2048 B aligned or `n_out ≥ 256`; inwit ≥ 512 KiB |
 | `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
 | SH megakey page | 4 KiB delta stream | Page chain; not a single-integer cap |
 | `sp_tweaks` off | u32 per segment | Already segmented |
 | Script kind | 4 bits | 0–9 used; 10–15 reserved Corrupt; extension = RAW or soft-18 |
 
-Practical risks are **soft-span misuse** (one idx segment past 32 GiB) and
-**Bitcoin timestamp 2106** (consensus, every node).
+Practical risks are **loc overflow without ovf** (sentinel with missing
+sidecar) and **Bitcoin timestamp 2106** (consensus, every node).
 
 ### What would force schema 18
 
@@ -343,7 +343,7 @@ match **stride-8** (`IDX_STRIDE = 8`): loc stores body lengths as stride units.
 The schema-11/12 page non-straddle rule for a leading 32-byte txid is **retired**
 — identity is **`txid.body`**, not body bytes.
 
-Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt.
+Decode walks meta + runs to a logical end; any remaining bytes in the loc span must be **all zeros**. Non-zero trailing garbage is corrupt.
 
 **Body meta (schema 22 LAYOUT17, variable):** first byte bit 7 = `LAYOUT17`
 (required). Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 =
@@ -485,7 +485,7 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
-| Capacity | Segment ends at **80% of head slots** (`max_keys`) → open next OA, seal previous on a sidecar. Idx 16 GiB soft-span does **not** cut `tx.head`. |
+| Capacity | Segment ends at **80% of head slots** (`max_keys`) → open next OA, seal previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode — **refused** (wipe `store/tx.head` and `store/scripthash*`; Class A kept) |
 | Probe | Open OA: page-local double-hash (1024 slots/page); one 4 KiB load. Sealed: RAM fuse skip, then unique 4 KiB packed BDZ `g` pages (not loaded into process heap); MPHF output is `rel−1` |
@@ -699,11 +699,11 @@ Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
 | `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (schema 15; 17 thin meta + templates cut ~18–26 GiB) |
 | `inwit.body` | — | **~486 GiB** (ins + witness; cold) |
 | `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** schema 15; **~21 GiB** after 8 B slots |
-| `{stem}.idx` | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** (`txout`/`inwit`/`spent`) |
+| `{stem}.idx` / loc | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** idx (schema 15–21); schema 22 is `create.loc` + `inwit.loc` |
 | `txid.body` / `tx.head` | 42.23 / 8.23 GiB | unchanged |
 
-Hot pin+annotate working set: **txout + spent + three idx + txid + tx.head**
-(~129+21+16+42+8 ≈ **216 GiB**) vs packed **tx.body + idx + txid + head**
+Hot pin+annotate working set: **txout + spent + create.loc + txid + tx.head**
+(~129+21+3+42+8 ≈ **203 GiB**) vs packed **tx.body + idx + txid + head**
 (~663+5+42+8 ≈ **718 GiB**). Reconstruct / `getrawtransaction` also needs
 `inwit` (~486 GiB), which pin/SH/tweaks do **not** open.
 
