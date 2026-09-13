@@ -653,6 +653,11 @@ impl LivePeer {
         self.ping_queued.store(true, Ordering::Relaxed);
     }
 
+    pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
+        self.writer()
+            .is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok())
+    }
+
     pub(crate) fn attach_out(&self, tx: mpsc::UnboundedSender<PeerOut>) {
         *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }

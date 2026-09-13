@@ -3,8 +3,8 @@
 //! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
 //! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
 //! **Tier B (default suite):** handshake timeout / GetAddr / keepalive ping,
-//! HB compact tip-follow, hub reorg (including leftover/BadPrev orphan that
-//! must not blacklist).
+//! HB compact tip-follow, mempool orphan child GetData of parent, hub reorg
+//! (including leftover/BadPrev orphan that must not blacklist).
 //! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
 //! `scripts/integration.sh` or `-- --ignored` only.
 
@@ -348,6 +348,115 @@ async fn p2p_hb_compact_tip_follow() {
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
         .expect("p2p_hb_compact_tip_follow wall timeout (20s)");
+}
+
+fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
+    use rbitcoin_net::MempoolHub;
+    use std::sync::Arc;
+
+    let mp = MempoolHub::open(dir.path().join("mp"), Arc::clone(&node.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(node.hub.attach_mempool(mp).is_ok(), "attach mempool once");
+    node.hub.set_max_tip_age_secs(u64::MAX);
+    assert!(
+        !node.hub.in_ibd(),
+        "maxtipage must leave IBD so P2P tx accept runs"
+    );
+}
+
+/// Child with a missing parent over a live follow session: park + GetData parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_orphan_child_getdatas_parent() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
+        let seed = start_node(&seed_dir).await;
+        let mut peer = start_node(&peer_dir).await;
+        attach_relay_mempool(&peer, &peer_dir);
+        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
+            .await
+            .expect("follow_from handshake")
+            .expect("follow");
+        assert!(
+            peer.follow_live_count() >= 1,
+            "outbound follow must stay live"
+        );
+
+        let parent_txid = bitcoin::Txid::from_byte_array([0x33; 32]);
+        let orphan = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let writer_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let queued = seed.peers.live_peers().into_iter().any(|p| {
+                p.inbound
+                    && p.handshake_complete()
+                    && p.queue_msg(NetworkMessage::Tx(orphan.clone()))
+            });
+            if queued {
+                break;
+            }
+            if tokio::time::Instant::now() >= writer_deadline {
+                panic!(
+                    "seed inbound writer must take the child tx (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let parked = peer.hub.mempool().map(|m| m.orphan_count()).unwrap_or(0);
+            let getdata = seed
+                .peers
+                .snapshot()
+                .into_iter()
+                .find(|p| p.inbound)
+                .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
+                .unwrap_or(0);
+            if parked == 1 && getdata > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "peer must park the child and GetData the parent \
+                     (parked={parked} getdata={getdata} seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_orphan_child_getdatas_parent wall timeout (20s)");
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
