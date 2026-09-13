@@ -2089,10 +2089,11 @@ fn reconstruct_and_connect_error_arms() {
     let mut trec = coinbase_block(50, Fk::NULL, None).1.tx;
     trec.txid[0] = 0x77;
     trec.input_count = 0;
-    trec.output_count = 0;
+    trec.output_count = 1;
+    let dummy_out = vec![OutputRecord::unspent(1, vec![0x51])];
     let _tfk = q
         .store()
-        .put_tx_full_batch_indexed(&[(trec, vec![], vec![])], true)
+        .put_tx_full_batch_indexed(&[(trec, vec![], dummy_out)], true)
         .unwrap()[0];
     // put_spend needs real create - skip if fails
     let _ = q.put_spend(&[1u8; 32], 0, fks0[0], 0);
