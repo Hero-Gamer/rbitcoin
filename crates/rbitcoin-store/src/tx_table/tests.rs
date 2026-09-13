@@ -1682,6 +1682,23 @@ fn output_zero_and_50btc_exp() {
 }
 
 #[test]
+fn output_live_utxo_mantissa_stays_one_byte() {
+    for (sats, exp, mantissa) in [
+        (330, 1u8, 33u8),
+        (1_250_000_000, 7, 125),
+        (2_500_000_000, 8, 25),
+    ] {
+        let rec = OutputRecord::unspent(sats, vec![0x51]);
+        let enc = rec.encode();
+        assert_eq!(enc[0] >> 4, exp, "{sats}");
+        assert_eq!(enc[1], mantissa, "{sats}");
+        assert_eq!(enc.len(), 2, "{sats}");
+        assert_eq!(OutputRecord::decode(&enc).unwrap().value, sats);
+        assert_eq!(rec.encoded_len_exact(), enc.len());
+    }
+}
+
+#[test]
 fn output_exp_nibble_10_is_corrupt() {
     let mut enc = OutputRecord::unspent(1, vec![0x51]).encode();
     enc[0] = SCRIPT_KIND_V17_OP_TRUE | (10 << 4);

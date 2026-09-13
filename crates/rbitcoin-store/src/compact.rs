@@ -476,6 +476,21 @@ mod tests {
         assert_eq!(amount_exp_mantissa(100_000_000), (8, 1));
         assert_eq!(amount_exp_mantissa(5_000_000_000), (9, 5));
         assert_eq!(amount_exp_mantissa(10_000_000_000), (9, 10));
+        assert_eq!(amount_exp_mantissa(330), (1, 33));
+        assert_eq!(amount_exp_mantissa(1_250_000_000), (7, 125));
+        assert_eq!(amount_exp_mantissa(2_500_000_000), (8, 25));
+        for sats in [
+            0u64,
+            330,
+            546,
+            1_000,
+            1_250_000_000,
+            2_500_000_000,
+            5_000_000_000,
+        ] {
+            let (e, m) = amount_exp_mantissa(sats);
+            assert_eq!(scale_amount_exp(e, m).unwrap(), sats, "{sats}");
+        }
         assert_eq!(scale_amount_exp(8, 1).unwrap(), 100_000_000);
         assert!(scale_amount_exp(10, 1).is_err());
         assert!(scale_amount_exp(1, 10).is_err());
