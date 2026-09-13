@@ -397,9 +397,9 @@ fn resolve_fk_and_range_pread(
 fn body_ranges_batched(
     table: &TxTable,
     fks: &[Fk],
-    _ctx: &mut crate::IoCtx<'_>,
+    ctx: &mut crate::IoCtx<'_>,
 ) -> Result<Vec<Option<crate::create_loc::CreateLocPair>>, StoreError> {
-    table.create_loc.range_batch(fks)
+    table.create_loc.range_batch_ctx(fks, ctx)
 }
 
 /// Connected if a height fence is set, else any winner.
