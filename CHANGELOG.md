@@ -261,7 +261,7 @@ before 1.0).
   `hold_body` / `register_explore`, `SortedHead::write`/`open`). Dropped
   crate-root names are denied by ast-grep (`crate-root-dropped-pub`).
 - **Workspace version 0.6.99:** in-tree toward 0.7.0.
-  Published GitHub Releases remain 0.6.0; `v0.6.x` is the patch branch.
+  Published GitHub Releases remain 0.6.1; `v0.6.x` is the patch branch.
 - **`ibd: perf` / `ibd: sizes` drop never-written meters:** DEBUG no longer
   prints `recon`/`wire`/`resolve`, `parent_io`, `miss_p`, `cold_idx`,
   `tip_gc`, `recent_pub`, annotate `pread=`, `spend_mix i=/skip=`,

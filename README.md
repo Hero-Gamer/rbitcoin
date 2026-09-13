@@ -8,7 +8,7 @@ around a **libbitcoin-class relational archive** and a **pure-Rust
 consensus/script** path.
 
 > **0.6.99** is the in-tree version (pre-**0.7.0**). Last published GitHub
-> Release tag is **0.6.0** (patch line **`v0.6.x`**: Linux musl + Windows
+> Release tag is **0.6.1** (patch line **`v0.6.x`**: Linux musl + Windows
 > CRT-static + Darwin aarch64). **Not 1.0:** schema can still refuse a named
 > wipe ([`SCHEMA.md`](./SCHEMA.md), [`OPERATOR.md`](./OPERATOR.md));
 > default mainnet **`--milestone 840000` skips historical script/sig checks**
