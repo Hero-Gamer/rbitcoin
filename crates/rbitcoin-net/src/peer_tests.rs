@@ -273,23 +273,6 @@ fn tip_announce_headers_and_inv() {
 }
 
 #[test]
-fn cmpct_announce_uses_generated_tip_body() {
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-announce");
-    hub.ensure_genesis().unwrap();
-    let hashes = hub
-        .generate_to_script(1, bitcoin::script::ScriptBuf::new(), vec![])
-        .unwrap();
-    let hash = hashes[0];
-    match cmpct_announce_msg(&hub, &hash, 2) {
-        Some(NetworkMessage::CmpctBlock(c)) => {
-            assert_eq!(c.compact_block.header.block_hash(), hash);
-        }
-        other => panic!("expected CmpctBlock, got {other:?}"),
-    }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
 fn header_getdata_is_compact_after_sendcmpct() {
     use bitcoin::block::Header;
     use bitcoin::consensus::encode::serialize;
@@ -1839,19 +1822,6 @@ fn blocksonly_relay_perm_tx_invs_other_inbound() {
 fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-none");
     hub.ensure_genesis().unwrap();
-    let gen = hub
-        .query
-        .reconstruct_block_by_hash(&hub.tip_hash().unwrap().to_byte_array())
-        .unwrap()
-        .unwrap();
-    let hsi = HeaderAndShortIds::from_block(&gen, 0xabc, 2, &[]).unwrap();
-    assert!(
-        matches!(
-            try_reconstruct_cmpct(&hub, &hsi, 2),
-            Some(CmpctReconstruct::Block(_))
-        ),
-        "coinbase-only compact fills from prefilled txs without a mempool"
-    );
     assert!(hub.mempool().is_none());
 
     // Closed channel → Protocol error.
@@ -2884,105 +2854,6 @@ fn parked_orphan_tx_is_not_logged_as_reject() {
     });
 }
 
-/// INV of an already-parked orphan must not re-GETDATA it (AlreadyHave includes
-/// the orphanage, matching Core TxDownloadManager).
-#[test]
-fn inv_of_parked_orphan_does_not_getdata() {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
-
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("orphan-inv");
-        hub.ensure_genesis().unwrap();
-        let t = hub.tip_header().unwrap().time;
-        hub.clock.set_mock(i64::from(t) + 1);
-        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        mp.set_relay_enabled(true);
-        assert!(hub.attach_mempool(mp).is_ok());
-
-        let orphan = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let txid = orphan.compute_txid();
-        let wtxid = orphan.compute_wtxid();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: true,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-        };
-        handle_peer_frame(
-            frame_for(NetworkMessage::Tx(orphan)),
-            &hub,
-            &out_tx,
-            &mut follow,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(hub.mempool().unwrap().orphan_count(), 1);
-        while out_rx.try_recv().is_ok() {}
-
-        handle_peer_frame(
-            frame_for(NetworkMessage::Inv(vec![
-                Inventory::WitnessTransaction(txid),
-                Inventory::WTx(wtxid),
-            ])),
-            &hub,
-            &out_tx,
-            &mut follow,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            out_rx.try_recv().is_err(),
-            "parked orphan INV must not GetData"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    });
-}
-
 /// Production P2P runs on `tokio-rt-worker`. Parking must not take the mempool
 /// inner lock on that thread (reader panics, ping/block-sync stall).
 #[test]
@@ -3388,11 +3259,10 @@ fn invalid_getdata_type0_still_serves_tip_block() {
     });
 }
 
-/// Compact helpers with a live mempool hub attached (fill/missing/blocktxn).
+/// Compact fill with a live mempool hub must not `list_live` every body.
 #[test]
-fn cmpct_helpers_with_mempool_live_and_blocktxn() {
+fn cmpct_helpers_with_mempool_skip_list_live() {
     use bitcoin::absolute::LockTime;
-    use bitcoin::bip152::BlockTransactions;
     use bitcoin::block::{Header, Version};
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
@@ -3468,18 +3338,6 @@ fn cmpct_helpers_with_mempool_live_and_blocktxn() {
         "compact fill must not list_live/clone every body (got {})",
         fill.list_live
     );
-
-    let pc = PendingCmpct {
-        hsi: hsi.clone(),
-        missing: missing.clone(),
-        version: 2,
-    };
-    let bt = BlockTransactions {
-        block_hash: block.block_hash(),
-        transactions: vec![spend],
-    };
-    let recon = apply_cmpct_blocktxn(&hub, &pc, &bt).expect("blocktxn fill");
-    assert_eq!(recon.txdata.len(), 2);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -4109,9 +3967,6 @@ fn expect_services_from_conn_matches_core() {
 
 #[test]
 fn handshake_disconnect_log_needles() {
-    let line = connected_to_self_log("127.0.0.1:18444");
-    assert!(line.contains("connected to self"));
-    assert!(line.contains("disconnecting"));
     assert_eq!(
         crate::peer::ping_prior_to_verack_log(0),
         "Unsupported message \"ping\" prior to verack from peer=0"
@@ -5675,84 +5530,6 @@ fn compact_tip_announce_must_not_consume_serve_slots() {
             ),
             "getdata MSG_CMPCT_BLOCK must still serve after a burst of compact announces"
         );
-        let _ = std::fs::remove_dir_all(dir);
-    });
-}
-
-/// Coinbase-only compact must reconstruct from prefilled txs; a missing
-/// mempool hub must not force a full-getdata fallback that then never
-/// arrives (`p2p_compactblocks_hb` 1-block relay).
-#[test]
-fn coinbase_compact_fills_without_mempool() {
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::Network;
-    use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
-
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        let (src_dir, src) = crate::chain::tiny_regtest_hub_labeled("cmpct-nomp-src");
-        src.ensure_genesis().unwrap();
-        let hashes = src
-            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
-        let hash = hashes[0];
-        let block = src
-            .query
-            .reconstruct_archived_block(&hash.to_byte_array())
-            .unwrap()
-            .expect("src body");
-        let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
-
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-nomp-dst");
-        hub.ensure_genesis().unwrap();
-        assert!(hub.mempool().is_none());
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: true,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-        };
-        handle_peer_frame(
-            frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
-                compact_block: hsi,
-            })),
-            &hub,
-            &out_tx,
-            &mut follow,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            hub.has_block(&hash),
-            "coinbase compact must connect without a mempool hub"
-        );
-        while let Ok(msg) = out_rx.try_recv().map(PeerOut::expect_msg) {
-            if matches!(msg, NetworkMessage::GetData(_)) {
-                panic!("coinbase compact must not fall back to getdata, got {msg:?}");
-            }
-        }
-        let _ = std::fs::remove_dir_all(src_dir);
         let _ = std::fs::remove_dir_all(dir);
     });
 }

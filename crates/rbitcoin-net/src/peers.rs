@@ -2574,56 +2574,31 @@ mod tests {
     }
 
     #[test]
-    fn getaddr_cache_repeats_same_bind() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let a = addr_ips(&hub.addr_response_for_bind(bind));
-        let b = addr_ips(&hub.addr_response_for_bind(bind));
-        assert_eq!(a.len(), 1000);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn getaddr_cache_distinct_listens_differ() {
+    fn getaddr_cache_bind_key_and_ttl() {
         let hub = PeerHub::new();
         hub.set_mock_now(1_700_000_000);
         hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
         let a = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
         let b = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18445))));
         let c = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18446))));
+        let mapped = addr_ips(&hub.addr_response_for_bind(SocketAddr::from((
+            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(),
+            18444,
+        ))));
         assert_eq!(a.len(), 1000);
         assert_eq!(b.len(), 1000);
         assert_eq!(c.len(), 1000);
+        assert_eq!(
+            a, mapped,
+            "IPv4-mapped IPv6 must share the clearnet cache key"
+        );
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
-    }
-
-    #[test]
-    fn getaddr_cache_ipv4_mapped_shares_clearnet_key() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let v4 = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let v6 = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped(), 18444));
-        let a = addr_ips(&hub.addr_response_for_bind(v4));
-        let b = addr_ips(&hub.addr_response_for_bind(v6));
-        assert_eq!(a.len(), 1000);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn getaddr_cache_expires_after_24h() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
-        let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
-        let first = addr_ips(&hub.addr_response_for_bind(bind));
         hub.set_mock_now(1_700_000_000 + 24 * 60 * 60);
-        let second = addr_ips(&hub.addr_response_for_bind(bind));
-        assert_eq!(first.len(), 1000);
-        assert_ne!(first, second);
+        let expired =
+            addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
+        assert_eq!(expired.len(), 1000);
+        assert_ne!(a, expired);
     }
 }

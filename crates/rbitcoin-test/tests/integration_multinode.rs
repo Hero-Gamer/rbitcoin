@@ -2,11 +2,10 @@
 //!
 //! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
 //! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
-//! **Tier B (default suite):** handshake timeout / GetAddr / keepalive ping,
-//! HB compact tip-follow, compact `getblocktxn` for a missing extra tx,
-//! mempool orphan child GetData of parent, outbound feeler complete-and-close,
-//! inbound-full reject, hub reorg (including leftover/BadPrev orphan that must not
-//! blacklist).
+//! **Tier B (default suite):** handshake timeout / GetAddr cache / keepalive ping,
+//! compact HB + missing-tx `getblocktxn` + orphan child→parent on one mature pad,
+//! outbound feeler complete-and-close + inbound-full reject, hub reorg
+//! (leftover/BadPrev orphan that must not blacklist).
 //! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
 //! `scripts/integration.sh` or `-- --ignored` only.
 
@@ -45,6 +44,55 @@ async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
     )
     .await
     .expect("listen")
+}
+
+fn open_padded_query(dir: &TempDir) -> Query {
+    use rbitcoin_consensus::accept_and_connect_block;
+    use rbitcoin_test::pad_empty_from;
+
+    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let last = params.coinbase_maturity() + 1;
+    pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        last,
+    );
+    q
+}
+
+async fn start_padded(dir: &TempDir) -> P2PNode {
+    let q = open_padded_query(dir);
+    P2PNode::start(
+        "127.0.0.1:0".parse().unwrap(),
+        q,
+        ChainParams::regtest(),
+        Milestone::NONE,
+    )
+    .await
+    .expect("listen")
+}
+
+async fn wait_ms_until(
+    ms: u64,
+    mut pred: impl FnMut() -> bool,
+    on_timeout: impl FnOnce() -> String,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+    loop {
+        if pred() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{}", on_timeout());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn seed_chain(node: &P2PNode, blocks: u32) {
@@ -104,9 +152,11 @@ async fn two_node_header_and_block_sync() {
 }
 
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,
-/// AddrFetch GetAddr, and one post-verack keepalive ping/pong.
+/// full-relay GetAddr cache (1000 / 23%), AddrFetch GetAddr (no getheaders),
+/// one post-verack keepalive ping/pong, and headers-sync stall replace.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_timeout_getaddr_and_keepalive_ping() {
+    use bitcoin::p2p::message::NetworkMessage;
     use rbitcoin_net::{AddrMan, PeerConnType};
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
@@ -114,14 +164,21 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
+        let dummy_dir = TempDir::new().unwrap();
         let seed = start_node(&seed_dir).await;
         seed.peers.set_peer_timeout_secs(1);
 
         let mut book = AddrMan::new();
-        book.add(std::net::SocketAddr::from(([1, 2, 3, 4], 8333)));
+        for i in 0..5_000u32 {
+            book.add(std::net::SocketAddr::from((
+                [(i >> 8) as u8, (i & 0xff) as u8, 1, 1],
+                8333,
+            )));
+        }
         seed.peers.set_addrman(Arc::new(Mutex::new(book)));
 
         let mut peer = start_node(&peer_dir).await;
+        let dummy = start_node(&dummy_dir).await;
         tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
             .await
             .expect("follow_from must return after handshake")
@@ -130,6 +187,26 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             peer.follow_live_count() >= 1,
             "outbound session must stay live after follow_from"
         );
+        seed.peers
+            .addconnection(dummy.local_addr, PeerConnType::OutboundFullRelay)
+            .expect("preferred outbound for stall");
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.snapshot().into_iter().any(|p| {
+                    !p.inbound
+                        && p.conn_type == PeerConnType::OutboundFullRelay
+                        && !p.subver.is_empty()
+                })
+            },
+            || {
+                format!(
+                    "seed outbound to dummy must complete (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
 
         tokio::time::sleep(Duration::from_millis(250)).await;
         let inbound = seed
@@ -156,6 +233,95 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "first pong must match the outstanding nonce (pingwait={:?})",
             outbound.pingwait
         );
+
+        wait_ms_until(
+            3_000,
+            || {
+                peer.peers.live_peers().into_iter().any(|p| {
+                    !p.inbound && p.handshake_complete() && p.queue_msg(NetworkMessage::GetAddr)
+                })
+            },
+            || {
+                format!(
+                    "follower outbound must take GetAddr (peer={:?})",
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            5_000,
+            || {
+                peer.peers.snapshot().into_iter().any(|p| {
+                    !p.inbound && p.bytesrecv_per_msg.get("addrv2").copied().unwrap_or(0) > 0
+                })
+            },
+            || {
+                format!(
+                    "full-relay GetAddr must return addrv2 (peer={:?})",
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        let bind = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound && !p.subver.is_empty())
+            .map(|p| p.addrbind)
+            .unwrap_or(seed.local_addr);
+        let cached = seed.peers.addr_response_for_bind(bind);
+        assert_eq!(
+            cached.len(),
+            1000,
+            "GetAddr must cap at MAX_ADDR_TO_SEND (23% of 5000 is 1150)"
+        );
+        assert_eq!(
+            cached,
+            seed.peers.addr_response_for_bind(bind),
+            "same listen bind must reuse the 24h GetAddr cache"
+        );
+
+        let now = seed.peers.now_secs();
+        seed.peers.set_mock_now(now + 40 * 60);
+        wait_ms_until(
+            3_000,
+            || {
+                !seed
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.inbound && !p.subver.is_empty())
+            },
+            || {
+                format!(
+                    "stalling headers-sync inbound must drop when a preferred outbound exists \
+                     (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        seed.peers.set_mock_now(0);
+
+        seed.peers
+            .addconnection(seed.local_addr, PeerConnType::OutboundFullRelay)
+            .expect("self-connect dial");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !seed
+                .peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.addr == seed.local_addr && !p.subver.is_empty()),
+            "self-connect must not complete handshake: {:?}",
+            seed.peers.snapshot()
+        );
+
+        let mut one = AddrMan::new();
+        one.add(std::net::SocketAddr::from(([1, 2, 3, 4], 8333)));
+        seed.peers.set_addrman(Arc::new(Mutex::new(one)));
 
         let magic = bitcoin::p2p::Magic::from(bitcoin::Network::Regtest).to_bytes();
         let mut raw = tokio::net::TcpStream::connect(seed.local_addr)
@@ -212,6 +378,8 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        let t = seed.peers.now_secs();
+        seed.peers.set_mock_now(t + 24 * 60 * 60 + 1);
         peer.peers
             .addconnection(seed.local_addr, PeerConnType::AddrFetch)
             .expect("addrfetch dial");
@@ -266,6 +434,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
 
         seed.shutdown().await;
         peer.shutdown().await;
+        dummy.shutdown().await;
     };
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
@@ -281,15 +450,22 @@ fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
     h
 }
 
-/// Genesis-only follow: first new tip via headers/inv, then HB `cmpctblock`.
-/// Coinbase-only compact reconstructs without `getblocktxn`.
+/// Mature-pad follow: HB coinbase compact, 2-tx compact → getblocktxn + connect,
+/// then orphan child GetData + parent accept (INV of parked child is AlreadyHave).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn p2p_hb_compact_tip_follow() {
+async fn p2p_compact_hb_getblocktxn_and_orphan() {
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use bitcoin::Amount;
+    use rbitcoin_test::mine::spend_anyone_can_spend;
+
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
-        let seed = start_node(&seed_dir).await;
-        let mut peer = start_node(&peer_dir).await;
+        let seed = start_padded(&seed_dir).await;
+        let mut peer = start_padded(&peer_dir).await;
+        attach_relay_mempool(&peer, &peer_dir);
+        let pad_h = seed.query.tip_height().expect("pad tip").0;
         tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
             .await
             .expect("follow_from handshake")
@@ -299,71 +475,202 @@ async fn p2p_hb_compact_tip_follow() {
             "outbound follow must stay live"
         );
 
-        let h1 = mine_on(&seed, 1);
-        peer.wait_tip_hash(h1, Duration::from_secs(5))
+        let h_empty = mine_on(&seed, pad_h + 1);
+        peer.wait_tip_hash(h_empty, Duration::from_secs(5))
             .await
             .expect("first tip via headers/inv");
-
-        let hb_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let seed_hb_from = seed
-                .peers
-                .snapshot()
-                .into_iter()
-                .any(|p| p.inbound && p.bip152_hb_from);
-            if seed_hb_from {
-                break;
-            }
-            if tokio::time::Instant::now() >= hb_deadline {
-                panic!(
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.inbound && p.bip152_hb_from)
+            },
+            || {
+                format!(
                     "seed inbound must see sendcmpct(1) after first tip \
                      (seed={:?} peer={:?})",
                     seed.peers.snapshot(),
                     peer.peers.snapshot()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+                )
+            },
+        )
+        .await;
 
-        let h2 = mine_on(&seed, 2);
-        peer.wait_tip_hash(h2, Duration::from_secs(5))
+        let cb1 = seed
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let extra = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+        let tip = seed.hub.tip_hash().expect("tip");
+        let tip_time = seed.hub.tip_header().expect("tip time").time;
+        let with_extra = mine_regtest_block(tip, tip_time + 600, pad_h + 2, vec![extra]);
+        assert_eq!(with_extra.txdata.len(), 2, "coinbase + extra");
+        let h_extra = with_extra.block_hash();
+        seed.ingest_block(pad_h + 2, with_extra).unwrap();
+        wait_ms_until(
+            5_000,
+            || {
+                seed.peers.snapshot().into_iter().any(|p| {
+                    p.inbound && p.bytesrecv_per_msg.get("getblocktxn").copied().unwrap_or(0) > 0
+                })
+            },
+            || {
+                format!(
+                    "follower must GetBlockTxn the missing extra tx \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        peer.wait_tip_hash(h_extra, Duration::from_secs(5))
             .await
-            .expect("second tip via compact");
-        assert_eq!(peer.query.tip_height(), Some(Height(2)));
+            .expect("2-tx compact via getblocktxn");
+        assert_eq!(peer.query.tip_height(), Some(Height(pad_h + 2)));
 
-        let peer_out = peer
+        let cb2 = seed
+            .query
+            .reconstruct_block_at_height(Height(2))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let parent = spend_anyone_can_spend(cb2, 0, Amount::from_sat(49_0000_0000));
+        let child =
+            spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(48_0000_0000));
+        let child_txid = child.compute_txid();
+        let child_wtxid = child.compute_wtxid();
+
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::Tx(child.clone()))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take the child tx (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            5_000,
+            || {
+                let parked = peer.hub.mempool().map(|m| m.orphan_count()).unwrap_or(0);
+                let getdata = seed
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .find(|p| p.inbound)
+                    .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
+                    .unwrap_or(0);
+                parked == 1 && getdata > 0
+            },
+            || {
+                format!(
+                    "peer must park the child and GetData the parent \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        let getdata_parked = seed
             .peers
             .snapshot()
             .into_iter()
-            .find(|p| !p.inbound)
-            .expect("peer outbound");
-        let cmpct = peer_out
-            .bytesrecv_per_msg
-            .get("cmpctblock")
-            .copied()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
             .unwrap_or(0);
-        assert!(
-            cmpct > 0,
-            "follower must receive cmpctblock for the HB tip: {:?}",
-            peer_out.bytesrecv_per_msg
-        );
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::Inv(vec![
+                            Inventory::WitnessTransaction(child_txid),
+                            Inventory::WTx(child_wtxid),
+                        ]))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take orphan INV (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let getdata_after_inv = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
+            .unwrap_or(0);
         assert_eq!(
-            peer_out
-                .bytessent_per_msg
-                .get("getblocktxn")
-                .copied()
-                .unwrap_or(0),
-            0,
-            "coinbase-only compact must reconstruct without getblocktxn: {:?}",
-            peer_out.bytessent_per_msg
+            getdata_after_inv, getdata_parked,
+            "parked orphan INV must not GetData"
         );
+
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::Tx(parent.clone()))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take the parent tx (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            5_000,
+            || {
+                let Some(mp) = peer.hub.mempool() else {
+                    return false;
+                };
+                mp.orphan_count() == 0
+                    && mp.contains(&parent.compute_txid())
+                    && mp.contains(&child_txid)
+            },
+            || {
+                format!(
+                    "parent accept must promote the parked child \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
 
         seed.shutdown().await;
         peer.shutdown().await;
     };
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
-        .expect("p2p_hb_compact_tip_follow wall timeout (20s)");
+        .expect("p2p_compact_hb_getblocktxn_and_orphan wall timeout (20s)");
 }
 
 fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
@@ -378,194 +685,6 @@ fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
         !node.hub.in_ibd(),
         "maxtipage must leave IBD so P2P tx accept runs"
     );
-}
-
-/// Child with a missing parent over a live follow session: park + GetData parent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn p2p_orphan_child_getdatas_parent() {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::p2p::message::NetworkMessage;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-
-    let fut = async {
-        let seed_dir = TempDir::new().unwrap();
-        let peer_dir = TempDir::new().unwrap();
-        let seed = start_node(&seed_dir).await;
-        let mut peer = start_node(&peer_dir).await;
-        attach_relay_mempool(&peer, &peer_dir);
-        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
-            .await
-            .expect("follow_from handshake")
-            .expect("follow");
-        assert!(
-            peer.follow_live_count() >= 1,
-            "outbound follow must stay live"
-        );
-
-        let parent_txid = bitcoin::Txid::from_byte_array([0x33; 32]);
-        let orphan = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent_txid,
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-
-        let writer_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let queued = seed.peers.live_peers().into_iter().any(|p| {
-                p.inbound
-                    && p.handshake_complete()
-                    && p.queue_msg(NetworkMessage::Tx(orphan.clone()))
-            });
-            if queued {
-                break;
-            }
-            if tokio::time::Instant::now() >= writer_deadline {
-                panic!(
-                    "seed inbound writer must take the child tx (seed={:?} peer={:?})",
-                    seed.peers.snapshot(),
-                    peer.peers.snapshot()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let parked = peer.hub.mempool().map(|m| m.orphan_count()).unwrap_or(0);
-            let getdata = seed
-                .peers
-                .snapshot()
-                .into_iter()
-                .find(|p| p.inbound)
-                .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
-                .unwrap_or(0);
-            if parked == 1 && getdata > 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "peer must park the child and GetData the parent \
-                     (parked={parked} getdata={getdata} seed={:?} peer={:?})",
-                    seed.peers.snapshot(),
-                    peer.peers.snapshot()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        seed.shutdown().await;
-        peer.shutdown().await;
-    };
-    tokio::time::timeout(Duration::from_secs(20), fut)
-        .await
-        .expect("p2p_orphan_child_getdatas_parent wall timeout (20s)");
-}
-
-/// Compact of a 2-tx tip: coinbase prefilled, extra tx absent from mempool → getblocktxn.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn p2p_compact_getblocktxn_missing_extra_tx() {
-    use bitcoin::bip152::HeaderAndShortIds;
-    use bitcoin::p2p::message::NetworkMessage;
-    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
-    use bitcoin::Amount;
-    use rbitcoin_test::mine::spend_anyone_can_spend;
-
-    let fut = async {
-        let seed_dir = TempDir::new().unwrap();
-        let peer_dir = TempDir::new().unwrap();
-        let seed = start_node(&seed_dir).await;
-        let mut peer = start_node(&peer_dir).await;
-        attach_relay_mempool(&peer, &peer_dir);
-        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
-            .await
-            .expect("follow_from handshake")
-            .expect("follow");
-        assert!(
-            peer.follow_live_count() >= 1,
-            "outbound follow must stay live"
-        );
-
-        let extra = spend_anyone_can_spend(
-            bitcoin::Txid::from_byte_array([0x33; 32]),
-            0,
-            Amount::from_sat(1000),
-        );
-        let tip = seed.hub.tip_hash().expect("genesis");
-        let tip_time = seed.hub.tip_header().expect("genesis header").time;
-        let block = mine_regtest_block(tip, tip_time + 600, 1, vec![extra]);
-        assert_eq!(block.txdata.len(), 2, "coinbase + extra");
-        let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).expect("compact hsi");
-        assert_eq!(
-            hsi.short_ids.len(),
-            1,
-            "coinbase prefilled; extra is a short-id"
-        );
-
-        let writer_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let queued = seed.peers.live_peers().into_iter().any(|p| {
-                p.inbound
-                    && p.handshake_complete()
-                    && p.queue_msg(NetworkMessage::CmpctBlock(CmpctBlock {
-                        compact_block: hsi.clone(),
-                    }))
-            });
-            if queued {
-                break;
-            }
-            if tokio::time::Instant::now() >= writer_deadline {
-                panic!(
-                    "seed inbound writer must take cmpctblock (seed={:?} peer={:?})",
-                    seed.peers.snapshot(),
-                    peer.peers.snapshot()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let getblocktxn = seed
-                .peers
-                .snapshot()
-                .into_iter()
-                .find(|p| p.inbound)
-                .map(|p| p.bytesrecv_per_msg.get("getblocktxn").copied().unwrap_or(0))
-                .unwrap_or(0);
-            if getblocktxn > 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "follower must GetBlockTxn the missing extra tx \
-                     (seed={:?} peer={:?})",
-                    seed.peers.snapshot(),
-                    peer.peers.snapshot()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        seed.shutdown().await;
-        peer.shutdown().await;
-    };
-    tokio::time::timeout(Duration::from_secs(20), fut)
-        .await
-        .expect("p2p_compact_getblocktxn_missing_extra_tx wall timeout (20s)");
 }
 
 /// Outbound feeler: VERSION completes, then the session closes (no live follow).
