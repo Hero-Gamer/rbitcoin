@@ -305,9 +305,8 @@ New features: add a high-level scenario; remove obsolete lower-level tests in th
 
 ## Core differential
 
-Nightly (not a required PR check) `fuzz.yml` runs **16** cargo-fuzz jobs plus
-in-tree extras (`store_reorg`, later `script_kernel_differential` /
-`p2p_sequence_differential`). `fuzz/` is not a default workspace member.
+Nightly (not a required PR check) `fuzz.yml` runs **20** cargo-fuzz jobs.
+`fuzz/` is not a default workspace member.
 Treat crate-root `pub` that exists only so a fuzz target can call it as
 the same smell as a test-only export: prefer `pub(crate)` plus an in-crate
 harness, or the published `rbitcoin-node` / CLI binary, even if that costs
@@ -322,6 +321,7 @@ API.
 | `addrv2_wire` | BIP155 `addrv2` payload parse (ASan, `addrv2.dict`) | none |
 | `inv_getdata_wire` | `inv` / `getdata` payload parse (ASan, `inv.dict`) | none |
 | `electrum_json` | Electrum JSON-RPC line parse (ASan, `electrum.dict`) | none |
+| `asmap` | Core asmap bytecode `AsMap::from_bytes` then `interpret_ip16` on leftover 16 bytes (ASan, no Core). Junk must not panic or hang | none |
 | `v2_session` | BIP324 handshake + structured ping/pong vs a live v31.1 `bitcoind` v2 peer (ASan). Matching `pong` is a comparison. Garbage slice remains for encoder ASan. | official **v31.1** `bitcoind` tarball (`scripts/core-functional/fetch-bitcoind.sh`), `-listen=1` |
 | `cmpct_differential` | structured BIP152 recipe → `try_reconstruct` missing indexes vs Core `getblocktxn` (ASan). Fill-flag extras go to Core extra-txn first. Raw-wire arm is skip if decode fails. Full reconstruct (no `getblocktxn`) is a comparison. **Not** accept/reject; **not** two-node reorg. | same tarball, `-listen=1` |
 | `block_differential` | height-1 `ChainHub::accept_received_block` vs Core `submitblock`, **accept vs reject only** | same tarball |
@@ -343,6 +343,7 @@ API.
 ./scripts/fuzz-run.sh addrv2_wire               # BIP155 payload (ASan)
 ./scripts/fuzz-run.sh inv_getdata_wire          # inv/getdata payload (ASan)
 ./scripts/fuzz-run.sh electrum_json             # Electrum JSON line (ASan)
+./scripts/fuzz-run.sh asmap                      # asmap bytecode + leftover IP (ASan)
 ./scripts/fuzz-run.sh v2_session                # live Core v2 peer, ping/pong compare, ASan
 ./scripts/fuzz-run.sh cmpct_differential        # compact missing indexes vs getblocktxn, ASan
 ./scripts/fuzz-run.sh block_differential        # fetch bitcoind, --sanitizer none

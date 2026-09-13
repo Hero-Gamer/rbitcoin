@@ -178,7 +178,7 @@ if [[ "${FUZZ_DRY_RUN:-}" == "1" ]]; then
   if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" ]]; then
     echo "RBITCOIN_CORE_BITCOIND=${RBITCOIN_CORE_BITCOIND:-}"
   fi
-  if [[ "$BIN" == "store_reorg" ]]; then
+  if [[ "$BIN" == "store_reorg" || "$BIN" == "asmap" ]]; then
     echo "FUZZ_NO_CORE=1"
   fi
   if [[ "$BIN" == "script_kernel_differential" ]]; then
@@ -240,7 +240,7 @@ if [[ "$BIN" == "v2_contents" ]]; then
   exit 0
 fi
 
-if [[ "$BIN" == "addrv2_wire" || "$BIN" == "inv_getdata_wire" || "$BIN" == "electrum_json" ]]; then
+if [[ "$BIN" == "addrv2_wire" || "$BIN" == "inv_getdata_wire" || "$BIN" == "electrum_json" || "$BIN" == "asmap" ]]; then
   mkdir -p "fuzz/corpus/$BIN"
   if [[ "$BIN" == "addrv2_wire" ]]; then
     merge_seed fuzz/corpus/addrv2_wire \
@@ -254,14 +254,21 @@ if [[ "$BIN" == "addrv2_wire" || "$BIN" == "inv_getdata_wire" || "$BIN" == "elec
     fi
     merge_seed fuzz/corpus/electrum_json \
       crates/rbitcoin-electrum/tests/fixtures/blockchain_scripthash_subscribe.json
+  elif [[ "$BIN" == "asmap" ]]; then
+    merge_seed fuzz/corpus/asmap \
+      crates/rbitcoin-net/tests/fixtures/asmap_two_prefix_plus_ip.bin
   fi
   dict="$(wire_dict_for_bin "$BIN")"
+  dict_args=()
+  if [[ -n "$dict" ]]; then
+    dict_args=(-dict="$dict")
+  fi
   set +e
   env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" "$BIN" -- \
     -max_total_time="$(fuzz_max_total_time)" \
     -timeout="$timeout" \
     -max_len=65536 \
-    -dict="$dict" \
+    "${dict_args[@]}" \
     -seed="$SEED"
   st=$?
   set -e

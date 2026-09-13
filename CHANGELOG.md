@@ -17,6 +17,10 @@ before 1.0).
 
 ### Added
 
+- **asmap ASan fuzz:** nightly `asmap` target runs Core `SanityCheckAsmap` then
+  `Interpret` (`AsMap::from_bytes`, leftover 16-byte IP). Junk must not panic
+  or hang.
+
 - **`--sptweaks-dust SATS`** (conf `sptweaks_dust=`): Electrum
   `blockchain.tweaks.subscribe` omits P2TR `output_pubkeys` with
   `value <= SATS` and drops txs that then have none. Default **1000**.
