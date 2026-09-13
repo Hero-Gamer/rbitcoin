@@ -11,6 +11,14 @@ before 1.0).
 
 ### Added
 
+- **Process `submitpackage` after IBD leave:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  keeps serving-only `submitpackage` refuse (stale tip, relay off), then `generate`
+  latches IBD false and enables relay. `submitpackage` then pins maxfeerate reject,
+  1p1c success, and already-in-mempool continue. Same pad also pins process
+  `getmempoolancestors` / `getmempooldescendants` / `getmempoolcluster` /
+  `gettxspendingprevout` / `getmempoolfeeratediagram` / verbose `getrawmempool`
+  on the Esplora 1p1c. Dispatch maxburn fail stays a unit.
+
 - **Process `getpeerinfo` on live `run_p2p`:** `node_run_p2p_short` `--connect`s to a
   seeder, then JSON-RPC `getpeerinfo` (v2 outbound-full-relay), `getconnectioncount` /
   `getnetworkinfo` / `getnettotals` / `ping`, `addconnection inbound` refuses,

@@ -152,7 +152,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let (coinbase_txid, rpc_cb, pkg_cb) = {
+    let (coinbase_txid, rpc_cb, pkg_cb, relay_cb) = {
         let q = Query::open_or_create_tiny(td.store_path()).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let (_tip, _time, cbs) = pad_empty_from(
@@ -162,10 +162,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             genesis.header.time,
             1,
             102,
-            3,
+            4,
         );
         q.flush().unwrap();
-        (cbs[0], cbs[1], cbs[2])
+        (cbs[0], cbs[1], cbs[2], cbs[3])
     };
 
     let electrum_addr = ephemeral_addr();
@@ -195,6 +195,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(height, "102");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
     assert_eq!(count["result"], 102, "{count}");
+    let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
+    assert_eq!(chain["result"]["initialblockdownload"], true, "{chain}");
+    let mpinfo = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
+    assert_eq!(mpinfo["result"]["relay_enabled"], false, "{mpinfo}");
     let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
     assert_eq!(tips["result"][0]["height"], 102, "{tips}");
     assert_eq!(tips["result"][0]["status"], "active", "{tips}");
@@ -463,6 +467,67 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{submitted}"
     );
 
+    let entry = jsonrpc(rpc_addr, "getmempoolentry", json!([pkg_child_txid.clone()])).await;
+    assert_eq!(entry["result"]["ancestorcount"], 2, "{entry}");
+    assert_eq!(
+        entry["result"]["depends"],
+        json!([pkg_parent_txid.clone()]),
+        "{entry}"
+    );
+    let ancs = jsonrpc(
+        rpc_addr,
+        "getmempoolancestors",
+        json!([pkg_child_txid.clone()]),
+    )
+    .await;
+    let anc_rows = ancs["result"].as_array().expect("ancestors array");
+    assert!(
+        anc_rows
+            .iter()
+            .any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
+        "getmempoolancestors missing parent: {ancs}"
+    );
+    let desc = jsonrpc(
+        rpc_addr,
+        "getmempooldescendants",
+        json!([pkg_parent_txid.clone()]),
+    )
+    .await;
+    let desc_rows = desc["result"].as_array().expect("descendants array");
+    assert!(
+        desc_rows
+            .iter()
+            .any(|v| v.as_str() == Some(pkg_child_txid.as_str())),
+        "getmempooldescendants missing child: {desc}"
+    );
+    let cluster = jsonrpc(
+        rpc_addr,
+        "getmempoolcluster",
+        json!([pkg_child_txid.clone()]),
+    )
+    .await;
+    assert_eq!(cluster["result"]["txcount"], 2, "{cluster}");
+    let spend = jsonrpc(
+        rpc_addr,
+        "gettxspendingprevout",
+        json!([[{"txid": pkg_cb.to_string(), "vout": 0}]]),
+    )
+    .await;
+    assert_eq!(
+        spend["result"][0]["spendingtxid"], pkg_parent_txid,
+        "{spend}"
+    );
+    let diagram = jsonrpc(rpc_addr, "getmempoolfeeratediagram", json!([])).await;
+    assert!(
+        diagram["result"].as_array().is_some_and(|a| !a.is_empty()),
+        "{diagram}"
+    );
+    let verbose = jsonrpc(rpc_addr, "getrawmempool", json!([true])).await;
+    assert_eq!(
+        verbose["result"][&pkg_child_txid]["ancestorcount"], 2,
+        "{verbose}"
+    );
+
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     for tid in [
         &high_txid,
@@ -566,6 +631,71 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(
         imm["error"]["message"], "bad-txns-premature-spend-of-coinbase",
         "{imm}"
+    );
+
+    let relay_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
+        if info["result"]["relay_enabled"] == true {
+            break;
+        }
+        if Instant::now() >= relay_deadline {
+            panic!("relay never enabled after generate: {info}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
+    assert_eq!(chain["result"]["initialblockdownload"], false, "{chain}");
+
+    let relay_parent = acs_spend(
+        relay_cb,
+        50_0000_0000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x59]),
+    );
+    let relay_child = acs_spend(
+        relay_parent.compute_txid(),
+        50_0000_0000 - 1_000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x5a]),
+    );
+    let relay_parent_txid = relay_parent.compute_txid().to_string();
+    let relay_child_txid = relay_child.compute_txid().to_string();
+    let pkg_hexes = json!([encode_tx(&relay_parent), encode_tx(&relay_child)]);
+    let capped = jsonrpc(
+        rpc_addr,
+        "submitpackage",
+        json!([pkg_hexes.clone(), "0.00000001"]),
+    )
+    .await;
+    assert_eq!(
+        capped["result"]["package_msg"], "transaction failed",
+        "{capped}"
+    );
+    let cap_err = capped["result"]["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .and_then(|v| v["error"].as_str())
+        .unwrap_or("");
+    assert_eq!(cap_err, "max-fee-exceeded", "{capped}");
+
+    let ok = jsonrpc(rpc_addr, "submitpackage", json!([pkg_hexes.clone()])).await;
+    assert_eq!(ok["result"]["package_msg"], "success", "{ok}");
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert!(
+        mempool_has(&mem, &relay_parent_txid) && mempool_has(&mem, &relay_child_txid),
+        "submitpackage success missing members: {mem}"
+    );
+    let again = jsonrpc(rpc_addr, "submitpackage", json!([pkg_hexes])).await;
+    assert_eq!(again["result"]["package_msg"], "success", "{again}");
+    let again_row = again["result"]["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .cloned()
+        .unwrap_or(json!(null));
+    assert!(
+        again_row.get("error").is_none(),
+        "already-in-mempool must not error: {again}"
     );
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
