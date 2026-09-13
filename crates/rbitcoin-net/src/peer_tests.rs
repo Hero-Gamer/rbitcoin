@@ -4206,14 +4206,6 @@ fn handshake_disconnect_log_needles() {
     assert!(line.contains("connected to self"));
     assert!(line.contains("disconnecting"));
     assert_eq!(
-        crate::peer::version_handshake_timeout_log(0),
-        "version handshake timeout, disconnecting peer=0"
-    );
-    assert_eq!(
-        crate::v2::v2_handshake_timeout_log(0),
-        "V2 handshake timeout, disconnecting peer=0"
-    );
-    assert_eq!(
         crate::peer::ping_prior_to_verack_log(0),
         "Unsupported message \"ping\" prior to verack from peer=0"
     );

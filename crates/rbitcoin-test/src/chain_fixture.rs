@@ -121,4 +121,10 @@ pub fn assert_reconstruct_eq(query: &Query, height: u32, original: &Block) {
         .unwrap()
         .expect("by hash");
     assert_eq!(by_hash.block_hash(), original.block_hash());
+    let via_ast = bitcoin::consensus::encode::serialize(&recon);
+    let via_direct = query
+        .witness_block_bytes_by_hash(&original.block_hash().to_byte_array())
+        .unwrap()
+        .expect("witness_block_bytes");
+    assert_eq!(via_direct, via_ast, "witness_block_bytes height {height}");
 }

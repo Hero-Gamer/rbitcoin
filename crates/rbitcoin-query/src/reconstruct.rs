@@ -410,3 +410,34 @@ fn encode_class_a_tx(
     }
     let _ = rec.locktime.consensus_encode(&mut *out);
 }
+
+#[cfg(test)]
+mod encode_witness_tests {
+    use super::*;
+
+    #[test]
+    fn encode_class_a_tx_emits_segwit_marker_when_input_has_witness() {
+        let rec = TxRecord {
+            txid: [0xee; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let ins = vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x01],
+            vec![vec![0x51]],
+        )];
+        let outs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let mut out = Vec::new();
+        encode_class_a_tx(&mut out, &rec, &ins, &outs);
+        assert_eq!(&out[4..6], &[0, 1], "BIP141 marker after version");
+        let no_wit = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let mut plain = Vec::new();
+        encode_class_a_tx(&mut plain, &rec, &no_wit, &outs);
+        assert_ne!(&plain[4..6], &[0, 1]);
+    }
+}
