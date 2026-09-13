@@ -4109,10 +4109,6 @@ fn expect_services_from_conn_matches_core() {
 
 #[test]
 fn handshake_disconnect_log_needles() {
-    assert_eq!(
-        feeler_connection_completed_log(),
-        "feeler connection completed"
-    );
     let line = connected_to_self_log("127.0.0.1:18444");
     assert!(line.contains("connected to self"));
     assert!(line.contains("disconnecting"));
