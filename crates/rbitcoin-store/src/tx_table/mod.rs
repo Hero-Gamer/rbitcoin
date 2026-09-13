@@ -576,13 +576,13 @@ impl TxTable {
         inwit_dir: &Path,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        if dir.join("tx.body").exists() && !dir.join("txout.body").exists() {
-            let legacy = VarTable::open(dir, "tx", TableKind::TxOut)?;
-            if legacy.count() > 0 {
-                return Err(StoreError::Corrupt(
-                    "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
-                ));
-            }
+        if dir.join("tx.body").exists()
+            && !dir.join("txout.body").exists()
+            && class_a_body_occupied(dir, "tx")
+        {
+            return Err(StoreError::Corrupt(
+                "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
+            ));
         }
         let (seal_bits, workers, _soft_span) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;

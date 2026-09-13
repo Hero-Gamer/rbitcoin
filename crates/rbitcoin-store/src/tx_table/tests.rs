@@ -640,7 +640,8 @@ fn denserels_layout_exact_matches_encode_decode_shapes() {
         }
         let mut raw = Vec::new();
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
-        let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw, 1).unwrap();
+        let (_, _, decode_rels) =
+            decode_packed_tx_outs_with_spender_rels(&raw, outputs.len() as u32).unwrap();
         assert_eq!(decode_rels.len(), outputs.len());
         let (_, mut off) = TxRecord::decode_body_meta(&raw).unwrap();
         for (i, _) in outputs.iter().enumerate() {
@@ -1651,7 +1652,7 @@ fn tx_fixed_roundtrip() {
         input_start_fk: Fk::NULL,
         input_count: 1,
         output_start_fk: Fk::NULL,
-        output_count: 2,
+        output_count: 0,
     };
     let enc = rec.encode();
     assert!(enc.len() > 32, "txid + thin meta");
@@ -2055,13 +2056,13 @@ fn packed_encode_decode_flags_and_error_arms() {
     // trailing zero pad is accepted (schema 11 alignment gap)
     let mut trail_z = raw.clone();
     trail_z.extend_from_slice(&[0u8; 7]);
-    let (mz, _, _) = decode_packed_tx_outs_with_spender_rels(&trail_z, 1).unwrap();
+    let (mz, _, _) = decode_packed_tx_outs_with_spender_rels(&trail_z, 2).unwrap();
     assert_eq!(mz.txid, [0u8; 32]);
     // non-zero trailing garbage is rejected
     let mut trail = raw.clone();
     trail.push(0x01);
     assert!(matches!(
-        decode_packed_tx_outs_with_spender_rels(&trail, 1),
+        decode_packed_tx_outs_with_spender_rels(&trail, 2),
         Err(StoreError::Corrupt(_))
     ));
     // run helpers
@@ -3423,11 +3424,7 @@ fn spent_span_matches_slot_len_times_n_out() {
             );
         }
         let rec = spent_record_len(n_out);
-        if n_out == 0 {
-            assert_eq!(rec, 8, "zero-out spent still pays one idx stride");
-        } else {
-            assert_eq!(rec, buf.len() as u64);
-        }
+        assert_eq!(rec, buf.len() as u64);
     }
 }
 
