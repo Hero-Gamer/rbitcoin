@@ -145,6 +145,56 @@ async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+const RPC_BASIC: &str = "Basic dXNlcjpwYXNz";
+
+fn ephemeral_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+async fn wait_listeners(addrs: &[SocketAddr]) {
+    use std::time::Instant;
+    use tokio::net::TcpStream;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut missing = None;
+        for addr in addrs {
+            if TcpStream::connect(addr).await.is_err() {
+                missing = Some(*addr);
+                break;
+            }
+        }
+        if missing.is_none() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("listeners not up ({missing:?}): {addrs:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn jsonrpc(addr: SocketAddr, method: &str, params: serde_json::Value) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let body = serde_json::json!({"jsonrpc":"1.0","id":"test","method":method,"params":params})
+        .to_string();
+    let req = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BASIC}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).await.expect("rpc connect");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    let json_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+    serde_json::from_str(json_body)
+        .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}"))
+}
+
 /// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default suite).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
@@ -1636,13 +1686,16 @@ fn reorg_same_height_then_multi_block_branch() {
     ));
 }
 
-/// Product `run_p2p`: listen, `--connect` to a live seeder, exit via `max_run_secs=0`.
+/// Product `run_p2p`: `--connect` to a live seeder; process RPC while connected.
+/// `max_run_secs=0` (exit after catch-up, no RPC window) stays a node-crate unit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
     let fut = async {
         let _live = live_p2p_lock().await;
         use rbitcoin_node::{run_p2p, NodeConfig};
         use rbitcoin_primitives::Network;
+        use serde_json::json;
+        use std::time::Instant;
 
         let seed_dir = TempDir::new().unwrap();
         let node_dir = TempDir::new().unwrap();
@@ -1650,6 +1703,7 @@ async fn node_run_p2p_short() {
         let seed = start_node(&seed_dir).await;
         seed_chain(&seed, 3).await;
         let seed_addr = seed.local_addr;
+        let rpc_addr = ephemeral_addr();
 
         let mut cfg = NodeConfig::default()
             .with_datadir(node_dir.path())
@@ -1658,9 +1712,109 @@ async fn node_run_p2p_short() {
             .with_tiny_heads();
         cfg.listen.connect = vec![seed_addr];
         cfg.listen.use_seeds = false;
-        cfg.max_run_secs = Some(0);
+        cfg.rpc.listen = Some(rpc_addr);
+        cfg.rpc.user = Some("user".into());
+        cfg.rpc.password = Some("pass".into());
+        cfg.max_run_secs = Some(60);
+
+        let pin = tokio::spawn(async move {
+            wait_listeners(&[rpc_addr]).await;
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+            while count["result"] != 3 {
+                if Instant::now() >= deadline {
+                    panic!("getblockcount never reached 3: {count}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+            }
+
+            let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+            let rows = peers["result"].as_array().expect("getpeerinfo array");
+            assert_eq!(rows.len(), 1, "{peers}");
+            assert_eq!(rows[0]["inbound"], false, "{peers}");
+            assert_eq!(rows[0]["connection_type"], "outbound-full-relay", "{peers}");
+            assert_eq!(rows[0]["transport_protocol_type"], "v2", "{peers}");
+            assert!(
+                rows[0]["bytesrecv"].as_u64().unwrap_or(0) > 0,
+                "IBD must receive bytes: {peers}"
+            );
+            let addr = rows[0]["addr"].as_str().expect("addr").to_string();
+            assert_eq!(addr, seed_addr.to_string(), "{peers}");
+
+            let n = jsonrpc(rpc_addr, "getconnectioncount", json!([])).await;
+            assert_eq!(n["result"], 1, "{n}");
+            let net = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await;
+            assert_eq!(net["result"]["connections"], 1, "{net}");
+            assert_eq!(net["result"]["connections_out"], 1, "{net}");
+            let totals = jsonrpc(rpc_addr, "getnettotals", json!([])).await;
+            assert!(
+                totals["result"]["totalbytesrecv"].as_u64().unwrap_or(0) > 0,
+                "{totals}"
+            );
+            let ping = jsonrpc(rpc_addr, "ping", json!([])).await;
+            assert!(ping["result"].is_null(), "{ping}");
+
+            let inbound = jsonrpc(
+                rpc_addr,
+                "addconnection",
+                json!([seed_addr.to_string(), "inbound"]),
+            )
+            .await;
+            assert!(
+                inbound["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("cannot create inbound"),
+                "{inbound}"
+            );
+
+            let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
+            assert!(disc["error"].is_null(), "{disc}");
+            let gone_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+                if peers["result"].as_array().is_some_and(|a| a.is_empty()) {
+                    break;
+                }
+                if Instant::now() >= gone_deadline {
+                    panic!("getpeerinfo still occupied after disconnectnode: {peers}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            let added = jsonrpc(
+                rpc_addr,
+                "addnode",
+                json!([seed_addr.to_string(), "onetry"]),
+            )
+            .await;
+            assert!(added["error"].is_null(), "{added}");
+            let re_deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+                let ok = peers["result"].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|p| p["inbound"] == false && p["connection_type"] == "manual")
+                });
+                if ok {
+                    break;
+                }
+                if Instant::now() >= re_deadline {
+                    panic!("addnode onetry did not produce a manual peer: {peers}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+        });
 
         run_p2p(cfg).await.expect("run_p2p");
+        match pin.await {
+            Ok(()) => {}
+            Err(e) => panic!("rpc pin join: {e}"),
+        }
 
         let q = Query::open_or_create_tiny(node_dir.path().join("store")).unwrap();
         assert_eq!(q.tip_height(), Some(Height(3)));
