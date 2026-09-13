@@ -262,7 +262,7 @@ included; tree at #318):
 | `TODO` / `FIXME` / `#[allow(` | **0** / **0** / **4** |
 | Coverage gate | **≥90%** LCOV `LH`/`LF` (required CI) |
 | Required CI | `fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`, `macos`, `multinode`, `coverage` (+ CodeQL) |
-| Extra CI | `release.yml` on `v*.*.*` / dispatch; `fuzz.yml` nightly; `miri.yml` nightly primitives; `core-functional.yml` nightly / labeled PR / **ship version-bump** (`release-extra` fails if a ship PR skipped it) |
+| Extra CI | `release.yml` on `v*.*.*` / dispatch; `fuzz.yml` nightly; `miri.yml` nightly primitives; `core-functional.yml` nightly / labeled PR / **ship version-bump** (not required on ordinary net/RPC PRs; `release-extra` fails if a ship PR skipped it) |
 | rustc | **1.95** (`Cargo.toml` + `rust-toolchain.toml` + `dtolnay/rust-toolchain@1.95.0` + nixos-26.05 / shell) |
 | Nix | **nixos-26.05** + crane **0.24.0** |
 | Host cargo silos | `target/dev` (test) / `target/cov` (coverage) |

@@ -144,9 +144,11 @@ lists as done, but whose official script still fails on dialect, stay
 runs `scripts/core-functional/nightly.sh` on a nightly cron, on
 `workflow_dispatch`, and on PRs that are **ship versions**, or labeled
 **`core-functional`** / **`release`**. Unlabeled non-ship PRs keep the cargo
-gates only. Label harness PRs and every version-bump ship PR (see
-[`releases.md`](./releases.md)). The `release-extra` job on that workflow
-fails when a ship PR did not get a green `core-functional`.
+gates only. Do **not** make this job required on all PRs, or on PRs that
+merely touch net or RPC (too slow). Default `cargo test` is the PR pin
+([`TESTING.md`](../TESTING.md)). Label harness PRs and every version-bump
+ship PR (see [`releases.md`](./releases.md)). The `release-extra` job on
+that workflow fails when a ship PR did not get a green `core-functional`.
 
 The job sparse-inits the pin, checks the inventory, **warns** (does not
 fail) if a newer Bitcoin Core *release* exists than `inventory.toml`

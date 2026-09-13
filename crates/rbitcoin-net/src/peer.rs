@@ -377,7 +377,9 @@ impl HandshakePolicy<'static> {
     }
 }
 
-/// Outbound BIP324 session after VERSION/VERACK with [`HandshakePolicy::plain`].
+/// Outbound BIP324 session. [`Self::outbound_regtest`] completes VERSION/VERACK;
+/// [`Self::outbound_bip324`] stops after transport so the caller can send a
+/// custom first application message.
 pub struct V2PlainSession {
     reader: V2Reader,
     writer: V2Writer,
@@ -385,6 +387,17 @@ pub struct V2PlainSession {
 }
 
 impl V2PlainSession {
+    /// Dial-side BIP324 only (no VERSION). Caller sends the first application message.
+    pub async fn outbound_bip324(stream: TcpStream) -> Result<Self, NetError> {
+        let magic = Magic::REGTEST;
+        let (reader, writer, _wire, tcp_shutdown) = open_v2(stream, magic, false).await?;
+        Ok(Self {
+            reader,
+            writer,
+            tcp_shutdown,
+        })
+    }
+
     /// Dial-side handshake on `stream`; `limit` bounds VERSION/VERACK.
     pub async fn outbound_regtest(
         stream: TcpStream,

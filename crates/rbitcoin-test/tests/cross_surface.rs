@@ -99,6 +99,40 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("rpc {method} json: {e} body={text}"))
 }
 
+fn encode_tx(tx: &Transaction) -> String {
+    let mut raw = Vec::new();
+    tx.consensus_encode(&mut raw).unwrap();
+    rbitcoin_primitives::hex_encode(&raw)
+}
+
+fn acs_spend(prev: Txid, input_sat: u64, fee: u64, spk: ScriptBuf) -> Transaction {
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(input_sat - fee),
+            script_pubkey: spk,
+        }],
+    }
+}
+
+fn mempool_has(mem: &Value, txid: &str) -> bool {
+    mem["result"]
+        .as_array()
+        .expect("getrawmempool array")
+        .iter()
+        .any(|v| v.as_str() == Some(txid))
+}
+
 async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {
     let req = json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
     let mut line = serde_json::to_string(&req).unwrap();
@@ -163,32 +197,12 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(count["result"], 102, "{count}");
 
     let rpc_spk = ScriptBuf::from_bytes(vec![0x54]);
-    let rpc_spend = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: rpc_cb,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 - 1_000),
-            script_pubkey: rpc_spk,
-        }],
-    };
-    let mut rpc_raw = Vec::new();
-    rpc_spend.consensus_encode(&mut rpc_raw).unwrap();
-    let rpc_hex = rbitcoin_primitives::hex_encode(&rpc_raw);
+    let rpc_spend = acs_spend(rpc_cb, 50_0000_0000, 1_000, rpc_spk);
+    let rpc_hex = encode_tx(&rpc_spend);
     let rpc_txid = rpc_spend.compute_txid().to_string();
     let mut zero_fee = rpc_spend.clone();
     zero_fee.output[0].value = Amount::from_sat(50_0000_0000);
-    let mut zero_raw = Vec::new();
-    zero_fee.consensus_encode(&mut zero_raw).unwrap();
-    let zero_hex = rbitcoin_primitives::hex_encode(&zero_raw);
+    let zero_hex = encode_tx(&zero_fee);
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[zero_hex]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
     assert_eq!(
@@ -200,9 +214,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([rpc_hex])).await;
     assert_eq!(sent["result"], rpc_txid, "{sent}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    let ids = mem["result"].as_array().expect("getrawmempool array");
     assert!(
-        ids.iter().any(|v| v.as_str() == Some(rpc_txid.as_str())),
+        mempool_has(&mem, &rpc_txid),
         "getrawmempool missing sendraw {rpc_txid}: {mem}"
     );
     let miss = Transaction {
@@ -233,26 +246,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     );
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
-    let spend = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: coinbase_txid,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 - 1_000),
-            script_pubkey: spk.clone(),
-        }],
-    };
-    let mut raw = Vec::new();
-    spend.consensus_encode(&mut raw).unwrap();
-    let hex = rbitcoin_primitives::hex_encode(&raw);
+    let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());
+    let hex = encode_tx(&spend);
     let txid_hex = spend.compute_txid().to_string();
 
     let (st, body) = http_post(esplora_addr, "/tx", &hex).await;
@@ -267,13 +262,12 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(status_v["confirmed"], false, "{status_v}");
 
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
-    let ids = mem["result"].as_array().expect("getrawmempool array");
     assert!(
-        ids.iter().any(|v| v.as_str() == Some(txid_hex.as_str())),
+        mempool_has(&mem, &txid_hex),
         "getrawmempool missing {txid_hex}: {mem}"
     );
     assert!(
-        ids.iter().any(|v| v.as_str() == Some(rpc_txid.as_str())),
+        mempool_has(&mem, &rpc_txid),
         "getrawmempool dropped sendraw {rpc_txid}: {mem}"
     );
 
@@ -309,26 +303,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     }
 
     let child_spk = ScriptBuf::from_bytes(vec![0x53]);
-    let child = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: spend.compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 - 2_000),
-            script_pubkey: child_spk.clone(),
-        }],
-    };
-    let mut child_raw = Vec::new();
-    child.consensus_encode(&mut child_raw).unwrap();
-    let child_hex = rbitcoin_primitives::hex_encode(&child_raw);
+    let child = acs_spend(
+        spend.compute_txid(),
+        50_0000_0000 - 1_000,
+        1_000,
+        child_spk.clone(),
+    );
+    let child_hex = encode_tx(&child);
     let child_txid = child.compute_txid().to_string();
     let (st, body) = http_post(esplora_addr, "/tx", &child_hex).await;
     assert_eq!(st, 200, "POST /tx child: {body}");
@@ -371,6 +352,62 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{child_mem_row}"
     );
 
+    let low = acs_spend(
+        rpc_cb,
+        50_0000_0000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x55]),
+    );
+    let low_hex = encode_tx(&low);
+    let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[low_hex.clone()]])).await;
+    assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
+    assert_eq!(
+        tma["result"][0]["reject-reason"], "insufficient fee",
+        "{tma}"
+    );
+    let rejected = jsonrpc(rpc_addr, "sendrawtransaction", json!([low_hex])).await;
+    assert_eq!(rejected["error"]["code"], -26, "{rejected}");
+    assert_eq!(
+        rejected["error"]["message"], "insufficient fee",
+        "{rejected}"
+    );
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert!(
+        mempool_has(&mem, &rpc_txid),
+        "too-low RBF must leave the original: {mem}"
+    );
+
+    let high = acs_spend(
+        rpc_cb,
+        50_0000_0000,
+        50_000,
+        ScriptBuf::from_bytes(vec![0x56]),
+    );
+    let high_hex = encode_tx(&high);
+    let high_txid = high.compute_txid().to_string();
+    let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[high_hex.clone()]])).await;
+    assert_eq!(tma["result"][0]["allowed"], true, "{tma}");
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert!(
+        mempool_has(&mem, &rpc_txid),
+        "testmempoolaccept must not RBF-evict: {mem}"
+    );
+    assert!(
+        !mempool_has(&mem, &high_txid),
+        "trial replacement must not remain: {mem}"
+    );
+    let replaced = jsonrpc(rpc_addr, "sendrawtransaction", json!([high_hex])).await;
+    assert_eq!(replaced["result"], high_txid, "{replaced}");
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert!(
+        mempool_has(&mem, &high_txid),
+        "replacement missing from mempool: {mem}"
+    );
+    assert!(
+        !mempool_has(&mem, &rpc_txid),
+        "replaced tx must leave mempool: {mem}"
+    );
+
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert_eq!(
         mined["result"].as_array().map(|a| a.len()),
@@ -386,11 +423,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
     assert!(
         txs.len() >= 4,
-        "coinbase + sendraw + esplora parent + child: {blk}"
+        "coinbase + RBF replacement + esplora parent + child: {blk}"
     );
     assert!(
-        txs.iter().any(|t| t["txid"] == rpc_txid),
-        "generate must include sendraw: {blk}"
+        txs.iter().any(|t| t["txid"] == high_txid),
+        "generate must include RBF replacement: {blk}"
     );
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
     let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;

@@ -130,7 +130,9 @@ Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`ast-grep`**, **`test`**,
 store + `--smoke` (not operator zips). Operator binaries are GitHub Releases
 (`release.yml`). Releases (minor / patch / major): [`docs/releases.md`](docs/releases.md).
 Label **`core-functional`** when the PR touches the Core functional harness
-(and on every **ship** version-bump PR).
+(and on every **ship** version-bump PR). Do **not** label ordinary net or
+RPC PRs; the job is too slow for the default gate. Default `cargo test` is
+the pin; owner rules: [`TESTING.md`](TESTING.md) (Default CI is the pin).
 
 `origin` fetch/pull is HTTPS; `pushurl` is SSH (operator). This VM has **no**
 GitHub App SSH key. The App token from `~/.config/rbitcoin-grok/gh-login.sh`
@@ -229,7 +231,9 @@ the agent VM. Perf A/B is operator-host only.
 | **Refactor** | Remove the one-off | Still green: fold into the real shape; delete dual paths. |
 
 Planning anatomy, INVEST, step template: [`docs/how-we-plan.md`](docs/how-we-plan.md).
-Fixture size, one-entry-per-path, coverage bar: [`TESTING.md`](TESTING.md).
+Fixture size, one-entry-per-path, coverage bar, default-CI vs nightly Core:
+[`TESTING.md`](TESTING.md). Extend a catalog journey; do not add a twin or
+treat Core functional as the PR pin.
 
 The test must assert the **exact** contract, drive the **shipped** function,
 fail with the **same class of error**, and use tiny `/tmp` fixtures.

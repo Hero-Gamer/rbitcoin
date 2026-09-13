@@ -159,9 +159,13 @@ Aligned with AGENTS.md TDD + suite speed:
 
 | Prefer for Red | When |
 |----------------|------|
+| Extend an existing default [catalog](../TESTING.md#scenario-catalog) journey | Operator/peer-visible RPC, Electrum, Esplora, BIP324 P2P |
 | Focused unit next to shipped fn | Pure helper, fast loop, expensive full path |
 | Slim scenario / integration | Stage boundaries, IBD/confirm wiring, store publish order |
 | One pin per contract | Not unit + twin integration for the same lines |
+
+Core functional `run` scripts are a nightly oracle. They are **not** the Red
+test for a default-CI story and **not** a reason to skip an in-tree journey.
 
 | Plan-time rules | |
 |-----------------|--|
@@ -239,6 +243,7 @@ Each step is independently green and shippable.
 | Spike disguised as implement | Named spike + follow-on story |
 | Green without refactor forever | Refactor phase required in the step template |
 | Plan ignores test runtime | Explicit unit vs scenario choice per step |
+| Core functional as the default-CI Red | In-tree catalog journey; Core stays nightly |
 | Step done = “code compiles” | Step done = Red→Green→Refactor verify checklist |
 
 ---
@@ -251,7 +256,7 @@ Before accepting a plan:
 - [ ] Every step has **Contract + Red + Green + Refactor + Verify**  
 - [ ] No step larger than one Red→Green→Refactor without a spike  
 - [ ] Vertical slices; horizontal deps called out as prior steps  
-- [ ] Test budget: suite stays fast; no unjustified full-store twins  
+- [ ] Test budget: suite stays fast; no unjustified full-store twins; Red is in-tree (catalog journey or unit), not Core functional  
 - [ ] No production-scale default fixtures when tiny N still hits the branch (see TESTING.md)  
 
 - [ ] Constraints cite project invariants (concurrency, IO split, no live heal, …)  

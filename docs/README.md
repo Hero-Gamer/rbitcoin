@@ -14,7 +14,7 @@ update that file — do not paste a parallel spec.
 | Agent | [`AGENTS.md`](../AGENTS.md) | Short hard rules + pointers (not a second design book) |
 | On-disk | [`SCHEMA.md`](../SCHEMA.md) | Current bytes; soft migrate / bump / refuse; history in [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) |
 | Confirm / store implementer | [`invariants.md`](./invariants.md) + [`concurrency.md`](./concurrency.md) | Stage IO, leftover union, roles, tip commit |
-| Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage |
+| Tests | [`TESTING.md`](../TESTING.md) | How to run, budgets, coverage, default-CI pin vs nightly Core |
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
@@ -65,7 +65,7 @@ quality backlog).
 | [`CHANGELOG.md`](../CHANGELOG.md) | Release notes. |
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk schema (`SCHEMA_VERSION` home). Soft migrate / bump / refuse. |
 | [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) | Prior versions and migrations. |
-| [`TESTING.md`](../TESTING.md) | Suite, budgets, coverage policy. |
+| [`TESTING.md`](../TESTING.md) | Suite, budgets, coverage policy, default-CI pin vs nightly Core. |
 
 ## Confirm stage IO (one table)
 

@@ -11,6 +11,38 @@
 
 **Fewer scenario functions / store opens, not less coverage** — put more asserts on one carefully designed multi-stage journey.
 
+### Default CI is the pin
+
+Default `cargo test` owns operator- and peer-visible contracts (JSON-RPC,
+Electrum TCP, Esplora HTTP, BIP324 P2P). Bitcoin Core’s Python functional
+suite is a **nightly / ship / `core-functional` label** oracle. It is **not**
+a required PR check and **not** required on PRs that merely touch net or RPC
+(too slow). Nightly Core is not a license to delete in-tree tests.
+
+When adding or folding a pin:
+
+| Do | Do not |
+|----|--------|
+| Extend an existing [catalog](#scenario-catalog) journey (same `/tmp` pad, more asserts) | A new skinny scenario that remine-pads the same chain |
+| Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
+| Keep guts the journey cannot hit | Delete handshake **format** needles, `decode_rpc_subset`, or BIP324 encode vectors waiting for Core |
+| Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
+| New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` (`coverage.sh` skips it) |
+
+Coverage (≥90% LCOV `LH`/`LF`) is a required PR job. If deleting a guts test
+drops the bar, the journey did not cover the path — keep the guts or hit
+those lines from the journey first.
+
+Keep until a **default** journey hits the same lines: store packed / v17 /
+fuse / SH machines, empty / truncated / v1 fuse refuse, unsorted pack/lag,
+IBD wave fence / 8×8000, SH writebehind / uring CAS, leftover identity,
+handshake format needles, `getaddr_cache_*`, eviction ranking, feeler silence
+timeout, sole-preferred stall KEEP, `stamp_reject_names_*`,
+`multi_hop_bad_prev_*`, structure s1–s18, rate-limiter, netgroup, subsidy
+table. Optional leftovers (more HTTP methods on `cross_surface`, a tiny
+legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
+are not a backlog.
+
 ### Parallel cargo test (same binary)
 
 `cargo test` / `cargo llvm-cov test` run **one process per test binary**. Do not:
@@ -234,12 +266,12 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `electrum_leftover_mempool_does_not_double_count` | Electrum | Relay-off leftover is confirmed, not a second mempool UTXO |
 | `electrum_and_esplora_asof_hides_later_spend` | Electrum + Esplora | One pad: TCP `1.4.2-asof` plus HTTP `?asof=` hide a later spend; unknown asof errors; `GET /tx` `v0_p2wpkh` vout |
 | `electrum_empty_chain_headers_subscribe_and_empty_scripthash` | Electrum | Empty store: `headers.subscribe` errors; scripthash history/balance/unspent/mempool empty |
-| `electrum_tweaks_subscribe_streams_then_done` | Electrum | Cake `tweaks.subscribe`: one-height result, per-height notifies, then `done` |
+| `electrum_tweaks_subscribe_streams_then_done` | Electrum | Cake `tweaks.subscribe`: one-height result, per-height notifies, `done`, and BIP352 hash-bind on a P2WPKH→P2TR spend. Keep zero-chunk / pre-taproot units |
 | `electrum_max_connections_rejects_extra_client` | Electrum | TCP cap drops the extra client |
 | `electrum_idle_timeout_disconnects_quiet_client` | Electrum | Idle timeout closes a quiet socket |
-| `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: HTTP `sendrawtransaction` / `testmempoolaccept` (allowed, missing-or-spent, min-relay), Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`); `generate` includes those txs; immature coinbase sendraw rejects. Keep `accept.rs` reject units and RPC dry-run orphan-count |
+| `esplora_broadcast_visible_in_rpc_and_electrum` | Node + Electrum + Esplora + RPC | One `run_p2p` datadir: HTTP `sendrawtransaction` / `testmempoolaccept` (allowed, missing-or-spent, min-relay, RBF too-low reject + replacement), Esplora `POST /tx` parent and mempool child appear in `getrawmempool` and Electrum mempool/history (`fee` on unconfirmed, including child `height = -1`); `generate` includes those txs; immature coinbase sendraw rejects. Keep `accept.rs` reject units and RPC dry-run orphan-count |
 | `two_node_header_and_block_sync` | P2P (**default + multinode CI**) | Seeder → peer 8-block IBD; peer `last_write` meter. **Not** re-run under `coverage.sh`. |
-| `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Sole-preferred stall KEEP stays a PeerHub unit. |
+| `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, obsolete VERSION and pre-verack ping close the peer, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Handshake **format** needles stay. Sole-preferred stall KEEP stays a PeerHub unit. |
 | `p2p_compact_hb_getblocktxn_and_orphan` | P2P (**default**) | One mature pad: HB coinbase `cmpctblock`, 2-tx compact → `getblocktxn` + connect, orphan child GetData then parent accept (INV AlreadyHave). Does **not** pin depth-10 full-block serve, tokio-worker lock, or park-not-reject logs |
 | `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |
 | `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
@@ -426,8 +458,10 @@ The nightly job (`.github/workflows/core-functional.yml` →
 `scripts/core-functional/nightly.sh`) warns — it does not fail — when a
 newer Bitcoin Core release exists than the inventory pin. Label
 **`core-functional`** on harness PRs and on **ship** version-bump PRs
-([`docs/releases.md`](docs/releases.md)). Default `cargo test` does **not**
-invoke Core’s Python suite.
+([`docs/releases.md`](docs/releases.md)). It is **not** a required PR check,
+including on PRs that touch net or RPC (too slow). Unlabeled PRs keep the
+default cargo jobs. Default `cargo test` does **not** invoke Core’s Python
+suite.
 
 ```bash
 python3 scripts/core-functional/check_inventory.py
