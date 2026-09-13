@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Process package + live mempool HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  pins Esplora `POST /txs/package` 1p1c success, process `gettxout` (confirmed,
+  mempool create, mempool-spent hide), `getchaintips`, live `GET /mempool` /
+  `/mempool/txids` / `/mempool/recent` / `/fee-estimates`, and serving-only
+  `submitpackage` refusing while relay is off (`sendraw` still admits).
+  Package JSON errors and dispatch `gettxout` stay units.
+
 - **P2P getblocks / feefilter / bloom:** live follower `getblocks` is answered
   with `inv`, inbound BIP133 `feefilter` is recorded, and `filterload`
   disconnects (bloom off). Oversize locator and MemPool/`filteradd`/`filterclear`
@@ -73,6 +80,11 @@ before 1.0).
   [`COMPAT.md`](COMPAT.md).
 
 ### Fixed
+
+- **Esplora `POST /txs/package` 1p1c:** `MempoolHub::accept_package` commits each
+  member before the next admit so a child can spend an in-package parent
+  (same sequential shape as `ActiveMempool::accept_package`). Prepare-all
+  left the child orphaned.
 
 - **Coverage `integration_multinode` SIGABRT:** live `P2PNode` tests serialize
   on a process mutex so overlapping `shutdown` abort cannot smash the shared
