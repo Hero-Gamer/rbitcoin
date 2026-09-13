@@ -310,7 +310,7 @@ fn denserels_by_stamped_range(
 /// Sources: plan/in-flight offline denserels → stamp-carried CreatePin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
 /// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
-/// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is holes-only.
+/// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is abs-or-Corrupt.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -440,178 +440,15 @@ pub(super) fn pin_for_wire_batch(
     Ok((batch_parents, spend_edges))
 }
 
-fn stamp_spent_ranges(
-    query: &Query,
-    batch_parents: &mut rbitcoin_query::BatchParents,
-    ids: impl IntoIterator<Item = u64>,
-) -> Result<(), ConsensusError> {
-    let mut spent_fks: Vec<rbitcoin_primitives::Fk> =
-        ids.into_iter().map(rbitcoin_primitives::Fk).collect();
-    spent_fks.sort_unstable_by_key(|f| f.0);
-    spent_fks.dedup();
-    spent_fks.retain(|fk| !batch_parents.has_abs_layout(*fk));
-    if spent_fks.is_empty() {
-        return Ok(());
-    }
-    let loc = query
-        .store()
-        .tx_create_loc_range_batch(&spent_fks)
-        .map_err(ConsensusError::from)?;
-    for (fk, opt) in spent_fks.iter().zip(loc) {
-        let Some(p) = opt else { continue };
-        batch_parents.set_spent_range_only(*fk, p.spent);
-        if batch_parents.get_body_range(*fk).is_none() {
-            batch_parents.set_body_range_only(*fk, p.txout);
-        }
-    }
-    Ok(())
-}
-
 /// Ensure spend abs for every spend edge on the write batch.
 ///
 /// Lookup stamps archived-parent spent ranges; load copies them onto
-/// the pin. This loc-stamps remaining holes (same-batch creates after Class A,
-/// missing stamp). Missing abs after that is `Corrupt`. Never `put_spend*`.
+/// the pin. Same-batch abs comes from append RAM in write fill. Missing
+/// abs is `Corrupt`. Never `put_spend*` and never preads `create.loc`.
 pub(super) fn ensure_spend_abs_layouts(
-    query: &Query,
-    batch_parents: &mut rbitcoin_query::BatchParents,
+    batch_parents: &rbitcoin_query::BatchParents,
     prepared: &[Prepared],
 ) -> Result<(), ConsensusError> {
-    use rbitcoin_store::IdxBodyMode;
-
-    let mut need: U64Map<Vec<u32>> = U64Map::default();
-    for p in prepared {
-        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
-            if sfk.is_null() || cfk.is_null() {
-                continue;
-            }
-            if batch_parents.get_spender_abs(cfk, vout).is_some() {
-                continue;
-            }
-            if let Some(id) = cfk.get() {
-                need.entry(id).or_default().push(vout);
-            }
-        }
-    }
-    // Also repair pins that have outs but no layout (structural cold path would
-    // skip unpinned; pinned-without-abs fails structural).
-    for fk in batch_parents.fks_missing_layout() {
-        if let Some(id) = fk.get() {
-            need.entry(id).or_default();
-        }
-    }
-    if need.is_empty() {
-        return Ok(());
-    }
-    for vouts in need.values_mut() {
-        vouts.sort_unstable();
-        vouts.dedup();
-    }
-
-    let first: Vec<u64> = need
-        .keys()
-        .copied()
-        .filter(|&id| batch_parents.contains(rbitcoin_primitives::Fk(id)))
-        .collect();
-    let first_stamped: U64Set = first.iter().copied().collect();
-    stamp_spent_ranges(query, batch_parents, first)?;
-
-    let mut ensure_res = 0u64;
-    let mut still: U64Map<Vec<u32>> = U64Map::default();
-    for (id, need_v) in &need {
-        let fk = rbitcoin_primitives::Fk(*id);
-        if batch_parents.has_abs_layout(fk)
-            && (need_v.is_empty()
-                || need_v
-                    .iter()
-                    .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
-        {
-            ensure_res = ensure_res.saturating_add(1);
-            continue;
-        }
-        still.insert(*id, need_v.clone());
-    }
-    rbitcoin_query::note_confirm(&query.confirm_stats().ensure_res_hit, ensure_res);
-
-    // Class A denserels body for remainder only — must not re-load pin denserels hits.
-    if !still.is_empty() {
-        let fks: Vec<rbitcoin_primitives::Fk> = still
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .collect();
-        rbitcoin_query::note_confirm(&query.confirm_stats().ensure_cold_n, fks.len() as u64);
-        let loaded = rbitcoin_query::load_creates_once(query.store(), &fks, IdxBodyMode::Outs)
-            .map_err(ConsensusError::from)?;
-        let secret = query.store().txs.store_secret();
-        for c in loaded {
-            let Some(id) = c.fk.get() else {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: ensure denserels null create_fk",
-                )));
-            };
-            let need_v = still.get(&id).cloned().unwrap_or_default();
-            let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
-                dec
-            } else {
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                    &c.raw,
-                    c.n_out,
-                    Some(secret),
-                )
-                .map_err(|_| {
-                    ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: ensure denserels decode failed",
-                    ))
-                })?
-            };
-            // Write ensure may read txid.body (not load stage).
-            tx.txid = known_create_txid_lookup(query, id, None)?;
-            if batch_parents.contains(c.fk) {
-                batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
-                continue;
-            }
-            // Not pinned at load (e.g. already-archived same-batch create): insert
-            // with layout so annotate/structural abs paths work.
-            let mut checked = need_v;
-            if checked.is_empty() {
-                checked = (0..outs.len() as u32).collect();
-            }
-            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = checked
-                .iter()
-                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                .collect();
-            if live.len() != checked.len() {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: ensure denserels incomplete outs for need_vouts",
-                )));
-            }
-            let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
-            if !rbitcoin_query::layout_covers_need(Some(c.body_range), &sparse, &checked) {
-                return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: ensure denserels incomplete for need_vouts",
-                )));
-            }
-            let cb = if tx.input_count != 1 {
-                Some(false)
-            } else {
-                None
-            };
-            batch_parents.insert_owned(c.fk, tx, live, checked, cb, Some(c.body_range), sparse);
-        }
-        let after: Vec<u64> = still
-            .keys()
-            .copied()
-            .filter(|&id| {
-                if first_stamped.contains(&id) {
-                    return false;
-                }
-                let fk = rbitcoin_primitives::Fk(id);
-                batch_parents.contains(fk) && !batch_parents.has_abs_layout(fk)
-            })
-            .collect();
-        stamp_spent_ranges(query, batch_parents, after)?;
-    }
-
     for p in prepared {
         for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
             if sfk.is_null() || cfk.is_null() {

@@ -834,7 +834,7 @@ impl Query {
     /// Drains write-behind `tx.head` before return. Confirm write uses
     /// [`Self::archive_commit_plan_defer_head`] to overlap drain with Class C.
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<bool, QueryError> {
-        let committed = self.archive_commit_plan_defer_head(plan)?;
+        let (committed, _) = self.archive_commit_plan_defer_head(plan)?;
         if committed {
             let _ = self.drain_pending_tx_head()?;
         }
@@ -842,16 +842,17 @@ impl Query {
     }
 
     /// Like [`Self::archive_commit_plan`] but leaves `tx.head` in the pending map.
+    /// Loc pairs are the Class A append starts (RAM). Empty when nothing committed.
     pub fn archive_commit_plan_defer_head(
         &self,
         mut plan: ArchiveWritePlan,
-    ) -> Result<bool, QueryError> {
+    ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
         use std::time::Instant;
         if plan.packed.is_empty() {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
         if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
         let t0 = Instant::now();
         let n_blocks = plan.per_header_ranges.len() as u64;
@@ -864,7 +865,7 @@ impl Query {
 
         let t = Instant::now();
         let overlay = plan.same_batch_spent_overlay();
-        let got_tx_fks = self.store.put_tx_full_batch_from_pins(
+        let (got_tx_fks, loc) = self.store.put_tx_full_batch_from_pins(
             &plan.packed,
             /*index=*/ false,
             &overlay,
@@ -872,6 +873,9 @@ impl Query {
         let body_ns = t.elapsed().as_nanos() as u64;
         if got_tx_fks.len() != plan.packed.len() {
             return Err(StoreError::Corrupt("tx put_full_batch length"));
+        }
+        if loc.len() != got_tx_fks.len() {
+            return Err(StoreError::Corrupt("invariant: append loc length"));
         }
         if got_tx_fks != plan.planned_fks {
             return Err(StoreError::Corrupt(
@@ -917,7 +921,7 @@ impl Query {
             htxs_ns,
             n_blocks.max(1),
         );
-        Ok(true)
+        Ok((true, loc))
     }
 
     /// Drain write-behind `tx.head` inserts (page-grouped).

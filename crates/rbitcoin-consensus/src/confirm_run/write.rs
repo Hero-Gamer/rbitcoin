@@ -90,45 +90,40 @@ pub fn confirm_write_phase(
                 .map_err(ConsensusError::from)?;
             let t_take = Instant::now();
             let planned_fks = plan.planned_fks.clone();
-            let pins = if query.index_mode().is_tip() {
-                Some(if plan.batch_pin.len() == plan.planned_fks.len() {
+            let packed_pins: Vec<rbitcoin_query::CreatePin> =
+                if plan.batch_pin.len() == plan.planned_fks.len() {
                     std::mem::take(&mut plan.batch_pin)
                 } else {
                     plan.packed
                         .iter()
                         .map(|(pin, _)| std::sync::Arc::clone(pin))
-                        .collect::<Vec<_>>()
-                })
-            } else {
-                None
-            };
+                        .collect()
+                };
             plan_take_ns = t_take.elapsed().as_nanos() as u64;
             let t_ca = Instant::now();
-            let committed = query
+            let (committed, loc) = query
                 .archive_commit_plan_defer_head(plan)
                 .map_err(ConsensusError::from)?;
             class_a_ns = t_ca.elapsed().as_nanos() as u64;
-            // Layout + SH pins only after a real append. Idempotent skip (Class A
-            // already present) uses store denserels via ensure / class_c cold pins.
+            // Layout from append RAM. Idempotent skip (Class A already present)
+            // must already have lookup stamps — missing abs is Corrupt.
             // Direct SH collect is a no-op — skip the FkMap.
             if committed {
-                if let Some(pins) = pins {
+                if query.index_mode().is_tip() {
                     let t_map = Instant::now();
                     write_create_pins.reserve(planned_fks.len());
-                    for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
+                    for (fk, pin) in planned_fks.iter().zip(packed_pins.iter()) {
                         write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
                     }
                     create_map_ns = t_map.elapsed().as_nanos() as u64;
                 }
                 let t_ens = Instant::now();
-                let loc = query
-                    .store()
-                    .tx_create_loc_range_batch(&planned_fks)
-                    .map_err(ConsensusError::from)?;
                 fill_planned_create_layout_after_commit(
                     &mut batch.batch_parents,
                     &planned_fks,
                     &loc,
+                    &packed_pins,
+                    &batch.prepared,
                 )?;
                 ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
                 if let Some(last) = batch.prepared.last() {
@@ -139,7 +134,7 @@ pub fn confirm_write_phase(
     }
     {
         let t_ens = Instant::now();
-        ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;
+        ensure_spend_abs_layouts(&batch.batch_parents, &batch.prepared)?;
         ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
     }
     if class_a_ns > 0 {
@@ -400,32 +395,70 @@ fn annotate_jobs_from_connected_hash(
     Ok(jobs)
 }
 
-/// After Class A commit, set body+spent ranges for **pinned** creates still
-/// missing layout. One `create_loc_range_batch`.
+/// After Class A commit, stamp same-batch spend creates from append RAM loc
+/// and packed pin outs. Write never preads `create.loc`.
 pub(super) fn fill_planned_create_layout_after_commit(
     batch_parents: &mut rbitcoin_query::BatchParents,
     planned_fks: &[rbitcoin_primitives::Fk],
-    loc: &[Option<rbitcoin_store::CreateLocPair>],
+    loc: &[rbitcoin_store::CreateLocPair],
+    packed: &[rbitcoin_query::CreatePin],
+    prepared: &[Prepared],
 ) -> Result<(), ConsensusError> {
     if planned_fks.is_empty() {
         return Ok(());
     }
-    let missing: U64Set = batch_parents
-        .fks_missing_layout()
-        .into_iter()
-        .filter_map(|f| f.get())
-        .collect();
-    if missing.is_empty() {
+    let mut need: U64Map<Vec<u32>> = U64Map::default();
+    for p in prepared {
+        for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
+            if sfk.is_null() || cfk.is_null() {
+                continue;
+            }
+            if batch_parents.get_spender_abs(cfk, vout).is_some() {
+                continue;
+            }
+            if let Some(id) = cfk.get() {
+                need.entry(id).or_default().push(vout);
+            }
+        }
+    }
+    if need.is_empty() {
         return Ok(());
     }
-    for (fk, pair) in planned_fks.iter().zip(loc.iter()) {
+    if loc.len() != planned_fks.len() || packed.len() != planned_fks.len() {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: append loc length",
+        )));
+    }
+    for (fk, (pair, pin)) in planned_fks.iter().zip(loc.iter().zip(packed.iter())) {
         let Some(id) = fk.get() else { continue };
-        if !missing.contains(&id) {
+        let Some(vouts) = need.get(&id) else { continue };
+        if pair.n_out != pin.1.len() as u32 {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: append loc length",
+            )));
+        }
+        if batch_parents.contains(*fk) {
+            batch_parents.set_body_range_only(*fk, pair.txout);
+            batch_parents.set_spent_range_only(*fk, pair.spent);
             continue;
         }
-        let Some(p) = pair else { continue };
-        batch_parents.set_body_range_only(*fk, p.txout);
-        batch_parents.set_spent_range_only(*fk, p.spent);
+        let mut checked = vouts.clone();
+        checked.sort_unstable();
+        checked.dedup();
+        let cb = if pin.0.input_count != 1 {
+            Some(false)
+        } else {
+            None
+        };
+        batch_parents.insert_create_pin(
+            *fk,
+            std::sync::Arc::clone(pin),
+            checked,
+            cb,
+            Some(pair.txout),
+            Vec::new(),
+        );
+        batch_parents.set_spent_range_only(*fk, pair.spent);
     }
     Ok(())
 }

@@ -1677,7 +1677,7 @@ impl TxTable {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
-        let fks = self.append_stems_one_wave(
+        let (fks, _loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
             est_inwit,
@@ -1714,9 +1714,9 @@ impl TxTable {
         items: &[PinInItem],
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
-    ) -> Result<Vec<Fk>, StoreError> {
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         if items.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if !spent_overlay.is_empty() && spent_overlay.len() != items.len() {
             return Err(StoreError::Corrupt("spent overlay length"));
@@ -1760,7 +1760,7 @@ impl TxTable {
             .iter()
             .map(|(pin, _)| pin.as_ref().1.len() as u32)
             .collect();
-        let fks = self.append_stems_one_wave(
+        let (fks, loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
             est_inwit,
@@ -1789,13 +1789,14 @@ impl TxTable {
                 .collect();
             self.head_insert_many(&heads)?;
         }
-        Ok(fks)
+        Ok((fks, loc))
     }
 
     #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
     /// Encode and write `txout` + `inwit` + `spent` bodies as one pwrite wave.
     ///
     /// Order is still body → loc → HWM per stem. Not the spend-annotate machine.
+    /// Loc pairs are the append starts (write keeps them in RAM; no loc pread).
     fn append_stems_one_wave(
         &self,
         n: usize,
@@ -1806,12 +1807,12 @@ impl TxTable {
         encode_out: impl FnMut(usize, &mut Vec<u8>),
         encode_in: impl FnMut(usize, &mut Vec<u8>),
         encode_sp: impl FnMut(usize, &mut Vec<u8>),
-    ) -> Result<Vec<Fk>, StoreError> {
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         if n_outs.len() != n {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let Some(p_out) = self.body.prepare_batch_encode(n, est_out, encode_out)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let Some(p_in) = self.inwit.prepare_batch_encode(n, est_inwit, encode_in)? else {
             return Err(StoreError::Corrupt("Class A inwit prepare empty"));
@@ -1826,11 +1827,18 @@ impl TxTable {
         ])?;
         let tx_lens = p_out.aligned_lens();
         let mut recs = Vec::with_capacity(n);
+        let mut loc = Vec::with_capacity(n);
         for i in 0..n {
+            let spent_len = spent_record_len(n_outs[i]);
             recs.push(crate::create_loc::CreateLocAppend {
                 txout_start: p_out.starts[i],
                 txout_len: tx_lens[i],
                 spent_start: p_sp.starts[i],
+                n_out: n_outs[i],
+            });
+            loc.push(crate::create_loc::CreateLocPair {
+                txout: (p_out.starts[i], tx_lens[i]),
+                spent: (p_sp.starts[i], spent_len),
                 n_out: n_outs[i],
             });
         }
@@ -1844,7 +1852,7 @@ impl TxTable {
                 "Class A append fk mismatch across stems",
             ));
         }
-        Ok(fks)
+        Ok((fks, loc))
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
