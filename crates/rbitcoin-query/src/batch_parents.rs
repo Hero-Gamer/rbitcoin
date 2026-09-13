@@ -891,6 +891,7 @@ impl BatchParents {
     }
 
     /// Unique `(create_id, vout, abs, spend_fk)` for spend edges. Missing abs is Corrupt.
+    #[allow(clippy::type_complexity)] // packed (id, vout, abs, spend_fk, vin)
     pub fn spend_abs_jobs(
         &self,
         edges: impl IntoIterator<Item = (Fk, u32, Fk, u32)>,

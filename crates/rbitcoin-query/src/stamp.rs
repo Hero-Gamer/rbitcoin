@@ -7,7 +7,7 @@
 //! lookup-wave drain+fence snapshot taken before TipOnly.
 
 use crate::id_map::{IdMap, TxidHasher};
-use crate::{CreatePin, InFlight, QueryError, U64Map, U64Set};
+use crate::{CreatePin, InFlight, QueryError, U64Map};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
@@ -24,16 +24,22 @@ pub struct BatchParentIds {
     pub ids: Arc<IdMap>,
     /// Wave `create_fk_id → spent.body` range (shared across chunks).
     pub spent: Arc<U64Map<(u64, u64)>>,
+    /// Wave `create_fk_id → loc n_out`.
+    pub n_out: Arc<U64Map<u32>>,
     /// Per-chunk `create_fk_id → vouts` spent in this load batch.
     pub need_vouts: U64Map<Vec<u32>>,
 }
 
 impl BatchParentIds {
     #[allow(clippy::type_complexity)] // packed (fk, range) / span row is the on-disk shape
-    pub fn get(&self, txid: &[u8; 32]) -> Option<(Fk, (u64, u64), Option<(u64, u64)>)> {
+    pub fn get(
+        &self,
+        txid: &[u8; 32],
+    ) -> Option<(Fk, (u64, u64), Option<(u64, u64)>, Option<u32>)> {
         let &(fk, body) = self.ids.get(txid)?;
         let spent = fk.get().and_then(|id| self.spent.get(&id).copied());
-        Some((fk, body, spent))
+        let n_out = fk.get().and_then(|id| self.n_out.get(&id).copied());
+        Some((fk, body, spent, n_out))
     }
 }
 
@@ -43,6 +49,7 @@ pub struct ParentIdent {
     pub txid: [u8; 32],
     pub body: Option<(u64, u64)>,
     pub spent: Option<(u64, u64)>,
+    pub n_out: Option<u32>,
     pub pin: Option<CreatePin>,
 }
 
@@ -53,6 +60,7 @@ impl ParentIdent {
             txid,
             body: None,
             spent: None,
+            n_out: None,
             pin: None,
         }
     }
@@ -63,6 +71,18 @@ impl ParentIdent {
             txid,
             body: Some(body),
             spent: None,
+            n_out: None,
+            pin: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_loc(txid: [u8; 32], body: (u64, u64), spent: (u64, u64), n_out: u32) -> Self {
+        Self {
+            txid,
+            body: Some(body),
+            spent: Some(spent),
+            n_out: Some(n_out),
             pin: None,
         }
     }
@@ -138,7 +158,7 @@ pub fn stamp_external_parents(
     let mut after_skel: Vec<&[u8; 32]> = Vec::new();
     if let Some(skel) = skeleton {
         for t in still_need {
-            if let Some((fk, range, spent)) = skel.get(t) {
+            if let Some((fk, range, spent, n_out)) = skel.get(t) {
                 stamp.resolved.insert(*t, fk);
                 if let Some(id) = fk.get() {
                     let e = stamp.bind(id, *t);
@@ -146,6 +166,7 @@ pub fn stamp_external_parents(
                     if let Some(sr) = spent {
                         e.spent = Some(sr);
                     }
+                    e.n_out = n_out;
                 }
                 stamp.pin_txid_n = stamp.pin_txid_n.saturating_add(1);
                 continue;
@@ -176,11 +197,14 @@ pub fn stamp_external_parents(
         let mut age3 = 0u64;
         let mut age_n = 0u64;
         for (txid, row) in hits {
-            if let Some((fk, range)) = row {
+            if let Some((fk, pair)) = row {
                 stamp.resolved.insert(txid, fk);
                 stamp.head_hit_n = stamp.head_hit_n.saturating_add(1);
                 if let Some(id) = fk.get() {
-                    stamp.bind(id, txid).body = Some(range);
+                    let e = stamp.bind(id, txid);
+                    e.body = Some(pair.txout);
+                    e.spent = Some(pair.spent);
+                    e.n_out = Some(pair.n_out);
                     if let Some(age) =
                         rbitcoin_store::head_resolve_stats::sealed_age_for_fk(&first_fks, id)
                     {
@@ -240,57 +264,32 @@ pub fn fill_missing_parent_ranges(
     stats: &crate::ConfirmStats,
 ) -> Result<(), QueryError> {
     stats.note_fill_missing();
-    let mut need_body: Vec<Fk> = Vec::new();
-    let mut need_spent: Vec<Fk> = Vec::new();
+    let mut need: Vec<Fk> = Vec::new();
     for (&id, ident) in idents.iter() {
         if in_flight.get_out(id).is_some() {
             continue;
         }
-        let fk = Fk(id);
-        if ident.body.is_none() {
-            need_body.push(fk);
-        }
-        if ident.spent.is_none() {
-            need_spent.push(fk);
+        if ident.body.is_none() || ident.spent.is_none() || ident.n_out.is_none() {
+            need.push(Fk(id));
         }
     }
-    let mut body_filled = U64Set::default();
-    if !need_body.is_empty() {
-        let filled = store.tx_body_range_batch(&need_body)?;
-        for (fk, row) in need_body.into_iter().zip(filled) {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            let Some(range) = row else {
-                return Err(rbitcoin_store::StoreError::Corrupt(
-                    "archive: external parent body_range missing after create_fk stamp",
-                ));
-            };
-            if let Some(e) = idents.get_mut(&id) {
-                e.body = Some(range);
-            }
-            body_filled.insert(id);
-        }
+    if need.is_empty() {
+        return Ok(());
     }
-    if !need_spent.is_empty() {
-        let filled = store.tx_spent_range_batch(&need_spent)?;
-        for (fk, row) in need_spent.into_iter().zip(filled) {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            match row {
-                Some(sr) => {
-                    if let Some(e) = idents.get_mut(&id) {
-                        e.spent = Some(sr);
-                    }
-                }
-                None if body_filled.contains(&id) => {
-                    return Err(rbitcoin_store::StoreError::Corrupt(
-                        "archive: external parent spent_range missing after create_fk stamp",
-                    ));
-                }
-                None => {}
-            }
+    let filled = store.tx_create_loc_range_batch(&need)?;
+    for (fk, row) in need.into_iter().zip(filled) {
+        let Some(id) = fk.get() else {
+            continue;
+        };
+        let Some(pair) = row else {
+            return Err(rbitcoin_store::StoreError::Corrupt(
+                "archive: external parent loc missing after create_fk stamp",
+            ));
+        };
+        if let Some(e) = idents.get_mut(&id) {
+            e.body = Some(pair.txout);
+            e.spent = Some(pair.spent);
+            e.n_out = Some(pair.n_out);
         }
     }
     Ok(())
@@ -336,6 +335,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(ids),
             spent: Arc::new(spent),
+            n_out: Default::default(),
             need_vouts: U64Map::default(),
         };
         let empty = InFlight::new();

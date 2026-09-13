@@ -24,7 +24,7 @@
 //! Stage walls (window sums; stages overlap on OS threads):
 //! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`
 //!   with nested `decode=` / `precompute=` / `collect=` /
-//!   `head=(probe= io= preads=)` / `spent=`)
+//!   `head=(probe= io= preads=)` / `loc=`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp
 //!   (plan=None / S0 only), clone, and post-stamp prune on a marked last load
@@ -348,7 +348,7 @@ pub(crate) struct IbdPerfSample {
     pub lookup_wave_head_io_ms: u64,
     /// TipOnly `txid.body` / identity preads this window.
     pub lookup_wave_head_preads: u64,
-    /// Lookup-wave `tx_spent_range_batch` for TipOnly hits (`wave=… spent=`).
+    /// Lookup-wave `create.loc` fill inside TipOnly `head=` (`wave=… loc=`).
     pub lookup_wave_spent_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
@@ -1027,7 +1027,7 @@ pub(crate) fn sample(
         lookup_wave_head_probe_ms: ns_ms(head_res.probe_ns),
         lookup_wave_head_io_ms: ns_ms(head_res.body_ns.saturating_add(head_res.idx_ns)),
         lookup_wave_head_preads: head_res.body_lookups,
-        lookup_wave_spent_ms: ns_ms(w.lookup_wave_spent_ns),
+        lookup_wave_spent_ms: ns_ms(head_res.idx_ns),
         plan_parents: w.lookup_parents,
         plan_already: w.lookup_already,
         plan_cold: w.lookup_cold,
@@ -1219,7 +1219,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let stamp_pack_ms = s.thr_load_stamp_ms.saturating_sub(stamp_head_ms);
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
-         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={}) spent={}ms) other={}ms send_w={}ms) \
+         lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={}) loc={}ms) other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
@@ -1317,7 +1317,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms spent={}ms stamp_head={}ms cold_io={}ms)",
+            " lookup_sub(blks={} parents={} already={} cold={} same={} collect={}ms decode={}ms precompute={}ms head={}ms loc={}ms stamp_head={}ms cold_io={}ms)",
             s.plan_blks,
             s.plan_parents,
             s.plan_already,
@@ -2281,7 +2281,7 @@ mod tests {
         assert!(info.contains("collect=3ms"), "{info}");
         assert!(
             info.contains(
-                "wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms(probe=0ms io=0ms preads=0) spent=0ms)"
+                "wave=1ms(decode=40ms precompute=30ms collect=3ms head=20ms(probe=0ms io=0ms preads=0) loc=0ms)"
             ),
             "{info}"
         );

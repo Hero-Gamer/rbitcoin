@@ -719,7 +719,7 @@ mod tests {
         assert!(hot.join("store/txout.body").is_file());
         assert!(!hot.join("store/inwit.body").exists());
         assert!(cold.join("store/inwit.body").is_file());
-        assert!(cold.join("store/inwit.idx").is_dir());
+        assert!(cold.join("store/inwit.loc").is_file());
         assert!(hot.join("store").join("inwit.reloc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }

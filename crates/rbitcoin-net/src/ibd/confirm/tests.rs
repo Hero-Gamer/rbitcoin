@@ -454,6 +454,7 @@ fn chunk_parent_ids_vouts_are_per_chunk() {
     let wave = BatchParentIds {
         ids: Arc::new(ids),
         spent: Arc::new(rbitcoin_query::U64Map::default()),
+        n_out: Default::default(),
         need_vouts: rbitcoin_query::U64Map::default(),
     };
     let spend = Block {

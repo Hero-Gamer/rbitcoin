@@ -1114,7 +1114,7 @@ mod tests {
             let mut raw = Vec::new();
             rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
             let (meta, dec_outs, _) =
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw, 1).unwrap();
             assert_eq!(meta.output_count as usize, dec_outs.len());
             assert_eq!(outs.len(), dec_outs.len());
         }
@@ -1564,7 +1564,7 @@ mod tests {
         let known = plan.external_parent_txid(pid).expect("reverse map");
         let (rows, _body_ns, _dec_ns, _extend_n, _sqe_n, _guess_n) = q
             .store
-            .get_outs_by_range_batch(&[(parent_fk, range, known, vec![0])])
+            .get_outs_by_range_batch(&[(parent_fk, range, known, 1, vec![0])])
             .unwrap();
         let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
         assert_eq!(
@@ -2110,6 +2110,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
         let child = child_spend(parent_txid, 0x66);
@@ -2146,6 +2147,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
         let child = child_spend(parent_txid, 0x66);
@@ -2198,6 +2200,7 @@ mod tests {
         let skel = BatchParentIds {
             ids: Arc::new(m),
             spent: Arc::new(crate::U64Map::default()),
+            n_out: Default::default(),
             need_vouts: crate::U64Map::default(),
         };
 

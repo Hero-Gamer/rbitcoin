@@ -59,10 +59,16 @@ fn wave_join_is_dense(elig_count: usize, first_id: u64, last_id: u64) -> bool {
 }
 
 #[allow(clippy::type_complexity)] // packed (fk, range) / span row is the on-disk shape
-fn thin_join_txids_and_ranges(
+fn thin_join_txids_and_loc(
     store: &Store,
     elig_fks: &[Fk],
-) -> Result<(Vec<Option<[u8; 32]>>, Vec<Option<(u64, u64)>>), StoreError> {
+) -> Result<
+    (
+        Vec<Option<[u8; 32]>>,
+        Vec<Option<rbitcoin_store::CreateLocPair>>,
+    ),
+    StoreError,
+> {
     let Some(first_id) = elig_fks.first().and_then(|f| f.get()) else {
         return Err(StoreError::InvalidFk);
     };
@@ -71,15 +77,16 @@ fn thin_join_txids_and_ranges(
     };
     if wave_join_is_dense(elig_fks.len(), first_id, last_id) {
         let all_txids = store.txs.txid_sidefile().get_range(first_id, last_id)?;
-        let all_ranges = store.txs.body_ranges(first_id, last_id)?;
+        let span_fks: Vec<Fk> = (first_id..=last_id).map(Fk).collect();
+        let all_loc = store.tx_create_loc_range_batch(&span_fks)?;
         let n = (last_id - first_id + 1) as usize;
-        if all_txids.len() != n || all_ranges.len() != n {
+        if all_txids.len() != n || all_loc.len() != n {
             return Err(StoreError::Corrupt(
                 "invariant: thin tweak dense join length mismatch",
             ));
         }
         let mut txids = Vec::with_capacity(elig_fks.len());
-        let mut ranges = Vec::with_capacity(elig_fks.len());
+        let mut loc = Vec::with_capacity(elig_fks.len());
         for fk in elig_fks {
             let id = fk.get().ok_or(StoreError::InvalidFk)?;
             let i = (id - first_id) as usize;
@@ -89,13 +96,13 @@ fn thin_join_txids_and_ranges(
                 ));
             }
             txids.push(Some(all_txids[i]));
-            ranges.push(Some(all_ranges[i]));
+            loc.push(all_loc[i]);
         }
-        Ok((txids, ranges))
+        Ok((txids, loc))
     } else {
         Ok((
             store.txs.txid_sidefile().get_many(elig_fks)?,
-            store.tx_body_range_batch(elig_fks)?,
+            store.tx_create_loc_range_batch(elig_fks)?,
         ))
     }
 }
@@ -240,8 +247,9 @@ impl Query {
     /// span** from first..=last eligible fk in the wave (ineligible txout in
     /// the hole is included; `inwit` is not). `sp_tweaks` mutex is not held
     /// during Class A IO. `limits.cut_through` drops confirmed-spent P2TR
-    /// outs after the join (one spent-range batch, then one spent-body walk
-    /// per create; txs with none left are omitted; the height remains).
+    /// outs after the join (spent range from the same `create.loc` pair as the
+    /// body join, then one spent-body walk per create; txs with none left are
+    /// omitted; the height remains).
     pub fn load_thin_tweaks_range(
         &self,
         start: Height,
@@ -324,12 +332,14 @@ impl Query {
             .map(|p| Vec::with_capacity(p.elig.len()))
             .collect();
 
-        if !elig_fks.is_empty() {
-            let (txids, ranges) = thin_join_txids_and_ranges(&self.store, &elig_fks)?;
+        let loc_pairs: Vec<Option<rbitcoin_store::CreateLocPair>> = if elig_fks.is_empty() {
+            Vec::new()
+        } else {
+            let (txids, loc) = thin_join_txids_and_loc(&self.store, &elig_fks)?;
             let mut span_off = u64::MAX;
             let mut span_end = 0u64;
-            for r in &ranges {
-                let (off, len) = require_thin_body_range(*r)?;
+            for p in &loc {
+                let (off, len) = require_thin_body_range(p.as_ref().map(|x| x.txout))?;
                 span_off = span_off.min(off);
                 span_end = span_end.max(off.saturating_add(len));
             }
@@ -338,8 +348,11 @@ impl Query {
             self.store
                 .txs
                 .with_body_span_into(span_off, span_len, &mut span_buf, |raw| {
-                    for (i, r) in ranges.iter().enumerate() {
-                        let (off, len) = r.unwrap();
+                    for (i, p) in loc.iter().enumerate() {
+                        let pair = p.as_ref().ok_or(StoreError::Corrupt(
+                            "invariant: thin tweak eligible loc missing",
+                        ))?;
+                        let (off, len) = pair.txout;
                         let rel = (off - span_off) as usize;
                         let sl = raw.get(rel..rel.saturating_add(len as usize)).ok_or(
                             StoreError::Corrupt(
@@ -352,7 +365,7 @@ impl Query {
                             ));
                         };
                         let (pi, ei) = tag[i];
-                        let p2tr = self.store.txs.packed_p2tr_from_raw(sl)?;
+                        let p2tr = self.store.txs.packed_p2tr_from_raw(sl, pair.n_out)?;
                         out_rows[pi].push(ThinTweakRow {
                             txid,
                             tweak: plans[pi].elig[ei].1,
@@ -362,7 +375,8 @@ impl Query {
                     Ok(())
                 })?;
             self.note_thin_tweak_body_bytes(span_len);
-        }
+            loc
+        };
 
         if limits.cut_through && !elig_fks.is_empty() {
             let n_rows: usize = out_rows.iter().map(Vec::len).sum();
@@ -371,8 +385,7 @@ impl Query {
                     "invariant: thin cut_through row/fk count",
                 ));
             }
-            let ranges = self.store.tx_spent_range_batch(&elig_fks)?;
-            if ranges.len() != elig_fks.len() {
+            if loc_pairs.len() != elig_fks.len() {
                 return Err(StoreError::Corrupt("invariant: spent_range_batch length"));
             }
             let mut i = 0usize;
@@ -382,9 +395,10 @@ impl Query {
                 for r in 0..rows.len() {
                     vouts.clear();
                     vouts.extend(rows[r].p2tr.iter().map(|p| p.0));
+                    let spent = loc_pairs[i].as_ref().map(|p| p.spent);
                     let live = self
                         .store
-                        .unspent_create_vouts(elig_fks[i], &vouts, ranges[i])?;
+                        .unspent_create_vouts(elig_fks[i], &vouts, spent)?;
                     i += 1;
                     rbitcoin_store::keep_unspent_vout_subsequence(&mut rows[r].p2tr, &live, |p| {
                         p.0
