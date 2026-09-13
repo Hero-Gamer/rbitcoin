@@ -47,7 +47,7 @@ wire / body-queue
   → lookup (stamp create_fk + parent txout/spent ranges + parent txid;
             IO: tx.head, create.loc, txid.body — NEVER outs/inwit decode)
   → load / pin (BatchParents outs by known txout range only;
-            IO: txout.body — NEVER head / idx / txid.body / inwit)
+            IO: txout.body — NEVER head / loc / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present; encode ins from Arc<Block> + SpendEdges)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
@@ -60,7 +60,7 @@ IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
 `take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
 run on the **load** thread and consume `LoadBatch.pres` — they do not read
 `block_queue_resolved`. Leftover TipOnly on that stamp is still **lookup-stage
-IO** (head / idx), not load pin, and only on **plan=None / S0**. After lookup
+IO** (head / create.loc), not load pin, and only on **plan=None / S0**. After lookup
 puts parent P on the load-batch skeleton, load stamp of a child spending P has
 **zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
 move `plan_batch` onto lookup.
@@ -79,7 +79,7 @@ not head/idx.
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (in-flight outs skip) | Missing → hard Err at stamp / pin contract |
-| Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (**engine fault**: requeue once, then halt IBD; never blacklist). Identity without loc range → `Corrupt("invariant: idx range missing after identity")`, not a miss |
+| Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (**engine fault**: requeue once, then halt IBD; never blacklist). Identity without loc range → `Corrupt("invariant: loc range missing after identity")`, not a miss |
 | io_uring harvest | TLS session fail-closed ([`io-modality.md`](./io-modality.md)) | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Ring-unavailable still pread-fallback |
 | Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO) | **No** loc cold outs on load; **no** `create.loc` on load; **no** `inwit` on pin |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup already stamped archived parents; write `create_loc_range_batch` only for unstamped fks (same-batch after Class A, holes) | Stamp remaining ranges from `create.loc`; incomplete → `invariant:` |
@@ -109,9 +109,9 @@ Short sequence:
 | 4 | One `repair_class_c_above_tip` (fence complement: holes + short suffix) |
 | 5 | Then node may densify / extend tip |
 
-`TxIdx::open` refuses a non-monotone tail (`IDX_OPEN_DOUBLE_APPEND`). Offline
-compact: `scripts/repair-idx-double-append.py`. No live heal of a cloned
-published idx window.
+`create.loc` is body-only deltas plus RAM checkpoints; a loc/off size mismatch
+on open is `Corrupt` (wipe + IBD). Historic schema-≤14 idx double-append
+repair (`scripts/repair-idx-double-append.py`) does not apply to schema 22.
 
 ## Store start states (intake at confirm start)
 

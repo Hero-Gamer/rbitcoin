@@ -59,10 +59,10 @@ pub struct CombinedCreate {
     )>,
 }
 
-/// Load creates by fk via idx→body, decode once.
+/// Load creates by fk via loc→body, decode once.
 ///
 /// Each successful body fetch increments [`body_ok_reads`]. Ranges are always
-/// resolved from `tx.idx` (`range=None` on jobs). Callers fill schema-13 zero
+/// resolved from `create.loc` (`range=None` on jobs). Callers fill schema-13 zero
 /// body `TxRecord.txid` from plan RAM maps when needed — this path never seeds
 /// a process pin map and does not fill txid from `txid.body` for that purpose.
 ///

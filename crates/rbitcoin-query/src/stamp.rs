@@ -252,7 +252,7 @@ pub fn stamp_external_parents(
     Ok(stamp)
 }
 
-/// Idx body_range and spent_range for stamped create_fks with no in-flight outs.
+/// Loc body_range and spent_range for stamped create_fks with no in-flight outs.
 ///
 /// Body miss after identity is `Corrupt`. Spent miss after a **store** body fill
 /// is `Corrupt`. RAM-only identity (in-flight outs, no spent range row) leaves

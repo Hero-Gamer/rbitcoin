@@ -167,7 +167,7 @@ Segmented heads reduce grow/remap pain but do not free us from page locality.
 
 ## End goal (phased)
 
-1. **FdOnly** for multi‑GiB random tables: `tx.idx` → `tx.head` / header head → SH head/body / spenders.
+1. **FdOnly** for multi‑GiB random tables: `create.loc` → `tx.head` / header head → SH head/body / spenders.
 2. **InRam** (explicit process buffers) for small Class C / mempool — not leftover MapFull “because small.”
 3. **Remove `memmap2`** from the workspace.
 4. Update this doc after **each** phase with host A/B results.

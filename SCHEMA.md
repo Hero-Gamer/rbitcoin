@@ -316,20 +316,20 @@ Append-published with Class A body/idx on the sole Class A write path. Count mus
 
 ### Split bodies (schema 15)
 
-Each create_fk has three 8-aligned var records (per-stem idx maps; rolls
-are independent when that stem’s next start would exceed the soft span):
+Each create_fk has three 8-aligned var records (loc maps; independent
+stems; spent length is `8 × n_out` with `n_out ≥ 1`):
 
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
 inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
-spent.body Ss:  8 B × max(n_out,1)  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
+spent.body Ss:  8 B × n_out  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
 ```
 
-Empty inwit / zero-out spent: **8-byte zero pad** so idx starts stay strictly monotone.
+Empty inwit: **8-byte zero pad** so loc strides stay strictly monotone.
 Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `inwit`. First-wave Outs reads stay on the starting
 OS page unless `4+(max_need+1)×38` (LAYOUT17 meta + kind + 5 B uleb amount + P2TR;
-empty need: the idx span) is likely to spill; then the first wave is the full idx
+empty need: the loc span) is likely to spill; then the first wave is the full loc
 span. Extend still covers a missed need.
 
 Packed `tx.body` (schema 13–14: 32 B meta | inputs+witness | outputs) is **refused** if it contains creates.
