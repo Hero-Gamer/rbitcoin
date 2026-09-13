@@ -555,7 +555,7 @@ fn param_u32(params: &Value, idx: usize) -> Result<u32, String> {
         .and_then(|a| a.get(idx))
         .and_then(|v| {
             v.as_u64()
-                .map(|n| n as u32)
+                .and_then(|n| u32::try_from(n).ok())
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or_else(|| format!("param {idx} expected number"))

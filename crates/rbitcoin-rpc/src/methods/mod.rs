@@ -445,7 +445,10 @@ pub(crate) fn dispatch_inner(
         "waitforblockheight" => waitforblockheight(ctx, &params),
         "waitfornewblock" => waitfornewblock(ctx, &params),
         "getblocktemplate" => getblocktemplate(ctx, &params),
-        "getmininginfo" => getmininginfo(ctx),
+        "getmininginfo" => {
+            params.reject_unknown(&[])?;
+            getmininginfo(ctx)
+        }
         "prioritisetransaction" => prioritisetransaction(ctx, &params),
         "getprioritisedtransactions" => getprioritisedtransactions(ctx, &params),
         "getmempoolcluster" => getmempoolcluster(ctx, &params),

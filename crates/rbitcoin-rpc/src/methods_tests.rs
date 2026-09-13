@@ -3372,3 +3372,219 @@ fn decode_rpc_subset() {
     assert_eq!(still_never["code"], ERR_METHOD_NOT_FOUND);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[allow(clippy::cognitive_complexity)] // table of RpcParams coercions
+#[test]
+fn rpc_params_type_coercion_and_unknown_named() {
+    let p = RpcParams::positional(vec![json!("abc"), json!(7), json!(true)]);
+    assert_eq!(p.req_str(0, "hexstring").unwrap(), "abc");
+    assert_eq!(p.req_u64(1, "n").unwrap(), 7);
+    assert_eq!(p.opt_bool(2, "flag").unwrap(), Some(true));
+    assert_eq!(p.opt_str(3, "missing").unwrap(), None);
+    assert_eq!(p.opt_u64(3, "missing").unwrap(), None);
+    assert_eq!(p.opt_bool(3, "missing").unwrap(), None);
+
+    let e = p.req_str(1, "hexstring").unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMS);
+    assert!(e["message"].as_str().unwrap().contains("must be a string"));
+    let e = p.req_u64(0, "n").unwrap_err();
+    assert!(e["message"]
+        .as_str()
+        .unwrap()
+        .contains("must be an integer"));
+    let e = p.req(9, "height").unwrap_err();
+    assert!(e["message"].as_str().unwrap().contains("height required"));
+
+    let nulls = RpcParams::positional(vec![Value::Null]);
+    assert_eq!(nulls.opt_str(0, "x").unwrap(), None);
+    assert_eq!(nulls.opt_u64(0, "x").unwrap(), None);
+    assert_eq!(nulls.opt_bool(0, "x").unwrap(), None);
+    let e = nulls.req_str(0, "hexstring").unwrap_err();
+    assert!(e["message"].as_str().unwrap().contains("must be a string"));
+
+    let bad_opt = RpcParams::positional(vec![json!("nope")]);
+    assert!(bad_opt.opt_u64(0, "n").unwrap_err()["message"]
+        .as_str()
+        .unwrap()
+        .contains("must be an integer"));
+    assert!(bad_opt.opt_bool(0, "flag").unwrap_err()["message"]
+        .as_str()
+        .unwrap()
+        .contains("must be a bool"));
+    assert!(bad_opt.opt_str(0, "s").unwrap().is_some());
+
+    let extra = RpcParams::named(
+        json!({"blockhash": "aa", "foo": 1})
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    let e = extra.reject_unknown(&["blockhash"]).unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+    assert!(e["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown named parameter foo"));
+    extra.reject_unknown(&["blockhash", "foo"]).unwrap();
+    RpcParams::positional(vec![json!(1)])
+        .reject_unknown(&[])
+        .unwrap();
+
+    let mixed = RpcParams::named(
+        json!({"args": ["from-args"], "verbose": true})
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    assert_eq!(
+        mixed.get(0, "hexstring").and_then(|v| v.as_str()),
+        Some("from-args")
+    );
+    assert_eq!(mixed.opt_bool(1, "verbose").unwrap(), Some(true));
+
+    let args_not_array = RpcParams::named(
+        json!({"args": "not-array", "blockhash": "aa"})
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    assert_eq!(args_not_array.req_str(0, "blockhash").unwrap(), "aa");
+
+    assert_eq!(json_u64(&json!(0)), Some(0));
+    assert_eq!(json_u64(&json!(-1)), None);
+    assert_eq!(json_i64(&json!(-1)), Some(-1));
+    assert_eq!(json_i64(&json!(u64::MAX)), None);
+
+    assert_eq!(
+        opt_verbosity(&RpcParams::positional(vec![json!(true)]), 0, "verbosity").unwrap(),
+        1
+    );
+    assert_eq!(
+        opt_verbosity(&RpcParams::positional(vec![json!(false)]), 0, "verbosity").unwrap(),
+        0
+    );
+    assert_eq!(
+        opt_verbosity(&RpcParams::positional(vec![json!(2)]), 0, "verbosity").unwrap(),
+        2
+    );
+    assert_eq!(
+        opt_verbosity(&RpcParams::empty(), 0, "verbosity").unwrap(),
+        1
+    );
+    assert!(
+        opt_verbosity(&RpcParams::positional(vec![json!("nope")]), 0, "verbosity").unwrap_err()
+            ["message"]
+            .as_str()
+            .unwrap()
+            .contains("must be an integer")
+    );
+}
+
+#[test]
+fn every_listed_method_rejects_unknown_named_param() {
+    let (ctx, dir) = ctx_empty();
+    let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
+    let listed = info["methods"].as_array().unwrap();
+    assert!(listed.len() >= 50, "catalog shrank: {}", listed.len());
+    for name in listed.iter().filter_map(|v| v.as_str()) {
+        let err = dispatch(&ctx, name, named(json!({"not_a_real_rpc_param": 1}))).unwrap_err();
+        assert_eq!(err["code"], ERR_INVALID_PARAMETER, "{name}: {err}");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown named parameter not_a_real_rpc_param"),
+            "{name}: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[allow(clippy::cognitive_complexity)] // one empty store, every required-arg type gate
+#[test]
+fn dispatch_wrong_json_types_are_param_errors() {
+    let (ctx, dir) = ctx_empty();
+    for (method, params, needle) in [
+        ("help", vec![json!(1)], "command must be a string"),
+        ("getblockhash", vec![json!("0")], "must be an integer"),
+        ("getblockheader", vec![json!(1)], "must be a string"),
+        ("getblock", vec![json!(true)], "must be a string"),
+        ("getrawtransaction", vec![json!([])], "must be a string"),
+        ("decoderawtransaction", vec![json!(0)], "must be a string"),
+        ("decodescript", vec![json!(false)], "must be a string"),
+        ("validateaddress", vec![json!(1)], "must be a string"),
+        ("sendrawtransaction", vec![json!(1)], "must be a string"),
+        ("submitblock", vec![json!(1)], "must be a string"),
+        ("getmempoolentry", vec![json!(0)], "must be a string"),
+        ("stop", vec![json!("1")], "must be an integer"),
+        ("gettxout", vec![json!(1), json!(0)], "must be a string"),
+        (
+            "prioritisetransaction",
+            vec![json!(1), json!(0), json!(1)],
+            "must be a string",
+        ),
+        (
+            "testmempoolaccept",
+            vec![json!("00")],
+            "rawtxs array required",
+        ),
+        ("submitpackage", vec![json!("00")], "package array required"),
+        (
+            "gettxspendingprevout",
+            vec![json!("00")],
+            "outputs array required",
+        ),
+        ("waitforblock", vec![json!(1)], "must be a string"),
+        ("waitforblockheight", vec![json!("1")], "must be an integer"),
+        ("waitfornewblock", vec![json!("1")], "must be an integer"),
+        ("getnetworkhashps", vec![json!("120")], "must be an integer"),
+        ("getrawmempool", vec![json!("true")], "must be a bool"),
+    ] {
+        let err = dispatch(&ctx, method, params).unwrap_err();
+        assert!(
+            err["message"].as_str().unwrap_or("").contains(needle),
+            "{method}: expected {needle:?} in {err}"
+        );
+    }
+
+    let wit = dispatch(
+        &ctx,
+        "decoderawtransaction",
+        named(json!({"hexstring": "00", "iswitness": "yes"})),
+    )
+    .unwrap_err();
+    assert!(wit["message"].as_str().unwrap().contains("must be a bool"));
+
+    let extra = dispatch(
+        &ctx,
+        "decoderawtransaction",
+        named(json!({"hexstring": "00", "nope": true})),
+    )
+    .unwrap_err();
+    assert_eq!(extra["code"], ERR_INVALID_PARAMETER);
+
+    let missing = dispatch(&ctx, "validateaddress", vec![]).unwrap_err();
+    assert_eq!(missing["code"], ERR_INVALID_PARAMS);
+    assert!(missing["message"]
+        .as_str()
+        .unwrap()
+        .contains("address required"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    for (method, params, needle) in [
+        ("submitheader", vec![json!(true)], "must be a string"),
+        ("invalidateblock", vec![json!(1)], "must be a string"),
+        ("reconsiderblock", vec![json!(false)], "must be a string"),
+        ("preciousblock", vec![json!(0)], "must be a string"),
+        ("setmocktime", vec![json!("0")], "must be an integer"),
+        ("mockscheduler", vec![json!("1")], "must be an integer"),
+    ] {
+        let err = dispatch(&ctx, method, params).unwrap_err();
+        assert!(
+            err["message"].as_str().unwrap_or("").contains(needle),
+            "{method}: expected {needle:?} in {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

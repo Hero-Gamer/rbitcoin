@@ -201,6 +201,8 @@ mod tests {
         let dir = tmp();
         assert!(resolve_rpc_auth(&dir, Some("u"), None, None).is_err());
         assert!(resolve_rpc_auth(&dir, None, Some("p"), None).is_err());
+        assert!(resolve_rpc_auth(&dir, Some(""), Some("p"), None).is_err());
+        assert!(resolve_rpc_auth(&dir, Some("u"), Some(""), None).is_err());
     }
 
     #[test]
@@ -210,6 +212,21 @@ mod tests {
         let (u, p) = parse_basic_auth(&format!("Basic {tok}")).unwrap();
         assert_eq!(u, "alice");
         assert_eq!(p, "s3cret");
+        let (u, p) = parse_basic_auth(&format!("basic {tok}")).unwrap();
+        assert_eq!(u, "alice");
+        assert_eq!(p, "s3cret");
         assert!(parse_basic_auth("Bearer x").is_none());
+        assert!(parse_basic_auth("Basic !!!").is_none());
+        assert!(parse_basic_auth("Basic ").is_none());
+        let nocolon = base64::engine::general_purpose::STANDARD.encode("nocolon");
+        assert!(parse_basic_auth(&format!("Basic {nocolon}")).is_none());
+        assert!(RpcAuth::from_cookie_line("").is_none());
+        assert!(RpcAuth::from_cookie_line("nocolon").is_none());
+        assert!(RpcAuth::from_cookie_line(":pass").is_none());
+        assert!(RpcAuth::from_cookie_line("user:").is_none());
+        let a = RpcAuth::new("u", "p");
+        assert!(a.matches("u", "p"));
+        assert!(!a.matches("u", "wrong"));
+        assert!(!a.matches("x", "p"));
     }
 }
