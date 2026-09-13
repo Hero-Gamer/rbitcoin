@@ -109,6 +109,7 @@ pub fn confirm_write_phase(
             // must already have lookup stamps — missing abs is Corrupt.
             // Direct SH collect is a no-op — skip the FkMap.
             if committed {
+                query.note_write_create_loc(&planned_fks, &loc);
                 if query.index_mode().is_tip() {
                     let t_map = Instant::now();
                     write_create_pins.reserve(planned_fks.len());
@@ -119,6 +120,7 @@ pub fn confirm_write_phase(
                 }
                 let t_ens = Instant::now();
                 fill_planned_create_layout_after_commit(
+                    query,
                     &mut batch.batch_parents,
                     &planned_fks,
                     &loc,
@@ -395,18 +397,16 @@ fn annotate_jobs_from_connected_hash(
     Ok(jobs)
 }
 
-/// After Class A commit, stamp same-batch spend creates from append RAM loc
-/// and packed pin outs. Write never preads `create.loc`.
+/// After Class A commit, stamp spend creates from append RAM loc
+/// (this pack + just-written packs). Write never preads `create.loc`.
 pub(super) fn fill_planned_create_layout_after_commit(
+    query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
     planned_fks: &[rbitcoin_primitives::Fk],
     loc: &[rbitcoin_store::CreateLocPair],
     packed: &[rbitcoin_query::CreatePin],
     prepared: &[Prepared],
 ) -> Result<(), ConsensusError> {
-    if planned_fks.is_empty() {
-        return Ok(());
-    }
     let mut need: U64Map<Vec<u32>> = U64Map::default();
     for p in prepared {
         for &(_txid, vout, sfk, cfk, _vin) in &p.spends {
@@ -424,41 +424,54 @@ pub(super) fn fill_planned_create_layout_after_commit(
     if need.is_empty() {
         return Ok(());
     }
-    if loc.len() != planned_fks.len() || packed.len() != planned_fks.len() {
-        return Err(ConsensusError::Store(StoreError::Corrupt(
-            "invariant: append loc length",
-        )));
-    }
-    for (fk, (pair, pin)) in planned_fks.iter().zip(loc.iter().zip(packed.iter())) {
-        let Some(id) = fk.get() else { continue };
-        let Some(vouts) = need.get(&id) else { continue };
-        if pair.n_out != pin.1.len() as u32 {
+    if !planned_fks.is_empty() {
+        if loc.len() != planned_fks.len() || packed.len() != planned_fks.len() {
             return Err(ConsensusError::Store(StoreError::Corrupt(
                 "invariant: append loc length",
             )));
         }
-        if batch_parents.contains(*fk) {
-            batch_parents.set_body_range_only(*fk, pair.txout);
+        for (fk, (pair, pin)) in planned_fks.iter().zip(loc.iter().zip(packed.iter())) {
+            let Some(id) = fk.get() else { continue };
+            let Some(vouts) = need.get(&id) else { continue };
+            if pair.n_out != pin.1.len() as u32 {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: append loc length",
+                )));
+            }
+            if batch_parents.contains(*fk) {
+                batch_parents.set_body_range_only(*fk, pair.txout);
+                batch_parents.set_spent_range_only(*fk, pair.spent);
+                continue;
+            }
+            let mut checked = vouts.clone();
+            checked.sort_unstable();
+            checked.dedup();
+            let cb = if pin.0.input_count != 1 {
+                Some(false)
+            } else {
+                None
+            };
+            batch_parents.insert_create_pin(
+                *fk,
+                std::sync::Arc::clone(pin),
+                checked,
+                cb,
+                Some(pair.txout),
+                Vec::new(),
+            );
             batch_parents.set_spent_range_only(*fk, pair.spent);
+        }
+    }
+    for (id, _) in &need {
+        let fk = rbitcoin_primitives::Fk(*id);
+        if !batch_parents.contains(fk) || batch_parents.has_abs_layout(fk) {
             continue;
         }
-        let mut checked = vouts.clone();
-        checked.sort_unstable();
-        checked.dedup();
-        let cb = if pin.0.input_count != 1 {
-            Some(false)
-        } else {
-            None
+        let Some(pair) = query.write_create_loc(fk) else {
+            continue;
         };
-        batch_parents.insert_create_pin(
-            *fk,
-            std::sync::Arc::clone(pin),
-            checked,
-            cb,
-            Some(pair.txout),
-            Vec::new(),
-        );
-        batch_parents.set_spent_range_only(*fk, pair.spent);
+        batch_parents.set_body_range_only(fk, pair.txout);
+        batch_parents.set_spent_range_only(fk, pair.spent);
     }
     Ok(())
 }

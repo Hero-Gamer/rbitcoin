@@ -1255,6 +1255,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
     }];
     let mut bp = BatchParents::new();
     fill_planned_create_layout_after_commit(
+        &q,
         &mut bp,
         &fks,
         &loc,
