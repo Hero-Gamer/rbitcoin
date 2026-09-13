@@ -1588,7 +1588,8 @@ impl MempoolHub {
         let utxo = self.utxo_provider();
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
-        let mut preps = Vec::with_capacity(txs.len());
+        let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
+        let mut prevouts: Vec<Vec<TxOut>> = Vec::with_capacity(txs.len());
         for tx in txs {
             utxo.note_spender(tx);
             let delta = self.fee_delta(&tx.compute_txid());
@@ -1601,85 +1602,71 @@ impl MempoolHub {
             let prep = match self.admit_staged(tx, &utxo, spec, &mut stages, &mut lock_us) {
                 Ok(p) => p,
                 Err(e) => {
+                    if !accepted.is_empty() {
+                        let mut g = self.lock_write();
+                        for r in accepted.iter().rev() {
+                            let _ = g.remove_txid(&r.txid);
+                        }
+                    }
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             };
-            preps.push(prep);
-        }
-        let prevouts: Vec<Vec<TxOut>> = preps.iter().map(|p| p.prevouts.clone()).collect();
-        let result = {
+            let prev = prep.prevouts.clone();
             let t_lock = Instant::now();
-            let mut g = self.lock_write();
-            g.last_accept_stages = stages;
-            let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
-            let mut err = None;
-            for (tx, prep) in txs.iter().zip(preps) {
-                match g.commit_after_script(tx, prep) {
-                    Ok(r) => accepted.push(r),
-                    Err(e) => {
-                        for r in accepted.iter().rev() {
-                            let _ = g.remove_txid(&r.txid);
-                        }
-                        err = Some(e);
-                        break;
+            let commit = {
+                let mut g = self.lock_write();
+                g.last_accept_stages = stages;
+                let r = g.commit_after_script(tx, prep);
+                stages = g.last_accept_stages;
+                r
+            };
+            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
+            match commit {
+                Ok(r) => {
+                    prevouts.push(prev);
+                    accepted.push(r);
+                }
+                Err(e) => {
+                    let mut g = self.lock_write();
+                    for r in accepted.iter().rev() {
+                        let _ = g.remove_txid(&r.txid);
                     }
+                    let us = t0.elapsed().as_micros() as u64;
+                    self.meter_accept_stages(lock_us, stages);
+                    return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             }
-            stages = g.last_accept_stages;
-            lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
-            match err {
-                Some(e) => Err(e),
-                None => Ok(accepted),
-            }
-        };
+        }
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
-        match result {
-            Ok(res) => {
-                let per = us / (res.len().max(1) as u64);
-                for (i, (tx, r)) in txs.iter().zip(res.iter()).enumerate() {
-                    self.meter_accept_wall(per, true);
-                    self.note_fee_flow_admit(r.weight, r.fee_sat);
-                    self.push_recent(tx, r);
-                    for old in &r.replaced {
-                        self.unindex_txid(old);
-                    }
-                    self.index_txid(
-                        r.txid,
-                        tx,
-                        prevouts.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                    );
-                    let shs = self
-                        .sh_index
-                        .lock()
-                        .unwrap()
-                        .by_tx
-                        .get(&r.txid)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.publish_announce(r, shs);
-                    self.promote_orphans_staged(r.txid, &utxo);
-                }
-                self.note_template_update();
-                Ok(res)
+        let per = us / (accepted.len().max(1) as u64);
+        for (i, (tx, r)) in txs.iter().zip(accepted.iter()).enumerate() {
+            self.meter_accept_wall(per, true);
+            self.note_fee_flow_admit(r.weight, r.fee_sat);
+            self.push_recent(tx, r);
+            for old in &r.replaced {
+                self.unindex_txid(old);
             }
-            Err(e) => {
-                let hard = !matches!(
-                    e,
-                    AcceptError::Duplicate(_)
-                        | AcceptError::Orphaned { .. }
-                        | AcceptError::Policy("mempool full")
-                );
-                if hard {
-                    self.meter_accept_wall(us, false);
-                } else {
-                    self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
-                }
-                Err(e)
-            }
+            self.index_txid(
+                r.txid,
+                tx,
+                prevouts.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            );
+            let shs = self
+                .sh_index
+                .lock()
+                .unwrap()
+                .by_tx
+                .get(&r.txid)
+                .cloned()
+                .unwrap_or_default();
+            self.publish_announce(r, shs);
+            self.promote_orphans_staged(r.txid, &utxo);
         }
+        self.note_template_update();
+        Ok(accepted)
     }
 
     /// Remove confirmed txids (tip connect / archive confirm) and re-try orphans

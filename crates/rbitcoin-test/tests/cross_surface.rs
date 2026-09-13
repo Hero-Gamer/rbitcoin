@@ -152,7 +152,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let (coinbase_txid, rpc_cb) = {
+    let (coinbase_txid, rpc_cb, pkg_cb) = {
         let q = Query::open_or_create_tiny(td.store_path()).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let (_tip, _time, cbs) = pad_empty_from(
@@ -162,10 +162,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             genesis.header.time,
             1,
             102,
-            2,
+            3,
         );
         q.flush().unwrap();
-        (cbs[0], cbs[1])
+        (cbs[0], cbs[1], cbs[2])
     };
 
     let electrum_addr = ephemeral_addr();
@@ -195,6 +195,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(height, "102");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
     assert_eq!(count["result"], 102, "{count}");
+    let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
+    assert_eq!(tips["result"][0]["height"], 102, "{tips}");
+    assert_eq!(tips["result"][0]["status"], "active", "{tips}");
+    let cb_hex = coinbase_txid.to_string();
+    let utxo = jsonrpc(rpc_addr, "gettxout", json!([cb_hex.clone(), 0])).await;
+    assert_eq!(utxo["result"]["coinbase"], true, "{utxo}");
+    assert_eq!(utxo["result"]["confirmations"], 102, "{utxo}");
 
     let rpc_spk = ScriptBuf::from_bytes(vec![0x54]);
     let rpc_spend = acs_spend(rpc_cb, 50_0000_0000, 1_000, rpc_spk);
@@ -213,6 +220,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(tma["result"][0]["allowed"], true, "{tma}");
     let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([rpc_hex])).await;
     assert_eq!(sent["result"], rpc_txid, "{sent}");
+    let mem_utxo = jsonrpc(rpc_addr, "gettxout", json!([rpc_txid.clone(), 0])).await;
+    assert_eq!(mem_utxo["result"]["confirmations"], 0, "{mem_utxo}");
+    assert_eq!(mem_utxo["result"]["coinbase"], false, "{mem_utxo}");
     let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     assert!(
         mempool_has(&mem, &rpc_txid),
@@ -253,6 +263,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_post(esplora_addr, "/tx", &hex).await;
     assert_eq!(st, 200, "POST /tx: {body}");
     assert_eq!(body, txid_hex);
+    let hidden = jsonrpc(rpc_addr, "gettxout", json!([cb_hex.clone(), 0])).await;
+    assert!(
+        hidden["result"].is_null(),
+        "default include_mempool hides mempool-spent coinbase: {hidden}"
+    );
+    let shown = jsonrpc(rpc_addr, "gettxout", json!([cb_hex, 0, false])).await;
+    assert_eq!(shown["result"]["coinbase"], true, "{shown}");
     let dup = jsonrpc(rpc_addr, "sendrawtransaction", json!([hex.clone()])).await;
     assert_eq!(dup["result"], txid_hex, "sendraw of live mempool tx: {dup}");
 
@@ -408,6 +425,87 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "replaced tx must leave mempool: {mem}"
     );
 
+    let pkg_parent = acs_spend(
+        pkg_cb,
+        50_0000_0000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x57]),
+    );
+    let pkg_child = acs_spend(
+        pkg_parent.compute_txid(),
+        50_0000_0000 - 1_000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x58]),
+    );
+    let pkg_parent_txid = pkg_parent.compute_txid().to_string();
+    let pkg_child_txid = pkg_child.compute_txid().to_string();
+    let pkg_body = json!([encode_tx(&pkg_parent), encode_tx(&pkg_child)]).to_string();
+    let (st, body) = http_post(esplora_addr, "/txs/package", &pkg_body).await;
+    assert_eq!(st, 200, "POST /txs/package: {body}");
+    let pkg_v: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!("POST /txs/package json: {e} body={body}");
+    });
+    assert_eq!(
+        pkg_v["txids"],
+        json!([pkg_parent_txid.clone(), pkg_child_txid.clone()]),
+        "{pkg_v}"
+    );
+
+    let submitted = jsonrpc(
+        rpc_addr,
+        "submitpackage",
+        json!([[encode_tx(&pkg_parent), encode_tx(&pkg_child)]]),
+    )
+    .await;
+    assert_eq!(submitted["error"]["code"], -1, "{submitted}");
+    assert_eq!(
+        submitted["error"]["message"], "mempool relay disabled (still in IBD or tip not ready)",
+        "{submitted}"
+    );
+
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    for tid in [
+        &high_txid,
+        &txid_hex,
+        &child_txid,
+        &pkg_parent_txid,
+        &pkg_child_txid,
+    ] {
+        assert!(mempool_has(&mem, tid), "getrawmempool missing {tid}: {mem}");
+    }
+
+    let (st, body) = http_get(esplora_addr, "/mempool").await;
+    assert_eq!(st, 200, "GET /mempool: {body}");
+    let mem_info: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        mem_info["count"].as_u64().unwrap_or(0) >= 5,
+        "live mempool count: {mem_info}"
+    );
+    let (st, body) = http_get(esplora_addr, "/mempool/txids").await;
+    assert_eq!(st, 200, "GET /mempool/txids: {body}");
+    let txids_v: Value = serde_json::from_str(&body).unwrap();
+    let txid_list = txids_v.as_array().expect("mempool/txids array");
+    assert!(
+        txid_list
+            .iter()
+            .any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
+        "mempool/txids missing package parent: {body}"
+    );
+    let (st, body) = http_get(esplora_addr, "/mempool/recent").await;
+    assert_eq!(st, 200, "GET /mempool/recent: {body}");
+    let recent: Value = serde_json::from_str(&body).unwrap();
+    let recent_rows = recent.as_array().expect("mempool/recent array");
+    assert!(
+        recent_rows
+            .iter()
+            .any(|r| r["txid"] == pkg_child_txid || r["txid"] == pkg_parent_txid),
+        "mempool/recent missing package tx: {body}"
+    );
+    let (st, body) = http_get(esplora_addr, "/fee-estimates").await;
+    assert_eq!(st, 200, "GET /fee-estimates: {body}");
+    let fees: Value = serde_json::from_str(&body).unwrap();
+    assert!(fees.get("1").is_some(), "{fees}");
+
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert_eq!(
         mined["result"].as_array().map(|a| a.len()),
@@ -422,13 +520,21 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
     assert!(
-        txs.len() >= 4,
-        "coinbase + RBF replacement + esplora parent + child: {blk}"
+        txs.len() >= 6,
+        "coinbase + RBF + esplora parent/child + package: {blk}"
     );
-    assert!(
-        txs.iter().any(|t| t["txid"] == high_txid),
-        "generate must include RBF replacement: {blk}"
-    );
+    for tid in [
+        &high_txid,
+        &txid_hex,
+        &child_txid,
+        &pkg_parent_txid,
+        &pkg_child_txid,
+    ] {
+        assert!(
+            txs.iter().any(|t| t["txid"] == *tid),
+            "generate must include {tid}: {blk}"
+        );
+    }
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
     let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
     let immature = Transaction {
