@@ -17,6 +17,9 @@ before 1.0).
 
 ### Added
 
+- **README coverage badge:** latest CI LCOV **91.93%** (gate **≥90%** on every
+  PR). [`TESTING.md`](TESTING.md).
+
 - **asmap ASan fuzz:** nightly `asmap` target runs Core `SanityCheckAsmap` then
   `Interpret` (`AsMap::from_bytes`, leftover 16-byte IP). Junk must not panic
   or hang.

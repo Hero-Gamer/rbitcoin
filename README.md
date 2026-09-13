@@ -1,5 +1,7 @@
 # rbitcoin
 
+[![coverage](https://img.shields.io/badge/coverage-91.93%25-brightgreen)](TESTING.md)
+
 Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
 IBD, tip follow, block/tx relay (tip mode), optional **Core-class JSON-RPC**, and
 in-process **Electrum + optional Esplora REST for wallet clients** (scripthash
@@ -25,6 +27,7 @@ consensus/script** path.
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.6.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
+| **Coverage** | **91.93%** LCOV line (first-party); every PR **≥90%** — [`TESTING.md`](./TESTING.md) |
 
 ## Why this node is different
 
