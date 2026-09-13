@@ -3114,15 +3114,39 @@ fn refuse_legacy_mono_head_on_create() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Crash snapshot: seal worker may unlink OA / `.tmp` between readdir and copy.
 fn copy_tree(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
-    for ent in std::fs::read_dir(src).unwrap() {
-        let ent = ent.unwrap();
-        let to = dst.join(ent.file_name());
-        if ent.path().is_dir() {
-            copy_tree(&ent.path(), &to);
-        } else {
-            std::fs::copy(ent.path(), &to).unwrap();
+    let rd = match std::fs::read_dir(src) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("read_dir {src:?}: {e}"),
+    };
+    for ent in rd {
+        let ent = match ent {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("read_dir entry {src:?}: {e}"),
+        };
+        let name = ent.file_name();
+        if name.to_string_lossy().ends_with(".tmp") {
+            continue;
+        }
+        let from = ent.path();
+        let to = dst.join(&name);
+        let is_dir = match ent.file_type() {
+            Ok(t) => t.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("file_type {from:?}: {e}"),
+        };
+        if is_dir {
+            copy_tree(&from, &to);
+            continue;
+        }
+        match std::fs::copy(&from, &to) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("copy {from:?} -> {to:?}: {e}"),
         }
     }
 }
@@ -3132,38 +3156,40 @@ fn copy_tree(src: &Path, dst: &Path) {
 #[test]
 fn open_seals_unsealed_nontail_after_copied_roll() {
     let dir = tempfile_dir("bg-seal-live");
-    let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
-    let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-    let n = 205u64;
-    let recs: Vec<TxRecord> = (0..n)
-        .map(|i| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-            TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 0,
-                output_start_fk: Fk::NULL,
-                output_count: 0,
-            }
-        })
-        .collect();
-    t.put_full_batch_indexed(&meta_only_items(&recs), true)
-        .unwrap();
-    assert_eq!(
-        t.head.sealed_segment_count(),
-        0,
-        "roll must leave the seal unpublished"
-    );
-    assert!(
-        t.head.unsealed_ranges().len() >= 2,
-        "tail + sealing OA, unsealed={:?}",
-        t.head.unsealed_ranges()
-    );
     let copy = tempfile_dir("bg-seal-copy");
-    copy_tree(&dir, &copy);
+    {
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let n = 205u64;
+        let recs: Vec<TxRecord> = (0..n)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                }
+            })
+            .collect();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+        assert_eq!(
+            t.head.sealed_segment_count(),
+            0,
+            "roll must leave the seal unpublished"
+        );
+        assert!(
+            t.head.unsealed_ranges().len() >= 2,
+            "tail + sealing OA, unsealed={:?}",
+            t.head.unsealed_ranges()
+        );
+        copy_tree(&dir, &copy);
+    }
     let t2 = TxTable::open_tiny(&copy).unwrap();
     assert!(
         t2.head.sealed_segment_count() >= 1,

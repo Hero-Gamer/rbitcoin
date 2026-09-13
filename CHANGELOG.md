@@ -62,6 +62,10 @@ before 1.0).
 
 ### Fixed
 
+- **`open_seals_unsealed_nontail_after_copied_roll`:** crash-copy skips
+  ENOENT / `.tmp` so a live seal worker unlinking the OA cannot fail the
+  snapshot. Live table drops before cleanup.
+
 - **Write loc RAM:** Class A append returns loc pairs; write keeps them in a
   sequential window and stamps same-batch / just-written abs from that RAM
   (packed pin outs). Write does not pread `create.loc`. Missing stamp is
