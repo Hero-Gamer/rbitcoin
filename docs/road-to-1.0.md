@@ -4,8 +4,8 @@ What an operator or library user should be able to **count on** at **1.0**.
 Day-to-day ranked work stays in [`quality.md`](./quality.md).
 
 **Today (0.6.99):** in-tree toward **0.7.0**. Last published tag is **0.6.1**
-(`v0.6.x` patch line). Schema **20**
-(BDZ2 `tx.head` / BDZ3 SH) can still refuse a named index wipe.
+(`v0.6.x` patch line). Schema **21**
+can still refuse a named index wipe ([`SCHEMA.md`](../SCHEMA.md)).
 Electrum/Esplora need `--shindex` (default off). BIP324 v2-only. Install is
 a GitHub Release (Linux musl; Windows/Darwin snapshots). Nightly
 differential fuzz vs Core v31.1 is continuous (**Q-30**). Core functional
@@ -135,7 +135,7 @@ second** on a laptop-class SSD.
 The “often 2–10 s” line this doc used at 0.5.0 is stale. Last instrumented
 fat-era catch-up was **6.4 blk/s** at #126 (2026-08-18). That has **not**
 been re-baselined after IBD cadence, tip-accept OS thread, reactor-safe
-mempool accept, or schema 20. 1.0 is a named host measurement on a
+mempool accept, or later schema bumps. 1.0 is a named host measurement on a
 laptop-class SSD — not another in-tree cadence tweak unless that number
 misses ~1 s.
 
@@ -192,7 +192,7 @@ Older-than-1.0 or corrupt files can still refuse with a one-line message.
 
 Do not freeze while Class C / sidecar / fuse8 can lose a `set` or index
 OOB (**Q-57**). Mempool persist writes body before LIVE slots (**Q-58**).
-Schema 20 is the current bytes; 0.x may still bump.
+Schema 21 is the current bytes; 0.x may still bump.
 
 | Done | Step |
 |:----:|------|

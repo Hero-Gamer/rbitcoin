@@ -94,7 +94,7 @@ Core / Fulcrum stay in the tables above. Snapshot of **Hornet Node** and
 
 ## Novel on-disk model
 
-Deep layout and schema 17 freeze: [`SCHEMA.md`](../SCHEMA.md). Crash / tip
+Deep layout and current bytes: [`SCHEMA.md`](../SCHEMA.md). Crash / tip
 commit: [`docs/crash-recovery.md`](./crash-recovery.md).
 
 ### Class A / B / C (intuition)
