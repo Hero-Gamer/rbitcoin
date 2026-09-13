@@ -62,9 +62,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **22:** Restore `spent.idx`. Spent slot is flags + u40 spend fk + u16 vin.
-///         Occupied 21 Class A refused (wipe + IBD). Empty 21 rewrites `meta`
-///         and unlinks leftover `spent.off`.
+/// **22:** `create.loc` + `inwit.loc`; LAYOUT17 omits `output_count`. Spent
+///         slot is flags + u40 spend fk + u16 vin. Occupied 21 Class A
+///         refused (wipe + IBD). Empty 21 rewrites `meta` and unlinks
+///         leftover `spent.off` and `{txout,spent,inwit}.idx`.
 /// **21:** Drop `spent.idx`; leftover unlinked; rewrite `meta` 20→21. Spent
 ///         ranges are `n_out` prefix of `txout` (sparse `spent.off`).
 /// **20:** Sealed `tx.head` value-assigned packed BDZ (no `.rel`). Occupied
@@ -87,12 +88,13 @@ pub const SCHEMA_VERSION: u16 = 22;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **22** is current (`spent.idx` restored; occupied 21 Class A refused).
-/// Schema **21** empty Class A rewrites `meta`. Schema **20** table headers still
-/// open when Class A is empty. Schema **18/19** with occupied `tx.head`
-/// or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`. Schema **17**
-/// still refuses populated `tx.head` / `scripthash*` or rewrites empty indexes.
-/// Schema **13**–**16** still soft-open empty Class A / empty SH (meta rewrite).
+/// Schema **22** is current (`create.loc` + `inwit.loc`; occupied 21 Class A
+/// refused). Schema **21** empty Class A rewrites `meta`. Schema **20** table
+/// headers still open when Class A is empty. Schema **18/19** with occupied
+/// `tx.head` or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`.
+/// Schema **17** still refuses populated `tx.head` / `scripthash*` or rewrites
+/// empty indexes. Schema **13**–**16** still soft-open empty Class A / empty SH
+/// (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
     ver == SCHEMA_VERSION || (SCHEMA_VERSION == 22 && matches!(ver, 13..=21))

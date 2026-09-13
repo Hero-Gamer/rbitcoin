@@ -1,14 +1,14 @@
 # On-disk schema (current)
 
 **Version:** `SCHEMA_VERSION = 22` (`rbitcoin_primitives`).  
-**Status:** 22 restores `spent.idx` (u32 stride-8, same as `txout`/`inwit`).
-Spent slot is flags + u40 spend fk + u16 vin (still 8 bytes). Occupied
-15–21 LAYOUT17 Class A with creates is **refused** (wipe datadir and redo
-IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover `spent.off`.
-A 21 binary refuses 22 `meta`. Occupied schema 18/19 `tx.head` or
-`scripthash*` (empty Class A) is **refused** (wipe those index dirs, keep
-Class A). Empty 18/19 indexes rewrite `meta` to 22; `tx.head` rebuilds from
-Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
+**Status:** 22 is `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`),
+LAYOUT17 without `output_count`, and spent slots flags + u40 spend fk + u16 vin
+(still 8 bytes). Occupied 15–21 LAYOUT17 Class A with creates is **refused**
+(wipe datadir and redo IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover
+`spent.off` and leftover `*.idx`. A 21 binary refuses 22 `meta`. Occupied schema
+18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
+dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 22; `tx.head` rebuilds
+from Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
 `meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
 Class A is **refused**. Empty 17 indexes rewrite `meta` to 22.
 
@@ -183,10 +183,10 @@ itself changed.
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index (overflow: header.head.gN)
-    txout.body / txout.idx/                         # Class A outs (hot)
-    inwit.body / inwit.idx/                         # Class A inputs+witness (cold)
+    txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
+    inwit.body / inwit.loc / inwit.off / inwit.loc.ovf       # Class A inputs+witness (cold loc)
     inwit.reloc                  # optional: inwit lives under --datadir-cold/store
-    spent.body / spent.idx/                         # sole-spender 8 B × max(n_out,1); leftover spent.off unlinked
+    spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
@@ -209,12 +209,13 @@ itself changed.
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
-    inwit.body / inwit.idx/      # same files; not duplicated under <datadir>/store
+    inwit.body / inwit.loc / inwit.off / inwit.loc.ovf
 ```
 
 `--datadir` holds both stems by default. `--datadir-cold PATH` places only
-`inwit.body` + `inwit.idx/` under `PATH/store/` (and writes `inwit.reloc` in
-the hot store). Pin / SH / spend-annotate stay on the hot volume.
+`inwit.body` + `inwit.loc` (and `inwit.off` / `inwit.loc.ovf`) under `PATH/store/`
+(and writes `inwit.reloc` in the hot store). Pin / SH / spend-annotate stay on
+the hot volume.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.
@@ -252,6 +253,7 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 | 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
 | 16 | inwit (`inwit.body`) |
 | 17 | spent (`spent.body`) |
+| 18 | delta loc (`create.loc` / `inwit.loc` and `.ovf`) |
 
 ---
 
@@ -262,15 +264,16 @@ the hot store). Pin / SH / spend-annotate stay on the hot volume.
 
 ---
 
-## Growable var records (`*.body` + `*.idx`)
+## Growable var records (`*.body` + loc)
 
 Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`).
 
 - **body:** append-oriented **unframed** payloads (no per-record length prefix).
-- **idx:** segmented **u32 stride-8** relatives (`{stem}.idx/`); see Class A index below.
-  Header hash lookup is a separate `HashHead`, not this idx.
-- Record length = `start(fk+1) − start(fk)` (last: published body end − start).
-- FK = 1-based index into idx.
+- **loc:** schema 22 `create.loc` (txout + `n_out`) and `inwit.loc` (cold).
+  Header hash lookup is a separate `HashHead`, not this loc.
+- Record length = loc pair (txout/spent) or `inwit.loc` (inwit). Last record
+  uses 8-aligned published body end.
+- FK = 1-based create id.
 
 ---
 
@@ -335,42 +338,42 @@ Packed `tx.body` (schema 13–14: 32 B meta | inputs+witness | outputs) is **ref
 
 There is **no** leading magic byte and **no** leading txid (schema 11–12 stored txid at `[S, S+32)`). There are **no** standalone `input.body` / `output.body` tables.
 
-**Alignment** (schema 13+): `S % 8 == 0` only. The pad exists so record starts match **`tx.idx` u32 stride-8** (`IDX_STRIDE = 8`): idx stores body offsets as stride units from `body_base`. The schema-11/12 page non-straddle rule for a leading 32-byte txid is **retired** — identity is **`txid.body`**, not body bytes.
+**Alignment** (schema 13+): `S % 8 == 0` only. The pad exists so record starts
+match **stride-8** (`IDX_STRIDE = 8`): loc stores body lengths as stride units.
+The schema-11/12 page non-straddle rule for a leading 32-byte txid is **retired**
+— identity is **`txid.body`**, not body bytes.
 
 Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt.
 
-**Body meta (schema 17, variable):** first byte bit 7 = `LAYOUT17` (required).
-Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 = locktime 0
-(else uleb locktime); then uleb `input_count` and `output_count`. Typical
-v2+locktime 0 is **3 B**. Schema-15 16-byte prefixes (v1 starts `01 00 00 00`)
-are not accepted. `input_start_fk` / `output_start_fk` stay null in RAM.
-Soft `TxRecord.txid` is filled from the sidefile on get paths.
+**Body meta (schema 22 LAYOUT17, variable):** first byte bit 7 = `LAYOUT17`
+(required). Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 =
+locktime 0 (else uleb locktime); then uleb `input_count` only (no
+`output_count`). Typical v2+locktime 0 is **2 B**. `CreateLocPair.n_out` (≥ 1)
+fills `TxRecord.output_count`. Schema-15 16-byte prefixes (v1 starts
+`01 00 00 00`) are not accepted. `input_start_fk` / `output_start_fk` stay null
+in RAM. Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-### Segmented body index (`txout.idx.*` / `inwit.idx.*` / `spent.idx.*`)
-
-```text
-{txout,inwit,spent}.idx/meta     # per-stem segment map (first_fk / file_id)
-{txout,inwit,spent}.idx/000000   # dense u32 LE stride units
-…
-```
-
-Each segment covers a contiguous create_fk range with a fixed **8-aligned** `body_base`:
+### Create / inwit locators (`create.loc` / `inwit.loc`)
 
 ```text
-abs_start = body_base + (u32_le[i] as u64) * 8
-i = fk - first_fk
+create.off              # ArrayLink: per 1024 creates, u64 txout_abs + u64 spent_abs
+create.loc              # 2 B/create: (txout_strides:u8, n_out:u8)
+create.loc.ovf          # sorted 12 B: fk:u64, strides:u16, n_out:u16
+inwit.loc / inwit.off / inwit.loc.ovf   # u16 strides; cold with inwit.body
 ```
 
-| Segment field | Meaning |
-|---------------|---------|
-| `first_fk` | 1-based inclusive start of the range |
-| `count` | number of u32 slots in the segment file |
-| `body_base` | absolute body base (8-aligned) for relatives |
-| `file_id` | maps to `{stem}.idx/{file_id:06}` |
+`n_out` is the true output count, always ≥ 1. Spent length is `8 × n_out`.
+Loc byte **0** = overflow (`n_out ≥ 256` or txout aligned length ≥ 2048).
+`inwit.loc` **0** = overflow (`strides ≥ 65536`, i.e. ≥ 512 KiB). Missing ovf
+when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
+(or inwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`.
 
-Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). **Each stem rolls independently** when that stem’s next start would exceed the soft span (`inwit` no longer forces `txout` idx splits). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
+One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
+stamps both ranges; load copies the stamp; write is holes-only or post-commit
+loc once. Occupied 21 Class A is refused. Leftover `{txout,spent,inwit}.idx`
+and `spent.off` are unlinked on empty 21/22 open.
 
-**`spent.idx` is the spent-range authority.** Record length is `8 × max(n_out, 1)` (zero-out still pays one stride so starts stay monotone). Lookup stamps `(off,len)` from `spent.idx` only — not `txout.body`. `spent_abs(off, vout) = off + 8×vout`. LAYOUT17 `output_count` stays the authority for true `n_out==0` (0-out and 1-out both have spent `len=8`). Leftover `spent.off` is unlinked on open; occupied 21 Class A is refused.
+`spent_abs(off, vout) = off + 8×vout`.
 
 ### Input encoding (embedded)
 

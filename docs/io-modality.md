@@ -129,7 +129,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`txout.body`** | L0 | Hot outs (pin / SH / Electrum tweaks); pread/pwrite/uring |
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
-| **`txout.idx` / `inwit.idx` / `spent.idx`** | L0 | Append pwrite; reads pread; **grow-tight** (~1 MiB); leftover `spent.off` unlinked |
+| **`create.loc` / `inwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked |
 | **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: RAM fuse8; packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
@@ -144,8 +144,8 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | Path | Table part | Fd/uring bulk part |
 |------|------------|---------------------|
 | Head resolve stream | FdOnly **page-batched** head probe + FdOnly idx | uring/pread body prefix |
-| Pin outs | FdOnly `txout.idx` ranges | uring/pread `txout` bytes (starting OS page; full span if need is likely to spill) |
-| IBD **getdata serve** reconstruct | FdOnly `txout.idx` / `inwit.idx` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `inwit.body` in parallel (not confirm `idx_body_pipeline`) |
+| Pin outs | FdOnly `create.loc` ranges | uring/pread `txout` bytes (starting OS page; full span if need is likely to spill) |
+| IBD **getdata serve** reconstruct | FdOnly `create.loc` / `inwit.loc` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `inwit.body` in parallel (not confirm `idx_body_pipeline`) |
 
 ---
 

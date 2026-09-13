@@ -351,7 +351,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | Flag | Core-ish alias | Default |
 |------|----------------|---------|
 | `--datadir PATH` | same | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
-| `--datadir-cold PATH` | conf `datadir-cold=` | unset — Class A `inwit.body` / `inwit.idx/` under `{PATH}/store`; everything else stays in `--datadir` |
+| `--datadir-cold PATH` | conf `datadir-cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
 | `--network NET` | `--chain` | `mainnet` |
 | `--signetchallenge HEX` | `--signet-challenge` | default global Signet challenge |
 | `--signetblocktime SECONDS` | `--signet-block-time` | 600; requires a custom challenge |
@@ -407,7 +407,7 @@ mempool_size_mb=100
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `.cookie`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
-rarely-read Class A **inwit** stem (`inwit.body` + `inwit.idx/`, ~486 GiB + idx
+rarely-read Class A **inwit** stem (`inwit.body` + `inwit.loc`, ~486 GiB + loc
 on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
 read inwit; reconstruct / `getrawtransaction` / block serve do.
 
@@ -415,7 +415,7 @@ read inwit; reconstruct / `getrawtransaction` / block serve do.
 --datadir /mnt/nvme/rbtc --datadir-cold /mnt/hdd/rbtc-cold
 # hot:  /mnt/nvme/rbtc/store/txout.body  (and the rest)
 # cold: /mnt/hdd/rbtc-cold/store/inwit.body
-#       /mnt/hdd/rbtc-cold/store/inwit.idx/
+#       /mnt/hdd/rbtc-cold/store/inwit.loc
 ```
 
 A hot-store sidecar `inwit.reloc` records the split. Opening without
@@ -424,7 +424,7 @@ existing datadir is operator `mv` (or copy+remove cross-device):
 
 ```
 mkdir -p /mnt/hdd/rbtc-cold/store
-mv /mnt/nvme/rbtc/store/inwit.body /mnt/nvme/rbtc/store/inwit.idx /mnt/hdd/rbtc-cold/store/
+mv /mnt/nvme/rbtc/store/inwit.body /mnt/nvme/rbtc/store/inwit.loc /mnt/nvme/rbtc/store/inwit.off /mnt/nvme/rbtc/store/inwit.loc.ovf /mnt/hdd/rbtc-cold/store/
 ```
 
 **Advanced** IO/perf tunables may still use `RBITCOIN_*` (see below); they are
@@ -505,9 +505,9 @@ gate is median/min (not max/min), so one fast peer does not peel the pack.
 `class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 
 **Archive head resolve:** streaming — **FdOnly** page-coalesced head probe +
-**FdOnly** `txout.idx` + **`txid.body`** identity via **io_uring or pread**
+**FdOnly** `create.loc` + **`txid.body`** identity via **io_uring or pread**
 (deepest-cand-first).
-**Class A `txout` / `inwit` / `spent` + their `*.idx`, `tx.head`, header head,
+**Class A `txout` / `inwit` / `spent` + `create.loc` / `inwit.loc`, `tx.head`, header head,
 SH head/body, and spenders are fd pread/pwrite**.
 Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
 
@@ -636,15 +636,11 @@ Copy-paste (node stopped with SIGTERM):
 DATADIR=/path/to/datadir
 # fuse8 v1 / Shared SH body / Paged SH heads (same dirs as schema-20 index refuse):
 rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
-# leftover flat idx only (keep Class A bodies). If store/txout.idx/ already exists,
-# delete the flat siblings; otherwise move them into the directory:
-#   mkdir -p "$DATADIR/store/txout.idx"
-#   mv "$DATADIR/store/txout.idx.meta" "$DATADIR/store/txout.idx/meta"
-#   mv "$DATADIR/store/txout.idx."[0-9][0-9][0-9][0-9][0-9][0-9] "$DATADIR/store/txout.idx/"
-# same for inwit.idx and spent.idx
+# leftover Class A `*.idx` dirs (schema 22 uses create.loc / inwit.loc):
+#   rm -rf "$DATADIR/store/txout.idx" "$DATADIR/store/spent.idx" "$DATADIR/store/inwit.idx"
 ```
 
-Keep Class A (`txout` / `inwit` / `spent` + `txout.idx` / `inwit.idx` / `spent.idx`, `txid.body`, headers) and
+Keep Class A (`txout` / `inwit` / `spent` + `create.loc` / `inwit.loc`, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--shindex`, SH rematerializes. Do **not** `rm -rf store/`.
 

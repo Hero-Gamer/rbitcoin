@@ -11,12 +11,13 @@ before 1.0).
 
 ### Changed
 
-- **Schema 22:** restore `spent.idx` (u32 stride-8). Spent slot is flags +
+- **Schema 22:** `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`).
+  LAYOUT17 omits `output_count` (decode `n_out` from loc). Spent slot is flags +
   u40 spend fk + u16 vin. Occupied 15–21 Class A with creates refuses
   (`wipe datadir and redo IBD`). Empty 15–21 rewrite `meta` to 22 and
-  unlink leftover `spent.off`. A 21 binary refuses 22 `meta`. Esplora
-  `/outspend(s)` emits `vin` from the slot (mempool overlay uses the hub
-  tx input index). First-wave Outs guess is `4+(max_vout+1)×38`.
+  unlink leftover `spent.off` and leftover `*.idx`. A 21 binary refuses 22
+  `meta`. Esplora `/outspend(s)` emits `vin` from the slot (mempool overlay uses
+  the hub tx input index). First-wave Outs guess is `4+(max_vout+1)×38`.
 
 ### Added
 
