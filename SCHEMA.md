@@ -373,9 +373,10 @@ when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
 (or inwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`.
 
 One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
-stamps both ranges; load copies the stamp; write is holes-only or post-commit
-loc once. Occupied 21 Class A is refused. Leftover `{txout,spent,inwit}.idx`
-and `spent.off` are unlinked on empty 21/22 open.
+stamps both ranges; load copies the stamp; write appends loc and keeps the RAM
+pairs (same-batch abs). Write does not pread `create.loc`. Occupied 21 Class A
+is refused. Leftover `{txout,spent,inwit}.idx` and `spent.off` are unlinked on
+empty 21/22 open.
 
 `spent_abs(off, vout) = off + 8×vout`.
 

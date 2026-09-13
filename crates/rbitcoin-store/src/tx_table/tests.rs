@@ -156,9 +156,13 @@ fn put_full_batch_from_pins_roundtrip() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
-    let fks = t
+    let (fks, loc) = t
         .put_full_batch_from_pins(&[(pin, ins)], true, &[])
         .unwrap();
+    assert_eq!(loc.len(), 1);
+    assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
+    assert_eq!(loc[0].spent, t.spent_range(fks[0]).unwrap());
+    assert_eq!(loc[0].n_out, 1);
     let (got, gins, gouts) = t.get_full(fks[0]).unwrap();
     assert_eq!(got.txid, [3u8; 32]);
     assert_eq!(gins.len(), 1);
@@ -184,7 +188,7 @@ fn put_full_batch_one_body_write_wave() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let _ = crate::uring_session::tls_take_max_batch_pwrite_n();
-    let fks = t
+    let (fks, _loc) = t
         .put_full_batch_from_pins(&[(pin, ins)], true, &[])
         .unwrap();
     assert_eq!(fks.len(), 1);
@@ -241,7 +245,7 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         witness: vec![],
     }];
     let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
-    let fks = t
+    let (fks, loc) = t
         .put_full_batch_from_pins(
             &[(parent_pin, parent_ins), (child_pin, child_ins)],
             false,
@@ -249,6 +253,8 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
+    assert_eq!(loc[0].spent, t.spent_range(fks[0]).unwrap());
+    assert_eq!(loc[0].n_out, 2);
     let (off, _len) = t.spent_range(fks[0]).unwrap();
     let abs0 = spent_abs(off, 0);
     let abs1 = spent_abs(off, 1);

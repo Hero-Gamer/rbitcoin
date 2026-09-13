@@ -37,7 +37,7 @@ use crate::params::{genesis_block, ChainParams};
 use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{FkMap, Query, U32Map, U64Map, U64Set};
+use rbitcoin_query::{FkMap, Query, U32Map, U64Map};
 use rbitcoin_store::{StoreError, WriteIoBackend};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -60,7 +60,6 @@ pub use bq_resolve::{
 use head_drain::{submit_head_drain, submit_head_insert, HEAD_DRAIN_THREAD_NAME};
 #[cfg(test)]
 use lookup::confirm_archive_kind;
-use lookup::known_create_txid_lookup;
 #[cfg(test)]
 use lookup::ConfirmArchiveKind;
 pub use lookup::{
@@ -75,7 +74,10 @@ pub use scripts::{confirm_scripts_phase, drive_script_waves_with};
 pub(crate) use write::finish_post_commit;
 pub use write::{confirm_write_phase, finish_post_commit_hashes};
 #[cfg(test)]
-use write::{write_batch_vs_tip, write_height_needed, WriteBatchVsTip};
+use write::{
+    fill_planned_create_layout_after_commit, write_batch_vs_tip, write_height_needed,
+    WriteBatchVsTip,
+};
 
 /// Pure-write annotate backend from global `RBITCOIN_IO`.
 #[inline]

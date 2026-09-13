@@ -802,7 +802,7 @@ impl Store {
         items: &[crate::tx_table::PinInItem],
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
-    ) -> Result<Vec<Fk>, StoreError> {
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         self.txs
             .put_full_batch_from_pins(items, index, spent_overlay)
     }

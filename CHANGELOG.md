@@ -62,6 +62,11 @@ before 1.0).
 
 ### Fixed
 
+- **Write loc RAM:** Class A append returns loc pairs; write keeps them in a
+  sequential window and stamps same-batch / just-written abs from that RAM
+  (packed pin outs). Write does not pread `create.loc`. Missing stamp is
+  `Corrupt`.
+
 - **`store_reorg` overnight ASan OOM:** sibling ops no-op at 16 parked
   `held_bodies` and the tiny hub is not reopened. Recycle-every-16 grew
   libFuzzer RSS to the 2048 MiB cap (~45 min into the Sunday 1h job)

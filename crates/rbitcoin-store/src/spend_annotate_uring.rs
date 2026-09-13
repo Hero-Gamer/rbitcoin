@@ -868,7 +868,7 @@ mod tests {
         ));
         let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
         let sfk = Fk(9);
-        let fks = t
+        let (fks, _loc) = t
             .put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk, 0)]])
             .unwrap();
         let cfk = fks[0];

@@ -589,34 +589,6 @@ pub(super) fn create_fks_from_header_ranges(
     by_header
 }
 
-/// Lookup-side identity fill: plan RAM first, else `txid.body` (lookup may read
-/// the sidefile; load must not call this).
-#[inline]
-pub(super) fn known_create_txid_lookup(
-    query: &Query,
-    create_fk_id: u64,
-    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
-) -> Result<[u8; 32], ConsensusError> {
-    if let Some(p) = plan {
-        if let Some(tid) = p.external_parent_txid(create_fk_id) {
-            if tid != [0u8; 32] {
-                return Ok(tid);
-            }
-        }
-    }
-    let tid = query
-        .store()
-        .txs
-        .body_txid(rbitcoin_primitives::Fk(create_fk_id))
-        .map_err(ConsensusError::from)?;
-    if tid == [0u8; 32] {
-        return Err(ConsensusError::Store(StoreError::Corrupt(
-            "invariant: pin parent create identity still zero after txid.body",
-        )));
-    }
-    Ok(tid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
