@@ -462,7 +462,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
             batch_parents.set_spent_range_only(*fk, pair.spent);
         }
     }
-    for (id, _) in &need {
+    for id in need.keys() {
         let fk = rbitcoin_primitives::Fk(*id);
         if !batch_parents.contains(fk) || batch_parents.has_abs_layout(fk) {
             continue;
