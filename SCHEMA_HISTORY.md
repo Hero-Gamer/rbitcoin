@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **22** | `create.loc` + `inwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | **Current** |
+| **22** | `create.loc` + `inwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | **Current** |
 | **21** | Drop `spent.idx`. Spent ranges are `8 × max(n_out,1)` from txout meta; sparse `spent.off`. Unlink leftover idx; rewrite `meta` 20→21. Table headers 13–20 remain openable. | Prior |
 | **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). Refuse occupied 18/19 `tx.head` / `scripthash*`. Leftover fuse8 v1, flat `*.idx.meta`, Shared SH body, pack8 Paged (mode 10) refuse. | Prior |
 | **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
@@ -36,7 +36,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v22 (create.loc + inwit.loc + vin pack)
+## v22 (create.loc + inwit.loc + vin pack + amount exp)
 
 `create.loc` (2 B/create: txout strides + `n_out`) plus RAM `create.off`
 checkpoints replace `txout.idx` and `spent.idx`. `inwit.loc` (u16 strides)
@@ -44,13 +44,17 @@ on the cold volume replaces `inwit.idx`. `VarTable` is body-only. LAYOUT17
 meta is flags + version/locktime + uleb `input_count` only; decode takes
 `n_out` from loc (`n_out ≥ 1`). Spent length is `8 × n_out` (no zero-out pad).
 Spent slot is still 8 bytes: flags + u40 spend fk + u16 vin. `spent.ovf`
-nodes use the same pack. Occupied 15–21 LAYOUT17 Class A with creates refuses
+nodes use the same pack. `txout` amount uses flags bits 4–7 as a decimal
+exponent (0–9) and a ULEB mantissa (`sats = mantissa × 10^e`). `e=0` is the
+old raw satoshi ULEB (messy amounts). `e>9` or a non-canonical mantissa
+(`e<9` and `mantissa` divisible by 10, except zero) is Corrupt. Occupied
+15–21 LAYOUT17 Class A with creates refuses
 (`schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`)
 because the old flags+u56-fk layout has no vin, LAYOUT17 still had
-`output_count`, and locators are not idx. Empty 15–21 rewrite `store/meta`
-to 22 and unlink leftover `spent.off` plus leftover `{txout,spent,inwit}.idx`.
-A 21 binary refuses 22 `meta`. Table file headers 13–21 remain openable when
-Class A is empty.
+`output_count`, locators are not idx, and reserved amount bits were 0.
+Empty 15–21 rewrite `store/meta` to 22 and unlink leftover `spent.off` plus
+leftover `{txout,spent,inwit}.idx`. A 21 binary refuses 22 `meta`. Table file
+headers 13–21 remain openable when Class A is empty.
 
 ## v21 (drop spent.idx)
 

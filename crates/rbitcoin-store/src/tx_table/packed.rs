@@ -731,9 +731,9 @@ pub fn scan_packed_p2tr_outs(
         if raw.len() - off < 2 {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let kind = raw[off] & 0x0f;
+        let (kind, exp) = split_output_flags(raw[off])?;
         let mut o = off + 1;
-        let (v, n) = read_uleb128(&raw[o..])?;
+        let (v, n) = decode_output_amount(exp, &raw[o..])?;
         o += n;
         let value = if v > i64::MAX as u64 {
             return Err(StoreError::Corrupt("output value too large"));
@@ -769,12 +769,9 @@ pub fn visit_packed_script_hashes(
             return Err(StoreError::Corrupt("packed outputs short"));
         }
         let flags = raw[off];
-        if flags & 0xf0 != 0 {
-            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
-        }
-        let kind = flags & 0x0f;
+        let (kind, exp) = split_output_flags(flags)?;
         let mut o = off + 1;
-        let (_v, n) = read_uleb128(&raw[o..])?;
+        let (_v, n) = decode_output_amount(exp, &raw[o..])?;
         o += n;
         let used = crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
         payload.clear();
@@ -874,7 +871,7 @@ pub struct HeadResizeSizeSnapshot {
 #[cfg(test)]
 mod scan_p2tr_tests {
     use super::*;
-    use crate::compact::{write_uleb128, SCRIPT_KIND_V17_P2TR};
+    use crate::compact::{amount_exp_mantissa, write_uleb128, SCRIPT_KIND_V17_P2TR};
 
     fn packed_p2tr_body(value: u64) -> Vec<u8> {
         let meta = TxRecord {
@@ -888,8 +885,14 @@ mod scan_p2tr_tests {
         };
         let mut raw = Vec::new();
         meta.encode_body_meta_into(&mut raw);
-        raw.push(SCRIPT_KIND_V17_P2TR);
-        write_uleb128(&mut raw, value);
+        if value > i64::MAX as u64 {
+            raw.push(SCRIPT_KIND_V17_P2TR);
+            write_uleb128(&mut raw, value);
+        } else {
+            let (exp, mantissa) = amount_exp_mantissa(value);
+            raw.push(SCRIPT_KIND_V17_P2TR | (exp << 4));
+            write_uleb128(&mut raw, mantissa);
+        }
         raw.extend_from_slice(&[0u8; 32]);
         raw
     }

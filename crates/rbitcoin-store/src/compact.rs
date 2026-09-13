@@ -121,6 +121,58 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
     Err(StoreError::Corrupt("uleb128 truncated"))
 }
 
+/// Trailing decimal zeros in a satoshi amount, capped at 9 (fits flags bits 4–7).
+pub const AMOUNT_EXP_MAX: u8 = 9;
+
+pub fn amount_exp_mantissa(sats: u64) -> (u8, u64) {
+    if sats == 0 {
+        return (0, 0);
+    }
+    let mut e = 0u8;
+    let mut n = sats;
+    while e < AMOUNT_EXP_MAX && n.is_multiple_of(10) {
+        n /= 10;
+        e += 1;
+    }
+    (e, n)
+}
+
+pub fn split_output_flags(flags: u8) -> Result<(u8, u8), StoreError> {
+    let exp = flags >> 4;
+    if exp > AMOUNT_EXP_MAX {
+        return Err(StoreError::Corrupt("txout amount exp"));
+    }
+    Ok((flags & 0x0f, exp))
+}
+
+pub fn scale_amount_exp(exp: u8, mantissa: u64) -> Result<u64, StoreError> {
+    if exp > AMOUNT_EXP_MAX {
+        return Err(StoreError::Corrupt("txout amount exp"));
+    }
+    if mantissa == 0 {
+        if exp != 0 {
+            return Err(StoreError::Corrupt("txout amount exp"));
+        }
+        return Ok(0);
+    }
+    if exp < AMOUNT_EXP_MAX && mantissa.is_multiple_of(10) {
+        return Err(StoreError::Corrupt("txout amount exp"));
+    }
+    let mut v = mantissa;
+    for _ in 0..exp {
+        v = v
+            .checked_mul(10)
+            .ok_or(StoreError::Corrupt("output value too large"))?;
+    }
+    Ok(v)
+}
+
+/// `(sats, uleb bytes)`. `buf` starts at the mantissa ULEB.
+pub fn decode_output_amount(exp: u8, buf: &[u8]) -> Result<(u64, usize), StoreError> {
+    let (mantissa, n) = read_uleb128(buf)?;
+    Ok((scale_amount_exp(exp, mantissa)?, n))
+}
+
 /// Input record flags (schema v10).
 pub mod input_flags {
     /// `sequence == 0xffff_ffff`
@@ -410,6 +462,21 @@ mod tests {
         assert_eq!(uleb128_len(127), 1);
         assert_eq!(uleb128_len(128), 2);
         assert!(uleb128_len(u64::MAX) >= 9);
+    }
+
+    #[test]
+    fn amount_exp_mantissa_strips_trailing_tens() {
+        assert_eq!(amount_exp_mantissa(0), (0, 0));
+        assert_eq!(amount_exp_mantissa(546), (0, 546));
+        assert_eq!(amount_exp_mantissa(1_000), (3, 1));
+        assert_eq!(amount_exp_mantissa(100_000_000), (8, 1));
+        assert_eq!(amount_exp_mantissa(5_000_000_000), (9, 5));
+        assert_eq!(amount_exp_mantissa(10_000_000_000), (9, 10));
+        assert_eq!(scale_amount_exp(8, 1).unwrap(), 100_000_000);
+        assert!(scale_amount_exp(10, 1).is_err());
+        assert!(scale_amount_exp(1, 10).is_err());
+        assert!(scale_amount_exp(3, 0).is_err());
+        assert_eq!(scale_amount_exp(0, 0).unwrap(), 0);
     }
 
     #[test]

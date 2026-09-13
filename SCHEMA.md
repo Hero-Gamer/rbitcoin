@@ -3,7 +3,9 @@
 **Version:** `SCHEMA_VERSION = 22` (`rbitcoin_primitives`).  
 **Status:** 22 is `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`),
 LAYOUT17 without `output_count`, and spent slots flags + u40 spend fk + u16 vin
-(still 8 bytes). Occupied 15–21 LAYOUT17 Class A with creates is **refused**
+(still 8 bytes). `txout` amount is flags bits 4–7 = decimal exponent (0–9) +
+ULEB mantissa (`sats = mantissa × 10^e`; `e=0` is a raw satoshi ULEB). Occupied
+15–21 LAYOUT17 Class A with creates is **refused**
 (wipe datadir and redo IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover
 `spent.off` and leftover `*.idx`. A 21 binary refuses 22 `meta`. Occupied schema
 18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
@@ -395,8 +397,11 @@ Legacy `LOCAL_PREV` is **rejected** on decode.
 ### Output encoding (`txout.body`)
 
 ```text
-flags:u8 (bits 0–3 SCRIPT_KIND, bits 4–7 reserved 0)
-uleb128 value
+flags:u8 (bits 0–3 SCRIPT_KIND, bits 4–7 amount exp 0–9; 10–15 Corrupt)
+uleb128 mantissa
+  sats = mantissa × 10^e
+  e < 9 and mantissa divisible by 10 (except 0) is Corrupt
+  zero amount is e=0, mantissa 0
 kind payload:
   0 RAW            CompactSize + bytes
   1 EMPTY          none

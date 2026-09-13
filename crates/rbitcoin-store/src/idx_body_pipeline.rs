@@ -459,14 +459,18 @@ mod tests {
         use crate::tx_table::OutputRecord;
         let mut script = vec![0x51, 0x20];
         script.extend_from_slice(&[0x11u8; 32]);
-        let rec = OutputRecord::unspent(6_2500_0000, script);
-        let out_len = rec.encoded_len_exact() as u64;
+        let rec = OutputRecord::unspent(6_2500_0000, script.clone());
         assert_eq!(
-            out_len, OUTS_GUESS_PER_VOUT,
-            "kind + amount + P2TR: {out_len}"
+            rec.encoded_len_exact() as u64,
+            35,
+            "6.25 BTC exp+mantissa+P2TR"
         );
-        let with_meta = OUTS_META_GUESS + out_len;
-        assert_eq!(with_meta, 42, "got {with_meta}");
+        let fat = OutputRecord::unspent(2_6843_5456, script);
+        assert_eq!(
+            fat.encoded_len_exact() as u64,
+            OUTS_GUESS_PER_VOUT,
+            "messy 5-byte amount + P2TR is the 38 guess"
+        );
         assert_eq!(outs_first_wave_len(0, 8000, &[0]), 4096);
     }
 

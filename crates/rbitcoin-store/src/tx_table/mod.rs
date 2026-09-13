@@ -1,7 +1,8 @@
 use crate::address_head::HeadLayout;
 use crate::compact::{
-    decode_script_kind_v17, encode_script_kind_v17, input_flags, output_flags, read_compact_size,
-    read_uleb128, script_kind_v17_disk_used, write_compact_size, write_uleb128,
+    amount_exp_mantissa, decode_output_amount, decode_script_kind_v17, encode_script_kind_v17,
+    input_flags, output_flags, read_compact_size, read_uleb128, script_kind_v17_disk_used,
+    split_output_flags, write_compact_size, write_uleb128,
 };
 use crate::error::StoreError;
 use crate::hashhead::HeadOpenOpts;
@@ -227,7 +228,7 @@ impl OutputRecord {
         }
     }
 
-    /// Encode `txout` payload (schema 17: kind nibble + template payload; no spender).
+    /// Encode `txout` payload (kind nibble + amount exp + ULEB mantissa; no spender).
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let flags_at = out.len();
         out.push(0);
@@ -236,9 +237,10 @@ impl OutputRecord {
         } else {
             self.value as u64
         };
-        write_uleb128(out, v);
+        let (exp, mantissa) = amount_exp_mantissa(v);
+        write_uleb128(out, mantissa);
         let kind = encode_script_kind_v17(&self.script, out);
-        out[flags_at] = kind;
+        out[flags_at] = kind | (exp << 4);
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -260,12 +262,9 @@ impl OutputRecord {
             return Err(StoreError::Corrupt("short output record"));
         }
         let flags = buf[0];
-        if flags & 0xf0 != 0 {
-            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
-        }
-        let kind = flags & 0x0f;
+        let (kind, exp) = split_output_flags(flags)?;
         let mut off = 1usize;
-        let (v, n) = read_uleb128(&buf[off..])?;
+        let (v, n) = decode_output_amount(exp, &buf[off..])?;
         off += n;
         if v > i64::MAX as u64 {
             return Err(StoreError::Corrupt("output value too large"));
@@ -297,12 +296,9 @@ impl OutputRecord {
             return Err(StoreError::Corrupt("short output record"));
         }
         let flags = buf[0];
-        if flags & 0xf0 != 0 {
-            return Err(StoreError::Corrupt("v17 txout reserved output flags"));
-        }
-        let kind = flags & 0x0f;
+        let (kind, exp) = split_output_flags(flags)?;
         let mut off = 1usize;
-        let (_v, n) = read_uleb128(&buf[off..])?;
+        let (_v, n) = decode_output_amount(exp, &buf[off..])?;
         off += n;
         off += script_kind_v17_disk_used(kind, &buf[off..])?;
         Ok(off)
@@ -331,6 +327,7 @@ impl OutputRecord {
         } else {
             self.value as u64
         };
+        let (_exp, mantissa) = amount_exp_mantissa(v);
         let (kind, payload) = classify_script(&self.script);
         let payload_len = match kind {
             SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
@@ -338,7 +335,7 @@ impl OutputRecord {
             }
             _ => payload.len(),
         };
-        1 + uleb128_len(v) + payload_len
+        1 + uleb128_len(mantissa) + payload_len
     }
 
     /// Sole-spender slot length in `spent.body`.

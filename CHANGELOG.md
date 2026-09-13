@@ -13,7 +13,9 @@ before 1.0).
 
 - **Schema 22:** `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`).
   LAYOUT17 omits `output_count` (decode `n_out` from loc). Spent slot is flags +
-  u40 spend fk + u16 vin. Occupied 15–21 Class A with creates refuses
+  u40 spend fk + u16 vin. `txout` amount is flags bits 4–7 = decimal
+  exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`; messy amounts
+  stay `e=0`). Occupied 15–21 Class A with creates refuses
   (`wipe datadir and redo IBD`). Empty 15–21 rewrite `meta` to 22 and
   unlink leftover `spent.off` and leftover `*.idx`. A 21 binary refuses 22
   `meta`. Esplora `/outspend(s)` emits `vin` from the slot (mempool overlay uses
