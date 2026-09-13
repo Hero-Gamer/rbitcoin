@@ -90,7 +90,7 @@ before 1.0).
 - **`create.loc` leftover stamp:** lookup reads/sums only through the highest
   fk in each 1024-create window, preads those windows as one bulk batch (held
   head-resolve session or `pread_batch`), and prefix-sums non-overflow windows
-  with SIMD. No cross-window loc cache.
+  with SIMD (SSE2 on x86_64, NEON on aarch64). No cross-window loc cache.
 
 - **`store_reorg` overnight ASan OOM:** sibling ops no-op at 16 parked
   `held_bodies` and the tiny hub is not reopened. Recycle-every-16 grew

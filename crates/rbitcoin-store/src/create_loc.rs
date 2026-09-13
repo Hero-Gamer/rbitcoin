@@ -423,7 +423,7 @@ pub(crate) fn prefix_sum_create_no_ovf(buf: &[u8], n: usize, tx0: u64, sp0: u64)
     (tx_ps, sp_ps, n_outs)
 }
 
-#[cfg(any(test, not(target_arch = "x86_64")))]
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub(crate) fn prefix_sum_create_no_ovf_scalar(
     buf: &[u8],
     n: usize,
@@ -446,13 +446,13 @@ fn prefix_sum_create_no_ovf_into(
     sp_ps: &mut [u64],
     n_outs: &mut [u32],
 ) {
-    #[cfg(target_arch = "x86_64")]
-    prefix_sum_create_sse2(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    prefix_sum_create_u8x8(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     prefix_sum_create_no_ovf_scalar_into(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
 }
 
-#[cfg(any(test, not(target_arch = "x86_64")))]
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 fn prefix_sum_create_no_ovf_scalar_into(
     buf: &[u8],
     n: usize,
@@ -473,8 +473,8 @@ fn prefix_sum_create_no_ovf_scalar_into(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-fn prefix_sum_create_sse2(
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn prefix_sum_create_u8x8(
     buf: &[u8],
     n: usize,
     tx0: u64,
@@ -497,9 +497,22 @@ fn prefix_sum_create_sse2(
             no[k] = buf[base + k * 2 + 1];
             n_outs[i + k] = u32::from(no[k]);
         }
-        // SAFETY: `st`/`no` are 8-byte stack arrays; movq load is defined unaligned.
-        let tx_inc = unsafe { sse2_u8x8_times_8_inclusive(st.as_ptr()) };
-        let sp_inc = unsafe { sse2_u8x8_times_8_inclusive(no.as_ptr()) };
+        // SAFETY: `st`/`no` are 8-byte stack arrays; SSE2 movq / NEON vld1
+        // 8-byte loads are defined unaligned.
+        #[cfg(target_arch = "x86_64")]
+        let (tx_inc, sp_inc) = unsafe {
+            (
+                sse2_u8x8_times_8_inclusive(st.as_ptr()),
+                sse2_u8x8_times_8_inclusive(no.as_ptr()),
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (tx_inc, sp_inc) = unsafe {
+            (
+                neon_u8x8_times_8_inclusive(st.as_ptr()),
+                neon_u8x8_times_8_inclusive(no.as_ptr()),
+            )
+        };
         let tx_start = tx;
         let sp_start = sp;
         for k in 0..8 {
@@ -544,6 +557,34 @@ unsafe fn sse2_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
     let mut out = [0u32; 8];
     _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, lo);
     _mm_storeu_si128(out.as_mut_ptr().add(4) as *mut __m128i, hi);
+    out
+}
+
+/// Inclusive scan of eight `u8 << 3` values (fits u32 for a 1024-create window).
+///
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
+    use std::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vdupq_n_u32, vextq_u32, vget_high_u16, vget_low_u16, vgetq_lane_u32,
+        vld1_u8, vmovl_u16, vmovl_u8, vshlq_n_u32, vst1q_u32,
+    };
+    let prefix4 = |v: uint32x4_t| {
+        let z = vdupq_n_u32(0);
+        let s = vaddq_u32(v, vextq_u32(z, v, 3));
+        vaddq_u32(s, vextq_u32(z, s, 2))
+    };
+    let v = vld1_u8(p);
+    let v16 = vmovl_u8(v);
+    let lo = prefix4(vshlq_n_u32(vmovl_u16(vget_low_u16(v16)), 3));
+    let hi = prefix4(vshlq_n_u32(vmovl_u16(vget_high_u16(v16)), 3));
+    let hi = vaddq_u32(hi, vdupq_n_u32(vgetq_lane_u32(lo, 3)));
+    let mut out = [0u32; 8];
+    vst1q_u32(out.as_mut_ptr(), lo);
+    vst1q_u32(out.as_mut_ptr().add(4), hi);
     out
 }
 

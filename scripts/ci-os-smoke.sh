@@ -28,6 +28,10 @@ case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT*)
     STORE_PLATFORM_SKIPS+=(concurrent_readers_during_append_and_grow)
     ;;
+  Darwin*)
+    # Linux CI is x86_64; Darwin smoke is the aarch64 NEON pin.
+    STORE_PLATFORM_FILTERS+=(create_loc::tests::prefix_sum_fast_matches_scalar)
+    ;;
 esac
 
 if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then

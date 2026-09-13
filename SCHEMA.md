@@ -374,7 +374,7 @@ when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
 reads and prefix-sums only through the highest fk in each 1024-create window
 (not the unused tail). Those window preads are **one** bulk batch (held
 head-resolve session, else `pread_batch`). Non-overflow windows use a SIMD
-prefix sum (`u8×8` SSE2 on x86_64).
+prefix sum (`u8×8` SSE2 on x86_64, NEON on aarch64).
 
 One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
 stamps both ranges; load copies the stamp; write appends loc and keeps the RAM
