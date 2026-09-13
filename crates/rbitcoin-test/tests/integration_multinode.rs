@@ -3,7 +3,8 @@
 //! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
 //! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
 //! **Tier B (default suite):** handshake timeout / GetAddr / keepalive ping,
-//! hub reorg (including leftover/BadPrev orphan that must not blacklist).
+//! HB compact tip-follow, hub reorg (including leftover/BadPrev orphan that
+//! must not blacklist).
 //! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
 //! `scripts/integration.sh` or `-- --ignored` only.
 
@@ -221,6 +222,22 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let fetch = peer
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.conn_type == PeerConnType::AddrFetch)
+            .expect("AddrFetch session");
+        assert_eq!(
+            fetch
+                .bytessent_per_msg
+                .get("getheaders")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "AddrFetch must not GetHeaders: {:?}",
+            fetch.bytessent_per_msg
+        );
         for id in peer
             .peers
             .snapshot()
@@ -237,6 +254,100 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
         .expect("p2p_timeout_getaddr_and_keepalive_ping wall timeout (20s)");
+}
+
+fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
+    let tip = node.hub.tip_hash().expect("tip hash");
+    let tip_time = node.hub.tip_header().expect("tip header").time;
+    let b = mine_regtest_block(tip, tip_time + 600, height, vec![]);
+    let h = b.block_hash();
+    node.ingest_block(height, b).unwrap();
+    h
+}
+
+/// Genesis-only follow: first new tip via headers/inv, then HB `cmpctblock`.
+/// Coinbase-only compact reconstructs without `getblocktxn`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_hb_compact_tip_follow() {
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
+        let seed = start_node(&seed_dir).await;
+        let mut peer = start_node(&peer_dir).await;
+        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
+            .await
+            .expect("follow_from handshake")
+            .expect("follow");
+        assert!(
+            peer.follow_live_count() >= 1,
+            "outbound follow must stay live"
+        );
+
+        let h1 = mine_on(&seed, 1);
+        peer.wait_tip_hash(h1, Duration::from_secs(5))
+            .await
+            .expect("first tip via headers/inv");
+
+        let hb_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let seed_hb_from = seed
+                .peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.inbound && p.bip152_hb_from);
+            if seed_hb_from {
+                break;
+            }
+            if tokio::time::Instant::now() >= hb_deadline {
+                panic!(
+                    "seed inbound must see sendcmpct(1) after first tip \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let h2 = mine_on(&seed, 2);
+        peer.wait_tip_hash(h2, Duration::from_secs(5))
+            .await
+            .expect("second tip via compact");
+        assert_eq!(peer.query.tip_height(), Some(Height(2)));
+
+        let peer_out = peer
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| !p.inbound)
+            .expect("peer outbound");
+        let cmpct = peer_out
+            .bytesrecv_per_msg
+            .get("cmpctblock")
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            cmpct > 0,
+            "follower must receive cmpctblock for the HB tip: {:?}",
+            peer_out.bytesrecv_per_msg
+        );
+        assert_eq!(
+            peer_out
+                .bytessent_per_msg
+                .get("getblocktxn")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "coinbase-only compact must reconstruct without getblocktxn: {:?}",
+            peer_out.bytessent_per_msg
+        );
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_hb_compact_tip_follow wall timeout (20s)");
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct

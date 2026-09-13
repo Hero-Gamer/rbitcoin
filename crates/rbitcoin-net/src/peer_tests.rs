@@ -4334,66 +4334,6 @@ fn redundant_verack_is_ignored_and_logged() {
     });
 }
 
-/// `p2p_addrfetch.py`: post-handshake AddrFetch queues getaddr, not getheaders.
-#[test]
-fn addrfetch_post_handshake_queues_getaddr_not_getheaders() {
-    use bitcoin::p2p::address::Address;
-    use bitcoin::p2p::message_network::VersionMessage;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::Ordering;
-
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("addrfetch-getaddr");
-    hub.ensure_genesis().unwrap();
-    let peers = crate::peers::PeerHub::new();
-    // Tip older than 24h so try_start_headers_sync would otherwise start.
-    peers.set_mock_now(1_700_000_000);
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-    let ver = VersionMessage {
-        version: 70016,
-        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-        timestamp: 0,
-        receiver: Address::new(&addr, ServiceFlags::NONE),
-        sender: Address::new(&addr, ServiceFlags::NONE),
-        nonce: 1,
-        user_agent: "/rbitcoin:test/".into(),
-        start_height: 0,
-        relay: true,
-    };
-    let sess = peers.register(
-        addr,
-        addr,
-        &ver,
-        false,
-        crate::peers::PeerConnType::AddrFetch,
-    );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    sess.attach_out(out_tx.clone());
-
-    assert!(
-        !maybe_queue_initial_getheaders(&out_tx, &hub, sess.as_ref()),
-        "AddrFetch must not start initial headers sync"
-    );
-    assert!(
-        maybe_queue_addrfetch_getaddr(&out_tx, sess.as_ref()),
-        "AddrFetch must queue getaddr after handshake"
-    );
-
-    let mut saw_getaddr = false;
-    let mut saw_getheaders = false;
-    while let Ok(m) = out_rx.try_recv().map(PeerOut::expect_msg) {
-        match m {
-            NetworkMessage::GetAddr => saw_getaddr = true,
-            NetworkMessage::GetHeaders(_) => saw_getheaders = true,
-            _ => {}
-        }
-    }
-    assert!(saw_getaddr, "expected GetAddr");
-    assert!(!saw_getheaders, "AddrFetch must not queue GetHeaders");
-    assert!(!sess.stop.load(Ordering::SeqCst));
-
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 /// `p2p_addrfetch.py`: Addr/AddrV2 with >1 entry completes addr-fetch (disconnect).
 #[test]
 fn addrfetch_multi_addr_disconnects() {
