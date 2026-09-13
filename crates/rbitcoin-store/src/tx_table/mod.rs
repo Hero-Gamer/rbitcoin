@@ -35,6 +35,8 @@ pub(crate) type PinInItem = (
 pub(crate) type OutsByRangeJob = (Fk, (u64, u64), [u8; 32], Vec<u32>);
 /// `(rows, body_ns, decode_ns, extend_n, body_sqe_n, guess_full_n)` from [`TxTable::get_outs_by_range_batch`].
 pub(crate) type OutsByRangeOut = (Vec<Option<SparseOutsRow>>, u64, u64, u64, u64, u64);
+/// `spent.body` slot: spender fk + flags + vin.
+pub(crate) type SpenderSlot = (Fk, u8, u32);
 
 pub(crate) fn parse_rebuild_seal_bits(raw: Option<&str>) -> u32 {
     raw.and_then(|s| s.parse::<u32>().ok())
@@ -1165,7 +1167,7 @@ impl TxTable {
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend())
     }
 
@@ -1174,7 +1176,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         if abs_offs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1200,7 +1202,7 @@ impl TxTable {
     fn get_spender_meta_at_abs_batch_uring(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Uring)
     }
 
@@ -1208,7 +1210,7 @@ impl TxTable {
     fn get_spender_meta_at_abs_batch_pread(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Pread)
     }
 
@@ -1216,7 +1218,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
         let body_fd = self.spent.body_read_fd();
@@ -1250,7 +1252,7 @@ impl TxTable {
         }
         bulk_io::pread_batch_backend(&mut ops, backend);
 
-        let mut out: Vec<Option<(Fk, u8, u32)>> = vec![None; abs_offs.len()];
+        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
         for (ro, &i) in ops.iter().zip(submitted.iter()) {
             if ro.result < 0 {
                 return Err(StoreError::io(

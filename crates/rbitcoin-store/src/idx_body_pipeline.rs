@@ -473,9 +473,12 @@ mod tests {
         script.extend_from_slice(&[0x11u8; 32]);
         let rec = OutputRecord::unspent(6_2500_0000, script);
         let out_len = rec.encoded_len_exact() as u64;
-        assert!(out_len > 40, "amount+P2TR exceeds old 40 guess: {out_len}");
-        let with_meta = 3 + out_len;
-        assert!(with_meta > 40 && with_meta <= 42, "got {with_meta}");
+        assert_eq!(
+            out_len, OUTS_GUESS_PER_VOUT,
+            "kind + amount + P2TR: {out_len}"
+        );
+        let with_meta = OUTS_META_GUESS + out_len;
+        assert_eq!(with_meta, 42, "got {with_meta}");
         assert_eq!(outs_first_wave_len(0, 8000, &[0]), 4096);
     }
 

@@ -344,7 +344,7 @@ impl Store {
                 "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
             ));
         }
-        if meta_ver < SCHEMA_VERSION && meta_ver >= 15 && class_a_has_creates(&path) {
+        if (15..SCHEMA_VERSION).contains(&meta_ver) && class_a_has_creates(&path) {
             return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
         }
         if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
@@ -1045,7 +1045,7 @@ impl Store {
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<crate::tx_table::SpenderSlot>>, StoreError> {
         self.txs.get_spender_meta_at_abs_batch(abs_offs)
     }
 
@@ -1054,7 +1054,7 @@ impl Store {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<(Fk, u8, u32)>>, StoreError> {
+    ) -> Result<Vec<Option<crate::tx_table::SpenderSlot>>, StoreError> {
         self.txs
             .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }

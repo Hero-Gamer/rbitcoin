@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 
 const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
 const MAX_SLOTS: usize = 128;
+type SpentAbsWrite = (u64, Fk, u32, Fk, u32, [u8; META_LEN]);
 
 enum Phase {
     Reading,
@@ -344,7 +345,7 @@ fn multi_list_contains(
 struct SpentPageGroup {
     off: u64,
     len: usize,
-    writes: Vec<(u64, Fk, u32, Fk, u32, [u8; META_LEN])>,
+    writes: Vec<SpentAbsWrite>,
 }
 
 /// Page span covering the 8-byte slot at `abs` (`[lo, hi)`).
@@ -372,19 +373,13 @@ fn clip_spent_page_window(span_lo: u64, span_hi: u64, body_pub: u64) -> Option<(
 /// Same-page slots share one RMW. An 8 B slot that straddles a page boundary
 /// extends the span so the next page's writes merge (no overlapping in-flight
 /// RMWs). Adjacent pages without a straddle stay separate.
-fn group_writes_by_spent_page(
-    writes: &[(u64, Fk, u32, Fk, u32, [u8; META_LEN])],
-    body_pub: u64,
-) -> Vec<SpentPageGroup> {
+fn group_writes_by_spent_page(writes: &[SpentAbsWrite], body_pub: u64) -> Vec<SpentPageGroup> {
     let mut groups = Vec::new();
     let mut cur_lo = 0u64;
     let mut cur_hi = 0u64;
-    let mut cur: Vec<(u64, Fk, u32, Fk, u32, [u8; META_LEN])> = Vec::new();
+    let mut cur: Vec<SpentAbsWrite> = Vec::new();
 
-    let flush = |groups: &mut Vec<SpentPageGroup>,
-                 lo: u64,
-                 hi: u64,
-                 cur: Vec<(u64, Fk, u32, Fk, u32, [u8; META_LEN])>| {
+    let flush = |groups: &mut Vec<SpentPageGroup>, lo: u64, hi: u64, cur: Vec<SpentAbsWrite>| {
         if cur.is_empty() {
             return;
         }
@@ -420,11 +415,7 @@ fn group_writes_by_spent_page(
     groups
 }
 
-fn poke_spent_page(
-    buf: &mut [u8],
-    off: u64,
-    writes: &[(u64, Fk, u32, Fk, u32, [u8; META_LEN])],
-) -> Result<(), StoreError> {
+fn poke_spent_page(buf: &mut [u8], off: u64, writes: &[SpentAbsWrite]) -> Result<(), StoreError> {
     for &(abs, _, _, _, _, meta) in writes {
         let i = abs.saturating_sub(off) as usize;
         if i.saturating_add(META_LEN) > buf.len() {
@@ -437,10 +428,7 @@ fn poke_spent_page(
     Ok(())
 }
 
-fn cold_group_edges(
-    cold: &mut Vec<(Fk, u32, Fk, u32)>,
-    writes: &[(u64, Fk, u32, Fk, u32, [u8; META_LEN])],
-) {
+fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk, u32)>, writes: &[SpentAbsWrite]) {
     for &(_, cfk, vout, sfk, vin, _) in writes {
         cold.push((cfk, vout, sfk, vin));
     }
@@ -474,7 +462,7 @@ pub fn put_spend_batch_by_abs_meta_known(
 
     let body_pub = txs.spent.body_published_len();
     let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
-    let mut writes: Vec<(u64, Fk, u32, Fk, u32, [u8; META_LEN])> = Vec::with_capacity(order.len());
+    let mut writes: Vec<SpentAbsWrite> = Vec::with_capacity(order.len());
 
     for &i in &order {
         let (abs, cfk, vout, sfk, vin) = abs_edges[i];
@@ -506,7 +494,7 @@ pub fn put_spend_batch_by_abs_meta_known(
 /// libc page-RMW (pread + pwrite, no ring) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_pwrite(
     txs: &TxTable,
-    writes: &[(u64, Fk, u32, Fk, u32, [u8; META_LEN])],
+    writes: &[SpentAbsWrite],
     mut cold: Vec<(Fk, u32, Fk, u32)>,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     let body_pub = txs.spent.body_published_len();
@@ -532,7 +520,7 @@ fn put_spend_batch_pure_write_pwrite(
 /// io_uring page-RMW (pread page → poke → pwrite page) for prepared 8-byte metas.
 fn put_spend_batch_pure_write_uring(
     txs: &TxTable,
-    writes: &[(u64, Fk, u32, Fk, u32, [u8; META_LEN])],
+    writes: &[SpentAbsWrite],
     cold: Vec<(Fk, u32, Fk, u32)>,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if writes.is_empty() {
