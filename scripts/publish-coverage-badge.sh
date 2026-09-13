@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Push coverage/badge.json to the orphan-style `badges` branch as coverage.json.
+# Last green master coverage job wins. Does not touch master.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="${1:-$ROOT/coverage/badge.json}"
+REPO="${GITHUB_REPOSITORY:-reardencode/rbitcoin}"
+BRANCH="badges"
+
+if [[ "${BADGE_DRY_RUN:-}" == "1" ]]; then
+  echo "publish-coverage-badge: $SRC -> $REPO $BRANCH/coverage.json"
+  exit 0
+fi
+
+if [[ ! -f "$SRC" ]]; then
+  echo "publish-coverage-badge: skip (missing $SRC)"
+  exit 0
+fi
+
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "publish-coverage-badge: skip (no GITHUB_TOKEN)"
+  exit 0
+fi
+
+if [[ "${PUBLISH_COVERAGE_BADGE:-}" != "1" ]]; then
+  echo "publish-coverage-badge: skip (PUBLISH_COVERAGE_BADGE!=1)"
+  exit 0
+fi
+
+work="$(mktemp -d)"
+cleanup() { rm -rf "$work"; }
+trap cleanup EXIT
+
+url="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+if git clone --depth 1 --branch "$BRANCH" "$url" "$work" 2>/dev/null; then
+  :
+elif git ls-remote --exit-code "$url" "refs/heads/${BRANCH}" >/dev/null 2>&1; then
+  echo "publish-coverage-badge: clone failed but ${BRANCH} exists" >&2
+  exit 1
+else
+  git init --initial-branch="$BRANCH" "$work"
+  git -C "$work" remote add origin "$url"
+fi
+
+cp "$SRC" "$work/coverage.json"
+git -C "$work" add coverage.json
+if git -C "$work" diff --cached --quiet; then
+  echo "publish-coverage-badge: unchanged"
+  exit 0
+fi
+
+msg="$(python3 -c "import json; print(json.load(open('$SRC'))['message'])")"
+sha="${GITHUB_SHA:-unknown}"
+git -C "$work" \
+  -c user.name="github-actions[bot]" \
+  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+  commit -m "coverage: ${msg} (${sha:0:12})"
+git -C "$work" push origin "HEAD:${BRANCH}"
+echo "publish-coverage-badge: pushed ${msg} to ${BRANCH}"

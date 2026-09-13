@@ -161,9 +161,18 @@ async fn two_node_header_and_block_sync() {
         seed.shutdown().await;
         peer.shutdown().await;
     };
-    tokio::time::timeout(Duration::from_secs(60), fut)
+    let wall = two_node_wall();
+    tokio::time::timeout(wall, fut)
         .await
-        .expect("two_node_header_and_block_sync wall timeout (60s)");
+        .unwrap_or_else(|_| panic!("two_node_header_and_block_sync wall timeout ({wall:?})"));
+}
+
+fn two_node_wall() -> Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(60)
+    }
 }
 
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,

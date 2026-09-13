@@ -111,6 +111,8 @@ jobs:
         run: ./scripts/core-functional/fetch-bitcoind.test.sh
       - name: miri-run self-test
         run: ./scripts/miri.test.sh
+      - name: coverage self-test
+        run: ./scripts/coverage.test.sh
       - name: coverage-crap self-test
         run: ./scripts/coverage-crap.test.sh
       - name: release self-test
@@ -209,11 +211,13 @@ jobs:
             serve_after_restart_via_reconstruct -- --ignored --nocapture
           cargo test -p rbitcoin-test --test integration_multinode \
             ibd_skips_dead_peer -- --ignored --nocapture
-  # Line-coverage gate (≥90% first-party LCOV LH/LF). Slow; waits for the
+  # Line-coverage gate (≥90% production-file LCOV LH/LF). Slow; waits for the
   # fast gates so a red fmt/clippy/test does not start this job. Required.
   coverage:
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
+    permissions:
+      contents: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && 'write' || 'read' }}
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
       CARGO_TARGET_DIR: target/cov
@@ -233,3 +237,9 @@ jobs:
           tool: cargo-llvm-cov@0.6.14,cargo-crap@0.4.3
       - name: coverage (line gate)
         run: ./scripts/coverage.sh
+      - name: publish coverage badge
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_COVERAGE_BADGE: "1"
+        run: ./scripts/publish-coverage-badge.sh
