@@ -3,8 +3,9 @@
 //! **Tier A (default + CI `multinode` job):** single-hop IBD (8 blocks), cold
 //! reconstruct serve (10 blocks). Hard wall timeouts; hang-free on CI-class hosts.
 //! **Tier B (default suite):** handshake timeout / GetAddr / keepalive ping,
-//! HB compact tip-follow, mempool orphan child GetData of parent, hub reorg
-//! (including leftover/BadPrev orphan that must not blacklist).
+//! HB compact tip-follow, compact `getblocktxn` for a missing extra tx,
+//! mempool orphan child GetData of parent, hub reorg (including leftover/BadPrev
+//! orphan that must not blacklist).
 //! **Tier C (`#[ignore]`):** multi-hop, tip-follow, 48-block dual seeder, mesh —
 //! `scripts/integration.sh` or `-- --ignored` only.
 
@@ -457,6 +458,99 @@ async fn p2p_orphan_child_getdatas_parent() {
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
         .expect("p2p_orphan_child_getdatas_parent wall timeout (20s)");
+}
+
+/// Compact of a 2-tx tip: coinbase prefilled, extra tx absent from mempool → getblocktxn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_compact_getblocktxn_missing_extra_tx() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::Amount;
+    use rbitcoin_test::mine::spend_anyone_can_spend;
+
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let peer_dir = TempDir::new().unwrap();
+        let seed = start_node(&seed_dir).await;
+        let mut peer = start_node(&peer_dir).await;
+        attach_relay_mempool(&peer, &peer_dir);
+        tokio::time::timeout(Duration::from_secs(5), peer.follow_from(seed.local_addr))
+            .await
+            .expect("follow_from handshake")
+            .expect("follow");
+        assert!(
+            peer.follow_live_count() >= 1,
+            "outbound follow must stay live"
+        );
+
+        let extra = spend_anyone_can_spend(
+            bitcoin::Txid::from_byte_array([0x33; 32]),
+            0,
+            Amount::from_sat(1000),
+        );
+        let tip = seed.hub.tip_hash().expect("genesis");
+        let tip_time = seed.hub.tip_header().expect("genesis header").time;
+        let block = mine_regtest_block(tip, tip_time + 600, 1, vec![extra]);
+        assert_eq!(block.txdata.len(), 2, "coinbase + extra");
+        let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).expect("compact hsi");
+        assert_eq!(
+            hsi.short_ids.len(),
+            1,
+            "coinbase prefilled; extra is a short-id"
+        );
+
+        let writer_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let queued = seed.peers.live_peers().into_iter().any(|p| {
+                p.inbound
+                    && p.handshake_complete()
+                    && p.queue_msg(NetworkMessage::CmpctBlock(CmpctBlock {
+                        compact_block: hsi.clone(),
+                    }))
+            });
+            if queued {
+                break;
+            }
+            if tokio::time::Instant::now() >= writer_deadline {
+                panic!(
+                    "seed inbound writer must take cmpctblock (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let getblocktxn = seed
+                .peers
+                .snapshot()
+                .into_iter()
+                .find(|p| p.inbound)
+                .map(|p| p.bytesrecv_per_msg.get("getblocktxn").copied().unwrap_or(0))
+                .unwrap_or(0);
+            if getblocktxn > 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "follower must GetBlockTxn the missing extra tx \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        seed.shutdown().await;
+        peer.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_compact_getblocktxn_missing_extra_tx wall timeout (20s)");
 }
 
 /// Phase 4: seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct
