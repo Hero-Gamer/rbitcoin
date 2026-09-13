@@ -28,41 +28,6 @@ fn connect_genesis(q: &Query, params: &ChainParams) {
 // ─── Header rules ───────────────────────────────────────────────────────────
 
 #[test]
-fn h1_rejects_wrong_genesis_hash() {
-    let (_td, q, params) = regtest_q();
-    let mut g = regtest_genesis();
-    g.header.nonce = g.header.nonce.wrapping_add(1);
-    // Even if PoW happens to pass regtest, genesis hash check fires first for h=0.
-    let err = validate_header(&q, &params, Height::GENESIS, &g.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadHeader(s) if s.contains("genesis")),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn h2_rejects_bad_prev_link() {
-    let (_td, q, params) = regtest_q();
-    connect_genesis(&q, &params);
-    let g = regtest_genesis();
-    let mut b1 = mine_regtest_block(g.block_hash(), g.header.time + 1, 1, vec![]);
-    b1.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
-    // Re-mine nonce after prev change (PoW may fail first; BadPrev is the link check).
-    let target = bitcoin::Target::from_compact(b1.header.bits);
-    for nonce in 0..100_000u32 {
-        b1.header.nonce = nonce;
-        if b1.header.validate_pow(target).is_ok() {
-            break;
-        }
-    }
-    let err = validate_header(&q, &params, Height(1), &b1.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadPrev),
-        "expected BadPrev, got {err:?}"
-    );
-}
-
-#[test]
 fn h4_rejects_checkpoint_mismatch() {
     let (_td, q, mut params) = regtest_q();
     connect_genesis(&q, &params);
@@ -76,28 +41,6 @@ fn h4_rejects_checkpoint_mismatch() {
     let err = validate_header(&q, &params, Height(1), &b1.header).unwrap_err();
     assert!(
         matches!(err, ConsensusError::BadHeader(s) if s.contains("checkpoint")),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn h5_regtest_rejects_wrong_bits() {
-    let (_td, q, params) = regtest_q();
-    connect_genesis(&q, &params);
-    let g = regtest_genesis();
-    let mut b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
-    // Corrupt bits (regtest has no retarget — must equal prev).
-    b1.header.bits = CompactTarget::from_consensus(0x207f_fffe);
-    let target = bitcoin::Target::from_compact(b1.header.bits);
-    for nonce in 0..100_000u32 {
-        b1.header.nonce = nonce;
-        if b1.header.validate_pow(target).is_ok() {
-            break;
-        }
-    }
-    let err = validate_header(&q, &params, Height(1), &b1.header).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadHeader(s) if s.contains("bits") || s.contains("proof")),
         "{err:?}"
     );
 }
@@ -192,7 +135,29 @@ fn header_and_spending_boundaries() {
 
     let (_td, q, params) = regtest_q();
     let g = regtest_genesis();
+    let mut bad_g = g.clone();
+    bad_g.header.nonce = g.header.nonce.wrapping_add(1);
+    let err = validate_header(&q, &params, Height::GENESIS, &bad_g.header).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadHeader(s) if s.contains("genesis")),
+        "h1: {err:?}"
+    );
     accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
+
+    let mut bad_prev = mine_regtest_block(g.block_hash(), g.header.time + 1, 1, vec![]);
+    bad_prev.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
+    grind_pow(&mut bad_prev);
+    let err = validate_header(&q, &params, Height(1), &bad_prev.header).unwrap_err();
+    assert!(matches!(err, ConsensusError::BadPrev), "h2: {err:?}");
+
+    let mut bad_bits = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    bad_bits.header.bits = CompactTarget::from_consensus(0x207f_fffe);
+    grind_pow(&mut bad_bits);
+    let err = validate_header(&q, &params, Height(1), &bad_bits.header).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadHeader(s) if s.contains("bits") || s.contains("proof")),
+        "h5: {err:?}"
+    );
 
     let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
     validate_header(&q, &params, Height(1), &b1.header).expect("valid parent, pow, bits");

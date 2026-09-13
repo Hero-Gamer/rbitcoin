@@ -224,7 +224,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `consensus_mature_chain_spend_reconstruct_and_scripthash` | Consensus+query | **One** mature mine: spend, local prev_fk, double-spend, reopen reconstruct (`witness_block_bytes` == serialize), SH history/balance |
 | `ibd_parallel_archive_idempotent_confirm_without_tx_head` | Query+consensus | Out-of-order archive, re-archive idempotent, head-off prevout+maturity |
 | `resume_head_off_warms_cache_for_external_prev` | Query+consensus | Resume head-off: warm Class A cache fixes external-prev missing prevout |
-| `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md). Hornet-mapped subset: `./scripts/test-hornet-rules.sh` |
+| `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md). Combined `header_and_spending_boundaries` includes H1/H2/H5. Hornet-mapped subset: `./scripts/test-hornet-rules.sh` |
 | `core_analogs::analog_milestone_and_mempool_persist` | Consensus | Milestone skip-below/check-above, missing prevout under high milestone, mempool persist (one pad) |
 | `core_analogs::analog_reconstruct_after_lost_head` | Store+query | Wipe `tx.head/`, reopen, reconstruct height 1 and txid probe. Does **not** pin empty-head / truncated-head / v1 fuse refuse |
 | `unified_wire_pipeline_multi_block_to_tip` | Consensus+query | Class A archived ahead of tip then `confirm_wire_run` (no re-append + re-entry); then heights 2..=4 unified load/scripts/write |
