@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **IBD BQ residue:** same-process `rehydrate_block_queue_into_confirm` drops
+  at/below tip, keeps above-tip wire even if `has_block` / known-archived,
+  skips empty payloads, and marks unknown-height plus tip+1 gaps missing
+  for densify. Process restart still starts with an empty RAM queue.
+
 ### Changed
 
 - **Live P2P IBD in default CI:** hop serve, dual live seeders (8-block),

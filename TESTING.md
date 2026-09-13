@@ -36,6 +36,7 @@ those lines from the journey first.
 Keep until a **default** journey hits the same lines: store packed / v17 /
 fuse / SH machines, empty / truncated / v1 fuse refuse, unsorted pack/lag,
 IBD wave fence / 8×8000, SH writebehind / uring CAS, leftover identity,
+RAM body-queue residue rehydrate (process restart empties the queue),
 handshake format needles, `getaddr_cache_*`, eviction ranking, feeler silence
 timeout, sole-preferred stall KEEP, `stamp_reject_names_*`,
 `multi_hop_bad_prev_*`, structure s1–s18, rate-limiter, netgroup, subsidy
@@ -288,7 +289,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |
 | `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
-| `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct |
+| `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Does **not** pin same-process RAM BQ residue (`rehydrate_block_queue_into_confirm` in `ibd/archive.rs`) |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
 | `three_node_relay_path` | P2P (**default**) | Leaf IBD-syncs from a mid node that already synced (hop serve) |
