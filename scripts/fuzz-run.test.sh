@@ -150,6 +150,8 @@ assert_ok "asmap fuzz target exists" \
   test -f "$ROOT/fuzz/fuzz_targets/asmap.rs"
 assert_ok "asmap two-prefix-plus-ip seed" \
   test -s "$ROOT/crates/rbitcoin-net/tests/fixtures/asmap_two_prefix_plus_ip.bin"
+assert_ok "asmap listed in fuzz.yml matrix" \
+  grep -q '{ bin: asmap, core: false }' "$ROOT/.github/workflows/fuzz.yml"
 
 t6="$(FUZZ_WEEKDAY=6 "$RUN" --default-time)"
 assert_ok "FUZZ_WEEKDAY=6 is 600" \
