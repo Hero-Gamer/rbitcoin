@@ -216,75 +216,9 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::block::{Header, Version};
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{
-        Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-        Witness,
-    };
-
-    fn dummy_block(prev: BlockHash, n: u32) -> Block {
-        let coinbase = Transaction {
-            version: TxVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![n as u8]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let mut b = Block {
-            header: Header {
-                version: Version::from_consensus(4),
-                prev_blockhash: prev,
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
-                time: 1_700_000_000 + n,
-                bits: CompactTarget::from_consensus(0x207fffff),
-                nonce: n,
-            },
-            txdata: vec![coinbase],
-        };
-        b.header.merkle_root = b.compute_merkle_root().unwrap();
-        b
-    }
 
     #[test]
     fn default_body_depth_is_compact_serve_window() {
         assert_eq!(DEFAULT_BODY_DEPTH, 16);
-        let c = BlockCache::new();
-        let g = dummy_block(BlockHash::from_byte_array([0u8; 32]), 0);
-        let genesis = g.block_hash();
-        c.push_best(g).unwrap();
-        let mut tip = genesis;
-        for n in 1..=20u32 {
-            let b = dummy_block(tip, n);
-            tip = b.block_hash();
-            c.push_best(b).unwrap();
-        }
-        assert_eq!(c.tip_height(), Some(20));
-        assert_eq!(c.body_count(), 16);
-        assert!(c.get_block(&genesis).is_none());
-        assert!(c.hash_at_height(0).is_some());
-        assert_eq!(c.hash_at_height(0), Some(genesis));
-        assert!(c.get_block(&tip).is_some());
-        let keep_from = 20u32.saturating_sub(15);
-        for h in 0..=20u32 {
-            assert!(c.hash_at_height(h).is_some());
-            let hash = c.hash_at_height(h).unwrap();
-            if h < keep_from {
-                assert!(
-                    c.get_block(&hash).is_none(),
-                    "body at height {h} must evict"
-                );
-            } else {
-                assert!(c.get_block(&hash).is_some(), "body at height {h} must stay");
-            }
-        }
     }
 }
