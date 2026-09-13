@@ -2,12 +2,14 @@
 //!
 //! Checkpoints in `create.off` (RAM). Loc and overflow stay FdOnly.
 
+use crate::bulk_io::ReadOp;
 use crate::delta_loc::{
     create_table_file, decode_create_pair, load_create_ovf, loc_file_off, loc_window, loc_within,
     open_table_file, pack_create_pair, strides_from_aligned_len, IDX_STRIDE, LOC_WINDOW,
 };
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::IoCtx;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +18,15 @@ use std::sync::RwLock;
 const SLOT: u64 = 2;
 const OFF_SLOT: u64 = 16;
 const OVF_SLOT: u64 = 12;
+
+/// Slots to read and prefix-sum in `[win_first, win_last]` for the highest needed fk.
+#[inline]
+pub(crate) fn loc_window_need_n(max_id: u64, win_first: u64, win_last: u64) -> usize {
+    if max_id < win_first || win_last < win_first {
+        return 0;
+    }
+    (max_id.min(win_last) - win_first + 1) as usize
+}
 
 /// One create's txout range, spent range, and true output count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +229,15 @@ impl CreateLoc {
     }
 
     pub fn range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<CreateLocPair>>, StoreError> {
+        self.range_batch_ctx(fks, &mut IoCtx::none())
+    }
+
+    /// Same as [`Self::range_batch`] on a held completion session (head-resolve TLS).
+    pub(crate) fn range_batch_ctx(
+        &self,
+        fks: &[Fk],
+        ctx: &mut IoCtx<'_>,
+    ) -> Result<Vec<Option<CreateLocPair>>, StoreError> {
         if fks.is_empty() {
             return Ok(Vec::new());
         }
@@ -235,6 +255,7 @@ impl CreateLoc {
             return Ok(out);
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
+        let mut windows: Vec<LocWinRead> = Vec::new();
         let mut w_i = 0usize;
         while w_i < jobs.len() {
             let w = loc_window(jobs[w_i].1);
@@ -244,7 +265,12 @@ impl CreateLoc {
             }
             let win_first = w * LOC_WINDOW + 1;
             let win_last = ((w + 1) * LOC_WINDOW).min(count);
-            let n = (win_last - win_first + 1) as usize;
+            let max_id = jobs[w_j - 1].1;
+            let n = loc_window_need_n(max_id, win_first, win_last);
+            if n == 0 {
+                w_i = w_j;
+                continue;
+            }
             let (tx0, sp0) = {
                 let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
                 if w == 0 {
@@ -254,43 +280,21 @@ impl CreateLoc {
                         .ok_or(StoreError::Corrupt("invariant: create.off checkpoint"))?
                 }
             };
-            let mut buf = vec![0u8; n * 2];
-            self.loc.read_at(loc_file_off(win_first, SLOT), &mut buf)?;
-            let mut tx_ps = vec![0u64; n + 1];
-            let mut sp_ps = vec![0u64; n + 1];
-            let mut n_outs = vec![0u32; n];
-            tx_ps[0] = tx0;
-            sp_ps[0] = sp0;
-            let mut any_sentinel = false;
-            for i in 0..n {
-                if buf[i * 2] == 0 || buf[i * 2 + 1] == 0 {
-                    any_sentinel = true;
-                    break;
-                }
-            }
-            if any_sentinel {
-                let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                for i in 0..n {
-                    let fk = win_first + i as u64;
-                    let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, &ovf)?;
-                    n_outs[i] = n_out;
-                    tx_ps[i + 1] =
-                        tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
-                    sp_ps[i + 1] =
-                        sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
-                }
-            } else {
-                for i in 0..n {
-                    let st = u32::from(buf[i * 2]);
-                    let n_out = u32::from(buf[i * 2 + 1]);
-                    n_outs[i] = n_out;
-                    tx_ps[i + 1] =
-                        tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
-                    sp_ps[i + 1] =
-                        sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
-                }
-            }
-            for &(orig, id) in &jobs[w_i..w_j] {
+            windows.push(LocWinRead {
+                job_lo: w_i,
+                job_hi: w_j,
+                win_first,
+                n,
+                tx0,
+                sp0,
+                buf: vec![0u8; n * 2],
+            });
+            w_i = w_j;
+        }
+        self.pread_windows(ctx, &mut windows)?;
+        for win in &windows {
+            let (tx_ps, sp_ps, n_outs) = self.prefix_sum_win(win)?;
+            for &(orig, id) in &jobs[win.job_lo..win.job_hi] {
                 let within = loc_within(id);
                 out[orig] = Some(CreateLocPair {
                     txout: (tx_ps[within], tx_ps[within + 1] - tx_ps[within]),
@@ -298,10 +302,292 @@ impl CreateLoc {
                     n_out: n_outs[within],
                 });
             }
-            w_i = w_j;
         }
         Ok(out)
     }
+
+    fn prefix_sum_win(&self, win: &LocWinRead) -> Result<LocPrefix, StoreError> {
+        let mut any_sentinel = false;
+        for i in 0..win.n {
+            if win.buf[i * 2] == 0 || win.buf[i * 2 + 1] == 0 {
+                any_sentinel = true;
+                break;
+            }
+        }
+        if any_sentinel {
+            let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
+            prefix_sum_create_ovf(&win.buf, win.n, win.tx0, win.sp0, win.win_first, &ovf)
+        } else {
+            Ok(prefix_sum_create_no_ovf(&win.buf, win.n, win.tx0, win.sp0))
+        }
+    }
+
+    fn pread_windows(
+        &self,
+        ctx: &mut IoCtx<'_>,
+        windows: &mut [LocWinRead],
+    ) -> Result<(), StoreError> {
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let fd = self.loc.read_fd();
+        let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(windows.len());
+        for w in windows.iter_mut() {
+            let off = loc_file_off(w.win_first, SLOT);
+            let ptr = w.buf.as_mut_ptr();
+            let len = w.buf.len();
+            // SAFETY: each window owns a distinct `buf` until this function returns.
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            ops.push(ReadOp {
+                fd,
+                offset: off,
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        let held = ctx.session().is_some();
+        if held {
+            match crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops) {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(ops);
+                    for w in windows.iter_mut() {
+                        self.loc
+                            .pread_at(loc_file_off(w.win_first, SLOT), &mut w.buf)?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            crate::bulk_io::pread_batch(&mut ops);
+        }
+        let mut shorts = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            if op.result < 0 || (op.result as usize) != windows[i].buf.len() {
+                shorts.push(i);
+            }
+        }
+        drop(ops);
+        for i in shorts {
+            self.loc.pread_at(
+                loc_file_off(windows[i].win_first, SLOT),
+                &mut windows[i].buf,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct LocWinRead {
+    job_lo: usize,
+    job_hi: usize,
+    win_first: u64,
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    buf: Vec<u8>,
+}
+
+type LocPrefix = (Vec<u64>, Vec<u64>, Vec<u32>);
+
+fn prefix_sum_create_ovf(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    win_first: u64,
+    ovf: &[(u64, u32, u32)],
+) -> Result<LocPrefix, StoreError> {
+    let mut tx_ps = vec![0u64; n + 1];
+    let mut sp_ps = vec![0u64; n + 1];
+    let mut n_outs = vec![0u32; n];
+    tx_ps[0] = tx0;
+    sp_ps[0] = sp0;
+    for i in 0..n {
+        let fk = win_first + i as u64;
+        let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, ovf)?;
+        n_outs[i] = n_out;
+        tx_ps[i + 1] = tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
+        sp_ps[i + 1] = sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
+    }
+    Ok((tx_ps, sp_ps, n_outs))
+}
+
+/// Non-overflow window: SIMD prefix when the arch provides it, else scalar.
+pub(crate) fn prefix_sum_create_no_ovf(buf: &[u8], n: usize, tx0: u64, sp0: u64) -> LocPrefix {
+    let mut tx_ps = vec![0u64; n + 1];
+    let mut sp_ps = vec![0u64; n + 1];
+    let mut n_outs = vec![0u32; n];
+    prefix_sum_create_no_ovf_into(buf, n, tx0, sp0, &mut tx_ps, &mut sp_ps, &mut n_outs);
+    (tx_ps, sp_ps, n_outs)
+}
+
+/// Independent scalar prefix: test golden, and the production path off x86_64/aarch64.
+/// Test binaries on those arches still run [`prefix_sum_create_no_ovf`] through SIMD.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub(crate) fn prefix_sum_create_no_ovf_scalar(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+) -> LocPrefix {
+    let mut tx_ps = vec![0u64; n + 1];
+    let mut sp_ps = vec![0u64; n + 1];
+    let mut n_outs = vec![0u32; n];
+    prefix_sum_create_no_ovf_scalar_into(buf, n, tx0, sp0, &mut tx_ps, &mut sp_ps, &mut n_outs);
+    (tx_ps, sp_ps, n_outs)
+}
+
+fn prefix_sum_create_no_ovf_into(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    tx_ps: &mut [u64],
+    sp_ps: &mut [u64],
+    n_outs: &mut [u32],
+) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    prefix_sum_create_u8x8(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    prefix_sum_create_no_ovf_scalar_into(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
+}
+
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn prefix_sum_create_no_ovf_scalar_into(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    tx_ps: &mut [u64],
+    sp_ps: &mut [u64],
+    n_outs: &mut [u32],
+) {
+    tx_ps[0] = tx0;
+    sp_ps[0] = sp0;
+    for i in 0..n {
+        let st = u32::from(buf[i * 2]);
+        let n_out = u32::from(buf[i * 2 + 1]);
+        n_outs[i] = n_out;
+        tx_ps[i + 1] = tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
+        sp_ps[i + 1] = sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn prefix_sum_create_u8x8(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    tx_ps: &mut [u64],
+    sp_ps: &mut [u64],
+    n_outs: &mut [u32],
+) {
+    tx_ps[0] = tx0;
+    sp_ps[0] = sp0;
+    let mut i = 0usize;
+    let mut tx = tx0;
+    let mut sp = sp0;
+    while i + 8 <= n {
+        let mut st = [0u8; 8];
+        let mut no = [0u8; 8];
+        let base = i * 2;
+        for k in 0..8 {
+            st[k] = buf[base + k * 2];
+            no[k] = buf[base + k * 2 + 1];
+            n_outs[i + k] = u32::from(no[k]);
+        }
+        // SAFETY: `st`/`no` are 8-byte stack arrays; SSE2 movq / NEON vld1
+        // 8-byte loads are defined unaligned.
+        #[cfg(target_arch = "x86_64")]
+        let (tx_inc, sp_inc) = unsafe {
+            (
+                sse2_u8x8_times_8_inclusive(st.as_ptr()),
+                sse2_u8x8_times_8_inclusive(no.as_ptr()),
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (tx_inc, sp_inc) = unsafe {
+            (
+                neon_u8x8_times_8_inclusive(st.as_ptr()),
+                neon_u8x8_times_8_inclusive(no.as_ptr()),
+            )
+        };
+        let tx_start = tx;
+        let sp_start = sp;
+        for k in 0..8 {
+            tx_ps[i + k + 1] = tx_start.saturating_add(u64::from(tx_inc[k]));
+            sp_ps[i + k + 1] = sp_start.saturating_add(u64::from(sp_inc[k]));
+        }
+        tx = tx_ps[i + 8];
+        sp = sp_ps[i + 8];
+        i += 8;
+    }
+    for j in i..n {
+        let st = u32::from(buf[j * 2]);
+        let n_out = u32::from(buf[j * 2 + 1]);
+        n_outs[j] = n_out;
+        tx = tx.saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
+        sp = sp.saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
+        tx_ps[j + 1] = tx;
+        sp_ps[j + 1] = sp;
+    }
+}
+
+/// Inclusive scan of eight `u8 << 3` values (fits u32 for a 1024-create window).
+///
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sse2_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_cvtepu8_epi32, _mm_extract_epi32, _mm_loadl_epi64,
+        _mm_set1_epi32, _mm_slli_epi32, _mm_slli_si128, _mm_srli_si128, _mm_storeu_si128,
+    };
+    let prefix4 = |v: __m128i| {
+        let s = _mm_add_epi32(v, _mm_slli_si128(v, 4));
+        _mm_add_epi32(s, _mm_slli_si128(s, 8))
+    };
+    let v = _mm_loadl_epi64(p as *const __m128i);
+    let lo = prefix4(_mm_slli_epi32(_mm_cvtepu8_epi32(v), 3));
+    let hi = prefix4(_mm_slli_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(v, 4)), 3));
+    let lo_sum = _mm_extract_epi32(lo, 3);
+    let hi = _mm_add_epi32(hi, _mm_set1_epi32(lo_sum));
+    let mut out = [0u32; 8];
+    _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, lo);
+    _mm_storeu_si128(out.as_mut_ptr().add(4) as *mut __m128i, hi);
+    out
+}
+
+/// Inclusive scan of eight `u8 << 3` values (fits u32 for a 1024-create window).
+///
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
+    use std::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vdupq_n_u32, vextq_u32, vget_high_u16, vget_low_u16, vgetq_lane_u32,
+        vld1_u8, vmovl_u16, vmovl_u8, vshlq_n_u32, vst1q_u32,
+    };
+    let prefix4 = |v: uint32x4_t| {
+        let z = vdupq_n_u32(0);
+        let s = vaddq_u32(v, vextq_u32(z, v, 3));
+        vaddq_u32(s, vextq_u32(z, s, 2))
+    };
+    let v = vld1_u8(p);
+    let v16 = vmovl_u8(v);
+    let lo = prefix4(vshlq_n_u32(vmovl_u16(vget_low_u16(v16)), 3));
+    let hi = prefix4(vshlq_n_u32(vmovl_u16(vget_high_u16(v16)), 3));
+    let hi = vaddq_u32(hi, vdupq_n_u32(vgetq_lane_u32(lo, 3)));
+    let mut out = [0u32; 8];
+    vst1q_u32(out.as_mut_ptr(), lo);
+    vst1q_u32(out.as_mut_ptr().add(4), hi);
+    out
 }
 
 #[cfg(test)]
@@ -484,5 +770,81 @@ mod tests {
         assert_eq!(IDX_STRIDE, 8);
         assert_eq!(3u64.saturating_mul(IDX_STRIDE), 24);
         assert_eq!(256u64.saturating_mul(IDX_STRIDE), 2048);
+    }
+
+    #[test]
+    fn loc_window_need_n_stops_at_max_id() {
+        assert_eq!(loc_window_need_n(3, 1, 1024), 3);
+        assert_eq!(loc_window_need_n(1024, 1, 1024), 1024);
+        assert_eq!(loc_window_need_n(1025, 1025, 2048), 1);
+        assert_eq!(loc_window_need_n(1100, 1025, 2048), 76);
+        assert_eq!(loc_window_need_n(1, 1025, 2048), 0);
+    }
+
+    #[test]
+    fn prefix_sum_fast_matches_scalar() {
+        let mut buf = Vec::new();
+        for i in 0..1024 {
+            buf.push(((i % 254) + 1) as u8);
+            buf.push(((i % 200) + 1) as u8);
+        }
+        let fat = vec![255u8; 1024 * 2];
+        for n in [1usize, 7, 8, 9, 16, 63, 64, 1024] {
+            assert_eq!(
+                prefix_sum_create_no_ovf(&buf, n, 64, 80),
+                prefix_sum_create_no_ovf_scalar(&buf, n, 64, 80),
+                "n={n}"
+            );
+            assert_eq!(
+                prefix_sum_create_no_ovf(&fat, n, 0, 64),
+                prefix_sum_create_no_ovf_scalar(&fat, n, 0, 64),
+                "fat n={n}"
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn prefix_sum_u8x8_scan_matches_scalar() {
+        let p = [255u8, 1, 0, 8, 255, 9, 2, 3];
+        let mut expect = [0u32; 8];
+        let mut acc = 0u32;
+        for (i, b) in p.iter().enumerate() {
+            acc += u32::from(*b) << 3;
+            expect[i] = acc;
+        }
+        let got = unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                sse2_u8x8_times_8_inclusive(p.as_ptr())
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                neon_u8x8_times_8_inclusive(p.as_ptr())
+            }
+        };
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn range_batch_multi_window_matches_serial_and_held() {
+        let dir = TempDir::labeled("create-loc-batch-win").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&vec![1u32; 2000], &vec![8u64; 2000]))
+            .unwrap();
+        let fks = [Fk(3), Fk(50), Fk(1024), Fk(1025), Fk(2000), Fk::NULL];
+        let batch = loc.range_batch(&fks).unwrap();
+        for (i, fk) in fks.iter().enumerate() {
+            let one = loc.range_batch(&[*fk]).unwrap();
+            assert_eq!(batch[i], one[0], "fk={}", fk.0);
+        }
+        if let Ok(mut sess) =
+            crate::uring_session::UringSession::try_open(crate::uring_session::DEFAULT_ENTRIES)
+        {
+            let held = loc
+                .range_batch_ctx(&fks, &mut crate::IoCtx::held(&mut sess))
+                .unwrap();
+            assert_eq!(held, batch);
+        }
     }
 }
