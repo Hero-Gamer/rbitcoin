@@ -4,7 +4,8 @@
 //! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
 //! fill, product `run_p2p --connect`. Hard wall timeouts; hang-free on
 //! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
-//! live in the same binary.
+//! live in the same binary. Live `P2PNode` tests serialize on `live_p2p_lock`
+//! (process-wide script pool); hub-only reorgs do not.
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -127,10 +128,28 @@ async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
         .expect("ibd sync")
 }
 
+fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        Duration::from_secs(llvm_secs)
+    } else {
+        Duration::from_secs(default_secs)
+    }
+}
+
+/// One live `P2PNode` topology at a time: process-wide `rbtc-scripts` steal
+/// plus confirm OS threads (overlapping abort under llvm-cov heap-corrupts).
+async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default suite).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -164,14 +183,6 @@ async fn two_node_header_and_block_sync() {
         .unwrap_or_else(|_| panic!("two_node_header_and_block_sync wall timeout ({wall:?})"));
 }
 
-fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(llvm_secs)
-    } else {
-        Duration::from_secs(default_secs)
-    }
-}
-
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,
 /// obsolete VERSION / pre-verack ping disconnect, full-relay GetAddr cache
 /// (1000 / 23%), AddrFetch GetAddr (no getheaders), one post-verack keepalive
@@ -184,6 +195,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use tokio::io::AsyncWriteExt;
 
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
         let dummy_dir = TempDir::new().unwrap();
@@ -557,6 +569,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
         let seed = start_padded(&seed_dir).await;
@@ -790,6 +803,7 @@ async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
 
     let fut = async {
+        let _live = live_p2p_lock().await;
         rbitcoin_log::capture_logs(true);
         let seed_dir = TempDir::new().unwrap();
         let dummy_dir = TempDir::new().unwrap();
@@ -846,6 +860,7 @@ async fn p2p_feeler_completes_and_closes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_inbound_full_rejects_extra() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
@@ -922,6 +937,7 @@ async fn p2p_inbound_full_rejects_extra() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_after_restart_via_reconstruct() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -985,6 +1001,7 @@ async fn serve_after_restart_via_reconstruct() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_relay_path() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let d0 = TempDir::new().unwrap();
         let d1 = TempDir::new().unwrap();
         let d2 = TempDir::new().unwrap();
@@ -1017,6 +1034,7 @@ async fn three_node_relay_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ibd_two_peers() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let mid_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -1054,6 +1072,7 @@ async fn ibd_two_peers() {
 /// Multi-peer IBD: dead address + live seeder (dial book tries both). Slim (4 blocks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ibd_skips_dead_peer() {
+    let _live = live_p2p_lock().await;
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
 
@@ -1077,6 +1096,7 @@ async fn ibd_skips_dead_peer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -1125,6 +1145,7 @@ async fn tip_follow_after_ibd() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_getheaders_catches_missed_blocks() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -1491,6 +1512,7 @@ fn reorg_same_height_then_multi_block_branch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
     let fut = async {
+        let _live = live_p2p_lock().await;
         use rbitcoin_node::{run_p2p, NodeConfig};
         use rbitcoin_primitives::Network;
 

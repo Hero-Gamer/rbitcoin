@@ -62,6 +62,10 @@ before 1.0).
 
 ### Fixed
 
+- **Coverage `integration_multinode` SIGABRT:** live `P2PNode` tests serialize
+  on a process mutex so overlapping `shutdown` abort cannot smash the shared
+  `rbtc-scripts` pool under llvm-cov.
+
 - **`open_seals_unsealed_nontail_after_copied_roll`:** crash-copy skips
   ENOENT / `.tmp` so a live seal worker unlinking the OA cannot fail the
   snapshot. Live table drops before cleanup.
