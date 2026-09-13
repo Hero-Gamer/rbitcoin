@@ -331,9 +331,9 @@ impl VarTable {
             starts.push(cursor);
             let before = body_blob.len();
             encode(i, &mut body_blob);
-            // Idx starts must be strictly monotone. Zero-length payloads (empty
-            // inwit / zero-out spent) get an 8-byte zero pad so the next start
-            // advances one stride. Decode treats trailing zeros as pad.
+            // Loc strides must be strictly monotone. Zero-length payloads (empty
+            // inwit) get an 8-byte zero pad so the next start advances one stride.
+            // Decode treats trailing zeros as pad. Spent `n_out ≥ 1` is 8×n.
             if body_blob.len() == before {
                 body_blob.resize(body_blob.len().saturating_add(8), 0);
             }

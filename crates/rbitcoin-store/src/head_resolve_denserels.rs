@@ -591,7 +591,7 @@ fn record_chosen_idx_ranges(
                     crate::uring_session::UringInvariant::IdxRangeMissing,
                 );
                 return Err(StoreError::Corrupt(
-                    "invariant: idx range missing after identity",
+                    "invariant: loc range missing after identity",
                 ));
             }
         }
@@ -740,7 +740,7 @@ mod tests {
             &[1],
             &mut age,
         ) {
-            Err(StoreError::Corrupt("invariant: idx range missing after identity")) => {}
+            Err(StoreError::Corrupt("invariant: loc range missing after identity")) => {}
             other => panic!("expected idx-range Corrupt, got {other:?}"),
         }
         assert!(winner[0].is_none());

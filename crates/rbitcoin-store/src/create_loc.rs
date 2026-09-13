@@ -191,18 +191,26 @@ impl CreateLoc {
             rows.extend_from_slice(&new_ovf);
         }
         if !new_offs.is_empty() {
-            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
-            let mut blob = Vec::with_capacity(new_offs.len() * OFF_SLOT as usize);
-            for &(w, txout_abs, spent_abs) in &new_offs {
-                if w as usize != cps.len() {
+            {
+                let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+                if new_offs[0].0 as usize != cps.len() {
                     return Err(StoreError::Corrupt("invariant: create.off index"));
                 }
-                cps.push((txout_abs, spent_abs));
+            }
+            let mut blob = Vec::with_capacity(new_offs.len() * OFF_SLOT as usize);
+            for &(_, txout_abs, spent_abs) in &new_offs {
                 blob.extend_from_slice(&txout_abs.to_le_bytes());
                 blob.extend_from_slice(&spent_abs.to_le_bytes());
             }
             let off_at = FILE_HEADER_LEN as u64 + new_offs[0].0 * OFF_SLOT;
             self.off.write_at(off_at, &blob)?;
+            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
+            for &(w, txout_abs, spent_abs) in &new_offs {
+                if w as usize != cps.len() {
+                    return Err(StoreError::Corrupt("invariant: create.off index"));
+                }
+                cps.push((txout_abs, spent_abs));
+            }
         }
         self.count
             .store(base + recs.len() as u64, Ordering::Release);
@@ -227,8 +235,6 @@ impl CreateLoc {
             return Ok(out);
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
-        let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
-        let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
         let mut w_i = 0usize;
         while w_i < jobs.len() {
             let w = loc_window(jobs[w_i].1);
@@ -239,14 +245,17 @@ impl CreateLoc {
             let win_first = w * LOC_WINDOW + 1;
             let win_last = ((w + 1) * LOC_WINDOW).min(count);
             let n = (win_last - win_first + 1) as usize;
+            let (tx0, sp0) = {
+                let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+                if w == 0 {
+                    (FILE_HEADER_LEN as u64, FILE_HEADER_LEN as u64)
+                } else {
+                    *cps.get((w - 1) as usize)
+                        .ok_or(StoreError::Corrupt("invariant: create.off checkpoint"))?
+                }
+            };
             let mut buf = vec![0u8; n * 2];
             self.loc.read_at(loc_file_off(win_first, SLOT), &mut buf)?;
-            let (tx0, sp0) = if w == 0 {
-                (FILE_HEADER_LEN as u64, FILE_HEADER_LEN as u64)
-            } else {
-                *cps.get((w - 1) as usize)
-                    .ok_or(StoreError::Corrupt("invariant: create.off checkpoint"))?
-            };
             let mut tx_ps = vec![0u64; n + 1];
             let mut sp_ps = vec![0u64; n + 1];
             let mut n_outs = vec![0u32; n];
@@ -260,6 +269,7 @@ impl CreateLoc {
                 }
             }
             if any_sentinel {
+                let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
                 for i in 0..n {
                     let fk = win_first + i as u64;
                     let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, &ovf)?;

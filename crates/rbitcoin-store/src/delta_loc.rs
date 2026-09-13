@@ -236,17 +236,25 @@ impl DeltaLoc {
             rows.extend_from_slice(&new_ovf);
         }
         if !new_offs.is_empty() {
-            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
+            {
+                let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+                if new_offs[0].0 as usize != cps.len() {
+                    return Err(StoreError::Corrupt("invariant: loc checkpoint index"));
+                }
+            }
             let mut blob = Vec::with_capacity(new_offs.len() * 8);
+            for &(_, abs) in &new_offs {
+                blob.extend_from_slice(&abs.to_le_bytes());
+            }
+            let off_at = FILE_HEADER_LEN as u64 + (new_offs[0].0 * 8);
+            self.off.write_at(off_at, &blob)?;
+            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             for &(w, abs) in &new_offs {
                 if w as usize != cps.len() {
                     return Err(StoreError::Corrupt("invariant: loc checkpoint index"));
                 }
                 cps.push(abs);
-                blob.extend_from_slice(&abs.to_le_bytes());
             }
-            let off_at = FILE_HEADER_LEN as u64 + (new_offs[0].0 * 8);
-            self.off.write_at(off_at, &blob)?;
         }
         self.count
             .store(base + starts.len() as u64, Ordering::Release);
@@ -271,8 +279,6 @@ impl DeltaLoc {
             return Ok(out);
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
-        let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
-        let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
         let mut w_i = 0usize;
         while w_i < jobs.len() {
             let w = loc_window(jobs[w_i].1);
@@ -283,24 +289,37 @@ impl DeltaLoc {
             let win_first = w * LOC_WINDOW + 1;
             let win_last = ((w + 1) * LOC_WINDOW).min(count);
             let n = (win_last - win_first + 1) as usize;
+            let win_start = {
+                let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+                if w == 0 {
+                    FILE_HEADER_LEN as u64
+                } else {
+                    *cps.get((w - 1) as usize)
+                        .ok_or(StoreError::Corrupt("invariant: loc checkpoint"))?
+                }
+            };
             let mut buf = vec![0u8; n * 2];
             self.loc.read_at(loc_file_off(win_first, 2), &mut buf)?;
-            let win_start = if w == 0 {
-                FILE_HEADER_LEN as u64
-            } else {
-                *cps.get((w - 1) as usize)
-                    .ok_or(StoreError::Corrupt("invariant: loc checkpoint"))?
-            };
             let mut ps = vec![0u64; n + 1];
             ps[0] = win_start;
-            for i in 0..n {
-                let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
-                let strides = if disk == 0 {
-                    ovf_lookup_strides(&ovf, win_first + i as u64, self.missing)?
-                } else {
-                    u32::from(disk)
-                };
-                ps[i + 1] = ps[i].saturating_add(u64::from(strides).saturating_mul(IDX_STRIDE));
+            let any_ovf =
+                (0..n).any(|i| u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap()) == 0);
+            if any_ovf {
+                let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
+                for i in 0..n {
+                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                    let strides = if disk == 0 {
+                        ovf_lookup_strides(&ovf, win_first + i as u64, self.missing)?
+                    } else {
+                        u32::from(disk)
+                    };
+                    ps[i + 1] = ps[i].saturating_add(u64::from(strides).saturating_mul(IDX_STRIDE));
+                }
+            } else {
+                for i in 0..n {
+                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                    ps[i + 1] = ps[i].saturating_add(u64::from(disk).saturating_mul(IDX_STRIDE));
+                }
             }
             for &(orig, id) in &jobs[w_i..w_j] {
                 let within = loc_within(id);

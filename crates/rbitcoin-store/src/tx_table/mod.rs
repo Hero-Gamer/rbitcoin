@@ -873,6 +873,57 @@ impl TxTable {
         self.create_loc.range_batch(fks)
     }
 
+    pub(crate) fn fill_txout_job_ranges(
+        &self,
+        jobs: &mut [crate::IdxBodyJob],
+    ) -> Result<(), StoreError> {
+        let mut need = Vec::new();
+        let mut slots = Vec::new();
+        for (i, j) in jobs.iter().enumerate() {
+            if j.id > 0 && (j.range.is_none() || j.n_out == 0) {
+                need.push(Fk(j.id));
+                slots.push(i);
+            }
+        }
+        if need.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.create_loc_range_batch(&need)?;
+        for (slot, p) in slots.into_iter().zip(pairs) {
+            if let Some(p) = p {
+                if jobs[slot].range.is_none() {
+                    jobs[slot].range = Some(p.txout);
+                }
+                if jobs[slot].n_out == 0 {
+                    jobs[slot].n_out = p.n_out;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fill_inwit_job_ranges(
+        &self,
+        jobs: &mut [crate::IdxBodyJob],
+    ) -> Result<(), StoreError> {
+        let mut need = Vec::new();
+        let mut slots = Vec::new();
+        for (i, j) in jobs.iter().enumerate() {
+            if j.range.is_none() && j.id > 0 {
+                need.push(Fk(j.id));
+                slots.push(i);
+            }
+        }
+        if need.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.inwit_loc.range_batch(&need)?;
+        for (slot, p) in slots.into_iter().zip(pairs) {
+            jobs[slot].range = p;
+        }
+        Ok(())
+    }
+
     /// One sequential `tx.body` pread of `[offset, offset+len)`.
     pub fn with_body_span<R>(
         &self,
@@ -1024,9 +1075,9 @@ impl TxTable {
     ///
     /// Short-circuit of the Shape A denserels machine
     /// ([`crate::head_resolve_denserels::resolve_fk_and_range_batch`]): probe →
-    /// **per-key depth-first** sidefile identity (io_uring when available) → idx
+    /// **per-key depth-first** sidefile identity (io_uring when available) → loc
     /// range on hit. **No** cross-key depth-round batching. Prep denserels-loads
-    /// via known `body_range` (skip `tx.idx`).
+    /// via known `body_range` (skip loc).
     ///
     /// BIP30: deepest matching create wins (probe order deepest-first).
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
@@ -1039,13 +1090,13 @@ impl TxTable {
 
     /// Sparse outs by known `txout` body ranges (prep pin after plan stamp).
     ///
-    /// Each job is `(create_fk, body_range, known_txid, need_vouts)`.
-    /// - **Skips `tx.idx`** (range known).
+    /// Each job is `(create_fk, body_range, known_txid, n_out, need_vouts)`.
+    /// - **Skips loc** (range known).
     /// - **`known_txid`**: RAM identity (plan reverse map / residency); not sidefile.
     /// - **`need_vouts`**: sorted unique; empty = all outs. Only those scripts are
     ///   allocated (N2.1). First-wave Outs peek is the remainder of the starting
-    ///   OS page unless `(max_vout+1)*40` (empty need: the idx span) is likely to
-    ///   spill onto the next page — then the first wave is the full idx span.
+    ///   OS page unless `(max_vout+1)*40` (empty need: the loc span) is likely to
+    ///   spill onto the next page — then the first wave is the full loc span.
     ///
     /// Returns `(rows, body_ns, decode_ns, extend_n, body_sqe_n, guess_full_n)` where each row is
     /// `Some((tx, live (vout,out), sparse denserels (vout,rel)))` (N2.0 timers).
@@ -1779,7 +1830,7 @@ impl TxTable {
     #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
     /// Encode and write `txout` + `inwit` + `spent` bodies as one pwrite wave.
     ///
-    /// Order is still body → idx → HWM per stem. Not the spend-annotate machine.
+    /// Order is still body → loc → HWM per stem. Not the spend-annotate machine.
     fn append_stems_one_wave(
         &self,
         n: usize,

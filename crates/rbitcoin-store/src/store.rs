@@ -997,7 +997,7 @@ impl Store {
         crate::head_resolve_denserels::diagnose_and_note_leftover_probe(&self.txs, txid);
     }
 
-    /// Sparse outs by known `txout` ranges (prep; skips idx).
+    /// Sparse outs by known `txout` ranges (prep; skips loc).
     ///
     /// See [`TxTable::get_outs_by_range_batch`].
     pub fn get_outs_by_range_batch(
@@ -1043,15 +1043,16 @@ impl Store {
             .collect())
     }
 
-    /// Completion-driven idx→body io_uring pipeline (confirm load / prep).
+    /// Completion-driven loc→body io_uring pipeline (confirm load / prep).
     ///
-    /// Jobs with pre-known `range` skip idx. See [`crate::run_idx_body_pipeline`].
+    /// Jobs with pre-known `range` skip loc fill when `n_out` is already set.
+    /// See [`crate::run_idx_body_pipeline`].
     pub fn idx_body_pipeline(
         &self,
         jobs: &mut [crate::IdxBodyJob],
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
-        self.fill_txout_job_ranges(jobs)?;
+        self.txs.fill_txout_job_ranges(jobs)?;
         crate::run_idx_body_pipeline(&self.txs.body, jobs, mode).map(|_| ())
     }
 
@@ -1060,49 +1061,8 @@ impl Store {
         jobs: &mut [crate::IdxBodyJob],
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
-        self.fill_inwit_job_ranges(jobs)?;
+        self.txs.fill_inwit_job_ranges(jobs)?;
         crate::run_idx_body_pipeline(&self.txs.inwit, jobs, mode).map(|_| ())
-    }
-
-    fn fill_txout_job_ranges(&self, jobs: &mut [crate::IdxBodyJob]) -> Result<(), StoreError> {
-        let mut need = Vec::new();
-        let mut slots = Vec::new();
-        for (i, j) in jobs.iter().enumerate() {
-            if j.range.is_none() && j.id > 0 {
-                need.push(Fk(j.id));
-                slots.push(i);
-            }
-        }
-        if need.is_empty() {
-            return Ok(());
-        }
-        let pairs = self.txs.create_loc_range_batch(&need)?;
-        for (slot, p) in slots.into_iter().zip(pairs) {
-            if let Some(p) = p {
-                jobs[slot].range = Some(p.txout);
-                jobs[slot].n_out = p.n_out;
-            }
-        }
-        Ok(())
-    }
-
-    fn fill_inwit_job_ranges(&self, jobs: &mut [crate::IdxBodyJob]) -> Result<(), StoreError> {
-        let mut need = Vec::new();
-        let mut slots = Vec::new();
-        for (i, j) in jobs.iter().enumerate() {
-            if j.range.is_none() && j.id > 0 {
-                need.push(Fk(j.id));
-                slots.push(i);
-            }
-        }
-        if need.is_empty() {
-            return Ok(());
-        }
-        let pairs = self.txs.inwit_loc.range_batch(&need)?;
-        for (slot, p) in slots.into_iter().zip(pairs) {
-            jobs[slot].range = p;
-        }
-        Ok(())
     }
 
     /// Bulk 8-byte spender meta at absolute `spent.body` offsets.

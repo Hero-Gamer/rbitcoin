@@ -1,7 +1,7 @@
-//! **idx → body** pipeline for confirm load (`txout` / `inwit` / `spent` stems).
+//! **loc → body** pipeline for confirm load (`txout` / `inwit` stems).
 //!
-//! Idx via sorted [`VarTable::record_range_batch`] (idx segments are
-//! fd pread). Body backend from
+//! Ranges from [`crate::create_loc::CreateLoc`] / [`crate::delta_loc::DeltaLoc`]
+//! (FdOnly). Body backend from
 //! [`crate::io_backend::read_io_backend`] (global
 //! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!
@@ -32,7 +32,7 @@ pub enum BodyMode {
 pub struct IdxBodyJob {
     /// 1-based create id (`Fk.0` when non-null).
     pub id: u64,
-    /// Known `(body_off, body_len)` skips idx; filled by pipeline when resolved.
+    /// Known `(body_off, body_len)` skips loc fill when `n_out` is set.
     pub range: Option<(u64, u64)>,
     /// Body bytes (mode-sized) when `ok`.
     pub body: Vec<u8>,
@@ -1003,6 +1003,23 @@ mod tests {
             assert_eq!(a.body, b.body);
             assert!(b.ok);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_stamped_range_fills_n_out_from_loc() {
+        let (dir, t) = temp_tx();
+        let fks = put_n(&t, 3);
+        let pair = t.create_loc_range_batch(&[fks[1]]).unwrap()[0].unwrap();
+        let mut jobs = [IdxBodyJob::new(fks[1].0, Some(pair.txout))];
+        assert_eq!(jobs[0].n_out, 0);
+        t.fill_txout_job_ranges(&mut jobs).unwrap();
+        assert_eq!(jobs[0].n_out, pair.n_out);
+        assert!(jobs[0].n_out >= 1);
+        run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
+        let (tx, outs, _) =
+            decode_packed_tx_outs_with_spender_rels(&jobs[0].body, jobs[0].n_out).unwrap();
+        assert_eq!(tx.output_count as usize, outs.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
