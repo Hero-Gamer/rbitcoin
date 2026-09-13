@@ -18,6 +18,7 @@ cargo test -p rbitcoin-consensus --lib core_tx_ -- --nocapture
 cargo test -p rbitcoin-consensus --lib core_sighash -- --nocapture
 cargo test -p rbitcoin-consensus --lib core_bip341 -- --nocapture
 cargo test -p rbitcoin-consensus --lib block_866342 -- --nocapture
+cargo test -p rbitcoin-consensus --test script_edge_fixtures
 # broader integration still covers connect success paths:
 cargo test -p rbitcoin-test --test scenarios consensus_
 ```
@@ -134,6 +135,7 @@ version floors and exact +2h).
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
 | C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings` |
+| C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
 
 ## Adding a new rule
 
