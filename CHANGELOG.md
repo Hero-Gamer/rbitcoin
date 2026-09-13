@@ -11,10 +11,15 @@ before 1.0).
 
 ### Changed
 
+- **Live P2P IBD in default CI:** hop serve, dual live seeders (8-block),
+  post-IBD tip follow, getheaders gap fill, and product `run_p2p --connect`
+  run in `cargo test --workspace` and `coverage.sh`. 48-block dual-seeder,
+  20-block combo, and 4-node mesh are gone. `scripts/integration.sh` is gone
+  (**Q-38** completed). [`TESTING.md`](TESTING.md).
+
 - **Tier A IBD in default CI:** `serve_after_restart_via_reconstruct` and
   `ibd_skips_dead_peer` run in `cargo test --workspace` and `coverage.sh`.
-  The separate `multinode` job is gone. Mesh / 48-block / 3-hop stay
-  `#[ignore]` (**Q-38**). [`TESTING.md`](TESTING.md).
+  The separate `multinode` job is gone. [`TESTING.md`](TESTING.md).
 
 - **No loc-count echo:** packed decode already walks loc `n_out` / inwit
   `input_count`; drop the tautological len==count Corrupt. `spent_record_len(0)`

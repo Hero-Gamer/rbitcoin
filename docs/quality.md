@@ -129,7 +129,6 @@ Retired on purpose. Not a backlog. Not a failure.
 | **Q-25** | crates.io package metadata | Distribution is `nix build .#rbitcoin-musl`. `repository` is already set |
 | **Q-32** | Structured logging option | INFO/DEBUG text is the operator contract. JSON/kv is a second dialect |
 | **Q-33** | Published rustdoc site | `cargo doc` locally. No docs.rs until crates.io (Q-25) |
-| **Q-38** | Tier-C multinode in default CI | Wall/flake. `#[ignore]` + `scripts/integration.sh` is the product |
 | **Q-35** | Mainnet soak program | Not a program. Run signet first, then mainnet with monitoring. No gated checklist or badge |
 | **—** | Darwin notarization / Developer ID | Ad-hoc `codesign -s -` on the macos snapshot. Notarization is still not a product |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
@@ -142,7 +141,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **—** | Flatten purpose-built io_uring machines | [`io-modality.md`](./io-modality.md): fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |
 | **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD confirm is body-queue wire → lookup → load. [`concurrency.md`](./concurrency.md), [`invariants.md`](./invariants.md) |
 | **—** | `rbitcoin-bench` default-member / musl / required CI | Optional crate, host A/B against a live store. Not a packaging or coverage gate |
-| **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Same class as Q-38 (too heavy / cannot go green). Primitives only (**Q-53**); extra islands are **Q-56**. |
+| **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Too heavy / cannot go green. Primitives only (**Q-53**); extra islands are **Q-56**. |
 | **—** | `cargo crap --fail-above --threshold 30` | At ≥90% line coverage CRAP **equals CC**. `handle_peer_frame` / confirm write / SH pack would force **R-10** peels. Use **Q-55** regression instead. |
 | **—** | ast-grep as a second clippy for style | Structural rules catch RSS/task-leak *shapes*. Clippy policy is [`code-shape.md`](./code-shape.md) (no workspace allow list; leftover lints are site-local). |
 
@@ -155,6 +154,7 @@ Retired on purpose. Not a backlog. Not a failure.
 
 | ID | Item | Resolution |
 |----|------|------------|
+| **Q-38** | Slim live P2P in default CI | Hop serve, 8-block dual live seeders, post-IBD tip follow, getheaders gap fill, and product `run_p2p --connect` run in `cargo test` / coverage. 48-block dual-seeder, 20-block combo, and 4-node mesh deleted. `scripts/integration.sh` deleted. |
 | **Q-62** | IBD load `txout.body` read bandwidth | Need-aware Outs extend: first 4 KiB peek is complete when every `need_vouts` `skip_at`s in-page (empty need still walks all outs). Overlapping body peeks in one uring wave share one OS-page SQE (cap two pages). `ibd: perf` `cold_range` `extend=` / `sqe=`. Random 4 KiB parent faults, spent page-RMW, and leftover TipOnly stay as designed (no coins cache, no persist-in-flight). |
 | **Q-61** | 0.6.0 readability (code shape) | Display-hash owner (`display_hash_hex` / `parse_display_hash32`); CLI `CliAccum` / `apply_kv`; RPC `METHOD_LIST` catalog so `help` / `getrpcinfo` list every dispatched method; Electrum/Esplora `sh_at_view`; `PeerFollowState` + `PendingSendCmpct` + shared mempool GetData; `CatchUp` + named `run_p2p` phases + shared hub-tip bridge. IBD confirm events drain through `apply_confirm_events`; Headers apply is named stages. `ChainHub` holds `HeldBodies` under one `RwLock` (cap 320); `Invalidated` / `HeaderTips` / `MiningKnobs` are named types. Query SH write-behind is `ShWriteBehind`; `IndexMode` names archive-spend / SH-enqueue products; `TxTable::probe_body_match_fk` is the body-txid head probe. Mempool `scan_conflicts_and_parents` / `evict_worst_chunks` / hub `admit_staged`. One-shot confirm load is stamp + load_from_plan; pin stages named; `ScriptVerifyFlags` on script jobs. Confirm reject class (`SoftMerkle` / `SoftRetarget` / `BadPrev` / `Permanent`) is set at the sender. Stretch closed. Owner: [`code-shape.md`](./code-shape.md). |
 | **Q-57** | Store publish / Class C flush / sidecar | `published_meta` Acquire. `ArrayTable` / `StrongTxTable` `flush_dirty` packed dirty-epoch (`0`=clean; snapshot under read; CAS `e0→0`; wrap of `u64::MAX` stays dirty). fuse8 `decode_body` refuses fingerprint arrays shorter than `hash_of_hash` geometry. Leftover fuse8 v1 refuses open. `for_each_spender_create` hops ≤ `spenders.count()`. Seal/install of `meta` / `.mphf` / SH `.idx` is tmp + `sync_all` then rename. `list_runs` is a scan (open-time SH `key_len` and leftover-run count do not delete). |
@@ -225,7 +225,7 @@ Q-01–Q-14, findings 001–022, CI split, map-free README: [`CHANGELOG.md`](../
   and refuse messages: [`SCHEMA.md`](../SCHEMA.md). Soft-migrate durable
   side formats; no silent wipes.
 - External findings hygiene + Core corpora without allowlist.
-- Confirm dual-path kill + tier-A IBD in default `cargo test` / coverage.
+- Confirm dual-path kill + live P2P IBD / hop-serve / tip-follow in default `cargo test` / coverage.
 - Tests assert shipped behavior, not repo text.
 - Sealed fuse8 fingerprints stay RAM; BDZ `g` is FdOnly.
 - Optional `sp_tweaks` leftover regenerate is not a Class A wipe.
