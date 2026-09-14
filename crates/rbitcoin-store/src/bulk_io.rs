@@ -268,11 +268,12 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
 
 /// Bulk pread on a shared [`crate::IoCtx`].
 ///
-/// - `Ok(true)`: submitted on the **held** session. Per-op short/errno stays
-///   on those ops; the caller libc-completes them. Do not treat that as
-///   session death.
+/// - `Ok(true)`: submitted on the **held** session. Per-op short/errno and
+///   live-ring batch fail (empty CQ / submit) stay on those ops; the caller
+///   libc-completes them. That is **not** session death and does not consume
+///   IBD uring recover credit.
 /// - `Ok(false)`: no session — caller may `pread_batch` (standalone TLS, `DEPTH=0`).
-/// - `Err`: held session failed (poison / leftover). Do **not** open another ring
+/// - `Err`: held session poisoned / leftover. Do **not** open another ring
 ///   and do **not** libc-complete on a dirty ring.
 pub(crate) fn pread_batch_on_ctx(
     ctx: &mut crate::IoCtx<'_>,
@@ -293,13 +294,20 @@ pub(crate) fn pread_batch_on_ctx(
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
     }
-    if pread_batch_on_session_inner(session, ops, total_nonempty) {
+    held_pread_after_inner(
+        pread_batch_on_session_inner(session, ops, total_nonempty),
+        session.is_poisoned(),
+    )
+}
+
+fn held_pread_after_inner(inner_ok: bool, poisoned: bool) -> Result<bool, StoreError> {
+    if inner_ok {
         return Ok(true);
     }
-    if session.is_poisoned() {
+    if poisoned {
         return Err(StoreError::Corrupt("invariant: io_uring session poisoned"));
     }
-    Err(StoreError::Corrupt("invariant: io_uring held pread failed"))
+    Ok(true)
 }
 
 fn pread_batch_on_session_inner(
@@ -938,6 +946,21 @@ mod tests {
         }
         assert_eq!(b, [0u8; 4], "must not libc-complete on a poisoned ring");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_held_pread_batch_fail_is_not_recover_abort() {
+        match held_pread_after_inner(false, false) {
+            Ok(true) => {}
+            other => panic!(
+                "empty CQ / submit fail on a live ring must libc-complete (Ok(true)), got {other:?}"
+            ),
+        }
+        match held_pread_after_inner(false, true) {
+            Err(e) if e.is_uring_session_fault() => {}
+            other => panic!("poisoned ring must stay fail-closed, got {other:?}"),
+        }
+        assert!(held_pread_after_inner(true, false).unwrap());
     }
 
     #[test]
