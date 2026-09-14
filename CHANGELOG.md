@@ -11,6 +11,14 @@ before 1.0).
 
 ### Added
 
+- **Electrum TCP line cap, merkle height, history window:**
+  `electrum_server_version_history_balance` pins request line at
+  `max_request_bytes` vs one-past `-32600` `request line too long`,
+  `get_merkle` of a known txid at the wrong height, and `get_history`
+  `from_height` / exclusive `to_height` / `to_height=-1` (subscribe status
+  stays full). Leftover-mempool TCP pins `broadcast` non-hex and
+  consensus-invalid with a hub attached.
+
 - **Package count/weight and CPFP min-relay:** `submitpackage` refuses more
   than 25 hexes and over-weight packages with `package too large` (same needle
   as Esplora `POST /txs/package`). `accept_package` admits a below-min-relay
