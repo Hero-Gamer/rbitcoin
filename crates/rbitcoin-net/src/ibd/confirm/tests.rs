@@ -1263,6 +1263,80 @@ fn isolate_if_batched_downgrades_multi_block_consensus() {
 }
 
 #[test]
+fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
+    use super::{emit_confirm_reject, ConfirmEvent, ConfirmFeed, ConfirmRejectClass};
+
+    let feed = ConfirmFeed::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let hash = BlockHash::from_byte_array([9u8; 32]);
+    emit_confirm_reject(
+        &tx,
+        &feed,
+        11,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        8,
+    )
+    .unwrap();
+    assert!(
+        feed.single_block(),
+        "batched consensus must isolate to one-block retry"
+    );
+    match rx.try_recv() {
+        Ok(ConfirmEvent::Reject {
+            height: 11,
+            class: ConfirmRejectClass::Cascade,
+            batch_len: 8,
+            ..
+        }) => {}
+        _ => panic!("expected Cascade isolate"),
+    }
+
+    let feed_one = ConfirmFeed::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    emit_confirm_reject(
+        &tx,
+        &feed_one,
+        12,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        1,
+    )
+    .unwrap();
+    assert!(
+        !feed_one.single_block(),
+        "single-block consensus stays blacklistable"
+    );
+    match rx.try_recv() {
+        Ok(ConfirmEvent::Reject {
+            class: ConfirmRejectClass::ConsensusInvalid,
+            batch_len: 1,
+            ..
+        }) => {}
+        _ => panic!("expected ConsensusInvalid"),
+    }
+
+    let feed_fault = ConfirmFeed::new();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    emit_confirm_reject(
+        &tx,
+        &feed_fault,
+        13,
+        hash,
+        ConfirmRejectClass::EngineFault,
+        "io_uring leftover cqe".into(),
+        8,
+    )
+    .unwrap();
+    assert!(
+        !feed_fault.single_block(),
+        "engine fault is not a cascade isolate"
+    );
+}
+
+#[test]
 fn plan_epoch_stale_after_clear() {
     let feed = ConfirmFeed::new();
     {
