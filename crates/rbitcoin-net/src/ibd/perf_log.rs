@@ -1663,6 +1663,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let file_pct = div_or_0(100 * s.rss_file_kb, s.rss_kb);
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let if_mib = o.inflight_bytes / (1024 * 1024);
+    let wloc_mib = o.wloc_bytes / (1024 * 1024);
     let h2h_mib = (o.h2h_keys as u64).saturating_mul(48) / (1024 * 1024);
     let fence_mib = (o.fence_runs as u64).saturating_mul(16) / (1024 * 1024);
     let conf_wire_mib = (load_wire_mib
@@ -1674,6 +1675,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
+        .saturating_add(wloc_mib)
         .saturating_add(h2h_mib)
         .saturating_add(fence_mib)
         .saturating_add(conf_wire_mib)
@@ -1691,7 +1693,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf_plans={} \
          | conf loadq={}/{} blks={} wire={}MiB scriptq={}/{} blks={} wire={}MiB writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
-         | heap bq={}MiB iflight={}L/{}pin≈{}MiB \
+         | heap bq={}MiB iflight={}L/{}pin≈{}MiB wloc={}L/{}pair≈{}MiB \
            h2h={}k≈{}MiB fence={}≈{}MiB \
            wire={}MiB fuse8={}MiB mphf_g={}MiB open_keys={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
@@ -1739,6 +1741,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.inflight_layers,
         o.inflight_pins,
         if_mib,
+        o.wloc_packs,
+        o.wloc_pairs,
+        wloc_mib,
         o.h2h_keys,
         h2h_mib,
         o.fence_runs,
@@ -2425,6 +2430,9 @@ mod tests {
         s.owned.inflight_layers = 3;
         s.owned.inflight_pins = 12_000;
         s.owned.inflight_bytes = 48 * 1024 * 1024;
+        s.owned.wloc_packs = 2;
+        s.owned.wloc_pairs = 4000;
+        s.owned.wloc_bytes = 160_000;
         s.owned.h2h_keys = 50;
         s.owned.fence_runs = 10;
         s.bq_count = 4;
@@ -2484,7 +2492,7 @@ mod tests {
         assert!(line.contains("segs=3 sealed=2"), "{line}");
         assert!(line.contains("class_a=2000000"), "{line}");
         assert!(
-            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB"),
+            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB wloc=2L/4000pair≈0MiB"),
             "{line}"
         );
         assert!(!line.contains("union="), "{line}");

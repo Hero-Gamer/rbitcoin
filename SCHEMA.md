@@ -377,8 +377,9 @@ head-resolve session, else `pread_batch`). Non-overflow windows use a SIMD
 prefix sum (`u8×8` SSE2 on x86_64, NEON on aarch64).
 
 One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
-stamps both ranges; load copies the stamp; write appends loc and keeps the RAM
-pairs (same-batch abs). Write does not pread `create.loc`. Occupied 21 Class A
+stamps both ranges; load copies the stamp; write appends loc and keeps RAM
+packs until write of `lookup_started_hi` at note (just-written abs). Write
+does not pread `create.loc`. Occupied 21 Class A
 is refused. Leftover `{txout,spent,inwit}.idx` and `spent.off` are unlinked on
 empty 21/22 open.
 

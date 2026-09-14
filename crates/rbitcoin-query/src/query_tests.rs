@@ -178,10 +178,22 @@ fn note_disconnect_rewinds_started_and_class_a_with_taken() {
     q.set_lookup_taken_hi(Some(12));
     q.set_lookup_started_hi(Some(12));
     q.set_class_a_hi(Some(10));
+    let fk = Fk(10);
+    let pair = rbitcoin_store::CreateLocPair {
+        txout: (10, 8),
+        spent: (20, 8),
+        n_out: 1,
+    };
+    q.note_write_create_loc(&[fk], &[pair], 10);
+    assert!(q.write_create_loc(fk).is_some());
     q.note_disconnect_height(8);
     assert_eq!(q.lookup_taken_hi(), Some(7));
     assert_eq!(q.lookup_started_hi(), Some(7));
     assert_eq!(q.class_a_hi(), Some(7));
+    assert!(
+        q.write_create_loc(fk).is_none(),
+        "disconnect drops write loc packs at/above that height"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

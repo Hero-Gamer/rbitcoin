@@ -108,10 +108,13 @@ before 1.0).
   ENOENT / `.tmp` so a live seal worker unlinking the OA cannot fail the
   snapshot. Live table drops before cleanup.
 
-- **Write loc RAM:** Class A append returns loc pairs; write keeps them in a
-  sequential window and stamps same-batch / just-written abs from that RAM
-  (packed pin outs). Write does not pread `create.loc`. Missing stamp is
-  `Corrupt`.
+- **Write loc RAM:** Class A append returns loc pairs; write keeps them in
+  height-tagged **thread-local** packs (no `Query` mutex) until write of
+  `lookup_started_hi` at note, extended while the pack is still at/above the
+  load drain fence (InFlight still makes TipOnly skip disk loc). Same-write
+  prune keeps the noting pack. Same-batch / just-written abs stamp from that
+  RAM (packed pin outs). Disconnect is polled on the write thread. Write does
+  not pread `create.loc`. Missing stamp is `Corrupt`. `ibd: sizes` `wloc=`.
 
 - **`create.loc` leftover stamp:** lookup reads/sums only through the highest
   fk in each 1024-create window, preads those windows as one bulk batch (held

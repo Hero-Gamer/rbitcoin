@@ -35,6 +35,7 @@ pres and **not** the raw bytes. Reorg gather that wants wire re-encodes.
 | **Load-batch parent skeleton** | Wave `txid → (fk, body_range)` + spent ranges on the `LoadBatch`; per-chunk need-vouts at split | Drop with the batch. Lookup TipOnly only. Not a process FIFO. |
 | **Pipeline pins (no process FIFO)** | Plan `batch_pin` / `BatchParents` only | Drop with batch. Cold **outs** for ancient parents use `txout.body` into `BatchParents` (stamped range). Recent-window first spend uses stamp-carried in-flight CreatePin until load drops the pack below the wave's pre-TipOnly drain+fence snapshot |
 | **In-flight CreatePin map** | identity + full create outs; one load-thread HashMap; lookup snapshots `drain_and_fence_hi` before TipOnly and passes it on the last load batch; load drops pack height below that after the in-flight read | Load notes after stamp; disconnect `drop_from` on pack height. Sizes: `iflight=`. Not a coins cache / spend FIFO |
+| **Write loc packs** | Class A append `CreateLocPair`s on the **write thread** (TLS, no `Query` mutex); height-tagged like InFlight. `keep_until` = `lookup_started_hi` at note, then extended while pack height ≥ load drain fence (TipOnly still skips disk loc via InFlight). No count cap | Write notes after append; prune when pack height is below that fence **and** `written_hi ≥ keep_until`. Same-write prune keeps the noting pack. Disconnect is polled on the write thread (`take_disconnect`) and `drop_from` on pack height (clamps remaining keep-until). Sizes: `wloc=` (atomics, like `iflight=`) |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH catalog runs** | leftover `scripthash.runs` discarded at tip (unsorted collect does not write them) | write-behind / discard; not during Direct confirm |
@@ -126,7 +127,7 @@ grep 'tip: perf' mainnet.log
 | `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH catalog runs / tip heads |
-| `heap … iflight= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins (`iflight=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= wloc= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins (`iflight=`) + write loc packs (`wloc=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 
