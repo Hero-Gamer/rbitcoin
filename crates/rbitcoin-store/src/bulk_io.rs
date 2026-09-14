@@ -268,9 +268,12 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
 
 /// Bulk pread on a shared [`crate::IoCtx`].
 ///
-/// - `Ok(true)`: filled on the **held** session.
+/// - `Ok(true)`: submitted on the **held** session. Per-op short/errno stays
+///   on those ops; the caller libc-completes them. Do not treat that as
+///   session death.
 /// - `Ok(false)`: no session — caller may `pread_batch` (standalone TLS, `DEPTH=0`).
-/// - `Err`: held session failed (poison / leftover). Do **not** open another ring.
+/// - `Err`: held session failed (poison / leftover). Do **not** open another ring
+///   and do **not** libc-complete on a dirty ring.
 pub(crate) fn pread_batch_on_ctx(
     ctx: &mut crate::IoCtx<'_>,
     ops: &mut [ReadOp<'_>],
@@ -296,7 +299,7 @@ pub(crate) fn pread_batch_on_ctx(
     if session.is_poisoned() {
         return Err(StoreError::Corrupt("invariant: io_uring session poisoned"));
     }
-    Err(StoreError::Corrupt("invariant: held pread failed"))
+    Err(StoreError::Corrupt("invariant: io_uring held pread failed"))
 }
 
 fn pread_batch_on_session_inner(
@@ -384,21 +387,16 @@ fn pread_batch_on_session_inner(
         }
     }
 
-    let mut any_fail = false;
     for op in ops.iter_mut() {
         if !op.buf.is_empty() && op.result == i32::MIN {
             op.result = -5; // EIO
-            any_fail = true;
-        }
-        if op.result < 0 {
-            any_fail = true;
         }
     }
     if session.drain_all().is_err() {
         return false;
     }
 
-    !any_fail
+    true
 }
 
 /// Pipelined bulk pwrite — same fill/harvest shape as [`pread_batch_uring`].
@@ -836,6 +834,110 @@ mod tests {
             sess.drain_all().unwrap();
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn held_pread_errno_on_live_ring_is_ok_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-held-errno-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"abcd").unwrap();
+            f.flush().unwrap();
+        }
+        let ro = std::fs::File::open(&path).unwrap();
+        let wo = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let fd_ok = crate::io_handle::IoHandle::from_file(&ro);
+        let fd_bad = crate::io_handle::IoHandle::from_file(&wo);
+        let mut sess = crate::uring_session::UringSession::try_open(32).unwrap_or_else(|_| {
+            crate::uring_session::UringSession::try_open_kind(
+                crate::uring_session::SessionKind::Pool,
+                32,
+            )
+            .expect("pool")
+        });
+        let mut good = [0u8; 4];
+        let mut bad = [0u8; 4];
+        let mut ops = [
+            ReadOp {
+                fd: fd_ok,
+                offset: 0,
+                buf: &mut good[..],
+                result: i32::MIN,
+            },
+            ReadOp {
+                fd: fd_bad,
+                offset: 0,
+                buf: &mut bad[..],
+                result: i32::MIN,
+            },
+        ];
+        let used = pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops)
+            .expect("per-op errno on a live ring is not session death");
+        assert!(used);
+        assert!(
+            !sess.is_poisoned(),
+            "write-only pread errno must not poison"
+        );
+        let r0 = ops[0].result;
+        let r1 = ops[1].result;
+        drop(ops);
+        assert_eq!(r0, 4);
+        assert_eq!(&good, b"abcd");
+        assert!(r1 < 0, "write-only pread must be errno, got {r1}");
+        sess.drain_all().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_pread_poison_stays_fail_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-held-poison-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"abcd").unwrap();
+            f.flush().unwrap();
+        }
+        let f = std::fs::File::open(&path).unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut sess = crate::uring_session::UringSession::try_open(32).unwrap_or_else(|_| {
+            crate::uring_session::UringSession::try_open_kind(
+                crate::uring_session::SessionKind::Pool,
+                32,
+            )
+            .expect("pool")
+        });
+        sess.poison();
+        let mut b = [0u8; 4];
+        let mut ops = [ReadOp {
+            fd,
+            offset: 0,
+            buf: &mut b[..],
+            result: i32::MIN,
+        }];
+        match pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops) {
+            Err(StoreError::Corrupt(m)) => {
+                assert!(m.contains("io_uring"), "{m}");
+                assert!(m.contains("poisoned"), "{m}");
+            }
+            other => panic!("poisoned held pread must stay fail-closed, got {other:?}"),
+        }
+        assert_eq!(b, [0u8; 4], "must not libc-complete on a poisoned ring");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -140,6 +140,14 @@ fn confirm_reject_class_matches_substring_table() {
         ConfirmRejectClass::from_err_str("io_uring submit failed"),
         ConfirmRejectClass::EngineFault
     );
+    assert_eq!(
+        ConfirmRejectClass::from_err_str("invariant: io_uring held pread failed"),
+        ConfirmRejectClass::EngineFault
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_err_str("invariant: held pread failed"),
+        ConfirmRejectClass::Cascade
+    );
 }
 
 /// `body.rejected ⊆ consensus-invalid set` — Cascade / SoftWire / EngineFault
