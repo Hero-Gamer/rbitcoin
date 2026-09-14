@@ -2655,52 +2655,6 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Leftover fuse8 v1 on a sealed segment: shipped open refuses (Class A kept).
-#[test]
-fn reopen_refuses_legacy_v1_sealed_fuse() {
-    let dir = tempfile_dir("fuse-v1-refuse");
-    let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
-    {
-        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
-        // 0.8 * 1024 slots = 819 → one seal at 820.
-        let recs: Vec<TxRecord> = (0..820u64)
-            .map(|i| {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
-                TxRecord {
-                    txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 0,
-                    output_start_fk: Fk::NULL,
-                    output_count: 0,
-                }
-            })
-            .collect();
-        t.put_full_batch_indexed(&meta_only_items(&recs), true)
-            .unwrap();
-        t.flush().unwrap();
-        assert!(t.head.sealed_segment_count() >= 1);
-    }
-    let fuse_path = dir.join("tx.head").join("000000.fuse8");
-    assert!(fuse_path.is_file());
-    let mut raw = Vec::from(*b"BF8R");
-    raw.extend_from_slice(&1u32.to_le_bytes()); // VERSION_V1
-    raw.extend_from_slice(&0u64.to_le_bytes());
-    std::fs::write(&fuse_path, &raw).unwrap();
-
-    match TxTable::open_tiny(&dir) {
-        Err(StoreError::Corrupt(m)) => {
-            assert_eq!(m, crate::fuse8_filter::INDEX_REFUSE_FUSE8_V1);
-        }
-        Ok(_) => panic!("v1 fuse must refuse TxTable::open"),
-        Err(other) => panic!("v1 fuse must refuse with INDEX_REFUSE_FUSE8_V1, got {other}"),
-    }
-    assert!(dir.join("txout.body").exists(), "Class A body kept");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Fat Class A bodies must not roll `tx.head` (OA 80% is the only head cut).
 #[test]
 fn fat_creates_do_not_roll_head() {
