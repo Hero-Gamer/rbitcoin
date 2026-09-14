@@ -140,10 +140,10 @@ pub fn put_spend_batch_by_abs_meta_uring(
         let _ = session.submit();
 
         while in_flight > 0 {
-            let mut cqes = session.harvest_ready()?;
+            let cqes = session.harvest_ready()?;
             if cqes.is_empty() {
                 session.submit_and_wait_one()?;
-                cqes = session.harvest_ready()?;
+                continue;
             }
 
             for (ud, res) in cqes {
@@ -596,10 +596,10 @@ fn put_spend_batch_pure_write_uring(
         let _ = session.submit();
 
         while in_flight > 0 {
-            let mut cqes = session.harvest_ready()?;
+            let cqes = session.harvest_ready()?;
             if cqes.is_empty() {
                 session.submit_and_wait_one()?;
-                cqes = session.harvest_ready()?;
+                continue;
             }
             for (ud, res) in cqes {
                 let (kind, _ep, slot) = uring_session::unpack_ud(ud);

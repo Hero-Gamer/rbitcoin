@@ -112,10 +112,10 @@ fn run_preads(
         }
         session.sync_submission();
         let _ = session.submit();
-        let mut cqes = session.harvest_ready()?;
+        let cqes = session.harvest_ready()?;
         if cqes.is_empty() {
             session.submit_and_wait_one()?;
-            cqes = session.harvest_ready()?;
+            continue;
         }
         for (ud, res) in cqes {
             let (k, ep, slot) = uring_session::unpack_ud(ud);

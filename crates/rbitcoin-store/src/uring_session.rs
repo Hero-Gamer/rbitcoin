@@ -45,6 +45,7 @@ pub(crate) enum DrainVerdict {
     HardCap,
 }
 
+#[derive(Debug)]
 enum WaitOneWindow {
     Ready,
     TimedOut,
@@ -633,17 +634,13 @@ impl UringSession {
                 ring.submission().sync();
                 let ts = io_uring::types::Timespec::new().nsec(DRAIN_WAIT_NS);
                 let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-                match ring.submitter().submit_with_args(1, &args) {
-                    Ok(_) => WaitOneWindow::Ready,
-                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => WaitOneWindow::TimedOut,
-                    Err(e) => {
-                        if let Some(err) = map_enter_err(&e) {
-                            WaitOneWindow::Enter(err)
-                        } else {
-                            WaitOneWindow::TimedOut
-                        }
-                    }
-                }
+                let enter = ring.submitter().submit_with_args(1, &args);
+                let cq_ready = {
+                    let mut cq = ring.completion();
+                    cq.sync();
+                    cq.len()
+                };
+                wait_window_after_enter(enter, cq_ready)
             }
             SessionBackend::Pool(pool) => {
                 if pool.wait_one_cqe_timeout(DRAIN_WINDOW) {
@@ -1318,6 +1315,25 @@ pub(crate) fn cq_overflow_result(overflow: u32) -> Result<(), StoreError> {
     }
 }
 
+/// Enter success is SQE count. Ready iff the CQ already has an event.
+#[cfg(target_os = "linux")]
+fn wait_window_after_enter(enter: Result<usize, std::io::Error>, cq_ready: usize) -> WaitOneWindow {
+    if cq_ready > 0 {
+        return WaitOneWindow::Ready;
+    }
+    match enter {
+        Ok(_) => WaitOneWindow::TimedOut,
+        Err(e) if e.raw_os_error() == Some(libc::ETIME) => WaitOneWindow::TimedOut,
+        Err(e) => {
+            if let Some(err) = map_enter_err(&e) {
+                WaitOneWindow::Enter(err)
+            } else {
+                WaitOneWindow::TimedOut
+            }
+        }
+    }
+}
+
 /// `None` → retry the enter (EINTR). `Some` → hard fail.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) fn map_enter_err(err: &std::io::Error) -> Option<StoreError> {
@@ -1548,6 +1564,35 @@ mod tests {
             other => panic!("negative CQE must be io, got {other:?}"),
         }
         assert!(require_full_cqe(8, 8, p).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn wait_ready_requires_visible_cqe() {
+        match wait_window_after_enter(Ok(1), 0) {
+            WaitOneWindow::TimedOut => {}
+            other => panic!("enter Ok with empty CQ must be TimedOut, got {other:?}"),
+        }
+        match wait_window_after_enter(Ok(0), 1) {
+            WaitOneWindow::Ready => {}
+            other => panic!("visible CQE must be Ready, got {other:?}"),
+        }
+        match wait_window_after_enter(Err(std::io::Error::from_raw_os_error(libc::ETIME)), 1) {
+            WaitOneWindow::Ready => {}
+            other => panic!("ETIME with a visible CQE must still be Ready, got {other:?}"),
+        }
+        match wait_window_after_enter(Err(std::io::Error::from_raw_os_error(libc::ETIME)), 0) {
+            WaitOneWindow::TimedOut => {}
+            other => panic!("ETIME with empty CQ must be TimedOut, got {other:?}"),
+        }
+        match wait_window_after_enter(Err(std::io::Error::from_raw_os_error(libc::EINTR)), 0) {
+            WaitOneWindow::TimedOut => {}
+            other => panic!("EINTR with empty CQ must retry (TimedOut), got {other:?}"),
+        }
+        match wait_window_after_enter(Err(std::io::Error::from_raw_os_error(libc::EIO)), 0) {
+            WaitOneWindow::Enter(_) => {}
+            other => panic!("EIO with empty CQ must be Enter, got {other:?}"),
+        }
     }
 
     #[test]

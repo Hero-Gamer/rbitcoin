@@ -958,14 +958,10 @@ impl AddressHead {
                     break;
                 }
 
-                let mut cqes = session.harvest_ready()?;
+                let cqes = session.harvest_ready()?;
                 if cqes.is_empty() {
                     session.submit_and_wait_one()?;
-                    cqes = session.harvest_ready()?;
-                    if cqes.is_empty() {
-                        session.poison();
-                        return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
-                    }
+                    continue;
                 }
 
                 for (ud, res) in cqes {
