@@ -734,8 +734,8 @@ impl Query {
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
-    /// Keep Class A append loc until write of the first height whose TipOnly
-    /// had not started at note (`lookup_started_hi + 1`). Write-thread TLS.
+    /// Keep Class A append loc until write of the last height whose TipOnly
+    /// had started at note (`lookup_started_hi`). Write-thread TLS.
     /// No loc pread. `keep_until` is not bumped after note.
     pub fn note_write_create_loc(
         &self,
@@ -750,7 +750,7 @@ impl Query {
         });
     }
 
-    /// Drop loc packs whose unstarted-at-note height has finished write.
+    /// Drop loc packs whose last-started-at-note height has finished write.
     pub fn prune_write_create_loc(&self, written_hi: u32) {
         write_create_loc::with_ram(self, |ram| {
             ram.prune_written_through(written_hi);
