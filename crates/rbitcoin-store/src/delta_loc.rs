@@ -557,23 +557,23 @@ mod tests {
         let (s, n, ovf) = pack_create_pair(65536, 1).expect("strides 65536");
         assert_eq!((s, n), (0, 1));
         let (st, no) = ovf.expect("ovf");
-        assert_eq!(u32::from(st), 65536);
-        assert_eq!(u32::from(no), 1);
+        assert_eq!(st, 65536);
+        assert_eq!(no, 1);
         let (s, n, ovf) = pack_create_pair(1, 65536).expect("n_out 65536");
         assert_eq!((s, n), (1, 0));
         let (st, no) = ovf.expect("ovf");
-        assert_eq!(u32::from(st), 1);
-        assert_eq!(u32::from(no), 65536);
+        assert_eq!(st, 1);
+        assert_eq!(no, 65536);
         let (s, n, ovf) = pack_create_pair(65536, 65536).expect("both");
         assert_eq!((s, n), (0, 0));
         let (st, no) = ovf.expect("ovf");
-        assert_eq!(u32::from(st), 65536);
-        assert_eq!(u32::from(no), 65536);
+        assert_eq!(st, 65536);
+        assert_eq!(no, 65536);
         let (s, n, ovf) = pack_create_pair(65535, 65535).unwrap();
         assert_eq!((s, n), (0, 0));
         let (st, no) = ovf.expect("ovf");
-        assert_eq!(u32::from(st), 65535);
-        assert_eq!(u32::from(no), 65535);
+        assert_eq!(st, 65535);
+        assert_eq!(no, 65535);
     }
 
     #[test]

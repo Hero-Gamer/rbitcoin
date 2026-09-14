@@ -2294,7 +2294,7 @@ mod tests {
         let data = &bytes[FILE_HEADER_LEN..logical as usize];
         let mut rows = Vec::new();
         if data.len().is_multiple_of(16)
-            && (data.len() % 12 != 0 || { data.len() >= 16 && data[10..12] == [0, 0] })
+            && (!data.len().is_multiple_of(12) || { data.len() >= 16 && data[10..12] == [0, 0] })
         {
             for chunk in data.chunks_exact(16) {
                 let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());

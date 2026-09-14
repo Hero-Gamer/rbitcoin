@@ -865,30 +865,30 @@ mod tests {
         });
         let mut good = [0u8; 4];
         let mut bad = [0u8; 4];
-        let mut ops = [
-            ReadOp {
-                fd: fd_ok,
-                offset: 0,
-                buf: &mut good[..],
-                result: i32::MIN,
-            },
-            ReadOp {
-                fd: fd_bad,
-                offset: 0,
-                buf: &mut bad[..],
-                result: i32::MIN,
-            },
-        ];
-        let used = pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops)
-            .expect("per-op errno on a live ring is not session death");
+        let (used, r0, r1) = {
+            let mut ops = [
+                ReadOp {
+                    fd: fd_ok,
+                    offset: 0,
+                    buf: &mut good[..],
+                    result: i32::MIN,
+                },
+                ReadOp {
+                    fd: fd_bad,
+                    offset: 0,
+                    buf: &mut bad[..],
+                    result: i32::MIN,
+                },
+            ];
+            let used = pread_batch_on_ctx(&mut crate::IoCtx::held(&mut sess), &mut ops)
+                .expect("per-op errno on a live ring is not session death");
+            (used, ops[0].result, ops[1].result)
+        };
         assert!(used);
         assert!(
             !sess.is_poisoned(),
             "write-only pread errno must not poison"
         );
-        let r0 = ops[0].result;
-        let r1 = ops[1].result;
-        drop(ops);
         assert_eq!(r0, 4);
         assert_eq!(&good, b"abcd");
         assert!(r1 < 0, "write-only pread must be errno, got {r1}");
