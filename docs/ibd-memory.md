@@ -142,7 +142,7 @@ intentional:
 | **Sealed BDZ `g`** | **0 heap** | Header only; 4 KiB `g` pages via uring stream (`KIND_MPHF_G`). Hot pages are kernel `RssFile`. |
 | **Class C L2 `strong_tx`** | **~177 MiB** | 1 bit/create, under the 256 MiB in-RAM cap. |
 | **Open-segment `open_keys`** | **~100–200 MiB** | `Vec<u64>` fuse keys for the unsealed tail. |
-| **`height_by_hash`** | **~60 MiB** | Query comment; still unmetered. |
+| **`height_by_hash`** | **~60 MiB** | In-process confirmed hash→height map. Incremental on tip extend/shrink; full `0..=tip` walk on open / invalidate only. |
 | **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |
 
 Meters `fuse8=` / `mphf_g=` / `open_keys=` / `class_c_l2=` enter `accounted`.

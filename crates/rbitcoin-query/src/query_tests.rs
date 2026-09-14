@@ -408,6 +408,171 @@ fn chain_view_pin_none_on_empty_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn prepared_at(q: &Query, height: Height, header_fk: Fk) -> ConfirmPrepared {
+    ConfirmPrepared {
+        height,
+        header_fk,
+        tx_fks: q
+            .header_tx_fks(header_fk, None)
+            .unwrap()
+            .expect("archived body"),
+    }
+}
+
+fn assert_height(q: &Query, hash: &[u8; 32], height: u32) {
+    assert_eq!(
+        q.height_of_hash(hash).unwrap(),
+        Some(Height(height)),
+        "hash at {height}"
+    );
+}
+
+/// Merged confirm / multi-height shrink must not walk `0..=tip`.
+#[test]
+fn height_by_hash_index_tracks_merged_tip_delta() {
+    let (dir, q) = temp_query("h2h-delta");
+    let ghost = [0xee; 32];
+    assert!(q.height_of_hash(&ghost).unwrap().is_none());
+    let empty = q.confirm_stats().take_window();
+    assert_eq!(empty.height_index_full_n, 0);
+    assert_eq!(empty.height_index_delta_n, 0);
+
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hashes = {
+        let mut hashes = vec![h0.hash];
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let genesis = q.confirm_stats().take_window();
+        assert_eq!(genesis.height_index_full_n, 1, "first tip fills from empty");
+        assert_eq!(genesis.height_index_full_headers, 1);
+        assert_eq!(genesis.height_index_delta_n, 0);
+        assert_eq!(q.process_owned_size_snapshot().h2h_keys, 1);
+
+        let prev = q.tip_header_fk().unwrap().unwrap();
+        let (h1, t1) = coinbase_block(1, prev, Some(hashes[0]));
+        hashes.push(h1.hash);
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let plus_one = q.confirm_stats().take_window();
+        assert_eq!(plus_one.height_index_full_n, 0, "+1 is not a full rebuild");
+        assert_eq!(plus_one.height_index_delta_n, 1);
+        assert_eq!(q.process_owned_size_snapshot().h2h_keys, 2);
+        hashes
+    };
+    let mut hashes = hashes;
+    let mut prev = q.tip_header_fk().unwrap().unwrap();
+    let mut parent = hashes[1];
+    let mut run = Vec::new();
+    for h in 2u32..=4 {
+        let (header, ta) = coinbase_block(h, prev, Some(parent));
+        let fk = q
+            .commit_class_a_only(&header, std::slice::from_ref(&ta))
+            .unwrap();
+        hashes.push(header.hash);
+        run.push(prepared_at(&q, Height(h), fk));
+        prev = fk;
+        parent = header.hash;
+    }
+    let _ = q.confirm_stats().take_window();
+    q.confirm_blocks_run(&run).unwrap();
+    let merged = q.confirm_stats().take_window();
+    assert_eq!(
+        merged.height_index_full_n, 0,
+        "merged confirm must extend, not walk 0..=tip"
+    );
+    assert_eq!(merged.height_index_full_headers, 0);
+    assert_eq!(merged.height_index_delta_n, 3);
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
+    for (h, hash) in hashes.iter().enumerate() {
+        assert_height(&q, hash, h as u32);
+    }
+    let (orphan, _) = coinbase_block(99, Fk::NULL, None);
+    q.put_header(&orphan).unwrap();
+    assert!(
+        q.height_of_hash(&orphan.hash).unwrap().is_none(),
+        "archive-only orphan is not confirmed"
+    );
+
+    let hole = q
+        .ensure_height_by_hash_index(Height(6))
+        .expect_err("gap above published tip");
+    assert!(hole.to_string().contains("height_by_hash"), "{hole}");
+    let after_hole = q.confirm_stats().take_window();
+    assert_eq!(after_hole.height_index_full_n, 0);
+    assert_eq!(after_hole.height_index_delta_n, 0);
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
+    assert_height(&q, &hashes[4], 4);
+
+    q.ensure_height_by_hash_index(Height(1)).unwrap();
+    let shrink = q.confirm_stats().take_window();
+    assert_eq!(
+        shrink.height_index_full_n, 0,
+        "shrink by N is retain, not rebuild"
+    );
+    assert_eq!(shrink.height_index_delta_n, 3);
+    assert_eq!(
+        q.process_owned_size_snapshot().h2h_keys,
+        2,
+        "map follows ensure tip, not store tip"
+    );
+    assert_height(&q, &hashes[4], 4);
+    assert_eq!(
+        q.process_owned_size_snapshot().h2h_keys,
+        2,
+        "tip/tip-1 height_of_hash must not rebuild the map"
+    );
+    q.ensure_height_by_hash_index(Height(4)).unwrap();
+    let reextend = q.confirm_stats().take_window();
+    assert_eq!(reextend.height_index_full_n, 0);
+    assert_eq!(reextend.height_index_delta_n, 3);
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
+    for (h, hash) in hashes.iter().enumerate() {
+        assert_height(&q, hash, h as u32);
+    }
+
+    q.ensure_height_by_hash_index(Height(4)).unwrap();
+    let same = q.confirm_stats().take_window();
+    assert_eq!(same.height_index_full_n, 0);
+    assert_eq!(same.height_index_delta_n, 0);
+
+    q.invalidate_height_by_hash_index();
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
+    assert_height(&q, &hashes[0], 0);
+    let rebuilt = q.confirm_stats().take_window();
+    assert_eq!(rebuilt.height_index_full_n, 1);
+    assert_eq!(rebuilt.height_index_full_headers, 5);
+
+    q.disconnect_tip().unwrap();
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    assert!(q.height_of_hash(&hashes[4]).unwrap().is_none());
+    assert!(q.height_of_hash(&hashes[3]).unwrap().is_none());
+    assert_height(&q, &hashes[2], 2);
+    let old_h2 = hashes[2];
+    let prev1 = q.header_at_height(Height(1)).unwrap().unwrap().0;
+    q.disconnect_tip().unwrap();
+    let (mut h2b, t2b) = coinbase_block(2, prev1, Some(hashes[1]));
+    h2b.nonce = h2b.nonce.wrapping_add(7);
+    rehash_header(&mut h2b, &hashes[1]);
+    q.connect_block(Height(2), &h2b, &[t2b]).unwrap();
+    assert!(q.height_of_hash(&old_h2).unwrap().is_none());
+    assert_height(&q, &h2b.hash, 2);
+
+    while q.tip_height().is_some() {
+        q.disconnect_tip().unwrap();
+    }
+    assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
+    let empty_fill = q
+        .ensure_height_by_hash_index(Height(0))
+        .expect_err("empty confirmed[] is not a tip-0 map");
+    assert!(
+        empty_fill.to_string().contains("height_by_hash"),
+        "{empty_fill}"
+    );
+    let _ = q.confirm_stats().take_window();
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn chain_view_pin_live_across_extension_dead_after_same_height_replace() {
     let (dir, q) = temp_query("chain-view-pin");

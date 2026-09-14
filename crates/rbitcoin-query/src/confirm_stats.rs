@@ -291,6 +291,9 @@ confirm_window! {
     thr_script_send_wait_ns,
     thr_write_recv_wait_ns,
     thr_write_work_ns,
+    height_index_full_n,
+    height_index_full_headers,
+    height_index_delta_n,
 }
 
 impl ConfirmWindow {
