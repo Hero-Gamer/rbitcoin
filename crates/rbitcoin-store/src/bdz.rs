@@ -766,14 +766,10 @@ fn stream_g_pages(
             if in_flight == 0 {
                 break;
             }
-            let mut cqes = session.harvest_ready()?;
+            let cqes = session.harvest_ready()?;
             if cqes.is_empty() {
                 session.submit_and_wait_one()?;
-                cqes = session.harvest_ready()?;
-                if cqes.is_empty() {
-                    session.poison();
-                    return Err(StoreError::Corrupt("invariant: io_uring wait timeout"));
-                }
+                continue;
             }
             for (ud, res) in cqes {
                 let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);

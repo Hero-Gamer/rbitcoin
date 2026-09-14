@@ -50,7 +50,10 @@ g-pages / rel preads share the ring). Held idx fill fails closed on that
 error (no libc fallback on a dirty ring). Undrained / unexpected /
 wait-timeout **poisons** the session and drops the TLS ring so the next wave
 opens a new one. `submit_and_wait_one` shares the drain budget (slow-log at
-5 s, poison at the hard cap). `drain_all` on every TLS session (Linux, pool,
+5 s, poison at the hard cap). Linux wait is Ready only when the CQ has a
+visible event (`io_uring_enter` returns SQEs submitted, not CQE count); an
+empty CQ is TimedOut. Live harvest loops wait, then retry; one empty harvest
+is not batch death. `drain_all` on every TLS session (Linux, pool,
 IOCP) waits while CQEs keep arriving; after 5 s it logs `store: io_uring
 drain slow`. Zero completions for `RBITCOIN_URING_DRAIN_HARD_SECS` (default
 120) abort **explicit** `drain_all` / `DrainOnDrop` (buffers still pinned).
@@ -59,8 +62,8 @@ stalled device cannot `abort` from a destructor. There is **no** runtime
 switch to `pread`. Drain before SQE buffers drop (spend annotate
 `DrainOnDrop`). Per-op short/errno on a live session still libc-completes
 that op; libc fail is `StoreError::io`. A live unpoisoned session that fails
-the bulk batch (empty CQ / submit) is the same libc-complete, not a recover
-credit. `RBITCOIN_IO=pread` is the only
+the bulk batch after the wait budget (submit / leftover) is the same
+libc-complete, not a recover credit. `RBITCOIN_IO=pread` is the only
 whole-batch pread fallback (session unavailable also falls back; operator
 restart after a drain abort).
 

@@ -108,6 +108,13 @@ before 1.0).
 
 ### Fixed
 
+- **io_uring wait Ready requires a CQE:** `submit_and_wait_one` peeks the
+  CQ after enter. `io_uring_enter` returns SQEs submitted; an empty CQ is
+  TimedOut on the drain budget, not Ready. Live harvest (held pread/pwrite,
+  probe, BDZ g-pages, spend annotate, SP tweaks) waits then retries; one
+  empty harvest is not batch death or `io_uring wait timeout`. libc-complete
+  on a live ring remains last-resort for leftover submit/push fail.
+
 - **Mixed `create.loc` windows SIMD then ovf:** every 1024-create window
   prefix-sums with SIMD (sentinels as 0), then adds true ovf length from
   `create.loc.ovf`. Same prefix as scalar `decode_create_pair`. About half of

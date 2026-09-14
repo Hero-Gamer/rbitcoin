@@ -310,6 +310,20 @@ fn held_pread_after_inner(inner_ok: bool, poisoned: bool) -> Result<bool, StoreE
     Ok(true)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyHarvest {
+    Retry,
+    Fail,
+}
+
+fn empty_harvest_next(wait_ok: bool) -> EmptyHarvest {
+    if wait_ok {
+        EmptyHarvest::Retry
+    } else {
+        EmptyHarvest::Fail
+    }
+}
+
 fn pread_batch_on_session_inner(
     session: &mut crate::uring_session::UringSession,
     ops: &mut [ReadOp<'_>],
@@ -352,7 +366,7 @@ fn pread_batch_on_session_inner(
             break;
         }
 
-        let mut cqes = match session.harvest_ready() {
+        let cqes = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
                 let _ = session.drain_all();
@@ -360,20 +374,12 @@ fn pread_batch_on_session_inner(
             }
         };
         if cqes.is_empty() {
-            if session.submit_and_wait_one().is_err() {
-                let _ = session.drain_all();
-                return false;
-            }
-            cqes = match session.harvest_ready() {
-                Ok(c) => c,
-                Err(_) => {
+            match empty_harvest_next(session.submit_and_wait_one().is_ok()) {
+                EmptyHarvest::Retry => continue,
+                EmptyHarvest::Fail => {
                     let _ = session.drain_all();
                     return false;
                 }
-            };
-            if cqes.is_empty() {
-                let _ = session.drain_all();
-                return false;
             }
         } else if session.submit().is_err() {
             let _ = session.drain_all();
@@ -466,7 +472,7 @@ fn pwrite_batch_on_session(
             break;
         }
 
-        let mut cqes = match session.harvest_ready() {
+        let cqes = match session.harvest_ready() {
             Ok(c) => c,
             Err(_) => {
                 let _ = session.drain_all();
@@ -474,20 +480,12 @@ fn pwrite_batch_on_session(
             }
         };
         if cqes.is_empty() {
-            if session.submit_and_wait_one().is_err() {
-                let _ = session.drain_all();
-                return false;
-            }
-            cqes = match session.harvest_ready() {
-                Ok(c) => c,
-                Err(_) => {
+            match empty_harvest_next(session.submit_and_wait_one().is_ok()) {
+                EmptyHarvest::Retry => continue,
+                EmptyHarvest::Fail => {
                     let _ = session.drain_all();
                     return false;
                 }
-            };
-            if cqes.is_empty() {
-                let _ = session.drain_all();
-                return false;
             }
         } else if session.submit().is_err() {
             let _ = session.drain_all();
@@ -961,6 +959,12 @@ mod tests {
             other => panic!("poisoned ring must stay fail-closed, got {other:?}"),
         }
         assert!(held_pread_after_inner(true, false).unwrap());
+    }
+
+    #[test]
+    fn empty_cq_after_wait_is_retry_not_batch_fail() {
+        assert_eq!(empty_harvest_next(true), EmptyHarvest::Retry);
+        assert_eq!(empty_harvest_next(false), EmptyHarvest::Fail);
     }
 
     #[test]
