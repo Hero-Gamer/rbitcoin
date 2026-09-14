@@ -307,20 +307,11 @@ impl CreateLoc {
         out: &mut [Option<CreateLocPair>],
     ) -> Result<(), StoreError> {
         let win_jobs = &jobs[win.job_lo..win.job_hi];
-        match extract_pairs_no_ovf(&win.buf, win.n, win.tx0, win.sp0, win_jobs, out) {
+        match extract_pairs_no_ovf(win, win_jobs, out) {
             Ok(()) => Ok(()),
             Err(ExtractFail::NeedOvf) => {
                 let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                extract_pairs_ovf(
-                    &win.buf,
-                    win.n,
-                    win.tx0,
-                    win.sp0,
-                    win.win_first,
-                    &ovf,
-                    win_jobs,
-                    out,
-                )
+                extract_pairs_ovf(win, &ovf, win_jobs, out)
             }
         }
     }
@@ -413,21 +404,20 @@ fn emit_pair(
 }
 
 fn extract_pairs_ovf(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-    win_first: u64,
+    win: &LocWinRead,
     ovf: &[(u64, u32, u32)],
     jobs: &[(usize, u64)],
     out: &mut [Option<CreateLocPair>],
 ) -> Result<(), StoreError> {
+    let buf = &win.buf;
+    let n = win.n;
+    let win_first = win.win_first;
     let last_fk = win_first.saturating_add(n as u64).saturating_sub(1);
     let lo = ovf.partition_point(|&(fk, _, _)| fk < win_first);
     let hi = ovf.partition_point(|&(fk, _, _)| fk <= last_fk);
     let win_ovf = &ovf[lo..hi];
-    let mut tx = tx0;
-    let mut sp = sp0;
+    let mut tx = win.tx0;
+    let mut sp = win.sp0;
     let mut j = 0usize;
     for i in 0..n {
         let fk = win_first + i as u64;
@@ -445,15 +435,14 @@ fn extract_pairs_ovf(
 }
 
 fn extract_pairs_no_ovf(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
+    win: &LocWinRead,
     jobs: &[(usize, u64)],
     out: &mut [Option<CreateLocPair>],
 ) -> Result<(), ExtractFail> {
-    let mut tx = tx0;
-    let mut sp = sp0;
+    let buf = &win.buf;
+    let n = win.n;
+    let mut tx = win.tx0;
+    let mut sp = win.sp0;
     let mut i = 0usize;
     let mut j = 0usize;
     while i + 8 <= n {
@@ -514,17 +503,12 @@ fn extract_pairs_no_ovf(
 fn deinterleave_pairs_u8x8(buf: &[u8]) -> ([u8; 8], [u8; 8], bool) {
     debug_assert!(buf.len() >= 16);
     #[cfg(target_arch = "x86_64")]
-    {
-        return unsafe { sse2_deinterleave_pairs_u8x8(buf.as_ptr()) };
-    }
+    let out = unsafe { sse2_deinterleave_pairs_u8x8(buf.as_ptr()) };
     #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { neon_deinterleave_pairs_u8x8(buf.as_ptr()) };
-    }
+    let out = unsafe { neon_deinterleave_pairs_u8x8(buf.as_ptr()) };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        deinterleave_pairs_u8x8_scalar(buf)
-    }
+    let out = deinterleave_pairs_u8x8_scalar(buf);
+    out
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -544,25 +528,21 @@ fn deinterleave_pairs_u8x8_scalar(buf: &[u8]) -> ([u8; 8], [u8; 8], bool) {
 
 fn inclusive_u8x8_times_8(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
     #[cfg(target_arch = "x86_64")]
-    {
-        return unsafe {
-            (
-                sse2_u8x8_times_8_inclusive(st.as_ptr()),
-                sse2_u8x8_times_8_inclusive(no.as_ptr()),
-            )
-        };
-    }
+    let out = unsafe {
+        (
+            sse2_u8x8_times_8_inclusive(st.as_ptr()),
+            sse2_u8x8_times_8_inclusive(no.as_ptr()),
+        )
+    };
     #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe {
-            (
-                neon_u8x8_times_8_inclusive(st.as_ptr()),
-                neon_u8x8_times_8_inclusive(no.as_ptr()),
-            )
-        };
-    }
+    let out = unsafe {
+        (
+            neon_u8x8_times_8_inclusive(st.as_ptr()),
+            neon_u8x8_times_8_inclusive(no.as_ptr()),
+        )
+    };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
+    let out = {
         let mut tx = [0u32; 8];
         let mut sp = [0u32; 8];
         let mut t = 0u32;
@@ -574,7 +554,8 @@ fn inclusive_u8x8_times_8(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
             sp[k] = s;
         }
         (tx, sp)
-    }
+    };
+    out
 }
 
 /// # Safety
@@ -608,11 +589,11 @@ unsafe fn neon_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool)
     use std::arch::aarch64::{vceq_u8, vdup_n_u8, vld2_u8, vmaxv_u8, vst1_u8};
     let v = vld2_u8(p);
     let z = vdup_n_u8(0);
-    let has_zero = vmaxv_u8(vceq_u8(v.val[0], z)) != 0 || vmaxv_u8(vceq_u8(v.val[1], z)) != 0;
+    let has_zero = vmaxv_u8(vceq_u8(v.0, z)) != 0 || vmaxv_u8(vceq_u8(v.1, z)) != 0;
     let mut st = [0u8; 8];
     let mut no = [0u8; 8];
-    vst1_u8(st.as_mut_ptr(), v.val[0]);
-    vst1_u8(no.as_mut_ptr(), v.val[1]);
+    vst1_u8(st.as_mut_ptr(), v.0);
+    vst1_u8(no.as_mut_ptr(), v.1);
     (st, no, has_zero)
 }
 
