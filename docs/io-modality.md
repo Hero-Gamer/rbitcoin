@@ -58,7 +58,9 @@ Session `Drop` waits the same budget then poisons without aborting so a
 stalled device cannot `abort` from a destructor. There is **no** runtime
 switch to `pread`. Drain before SQE buffers drop (spend annotate
 `DrainOnDrop`). Per-op short/errno on a live session still libc-completes
-that op; libc fail is `StoreError::io`. `RBITCOIN_IO=pread` is the only
+that op; libc fail is `StoreError::io`. A live unpoisoned session that fails
+the bulk batch (empty CQ / submit) is the same libc-complete, not a recover
+credit. `RBITCOIN_IO=pread` is the only
 whole-batch pread fallback (session unavailable also falls back; operator
 restart after a drain abort).
 

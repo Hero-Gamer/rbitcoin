@@ -79,6 +79,25 @@ fn uring_recover_or_abort_takes_credit() {
 }
 
 #[test]
+fn held_pread_fault_string_exhausts_lookup_recover_at_same_tip() {
+    use rbitcoin_store::StoreError;
+    assert!(
+        StoreError::Corrupt("invariant: io_uring held pread failed").is_uring_session_fault(),
+        "if loc still emitted this, lookup would recover then abort"
+    );
+    let (_d, q) = temp_query("held-pread-lookup-abort");
+    assert_eq!(
+        q.uring_recover("ibd-confirm-lookup"),
+        UringRecover::Recovered
+    );
+    assert_eq!(
+        q.uring_recover("ibd-confirm-lookup"),
+        UringRecover::Exhausted,
+        "second fault in the same 1000-height window aborts IBD"
+    );
+}
+
+#[test]
 fn header_has_class_a_body_from_fk_not_hash() {
     let (dir, q) = temp_query("has-body-fk");
     let (header, ta) = coinbase_block(0, Fk::NULL, None);

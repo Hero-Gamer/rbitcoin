@@ -113,11 +113,15 @@ before 1.0).
   `create.loc.ovf`. Same prefix as scalar `decode_create_pair`. About half of
   mainnet windows near height 896k have at least one overflow slot.
 
+- **Held loc pread live-ring fail is not recover-abort:** empty CQ / submit
+  fail on an unpoisoned ring returns `Ok(true)` so loc libc-completes those
+  windows. That used to be `io_uring held pread failed`, which consumed the
+  once-per-1000 recover credit and aborted IBD (`ibd-confirm-lookup` at tip
+  902337). Poison / leftover CQEs stay fail-closed.
+
 - **Held loc pread errno is not session death:** per-op short/errno on a live
   io_uring ring returns `Ok(true)` so loc libc-completes that window (same
-  as `txid.body`). Poison / leftover CQEs stay fail-closed. Remaining session
-  fail is `invariant: io_uring held pread failed` so lookup takes uring recover
-  instead of WARN corrupt record.
+  as `txid.body`). Poison / leftover CQEs stay fail-closed.
 
 - **IBD stamp loc by fk on InFlight TipOnly miss:** lookup can run a later
   wave before the parent is in `tx.head`, so the skeleton is empty while
