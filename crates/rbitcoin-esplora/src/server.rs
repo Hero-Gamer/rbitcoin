@@ -927,6 +927,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn http_503_chain_view_moved_omits_tip_header() {
+        let (dir, q) = temp_query("http-503-moved");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let state = AppState {
+            query: Arc::new(q),
+            network: Network::Regtest,
+            mempool: None,
+            max_body: 1024,
+            tip_tx: None,
+            ws_sem: None,
+            max_ws_message_bytes: 1024,
+            max_track_addresses: 1,
+            max_track_txs: 1,
+            sh_join: Arc::new(Mutex::new(None)),
+        };
+        async fn die_tip(State(st): State<AppState>) -> &'static str {
+            st.query.disconnect_tip().unwrap();
+            "ok"
+        }
+        let app = Router::new()
+            .route("/blocks/tip/hash", get(die_tip))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                stamp_chain_view_mw,
+            ))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (st, raw, body) = http_get_raw(addr, "/blocks/tip/hash").await;
+        assert_eq!(st, 503, "body={body}");
+        assert!(
+            body.contains("chain view moved"),
+            "503 body must name the move: {body}"
+        );
+        assert!(
+            header_value(&raw, HDR_CHAIN_TIP).is_none(),
+            "503 must not stamp a fork tip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[allow(clippy::cognitive_complexity)] // one listener, path/asof/POST junk table
     #[tokio::test]
     async fn http_junk_paths_asof_and_post() {
