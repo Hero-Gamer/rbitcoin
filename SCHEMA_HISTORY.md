@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 22`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 23`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **22** | `create.loc` + `inwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | **Current** |
+| **23** | `create.loc.ovf` 16 B (u32 strides / `n_out`). Occupied 22 rewrites 12 B ovf. Occupied 15–21 Class A refused. | **Current** |
+| **22** | `create.loc` + `inwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | Prior |
 | **21** | Drop `spent.idx`. Spent ranges are `8 × max(n_out,1)` from txout meta; sparse `spent.off`. Unlink leftover idx; rewrite `meta` 20→21. Table headers 13–20 remain openable. | Prior |
 | **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). Refuse occupied 18/19 `tx.head` / `scripthash*`. Leftover fuse8 v1, flat `*.idx.meta`, Shared SH body, pack8 Paged (mode 10) refuse. | Prior |
 | **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
@@ -35,6 +36,17 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v23 (create.loc.ovf u32)
+
+`create.loc.ovf` rows are 16 B: `fk:u64` + `strides:u32` + `n_out:u32`.
+Schema 22 stored those as u16 (max 524 280 B aligned txout / 65535 outputs).
+A consensus-valid ~1 MiB OP_RETURN (mainnet 896696) is ~125k strides; a 1 MB
+stripped tx of min-size outputs can exceed 65535 outs. Slot sentinels stay
+2 B (`0` at ≥256). Occupied 22 rewrites 12 B ovf via tmp+rename and `meta` to
+23. Occupied 15–21 Class A still refuses. Spent vin stays u16 (8 B slot;
+stripped input ≥ ~41 B). `inwit.loc.ovf` was already u32 strides. A 22 binary
+refuses 23 `meta`. Table file headers 13–22 remain openable.
 
 ## v22 (create.loc + inwit.loc + vin pack + amount exp)
 

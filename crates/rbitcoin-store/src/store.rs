@@ -336,7 +336,7 @@ impl Store {
                 "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
             ));
         }
-        if (15..SCHEMA_VERSION).contains(&meta_ver) && class_a_has_creates(&path) {
+        if (15..22).contains(&meta_ver) && class_a_has_creates(&path) {
             return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
         }
         if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
@@ -2224,7 +2224,7 @@ mod tests {
             "schema 22 open must keep create.loc"
         );
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 22);
+        assert_eq!(SCHEMA_VERSION, 23);
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
@@ -2262,6 +2262,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn ovf_data_len(dir: &Path) -> u64 {
+        let bytes = std::fs::read(dir.join("create.loc.ovf")).unwrap();
+        let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        logical - crate::file::FILE_HEADER_LEN as u64
+    }
+
+    fn write_legacy_create_ovf_v22(dir: &Path, rows: &[(u64, u16, u16)]) {
+        use crate::file::FILE_HEADER_LEN;
+        use rbitcoin_primitives::TableKind;
+        let mut payload = Vec::new();
+        for &(fk, st, n) in rows {
+            payload.extend_from_slice(&fk.to_le_bytes());
+            payload.extend_from_slice(&st.to_le_bytes());
+            payload.extend_from_slice(&n.to_le_bytes());
+        }
+        let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+        let mut blob = vec![0u8; FILE_HEADER_LEN];
+        blob[0..4].copy_from_slice(&STORE_MAGIC);
+        blob[4..6].copy_from_slice(&22u16.to_le_bytes());
+        blob[6..8].copy_from_slice(&TableKind::DeltaLoc.as_u16().to_le_bytes());
+        blob[8..16].copy_from_slice(&logical.to_le_bytes());
+        blob.extend_from_slice(&payload);
+        std::fs::write(dir.join("create.loc.ovf"), blob).unwrap();
+    }
+
+    fn snapshot_create_ovf_as_v22_12b(dir: &Path) {
+        use crate::file::FILE_HEADER_LEN;
+        let bytes = std::fs::read(dir.join("create.loc.ovf")).unwrap();
+        let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let data = &bytes[FILE_HEADER_LEN..logical as usize];
+        let mut rows = Vec::new();
+        if data.len().is_multiple_of(16)
+            && (!data.len().is_multiple_of(12) || { data.len() >= 16 && data[10..12] == [0, 0] })
+        {
+            for chunk in data.chunks_exact(16) {
+                let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let st = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let n = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+                rows.push((fk, st as u16, n as u16));
+            }
+        } else {
+            for chunk in data.chunks_exact(12) {
+                let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let st = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
+                let n = u16::from_le_bytes(chunk[10..12].try_into().unwrap());
+                rows.push((fk, st, n));
+            }
+        }
+        write_legacy_create_ovf_v22(dir, &rows);
+    }
+
+    #[test]
+    fn put_full_fat_txout_past_u16_strides() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let script = vec![0u8; 524_288];
+        let item = coinbase_item([0x89u8; 32], vec![OutputRecord::unspent(0, script.clone())]);
+        let fk = s.put_tx_full_batch_indexed(&[item], true).unwrap()[0];
+        let (tx, _ins, outs) = s.get_tx_full(fk).unwrap();
+        assert_eq!(tx.output_count, 1);
+        assert_eq!(outs[0].script.len(), 524_288);
+        drop(s);
+        let s = Store::open_tiny(&dir).unwrap();
+        let (_tx, _ins, outs) = s.get_tx_full(fk).unwrap();
+        assert_eq!(outs[0].script.len(), 524_288);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_schema22_occupied_rewrites_create_ovf_12_to_16() {
+        let dir = tmp();
+        let n_out = 256u32;
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            let outs = vec![OutputRecord::unspent(1, vec![0x51]); n_out as usize];
+            let item = coinbase_item([0x22u8; 32], outs);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        snapshot_create_ovf_as_v22_12b(&dir);
+        write_store_meta_ver(&dir, 22);
+        assert_eq!(ovf_data_len(&dir), 12);
+        let s = Store::open_tiny(&dir).unwrap();
+        let (tx, _ins, outs) = s.get_tx_full(Fk(1)).unwrap();
+        assert_eq!(tx.output_count, n_out);
+        assert_eq!(outs.len(), n_out as usize);
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        assert_eq!(ovf_data_len(&dir), 16);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn open_schema21_empty_rewrites_meta_and_unlinks_spent_off() {
         let dir = tmp();
@@ -2277,7 +2369,7 @@ mod tests {
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 22);
+        assert_eq!(SCHEMA_VERSION, 23);
         assert!(
             !dir.join("spent.off").exists(),
             "empty 21 open must unlink leftover spent.off"

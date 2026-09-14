@@ -4,8 +4,9 @@
 
 use crate::bulk_io::ReadOp;
 use crate::delta_loc::{
-    create_table_file, decode_create_pair, load_create_ovf, loc_file_off, loc_window, loc_within,
-    open_table_file, pack_create_pair, strides_from_aligned_len, IDX_STRIDE, LOC_WINDOW,
+    create_table_file, decode_create_pair, encode_create_ovf_row, load_create_ovf, loc_file_off,
+    loc_window, loc_within, migrate_create_ovf_v22_if_needed, open_table_file, pack_create_pair,
+    strides_from_aligned_len, CREATE_OVF_SLOT, IDX_STRIDE, LOC_WINDOW,
 };
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -17,7 +18,6 @@ use std::sync::RwLock;
 
 const SLOT: u64 = 2;
 const OFF_SLOT: u64 = 16;
-const OVF_SLOT: u64 = 12;
 
 /// Slots to read and prefix-sum in `[win_first, win_last]` for the highest needed fk.
 #[inline]
@@ -69,6 +69,9 @@ impl CreateLoc {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let loc = open_table_file(&dir.join("create.loc"), TableKind::DeltaLoc)?;
         let ovf_path = dir.join("create.loc.ovf");
+        if ovf_path.exists() {
+            migrate_create_ovf_v22_if_needed(&ovf_path)?;
+        }
         let ovf = if ovf_path.exists() {
             open_table_file(&ovf_path, TableKind::DeltaLoc)?
         } else {
@@ -129,11 +132,9 @@ impl CreateLoc {
         {
             let mut rows = self.ovf_rows.write().unwrap_or_else(|e| e.into_inner());
             rows.retain(|r| r.0 <= new_count);
-            let mut blob = Vec::with_capacity(rows.len() * OVF_SLOT as usize);
+            let mut blob = Vec::with_capacity(rows.len() * CREATE_OVF_SLOT as usize);
             for &(fk, st, n_out) in rows.iter() {
-                blob.extend_from_slice(&fk.to_le_bytes());
-                blob.extend_from_slice(&(st as u16).to_le_bytes());
-                blob.extend_from_slice(&(n_out as u16).to_le_bytes());
+                blob.extend_from_slice(&encode_create_ovf_row(fk, st, n_out));
             }
             self.ovf
                 .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
@@ -173,12 +174,8 @@ impl CreateLoc {
             loc_bytes.push(s8);
             loc_bytes.push(n8);
             if let Some((os, on)) = ovf {
-                let mut row = [0u8; OVF_SLOT as usize];
-                row[0..8].copy_from_slice(&fk.to_le_bytes());
-                row[8..10].copy_from_slice(&os.to_le_bytes());
-                row[10..12].copy_from_slice(&on.to_le_bytes());
-                ovf_bytes.extend_from_slice(&row);
-                new_ovf.push((fk, u32::from(os), u32::from(on)));
+                ovf_bytes.extend_from_slice(&encode_create_ovf_row(fk, os, on));
+                new_ovf.push((fk, os, on));
             }
             if fk.is_multiple_of(LOC_WINDOW) {
                 new_offs.push((
@@ -392,6 +389,46 @@ struct LocWinRead {
 type LocPrefix = (Vec<u64>, Vec<u64>, Vec<u32>);
 
 fn prefix_sum_create_ovf(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    win_first: u64,
+    ovf: &[(u64, u32, u32)],
+) -> Result<LocPrefix, StoreError> {
+    let last_fk = win_first.saturating_add(n as u64).saturating_sub(1);
+    let lo = ovf.partition_point(|&(fk, _, _)| fk < win_first);
+    let hi = ovf.partition_point(|&(fk, _, _)| fk <= last_fk);
+    let win_ovf = &ovf[lo..hi];
+    let (mut tx_ps, mut sp_ps, mut n_outs) = prefix_sum_create_no_ovf(buf, n, tx0, sp0);
+    let mut extra_tx = 0u64;
+    let mut extra_sp = 0u64;
+    for i in 0..n {
+        let s8 = buf[i * 2];
+        let n8 = buf[i * 2 + 1];
+        if s8 == 0 || n8 == 0 {
+            let fk = win_first + i as u64;
+            let (st, n_out) = decode_create_pair(s8, n8, fk, win_ovf)?;
+            extra_tx = extra_tx.saturating_add(
+                u64::from(st)
+                    .saturating_mul(IDX_STRIDE)
+                    .saturating_sub(u64::from(s8).saturating_mul(IDX_STRIDE)),
+            );
+            extra_sp = extra_sp.saturating_add(
+                u64::from(n_out)
+                    .saturating_mul(IDX_STRIDE)
+                    .saturating_sub(u64::from(n8).saturating_mul(IDX_STRIDE)),
+            );
+            n_outs[i] = n_out;
+        }
+        tx_ps[i + 1] = tx_ps[i + 1].saturating_add(extra_tx);
+        sp_ps[i + 1] = sp_ps[i + 1].saturating_add(extra_sp);
+    }
+    Ok((tx_ps, sp_ps, n_outs))
+}
+
+#[cfg(test)]
+fn prefix_sum_create_ovf_scalar(
     buf: &[u8],
     n: usize,
     tx0: u64,
@@ -618,6 +655,30 @@ mod tests {
         out
     }
 
+    fn ovf_data_len(dir: &Path) -> u64 {
+        let bytes = std::fs::read(dir.join("create.loc.ovf")).unwrap();
+        let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        logical - FILE_HEADER_LEN as u64
+    }
+
+    fn write_legacy_create_ovf_v22(dir: &Path, rows: &[(u64, u16, u16)]) {
+        use rbitcoin_primitives::{TableKind, STORE_MAGIC};
+        let mut payload = Vec::new();
+        for &(fk, st, n) in rows {
+            payload.extend_from_slice(&fk.to_le_bytes());
+            payload.extend_from_slice(&st.to_le_bytes());
+            payload.extend_from_slice(&n.to_le_bytes());
+        }
+        let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+        let mut blob = vec![0u8; FILE_HEADER_LEN];
+        blob[0..4].copy_from_slice(&STORE_MAGIC);
+        blob[4..6].copy_from_slice(&22u16.to_le_bytes());
+        blob[6..8].copy_from_slice(&TableKind::DeltaLoc.as_u16().to_le_bytes());
+        blob[8..16].copy_from_slice(&logical.to_le_bytes());
+        blob.extend_from_slice(&payload);
+        std::fs::write(dir.join("create.loc.ovf"), blob).unwrap();
+    }
+
     #[test]
     fn create_loc_n_out_1_and_3() {
         let dir = TempDir::labeled("create-loc-13").unwrap();
@@ -730,6 +791,58 @@ mod tests {
     }
 
     #[test]
+    fn create_loc_txout_past_u16_strides() {
+        let dir = TempDir::labeled("create-loc-u16-strides").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        let len = 65536 * IDX_STRIDE;
+        loc.append(&chain(&[1], &[len])).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, len);
+        assert_eq!(got[0].unwrap().n_out, 1);
+        drop(loc);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, len);
+        assert_eq!(got[0].unwrap().n_out, 1);
+        assert_eq!(ovf_data_len(dir.path()), 16);
+    }
+
+    #[test]
+    fn create_loc_n_out_past_u16() {
+        let dir = TempDir::labeled("create-loc-u16-nout").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[65536], &[8])).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().n_out, 65536);
+        assert_eq!(got[0].unwrap().spent.1, 65536 * IDX_STRIDE);
+        drop(loc);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        assert_eq!(loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap().n_out, 65536);
+        assert_eq!(ovf_data_len(dir.path()), 16);
+    }
+
+    #[test]
+    fn create_loc_opens_legacy_12b_ovf() {
+        let dir = TempDir::labeled("create-loc-ovf12").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[256, 256, 256, 256], &[8, 8, 8, 8]))
+            .unwrap();
+        drop(loc);
+        write_legacy_create_ovf_v22(
+            dir.path(),
+            &[(1, 1, 256), (2, 1, 256), (3, 1, 256), (4, 1, 256)],
+        );
+        assert_eq!(ovf_data_len(dir.path()), 48);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        let got = loc.range_batch(&[Fk(1), Fk(2), Fk(3), Fk(4)]).unwrap();
+        for g in &got {
+            assert_eq!(g.unwrap().n_out, 256);
+            assert_eq!(g.unwrap().spent.1, 256 * IDX_STRIDE);
+        }
+        assert_eq!(ovf_data_len(dir.path()), 64);
+    }
+
+    #[test]
     fn create_loc_mixed_window_overflow() {
         let dir = TempDir::labeled("create-loc-mix").unwrap();
         let loc = CreateLoc::create(dir.path()).unwrap();
@@ -746,6 +859,31 @@ mod tests {
         assert_eq!(
             got[2].unwrap().spent.0,
             FILE_HEADER_LEN as u64 + 7 * 8 + 256 * 8 + 7 * 8
+        );
+        if let Ok(mut sess) =
+            crate::uring_session::UringSession::try_open(crate::uring_session::DEFAULT_ENTRIES)
+        {
+            let held = loc
+                .range_batch_ctx(&[Fk(8), Fk(1), Fk(16)], &mut crate::IoCtx::held(&mut sess))
+                .unwrap();
+            assert_eq!(held, got);
+        }
+    }
+
+    #[test]
+    fn create_loc_mixed_window_u32_strides() {
+        let dir = TempDir::labeled("create-loc-mix-u32").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        let n_out = vec![1u32; 8];
+        let mut lens = vec![8u64; 8];
+        lens[3] = 65536 * IDX_STRIDE;
+        loc.append(&chain(&n_out, &lens)).unwrap();
+        let got = loc.range_batch(&[Fk(4), Fk(1), Fk(8)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, 65536 * IDX_STRIDE);
+        assert_eq!(got[1].unwrap().txout.1, 8);
+        assert_eq!(
+            got[2].unwrap().txout.0,
+            FILE_HEADER_LEN as u64 + 3 * 8 + 65536 * IDX_STRIDE + 3 * 8
         );
     }
 
@@ -801,6 +939,42 @@ mod tests {
                 "fat n={n}"
             );
         }
+    }
+
+    #[test]
+    fn prefix_sum_mixed_window_matches_scalar() {
+        let n = 16usize;
+        let mut buf = vec![0u8; n * 2];
+        for i in 0..n {
+            buf[i * 2] = ((i % 10) + 1) as u8;
+            buf[i * 2 + 1] = ((i % 7) + 1) as u8;
+        }
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[7 * 2] = 0;
+        buf[7 * 2 + 1] = 3;
+        buf[15 * 2] = 5;
+        buf[15 * 2 + 1] = 0;
+        let ovf = vec![(1, 300u32, 400u32), (8, 256, 3), (16, 5, 512)];
+        let got = prefix_sum_create_ovf(&buf, n, 64, 80, 1, &ovf).unwrap();
+        let want = prefix_sum_create_ovf_scalar(&buf, n, 64, 80, 1, &ovf).unwrap();
+        assert_eq!(got, want);
+        assert_ne!(
+            got,
+            prefix_sum_create_no_ovf(&buf, n, 64, 80),
+            "sentinel-as-zero SIMD must be corrected from ovf"
+        );
+
+        let n2 = 8usize;
+        let mut buf2 = vec![1u8; n2 * 2];
+        buf2[3 * 2] = 0;
+        buf2[3 * 2 + 1] = 0;
+        let ovf2 = vec![(4, 65536u32, 1u32)];
+        let got2 = prefix_sum_create_ovf(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
+        let want2 = prefix_sum_create_ovf_scalar(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
+        assert_eq!(got2, want2);
+        assert_eq!(got2.0[4] - got2.0[3], 65536 * IDX_STRIDE);
+        assert_eq!(got2.2[3], 1);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

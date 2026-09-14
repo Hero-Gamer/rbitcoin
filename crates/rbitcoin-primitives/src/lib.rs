@@ -62,6 +62,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **23:** `create.loc.ovf` rows are 16 B (`fk:u64` + strides/`n_out` u32) so a
+///         ~1 MiB consensus-valid txout (and `n_out > 65535`) stores. Occupied
+///         22 Class A rewrites 12 B ovf rows and `meta`. Occupied 15–21 Class A
+///         still refused. Empty 13–22 rewrite `meta`.
 /// **22:** `create.loc` + `inwit.loc`; LAYOUT17 omits `output_count`. Spent
 ///         slot is flags + u40 spend fk + u16 vin. Occupied 21 Class A
 ///         refused (wipe + IBD). Empty 21 rewrites `meta` and unlinks
@@ -84,20 +88,20 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 22;
+pub const SCHEMA_VERSION: u16 = 23;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **22** is current (`create.loc` + `inwit.loc`; occupied 21 Class A
-/// refused). Schema **21** empty Class A rewrites `meta`. Schema **20** table
-/// headers still open when Class A is empty. Schema **18/19** with occupied
-/// `tx.head` or `scripthash*` are refused; empty 18/19 indexes rewrite `meta`.
-/// Schema **17** still refuses populated `tx.head` / `scripthash*` or rewrites
-/// empty indexes. Schema **13**–**16** still soft-open empty Class A / empty SH
-/// (meta rewrite).
+/// Schema **23** is current (`create.loc.ovf` 16 B). Occupied **22** Class A
+/// rewrites 12 B ovf rows. Occupied 21 Class A is refused. Schema **21** empty
+/// Class A rewrites `meta`. Schema **20** table headers still open when Class A
+/// is empty. Schema **18/19** with occupied `tx.head` or `scripthash*` are
+/// refused; empty 18/19 indexes rewrite `meta`. Schema **17** still refuses
+/// populated `tx.head` / `scripthash*` or rewrites empty indexes. Schema **13**–**16**
+/// still soft-open empty Class A / empty SH (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver == SCHEMA_VERSION || (SCHEMA_VERSION == 22 && matches!(ver, 13..=21))
+    (13..=SCHEMA_VERSION).contains(&ver)
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -323,8 +327,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 22);
+        assert_eq!(SCHEMA_VERSION, 23);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(23));
         assert!(schema_file_openable(22));
         assert!(schema_file_openable(21));
         assert!(schema_file_openable(20));
@@ -336,6 +341,7 @@ mod tests {
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));
+        assert!(!schema_file_openable(24));
         assert!(!schema_file_openable(0));
     }
 

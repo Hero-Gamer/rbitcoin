@@ -161,9 +161,11 @@ mod tests {
             "io_uring submit_and_wait failed",
             "invariant: io_uring leftover cqe",
             "io_uring submit failed",
+            "invariant: io_uring held pread failed",
         ] {
             assert!(StoreError::Corrupt(m).is_uring_session_fault(), "{m}");
         }
+        assert!(!StoreError::Corrupt("invariant: held pread failed").is_uring_session_fault());
         assert!(!StoreError::BudgetFull("io_uring SQ").is_uring_session_fault());
         assert!(!StoreError::Unavailable.is_uring_session_fault());
         assert!(!StoreError::Corrupt("io_uring is Linux-only").is_uring_session_fault());

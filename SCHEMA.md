@@ -1,20 +1,22 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 22` (`rbitcoin_primitives`).  
-**Status:** 22 is `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`),
-LAYOUT17 without `output_count`, and spent slots flags + u40 spend fk + u16 vin
-(still 8 bytes). `txout` amount is flags bits 4–7 = decimal exponent (0–9) +
-ULEB mantissa (`sats = mantissa × 10^e`). Encoding is canonical compact: strip
-trailing tens up to `e=9` (`e<9` and mantissa divisible by 10 is Corrupt; zero
-is `e=0`, mantissa 0). Occupied
+**Version:** `SCHEMA_VERSION = 23` (`rbitcoin_primitives`).  
+**Status:** 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out` u32) so a
+consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22 Class A
+rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `inwit.loc` (no Class A
+`{txout,spent,inwit}.idx`), LAYOUT17 without `output_count`, and spent slots flags
++ u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bits 4–7 =
+decimal exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`). Encoding is
+canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa divisible
+by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
 15–21 LAYOUT17 Class A with creates is **refused**
-(wipe datadir and redo IBD). Empty 15–21 rewrite `meta` to 22 and unlink leftover
-`spent.off` and leftover `*.idx`. A 21 binary refuses 22 `meta`. Occupied schema
+(wipe datadir and redo IBD). Empty 15–22 rewrite `meta` to 23 and unlink leftover
+`spent.off` and leftover `*.idx`. A 22 binary refuses 23 `meta`. Occupied schema
 18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
-dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 22; `tx.head` rebuilds
+dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 23; `tx.head` rebuilds
 from Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
 `meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
-Class A is **refused**. Empty 17 indexes rewrite `meta` to 22.
+Class A is **refused**. Empty 17 indexes rewrite `meta` to 23.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -47,13 +49,13 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
 **17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 22 **before** `TxTable::open` (so a following
+Empty 17 indexes rewrite `meta` to 23 **before** `TxTable::open` (so a following
 head rebuild cannot trip the refuse). Occupied 17 Class A with creates is the
 schema-22 Class A refuse (not an index wipe).  
 **18/19→22 open:** Occupied Class A with creates is the schema-22 Class A refuse.
 If Class A is empty and `tx.head` occupancy or any `scripthash*` data exists:
 `schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)`.
-Empty 18/19 indexes rewrite `meta` to 22 **before** `ScriptHashTable::open` /
+Empty 18/19 indexes rewrite `meta` to 23 **before** `ScriptHashTable::open` /
 `TxTable::open`. `meta=22` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
 **18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
 A **20** binary refuses leftover pack8 Paged (mode 10).  
@@ -68,9 +70,10 @@ index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* the
 ```  
 **21→22 open:** occupied Class A with creates:
 `schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.
-Empty 21 rewrites `store/meta` to 22 and unlinks leftover `spent.off`.
-Table file headers 13–21 remain `schema_file_openable`. A 21 binary refuses 22 `meta`.
-Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 22.
+Empty 21 rewrites `store/meta` to 23 and unlinks leftover `spent.off`.
+Table file headers 13–22 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 23.
+**22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -85,7 +88,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |--------|----------------|
 | Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
-| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21/22. Flat `*.idx.meta` **refused**. |
+| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21/22/23. Flat `*.idx.meta` **refused**. |
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **dir** (sharded). Leftover file body **refused**. Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
@@ -273,7 +276,8 @@ the hot volume.
 Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`).
 
 - **body:** append-oriented **unframed** payloads (no per-record length prefix).
-- **loc:** schema 22 `create.loc` (txout + `n_out`) and `inwit.loc` (cold).
+- **loc:** schema 22 `create.loc` (txout + `n_out`) and `inwit.loc` (cold);
+  schema 23 ovf is 16 B u32 strides/`n_out`.
   Header hash lookup is a separate `HashHead`, not this loc.
 - Record length = loc pair (txout/spent) or `inwit.loc` (inwit). Last record
   uses 8-aligned published body end.
@@ -362,27 +366,30 @@ in RAM. Soft `TxRecord.txid` is filled from the sidefile on get paths.
 ```text
 create.off              # ArrayLink: per 1024 creates, u64 txout_abs + u64 spent_abs
 create.loc              # 2 B/create: (txout_strides:u8, n_out:u8)
-create.loc.ovf          # sorted 12 B: fk:u64, strides:u16, n_out:u16
+create.loc.ovf          # sorted 16 B: fk:u64, strides:u32, n_out:u32
 inwit.loc / inwit.off / inwit.loc.ovf   # u16 strides; cold with inwit.body
 ```
 
 `n_out` is the true output count, always ≥ 1. Spent length is `8 × n_out`.
 Loc byte **0** = overflow (`n_out ≥ 256` or txout aligned length ≥ 2048).
+`create.loc.ovf` holds the true u32 strides and `n_out` (a ~1 MiB OP_RETURN is
+~125k strides; min-size outputs in a 1 MB stripped tx can exceed 65535).
 `inwit.loc` **0** = overflow (`strides ≥ 65536`, i.e. ≥ 512 KiB). Missing ovf
 when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
 (or inwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`. Lookup `range_batch`
 reads and prefix-sums only through the highest fk in each 1024-create window
 (not the unused tail). Those window preads are **one** bulk batch (held
-head-resolve session, else `pread_batch`). Non-overflow windows use a SIMD
-prefix sum (`u8×8` SSE2 on x86_64, NEON on aarch64).
+head-resolve session, else `pread_batch`). Every window uses a SIMD prefix
+sum (`u8×8` SSE2 on x86_64, NEON on aarch64); overflow slots (u8 `0`) are then
+corrected from `create.loc.ovf`.
 
 One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
 stamps both ranges; load copies the stamp; write appends loc and keeps RAM
 packs until write of the last height whose TipOnly had started at note
 (`lookup_started_hi`; just-written abs; fill of that write runs first). Write
 does not pread `create.loc`. Occupied 21 Class A
-is refused. Leftover `{txout,spent,inwit}.idx` and `spent.off` are unlinked on
-empty 21/22 open.
+is refused. Occupied 22 rewrites `create.loc.ovf` 12 B → 16 B. Leftover
+`{txout,spent,inwit}.idx` and `spent.off` are unlinked on empty 21/22/23 open.
 
 `spent_abs(off, vout) = off + 8×vout`.
 

@@ -581,7 +581,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](./SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 22`). This section is
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 23`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -591,20 +591,22 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **22** | Open. |
-| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 22, then open. |
+| **23** | Open. |
+| **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B rows to 16 B, rewrite `meta` to 23, then open. |
+| **22**, empty Class A | Rewrite `meta` to 23, then open. |
+| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 23, then open. |
 | **21**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 22, then open. |
+| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 23, then open. |
 | **20**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 22, then open. |
+| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 23, then open. |
 | **19** or **18**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
 | **19** or **18**, empty Class A, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
-| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 22, then open. |
+| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 23, then open. |
 | **17**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
 | **17**, empty Class A, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
-A **21 binary** refuses 22 `meta` (do not downgrade in place). A **19 binary** refuses 20+ `meta`.
+A **22 binary** refuses 23 `meta` (do not downgrade in place). A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
 When the schema-22 Class A refuse fires, the log line is:
 
