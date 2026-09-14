@@ -470,6 +470,165 @@ fn confirm_engine_pins_spend_after_later_wave_intervening_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Mainnet 133433: lookup of the child wave starts before the parent is in
+/// `tx.head`, so TipOnly misses. InFlight still has the pin; write loc is
+/// already pruned. Offer the child after lookup has taken the parent, without
+/// waiting for tip (write may still be in flight / head may lag).
+#[test]
+fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
+    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
+
+    use crate::ibd::status::LoopStats;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use rbitcoin_consensus::{
+        mine_empty_regtest, mine_regtest_paying, pad_empty_from, ChainParams,
+    };
+
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("engine-133433");
+    hub0.query.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let hub = Arc::new(hub0);
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().expect("genesis");
+    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let maturity = params.coinbase_maturity();
+    let (tip, tip_time, cbs) =
+        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
+    let matured = cbs[0];
+    let spend = |prev: Txid, val: Amount| Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: val,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let h_parent = maturity + 2;
+    let parent = mine_regtest_paying(
+        tip,
+        tip_time + 600,
+        h_parent,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend(matured, Amount::from_sat(49_0000_0000))],
+    );
+    let parent_spend_txid = parent.txdata[1].compute_txid();
+    let empty = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, h_parent + 1);
+    let child_h = h_parent + 2;
+    let child = mine_regtest_paying(
+        empty.block_hash(),
+        empty.header.time + 600,
+        child_h,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
+    );
+
+    let feed = Arc::new(ConfirmFeed::new());
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    let accepted = Arc::new(AtomicU32::new(0));
+    let (engine, _queues) = spawn_confirm_engine(
+        Arc::clone(&hub),
+        Arc::clone(&feed),
+        ev_tx,
+        accepted,
+        Arc::new(LoopStats::default()),
+    );
+
+    let wait_tip = |want: u32| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if hub.tip_height() == Some(want) {
+                return;
+            }
+            match ev_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(ConfirmEvent::Reject { height, err, .. }) => {
+                    panic!("confirm reject @{height}: {err}");
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "timeout waiting for tip={want} (have {:?})",
+                            hub.tip_height()
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "confirm engine exited before tip={want} (have {:?})",
+                        hub.tip_height()
+                    );
+                }
+            }
+        }
+    };
+
+    let wait_taken = |want: u32| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if hub.query.lookup_taken_hi() >= Some(want) {
+                return;
+            }
+            match ev_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(ConfirmEvent::Reject { height, err, .. }) => {
+                    panic!("confirm reject @{height}: {err}");
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if Instant::now() > deadline {
+                        panic!(
+                            "timeout waiting for lookup_taken_hi>={want} (have {:?})",
+                            hub.query.lookup_taken_hi()
+                        );
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "confirm engine exited before lookup_taken_hi={want} (have {:?})",
+                        hub.query.lookup_taken_hi()
+                    );
+                }
+            }
+        }
+    };
+
+    let enqueue = |h: u32, b: &bitcoin::Block| {
+        hub.query
+            .block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b))
+            .unwrap();
+        feed.note(h, b.block_hash());
+    };
+
+    enqueue(h_parent, &parent);
+    wait_taken(h_parent);
+    enqueue(h_parent + 1, &empty);
+    enqueue(child_h, &child);
+    wait_tip(child_h);
+
+    feed.request_stop();
+    feed.notify();
+    let _ = engine.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.
 #[test]
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {

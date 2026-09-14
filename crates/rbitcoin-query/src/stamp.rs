@@ -7,6 +7,8 @@
 //! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
 //! omitted from that skeleton; a later wave's TipOnly loc is adopted onto the
 //! in-flight identity so write ensure does not need RAM loc after prune.
+//! When TipOnly misses (lookup ahead of `tx.head`) and loc is already on disk,
+//! fill loc by fk onto that in-flight identity; miss is OK (same-wave).
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -123,8 +125,10 @@ impl ExternalParentStamp {
 /// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
 /// skeleton loc when TipOnly already has that create (later wave). Same-wave
 /// creates are omitted from the skeleton; those holes stay for write fill.
-/// `skeleton = None` is plan=None / S0 leftover TipOnly. Same-batch identities
-/// are not inputs — callers skip them in `need` and keep them offline at pin.
+/// In-flight identity that still lacks spent after that bind tries loc by fk
+/// (later-wave TipOnly miss / head lag); miss is OK. `skeleton = None` is
+/// plan=None / S0 leftover TipOnly. Same-batch identities are not inputs —
+/// callers skip them in `need` and keep them offline at pin.
 pub fn stamp_external_parents(
     store: &Store,
     need: &[[u8; 32]],
@@ -197,6 +201,7 @@ pub fn stamp_external_parents(
         stamp.head_need_n = 0;
         stats.note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
         stats.note_recent(stamp.recent_n, stamp.recent_ns);
+        fill_inflight_spent_from_loc(store, in_flight, &mut stamp.idents, stats)?;
         return Ok(stamp);
     }
     let mut need_head: Vec<[u8; 32]> = still_need.into_iter().copied().collect();
@@ -310,6 +315,46 @@ pub fn fill_missing_parent_ranges(
     Ok(())
 }
 
+/// Later-wave InFlight identity that TipOnly missed (`tx.head` lag): loc by fk.
+///
+/// Hit stamps spent so write ensure does not need RAM loc after prune. Miss is
+/// OK (same-wave, not on disk yet — write fill).
+fn fill_inflight_spent_from_loc(
+    store: &Store,
+    in_flight: &InFlight,
+    idents: &mut U64Map<ParentIdent>,
+    stats: &crate::ConfirmStats,
+) -> Result<(), QueryError> {
+    stats.note_fill_missing();
+    let mut need: Vec<Fk> = Vec::new();
+    for (&id, ident) in idents.iter() {
+        if ident.spent.is_some() {
+            continue;
+        }
+        if in_flight.get_out(id).is_some() {
+            need.push(Fk(id));
+        }
+    }
+    if need.is_empty() {
+        return Ok(());
+    }
+    let filled = store.tx_create_loc_range_batch(&need)?;
+    for (fk, row) in need.into_iter().zip(filled) {
+        let Some(id) = fk.get() else {
+            continue;
+        };
+        let Some(pair) = row else {
+            continue;
+        };
+        if let Some(e) = idents.get_mut(&id) {
+            e.body = Some(pair.txout);
+            e.spent = Some(pair.spent);
+            e.n_out = Some(pair.n_out);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +419,76 @@ mod tests {
             stamp_external_parents(q.store(), &[txid], &inflight, None, q.confirm_stats()).unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Later-wave spend after lookup ran ahead of write: TipOnly missed the
+    /// parent (`tx.head` lag) so the skeleton is empty, InFlight still has the
+    /// pin, and loc is already on disk. Stamp must fill spent by fk (mainnet
+    /// 133433). Same-wave holes stay unset when loc is not on disk yet.
+    #[test]
+    fn inflight_hit_skeleton_miss_fills_loc_by_fk() {
+        let (dir, q) = tmp_store();
+        let p = pin(1);
+        let txid = p.0.txid;
+        let fks = q
+            .store
+            .txs
+            .put_full_batch_indexed(
+                &[(
+                    p.0.clone(),
+                    vec![rbitcoin_store::InputRecord::coinbase(
+                        u32::MAX,
+                        vec![0x01],
+                        vec![],
+                    )],
+                    p.1.clone(),
+                )],
+                true,
+            )
+            .unwrap();
+        assert_eq!(fks[0], Fk(1));
+        let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let skel = BatchParentIds::default();
+        let st = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .unwrap();
+        assert_eq!(st.resolved.get(&txid), Some(&Fk(1)));
+        let ident = st.idents.get(&1).expect("inflight ident");
+        assert!(ident.pin.is_some(), "inflight pin is kept");
+        assert_eq!(ident.spent, Some(spent));
+        assert!(ident.body.is_some_and(|r| r.1 > 0));
+        assert_eq!(ident.n_out, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_hit_skeleton_miss_without_loc_leaves_spent_unset() {
+        let (dir, q) = tmp_store();
+        let p = pin(42);
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(42), &p)], Some(1));
+        let txid = p.0.txid;
+        let skel = BatchParentIds::default();
+        let st = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .unwrap();
+        let ident = st.idents.get(&42).expect("inflight ident");
+        assert!(ident.pin.is_some());
+        assert_eq!(ident.spent, None);
+        assert_eq!(ident.body, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

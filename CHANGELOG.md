@@ -103,6 +103,12 @@ before 1.0).
 
 ### Fixed
 
+- **IBD stamp loc by fk on InFlight TipOnly miss:** lookup can run a later
+  wave before the parent is in `tx.head`, so the skeleton is empty while
+  InFlight still holds the pin and write loc is already pruned. Stamp fills
+  spent from `create.loc` by fk (miss is OK for same-wave). Mainnet 133433
+  `ensure denserels/abs incomplete for spend edge`.
+
 - **Esplora `POST /txs/package` 1p1c:** `MempoolHub::accept_package` commits each
   member before the next admit so a child can spend an in-package parent
   (same sequential shape as `ActiveMempool::accept_package`). Prepare-all
