@@ -48,6 +48,11 @@ before 1.0).
 
 ### Changed
 
+- **Schema 23:** `create.loc.ovf` is 16 B (`fk:u64` + u32 strides / `n_out`) so a
+  consensus-valid ~1 MiB txout (mainnet 896696 OP_RETURN) and `n_out > 65535`
+  store. Occupied schema 22 rewrites 12 B ovf rows and `meta`. Occupied 15–21
+  Class A still refuses. Spent vin stays u16. A 22 binary refuses 23 `meta`.
+
 - **llvm-cov drops `rbitcoin-bench`:** optional host client crate is not a
   coverage gate (`cargo llvm-cov test --exclude` + LCOV IGNORE).
   `cargo test --workspace` still runs its lib tests.

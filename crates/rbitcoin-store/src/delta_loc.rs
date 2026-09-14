@@ -4,8 +4,10 @@
 //! [`DeltaLoc`] is the single-plane u16 sibling used by `inwit.loc`.
 
 use crate::error::StoreError;
-use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{Fk, TableKind};
+use crate::file::{
+    leading_header_bytes, write_synced_tmp_rename, GrowPolicy, TableFile, FILE_HEADER_LEN,
+};
+use rbitcoin_primitives::{Fk, TableKind, SCHEMA_VERSION};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -16,6 +18,8 @@ pub const IDX_STRIDE: u64 = 8;
 pub const LOC_WINDOW: u64 = 1024;
 const CREATE_OVF_MISSING: &str = "invariant: create.loc overflow missing";
 const INWIT_OVF_MISSING: &str = "invariant: inwit.loc overflow missing";
+pub(crate) const CREATE_OVF_SLOT: u64 = 16;
+const CREATE_OVF_SLOT_V22: u64 = 12;
 
 #[inline]
 pub fn loc_window(id: u64) -> u64 {
@@ -366,7 +370,7 @@ fn load_u16_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32)>, StoreError> {
     Ok(rows)
 }
 
-type PackedCreateSlot = (u8, u8, Option<(u16, u16)>);
+type PackedCreateSlot = (u8, u8, Option<(u32, u32)>);
 
 pub(crate) fn pack_create_pair(
     txout_strides: u32,
@@ -378,12 +382,6 @@ pub(crate) fn pack_create_pair(
     if txout_strides == 0 {
         return Err(StoreError::Corrupt("invariant: create txout strides"));
     }
-    if txout_strides > u32::from(u16::MAX) {
-        return Err(StoreError::Corrupt("invariant: create txout strides"));
-    }
-    if n_out > u32::from(u16::MAX) {
-        return Err(StoreError::Corrupt("invariant: create n_out"));
-    }
     let s8 = if txout_strides >= 256 {
         0u8
     } else {
@@ -391,7 +389,7 @@ pub(crate) fn pack_create_pair(
     };
     let n8 = if n_out >= 256 { 0u8 } else { n_out as u8 };
     let ovf = if s8 == 0 || n8 == 0 {
-        Some((txout_strides as u16, n_out as u16))
+        Some((txout_strides, n_out))
     } else {
         None
     };
@@ -411,12 +409,20 @@ pub(crate) fn decode_create_pair(
     }
 }
 
+pub(crate) fn encode_create_ovf_row(fk: u64, strides: u32, n_out: u32) -> [u8; 16] {
+    let mut row = [0u8; CREATE_OVF_SLOT as usize];
+    row[0..8].copy_from_slice(&fk.to_le_bytes());
+    row[8..12].copy_from_slice(&strides.to_le_bytes());
+    row[12..16].copy_from_slice(&n_out.to_le_bytes());
+    row
+}
+
 pub(crate) fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, StoreError> {
     let data = ovf.data_len();
-    if !data.is_multiple_of(12) {
+    if !data.is_multiple_of(CREATE_OVF_SLOT) {
         return Err(StoreError::Corrupt("invariant: create.loc ovf size"));
     }
-    let n = (data / 12) as usize;
+    let n = (data / CREATE_OVF_SLOT) as usize;
     if n == 0 {
         return Ok(Vec::new());
     }
@@ -424,7 +430,60 @@ pub(crate) fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, S
     ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
     let mut rows = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(12) {
+    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT as usize) {
+        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+        let strides = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+        let n_out = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+        if fk == 0 || (prev != 0 && fk <= prev) {
+            return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
+        }
+        prev = fk;
+        rows.push((fk, strides, n_out));
+    }
+    Ok(rows)
+}
+
+fn create_ovf_header_ver(ovf: &TableFile) -> Result<u16, StoreError> {
+    let mut hdr = [0u8; FILE_HEADER_LEN];
+    ovf.pread_at(0, &mut hdr)?;
+    Ok(u16::from_le_bytes([hdr[4], hdr[5]]))
+}
+
+/// Schema 22 `create.loc.ovf` is 12 B (`fk:u64` + two u16). Schema 23 is 16 B
+/// (`fk:u64` + two u32). Rewrite on open so occupied 22 Class A can resume IBD.
+pub(crate) fn migrate_create_ovf_v22_if_needed(path: &Path) -> Result<(), StoreError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let ovf = open_loc_file(path, TableKind::DeltaLoc)?;
+    let ver = create_ovf_header_ver(&ovf)?;
+    let data = ovf.data_len();
+    if ver >= 23 {
+        return Ok(());
+    }
+    if data == 0 {
+        let hdr = leading_header_bytes(TableKind::DeltaLoc, FILE_HEADER_LEN as u64);
+        ovf.write_at(0, &hdr)?;
+        ovf.flush()?;
+        return Ok(());
+    }
+    if data.is_multiple_of(CREATE_OVF_SLOT) && !data.is_multiple_of(CREATE_OVF_SLOT_V22) {
+        let logical = FILE_HEADER_LEN as u64 + data;
+        let hdr = leading_header_bytes(TableKind::DeltaLoc, logical);
+        ovf.write_at(0, &hdr)?;
+        ovf.flush()?;
+        return Ok(());
+    }
+    if !data.is_multiple_of(CREATE_OVF_SLOT_V22) {
+        return Err(StoreError::Corrupt("invariant: create.loc ovf size"));
+    }
+    let mut bytes = vec![0u8; data as usize];
+    ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
+    drop(ovf);
+    let n = (data / CREATE_OVF_SLOT_V22) as usize;
+    let mut payload = Vec::with_capacity(n * CREATE_OVF_SLOT as usize);
+    let mut prev = 0u64;
+    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT_V22 as usize) {
         let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let strides = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
         let n_out = u16::from_le_bytes(chunk[10..12].try_into().unwrap());
@@ -432,9 +491,20 @@ pub(crate) fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, S
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }
         prev = fk;
-        rows.push((fk, u32::from(strides), u32::from(n_out)));
+        payload.extend_from_slice(&encode_create_ovf_row(
+            fk,
+            u32::from(strides),
+            u32::from(n_out),
+        ));
     }
-    Ok(rows)
+    let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+    let mut blob = leading_header_bytes(TableKind::DeltaLoc, logical).to_vec();
+    blob.extend_from_slice(&payload);
+    write_synced_tmp_rename(path, &blob)?;
+    rbitcoin_log::warn!(
+        "store: rewriting create.loc.ovf 12 B rows to 16 B (schema {SCHEMA_VERSION})"
+    );
+    Ok(())
 }
 
 pub(crate) fn create_table_file(path: &Path, kind: TableKind) -> Result<TableFile, StoreError> {
@@ -480,6 +550,30 @@ mod tests {
         let (s, n, ovf) = pack_create_pair(1, 256).unwrap();
         assert_eq!((s, n), (1, 0));
         assert_eq!(ovf, Some((1, 256)));
+    }
+
+    #[test]
+    fn pack_create_pair_past_u16_is_ok() {
+        let (s, n, ovf) = pack_create_pair(65536, 1).expect("strides 65536");
+        assert_eq!((s, n), (0, 1));
+        let (st, no) = ovf.expect("ovf");
+        assert_eq!(u32::from(st), 65536);
+        assert_eq!(u32::from(no), 1);
+        let (s, n, ovf) = pack_create_pair(1, 65536).expect("n_out 65536");
+        assert_eq!((s, n), (1, 0));
+        let (st, no) = ovf.expect("ovf");
+        assert_eq!(u32::from(st), 1);
+        assert_eq!(u32::from(no), 65536);
+        let (s, n, ovf) = pack_create_pair(65536, 65536).expect("both");
+        assert_eq!((s, n), (0, 0));
+        let (st, no) = ovf.expect("ovf");
+        assert_eq!(u32::from(st), 65536);
+        assert_eq!(u32::from(no), 65536);
+        let (s, n, ovf) = pack_create_pair(65535, 65535).unwrap();
+        assert_eq!((s, n), (0, 0));
+        let (st, no) = ovf.expect("ovf");
+        assert_eq!(u32::from(st), 65535);
+        assert_eq!(u32::from(no), 65535);
     }
 
     #[test]

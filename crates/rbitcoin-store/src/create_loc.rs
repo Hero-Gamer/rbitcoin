@@ -4,8 +4,9 @@
 
 use crate::bulk_io::ReadOp;
 use crate::delta_loc::{
-    create_table_file, decode_create_pair, load_create_ovf, loc_file_off, loc_window, loc_within,
-    open_table_file, pack_create_pair, strides_from_aligned_len, IDX_STRIDE, LOC_WINDOW,
+    create_table_file, decode_create_pair, encode_create_ovf_row, load_create_ovf, loc_file_off,
+    loc_window, loc_within, migrate_create_ovf_v22_if_needed, open_table_file, pack_create_pair,
+    strides_from_aligned_len, CREATE_OVF_SLOT, IDX_STRIDE, LOC_WINDOW,
 };
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -17,7 +18,6 @@ use std::sync::RwLock;
 
 const SLOT: u64 = 2;
 const OFF_SLOT: u64 = 16;
-const OVF_SLOT: u64 = 12;
 
 /// Slots to read and prefix-sum in `[win_first, win_last]` for the highest needed fk.
 #[inline]
@@ -69,6 +69,9 @@ impl CreateLoc {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let loc = open_table_file(&dir.join("create.loc"), TableKind::DeltaLoc)?;
         let ovf_path = dir.join("create.loc.ovf");
+        if ovf_path.exists() {
+            migrate_create_ovf_v22_if_needed(&ovf_path)?;
+        }
         let ovf = if ovf_path.exists() {
             open_table_file(&ovf_path, TableKind::DeltaLoc)?
         } else {
@@ -129,11 +132,9 @@ impl CreateLoc {
         {
             let mut rows = self.ovf_rows.write().unwrap_or_else(|e| e.into_inner());
             rows.retain(|r| r.0 <= new_count);
-            let mut blob = Vec::with_capacity(rows.len() * OVF_SLOT as usize);
+            let mut blob = Vec::with_capacity(rows.len() * CREATE_OVF_SLOT as usize);
             for &(fk, st, n_out) in rows.iter() {
-                blob.extend_from_slice(&fk.to_le_bytes());
-                blob.extend_from_slice(&(st as u16).to_le_bytes());
-                blob.extend_from_slice(&(n_out as u16).to_le_bytes());
+                blob.extend_from_slice(&encode_create_ovf_row(fk, st, n_out));
             }
             self.ovf
                 .set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)?;
@@ -173,12 +174,8 @@ impl CreateLoc {
             loc_bytes.push(s8);
             loc_bytes.push(n8);
             if let Some((os, on)) = ovf {
-                let mut row = [0u8; OVF_SLOT as usize];
-                row[0..8].copy_from_slice(&fk.to_le_bytes());
-                row[8..10].copy_from_slice(&os.to_le_bytes());
-                row[10..12].copy_from_slice(&on.to_le_bytes());
-                ovf_bytes.extend_from_slice(&row);
-                new_ovf.push((fk, u32::from(os), u32::from(on)));
+                ovf_bytes.extend_from_slice(&encode_create_ovf_row(fk, os, on));
+                new_ovf.push((fk, os, on));
             }
             if fk.is_multiple_of(LOC_WINDOW) {
                 new_offs.push((
@@ -618,6 +615,30 @@ mod tests {
         out
     }
 
+    fn ovf_data_len(dir: &Path) -> u64 {
+        let bytes = std::fs::read(dir.join("create.loc.ovf")).unwrap();
+        let logical = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        logical - FILE_HEADER_LEN as u64
+    }
+
+    fn write_legacy_create_ovf_v22(dir: &Path, rows: &[(u64, u16, u16)]) {
+        use rbitcoin_primitives::{TableKind, STORE_MAGIC};
+        let mut payload = Vec::new();
+        for &(fk, st, n) in rows {
+            payload.extend_from_slice(&fk.to_le_bytes());
+            payload.extend_from_slice(&st.to_le_bytes());
+            payload.extend_from_slice(&n.to_le_bytes());
+        }
+        let logical = FILE_HEADER_LEN as u64 + payload.len() as u64;
+        let mut blob = vec![0u8; FILE_HEADER_LEN];
+        blob[0..4].copy_from_slice(&STORE_MAGIC);
+        blob[4..6].copy_from_slice(&22u16.to_le_bytes());
+        blob[6..8].copy_from_slice(&TableKind::DeltaLoc.as_u16().to_le_bytes());
+        blob[8..16].copy_from_slice(&logical.to_le_bytes());
+        blob.extend_from_slice(&payload);
+        std::fs::write(dir.join("create.loc.ovf"), blob).unwrap();
+    }
+
     #[test]
     fn create_loc_n_out_1_and_3() {
         let dir = TempDir::labeled("create-loc-13").unwrap();
@@ -727,6 +748,58 @@ mod tests {
         let got = loc.range_batch(&[Fk(1)]).unwrap();
         assert_eq!(got[0].unwrap().txout.1, 2048);
         assert_eq!(got[0].unwrap().n_out, 1);
+    }
+
+    #[test]
+    fn create_loc_txout_past_u16_strides() {
+        let dir = TempDir::labeled("create-loc-u16-strides").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        let len = 65536 * IDX_STRIDE;
+        loc.append(&chain(&[1], &[len])).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, len);
+        assert_eq!(got[0].unwrap().n_out, 1);
+        drop(loc);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, len);
+        assert_eq!(got[0].unwrap().n_out, 1);
+        assert_eq!(ovf_data_len(dir.path()), 16);
+    }
+
+    #[test]
+    fn create_loc_n_out_past_u16() {
+        let dir = TempDir::labeled("create-loc-u16-nout").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[65536], &[8])).unwrap();
+        let got = loc.range_batch(&[Fk(1)]).unwrap();
+        assert_eq!(got[0].unwrap().n_out, 65536);
+        assert_eq!(got[0].unwrap().spent.1, 65536 * IDX_STRIDE);
+        drop(loc);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        assert_eq!(loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap().n_out, 65536);
+        assert_eq!(ovf_data_len(dir.path()), 16);
+    }
+
+    #[test]
+    fn create_loc_opens_legacy_12b_ovf() {
+        let dir = TempDir::labeled("create-loc-ovf12").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[256, 256, 256, 256], &[8, 8, 8, 8]))
+            .unwrap();
+        drop(loc);
+        write_legacy_create_ovf_v22(
+            dir.path(),
+            &[(1, 1, 256), (2, 1, 256), (3, 1, 256), (4, 1, 256)],
+        );
+        assert_eq!(ovf_data_len(dir.path()), 48);
+        let loc = CreateLoc::open(dir.path()).unwrap();
+        let got = loc.range_batch(&[Fk(1), Fk(2), Fk(3), Fk(4)]).unwrap();
+        for g in &got {
+            assert_eq!(g.unwrap().n_out, 256);
+            assert_eq!(g.unwrap().spent.1, 256 * IDX_STRIDE);
+        }
+        assert_eq!(ovf_data_len(dir.path()), 64);
     }
 
     #[test]

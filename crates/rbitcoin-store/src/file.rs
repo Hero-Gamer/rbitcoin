@@ -134,6 +134,10 @@ fn table_open_opts() -> OpenOptions {
     o
 }
 
+pub(crate) fn leading_header_bytes(kind: TableKind, logical: u64) -> [u8; FILE_HEADER_LEN] {
+    encode_leading_header(kind, logical)
+}
+
 fn encode_leading_header(kind: TableKind, logical: u64) -> [u8; FILE_HEADER_LEN] {
     let mut header = [0u8; FILE_HEADER_LEN];
     header[0..4].copy_from_slice(&STORE_MAGIC);
