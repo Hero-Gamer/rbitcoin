@@ -1034,13 +1034,6 @@ mod tests {
         let (st, body) = http_post(addr, "/txs/package", b"[1]").await;
         assert_eq!(st, 400, "{body}");
         assert!(body.contains("hex string"), "{body}");
-        let too_big = format!(
-            "[{}]",
-            (0..26).map(|_| "\"00\"").collect::<Vec<_>>().join(",")
-        );
-        let (st, body) = http_post(addr, "/txs/package", too_big.as_bytes()).await;
-        assert_eq!(st, 400, "{body}");
-        assert!(body.contains("package too large"), "{body}");
 
         let (st, _) = http_get(addr, "/tx").await;
         assert_eq!(st, 405);

@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Package count/weight and CPFP min-relay:** `submitpackage` refuses more
+  than 25 hexes and over-weight packages with `package too large` (same needle
+  as Esplora `POST /txs/package`). `accept_package` admits a below-min-relay
+  parent when the combined ancestor package meets min-relay. Cross-surface pins
+  25/26, over-weight, exact incremental RBF, exact 100 sat/kvB, and HTTP 1p1c
+  CPFP.
+
 - **Confirm reject isolate at emit:** `emit_confirm_reject` downgrades a
   multi-block consensus fail to Cascade and requests a one-block retry.
   `isolate_if_batched` stays the class table.

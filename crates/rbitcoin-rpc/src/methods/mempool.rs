@@ -955,12 +955,18 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             "mempool relay disabled (still in IBD or tip not ready)",
         ));
     }
+    if arr.len() > MempoolHub::max_package_count() {
+        return Err(rpc_error(ERR_INVALID_PARAMS, "package too large"));
+    }
     let mut txs = Vec::with_capacity(arr.len());
     for v in arr {
         let hex = v
             .as_str()
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package hex required"))?;
         txs.push(decode_tx_hex(hex)?);
+    }
+    if let Err(e) = MempoolHub::check_package_shape(&txs) {
+        return Err(rpc_error(ERR_INVALID_PARAMS, e.to_string()));
     }
     let mut tx_results = serde_json::Map::new();
     let mut replaced = Vec::new();

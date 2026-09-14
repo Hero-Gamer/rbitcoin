@@ -12,7 +12,7 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
     default_candidate_rates, frontier_feerate_from_chunks, min_rate_for_capacity,
     weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Chunk, Coin,
-    FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU,
+    FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -1580,12 +1580,28 @@ impl MempoolHub {
         Err(e)
     }
 
+    /// Count / weight / topo checks for `submitpackage` / `POST /txs/package`.
+    pub fn check_package_shape(txs: &[Transaction]) -> Result<(), AcceptError> {
+        ActiveMempool::check_package_shape(txs)
+    }
+
+    /// Core ancestor package size cap (count, not weight).
+    pub fn max_package_count() -> usize {
+        MAX_PACKAGE_COUNT
+    }
+
     /// Accept an ancestor package (local / Electrum path; BIP331 wire later).
     pub fn accept_package(&self, txs: &[Transaction]) -> Result<Vec<AcceptResult>, AcceptError> {
         crate::reactor::assert_not_reactor("mempool accept");
-        rbitcoin_mempool::ActiveMempool::check_package_shape(txs)?;
+        Self::check_package_shape(txs)?;
         let t0 = Instant::now();
         let utxo = self.utxo_provider();
+        let sat_kvb = self.min_relay_sat_kvb();
+        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb) {
+            Some(0)
+        } else {
+            None
+        };
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
@@ -1597,7 +1613,7 @@ impl MempoolHub {
                 report_orphans: true,
                 fee_delta: delta,
                 time_prepare_lock: true,
-                min_relay: None,
+                min_relay: member_min,
             };
             let prep = match self.admit_staged(tx, &utxo, spec, &mut stages, &mut lock_us) {
                 Ok(p) => p,
