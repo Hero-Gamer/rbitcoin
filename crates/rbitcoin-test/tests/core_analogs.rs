@@ -146,10 +146,24 @@ fn assert_query_open_refuses(store: &Path, needle: &str) {
     );
 }
 
+fn assert_query_rebuilds_from_class_a(store: &Path, b1: &bitcoin::Block, cb_txid: &[u8; 32]) {
+    let q = Query::open_or_create_tiny(store).expect("torn current tx.head rebuilds from Class A");
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    assert!(
+        q.tx_head_occupied() >= 3,
+        "open must rebuild tx.head from Class A bodies"
+    );
+    assert!(
+        q.get_tx_by_txid(cb_txid).unwrap().is_some(),
+        "txid must resolve after head rebuild"
+    );
+    assert_reconstruct_eq(&q, 1, b1);
+}
+
 /// Archive reconstruct of height 1 after dropping RAM and wiping `tx.head/`
 /// (`feature_reindex*.py` / operator delete-head reopen). Same pad: crash-open
-/// clamps an unsealed tip, then leftover v1 fuse / truncated mphf / empty meta
-/// refuse at `Query::open` (Class A kept).
+/// clamps an unsealed tip; leftover fuse8 v1 refuses; truncated MPHF / empty
+/// meta rebuild from Class A.
 #[test]
 fn analog_reconstruct_after_lost_head() {
     let td = TestDatadir::new().unwrap();
@@ -220,11 +234,7 @@ fn analog_reconstruct_after_lost_head() {
     drop(q2);
 
     let fuse = first_head_sidecar(&head, "fuse8");
-    let mphf = first_head_sidecar(&head, "mphf");
-    let meta = head.join("meta");
     let fuse_ok = std::fs::read(&fuse).unwrap();
-    let mphf_ok = std::fs::read(&mphf).unwrap();
-
     let mut v1 = Vec::from(*b"BF8R");
     v1.extend_from_slice(&1u32.to_le_bytes());
     v1.extend_from_slice(&0u64.to_le_bytes());
@@ -232,10 +242,11 @@ fn analog_reconstruct_after_lost_head() {
     assert_query_open_refuses(&store, "fuse8 v1");
     std::fs::write(&fuse, fuse_ok).unwrap();
 
+    let mphf = first_head_sidecar(&head, "mphf");
+    let mphf_ok = std::fs::read(&mphf).unwrap();
     std::fs::write(&mphf, &mphf_ok[..8.min(mphf_ok.len())]).unwrap();
-    assert_query_open_refuses(&store, "bdz mphf");
-    std::fs::write(&mphf, mphf_ok).unwrap();
+    assert_query_rebuilds_from_class_a(&store, &b1, &cb_txid);
 
-    std::fs::write(&meta, []).unwrap();
-    assert_query_open_refuses(&store, "tx.head.meta short");
+    std::fs::write(head.join("meta"), []).unwrap();
+    assert_query_rebuilds_from_class_a(&store, &b1, &cb_txid);
 }
