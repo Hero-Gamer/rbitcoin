@@ -101,7 +101,7 @@ pub const SCHEMA_VERSION: u16 = 23;
 /// still soft-open empty Class A / empty SH (meta rewrite).
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    ver >= 13 && ver <= SCHEMA_VERSION
+    (13..=SCHEMA_VERSION).contains(&ver)
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
