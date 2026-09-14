@@ -1309,15 +1309,91 @@ fn fill_same_batch_abs_from_append_loc_ram() {
         bp_later.get_spender_abs(fks[0], 0),
         Some(rbitcoin_store::spent_abs(loc[0].spent.0, 0))
     );
-    q.prune_write_create_loc(3);
-    assert!(
-        q.write_create_loc(fks[0]).is_some(),
-        "keep until write of lookup_started_hi (and pack below drain fence)"
-    );
     q.prune_write_create_loc(4);
     assert!(
+        q.write_create_loc(fks[0]).is_some(),
+        "keep until write of next unstarted (started_hi+1=5)"
+    );
+    q.prune_write_create_loc(5);
+    assert!(
         q.write_create_loc(fks[0]).is_none(),
-        "drop after last overlapping lookup batch finished write"
+        "drop after the unstarted-at-note height finished write"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Mainnet 496: lookup TipOnly already covers the child; note stamps
+/// `keep_until = started_hi+1` and intervening writes must not drop loc.
+#[test]
+fn fill_just_written_survives_until_next_unstarted_write() {
+    use super::{ensure_spend_abs_layouts, fill_planned_create_layout_after_commit, Prepared};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::OutputRecord;
+
+    let (path, q) = tiny_query();
+    let parent_pin =
+        std::sync::Arc::new((rec_tx(0x32, 1), vec![OutputRecord::unspent(1, vec![0x51])]));
+    q.store().reset_spent_range_batch();
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![rbitcoin_store::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    q.set_lookup_started_hi(Some(496));
+    q.note_write_create_loc(&fks, &loc, 360);
+    q.prune_write_create_loc(432);
+    assert!(
+        q.write_create_loc(fks[0]).is_some(),
+        "keep_until is 497 (next unstarted); write 432 must not drop"
+    );
+
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        std::sync::Arc::clone(&parent_pin),
+        vec![0],
+        None,
+        None,
+        Vec::new(),
+    );
+    let child = [Prepared {
+        height: Height(496),
+        header_fk: Fk(2),
+        tx_fks: vec![Fk(3)],
+        jobs: vec![],
+        spends: vec![([0x32u8; 32], 0, Fk(3), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [9u8; 32],
+        txids: vec![],
+        prev_mtp: 0,
+    }];
+    q.store().reset_spent_range_batch();
+    fill_planned_create_layout_after_commit(&q, &mut bp, &[], &[], &[], &child)
+        .expect("child fill from write loc until next-unstarted write");
+    ensure_spend_abs_layouts(&bp, &child).expect("abs until next-unstarted write");
+    assert!(
+        q.store().spent_range_batch_fks().is_empty(),
+        "write fill/ensure must not pread create.loc"
+    );
+    q.prune_write_create_loc(497);
+    assert!(
+        q.write_create_loc(fks[0]).is_none(),
+        "drop when the unstarted-at-note height finished write"
     );
 
     let _ = std::fs::remove_dir_all(&path);

@@ -734,33 +734,26 @@ impl Query {
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
-    /// Keep Class A append loc until write of the last pack whose TipOnly
-    /// may have missed it (`lookup_started_hi` at note), extended while the
-    /// pack is still at/above the load drain fence. Write-thread TLS. No loc pread.
+    /// Keep Class A append loc until write of the first height whose TipOnly
+    /// had not started at note (`lookup_started_hi + 1`). Write-thread TLS.
+    /// No loc pread. `keep_until` is not bumped after note.
     pub fn note_write_create_loc(
         &self,
         fks: &[rbitcoin_primitives::Fk],
         loc: &[rbitcoin_store::CreateLocPair],
         pack_height: u32,
     ) {
-        let keep_until = self
-            .lookup_started_hi()
-            .unwrap_or(pack_height)
-            .max(pack_height);
+        let keep_until =
+            write_create_loc::keep_until_at_note(pack_height, self.lookup_started_hi());
         write_create_loc::with_ram(self, |ram| {
             ram.note(pack_height, keep_until, fks, loc);
         });
     }
 
-    /// Drop loc packs whose last overlapping lookup batch has finished write
-    /// and whose pack height is below the load drain fence.
+    /// Drop loc packs whose unstarted-at-note height has finished write.
     pub fn prune_write_create_loc(&self, written_hi: u32) {
         write_create_loc::with_ram(self, |ram| {
-            ram.prune_written_through(
-                written_hi,
-                self.lookup_started_hi(),
-                self.drain_and_fence_hi(),
-            );
+            ram.prune_written_through(written_hi);
         });
     }
 
