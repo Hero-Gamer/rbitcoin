@@ -11,7 +11,7 @@
 //! fill loc by fk onto that in-flight identity; miss is OK (same-wave).
 
 use crate::id_map::{IdMap, TxidHasher};
-use crate::{CreatePin, InFlight, QueryError, U64Map, U64Set};
+use crate::{CreatePin, InFlight, QueryError, U64Map};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::Store;
 use std::collections::HashMap;
@@ -201,7 +201,7 @@ pub fn stamp_external_parents(
         stamp.head_need_n = 0;
         stats.note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
         stats.note_recent(stamp.recent_n, stamp.recent_ns);
-        fill_missing_parent_ranges(store, in_flight, &mut stamp.idents, stats)?;
+        fill_inflight_spent_from_loc(store, in_flight, &mut stamp.idents, stats)?;
         return Ok(stamp);
     }
     let mut need_head: Vec<[u8; 32]> = still_need.into_iter().copied().collect();
@@ -272,11 +272,11 @@ pub fn stamp_external_parents(
     Ok(stamp)
 }
 
-/// Loc body_range and spent_range for stamped create_fks that still lack ranges.
+/// Loc body_range and spent_range for stamped create_fks with no in-flight outs.
 ///
-/// Body miss after a non-inflight identity is `Corrupt`. In-flight outs with no
-/// spent range try loc by fk: hit covers later-wave TipOnly miss (head lag)
-/// after RAM loc prune; miss is OK (same-wave, not on disk yet — write fill).
+/// Body miss after identity is `Corrupt`. Spent miss after a **store** body fill
+/// is `Corrupt`. RAM-only identity (in-flight outs, no spent range row) leaves
+/// spent unset — write ensure still stamps those holes.
 pub fn fill_missing_parent_ranges(
     store: &Store,
     in_flight: &InFlight,
@@ -285,14 +285,12 @@ pub fn fill_missing_parent_ranges(
 ) -> Result<(), QueryError> {
     stats.note_fill_missing();
     let mut need: Vec<Fk> = Vec::new();
-    let mut inflight_ok_miss: U64Set = U64Set::default();
     for (&id, ident) in idents.iter() {
-        if ident.body.is_some() && ident.spent.is_some() && ident.n_out.is_some() {
+        if in_flight.get_out(id).is_some() {
             continue;
         }
-        need.push(Fk(id));
-        if in_flight.get_out(id).is_some() {
-            inflight_ok_miss.insert(id);
+        if ident.body.is_none() || ident.spent.is_none() || ident.n_out.is_none() {
+            need.push(Fk(id));
         }
     }
     if need.is_empty() {
@@ -304,12 +302,49 @@ pub fn fill_missing_parent_ranges(
             continue;
         };
         let Some(pair) = row else {
-            if inflight_ok_miss.contains(&id) {
-                continue;
-            }
             return Err(rbitcoin_store::StoreError::Corrupt(
                 "archive: external parent loc missing after create_fk stamp",
             ));
+        };
+        if let Some(e) = idents.get_mut(&id) {
+            e.body = Some(pair.txout);
+            e.spent = Some(pair.spent);
+            e.n_out = Some(pair.n_out);
+        }
+    }
+    Ok(())
+}
+
+/// Later-wave InFlight identity that TipOnly missed (`tx.head` lag): loc by fk.
+///
+/// Hit stamps spent so write ensure does not need RAM loc after prune. Miss is
+/// OK (same-wave, not on disk yet — write fill).
+fn fill_inflight_spent_from_loc(
+    store: &Store,
+    in_flight: &InFlight,
+    idents: &mut U64Map<ParentIdent>,
+    stats: &crate::ConfirmStats,
+) -> Result<(), QueryError> {
+    stats.note_fill_missing();
+    let mut need: Vec<Fk> = Vec::new();
+    for (&id, ident) in idents.iter() {
+        if ident.spent.is_some() {
+            continue;
+        }
+        if in_flight.get_out(id).is_some() {
+            need.push(Fk(id));
+        }
+    }
+    if need.is_empty() {
+        return Ok(());
+    }
+    let filled = store.tx_create_loc_range_batch(&need)?;
+    for (fk, row) in need.into_iter().zip(filled) {
+        let Some(id) = fk.get() else {
+            continue;
+        };
+        let Some(pair) = row else {
+            continue;
         };
         if let Some(e) = idents.get_mut(&id) {
             e.body = Some(pair.txout);
