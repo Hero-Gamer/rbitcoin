@@ -427,37 +427,14 @@ fn assert_height(q: &Query, hash: &[u8; 32], height: u32) {
     );
 }
 
-/// Merged confirm / multi-height shrink must not walk `0..=tip`.
-#[test]
-fn height_by_hash_index_tracks_merged_tip_delta() {
-    let (dir, q) = temp_query("h2h-delta");
-    let ghost = [0xee; 32];
-    assert!(q.height_of_hash(&ghost).unwrap().is_none());
-    let empty = q.confirm_stats().take_window();
-    assert_eq!(empty.height_index_full_n, 0);
-    assert_eq!(empty.height_index_delta_n, 0);
-
+fn h2h_pad_0_4(q: &Query) -> Vec<[u8; 32]> {
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    let hashes = {
-        let mut hashes = vec![h0.hash];
-        q.connect_block(Height(0), &h0, &[t0]).unwrap();
-        let genesis = q.confirm_stats().take_window();
-        assert_eq!(genesis.height_index_full_n, 1, "first tip fills from empty");
-        assert_eq!(genesis.height_index_full_headers, 1);
-        assert_eq!(genesis.height_index_delta_n, 0);
-        assert_eq!(q.process_owned_size_snapshot().h2h_keys, 1);
-
-        let prev = q.tip_header_fk().unwrap().unwrap();
-        let (h1, t1) = coinbase_block(1, prev, Some(hashes[0]));
-        hashes.push(h1.hash);
-        q.connect_block(Height(1), &h1, &[t1]).unwrap();
-        let plus_one = q.confirm_stats().take_window();
-        assert_eq!(plus_one.height_index_full_n, 0, "+1 is not a full rebuild");
-        assert_eq!(plus_one.height_index_delta_n, 1);
-        assert_eq!(q.process_owned_size_snapshot().h2h_keys, 2);
-        hashes
-    };
-    let mut hashes = hashes;
+    let mut hashes = vec![h0.hash];
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let prev0 = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev0, Some(hashes[0]));
+    hashes.push(h1.hash);
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
     let mut prev = q.tip_header_fk().unwrap().unwrap();
     let mut parent = hashes[1];
     let mut run = Vec::new();
@@ -467,12 +444,64 @@ fn height_by_hash_index_tracks_merged_tip_delta() {
             .commit_class_a_only(&header, std::slice::from_ref(&ta))
             .unwrap();
         hashes.push(header.hash);
-        run.push(prepared_at(&q, Height(h), fk));
+        run.push(prepared_at(q, Height(h), fk));
         prev = fk;
         parent = header.hash;
     }
-    let _ = q.confirm_stats().take_window();
     q.confirm_blocks_run(&run).unwrap();
+    hashes
+}
+
+fn h2h_assert_range(q: &Query, hashes: &[[u8; 32]]) {
+    for (h, hash) in hashes.iter().enumerate() {
+        assert_height(q, hash, h as u32);
+    }
+}
+
+/// Empty / genesis / +1, then merged +3 must not walk `0..=tip`.
+#[test]
+fn height_by_hash_merged_confirm_extends() {
+    let (dir, q) = temp_query("h2h-extend");
+    assert!(q.height_of_hash(&[0xee; 32]).unwrap().is_none());
+    let empty = q.confirm_stats().take_window();
+    assert_eq!(empty.height_index_full_n, 0);
+    assert_eq!(empty.height_index_delta_n, 0);
+
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let genesis = q.confirm_stats().take_window();
+    assert_eq!(genesis.height_index_full_n, 1, "first tip fills from empty");
+    assert_eq!(genesis.height_index_full_headers, 1);
+    assert_eq!(genesis.height_index_delta_n, 0);
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 1);
+
+    let prev = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev, Some(h0.hash));
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
+    let plus_one = q.confirm_stats().take_window();
+    assert_eq!(plus_one.height_index_full_n, 0, "+1 is not a full rebuild");
+    assert_eq!(plus_one.height_index_delta_n, 1);
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 2);
+
+    let hashes = {
+        let mut hashes = vec![h0.hash, h1.hash];
+        let mut prev = q.tip_header_fk().unwrap().unwrap();
+        let mut parent = h1.hash;
+        let mut run = Vec::new();
+        for h in 2u32..=4 {
+            let (header, ta) = coinbase_block(h, prev, Some(parent));
+            let fk = q
+                .commit_class_a_only(&header, std::slice::from_ref(&ta))
+                .unwrap();
+            hashes.push(header.hash);
+            run.push(prepared_at(&q, Height(h), fk));
+            prev = fk;
+            parent = header.hash;
+        }
+        let _ = q.confirm_stats().take_window();
+        q.confirm_blocks_run(&run).unwrap();
+        hashes
+    };
     let merged = q.confirm_stats().take_window();
     assert_eq!(
         merged.height_index_full_n, 0,
@@ -481,9 +510,8 @@ fn height_by_hash_index_tracks_merged_tip_delta() {
     assert_eq!(merged.height_index_full_headers, 0);
     assert_eq!(merged.height_index_delta_n, 3);
     assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
-    for (h, hash) in hashes.iter().enumerate() {
-        assert_height(&q, hash, h as u32);
-    }
+    h2h_assert_range(&q, &hashes);
+
     let (orphan, _) = coinbase_block(99, Fk::NULL, None);
     q.put_header(&orphan).unwrap();
     assert!(
@@ -500,6 +528,16 @@ fn height_by_hash_index_tracks_merged_tip_delta() {
     assert_eq!(after_hole.height_index_delta_n, 0);
     assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
     assert_height(&q, &hashes[4], 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shrink-by-N, invalidate rebuild, same-height replace, empty ensure.
+#[test]
+fn height_by_hash_shrink_invalidate_and_reorg() {
+    let (dir, q) = temp_query("h2h-shrink");
+    let hashes = h2h_pad_0_4(&q);
+    let _ = q.confirm_stats().take_window();
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
 
     q.ensure_height_by_hash_index(Height(1)).unwrap();
     let shrink = q.confirm_stats().take_window();
@@ -524,9 +562,7 @@ fn height_by_hash_index_tracks_merged_tip_delta() {
     assert_eq!(reextend.height_index_full_n, 0);
     assert_eq!(reextend.height_index_delta_n, 3);
     assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
-    for (h, hash) in hashes.iter().enumerate() {
-        assert_height(&q, hash, h as u32);
-    }
+    h2h_assert_range(&q, &hashes);
 
     q.ensure_height_by_hash_index(Height(4)).unwrap();
     let same = q.confirm_stats().take_window();
