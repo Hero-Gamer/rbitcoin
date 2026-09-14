@@ -1771,6 +1771,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// IBD skeleton miss + InFlight pin + loc on disk (lookup ahead of
+    /// `tx.head`): plan must still stamp spent so write ensure does not need
+    /// RAM loc after prune (mainnet 133433).
+    #[test]
+    fn plan_inflight_skeleton_miss_fills_loc_by_fk() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("plan-inflight-skel-miss");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        let pin: crate::CreatePin = Arc::new((parent.tx.clone(), parent.outputs.clone()));
+        q.store
+            .txs
+            .put_full_batch_indexed(
+                &[(parent.tx, parent.inputs, parent.outputs)],
+                /*index=*/ true,
+            )
+            .unwrap();
+        let spent = q
+            .store
+            .txs
+            .spent_range(Fk(1))
+            .expect("archived spent range");
+        let mut log = crate::InFlight::new();
+        log.note_pins([(Fk(1), &pin)], Some(1));
+        let child = child_spend(parent_txid, 0xee);
+        let need = vec![(Fk(2), vec![child])];
+        let skel = crate::BatchParentIds::default();
+        let plan = plan_applies(&q, &need, 2, &log, Some(&skel))
+            .expect("inflight + empty skeleton with loc on disk");
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(
+            plan.external_parents.get(&1).and_then(|p| p.spent),
+            Some(spent),
+            "TipOnly miss must still fill spent from create.loc by fk"
+        );
+        assert!(
+            plan.external_parents
+                .get(&1)
+                .and_then(|p| p.pin.as_ref())
+                .is_some(),
+            "inflight pin is kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Creates-only in_flight (txid→fk, no denserels outs) must still get
     /// body_range via idx so load denserels-by-range works (mainnet 961466 class).
     #[test]
