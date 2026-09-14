@@ -115,6 +115,15 @@ before 1.0).
 
 ### Fixed
 
+- **Head-resolve loc after identity:** three probe+identity waves pick fk
+  only; **one** `create.loc` batch runs after TLS drops (FdOnly / standalone
+  bulk). Loc is not on the held probe ring: probe poison / empty-CQ retry /
+  live-ring libc-complete stay on the probe session; loc shorts libc-complete
+  on their own batch and do not consume probe recover credit. `range_batch_ctx`
+  on a still-held session keeps poison fail-closed. Window extract is a running
+  sum + SIMD deinterleave (zero bytes in the same 16-byte load), not prefix
+  `Vec`s plus a separate sentinel scan.
+
 - **io_uring wait Ready requires a CQE:** `submit_and_wait_one` peeks the
   CQ after enter. `io_uring_enter` returns SQEs submitted; an empty CQ is
   TimedOut on the drain budget, not Ready. Live harvest (held pread/pwrite,
@@ -122,10 +131,10 @@ before 1.0).
   empty harvest is not batch death or `io_uring wait timeout`. libc-complete
   on a live ring remains last-resort for leftover submit/push fail.
 
-- **Mixed `create.loc` windows SIMD then ovf:** every 1024-create window
-  prefix-sums with SIMD (sentinels as 0), then adds true ovf length from
-  `create.loc.ovf`. Same prefix as scalar `decode_create_pair`. About half of
-  mainnet windows near height 896k have at least one overflow slot.
+- **Mixed `create.loc` windows:** a no-ovf running sum bails to
+  `decode_create_pair` when the 16-byte SIMD load contains a zero (overflow
+  sentinel). Same pairs as scalar. About half of mainnet windows near height
+  896k have at least one overflow slot.
 
 - **Held loc pread live-ring fail is not recover-abort:** empty CQ / submit
   fail on an unpoisoned ring returns `Ok(true)` so loc libc-completes those

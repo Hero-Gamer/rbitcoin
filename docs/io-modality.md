@@ -45,9 +45,12 @@ Nested calls panic. Harvest tracks pending `(kind, epoch, slot)`. A CQE that
 is unmatched, duplicate, from a prior epoch, leftover after `drain_all`, or
 from CQ overflow is `Corrupt` — not a completion and not a TipOnly miss.
 `begin_batch` drains leftover SQEs before bumping epoch and **returns `Err`**
-if the session is poisoned or leftover cannot drain (probe / idx / BDZ
-g-pages / rel preads share the ring). Held idx fill fails closed on that
-error (no libc fallback on a dirty ring). Undrained / unexpected /
+if the session is poisoned or leftover cannot drain (probe / identity / BDZ
+g-pages / rel preads share the ring). Held fill on that ring fails closed on that
+error (no libc fallback on a dirty ring). Head-resolve `create.loc` is **not**
+on the probe ring: one FdOnly batch after identity (standalone bulk; live shorts
+libc-complete; no probe recover credit). `range_batch_ctx` on a still-held
+session keeps poison fail-closed and live-ring libc-complete. Undrained / unexpected /
 wait-timeout **poisons** the session and drops the TLS ring so the next wave
 opens a new one. `submit_and_wait_one` shares the drain budget (slow-log at
 5 s, poison at the hard cap). Linux wait is Ready only when the CQ has a
@@ -134,7 +137,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`txout.body`** | L0 | Hot outs (pin / SH / Electrum tweaks); pread/pwrite/uring |
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
-| **`create.loc` / `inwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, SIMD prefix (no loc L2) |
+| **`create.loc` / `inwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
 | **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: RAM fuse8; packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
@@ -149,7 +152,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | Path | Table part | Fd/uring bulk part |
 |------|------------|---------------------|
 | Pin outs | FdOnly `create.loc` ranges (batched window preads; sum/read only through max fk in-window) | uring/pread `txout` bytes (starting OS page; full span if need is likely to spill) |
-| Head resolve stream | FdOnly **page-batched** head probe + FdOnly loc (batched windows on the held session) | uring/pread `txid.body` identity |
+| Head resolve stream | FdOnly **page-batched** head probe on the held session; **one** FdOnly loc batch after identity (standalone bulk, not on the probe ring) | uring/pread `txid.body` identity |
 | IBD **getdata serve** reconstruct | FdOnly `create.loc` / `inwit.loc` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `inwit.body` in parallel (not confirm `idx_body_pipeline`) |
 
 ---
@@ -226,5 +229,6 @@ hatch. Tables are fd pread/pwrite + fallocate.
 Class C is L2 write-behind (`flush_class_c_tip` before BQ dequeue).
 
 Live head insert is page-coalesced pread → mutate → pwrite (not per-slot uring).
-Head resolve batches one pread per distinct probe page. Node start logs `io=`,
+Head resolve batches one pread per distinct probe page, then one loc batch
+after identity (not on the probe ring). Node start logs `io=`,
 not `tx_head_access=`.

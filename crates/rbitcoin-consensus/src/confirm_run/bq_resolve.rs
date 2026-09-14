@@ -120,7 +120,8 @@ pub struct BqResolveWaveStats {
     pub collect_ns: u64,
     /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
     pub head_ns: u64,
-    /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`).
+    /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`): one
+    /// batch after identity waves, not on the held probe ring.
     pub spent_ns: u64,
 }
 

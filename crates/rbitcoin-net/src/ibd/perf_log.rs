@@ -349,6 +349,7 @@ pub(crate) struct IbdPerfSample {
     /// TipOnly `txid.body` / identity preads this window.
     pub lookup_wave_head_preads: u64,
     /// Lookup-wave `create.loc` fill inside TipOnly `head=` (`wave=… loc=`).
+    /// One batch after identity; not on the probe ring.
     pub lookup_wave_spent_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,
