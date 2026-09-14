@@ -108,6 +108,11 @@ before 1.0).
 
 ### Fixed
 
+- **Mixed `create.loc` windows SIMD then ovf:** every 1024-create window
+  prefix-sums with SIMD (sentinels as 0), then adds true ovf length from
+  `create.loc.ovf`. Same prefix as scalar `decode_create_pair`. About half of
+  mainnet windows near height 896k have at least one overflow slot.
+
 - **IBD stamp loc by fk on InFlight TipOnly miss:** lookup can run a later
   wave before the parent is in `tx.head`, so the skeleton is empty while
   InFlight still holds the pin and write loc is already pruned. Stamp fills
@@ -138,8 +143,9 @@ before 1.0).
 
 - **`create.loc` leftover stamp:** lookup reads/sums only through the highest
   fk in each 1024-create window, preads those windows as one bulk batch (held
-  head-resolve session or `pread_batch`), and prefix-sums non-overflow windows
-  with SIMD (SSE2 on x86_64, NEON on aarch64). No cross-window loc cache.
+  head-resolve session or `pread_batch`), and prefix-sums every window with
+  SIMD then ovf correction (SSE2 on x86_64, NEON on aarch64). No cross-window
+  loc cache.
 
 - **`store_reorg` overnight ASan OOM:** sibling ops no-op at 16 parked
   `held_bodies` and the tiny hub is not reopened. Recycle-every-16 grew

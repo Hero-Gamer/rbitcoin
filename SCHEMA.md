@@ -379,8 +379,9 @@ when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
 (or inwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`. Lookup `range_batch`
 reads and prefix-sums only through the highest fk in each 1024-create window
 (not the unused tail). Those window preads are **one** bulk batch (held
-head-resolve session, else `pread_batch`). Non-overflow windows use a SIMD
-prefix sum (`u8×8` SSE2 on x86_64, NEON on aarch64).
+head-resolve session, else `pread_batch`). Every window uses a SIMD prefix
+sum (`u8×8` SSE2 on x86_64, NEON on aarch64); overflow slots (u8 `0`) are then
+corrected from `create.loc.ovf`.
 
 One `create_loc_range_batch` yields both `(txout, spent)` and `n_out`. Lookup
 stamps both ranges; load copies the stamp; write appends loc and keeps RAM

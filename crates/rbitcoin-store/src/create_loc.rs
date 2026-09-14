@@ -396,6 +396,46 @@ fn prefix_sum_create_ovf(
     win_first: u64,
     ovf: &[(u64, u32, u32)],
 ) -> Result<LocPrefix, StoreError> {
+    let last_fk = win_first.saturating_add(n as u64).saturating_sub(1);
+    let lo = ovf.partition_point(|&(fk, _, _)| fk < win_first);
+    let hi = ovf.partition_point(|&(fk, _, _)| fk <= last_fk);
+    let win_ovf = &ovf[lo..hi];
+    let (mut tx_ps, mut sp_ps, mut n_outs) = prefix_sum_create_no_ovf(buf, n, tx0, sp0);
+    let mut extra_tx = 0u64;
+    let mut extra_sp = 0u64;
+    for i in 0..n {
+        let s8 = buf[i * 2];
+        let n8 = buf[i * 2 + 1];
+        if s8 == 0 || n8 == 0 {
+            let fk = win_first + i as u64;
+            let (st, n_out) = decode_create_pair(s8, n8, fk, win_ovf)?;
+            extra_tx = extra_tx.saturating_add(
+                u64::from(st)
+                    .saturating_mul(IDX_STRIDE)
+                    .saturating_sub(u64::from(s8).saturating_mul(IDX_STRIDE)),
+            );
+            extra_sp = extra_sp.saturating_add(
+                u64::from(n_out)
+                    .saturating_mul(IDX_STRIDE)
+                    .saturating_sub(u64::from(n8).saturating_mul(IDX_STRIDE)),
+            );
+            n_outs[i] = n_out;
+        }
+        tx_ps[i + 1] = tx_ps[i + 1].saturating_add(extra_tx);
+        sp_ps[i + 1] = sp_ps[i + 1].saturating_add(extra_sp);
+    }
+    Ok((tx_ps, sp_ps, n_outs))
+}
+
+#[cfg(test)]
+fn prefix_sum_create_ovf_scalar(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    win_first: u64,
+    ovf: &[(u64, u32, u32)],
+) -> Result<LocPrefix, StoreError> {
     let mut tx_ps = vec![0u64; n + 1];
     let mut sp_ps = vec![0u64; n + 1];
     let mut n_outs = vec![0u32; n];
@@ -820,6 +860,31 @@ mod tests {
             got[2].unwrap().spent.0,
             FILE_HEADER_LEN as u64 + 7 * 8 + 256 * 8 + 7 * 8
         );
+        if let Ok(mut sess) =
+            crate::uring_session::UringSession::try_open(crate::uring_session::DEFAULT_ENTRIES)
+        {
+            let held = loc
+                .range_batch_ctx(&[Fk(8), Fk(1), Fk(16)], &mut crate::IoCtx::held(&mut sess))
+                .unwrap();
+            assert_eq!(held, got);
+        }
+    }
+
+    #[test]
+    fn create_loc_mixed_window_u32_strides() {
+        let dir = TempDir::labeled("create-loc-mix-u32").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        let n_out = vec![1u32; 8];
+        let mut lens = vec![8u64; 8];
+        lens[3] = 65536 * IDX_STRIDE;
+        loc.append(&chain(&n_out, &lens)).unwrap();
+        let got = loc.range_batch(&[Fk(4), Fk(1), Fk(8)]).unwrap();
+        assert_eq!(got[0].unwrap().txout.1, 65536 * IDX_STRIDE);
+        assert_eq!(got[1].unwrap().txout.1, 8);
+        assert_eq!(
+            got[2].unwrap().txout.0,
+            FILE_HEADER_LEN as u64 + 3 * 8 + 65536 * IDX_STRIDE + 3 * 8
+        );
     }
 
     #[test]
@@ -874,6 +939,42 @@ mod tests {
                 "fat n={n}"
             );
         }
+    }
+
+    #[test]
+    fn prefix_sum_mixed_window_matches_scalar() {
+        let n = 16usize;
+        let mut buf = vec![0u8; n * 2];
+        for i in 0..n {
+            buf[i * 2] = ((i % 10) + 1) as u8;
+            buf[i * 2 + 1] = ((i % 7) + 1) as u8;
+        }
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[7 * 2] = 0;
+        buf[7 * 2 + 1] = 3;
+        buf[15 * 2] = 5;
+        buf[15 * 2 + 1] = 0;
+        let ovf = vec![(1, 300u32, 400u32), (8, 256, 3), (16, 5, 512)];
+        let got = prefix_sum_create_ovf(&buf, n, 64, 80, 1, &ovf).unwrap();
+        let want = prefix_sum_create_ovf_scalar(&buf, n, 64, 80, 1, &ovf).unwrap();
+        assert_eq!(got, want);
+        assert_ne!(
+            got,
+            prefix_sum_create_no_ovf(&buf, n, 64, 80),
+            "sentinel-as-zero SIMD must be corrected from ovf"
+        );
+
+        let n2 = 8usize;
+        let mut buf2 = vec![1u8; n2 * 2];
+        buf2[3 * 2] = 0;
+        buf2[3 * 2 + 1] = 0;
+        let ovf2 = vec![(4, 65536u32, 1u32)];
+        let got2 = prefix_sum_create_ovf(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
+        let want2 = prefix_sum_create_ovf_scalar(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
+        assert_eq!(got2, want2);
+        assert_eq!(got2.0[4] - got2.0[3], 65536 * IDX_STRIDE);
+        assert_eq!(got2.2[3], 1);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
