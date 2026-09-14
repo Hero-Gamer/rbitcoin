@@ -17,3 +17,11 @@ announcement is consumed, and we never getdata the real block.
 
 Track placed txids; second use of the same tx → missing (getblocktxn / full
 getdata). Same uniqueness on the `blocktxn` apply path.
+
+## Related: no extra-txn cache
+
+Core can fill a duplicate-txid short-id from `-blockreconstructionextratxn`
+that we still request. Production reconstruct is live mempool only; there is
+no extra-txn ring. Libre admission shrinks that cache's hit rate, not to
+zero (orphans, just-below-minfee 1p1c parents, eviction). Worth adding later;
+see [`COMPAT.md`](../../COMPAT.md). Not a Q-id.

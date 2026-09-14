@@ -310,6 +310,8 @@ if [[ "$BIN" == "cmpct_differential" ]]; then
   merge_seed fuzz/corpus/cmpct_differential \
     fuzz/fixtures/cmpct_fuzz_dup.bin
   merge_seed fuzz/corpus/cmpct_differential \
+    fuzz/fixtures/cmpct_fuzz_dup_prefill_corrupt.bin
+  merge_seed fuzz/corpus/cmpct_differential \
     fuzz/fixtures/cmpct_fuzz_raw.bin
   log="${TMPDIR:-/tmp}/rbtc-fuzz-cmpct.$$.log"
   set +e

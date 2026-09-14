@@ -110,6 +110,12 @@ pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
     Some(structured_cmpct_case(data))
 }
 
+/// Core extra-txn may place a duplicate-txid slot we still `getblocktxn`
+/// (018). Agree when every Core index is in `ours`; extra ours indexes are ok.
+pub fn cmpct_getblocktxn_agrees(ours: &[u64], core: &[u64]) -> bool {
+    core.iter().all(|i| ours.contains(i))
+}
+
 /// Missing indexes using the case fill set (empty = mempool-cold).
 pub fn cmpct_missing_for_case(case: &CmpctFuzzCase) -> Option<Vec<u64>> {
     if !rbitcoin_net::prefilled_indexes_ok(&case.hsi) {
@@ -248,9 +254,30 @@ mod tests {
         assert!(cmpct_hsi_regtest_connectable(&case.hsi));
         assert_eq!(cmpct_missing_for_case(&case).as_deref(), Some(&[1u64][..]));
         assert_eq!(
-            try_reconstruct(&case.hsi, &HashMap::new(), 2).unwrap_err(),
+            try_reconstruct(&case.hsi, &HashMap::<ShortId, Vec<&Transaction>>::new(), 2)
+                .unwrap_err(),
             vec![1]
         );
+    }
+
+    #[test]
+    fn overnight_dup_prefill_corrupt_missing_is_1_and_4() {
+        // fuzz.yml 34852819510: `[2, 203, 4, 63]` → FLAG_FILL|DUP|CORRUPT,
+        // 3 extras, prefill abs 3. Ours requests [1, 4]; Core extra-txn
+        // filled the duplicate and only `getblocktxn` [1].
+        let case = prepare_cmpct_fuzz_case(&[2, 203, 4, 63]).unwrap();
+        assert!(cmpct_hsi_regtest_connectable(&case.hsi));
+        assert_eq!(
+            cmpct_missing_for_case(&case).as_deref(),
+            Some(&[1u64, 4][..])
+        );
+        assert!(
+            cmpct_getblocktxn_agrees(&[1, 4], &[1]),
+            "018 extra missing vs Core extra-txn fill must not panic"
+        );
+        assert!(cmpct_getblocktxn_agrees(&[1], &[1]));
+        assert!(!cmpct_getblocktxn_agrees(&[1], &[1, 4]));
+        assert!(!cmpct_getblocktxn_agrees(&[], &[1]));
     }
 
     #[test]
@@ -262,6 +289,10 @@ mod tests {
         assert_eq!(
             std::fs::read(fixture("cmpct_fuzz_all_prefilled.bin")).unwrap(),
             [0, 0, 0, 0]
+        );
+        assert_eq!(
+            std::fs::read(fixture("cmpct_fuzz_dup_prefill_corrupt.bin")).unwrap(),
+            [2, 203, 4, 63]
         );
         let mut raw = vec![7u8];
         raw.extend_from_slice(&std::fs::read(fixture("cmpct_h1_two_tx.bin")).unwrap());
