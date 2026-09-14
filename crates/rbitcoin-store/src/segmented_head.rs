@@ -1122,6 +1122,22 @@ fn refuse_legacy_mono_head(dir: &Path) -> Result<(), StoreError> {
 /// Leftover flat `tx.head.meta` (pre-directory layout).
 pub const INDEX_REFUSE_FLAT_HEAD: &str = "index refuses flat tx.head.meta; wipe store/tx.head then restart (Class A kept; tx.head rebuilds)";
 
+/// Occupied-head layouts that must not auto-rebuild: leftover v1/flat, empty or
+/// truncated meta, truncated/missing sealed MPHF.
+pub(crate) fn is_index_open_refuse(err: &StoreError) -> bool {
+    match err {
+        StoreError::Corrupt(m) => {
+            *m == crate::fuse8_filter::INDEX_REFUSE_FUSE8_V1
+                || *m == INDEX_REFUSE_FLAT_HEAD
+                || *m == "tx.head.meta short"
+                || *m == "tx.head.meta truncated"
+                || *m == "tx.head sealed segment missing mphf"
+                || m.starts_with("bdz mphf:")
+        }
+        _ => false,
+    }
+}
+
 /// Ensure `tx.head/` exists. Leftover flat `tx.head.meta` refuses.
 fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
     let root = head_root(dir);

@@ -197,7 +197,7 @@ impl Store {
         if trimmed > 0 {
             self.flush_confirmed_only()?;
             self.rebuild_height_fence()?;
-            let _ = self.repair_class_c_above_tip()?;
+            self.persist_class_c_repair()?;
             report.tip_shrunk = true;
             eprintln!("rbitcoin: trimmed {trimmed} trailing null confirmed[] slots");
         }
@@ -413,9 +413,17 @@ impl Store {
 
         self.flush_confirmed_only()?;
         self.rebuild_height_fence()?;
-        let _ = self.repair_class_c_above_tip()?;
+        self.persist_class_c_repair()?;
         report.tip_shrunk = true;
         report.tip_after = self.confirmed.tip_height().map(|h| h.0);
+        Ok(())
+    }
+
+    fn persist_class_c_repair(&self) -> Result<(), StoreError> {
+        let n = self.repair_class_c_above_tip()?;
+        if n > 0 {
+            self.strong_tx.flush()?;
+        }
         Ok(())
     }
 }

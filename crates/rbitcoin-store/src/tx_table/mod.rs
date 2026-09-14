@@ -693,12 +693,7 @@ impl TxTable {
                     }
                 }
                 Err(e) => {
-                    if matches!(
-                        &e,
-                        StoreError::Corrupt(m)
-                            if *m == crate::fuse8_filter::INDEX_REFUSE_FUSE8_V1
-                                || *m == crate::segmented_head::INDEX_REFUSE_FLAT_HEAD
-                    ) {
+                    if crate::segmented_head::is_index_open_refuse(&e) {
                         return Err(e);
                     }
                     if n_bodies > 0 {

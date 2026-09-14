@@ -16,6 +16,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 use rbitcoin_test::{assert_reconstruct_eq, build_mature_regtest_with_spend, TestDatadir};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// One mature pad: mempool persist, then `--milestone` skip-below / check-above,
@@ -122,8 +123,33 @@ fn analog_milestone_and_mempool_persist() {
     );
 }
 
+fn first_head_sidecar(head: &Path, ext: &str) -> PathBuf {
+    for ent in std::fs::read_dir(head).unwrap() {
+        let p = ent.unwrap().path();
+        if p.extension().and_then(|e| e.to_str()) == Some(ext) {
+            return p;
+        }
+    }
+    panic!("no *.{ext} under {}", head.display());
+}
+
+fn assert_query_open_refuses(store: &Path, needle: &str) {
+    let err = match Query::open_or_create_tiny(store) {
+        Ok(_) => panic!("Query::open must refuse ({needle})"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains(needle), "expected {needle:?} in {msg}");
+    assert!(
+        store.join("txout.body").is_file(),
+        "Class A kept after {needle} refuse"
+    );
+}
+
 /// Archive reconstruct of height 1 after dropping RAM and wiping `tx.head/`
-/// (`feature_reindex*.py` / operator delete-head reopen).
+/// (`feature_reindex*.py` / operator delete-head reopen). Same pad: crash-open
+/// clamps an unsealed tip, then leftover v1 fuse / truncated mphf / empty meta
+/// refuse at `Query::open` (Class A kept).
 #[test]
 fn analog_reconstruct_after_lost_head() {
     let td = TestDatadir::new().unwrap();
@@ -131,18 +157,46 @@ fn analog_reconstruct_after_lost_head() {
     let genesis = regtest_genesis();
     let store = td.store_path();
     let b1;
+    let b2;
     let cb_txid;
+    let b3_cb;
     {
         let q = Query::open_or_create_tiny(&store).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
         accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        let b2 = mine_regtest_block(b1.block_hash(), b1.header.time + 600, 2, vec![]);
+        b2 = mine_regtest_block(b1.block_hash(), b1.header.time + 600, 2, vec![]);
         accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
         q.flush().unwrap();
         assert_eq!(q.tip_height(), Some(Height(2)));
         cb_txid = b1.txdata[0].compute_txid().to_byte_array();
+        let seal_path = store.join("tip_seal");
+        let seal = std::fs::read(&seal_path).expect("tip_seal after complete barrier");
+        let b3 = mine_regtest_block(b2.block_hash(), b2.header.time + 600, 3, vec![]);
+        accept_and_connect_block(&q, &params, Height(3), &b3, Milestone::NONE).unwrap();
+        assert_eq!(q.tip_height(), Some(Height(3)));
+        b3_cb = b3.txdata[0].compute_txid().to_byte_array();
+        std::fs::write(&seal_path, seal).expect("restore pre-height-3 seal");
     }
+
+    let q_clamp = Query::open_or_create_tiny(&store).unwrap();
+    assert_eq!(q_clamp.tip_height(), Some(Height(2)));
+    let view = q_clamp
+        .pin_chain_view()
+        .unwrap()
+        .expect("Electrum/RPC chain_tip after crash-open");
+    assert_eq!(view.height, Height(2));
+    assert_eq!(view.hash, b2.block_hash().to_byte_array());
+    let b3_fk = q_clamp
+        .get_tx_by_txid(&b3_cb)
+        .unwrap()
+        .expect("height-3 Class A kept")
+        .0;
+    assert!(
+        !q_clamp.store().is_confirmed_strong(b3_fk).unwrap(),
+        "leftover strong above clamped tip must not be confirmed"
+    );
+    drop(q_clamp);
 
     let head = store.join("tx.head");
     assert!(head.is_dir(), "tiny store writes segmented tx.head/");
@@ -163,4 +217,25 @@ fn analog_reconstruct_after_lost_head() {
         .reconstruct_block_at_height(Height(1))
         .expect("reconstruct height 1 after wiped tx.head");
     assert_eq!(rec.block_hash(), b1.block_hash());
+    drop(q2);
+
+    let fuse = first_head_sidecar(&head, "fuse8");
+    let mphf = first_head_sidecar(&head, "mphf");
+    let meta = head.join("meta");
+    let fuse_ok = std::fs::read(&fuse).unwrap();
+    let mphf_ok = std::fs::read(&mphf).unwrap();
+
+    let mut v1 = Vec::from(*b"BF8R");
+    v1.extend_from_slice(&1u32.to_le_bytes());
+    v1.extend_from_slice(&0u64.to_le_bytes());
+    std::fs::write(&fuse, &v1).unwrap();
+    assert_query_open_refuses(&store, "fuse8 v1");
+    std::fs::write(&fuse, fuse_ok).unwrap();
+
+    std::fs::write(&mphf, &mphf_ok[..8.min(mphf_ok.len())]).unwrap();
+    assert_query_open_refuses(&store, "bdz mphf");
+    std::fs::write(&mphf, mphf_ok).unwrap();
+
+    std::fs::write(&meta, []).unwrap();
+    assert_query_open_refuses(&store, "tx.head.meta short");
 }
