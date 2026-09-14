@@ -98,7 +98,8 @@ peers whose best-known header cannot beat our tip.
 Heap caps: [`docs/ibd-memory.md`](./ibd-memory.md) (tip-follow / P2P serve).
 
 **Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2.
-Incoming `cmpctblock` is reconstructed from the mempool short-id map; missing txs
+Incoming `cmpctblock` is reconstructed from the mempool short-id map (no Core
+extra-txn cache; [`COMPAT.md`](../COMPAT.md)); missing txs
 use `getblocktxn` / `blocktxn`. Full `getdata` MSG_WITNESS_BLOCK remains the
 fallback when mempool is cold or fill fails. We serve `getblocktxn` and
 `MSG_CMPCT_BLOCK` getdata from store/cache. A PoW-valid header that extends

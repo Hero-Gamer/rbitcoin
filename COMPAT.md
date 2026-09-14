@@ -47,7 +47,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Mempool structure | Cluster graph + chunks | Cluster mempool (same lineage) |
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
-| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve | v1/v2 high-bandwidth |
+| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve. Fill is **live mempool** only | v1/v2 high-bandwidth + `extra_txn` cache (`-blockreconstructionextratxn`) |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | GetAddr | Core `MAX_ADDR_TO_SEND` / `MAX_PCT_ADDR_TO_SEND` (**1000** / **23%**), 24h per-bind cache. Named copies in `rbitcoin-net` — do not “improve” without a named reason to diverge. `MAX_ADDR_MAN` (8192) is **our** HashMap DoS cap and must stay above `1000/0.23` | Core new/tried buckets (~80k); same 1000 / 23% |
 | Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
@@ -56,6 +56,13 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
 | JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli` | Full Core RPC |
+
+Compact reconstruct does not consult a Core-style **extra-txn** ring (recent
+`tx` bodies that missed or left the mempool). Libre admission (0.1 sat/vB, no
+dust, full RBF) keeps more of those bodies live than Core standardness, so the
+cache would hit less often than on Core — not never. Orphans, just-below-minfee
+1p1c parents, and eviction still miss the mempool short-id map and cost a
+`getblocktxn`. Worth adding later; not scheduled (no Open Q-id).
 
 ## Core-class JSON-RPC (subset)
 
