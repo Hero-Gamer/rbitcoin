@@ -46,6 +46,13 @@ before 1.0).
   skips empty payloads, and marks unknown-height plus tip+1 gaps missing
   for densify. Process restart still starts with an empty RAM queue.
 
+### Fixed
+
+- **`cmpct_differential` missing-index split:** Core extra-txn can fill a
+  duplicate-txid short-id we still `getblocktxn` (018). Recipe
+  `[2, 203, 4, 63]` is ours `[1, 4]` vs Core `[1]`. Agree when Core's indexes
+  are a subset of ours; still panic if we filled a slot Core requested.
+
 ### Changed
 
 - **Schema 23:** `create.loc.ovf` is 16 B (`fk:u64` + u32 strides / `n_out`) so a

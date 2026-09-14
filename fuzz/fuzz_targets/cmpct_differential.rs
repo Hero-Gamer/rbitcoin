@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use rbitcoin_fuzz::{
-    cmpct_missing_for_case, encode_cmpctblock_v2, encode_pong_v2, encode_sendcmpct_hb_v2,
-    encode_tx_v2, prepare_cmpct_fuzz_case, BlockOracle,
+    cmpct_getblocktxn_agrees, cmpct_missing_for_case, encode_cmpctblock_v2, encode_pong_v2,
+    encode_sendcmpct_hb_v2, encode_tx_v2, prepare_cmpct_fuzz_case, BlockOracle,
 };
 use rbitcoin_fuzz::{spawn_bitcoind_p2p, tmp_dir, CoreChild};
 use rbitcoin_net::{classify_v2_cmpct_peer, CmpctPeerFrame, NetError, V2PlainSession};
@@ -201,7 +201,7 @@ fn send_one(b: &Base, data: &[u8]) -> SendOutcome {
         }
         Err(_) => SendOutcome::Live,
         Ok(Some(core_idx)) => {
-            if core_idx != ours {
+            if !cmpct_getblocktxn_agrees(&ours, &core_idx) {
                 panic!("cmpct missing-index split: ours={ours:?} core={core_idx:?}");
             }
             let hash = case.hsi.header.block_hash().to_string();

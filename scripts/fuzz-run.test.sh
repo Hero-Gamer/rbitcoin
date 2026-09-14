@@ -120,6 +120,8 @@ assert_ok "cmpct-differential fill seed" \
   test -s "$ROOT/fuzz/fixtures/cmpct_fuzz_fill.bin"
 assert_ok "cmpct-differential dup seed" \
   test -s "$ROOT/fuzz/fixtures/cmpct_fuzz_dup.bin"
+assert_ok "cmpct-differential dup-prefill-corrupt seed" \
+  test -s "$ROOT/fuzz/fixtures/cmpct_fuzz_dup_prefill_corrupt.bin"
 assert_ok "cmpct-differential raw seed" \
   test -s "$ROOT/fuzz/fixtures/cmpct_fuzz_raw.bin"
 
