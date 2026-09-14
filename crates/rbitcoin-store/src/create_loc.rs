@@ -229,7 +229,12 @@ impl CreateLoc {
         self.range_batch_ctx(fks, &mut IoCtx::none())
     }
 
-    /// Same as [`Self::range_batch`] on a held completion session (head-resolve TLS).
+    /// Same as [`Self::range_batch`] on a caller-held completion session.
+    ///
+    /// Poisoned held session fails closed (no libc-complete). Live unpoisoned
+    /// batch fail libc-completes shorts and does not consume recover credit.
+    /// Head resolve does **not** pass its probe ring here — it uses
+    /// [`Self::range_batch`] after TLS drops.
     pub(crate) fn range_batch_ctx(
         &self,
         fks: &[Fk],
@@ -290,32 +295,33 @@ impl CreateLoc {
         }
         self.pread_windows(ctx, &mut windows)?;
         for win in &windows {
-            let (tx_ps, sp_ps, n_outs) = self.prefix_sum_win(win)?;
-            for &(orig, id) in &jobs[win.job_lo..win.job_hi] {
-                let within = loc_within(id);
-                out[orig] = Some(CreateLocPair {
-                    txout: (tx_ps[within], tx_ps[within + 1] - tx_ps[within]),
-                    spent: (sp_ps[within], sp_ps[within + 1] - sp_ps[within]),
-                    n_out: n_outs[within],
-                });
-            }
+            self.extract_win_pairs(win, &jobs, &mut out)?;
         }
         Ok(out)
     }
 
-    fn prefix_sum_win(&self, win: &LocWinRead) -> Result<LocPrefix, StoreError> {
-        let mut any_sentinel = false;
-        for i in 0..win.n {
-            if win.buf[i * 2] == 0 || win.buf[i * 2 + 1] == 0 {
-                any_sentinel = true;
-                break;
+    fn extract_win_pairs(
+        &self,
+        win: &LocWinRead,
+        jobs: &[(usize, u64)],
+        out: &mut [Option<CreateLocPair>],
+    ) -> Result<(), StoreError> {
+        let win_jobs = &jobs[win.job_lo..win.job_hi];
+        match extract_pairs_no_ovf(&win.buf, win.n, win.tx0, win.sp0, win_jobs, out) {
+            Ok(()) => Ok(()),
+            Err(ExtractFail::NeedOvf) => {
+                let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
+                extract_pairs_ovf(
+                    &win.buf,
+                    win.n,
+                    win.tx0,
+                    win.sp0,
+                    win.win_first,
+                    &ovf,
+                    win_jobs,
+                    out,
+                )
             }
-        }
-        if any_sentinel {
-            let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-            prefix_sum_create_ovf(&win.buf, win.n, win.tx0, win.sp0, win.win_first, &ovf)
-        } else {
-            Ok(prefix_sum_create_no_ovf(&win.buf, win.n, win.tx0, win.sp0))
         }
     }
 
@@ -386,191 +392,228 @@ struct LocWinRead {
     buf: Vec<u8>,
 }
 
-type LocPrefix = (Vec<u64>, Vec<u64>, Vec<u32>);
+enum ExtractFail {
+    NeedOvf,
+}
 
-fn prefix_sum_create_ovf(
+fn emit_pair(
+    orig: usize,
+    tx: u64,
+    tlen: u64,
+    sp: u64,
+    slen: u64,
+    n_out: u32,
+    out: &mut [Option<CreateLocPair>],
+) {
+    out[orig] = Some(CreateLocPair {
+        txout: (tx, tlen),
+        spent: (sp, slen),
+        n_out,
+    });
+}
+
+fn extract_pairs_ovf(
     buf: &[u8],
     n: usize,
     tx0: u64,
     sp0: u64,
     win_first: u64,
     ovf: &[(u64, u32, u32)],
-) -> Result<LocPrefix, StoreError> {
+    jobs: &[(usize, u64)],
+    out: &mut [Option<CreateLocPair>],
+) -> Result<(), StoreError> {
     let last_fk = win_first.saturating_add(n as u64).saturating_sub(1);
     let lo = ovf.partition_point(|&(fk, _, _)| fk < win_first);
     let hi = ovf.partition_point(|&(fk, _, _)| fk <= last_fk);
     let win_ovf = &ovf[lo..hi];
-    let (mut tx_ps, mut sp_ps, mut n_outs) = prefix_sum_create_no_ovf(buf, n, tx0, sp0);
-    let mut extra_tx = 0u64;
-    let mut extra_sp = 0u64;
-    for i in 0..n {
-        let s8 = buf[i * 2];
-        let n8 = buf[i * 2 + 1];
-        if s8 == 0 || n8 == 0 {
-            let fk = win_first + i as u64;
-            let (st, n_out) = decode_create_pair(s8, n8, fk, win_ovf)?;
-            extra_tx = extra_tx.saturating_add(
-                u64::from(st)
-                    .saturating_mul(IDX_STRIDE)
-                    .saturating_sub(u64::from(s8).saturating_mul(IDX_STRIDE)),
-            );
-            extra_sp = extra_sp.saturating_add(
-                u64::from(n_out)
-                    .saturating_mul(IDX_STRIDE)
-                    .saturating_sub(u64::from(n8).saturating_mul(IDX_STRIDE)),
-            );
-            n_outs[i] = n_out;
-        }
-        tx_ps[i + 1] = tx_ps[i + 1].saturating_add(extra_tx);
-        sp_ps[i + 1] = sp_ps[i + 1].saturating_add(extra_sp);
-    }
-    Ok((tx_ps, sp_ps, n_outs))
-}
-
-#[cfg(test)]
-fn prefix_sum_create_ovf_scalar(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-    win_first: u64,
-    ovf: &[(u64, u32, u32)],
-) -> Result<LocPrefix, StoreError> {
-    let mut tx_ps = vec![0u64; n + 1];
-    let mut sp_ps = vec![0u64; n + 1];
-    let mut n_outs = vec![0u32; n];
-    tx_ps[0] = tx0;
-    sp_ps[0] = sp0;
-    for i in 0..n {
-        let fk = win_first + i as u64;
-        let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, ovf)?;
-        n_outs[i] = n_out;
-        tx_ps[i + 1] = tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
-        sp_ps[i + 1] = sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
-    }
-    Ok((tx_ps, sp_ps, n_outs))
-}
-
-/// Non-overflow window: SIMD prefix when the arch provides it, else scalar.
-pub(crate) fn prefix_sum_create_no_ovf(buf: &[u8], n: usize, tx0: u64, sp0: u64) -> LocPrefix {
-    let mut tx_ps = vec![0u64; n + 1];
-    let mut sp_ps = vec![0u64; n + 1];
-    let mut n_outs = vec![0u32; n];
-    prefix_sum_create_no_ovf_into(buf, n, tx0, sp0, &mut tx_ps, &mut sp_ps, &mut n_outs);
-    (tx_ps, sp_ps, n_outs)
-}
-
-/// Independent scalar prefix: test golden, and the production path off x86_64/aarch64.
-/// Test binaries on those arches still run [`prefix_sum_create_no_ovf`] through SIMD.
-#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-pub(crate) fn prefix_sum_create_no_ovf_scalar(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-) -> LocPrefix {
-    let mut tx_ps = vec![0u64; n + 1];
-    let mut sp_ps = vec![0u64; n + 1];
-    let mut n_outs = vec![0u32; n];
-    prefix_sum_create_no_ovf_scalar_into(buf, n, tx0, sp0, &mut tx_ps, &mut sp_ps, &mut n_outs);
-    (tx_ps, sp_ps, n_outs)
-}
-
-fn prefix_sum_create_no_ovf_into(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-    tx_ps: &mut [u64],
-    sp_ps: &mut [u64],
-    n_outs: &mut [u32],
-) {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    prefix_sum_create_u8x8(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    prefix_sum_create_no_ovf_scalar_into(buf, n, tx0, sp0, tx_ps, sp_ps, n_outs);
-}
-
-#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
-fn prefix_sum_create_no_ovf_scalar_into(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-    tx_ps: &mut [u64],
-    sp_ps: &mut [u64],
-    n_outs: &mut [u32],
-) {
-    tx_ps[0] = tx0;
-    sp_ps[0] = sp0;
-    for i in 0..n {
-        let st = u32::from(buf[i * 2]);
-        let n_out = u32::from(buf[i * 2 + 1]);
-        n_outs[i] = n_out;
-        tx_ps[i + 1] = tx_ps[i].saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
-        sp_ps[i + 1] = sp_ps[i].saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn prefix_sum_create_u8x8(
-    buf: &[u8],
-    n: usize,
-    tx0: u64,
-    sp0: u64,
-    tx_ps: &mut [u64],
-    sp_ps: &mut [u64],
-    n_outs: &mut [u32],
-) {
-    tx_ps[0] = tx0;
-    sp_ps[0] = sp0;
-    let mut i = 0usize;
     let mut tx = tx0;
     let mut sp = sp0;
-    while i + 8 <= n {
-        let mut st = [0u8; 8];
-        let mut no = [0u8; 8];
-        let base = i * 2;
-        for k in 0..8 {
-            st[k] = buf[base + k * 2];
-            no[k] = buf[base + k * 2 + 1];
-            n_outs[i + k] = u32::from(no[k]);
+    let mut j = 0usize;
+    for i in 0..n {
+        let fk = win_first + i as u64;
+        let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, win_ovf)?;
+        let tlen = u64::from(st).saturating_mul(IDX_STRIDE);
+        let slen = u64::from(n_out).saturating_mul(IDX_STRIDE);
+        while j < jobs.len() && loc_within(jobs[j].1) == i {
+            emit_pair(jobs[j].0, tx, tlen, sp, slen, n_out, out);
+            j += 1;
         }
-        // SAFETY: `st`/`no` are 8-byte stack arrays; SSE2 movq / NEON vld1
-        // 8-byte loads are defined unaligned.
-        #[cfg(target_arch = "x86_64")]
-        let (tx_inc, sp_inc) = unsafe {
+        tx = tx.saturating_add(tlen);
+        sp = sp.saturating_add(slen);
+    }
+    Ok(())
+}
+
+fn extract_pairs_no_ovf(
+    buf: &[u8],
+    n: usize,
+    tx0: u64,
+    sp0: u64,
+    jobs: &[(usize, u64)],
+    out: &mut [Option<CreateLocPair>],
+) -> Result<(), ExtractFail> {
+    let mut tx = tx0;
+    let mut sp = sp0;
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i + 8 <= n {
+        let base = i * 2;
+        let (st, no, has_zero) = deinterleave_pairs_u8x8(&buf[base..base + 16]);
+        if has_zero {
+            return Err(ExtractFail::NeedOvf);
+        }
+        let (tx_inc, sp_inc) = inclusive_u8x8_times_8(&st, &no);
+        while j < jobs.len() {
+            let within = loc_within(jobs[j].1);
+            if within < i {
+                j += 1;
+                continue;
+            }
+            if within >= i + 8 {
+                break;
+            }
+            let k = within - i;
+            let tprev = if k == 0 { 0 } else { u64::from(tx_inc[k - 1]) };
+            let sprev = if k == 0 { 0 } else { u64::from(sp_inc[k - 1]) };
+            let tlen = u64::from(tx_inc[k]).saturating_sub(tprev);
+            let slen = u64::from(sp_inc[k]).saturating_sub(sprev);
+            emit_pair(
+                jobs[j].0,
+                tx.saturating_add(tprev),
+                tlen,
+                sp.saturating_add(sprev),
+                slen,
+                u32::from(no[k]),
+                out,
+            );
+            j += 1;
+        }
+        tx = tx.saturating_add(u64::from(tx_inc[7]));
+        sp = sp.saturating_add(u64::from(sp_inc[7]));
+        i += 8;
+    }
+    while i < n {
+        let st = buf[i * 2];
+        let no = buf[i * 2 + 1];
+        if st == 0 || no == 0 {
+            return Err(ExtractFail::NeedOvf);
+        }
+        let tlen = u64::from(st).saturating_mul(IDX_STRIDE);
+        let slen = u64::from(no).saturating_mul(IDX_STRIDE);
+        while j < jobs.len() && loc_within(jobs[j].1) == i {
+            emit_pair(jobs[j].0, tx, tlen, sp, slen, u32::from(no), out);
+            j += 1;
+        }
+        tx = tx.saturating_add(tlen);
+        sp = sp.saturating_add(slen);
+        i += 1;
+    }
+    Ok(())
+}
+
+fn deinterleave_pairs_u8x8(buf: &[u8]) -> ([u8; 8], [u8; 8], bool) {
+    debug_assert!(buf.len() >= 16);
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { sse2_deinterleave_pairs_u8x8(buf.as_ptr()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { neon_deinterleave_pairs_u8x8(buf.as_ptr()) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        deinterleave_pairs_u8x8_scalar(buf)
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn deinterleave_pairs_u8x8_scalar(buf: &[u8]) -> ([u8; 8], [u8; 8], bool) {
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    let mut has_zero = false;
+    for k in 0..8 {
+        st[k] = buf[k * 2];
+        no[k] = buf[k * 2 + 1];
+        if st[k] == 0 || no[k] == 0 {
+            has_zero = true;
+        }
+    }
+    (st, no, has_zero)
+}
+
+fn inclusive_u8x8_times_8(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe {
             (
                 sse2_u8x8_times_8_inclusive(st.as_ptr()),
                 sse2_u8x8_times_8_inclusive(no.as_ptr()),
             )
         };
-        #[cfg(target_arch = "aarch64")]
-        let (tx_inc, sp_inc) = unsafe {
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe {
             (
                 neon_u8x8_times_8_inclusive(st.as_ptr()),
                 neon_u8x8_times_8_inclusive(no.as_ptr()),
             )
         };
-        let tx_start = tx;
-        let sp_start = sp;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut tx = [0u32; 8];
+        let mut sp = [0u32; 8];
+        let mut t = 0u32;
+        let mut s = 0u32;
         for k in 0..8 {
-            tx_ps[i + k + 1] = tx_start.saturating_add(u64::from(tx_inc[k]));
-            sp_ps[i + k + 1] = sp_start.saturating_add(u64::from(sp_inc[k]));
+            t = t.saturating_add(u32::from(st[k]) << 3);
+            s = s.saturating_add(u32::from(no[k]) << 3);
+            tx[k] = t;
+            sp[k] = s;
         }
-        tx = tx_ps[i + 8];
-        sp = sp_ps[i + 8];
-        i += 8;
+        (tx, sp)
     }
-    for j in i..n {
-        let st = u32::from(buf[j * 2]);
-        let n_out = u32::from(buf[j * 2 + 1]);
-        n_outs[j] = n_out;
-        tx = tx.saturating_add(u64::from(st).saturating_mul(IDX_STRIDE));
-        sp = sp.saturating_add(u64::from(n_out).saturating_mul(IDX_STRIDE));
-        tx_ps[j + 1] = tx;
-        sp_ps[j + 1] = sp;
-    }
+}
+
+/// # Safety
+/// `p` must be readable for 16 bytes.
+#[cfg(target_arch = "x86_64")]
+unsafe fn sse2_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool) {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+        _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16, _mm_storel_epi64,
+    };
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let has_zero = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) != 0;
+    let mask = _mm_set1_epi16(0x00FF);
+    let st16 = _mm_and_si128(v, mask);
+    let no16 = _mm_srli_epi16(v, 8);
+    let z = _mm_setzero_si128();
+    let st8 = _mm_packus_epi16(st16, z);
+    let no8 = _mm_packus_epi16(no16, z);
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    _mm_storel_epi64(st.as_mut_ptr() as *mut __m128i, st8);
+    _mm_storel_epi64(no.as_mut_ptr() as *mut __m128i, no8);
+    (st, no, has_zero)
+}
+
+/// # Safety
+/// `p` must be readable for 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn neon_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool) {
+    use std::arch::aarch64::{vceq_u8, vdup_n_u8, vld2_u8, vmaxv_u8, vst1_u8};
+    let v = vld2_u8(p);
+    let z = vdup_n_u8(0);
+    let has_zero = vmaxv_u8(vceq_u8(v.val[0], z)) != 0 || vmaxv_u8(vceq_u8(v.val[1], z)) != 0;
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    vst1_u8(st.as_mut_ptr(), v.val[0]);
+    vst1_u8(no.as_mut_ptr(), v.val[1]);
+    (st, no, has_zero)
 }
 
 /// Inclusive scan of eight `u8 << 3` values (fits u32 for a 1024-create window).
@@ -920,66 +963,26 @@ mod tests {
     }
 
     #[test]
-    fn prefix_sum_fast_matches_scalar() {
-        let mut buf = Vec::new();
-        for i in 0..1024 {
-            buf.push(((i % 254) + 1) as u8);
-            buf.push(((i % 200) + 1) as u8);
+    fn deinterleave_pairs_lanes_and_zero_in_same_load() {
+        let mut buf = [0u8; 16];
+        for i in 0..8 {
+            buf[i * 2] = (i as u8) + 1;
+            buf[i * 2 + 1] = (i as u8) + 2;
         }
-        let fat = vec![255u8; 1024 * 2];
-        for n in [1usize, 7, 8, 9, 16, 63, 64, 1024] {
-            assert_eq!(
-                prefix_sum_create_no_ovf(&buf, n, 64, 80),
-                prefix_sum_create_no_ovf_scalar(&buf, n, 64, 80),
-                "n={n}"
-            );
-            assert_eq!(
-                prefix_sum_create_no_ovf(&fat, n, 0, 64),
-                prefix_sum_create_no_ovf_scalar(&fat, n, 0, 64),
-                "fat n={n}"
-            );
-        }
-    }
-
-    #[test]
-    fn prefix_sum_mixed_window_matches_scalar() {
-        let n = 16usize;
-        let mut buf = vec![0u8; n * 2];
-        for i in 0..n {
-            buf[i * 2] = ((i % 10) + 1) as u8;
-            buf[i * 2 + 1] = ((i % 7) + 1) as u8;
-        }
+        let (st, no, z) = deinterleave_pairs_u8x8(&buf);
+        assert_eq!(st, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(no, [2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(!z);
         buf[0] = 0;
-        buf[1] = 0;
-        buf[7 * 2] = 0;
-        buf[7 * 2 + 1] = 3;
-        buf[15 * 2] = 5;
-        buf[15 * 2 + 1] = 0;
-        let ovf = vec![(1, 300u32, 400u32), (8, 256, 3), (16, 5, 512)];
-        let got = prefix_sum_create_ovf(&buf, n, 64, 80, 1, &ovf).unwrap();
-        let want = prefix_sum_create_ovf_scalar(&buf, n, 64, 80, 1, &ovf).unwrap();
-        assert_eq!(got, want);
-        assert_ne!(
-            got,
-            prefix_sum_create_no_ovf(&buf, n, 64, 80),
-            "sentinel-as-zero SIMD must be corrected from ovf"
-        );
-
-        let n2 = 8usize;
-        let mut buf2 = vec![1u8; n2 * 2];
-        buf2[3 * 2] = 0;
-        buf2[3 * 2 + 1] = 0;
-        let ovf2 = vec![(4, 65536u32, 1u32)];
-        let got2 = prefix_sum_create_ovf(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
-        let want2 = prefix_sum_create_ovf_scalar(&buf2, n2, 0, 64, 1, &ovf2).unwrap();
-        assert_eq!(got2, want2);
-        assert_eq!(got2.0[4] - got2.0[3], 65536 * IDX_STRIDE);
-        assert_eq!(got2.2[3], 1);
+        assert!(deinterleave_pairs_u8x8(&buf).2);
+        buf[0] = 1;
+        buf[15] = 0;
+        assert!(deinterleave_pairs_u8x8(&buf).2);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
-    fn prefix_sum_u8x8_scan_matches_scalar() {
+    fn inclusive_u8x8_times_8_matches_shift_sum() {
         let p = [255u8, 1, 0, 8, 255, 9, 2, 3];
         let mut expect = [0u32; 8];
         let mut acc = 0u32;

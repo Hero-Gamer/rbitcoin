@@ -7,12 +7,13 @@
 //!
 //! Each wave: probe that slice → at most two page-grouped `txid.body` shots
 //! (first four cands, then the rest if still unfinished) → newest-first walk
-//! (`body==want`, fence-connected if a fence is on) → one `tx.idx` fill for
-//! chosen fks. Unconnected identity does **not** skip later waves or shot B.
-//! TipOnly strips unconnected winners at the end.
+//! (`body==want`, fence-connected if a fence is on). Unconnected identity does
+//! **not** skip later waves or shot B. TipOnly strips unconnected winners at
+//! the end. **One** `create.loc` batch runs **after** all three waves, on
+//! FdOnly / standalone bulk — not on the held probe ring.
 //!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
-//! idx, returns `(fk, body_range)` so prep denserels-loads by offset.
+//! loc, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
 //! **IO shape:** probe may use one TLS [`UringSession`]; sidefile ID is
 //! page-grouped bulk pread (one read per OS page of `txid.body`). Nested TLS
@@ -32,8 +33,8 @@ use std::time::Instant;
 
 /// Stamp short-circuit: **txids → (fk, body_range)** via one TLS uring machine.
 ///
-/// Probe (head pages) → depth-first identity → idx body_range. Prep denserels
-/// loads by offset (skip re-idx).
+/// Probe (head pages) + identity on the held ring, then **one** loc batch after
+/// TLS drops. Prep denserels loads by offset (skip re-idx).
 pub fn resolve_fk_and_range_batch(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -57,7 +58,7 @@ pub fn resolve_fk_and_range_batch_with_tip(
 
 fn note_first_leftover_miss(
     tip_only: bool,
-    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
+    picked: &[Option<Fk>],
     connected: &[bool],
     n_cands: &[usize],
     had_id: &[bool],
@@ -66,8 +67,8 @@ fn note_first_leftover_miss(
     if !tip_only {
         return;
     }
-    for i in 0..winner.len() {
-        if winner[i].is_some() {
+    for i in 0..picked.len() {
+        if picked[i].is_some() {
             continue;
         }
         let on =
@@ -250,27 +251,30 @@ fn add_wave_cands(n_cands: &mut [usize], cands: &[Vec<Fk>]) -> u64 {
     n
 }
 
-fn resolve_fk_and_range_core(
+struct IdentityHits {
+    picked: Vec<Option<Fk>>,
+}
+
+fn resolve_identity_core(
     table: &TxTable,
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
     session: Option<&mut UringSession>,
-) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
+) -> Result<IdentityHits, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
     let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
     let side = table.txid_sidefile();
     let first_fks = table.head.first_fks_snapshot();
     let mut local_age = [0u64; crate::head_resolve_stats::AGE_CAP];
-    let mut winner: Vec<Option<(Fk, crate::create_loc::CreateLocPair)>> = vec![None; txids.len()];
+    let mut picked: Vec<Option<Fk>> = vec![None; txids.len()];
     let mut connected = vec![false; txids.len()];
     let mut n_cands = vec![0usize; txids.len()];
     let mut had_id = vec![false; txids.len()];
     let mut body_lookups = 0u64;
     let mut miss_peeks = 0u64;
     let mut id_ns = 0u64;
-    let mut idx_ns = 0u64;
     let mut probe_ns = 0u64;
     let mut cands_total = 0u64;
     let mut ctx = crate::IoCtx::from_opt(session);
@@ -283,25 +287,23 @@ fn resolve_fk_and_range_core(
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
     cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &open));
     id_idx_wave(
-        table,
         txids,
         &open,
         side,
-        &mut winner,
+        &mut picked,
         &mut connected,
         heights,
         &mut body_lookups,
         &mut miss_peeks,
         &mut id_ns,
-        &mut idx_ns,
         &first_fks,
         &mut local_age,
         &mut ctx,
         &mut had_id,
     )?;
 
-    if any_unfinished(&winner, &connected, heights) {
-        let active = unfinished_mask(&winner, &connected, heights);
+    if any_unfinished(&picked, &connected, heights) {
+        let active = unfinished_mask(&picked, &connected, heights);
         let t_probe = Instant::now();
         let mid = table.head.probe_candidates_batch_wave(
             &mixed,
@@ -312,17 +314,15 @@ fn resolve_fk_and_range_core(
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &mid));
         id_idx_wave(
-            table,
             txids,
             &mid,
             side,
-            &mut winner,
+            &mut picked,
             &mut connected,
             heights,
             &mut body_lookups,
             &mut miss_peeks,
             &mut id_ns,
-            &mut idx_ns,
             &first_fks,
             &mut local_age,
             &mut ctx,
@@ -330,8 +330,8 @@ fn resolve_fk_and_range_core(
         )?;
     }
 
-    if any_unfinished(&winner, &connected, heights) {
-        let active = unfinished_mask(&winner, &connected, heights);
+    if any_unfinished(&picked, &connected, heights) {
+        let active = unfinished_mask(&picked, &connected, heights);
         let t_probe = Instant::now();
         let cold = table.head.probe_candidates_batch_wave(
             &mixed,
@@ -342,17 +342,15 @@ fn resolve_fk_and_range_core(
         probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cold));
         id_idx_wave(
-            table,
             txids,
             &cold,
             side,
-            &mut winner,
+            &mut picked,
             &mut connected,
             heights,
             &mut body_lookups,
             &mut miss_peeks,
             &mut id_ns,
-            &mut idx_ns,
             &first_fks,
             &mut local_age,
             &mut ctx,
@@ -361,27 +359,22 @@ fn resolve_fk_and_range_core(
     }
 
     if tip_only && heights.is_some() {
-        for (i, w) in winner.iter_mut().enumerate() {
+        for (i, w) in picked.iter_mut().enumerate() {
             if !connected[i] {
                 *w = None;
             }
         }
     }
-    note_first_leftover_miss(tip_only, &winner, &connected, &n_cands, &had_id);
+    note_first_leftover_miss(tip_only, &picked, &connected, &n_cands, &had_id);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_cands(cands_total);
     crate::head_resolve_stats::add_body(id_ns);
-    crate::head_resolve_stats::add_idx(idx_ns);
     crate::head_resolve_stats::add_body_lookups(body_lookups);
     crate::head_resolve_stats::add_miss_peeks(miss_peeks);
     crate::head_resolve_stats::add_hit_ages(&local_age);
 
-    Ok(txids
-        .iter()
-        .enumerate()
-        .map(|(i, t)| (*t, winner[i]))
-        .collect())
+    Ok(IdentityHits { picked })
 }
 
 fn resolve_fk_and_range_pread(
@@ -390,72 +383,100 @@ fn resolve_fk_and_range_pread(
     heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
-    resolve_fk_and_range_core(table, txids, heights, tip_only, None)
+    let ident = resolve_identity_core(table, txids, heights, tip_only, None)?;
+    attach_loc_to_identity(table, txids, ident)
 }
 
-/// Body ranges for chosen fks: one `create.loc` batch (both stems + `n_out`).
-fn body_ranges_batched(
+fn attach_loc_to_identity(
     table: &TxTable,
-    fks: &[Fk],
-    ctx: &mut crate::IoCtx<'_>,
-) -> Result<Vec<Option<crate::create_loc::CreateLocPair>>, StoreError> {
-    table.create_loc.range_batch_ctx(fks, ctx)
+    txids: &[[u8; 32]],
+    ident: IdentityHits,
+) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
+    let IdentityHits { picked } = ident;
+    let t_idx = Instant::now();
+    let mut need: Vec<Fk> = Vec::new();
+    let mut slots: Vec<usize> = Vec::new();
+    for (i, fk) in picked.iter().enumerate() {
+        if let Some(fk) = *fk {
+            need.push(fk);
+            slots.push(i);
+        }
+    }
+    let ranges = table.create_loc.range_batch(&need)?;
+    crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
+    let mut winner: Vec<Option<(Fk, crate::create_loc::CreateLocPair)>> = vec![None; picked.len()];
+    for (slot, (fk, range)) in slots.into_iter().zip(need.into_iter().zip(ranges)) {
+        match range {
+            Some(pair) => winner[slot] = Some((fk, pair)),
+            None => {
+                crate::uring_session::note_uring_invariant(
+                    crate::uring_session::UringInvariant::IdxRangeMissing,
+                );
+                return Err(StoreError::Corrupt(
+                    "invariant: loc range missing after identity",
+                ));
+            }
+        }
+    }
+    Ok(txids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, winner[i]))
+        .collect())
 }
 
 /// Connected if a height fence is set, else any winner.
 fn key_finished(
     ki: usize,
-    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
+    picked: &[Option<Fk>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
     if heights.is_some() {
         connected[ki]
     } else {
-        winner[ki].is_some()
+        picked[ki].is_some()
     }
 }
 
 fn any_unfinished(
-    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
+    picked: &[Option<Fk>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> bool {
-    (0..winner.len()).any(|i| !key_finished(i, winner, connected, heights))
+    (0..picked.len()).any(|i| !key_finished(i, picked, connected, heights))
 }
 
 fn unfinished_mask(
-    winner: &[Option<(Fk, crate::create_loc::CreateLocPair)>],
+    picked: &[Option<Fk>],
     connected: &[bool],
     heights: Option<&HeightFence>,
 ) -> Vec<bool> {
-    (0..winner.len())
-        .map(|i| !key_finished(i, winner, connected, heights))
+    (0..picked.len())
+        .map(|i| !key_finished(i, picked, connected, heights))
         .collect()
 }
 
 #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
-/// Sidefile ID (at most two page-grouped shots) then BIP30 match + batched idx.
+/// Sidefile ID (at most two page-grouped shots) then BIP30 match.
 ///
 /// Shot A is the first four cands of unfinished keys; shot B is the rest only
 /// when the key is still unfinished. A fence-connected win skips shot B; an
-/// unconnected body match does not. Chosen fks share **one** idx-page fill
-/// (held session or libc).
+/// unconnected body match does not. Loc fill is **one** batch after all
+/// probe waves (`attach_loc_to_identity`), never on this held probe ring.
 ///
-/// When `ctx` is held, ID + IDX page preads ride that **already-held**
-/// plan ring. When none, libc pread for ID and unique idx pages.
+/// When `ctx` is held, identity preads ride that **already-held** plan ring.
+/// When none, libc pread for ID.
 fn id_idx_wave(
-    table: &TxTable,
     txids: &[[u8; 32]],
     cands_by_key: &[Vec<Fk>],
     side: &TxidBody,
-    winner: &mut [Option<(Fk, crate::create_loc::CreateLocPair)>],
+    picked: &mut [Option<Fk>],
     connected: &mut [bool],
     heights: Option<&HeightFence>,
     body_lookups: &mut u64,
     miss_peeks: &mut u64,
     id_ns: &mut u64,
-    idx_ns: &mut u64,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
     ctx: &mut crate::IoCtx<'_>,
@@ -471,13 +492,11 @@ fn id_idx_wave(
     let mut skip = vec![false; n];
     let mut started = vec![false; n];
     for ki in 0..n {
-        let done = key_finished(ki, winner, connected, heights);
+        let done = key_finished(ki, picked, connected, heights);
         skip[ki] = done;
         started[ki] = !done;
     }
     let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
-    let mut chosen_kis: Vec<usize> = Vec::new();
-    let mut chosen_fks: Vec<Fk> = Vec::new();
 
     for take in [ID_FILL_CHUNK, usize::MAX] {
         let shot = next_id_shot(cands_by_key, &filled, &skip, take);
@@ -520,18 +539,16 @@ fn id_idx_wave(
             }
             if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, heights) {
                 crate::head_resolve_stats::add_hit_rank(rank);
-                chosen_kis.push(ki);
-                chosen_fks.push(fk);
+                note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
                 skip[ki] = true;
                 continue;
             }
-            if heights.is_none() || nfill < cands.len() || winner[ki].is_some() {
+            if heights.is_none() || nfill < cands.len() || picked[ki].is_some() {
                 continue;
             }
             if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, None) {
                 crate::head_resolve_stats::add_hit_rank(rank);
-                chosen_kis.push(ki);
-                chosen_fks.push(fk);
+                note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
                 skip[ki] = true;
             }
         }
@@ -548,55 +565,23 @@ fn id_idx_wave(
             &id_map,
         ));
     }
-    let t_idx = Instant::now();
-    let ranges = body_ranges_batched(table, &chosen_fks, ctx)?;
-    record_chosen_idx_ranges(
-        &chosen_kis,
-        &chosen_fks,
-        &ranges,
-        winner,
-        connected,
-        heights,
-        first_fks,
-        local_age,
-    )?;
-    *idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
-/// Apply idx ranges for identity picks. `connected` is set only when a range
-/// exists — never before idx. Missing range after a chosen fk is Corrupt.
-fn record_chosen_idx_ranges(
-    chosen_kis: &[usize],
-    chosen_fks: &[Fk],
-    ranges: &[Option<crate::create_loc::CreateLocPair>],
-    winner: &mut [Option<(Fk, crate::create_loc::CreateLocPair)>],
+fn note_identity_pick(
+    ki: usize,
+    fk: Fk,
+    picked: &mut [Option<Fk>],
     connected: &mut [bool],
     heights: Option<&HeightFence>,
     first_fks: &[u64],
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
-) -> Result<(), StoreError> {
-    for ((&ki, &fk), range) in chosen_kis.iter().zip(chosen_fks.iter()).zip(ranges) {
-        match range {
-            Some(range) => {
-                winner[ki] = Some((fk, *range));
-                if heights.is_some_and(|h| h.height_of(fk).is_some()) {
-                    connected[ki] = true;
-                }
-                crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
-            }
-            None => {
-                crate::uring_session::note_uring_invariant(
-                    crate::uring_session::UringInvariant::IdxRangeMissing,
-                );
-                return Err(StoreError::Corrupt(
-                    "invariant: loc range missing after identity",
-                ));
-            }
-        }
+) {
+    picked[ki] = Some(fk);
+    if heights.is_some_and(|h| h.height_of(fk).is_some()) {
+        connected[ki] = true;
     }
-    Ok(())
+    crate::head_resolve_stats::note_local_hit_age(local_age, first_fks, fk.0);
 }
 
 fn resolve_fk_and_range_uring(
@@ -605,9 +590,10 @@ fn resolve_fk_and_range_uring(
     heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
-    uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        resolve_fk_and_range_core(table, txids, heights, tip_only, Some(session))
-    })?
+    let ident = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
+        resolve_identity_core(table, txids, heights, tip_only, Some(session))
+    })??;
+    attach_loc_to_identity(table, txids, ident)
 }
 
 #[cfg(test)]
@@ -720,63 +706,6 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
-    #[test]
-    fn connected_after_idx_missing_range_is_corrupt() {
-        let mut winner = vec![None; 1];
-        let mut connected = vec![false; 1];
-        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
-            first_fk: 1,
-            count: 1,
-            height: 0,
-        }]);
-        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
-        match record_chosen_idx_ranges(
-            &[0],
-            &[Fk(1)],
-            &[None],
-            &mut winner,
-            &mut connected,
-            Some(&fence),
-            &[1],
-            &mut age,
-        ) {
-            Err(StoreError::Corrupt("invariant: loc range missing after identity")) => {}
-            other => panic!("expected idx-range Corrupt, got {other:?}"),
-        }
-        assert!(winner[0].is_none());
-        assert!(!connected[0], "must not mark connected without a range");
-    }
-
-    #[test]
-    fn connected_after_idx_sets_winner_and_connected() {
-        let mut winner = vec![None; 1];
-        let mut connected = vec![false; 1];
-        let fence = HeightFence::from_runs(vec![crate::height_fence::FenceRun {
-            first_fk: 1,
-            count: 1,
-            height: 0,
-        }]);
-        let mut age = [0u64; crate::head_resolve_stats::AGE_CAP];
-        record_chosen_idx_ranges(
-            &[0],
-            &[Fk(1)],
-            &[Some(crate::create_loc::CreateLocPair {
-                txout: (8, 16),
-                spent: (8, 8),
-                n_out: 1,
-            })],
-            &mut winner,
-            &mut connected,
-            Some(&fence),
-            &[1],
-            &mut age,
-        )
-        .unwrap();
-        assert_eq!(winner[0].unwrap().0, Fk(1));
-        assert_eq!(winner[0].unwrap().1.txout, (8, 16));
-        assert!(connected[0]);
-    }
-
     /// Uring machine returns same (fk, body_range) as sequential pread path.
     #[test]
     fn uring_fk_and_range_matches_pread() {
@@ -811,7 +740,7 @@ mod tests {
                 assert_eq!(pread, via);
                 assert!(
                     crate::uring_session::tls_take_sqe_n() > 0,
-                    "pool resolve must push probe/idx SQEs on the held session"
+                    "pool resolve must push probe/identity SQEs on the held session"
                 );
                 let _ = std::fs::remove_dir_all(&dir);
             },
@@ -1041,6 +970,18 @@ mod tests {
             cold[0].iter().any(|f| f.0 == 1),
             "oldest create must be in cold"
         );
+        let open_i = txids.len() - 1;
+        let hot_i = hit;
+        let cold_i = 0;
+        let want = [txids[open_i], txids[hot_i], txids[cold_i]];
+        let got = resolve_fk_and_range_batch(&t, &want).unwrap();
+        let pread = resolve_fk_and_range_pread(&t, &want, None, false).unwrap();
+        assert_eq!(got, pread);
+        for (_tid, row) in &got {
+            let (fk, pair) = row.expect("mixed-age resolve must stamp loc");
+            let serial = t.create_loc.range_batch(&[fk]).unwrap()[0].unwrap();
+            assert_eq!(pair, serial, "fk={}", fk.0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1085,8 +1026,7 @@ mod tests {
         let first = Fk(1);
         let near = Fk(2);
         let far = Fk(1100);
-        let batch =
-            body_ranges_batched(&t, &[first, near, far], &mut crate::IoCtx::none()).unwrap();
+        let batch = t.create_loc.range_batch(&[first, near, far]).unwrap();
         for (fk, got) in [first, near, far].iter().zip(batch.iter()) {
             let exp = t.body_range(*fk).unwrap();
             assert_eq!(got.map(|p| p.txout), Some(exp), "fk={}", fk.0);
@@ -1096,6 +1036,56 @@ mod tests {
         assert_eq!(got[0].1, Some((first, batch[0].unwrap())));
         assert_eq!(got[1].1, Some((near, batch[1].unwrap())));
         assert_eq!(got[2].1, Some((far, batch[2].unwrap())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loc_fill_does_not_use_held_probe_session() {
+        let (dir, t, txids) = seed_table(4);
+        let mut sess = crate::uring_session::UringSession::try_open(32).unwrap_or_else(|_| {
+            crate::uring_session::UringSession::try_open_kind(
+                crate::uring_session::SessionKind::Pool,
+                32,
+            )
+            .expect("pool")
+        });
+        sess.poison();
+        let got = t
+            .create_loc
+            .range_batch(&[Fk(1), Fk(2)])
+            .expect("standalone loc must not fail-close on a poisoned probe ring");
+        assert_eq!(got[0].unwrap().txout, t.body_range(Fk(1)).unwrap());
+        assert_eq!(got[1].unwrap().txout, t.body_range(Fk(2)).unwrap());
+        match t
+            .create_loc
+            .range_batch_ctx(&[Fk(1)], &mut crate::IoCtx::held(&mut sess))
+        {
+            Err(e) => {
+                let m = format!("{e}");
+                assert!(m.contains("poisoned") || m.contains("io_uring"), "{m}");
+            }
+            other => panic!("held loc ctx must stay fail-closed, got {other:?}"),
+        }
+        let via = resolve_fk_and_range_batch(&t, &[txids[0]]).unwrap();
+        assert!(via[0].1.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_loc_missing_after_identity_is_corrupt() {
+        let (dir, t, txids) = seed_table(2);
+        match attach_loc_to_identity(
+            &t,
+            &[txids[0]],
+            IdentityHits {
+                picked: vec![Some(Fk(99))],
+            },
+        ) {
+            Err(StoreError::Corrupt(m)) => {
+                assert!(m.contains("loc range missing after identity"), "{m}");
+            }
+            other => panic!("expected loc-range Corrupt, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
