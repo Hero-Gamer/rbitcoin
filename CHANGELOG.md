@@ -11,6 +11,10 @@ before 1.0).
 
 ### Added
 
+- **Confirm reject isolate at emit:** `emit_confirm_reject` downgrades a
+  multi-block consensus fail to Cascade and requests a one-block retry.
+  `isolate_if_batched` stays the class table.
+
 - **Process `submitpackage` after IBD leave:** `esplora_broadcast_visible_in_rpc_and_electrum`
   keeps serving-only `submitpackage` refuse (stale tip, relay off), then `generate`
   latches IBD false and enables relay. `submitpackage` then pins maxfeerate reject,
@@ -43,6 +47,10 @@ before 1.0).
   for densify. Process restart still starts with an empty RAM queue.
 
 ### Changed
+
+- **llvm-cov drops `rbitcoin-bench`:** optional host client crate is not a
+  coverage gate (`cargo llvm-cov test --exclude` + LCOV IGNORE).
+  `cargo test --workspace` still runs its lib tests.
 
 - **Live P2P IBD in default CI:** hop serve, dual live seeders (8-block),
   post-IBD tip follow, getheaders gap fill, and product `run_p2p --connect`

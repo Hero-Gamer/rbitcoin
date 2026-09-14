@@ -140,7 +140,7 @@ Retired on purpose. Not a backlog. Not a failure.
 | **—** | Restore `rbtc-script-coord-*` | `ibd-confirm` publishes waves, polls lock-free completion, feeds `scriptq` when steal is empty. Steal workers unpark the publisher. Do not add coordinator threads to keep the pool fed |
 | **—** | Flatten purpose-built io_uring machines | [`io-modality.md`](./io-modality.md): fix the machine; do not replace it with batched `pread`/`pwrite` without an explicit ask |
 | **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD confirm is body-queue wire → lookup → load. [`concurrency.md`](./concurrency.md), [`invariants.md`](./invariants.md) |
-| **—** | `rbitcoin-bench` default-member / musl / required CI | Optional crate, host A/B against a live store. Not a packaging or coverage gate |
+| **—** | `rbitcoin-bench` default-member / musl / required CI | Optional crate, host A/B against a live store. Not a packaging or coverage gate (`coverage.sh` `--exclude` + IGNORE) |
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Too heavy / cannot go green. Primitives only (**Q-53**); extra islands are **Q-56**. |
 | **—** | `cargo crap --fail-above --threshold 30` | At ≥90% line coverage CRAP **equals CC**. `handle_peer_frame` / confirm write / SH pack would force **R-10** peels. Use **Q-55** regression instead. |
 | **—** | ast-grep as a second clippy for style | Structural rules catch RSS/task-leak *shapes*. Clippy policy is [`code-shape.md`](./code-shape.md) (no workspace allow list; leftover lints are site-local). |

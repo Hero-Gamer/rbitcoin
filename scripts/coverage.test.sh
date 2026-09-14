@@ -38,6 +38,7 @@ excluded = [
     "/repo/crates/rbitcoin-net/tests/ibd_smoke.rs",
     "/repo/crates/rbitcoin-test/src/lib.rs",
     "/repo/crates/rbitcoin-test/tests/integration_multinode.rs",
+    "/repo/crates/rbitcoin-bench/src/suite.rs",
     "/repo/crates/rbitcoin-store/src/testutil.rs",
     "/repo/crates/rbitcoin-query/src/testutil.rs",
     "/repo/crates/rbitcoin-consensus/src/script/tests_verify.rs",
@@ -72,7 +73,9 @@ assert_ok "reconstruct is not skipped" \
 assert_ok "dead-peer is not skipped" \
   bash -c '! grep -q "skip ibd_skips_dead_peer" "$1"' _ "$COV"
 assert_ok "llvm-cov test has no --skip" \
-  bash -c '! grep -E "llvm-cov test" -A6 "$1" | grep -q -- "--skip"' _ "$COV"
+  bash -c '! grep -E "llvm-cov test" -A12 "$1" | grep -q -- "--skip"' _ "$COV"
+assert_ok "llvm-cov excludes rbitcoin-bench" \
+  bash -c 'grep -E "llvm-cov test" -A12 "$1" | grep -q -- "--exclude rbitcoin-bench"' _ "$COV"
 
 tmp="$(mktemp)"
 python3 "$ROOT/scripts/coverage-badge.py" \

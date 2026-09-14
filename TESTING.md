@@ -195,11 +195,11 @@ All workspace members that contain production code:
 - `rbitcoin-consensus`, `rbitcoin-mempool`, `rbitcoin-net`
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
-- `rbitcoin-bench` (lib only; bin is `--features cli`)
 
 **Excluded by default:** third-party crates, `src/main.rs` trampolines, test
 modules (`*_tests.rs`, `tests.rs`, crate `/tests/`, `testutil.rs`,
-`tests_verify.rs`), and crate `rbitcoin-test`. Dependencies are not attributed
+`tests_verify.rs`), crate `rbitcoin-test`, and `rbitcoin-bench` (optional
+host client tool; not a coverage gate). Dependencies are not attributed
 to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 
 ### Philosophy
