@@ -7,7 +7,7 @@ use crate::store::Mempool;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::time::Instant;
 
 const EXTRA_COMPACT_CAP: usize = 100;
@@ -1044,6 +1044,52 @@ impl ActiveMempool {
         Ok(())
     }
 
+    /// Combined ancestor/CPFP package fee vs total weight against `sat_kvb`.
+    pub fn package_meets_min_relay(
+        txs: &[Transaction],
+        utxos: &impl UtxoProvider,
+        sat_kvb: u64,
+    ) -> bool {
+        let pkg_ids: BTreeSet<Txid> = txs.iter().map(Transaction::compute_txid).collect();
+        let linked = txs.iter().any(|tx| {
+            tx.input
+                .iter()
+                .any(|inp| pkg_ids.contains(&inp.previous_output.txid))
+        });
+        if !linked {
+            return false;
+        }
+        let mut created: BTreeMap<Txid, Vec<u64>> = BTreeMap::new();
+        let mut fee = 0u64;
+        let mut weight = 0u64;
+        for tx in txs {
+            let mut inn = 0u64;
+            for inp in &tx.input {
+                let op = inp.previous_output;
+                let val = if let Some(outs) = created.get(&op.txid) {
+                    outs.get(op.vout as usize).copied()
+                } else {
+                    utxos.get_coin(&op).map(|c| c.txout.value.to_sat())
+                };
+                let Some(v) = val else {
+                    return false;
+                };
+                inn = inn.saturating_add(v);
+            }
+            let out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            if out > inn {
+                return false;
+            }
+            fee = fee.saturating_add(inn - out);
+            weight = weight.saturating_add(tx.weight().to_wu());
+            created.insert(
+                tx.compute_txid(),
+                tx.output.iter().map(|o| o.value.to_sat()).collect(),
+            );
+        }
+        policy::meets_min_relay_fee_at(fee, weight, sat_kvb)
+    }
+
     /// Accept an ancestor package (CPFP): txs must be parent-before-child.
     ///
     /// On any failure, already-accepted members of this package are rolled back.
@@ -1056,10 +1102,15 @@ impl ActiveMempool {
         Self::check_package_shape(txs)?;
 
         self.last_accept_stages = AcceptStageUs::default();
+        let member_min = if Self::package_meets_min_relay(txs, utxos, self.min_relay_sat_kvb) {
+            Some(0)
+        } else {
+            None
+        };
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         for tx in txs {
             // accept_tx_with + promote (not top-level accept_tx) so stages are not reset per member.
-            match self.accept_tx_with(tx, utxos, tip, 0, true, None) {
+            match self.accept_tx_with(tx, utxos, tip, 0, true, member_min) {
                 Ok(r) => {
                     self.promote_orphans_of(r.txid, utxos, tip);
                     accepted.push(r);
@@ -2858,6 +2909,36 @@ mod tests {
             .expect("paying child must select the extra-compact parent");
         assert_eq!(got.compute_txid(), parent_id);
         assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_package_admits_below_minrelay_parent_when_child_pays() {
+        let dir = tmp_dir();
+        let (op, txout, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_min_relay_sat_kvb(50_000);
+        let parent = spend_tx(op, txout.value.to_sat() - 200);
+        let parent_id = parent.compute_txid();
+        assert!(
+            matches!(
+                mp.accept_tx(&parent, &utxos, TIP_OK),
+                Err(AcceptError::Policy("min relay fee"))
+            ),
+            "parent must fail min-relay alone"
+        );
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            1_000,
+        );
+        let res = mp
+            .accept_package(&[parent, child], &utxos, TIP_OK)
+            .expect("combined package meets min-relay");
+        assert_eq!(res.len(), 2);
+        assert_eq!(mp.live_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
