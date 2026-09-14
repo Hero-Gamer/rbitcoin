@@ -1259,7 +1259,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
         &mut bp,
         &fks,
         &loc,
-        &[parent_pin, child_pin],
+        &[std::sync::Arc::clone(&parent_pin), child_pin],
         &prepared,
     )
     .expect("same-batch fill from append RAM");
@@ -1273,6 +1273,51 @@ fn fill_same_batch_abs_from_append_loc_ram() {
     assert!(
         q.store().spent_range_batch_fks().is_empty(),
         "write fill/ensure must not pread create.loc"
+    );
+
+    q.set_lookup_started_hi(Some(4));
+    q.note_write_create_loc(&fks, &loc, 1);
+    let mut bp_later = BatchParents::new();
+    bp_later.insert_create_pin(
+        fks[0],
+        std::sync::Arc::clone(&parent_pin),
+        vec![0],
+        None,
+        None,
+        Vec::new(),
+    );
+    assert!(!bp_later.has_abs_layout(fks[0]));
+    let later = [Prepared {
+        height: Height(2),
+        header_fk: Fk(2),
+        tx_fks: vec![Fk(3)],
+        jobs: vec![],
+        spends: vec![([0x32u8; 32], 0, Fk(3), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [8u8; 32],
+        txids: vec![],
+        prev_mtp: 0,
+    }];
+    q.store().reset_spent_range_batch();
+    fill_planned_create_layout_after_commit(&q, &mut bp_later, &[], &[], &[], &later)
+        .expect("just-written fill from write loc RAM");
+    assert!(bp_later.has_abs_layout(fks[0]));
+    assert_eq!(
+        bp_later.get_spender_abs(fks[0], 0),
+        Some(rbitcoin_store::spent_abs(loc[0].spent.0, 0))
+    );
+    q.prune_write_create_loc(3);
+    assert!(
+        q.write_create_loc(fks[0]).is_some(),
+        "keep until write of lookup_started_hi"
+    );
+    q.prune_write_create_loc(4);
+    assert!(
+        q.write_create_loc(fks[0]).is_none(),
+        "drop after last overlapping lookup batch finished write"
     );
 
     let _ = std::fs::remove_dir_all(&path);

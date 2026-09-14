@@ -22,6 +22,7 @@ mod stamp;
 pub mod testutil;
 mod tx_precompute;
 mod wave_prevout;
+mod write_create_loc;
 
 #[cfg(debug_assertions)]
 pub use combined_stage::{body_ok_reads, reset_body_ok_reads};
@@ -47,7 +48,7 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -95,6 +96,10 @@ pub struct ProcessOwnedSizes {
     pub fence_runs: usize,
     /// Body-queue heights whose raw payload was dropped after lookup decode.
     pub bq_promoted: usize,
+    /// Write-thread just-written `create.loc` packs (`wloc=`).
+    pub wloc_packs: usize,
+    pub wloc_pairs: usize,
+    pub wloc_bytes: u64,
 }
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
@@ -225,46 +230,6 @@ impl ShWriteBehind {
     }
 }
 
-/// Write-thread loc window (sequential fks). Cap drops the oldest pairs.
-#[derive(Default)]
-struct WriteCreateLocRam {
-    base: u64,
-    pairs: Vec<rbitcoin_store::CreateLocPair>,
-}
-
-impl WriteCreateLocRam {
-    const KEEP: usize = 1 << 20;
-
-    fn note(&mut self, fks: &[rbitcoin_primitives::Fk], loc: &[rbitcoin_store::CreateLocPair]) {
-        if fks.is_empty() || loc.len() != fks.len() {
-            return;
-        }
-        let Some(start) = fks[0].get() else {
-            return;
-        };
-        if self.pairs.is_empty() {
-            self.base = start;
-        }
-        let next = self.base.saturating_add(self.pairs.len() as u64);
-        if start != next {
-            self.base = start;
-            self.pairs.clear();
-        }
-        self.pairs.extend_from_slice(loc);
-        if self.pairs.len() > Self::KEEP {
-            let drop = self.pairs.len() - Self::KEEP;
-            self.pairs.drain(..drop);
-            self.base = self.base.saturating_add(drop as u64);
-        }
-    }
-
-    fn get(&self, fk: rbitcoin_primitives::Fk) -> Option<rbitcoin_store::CreateLocPair> {
-        let id = fk.get()?;
-        let off = id.checked_sub(self.base)?;
-        self.pairs.get(off as usize).copied()
-    }
-}
-
 /// Domain query facade used by higher layers (consensus, net, RPC).
 pub struct Query {
     store: Store,
@@ -294,7 +259,8 @@ pub struct Query {
     class_a_hi: AtomicU32,
     /// Write-thread loc pairs from Class A append. Later packs stamp abs from
     /// this RAM (just-written parents). Write never preads `create.loc`.
-    write_create_loc: Mutex<WriteCreateLocRam>,
+    /// Packs live until write of `lookup_started_hi` at note time.
+    write_create_loc: Mutex<write_create_loc::WriteCreateLocRam>,
     /// Post-IBD SH SEAL + leftover-run discard (unsorted collect is tip finalize).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -400,7 +366,7 @@ impl Query {
             lookup_taken_hi: AtomicU32::new(u32::MAX),
             lookup_started_hi: AtomicU32::new(u32::MAX),
             class_a_hi: AtomicU32::new(u32::MAX),
-            write_create_loc: Mutex::new(WriteCreateLocRam::default()),
+            write_create_loc: Mutex::new(write_create_loc::WriteCreateLocRam::default()),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -473,6 +439,10 @@ impl Query {
         self.set_lookup_taken_hi(rewind);
         self.set_lookup_started_hi(rewind);
         self.set_class_a_hi(rewind);
+        self.write_create_loc
+            .lock()
+            .unwrap()
+            .drop_from_height(height);
         self.block_queue_drop_resolved_from(height);
     }
 
@@ -755,13 +725,30 @@ impl Query {
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
     }
 
-    /// Keep Class A append loc in RAM for later write packs (no loc pread).
+    /// Keep Class A append loc until write of the last pack whose TipOnly
+    /// may have missed it (`lookup_started_hi` at note). No loc pread.
     pub fn note_write_create_loc(
         &self,
         fks: &[rbitcoin_primitives::Fk],
         loc: &[rbitcoin_store::CreateLocPair],
+        pack_height: u32,
     ) {
-        self.write_create_loc.lock().unwrap().note(fks, loc);
+        let keep_until = self
+            .lookup_started_hi()
+            .unwrap_or(pack_height)
+            .max(pack_height);
+        self.write_create_loc
+            .lock()
+            .unwrap()
+            .note(pack_height, keep_until, fks, loc);
+    }
+
+    /// Drop loc packs whose last overlapping lookup batch has finished write.
+    pub fn prune_write_create_loc(&self, written_hi: u32) {
+        self.write_create_loc
+            .lock()
+            .unwrap()
+            .prune_written_through(written_hi);
     }
 
     pub fn write_create_loc(
@@ -1034,6 +1021,11 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
+        let (wloc_packs, wloc_pairs, wloc_bytes) = self
+            .write_create_loc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .size_snapshot();
         let h2h_keys = self
             .height_by_hash
             .lock()
@@ -1056,6 +1048,9 @@ impl Query {
             h2h_keys,
             fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),
+            wloc_packs,
+            wloc_pairs,
+            wloc_bytes,
         }
     }
 

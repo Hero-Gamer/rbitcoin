@@ -64,6 +64,9 @@ pub fn confirm_write_phase(
                 .map(|p| (p.height.0, p.hash))
                 .collect();
             finish_post_commit_hashes(query, &items)?;
+            if let Some(h) = items.iter().map(|(h, _)| *h).max() {
+                query.prune_write_create_loc(h);
+            }
             return Ok(Vec::new());
         }
         WriteBatchVsTip::SpansTip => {
@@ -109,7 +112,8 @@ pub fn confirm_write_phase(
             // must already have lookup stamps — missing abs is Corrupt.
             // Direct SH collect is a no-op — skip the FkMap.
             if committed {
-                query.note_write_create_loc(&planned_fks, &loc);
+                let pack_hi = batch.prepared.last().map(|p| p.height.0).unwrap_or(0);
+                query.note_write_create_loc(&planned_fks, &loc, pack_hi);
                 if query.index_mode().is_tip() {
                     let t_map = Instant::now();
                     write_create_pins.reserve(planned_fks.len());
@@ -239,6 +243,9 @@ pub fn confirm_write_phase(
     }
 
     // No tip GC of sparse pins (dropped with ScriptOkBatch).
+    if let Some(h) = batch.prepared.iter().map(|p| p.height.0).max() {
+        query.prune_write_create_loc(h);
+    }
     rbitcoin_query::note_confirm(&query.confirm_stats().phase_blocks, n_blocks as u64);
     query
         .confirm_stats()
@@ -398,7 +405,8 @@ fn annotate_jobs_from_connected_hash(
 }
 
 /// After Class A commit, stamp spend creates from append RAM loc
-/// (this pack + just-written packs). Write never preads `create.loc`.
+/// (this pack + just-written packs still in the write loc window).
+/// Write never preads `create.loc`.
 pub(super) fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
