@@ -4,7 +4,9 @@
 //! plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly.
 //! One function for S0 plan (`archive_plan_batch_from_wire`) and plan=None
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
-//! lookup-wave drain+fence snapshot taken before TipOnly.
+//! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
+//! omitted from that skeleton; a later wave's TipOnly loc is adopted onto the
+//! in-flight identity so write ensure does not need RAM loc after prune.
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -118,9 +120,11 @@ impl ExternalParentStamp {
 /// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
 ///
 /// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
-/// `Corrupt` with no leftover `tx.head` probe. `skeleton = None` is plan=None
-/// / S0 leftover TipOnly. Same-batch identities are not inputs — callers skip
-/// them in `need` and keep them offline at pin.
+/// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
+/// skeleton loc when TipOnly already has that create (later wave). Same-wave
+/// creates are omitted from the skeleton; those holes stay for write fill.
+/// `skeleton = None` is plan=None / S0 leftover TipOnly. Same-batch identities
+/// are not inputs — callers skip them in `need` and keep them offline at pin.
 pub fn stamp_external_parents(
     store: &Store,
     need: &[[u8; 32]],
@@ -146,6 +150,17 @@ pub fn stamp_external_parents(
                 let e = stamp.bind(id, *t);
                 if let Some(pin) = in_flight.get_out(id) {
                     e.pin = Some(std::sync::Arc::clone(pin));
+                }
+                if let Some(skel) = skeleton {
+                    if let Some((sk_fk, range, spent, n_out)) = skel.get(t) {
+                        if sk_fk == fk {
+                            e.body = Some(range);
+                            if let Some(sr) = spent {
+                                e.spent = Some(sr);
+                            }
+                            e.n_out = n_out;
+                        }
+                    }
                 }
             }
         } else {
@@ -359,6 +374,42 @@ mod tests {
             stamp_external_parents(q.store(), &[txid], &inflight, None, q.confirm_stats()).unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_hit_adopts_skeleton_loc() {
+        let (dir, q) = tmp_store();
+        let p = pin(42);
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(42), &p)], Some(1));
+        let txid = p.0.txid;
+        let mut ids = IdMap::default();
+        ids.insert(txid, (Fk(42), (10, 20)));
+        let mut spent = U64Map::default();
+        spent.insert(42, (30, 40));
+        let mut n_out = U64Map::default();
+        n_out.insert(42, 1);
+        let skel = BatchParentIds {
+            ids: Arc::new(ids),
+            spent: Arc::new(spent),
+            n_out: Arc::new(n_out),
+            need_vouts: U64Map::default(),
+        };
+        let st = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .unwrap();
+        assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
+        let ident = st.idents.get(&42).expect("inflight ident");
+        assert!(ident.pin.is_some(), "inflight pin is kept");
+        assert_eq!(ident.body, Some((10, 20)));
+        assert_eq!(ident.spent, Some((30, 40)));
+        assert_eq!(ident.n_out, Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

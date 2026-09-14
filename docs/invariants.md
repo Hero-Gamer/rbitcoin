@@ -163,7 +163,7 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
 | `write_ensure_stamps_spent_range_after_load_pin` / `pin_and_ensure_journey` / `fill_same_batch_abs_from_append_loc_ram` / `fill_just_written_survives_until_next_unstarted_write` | load pin copies lookup spent range; missing stamp is Corrupt; same-batch abs from append RAM; just-written loc until write of next unstarted height (no write loc pread) |
-| `fill_missing_parent_ranges_stamps_spent_idx_for_archived` | lookup stamp carries spent range for TipOnly leftover |
+| `fill_missing_parent_ranges_stamps_spent_idx_for_archived` / `inflight_hit_adopts_skeleton_loc` | lookup stamp carries spent range for TipOnly leftover; InFlight identity still takes skeleton loc |
 | `spend_abs_jobs_unique_and_missing_is_corrupt` | pin arithmetic abs list; missing → Corrupt |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
@@ -174,5 +174,5 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
 | `direct_write_skips_create_pin_map_idx_without_recent` | Direct skips `write_create_pins`; Class A idx holds body range |
 | `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |
-| `confirm_engine_pins_spend_of_just_written_pack` | IBD load: child spend of just-written pack (187 denserels miss) |
+| `confirm_engine_pins_spend_of_just_written_pack` / `confirm_engine_pins_spend_across_same_wave_intervening_writes` / `confirm_engine_pins_spend_after_later_wave_intervening_write` | IBD load: child spend of just-written pack (187); same-wave intervening writes (496); later-wave intervening write still has InFlight so TipOnly loc must ride the stamp (905) |
 | `confirm_reject_blacklist_surface` | fk mismatch / connect height not tip+1 cascade requeue; store invariant engine-fault (requeue once then halt); only consensus-invalid blacklisted |
