@@ -144,6 +144,19 @@ async fn assert_esplora_asof_hides_later_spend(
     assert!(v1.get("scriptpubkey_address").is_some(), "{v1}");
 }
 
+fn header_hex(block: &bitcoin::Block) -> String {
+    bitcoin::consensus::encode::serialize_hex(&block.header)
+}
+
+async fn assert_esplora_asof_dead(addr: SocketAddr, path: &str) {
+    let (st, raw, body) = http_get_raw(addr, path).await;
+    assert_eq!(st, 404, "dead asof body={body}");
+    assert!(
+        http_header_value(&raw, "x-bitcoin-chain-tip").is_none(),
+        "dead asof must not stamp a fork tip"
+    );
+}
+
 #[allow(clippy::cognitive_complexity)] // one TCP session, many protocol arms
 #[tokio::test]
 async fn electrum_server_version_history_balance() {
@@ -750,6 +763,18 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     );
     accept_and_connect_block(&q, &params, Height(103), &spend_blk, Milestone::NONE).unwrap();
     q.apply_sh_pending().unwrap();
+    let spend_blk_b = rbitcoin_consensus::mine_regtest_paying(
+        create_blk.block_hash(),
+        spend_blk.header.time.wrapping_add(1),
+        103,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend.clone()],
+    );
+    assert_ne!(
+        spend_blk.block_hash(),
+        spend_blk_b.block_hash(),
+        "same-height sibling must be a different blockhash"
+    );
 
     let sh = electrum_scripthash_hex(create_spk.as_bytes());
     let asof_create =
@@ -768,9 +793,9 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     let esplora = rbitcoin_esplora::run_esplora(esplora_cfg, Arc::clone(&q), None, None)
         .await
         .expect("esplora listen");
-    let (tip_tx, _) = broadcast::channel(4);
+    let (tip_tx, _) = broadcast::channel(8);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx, None)
+    let handle = run_electrum(cfg, Arc::clone(&q), params.clone(), tip_tx.clone(), None)
         .await
         .expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
@@ -847,7 +872,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         &mut stream,
         9,
         "blockchain.scripthash.get_history",
-        json!([sh.clone(), tag_spend]),
+        json!([sh.clone(), tag_spend.clone()]),
     )
     .await;
     let hist1_rows = hist1["result"].as_array().unwrap();
@@ -902,6 +927,223 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         &asof_create,
         &asof_spend,
         &create_hex,
+    )
+    .await;
+
+    q.set_sh_index_enabled(false);
+    let lag_blk = rbitcoin_consensus::mine_empty_regtest(
+        spend_blk.block_hash(),
+        spend_blk.header.time + 600,
+        104,
+    );
+    accept_and_connect_block(&q, &params, Height(104), &lag_blk, Milestone::NONE).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(104)));
+    assert_eq!(
+        q.sh_lag_heights(),
+        1,
+        "SH-off connect must leave visible SH behind tip"
+    );
+    let lag_hash = lag_blk.block_hash().to_byte_array();
+    let spend_hash = spend_blk.block_hash().to_byte_array();
+    assert!(
+        q.pin_sh_chain_view_at(&spend_hash).unwrap().is_some(),
+        "asof at visible SH watermark must pin"
+    );
+    assert!(
+        q.pin_sh_chain_view_at(&lag_hash).unwrap().is_none(),
+        "asof of a confirmed hash ahead of visible SH must not pin"
+    );
+    let asof_lag = rbitcoin_primitives::display_hash_hex(&lag_hash);
+    let at_wm = rpc(
+        &mut stream,
+        13,
+        "blockchain.scripthash.get_balance",
+        json!([sh.clone(), tag_spend.clone()]),
+    )
+    .await;
+    assert_eq!(at_wm["result"]["confirmed"], 0, "{at_wm}");
+    let ahead = rpc(
+        &mut stream,
+        14,
+        "blockchain.scripthash.get_balance",
+        json!([sh.clone(), format!("asof:{asof_lag}")]),
+    )
+    .await;
+    let ahead_msg = ahead["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        ahead_msg.contains("asof not on chain"),
+        "asof ahead of visible SH: {ahead}"
+    );
+    let (st, raw, body) = http_get_raw(
+        esplora.local_addr,
+        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+    )
+    .await;
+    assert_eq!(st, 200, "asof at SH watermark utxo body={body}");
+    assert_eq!(
+        http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(),
+        Some(asof_spend.as_str())
+    );
+    assert_esplora_asof_dead(
+        esplora.local_addr,
+        &format!("/scripthash/{sh}/utxo?asof={asof_lag}"),
+    )
+    .await;
+
+    q.disconnect_tip().unwrap();
+    q.set_sh_index_enabled(true);
+    assert_eq!(q.tip_height(), Some(Height(103)));
+
+    let sub = rpc(
+        &mut stream,
+        15,
+        "blockchain.scripthash.subscribe",
+        json!([sh.clone()]),
+    )
+    .await;
+    let status_a = sub["result"]
+        .as_str()
+        .expect("subscribe status")
+        .to_string();
+    assert_eq!(status_a.len(), 64, "{sub}");
+
+    q.disconnect_tip().unwrap();
+    q.apply_sh_pending().unwrap();
+    accept_and_connect_block(&q, &params, Height(103), &spend_blk_b, Milestone::NONE).unwrap();
+    q.apply_sh_pending().unwrap();
+    tip_tx
+        .send(TipNotify {
+            height: 103,
+            header_hex: header_hex(&spend_blk_b),
+            reorg_from_height: Some(103),
+        })
+        .expect("same-height replace notify");
+    let push_b = read_notify(&mut stream, "same-height status B").await;
+    assert_eq!(
+        push_b["method"].as_str(),
+        Some("blockchain.scripthash.subscribe")
+    );
+    let status_b = push_b["params"][1].as_str().expect("status B").to_string();
+    assert_ne!(
+        status_a, status_b,
+        "same-height replace must change status via confirming blockhash"
+    );
+    let asof_a = rpc(
+        &mut stream,
+        16,
+        "blockchain.scripthash.get_history",
+        json!([sh.clone(), tag_spend.clone()]),
+    )
+    .await;
+    let asof_a_msg = asof_a["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        asof_a_msg.contains("asof not on chain"),
+        "asof of disconnected hash must not retry onto the sibling: {asof_a}"
+    );
+    assert_esplora_asof_dead(
+        esplora.local_addr,
+        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+    )
+    .await;
+    assert_esplora_asof_dead(
+        esplora.local_addr,
+        &format!("/tx/{spend_hex}/status?asof={asof_spend}"),
+    )
+    .await;
+
+    q.disconnect_tip().unwrap();
+    q.apply_sh_pending().unwrap();
+    accept_and_connect_block(&q, &params, Height(103), &spend_blk, Milestone::NONE).unwrap();
+    q.apply_sh_pending().unwrap();
+    tip_tx
+        .send(TipNotify {
+            height: 103,
+            header_hex: header_hex(&spend_blk),
+            reorg_from_height: Some(103),
+        })
+        .expect("A-B-A restore notify");
+    let push_a2 = read_notify(&mut stream, "same-height status A again").await;
+    assert_eq!(
+        push_a2["params"][1].as_str(),
+        Some(status_a.as_str()),
+        "A-B-A must restore the original status string: {push_a2}"
+    );
+
+    q.disconnect_tip().unwrap();
+    q.apply_sh_pending().unwrap();
+    tip_tx
+        .send(TipNotify {
+            height: 102,
+            header_hex: header_hex(&create_blk),
+            reorg_from_height: Some(102),
+        })
+        .expect("disconnect spend notify");
+    let push_u = read_notify(&mut stream, "unspend status").await;
+    let status_u = push_u["params"][1].as_str().unwrap_or("");
+    assert_ne!(
+        status_u, status_a,
+        "disconnecting the spend must restatus: {push_u}"
+    );
+
+    let hist_u = rpc(
+        &mut stream,
+        17,
+        "blockchain.scripthash.get_history",
+        json!([sh.clone()]),
+    )
+    .await;
+    let hist_u_rows = hist_u["result"].as_array().unwrap();
+    assert_eq!(hist_u_rows.len(), 1, "{hist_u}");
+    assert_eq!(hist_u_rows[0]["tx_hash"], create_hex);
+    let utxo_u = rpc(
+        &mut stream,
+        18,
+        "blockchain.scripthash.listunspent",
+        json!([sh.clone()]),
+    )
+    .await;
+    let utxo_u_rows = utxo_u["result"].as_array().unwrap();
+    assert_eq!(utxo_u_rows.len(), 1, "{utxo_u}");
+    assert_eq!(utxo_u_rows[0]["tx_hash"], create_hex);
+    let asof_dead = rpc(
+        &mut stream,
+        19,
+        "blockchain.scripthash.get_balance",
+        json!([sh.clone(), tag_spend]),
+    )
+    .await;
+    let asof_dead_msg = asof_dead["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        asof_dead_msg.contains("asof not on chain"),
+        "asof of disconnected spend hash: {asof_dead}"
+    );
+
+    let (st, raw, body) = http_get_raw(esplora.local_addr, &format!("/scripthash/{sh}/utxo")).await;
+    assert_eq!(st, 200, "live utxo after disconnect spend body={body}");
+    let utxos: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(utxos.as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(utxos[0]["txid"], create_hex);
+    assert_eq!(
+        http_header_value(&raw, "x-bitcoin-chain-tip").as_deref(),
+        Some(asof_create.as_str()),
+        "live stamp must be the create block, not the disconnected spend"
+    );
+    assert_eq!(
+        http_header_value(&raw, "x-bitcoin-chain-tip-height").as_deref(),
+        Some("102")
+    );
+    let (st, _, body) = http_get_raw(esplora.local_addr, &format!("/tx/{spend_hex}/status")).await;
+    assert_eq!(st, 200, "spend status after disconnect={body}");
+    let spend_st: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(spend_st["confirmed"], false, "{spend_st}");
+    assert_esplora_asof_dead(
+        esplora.local_addr,
+        &format!("/scripthash/{sh}/utxo?asof={asof_spend}"),
+    )
+    .await;
+    assert_esplora_asof_dead(
+        esplora.local_addr,
+        &format!("/tx/{spend_hex}/status?asof={asof_spend}"),
     )
     .await;
 
