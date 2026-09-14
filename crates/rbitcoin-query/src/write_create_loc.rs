@@ -1,11 +1,12 @@
 //! Write-thread loc pairs from Class A append (just-written parents).
 //!
 //! Lookup TipOnly reads `create.loc` after [`crate::Query::note_lookup_tiponly_start`].
-//! At note, `keep_until` is the first height whose TipOnly has **not** started
-//! (`lookup_started_hi + 1`, at least the noting pack). That value is never
-//! bumped. Prune drops a pack when that unstarted height has finished write
-//! (`written_hi ≥ keep_until`) and the pack is not the one just written
-//! (`pack_height < written_hi`).
+//! At note, `keep_until` is the last height whose TipOnly had started
+//! (`lookup_started_hi`, at least the noting pack). That value is never bumped.
+//! Prune drops a pack when that height has finished write (`written_hi ≥
+//! keep_until`) and the pack is not the one just written (`pack_height <
+//! written_hi`). Fill of that write runs first. Later-wave spends take TipOnly
+//! loc on the in-flight identity; RAM loc is only for same-wave holes.
 //!
 //! This window is **write-thread TLS** (one writer per thread — same ownership
 //! as load's [`crate::InFlight`], not a `Query` mutex). Disconnect is polled
@@ -20,12 +21,9 @@ use crate::Query;
 
 const PAIR_BYTES: u64 = std::mem::size_of::<CreateLocPair>() as u64;
 
-/// First height lookup has not TipOnly'd, floored at `pack_height`.
+/// Last TipOnly'd height at note, floored at `pack_height`.
 pub(crate) fn keep_until_at_note(pack_height: u32, started_hi: Option<u32>) -> u32 {
-    let next_unstarted = started_hi
-        .map(|h| h.saturating_add(1))
-        .unwrap_or(pack_height);
-    next_unstarted.max(pack_height)
+    started_hi.unwrap_or(pack_height).max(pack_height)
 }
 
 #[derive(Debug)]
@@ -90,7 +88,7 @@ impl WriteCreateLocRam {
         None
     }
 
-    /// Drop packs whose unstarted-at-note height has finished write.
+    /// Drop packs whose last-started-at-note height has finished write.
     ///
     /// `keep_until` is fixed at note. Equality drops once `written_hi` covers
     /// that height, except the noting pack (`pack_height < written_hi`).
@@ -229,9 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn keep_until_at_note_is_next_unstarted() {
-        assert_eq!(keep_until_at_note(360, Some(432)), 433);
-        assert_eq!(keep_until_at_note(360, Some(1080)), 1081);
+    fn keep_until_at_note_is_last_started() {
+        assert_eq!(keep_until_at_note(360, Some(432)), 432);
+        assert_eq!(keep_until_at_note(360, Some(1080)), 1080);
         assert_eq!(keep_until_at_note(360, None), 360);
         assert_eq!(keep_until_at_note(5, Some(3)), 5);
     }
@@ -251,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_drops_only_when_unstarted_height_has_written() {
+    fn prune_drops_when_last_started_height_has_written() {
         let mut m = WriteCreateLocRam::default();
         m.note(
             360,
@@ -259,13 +257,16 @@ mod tests {
             &fks(&[10]),
             &loc(&[10]),
         );
-        prune(&mut m, 432);
+        prune(&mut m, 431);
         assert!(
             m.get(Fk(10)).is_some(),
-            "keep until write of next unstarted (433), not the last started (432)"
+            "intervening writes below last started keep"
         );
-        prune(&mut m, 433);
-        assert!(m.get(Fk(10)).is_none());
+        prune(&mut m, 432);
+        assert!(
+            m.get(Fk(10)).is_none(),
+            "drop after last started write (fill of that write already ran)"
+        );
     }
 
     #[test]

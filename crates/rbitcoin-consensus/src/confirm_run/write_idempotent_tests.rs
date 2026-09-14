@@ -1309,24 +1309,24 @@ fn fill_same_batch_abs_from_append_loc_ram() {
         bp_later.get_spender_abs(fks[0], 0),
         Some(rbitcoin_store::spent_abs(loc[0].spent.0, 0))
     );
-    q.prune_write_create_loc(4);
+    q.prune_write_create_loc(3);
     assert!(
         q.write_create_loc(fks[0]).is_some(),
-        "keep until write of next unstarted (started_hi+1=5)"
+        "keep until write of last started (started_hi=4)"
     );
-    q.prune_write_create_loc(5);
+    q.prune_write_create_loc(4);
     assert!(
         q.write_create_loc(fks[0]).is_none(),
-        "drop after the unstarted-at-note height finished write"
+        "drop after the last-started-at-note height finished write"
     );
 
     let _ = std::fs::remove_dir_all(&path);
 }
 
 /// Mainnet 496: lookup TipOnly already covers the child; note stamps
-/// `keep_until = started_hi+1` and intervening writes must not drop loc.
+/// `keep_until = started_hi` and intervening writes must not drop loc.
 #[test]
-fn fill_just_written_survives_until_next_unstarted_write() {
+fn fill_just_written_survives_until_last_started_write() {
     use super::{ensure_spend_abs_layouts, fill_planned_create_layout_after_commit, Prepared};
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::BatchParents;
@@ -1356,7 +1356,7 @@ fn fill_just_written_survives_until_next_unstarted_write() {
     q.prune_write_create_loc(432);
     assert!(
         q.write_create_loc(fks[0]).is_some(),
-        "keep_until is 497 (next unstarted); write 432 must not drop"
+        "keep_until is 496 (last started); write 432 must not drop"
     );
 
     let mut bp = BatchParents::new();
@@ -1384,16 +1384,16 @@ fn fill_just_written_survives_until_next_unstarted_write() {
     }];
     q.store().reset_spent_range_batch();
     fill_planned_create_layout_after_commit(&q, &mut bp, &[], &[], &[], &child)
-        .expect("child fill from write loc until next-unstarted write");
-    ensure_spend_abs_layouts(&bp, &child).expect("abs until next-unstarted write");
+        .expect("child fill from write loc until last-started write");
+    ensure_spend_abs_layouts(&bp, &child).expect("abs until last-started write");
     assert!(
         q.store().spent_range_batch_fks().is_empty(),
         "write fill/ensure must not pread create.loc"
     );
-    q.prune_write_create_loc(497);
+    q.prune_write_create_loc(496);
     assert!(
         q.write_create_loc(fks[0]).is_none(),
-        "drop when the unstarted-at-note height finished write"
+        "drop when the last-started-at-note height finished write"
     );
 
     let _ = std::fs::remove_dir_all(&path);

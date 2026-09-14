@@ -118,8 +118,9 @@ before 1.0).
 
 - **Write loc RAM:** Class A append returns loc pairs; write keeps them in
   height-tagged **thread-local** packs (no `Query` mutex) until write of the
-  first height whose TipOnly had not started at note (`lookup_started_hi +
-  1`). `keep_until` is stamped once and never bumped. Same-batch /
+  last height whose TipOnly had started at note (`lookup_started_hi`).
+  `keep_until` is stamped once and never bumped. Fill of that write runs
+  first. Later-wave InFlight identity still takes TipOnly loc. Same-batch /
   just-written abs stamp from that RAM (packed pin outs). Disconnect is polled
   on the write thread. Write does not pread `create.loc`. Missing stamp is
   `Corrupt`. `ibd: sizes` `wloc=`.

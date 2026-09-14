@@ -209,7 +209,7 @@ fn confirm_engine_pins_spend_of_just_written_pack() {
 
 /// Mainnet 496: parent, intervening empties, and child are all in the BQ
 /// before any write (one lookup wave). Each height is its own write so loc
-/// must survive intervening prunes until the next unstarted height writes.
+/// must survive intervening prunes until the last started height writes.
 #[test]
 fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
     use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
