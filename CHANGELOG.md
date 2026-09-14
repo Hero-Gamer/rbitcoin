@@ -109,11 +109,12 @@ before 1.0).
   snapshot. Live table drops before cleanup.
 
 - **Write loc RAM:** Class A append returns loc pairs; write keeps them in
-  height-tagged packs until write of `lookup_started_hi` at note (last
-  TipOnly that may have missed disk loc). Same-batch / just-written abs
-  stamp from that RAM (packed pin outs). Disconnect drops packs at/above
-  that height. Write does not pread `create.loc`. Missing stamp is
-  `Corrupt`. `ibd: sizes` `wloc=`.
+  height-tagged **thread-local** packs (no `Query` mutex) until write of
+  `lookup_started_hi` at note, extended while the pack is still at/above the
+  load drain fence (InFlight still makes TipOnly skip disk loc). Same-write
+  prune keeps the noting pack. Same-batch / just-written abs stamp from that
+  RAM (packed pin outs). Disconnect is polled on the write thread. Write does
+  not pread `create.loc`. Missing stamp is `Corrupt`. `ibd: sizes` `wloc=`.
 
 - **`create.loc` leftover stamp:** lookup reads/sums only through the highest
   fk in each 1024-create window, preads those windows as one bulk batch (held

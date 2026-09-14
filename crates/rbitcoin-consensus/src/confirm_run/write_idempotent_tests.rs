@@ -1312,7 +1312,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
     q.prune_write_create_loc(3);
     assert!(
         q.write_create_loc(fks[0]).is_some(),
-        "keep until write of lookup_started_hi"
+        "keep until write of lookup_started_hi (and pack below drain fence)"
     );
     q.prune_write_create_loc(4);
     assert!(

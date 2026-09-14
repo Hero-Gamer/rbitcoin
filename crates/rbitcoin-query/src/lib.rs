@@ -104,13 +104,17 @@ pub struct ProcessOwnedSizes {
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
 ///
-/// Updated after each load note/prune ([`InFlight`]). Sampled by the ~5s IBD sizes line.
+/// Load publishes [`InFlight`] after note/prune; write publishes loc packs
+/// from TLS after note/prune. Sampled by the ~5s IBD sizes line.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static INFLIGHT_LAYERS: AtomicU64 = AtomicU64::new(0);
     static INFLIGHT_PINS: AtomicU64 = AtomicU64::new(0);
     static INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static WLOC_PACKS: AtomicU64 = AtomicU64::new(0);
+    static WLOC_PAIRS: AtomicU64 = AtomicU64::new(0);
+    static WLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
     /// Publish latest prep-ahead occupancy (overwrite).
     pub fn note(inflight_layers: usize, inflight_pins: usize, inflight_bytes: u64) {
@@ -119,11 +123,21 @@ pub mod process_mem_stats {
         INFLIGHT_BYTES.store(inflight_bytes, Ordering::Relaxed);
     }
 
+    /// Write-thread loc window occupancy (TLS; no lock on Query).
+    pub fn note_wloc(packs: usize, pairs: usize, bytes: u64) {
+        WLOC_PACKS.store(packs as u64, Ordering::Relaxed);
+        WLOC_PAIRS.store(pairs as u64, Ordering::Relaxed);
+        WLOC_BYTES.store(bytes, Ordering::Relaxed);
+    }
+
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Snap {
         pub inflight_layers: usize,
         pub inflight_pins: usize,
         pub inflight_bytes: u64,
+        pub wloc_packs: usize,
+        pub wloc_pairs: usize,
+        pub wloc_bytes: u64,
     }
 
     pub fn load() -> Snap {
@@ -131,6 +145,9 @@ pub mod process_mem_stats {
             inflight_layers: INFLIGHT_LAYERS.load(Ordering::Relaxed) as usize,
             inflight_pins: INFLIGHT_PINS.load(Ordering::Relaxed) as usize,
             inflight_bytes: INFLIGHT_BYTES.load(Ordering::Relaxed),
+            wloc_packs: WLOC_PACKS.load(Ordering::Relaxed) as usize,
+            wloc_pairs: WLOC_PAIRS.load(Ordering::Relaxed) as usize,
+            wloc_bytes: WLOC_BYTES.load(Ordering::Relaxed),
         }
     }
 }
@@ -257,10 +274,6 @@ pub struct Query {
     lookup_started_hi: AtomicU32,
     /// Max height whose Class A append committed (`u32::MAX` = none).
     class_a_hi: AtomicU32,
-    /// Write-thread loc pairs from Class A append. Later packs stamp abs from
-    /// this RAM (just-written parents). Write never preads `create.loc`.
-    /// Packs live until write of `lookup_started_hi` at note time.
-    write_create_loc: Mutex<write_create_loc::WriteCreateLocRam>,
     /// Post-IBD SH SEAL + leftover-run discard (unsorted collect is tip finalize).
     sh_run: sh_builder::ShRunBuilder,
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
@@ -316,6 +329,7 @@ impl Query {
     }
 
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, QueryError> {
+        write_create_loc::clear();
         let store = Store::open_or_create_layout(layout)?;
         // Core checkblocks-style tip window first so repair sees the final fence.
         let reval = store.revalidate_tip_window()?;
@@ -366,7 +380,6 @@ impl Query {
             lookup_taken_hi: AtomicU32::new(u32::MAX),
             lookup_started_hi: AtomicU32::new(u32::MAX),
             class_a_hi: AtomicU32::new(u32::MAX),
-            write_create_loc: Mutex::new(write_create_loc::WriteCreateLocRam::default()),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
@@ -439,10 +452,6 @@ impl Query {
         self.set_lookup_taken_hi(rewind);
         self.set_lookup_started_hi(rewind);
         self.set_class_a_hi(rewind);
-        self.write_create_loc
-            .lock()
-            .unwrap()
-            .drop_from_height(height);
         self.block_queue_drop_resolved_from(height);
     }
 
@@ -726,7 +735,8 @@ impl Query {
     }
 
     /// Keep Class A append loc until write of the last pack whose TipOnly
-    /// may have missed it (`lookup_started_hi` at note). No loc pread.
+    /// may have missed it (`lookup_started_hi` at note), extended while the
+    /// pack is still at/above the load drain fence. Write-thread TLS. No loc pread.
     pub fn note_write_create_loc(
         &self,
         fks: &[rbitcoin_primitives::Fk],
@@ -737,25 +747,28 @@ impl Query {
             .lookup_started_hi()
             .unwrap_or(pack_height)
             .max(pack_height);
-        self.write_create_loc
-            .lock()
-            .unwrap()
-            .note(pack_height, keep_until, fks, loc);
+        write_create_loc::with_ram(self, |ram| {
+            ram.note(pack_height, keep_until, fks, loc);
+        });
     }
 
-    /// Drop loc packs whose last overlapping lookup batch has finished write.
+    /// Drop loc packs whose last overlapping lookup batch has finished write
+    /// and whose pack height is below the load drain fence.
     pub fn prune_write_create_loc(&self, written_hi: u32) {
-        self.write_create_loc
-            .lock()
-            .unwrap()
-            .prune_written_through(written_hi);
+        write_create_loc::with_ram(self, |ram| {
+            ram.prune_written_through(
+                written_hi,
+                self.lookup_started_hi(),
+                self.drain_and_fence_hi(),
+            );
+        });
     }
 
     pub fn write_create_loc(
         &self,
         fk: rbitcoin_primitives::Fk,
     ) -> Option<rbitcoin_store::CreateLocPair> {
-        self.write_create_loc.lock().unwrap().get(fk)
+        write_create_loc::with_ram(self, |ram| ram.get(fk))
     }
 
     /// Densify / offer: height is already in the confirm pipeline.
@@ -1021,11 +1034,6 @@ impl Query {
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
         let mem = process_mem_stats::load();
-        let (wloc_packs, wloc_pairs, wloc_bytes) = self
-            .write_create_loc
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .size_snapshot();
         let h2h_keys = self
             .height_by_hash
             .lock()
@@ -1048,9 +1056,9 @@ impl Query {
             h2h_keys,
             fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),
-            wloc_packs,
-            wloc_pairs,
-            wloc_bytes,
+            wloc_packs: mem.wloc_packs,
+            wloc_pairs: mem.wloc_pairs,
+            wloc_bytes: mem.wloc_bytes,
         }
     }
 

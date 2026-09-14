@@ -3,15 +3,22 @@
 //! Lookup TipOnly reads `create.loc` after [`crate::Query::note_lookup_tiponly_start`].
 //! A later pack whose TipOnly already started cannot have stamped those pairs.
 //! Write keeps them until that last pack has finished write: `keep_until` is
-//! `lookup_started_hi` at note (at least the noting pack height). Prune when
-//! written height ≥ `keep_until`. Disconnect [`Self::drop_from_height`] drops
-//! packs at/above that height and clamps remaining `keep_until`. Height index
-//! matches [`crate::InFlight`]; the drop gate is written height vs keep-until,
-//! not drain+fence vs pack height.
+//! `lookup_started_hi` at note (at least the noting pack height), then extended
+//! while the pack is still at/above the load drain fence (TipOnly still skips
+//! disk loc via InFlight). Prune when pack height is below that fence **and**
+//! written height ≥ `keep_until`. The noting pack is not dropped on the same
+//! write (`pack_height < written_hi`).
+//!
+//! This window is **write-thread TLS** (one writer per thread — same ownership
+//! as load's [`crate::InFlight`], not a `Query` mutex). Disconnect is polled
+//! via [`crate::Query::take_disconnect`] on the write thread.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::CreateLocPair;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+
+use crate::Query;
 
 const PAIR_BYTES: u64 = std::mem::size_of::<CreateLocPair>() as u64;
 
@@ -77,19 +84,32 @@ impl WriteCreateLocRam {
         None
     }
 
-    /// Drop packs whose last overlapping lookup batch has finished write.
-    ///
-    /// Equality drops (`keep_until == written_hi`).
-    pub(crate) fn prune_written_through(&mut self, written_hi: u32) {
+    /// Drop packs whose loc is on disk for later TipOnly (`pack_height < fence`)
+    /// and whose overlapping lookup wave has finished write (`keep_until <=
+    /// written_hi`). Keep the noting pack so a child that looked up while the
+    /// parent was still in-flight can still fill abs.
+    pub(crate) fn prune_written_through(
+        &mut self,
+        written_hi: u32,
+        started_hi: Option<u32>,
+        fence_hi: Option<u32>,
+    ) {
+        let started = started_hi.unwrap_or(written_hi);
+        let fence = fence_hi.unwrap_or(written_hi);
         let drop: Vec<u32> = self
             .by_height
             .iter()
-            .filter(|(_, p)| p.keep_until <= written_hi)
+            .filter(|(h, p)| **h < fence && **h < written_hi && p.keep_until <= written_hi)
             .map(|(h, _)| *h)
             .collect();
         for h in drop {
             if let Some(p) = self.by_height.remove(&h) {
                 self.approx_bytes = self.approx_bytes.saturating_sub(p.approx_bytes);
+            }
+        }
+        for (h, pack) in self.by_height.iter_mut() {
+            if *h >= fence {
+                pack.keep_until = pack.keep_until.max(started);
             }
         }
     }
@@ -116,6 +136,43 @@ impl WriteCreateLocRam {
     }
 }
 
+thread_local! {
+    static RAM: RefCell<WriteCreateLocRam> = RefCell::new(WriteCreateLocRam::default());
+    static DISCONNECT_SEEN: Cell<u64> = const { Cell::new(0) };
+}
+
+fn publish(ram: &WriteCreateLocRam) {
+    let (packs, pairs, bytes) = ram.size_snapshot();
+    crate::process_mem_stats::note_wloc(packs, pairs, bytes);
+}
+
+/// Drop this thread's loc window (Query open / test isolation). Does not publish
+/// zeros — `wloc=` atomics are process-wide like `iflight=`.
+pub(crate) fn clear() {
+    RAM.with(|c| {
+        *c.borrow_mut() = WriteCreateLocRam::default();
+    });
+    DISCONNECT_SEEN.with(|c| c.set(0));
+}
+
+pub(crate) fn with_ram<R>(query: &Query, f: impl FnOnce(&mut WriteCreateLocRam) -> R) -> R {
+    RAM.with(|c| {
+        let mut ram = c.borrow_mut();
+        poll_disconnect(query, &mut ram);
+        let r = f(&mut ram);
+        publish(&ram);
+        r
+    })
+}
+
+fn poll_disconnect(query: &Query, ram: &mut WriteCreateLocRam) {
+    let mut seen = DISCONNECT_SEEN.with(|c| c.get());
+    if let Some(h) = query.take_disconnect(&mut seen) {
+        ram.drop_from_height(h);
+        DISCONNECT_SEEN.with(|c| c.set(seen));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +194,10 @@ mod tests {
         ids.iter().copied().map(pair).collect()
     }
 
+    fn prune(m: &mut WriteCreateLocRam, written_hi: u32) {
+        m.prune_written_through(written_hi, Some(written_hi), Some(written_hi));
+    }
+
     #[test]
     fn note_get_by_fk() {
         let mut m = WriteCreateLocRam::default();
@@ -151,9 +212,9 @@ mod tests {
     fn prune_written_through_drops_at_keep_until() {
         let mut m = WriteCreateLocRam::default();
         m.note(1, 4, &fks(&[10]), &loc(&[10]));
-        m.prune_written_through(3);
+        prune(&mut m, 3);
         assert!(m.get(Fk(10)).is_some(), "written_hi < keep_until keeps");
-        m.prune_written_through(4);
+        prune(&mut m, 4);
         assert!(
             m.get(Fk(10)).is_none(),
             "written_hi == keep_until drops (last overlapping batch finished write)"
@@ -166,11 +227,40 @@ mod tests {
         let mut m = WriteCreateLocRam::default();
         m.note(1, 4, &fks(&[10]), &loc(&[10]));
         m.note(2, 8, &fks(&[11]), &loc(&[11]));
-        m.prune_written_through(4);
+        prune(&mut m, 4);
         assert!(m.get(Fk(10)).is_none());
         assert!(m.get(Fk(11)).is_some(), "later pack waits for keep_until 8");
-        m.prune_written_through(8);
+        prune(&mut m, 8);
         assert!(m.get(Fk(11)).is_none());
+    }
+
+    #[test]
+    fn prune_keeps_noting_pack_until_later_write() {
+        let mut m = WriteCreateLocRam::default();
+        m.note(3, 3, &fks(&[10]), &loc(&[10]));
+        prune(&mut m, 3);
+        assert!(
+            m.get(Fk(10)).is_some(),
+            "same-write prune must not drop the noting pack (child TipOnly may still skip loc via InFlight)"
+        );
+        prune(&mut m, 4);
+        assert!(m.get(Fk(10)).is_none());
+        assert_eq!(m.size_snapshot(), (0, 0, 0));
+    }
+
+    #[test]
+    fn prune_bumps_keep_until_from_started_hi_while_at_fence() {
+        let mut m = WriteCreateLocRam::default();
+        m.note(2, 1, &fks(&[10]), &loc(&[10]));
+        m.prune_written_through(2, Some(8), Some(2));
+        assert!(m.get(Fk(10)).is_some());
+        m.prune_written_through(7, Some(8), Some(9));
+        assert!(
+            m.get(Fk(10)).is_some(),
+            "keep_until bumped to 8 while pack was still at fence"
+        );
+        m.prune_written_through(8, Some(8), Some(9));
+        assert!(m.get(Fk(10)).is_none());
     }
 
     #[test]
@@ -185,9 +275,9 @@ mod tests {
         assert_eq!(bytes, 8 * PAIR_BYTES);
         assert!(m.get(Fk(1000)).is_some());
         assert!(m.get(Fk(1007)).is_some());
-        m.prune_written_through(99);
+        prune(&mut m, 99);
         assert_eq!(m.size_snapshot().0, 8, "no silent FIFO drop");
-        m.prune_written_through(100);
+        prune(&mut m, 100);
         assert_eq!(m.size_snapshot(), (0, 0, 0));
     }
 
@@ -199,7 +289,7 @@ mod tests {
         m.drop_from_height(8);
         assert!(m.get(Fk(10)).is_some());
         assert!(m.get(Fk(11)).is_none());
-        m.prune_written_through(7);
+        prune(&mut m, 7);
         assert!(
             m.get(Fk(10)).is_none(),
             "keep_until clamped to disconnect-1 so remaining pipeline can retire the pack"
