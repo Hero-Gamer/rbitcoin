@@ -1339,6 +1339,7 @@ impl ChainHub {
                     if let Ok(Some(block)) =
                         self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                     {
+                        mp.note_recent_confirmed(&block.txdata);
                         let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
                         let spent: Vec<_> = block
                             .txdata
@@ -2264,6 +2265,7 @@ impl ChainHub {
         self.header_tips.write().unwrap().remove(&hash);
         let t_mp = std::time::Instant::now();
         if let Some(mp) = self.mempool() {
+            mp.note_recent_confirmed(&block.txdata);
             let ids = Self::strip_txids_from_pres(&pres);
             let spent: Vec<_> = block
                 .txdata
@@ -2324,6 +2326,7 @@ impl ChainHub {
         }
         self.cache.truncate_to_height(keep_height);
         if let Some(mp) = mp {
+            mp.clear_recent_confirmed();
             if !disconnected_txs.is_empty() {
                 let n = mp.reorg_reaccept(&disconnected_txs);
                 if n > 0 {
