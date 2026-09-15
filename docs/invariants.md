@@ -66,9 +66,9 @@ puts parent P on the load-batch skeleton, load stamp of a child spending P has
 move `plan_batch` onto lookup.
 
 IBD stamp does not build `TxApply` / packed ins (`archive_plan_batch_from_wire`).
-SpendEdges + CreatePin survive freeze. Write encodes ins from `Arc<Block>` +
-those edges. CreatePin outs stay stamp-time for in-flight. Load still does
-not head/idx.
+SpendEdges + CreatePin survive freeze. Write encodes ins and Class A outs from
+`Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
+the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|

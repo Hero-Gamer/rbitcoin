@@ -148,8 +148,7 @@ fn fill_pins(
         let Some(pin) = parent_pin.create_pin(*id).cloned() else {
             continue;
         };
-        let (_tx, outs) = pin.as_ref();
-        if !need.iter().all(|&v| outs.get(v as usize).is_some()) {
+        if !need.iter().all(|&v| pin.out_parts(v).is_some()) {
             continue;
         }
         plan_by_id.insert(*id, pin);
@@ -173,7 +172,7 @@ fn apply_plan_pins(
         let fk = rbitcoin_primitives::Fk(*id);
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
-                let (tx, _outs) = pin.as_ref();
+                let tx = pin.tx();
                 let cb = if tx.input_count != 1 {
                     Some(false)
                 } else {
@@ -188,12 +187,11 @@ fn apply_plan_pins(
             continue;
         }
         if let Some(pin) = plan_by_id.get(id) {
-            let (tx, outs) = pin.as_ref();
-            if !need.iter().all(|&v| outs.get(v as usize).is_some()) {
+            if !need.iter().all(|&v| pin.out_parts(v).is_some()) {
                 still_need.insert(*id, need.clone());
                 continue;
             }
-            let cb = if tx.input_count != 1 {
+            let cb = if pin.tx().input_count != 1 {
                 Some(false)
             } else {
                 None

@@ -441,7 +441,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
         for (fk, (pair, pin)) in planned_fks.iter().zip(loc.iter().zip(packed.iter())) {
             let Some(id) = fk.get() else { continue };
             let Some(vouts) = need.get(&id) else { continue };
-            if pair.n_out != pin.1.len() as u32 {
+            if pair.n_out != pin.n_out() as u32 {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: append loc length",
                 )));
@@ -454,7 +454,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
             let mut checked = vouts.clone();
             checked.sort_unstable();
             checked.dedup();
-            let cb = if pin.0.input_count != 1 {
+            let cb = if pin.tx().input_count != 1 {
                 Some(false)
             } else {
                 None
@@ -563,7 +563,8 @@ fn records_from_wire(
         return None;
     }
 
-    let mut by_txid: HashMap<[u8; 32], usize> = HashMap::with_capacity(p.txids.len());
+    let mut by_txid: rbitcoin_query::TxidMap<usize> =
+        rbitcoin_query::TxidMap::with_capacity_and_hasher(p.txids.len(), Default::default());
     for (i, tid) in p.txids.iter().enumerate() {
         by_txid.insert(*tid, i);
     }

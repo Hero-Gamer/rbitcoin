@@ -17,9 +17,10 @@ IBD path. It is **not** about kernel page cache under FdOnly store files
 Peers enqueue **raw** framed block payloads into the **in-RAM** body queue and
 stamp Σ `tx.input` (`block_wire_input_count`; CompactSize walk, not a `Block`).
 Lookup packs and **holds** on that stamped count (no clone, no decode). The first
-full decode is lookup emit: `consensus_decode` + `TxPrecompute::from_tx_connect`
-below milestone (txid/wtxid/sizes; no BIP143/341 midstates) or `from_tx` when
-scripts will run, **`take_raw`** (row gone), `ResolvedWire` on loadq. Load stamp takes
+full decode is lookup emit: `decode_block_precomputes` (payload-slice wtxid;
+stripped txid; `from_tx_wire` skips the second SHA engine when `wtxid==txid`;
+sighash midstates only when scripts run) then **`take_raw`** (row gone),
+`ResolvedWire` on loadq. Load stamp takes
 that same `pres` Arc (no second `from_tx`; do not re-stash on the BQ).
 Confirm commit is the sole Class A appender (**no** dual-track archive-job /
 ContigPark pipeline).

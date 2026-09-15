@@ -2010,6 +2010,34 @@ fn s17_rejects_duplicate_outpoints() {
 }
 
 #[test]
+fn s17_many_unique_outpoints_accept() {
+    let mut input = Vec::with_capacity(64);
+    for i in 0..64u32 {
+        let mut tid = [0u8; 32];
+        tid[..4].copy_from_slice(&i.to_le_bytes());
+        input.push(TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(tid),
+                vout: i,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        });
+    }
+    let many = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input,
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    check_tx_local(&many, many.base_size()).expect("64 unique inputs");
+}
+
+#[test]
 fn s18_rejects_non_coinbase_null_prevout() {
     validate_block_structure(
         &block_with(vec![coinbase(0), non_coinbase_spend(1)]),

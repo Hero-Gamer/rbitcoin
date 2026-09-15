@@ -66,14 +66,18 @@ fn check_tx_local(tx: &Transaction, base_size: usize) -> Result<(), ConsensusErr
     if base_size > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadTx("bad-txns-oversize"));
     }
-    for (i, inp) in tx.input.iter().enumerate() {
+    let mut seen: rbitcoin_query::OutPointSet =
+        rbitcoin_query::OutPointSet::with_capacity_and_hasher(tx.input.len(), Default::default());
+    for inp in &tx.input {
         if !tx.is_coinbase() && inp.previous_output.is_null() {
             return Err(ConsensusError::BadTx("bad-txns-prevout-null"));
         }
-        for prev in &tx.input[..i] {
-            if prev.previous_output == inp.previous_output {
-                return Err(ConsensusError::BadTx("bad-txns-inputs-duplicate"));
-            }
+        let key = (
+            inp.previous_output.txid.to_byte_array(),
+            inp.previous_output.vout,
+        );
+        if !seen.insert(key) {
+            return Err(ConsensusError::BadTx("bad-txns-inputs-duplicate"));
         }
     }
     Ok(())
@@ -150,7 +154,8 @@ pub fn validate_block_structure_with_pres(
         let v: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
         (Arc::from(v), t_txid.elapsed().as_nanos() as u64)
     };
-    let mut seen = std::collections::HashSet::with_capacity(n);
+    let mut seen: rbitcoin_query::TxidSet =
+        rbitcoin_query::TxidSet::with_capacity_and_hasher(n, Default::default());
     for p in pres.iter() {
         if !seen.insert(p.txid) {
             return Err(ConsensusError::BadBlock("duplicate txid"));
@@ -1028,9 +1033,6 @@ pub(crate) fn assemble_block_prevouts(
         txid_index.insert(*id, i);
     }
     let mut acc = AsmPrevoutAcc::default();
-    let mut clk_prev = 0u64;
-    let mut clk_sig = 0u64;
-    let mut clk_fin = 0u64;
     let mut clk_job = 0u64;
     let mut fees = 0i64;
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
@@ -1040,7 +1042,10 @@ pub(crate) fn assemble_block_prevouts(
         Vec::new()
     };
     const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
-    let mut block_sigops_cost = legacy_sigop_count(&block.txdata[0]).saturating_mul(4);
+    let mut block_sigops_cost = match pres.and_then(|p| p.first()) {
+        Some(p) => p.sigops.saturating_mul(4),
+        None => legacy_sigop_count(&block.txdata[0]).saturating_mul(4),
+    };
     let mut spends: Vec<(
         [u8; 32],
         u32,
@@ -1049,7 +1054,7 @@ pub(crate) fn assemble_block_prevouts(
         u32,
     )> = Vec::with_capacity(n_tx.saturating_mul(2));
 
-    use std::time::Instant;
+    let t_loop = Instant::now();
 
     // BIP113: caller prev_mtp (same as header MTP — no second walk).
     let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
@@ -1087,7 +1092,6 @@ pub(crate) fn assemble_block_prevouts(
             let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
             let mut tx_in_sigops = 0u64;
 
-            let t_prev = Instant::now();
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
                 let key = (op.txid.to_byte_array(), op.vout);
@@ -1142,30 +1146,34 @@ pub(crate) fn assemble_block_prevouts(
                     prevouts.push(prev_out.txout);
                 }
             }
-            clk_prev = clk_prev.saturating_add(t_prev.elapsed().as_nanos() as u64);
 
-            let t_sig = Instant::now();
+            let tx_legacy_sigops = match pres.and_then(|p| p.get(ti)) {
+                Some(p) => p.sigops.saturating_mul(4),
+                None => legacy_sigop_count(tx).saturating_mul(4),
+            };
             block_sigops_cost = block_sigops_cost
-                .saturating_add(legacy_sigop_count(tx).saturating_mul(4))
+                .saturating_add(tx_legacy_sigops)
                 .saturating_add(tx_in_sigops);
             if block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
-            clk_sig = clk_sig.saturating_add(t_sig.elapsed().as_nanos() as u64);
 
-            let t_fin = Instant::now();
-            clk_fin = clk_fin.saturating_add(t_fin.elapsed().as_nanos() as u64);
-
-            let mut value_out = 0i64;
-            for o in &tx.output {
-                let sats = o.value.to_sat() as i64;
-                if sats < 0 {
-                    return Err(ConsensusError::BadTx("negative output"));
+            let value_out = match pres.and_then(|p| p.get(ti)) {
+                Some(p) => p.out_sum as i64,
+                None => {
+                    let mut value_out = 0i64;
+                    for o in &tx.output {
+                        let sats = o.value.to_sat() as i64;
+                        if sats < 0 {
+                            return Err(ConsensusError::BadTx("negative output"));
+                        }
+                        value_out = value_out
+                            .checked_add(sats)
+                            .ok_or(ConsensusError::BadTx("value out overflow"))?;
+                    }
+                    value_out
                 }
-                value_out = value_out
-                    .checked_add(sats)
-                    .ok_or(ConsensusError::BadTx("value out overflow"))?;
-            }
+            };
             if value_out > value_in {
                 return Err(ConsensusError::BadTx("in < out"));
             }
@@ -1197,10 +1205,9 @@ pub(crate) fn assemble_block_prevouts(
         }
     }
 
+    let clk_prev = t_loop.elapsed().as_nanos() as u64;
     acc.flush(query.confirm_stats());
     rbitcoin_query::note_confirm(&query.confirm_stats().asm_prevout_ns, clk_prev);
-    rbitcoin_query::note_confirm(&query.confirm_stats().asm_sigop_ns, clk_sig);
-    rbitcoin_query::note_confirm(&query.confirm_stats().asm_final_ns, clk_fin);
     rbitcoin_query::note_confirm(&query.confirm_stats().asm_job_ns, clk_job);
     Ok((script_jobs, spends, fees))
 }
@@ -1337,7 +1344,8 @@ pub(crate) fn structural_validate_spends(
         .collect();
     // Sparse durable **spent** set (honest IBD: almost all outs unspent).
     // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
-    let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
+    let mut durable_spent: HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>> =
+        HashSet::with_hasher(Default::default());
     let mut multi_list_ns = 0u64;
 
     let tip = query.tip_height().map(|h| h.0);
@@ -1813,7 +1821,14 @@ fn resolve_prevout(
             acc.in_n = acc.in_n.saturating_add(1);
             acc.same_n = acc.same_n.saturating_add(1);
             return Ok(ResolvedPrevout {
-                txout: o.clone(),
+                txout: if need_script_buf {
+                    o.clone()
+                } else {
+                    TxOut {
+                        value: o.value,
+                        script_pubkey: ScriptBuf::new(),
+                    }
+                },
                 input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16, segwit),
                 create_fk: rbitcoin_primitives::Fk::NULL,
             });

@@ -880,7 +880,10 @@ fn pin_and_ensure_journey() {
     let missing_parent = Fk(999_999);
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        std::sync::Arc::new((rec_tx(0xAA, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0xAA, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         vec![InputRecord {
             prev_txid: [0xBB; 32],
             create_fk: missing_parent,
@@ -957,7 +960,10 @@ fn pin_and_ensure_journey() {
     }];
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0x22, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins.clone(),
     )];
     plan.planned_fks = vec![Fk(2)];
@@ -979,7 +985,10 @@ fn pin_and_ensure_journey() {
 
     let mut plan2 = ArchiveWritePlan::empty();
     plan2.packed = vec![(
-        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0x22, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins.clone(),
     )];
     plan2.planned_fks = vec![Fk(2)];
@@ -1085,7 +1094,10 @@ fn pin_and_ensure_journey() {
 
     let mut plan3 = ArchiveWritePlan::empty();
     plan3.packed = vec![(
-        std::sync::Arc::new((rec_tx(0x22, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0x22, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins,
     )];
     plan3.planned_fks = vec![Fk(2)];
@@ -1121,11 +1133,17 @@ fn pin_and_ensure_journey() {
     let mut plan4 = ArchiveWritePlan::empty();
     plan4.packed = vec![
         (
-            std::sync::Arc::new((rec_tx(0x32, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+            rbitcoin_query::CreatePinInner::records(
+                rec_tx(0x32, 1),
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
         ),
         (
-            std::sync::Arc::new((rec_tx(0x33, 1), vec![OutputRecord::unspent(1, vec![0x51])])),
+            rbitcoin_query::CreatePinInner::records(
+                rec_tx(0x33, 1),
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
             vec![InputRecord {
                 prev_txid: [0x32; 32],
                 create_fk: Fk(2),
@@ -1205,10 +1223,14 @@ fn fill_same_batch_abs_from_append_loc_ram() {
     use rbitcoin_store::{InputRecord, OutputRecord};
 
     let (path, q) = tiny_query();
-    let parent_pin =
-        std::sync::Arc::new((rec_tx(0x32, 1), vec![OutputRecord::unspent(1, vec![0x51])]));
-    let child_pin =
-        std::sync::Arc::new((rec_tx(0x33, 1), vec![OutputRecord::unspent(1, vec![0x51])]));
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x32, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let child_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x33, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
     let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let child_ins = vec![InputRecord {
         prev_txid: [0x32; 32],
@@ -1335,8 +1357,10 @@ fn fill_just_written_survives_until_last_started_write() {
     use rbitcoin_store::OutputRecord;
 
     let (path, q) = tiny_query();
-    let parent_pin =
-        std::sync::Arc::new((rec_tx(0x32, 1), vec![OutputRecord::unspent(1, vec![0x51])]));
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x32, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
     q.store().reset_spent_range_batch();
     let (fks, loc) = q
         .store()
@@ -1433,7 +1457,10 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
     }];
     let mut plan = ArchiveWritePlan {
         packed: vec![(
-            std::sync::Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            rbitcoin_query::CreatePinInner::records(
+                spend_tx,
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
             spend_ins,
         )],
         planned_fks: vec![Fk(2)],
@@ -1459,7 +1486,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         output_start_fk: Fk::NULL,
         output_count: 0,
     };
-    let pin = std::sync::Arc::new((parent_tx, Vec::new()));
+    let pin = rbitcoin_query::CreatePinInner::records(parent_tx, Vec::new());
     let mut inflight = rbitcoin_query::InFlight::new();
     inflight.note_pins([(Fk(parent_id), &pin)], None);
 
@@ -1550,7 +1577,7 @@ fn pin_takes_stamp_parent_vouts() {
     let range = q.store().txs.body_range(pfk).unwrap();
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        std::sync::Arc::new((
+        rbitcoin_query::CreatePinInner::records(
             TxRecord {
                 txid: [0x22u8; 32],
                 version: 1,
@@ -1561,7 +1588,7 @@ fn pin_takes_stamp_parent_vouts() {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
-        )),
+        ),
         vec![InputRecord {
             prev_txid: parent_tx.txid,
             create_fk: pfk,
@@ -1612,8 +1639,11 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
         output_start_fk: Fk::NULL,
         output_count: 1,
     };
-    let pin: CreatePin = Arc::new((parent_tx.clone(), vec![OutputRecord::unspent(50, script)]));
-    let expect = pin.1[0].script.as_ptr();
+    let pin: CreatePin = rbitcoin_query::CreatePinInner::records(
+        parent_tx.clone(),
+        vec![OutputRecord::unspent(50, script)],
+    );
+    let expect = pin.out_parts(0).expect("vout 0").1.as_ptr();
     let child_tx = TxRecord {
         txid: [0x42u8; 32],
         version: 1,
@@ -1630,7 +1660,10 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
         ),
         (
-            Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            rbitcoin_query::CreatePinInner::records(
+                child_tx,
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
             vec![InputRecord {
                 prev_txid: parent_tx.txid,
                 create_fk: Fk(1),
@@ -1686,10 +1719,10 @@ fn pin_plan_edges_without_packed_ins() {
         output_start_fk: Fk::NULL,
         output_count: 1,
     };
-    let pin: CreatePin = Arc::new((
+    let pin: CreatePin = rbitcoin_query::CreatePinInner::records(
         parent_tx.clone(),
         vec![OutputRecord::unspent(50, vec![0x51])],
-    ));
+    );
     let child_tx = TxRecord {
         txid: [0x42u8; 32],
         version: 1,
@@ -1703,7 +1736,10 @@ fn pin_plan_edges_without_packed_ins() {
     plan.packed = vec![
         (Arc::clone(&pin), vec![]),
         (
-            Arc::new((child_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+            rbitcoin_query::CreatePinInner::records(
+                child_tx,
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
             vec![],
         ),
     ];
@@ -1741,7 +1777,7 @@ fn pin_plan_empty_edges_is_invariant() {
     use std::sync::Arc;
     let (path, q) = tmp_query();
     q.enter_direct_index_mode().unwrap();
-    let pin = Arc::new((
+    let pin = rbitcoin_query::CreatePinInner::records(
         TxRecord {
             txid: [0x11u8; 32],
             version: 1,
@@ -1752,7 +1788,7 @@ fn pin_plan_empty_edges_is_invariant() {
             output_count: 1,
         },
         vec![OutputRecord::unspent(50, vec![0x51])],
-    ));
+    );
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(Arc::clone(&pin), vec![])];
     plan.planned_fks = vec![Fk(1)];
@@ -1821,7 +1857,10 @@ fn pin_sparse_need_high_vout_only() {
         script_sig: vec![],
         witness: vec![],
     }];
-    let spend_pin: CreatePin = Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])]));
+    let spend_pin: CreatePin = rbitcoin_query::CreatePinInner::records(
+        spend_tx,
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
     let mut plan = ArchiveWritePlan {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
         planned_fks: vec![Fk(2)],
@@ -1868,7 +1907,6 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::ArchiveWritePlan;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::Arc;
 
     let (path, q) = tmp_query();
     q.enter_direct_index_mode().unwrap();
@@ -1920,7 +1958,10 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
         .collect();
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            spend_tx,
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins,
     )];
     plan.planned_fks = vec![Fk(100)];
@@ -1975,7 +2016,8 @@ fn pin_stamp_outs_is_cache_not_new() {
         output_count: 1,
     };
     let parent_out = OutputRecord::unspent(50, vec![0x51, 0xaa]);
-    let pin: CreatePin = Arc::new((parent_tx.clone(), vec![parent_out.clone()]));
+    let pin: CreatePin =
+        rbitcoin_query::CreatePinInner::records(parent_tx.clone(), vec![parent_out.clone()]);
     let pfk = Fk(7);
 
     let spend_tx = TxRecord {
@@ -1997,7 +2039,10 @@ fn pin_stamp_outs_is_cache_not_new() {
     }];
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            spend_tx,
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins,
     )];
     plan.planned_fks = vec![Fk(100)];
@@ -2036,7 +2081,6 @@ fn pin_recent_identity_without_outs_still_range_fills() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::ArchiveWritePlan;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    use std::sync::Arc;
 
     let (path, q) = tmp_query();
     q.enter_direct_index_mode().unwrap();
@@ -2082,7 +2126,10 @@ fn pin_recent_identity_without_outs_still_range_fills() {
     }];
     let mut plan = ArchiveWritePlan::empty();
     plan.packed = vec![(
-        Arc::new((spend_tx, vec![OutputRecord::unspent(1, vec![0x51])])),
+        rbitcoin_query::CreatePinInner::records(
+            spend_tx,
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
         spend_ins,
     )];
     plan.planned_fks = vec![Fk(100)];
