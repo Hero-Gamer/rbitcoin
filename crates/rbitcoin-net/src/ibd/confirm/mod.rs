@@ -182,9 +182,7 @@ pub(crate) struct ConfirmFeed {
     stop: AtomicBool,
     /// Bumped by [`Self::clear`] so in-channel batches claimed earlier are dropped.
     epoch: AtomicU64,
-    /// Next lookup wave claims one height (isolate a multi-block consensus fail).
-    force_single: AtomicBool,
-    /// Clear [`Self::force_single`] once confirmed tip reaches this height (`u32::MAX` = none).
+    /// Isolate until confirmed tip reaches this height (`u32::MAX` = off).
     force_single_until: AtomicU32,
 }
 
@@ -208,7 +206,6 @@ impl ConfirmFeed {
             cv: std::sync::Condvar::new(),
             stop: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
-            force_single: AtomicBool::new(false),
             force_single_until: AtomicU32::new(u32::MAX),
         }
     }
@@ -226,17 +223,15 @@ impl ConfirmFeed {
 
     pub(crate) fn request_single_block(&self, until: u32) {
         self.force_single_until.store(until, Ordering::Release);
-        self.force_single.store(true, Ordering::Release);
     }
 
     pub(crate) fn single_block(&self) -> bool {
-        self.force_single.load(Ordering::Acquire)
+        self.force_single_until.load(Ordering::Acquire) != u32::MAX
     }
 
     pub(crate) fn release_isolate_if_tip(&self, tip: u32) {
         let until = self.force_single_until.load(Ordering::Acquire);
         if until != u32::MAX && tip >= until {
-            self.force_single.store(false, Ordering::Release);
             self.force_single_until.store(u32::MAX, Ordering::Release);
         }
     }
@@ -321,7 +316,6 @@ impl ConfirmFeed {
         g.inflight.clear();
         drop(g);
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.force_single.store(false, Ordering::Release);
         self.force_single_until.store(u32::MAX, Ordering::Release);
         self.cv.notify_all();
     }
