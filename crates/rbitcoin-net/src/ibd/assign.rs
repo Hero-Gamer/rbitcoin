@@ -669,9 +669,7 @@ pub(crate) fn first_pre_hole(
     };
     let hi = path_lo.saturating_add(max.saturating_sub(1) as u32);
     for ht in path_lo..=hi {
-        let Some(&hash) = st.height_to_hash.get(&ht) else {
-            return None;
-        };
+        let &hash = st.height_to_hash.get(&ht)?;
         if st.body.is_rejected(&hash) {
             continue;
         }
