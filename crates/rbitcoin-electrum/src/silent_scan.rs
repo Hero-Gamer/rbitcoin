@@ -192,5 +192,49 @@ mod tests {
         assert!(too.contains("too many"), "{too}");
         let r = subscribe_result(&sub);
         assert_eq!(r["start_height"], 12);
+        let plain = parse_sub(
+            &json!([scan, spend, "12", ["x", 2]]),
+            Network::Regtest,
+            Some(20),
+        )
+        .unwrap();
+        assert_eq!(plain.start, 12);
+        assert_eq!(plain.labels, vec![0, 2]);
+        let bool_start = parse_sub(&json!([scan, spend, true]), Network::Regtest, Some(0)).unwrap();
+        assert_eq!(bool_start.start, 0);
+    }
+
+    #[test]
+    fn tx_matches_bip352_simple_send() {
+        let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+        let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+        let sub = parse_sub(&json!([scan, spend, 0, [0, 1]]), Network::Regtest, Some(0)).unwrap();
+        let tweak =
+            hex_decode("024ac253c216532e961988e2a8ce266a447c894c781e52ef6cee902361db960004")
+                .unwrap();
+        let xonly =
+            hex_decode("3e9fce73d4e77a4809908e3c3a2e54ee147b9312dc5044a193d1fc85de46e3c1").unwrap();
+        let mut tw33 = [0u8; 33];
+        tw33.copy_from_slice(&tweak);
+        let mut x32 = [0u8; 32];
+        x32.copy_from_slice(&xonly);
+        let hit = rbitcoin_consensus::TxTweak {
+            tweak: tw33,
+            output_pubkeys: vec![rbitcoin_consensus::TaprootOut {
+                vout: 0,
+                xonly: x32,
+                value: 1,
+            }],
+        };
+        assert!(tx_matches(&sub, &hit));
+        let miss = rbitcoin_consensus::TxTweak {
+            tweak: tw33,
+            output_pubkeys: vec![rbitcoin_consensus::TaprootOut {
+                vout: 0,
+                xonly: [0u8; 32],
+                value: 1,
+            }],
+        };
+        assert!(!tx_matches(&sub, &miss));
     }
 }

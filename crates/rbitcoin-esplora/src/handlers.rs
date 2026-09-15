@@ -1357,7 +1357,7 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
 
 #[cfg(test)]
 mod pure_helper_tests {
-    use super::{block_summary_json, outspend_json, resolve_address_sh};
+    use super::{block_summary_json, outspend_json, resolve_address_sh, sat_vb_for_target};
     use bitcoin::Network;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::testutil::FixtureChain;
@@ -1404,6 +1404,14 @@ mod pure_helper_tests {
         };
         let _ = q.connect_block(Height(0), &header, &[ta]).unwrap();
         hash
+    }
+
+    #[test]
+    fn sat_vb_for_target_negative_positive_and_missing() {
+        assert_eq!(sat_vb_for_target(&[], 1), 1);
+        assert_eq!(sat_vb_for_target(&[(1, -1.0)], 1), 1);
+        assert_eq!(sat_vb_for_target(&[(1, 0.00002)], 1), 2);
+        assert_eq!(sat_vb_for_target(&[(6, 0.00005)], 1), 1);
     }
 
     #[test]
