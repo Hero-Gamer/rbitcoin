@@ -1662,7 +1662,7 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
 #[test]
 fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(103)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(105)]).unwrap();
     pin_sendraw_maxfeerate_at_default_and_one_sat_over(&ctx);
     let (hex, spend) = spend_generated_coinbase(&ctx, 3, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
@@ -1716,7 +1716,81 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
         &modest.compute_txid().to_string(),
         "{ok99}"
     );
+    pin_maxfeerate_json_shapes(&ctx);
+    let cb5 = generated_coinbase_value(&ctx, 5);
+    let (str_hex, str_tx) =
+        spend_generated_coinbase(&ctx, 5, cb5 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let ok_str = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(str_hex), json!("99999")],
+    )
+    .unwrap();
+    assert_eq!(
+        ok_str.as_str().unwrap(),
+        &str_tx.compute_txid().to_string(),
+        "{ok_str}"
+    );
+    let (huge_hex, _) = spend_generated_coinbase(&ctx, 6, 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let pkg_fee = dispatch(&ctx, "submitpackage", vec![json!([huge_hex])]).unwrap();
+    assert_eq!(pkg_fee["package_msg"], "transaction failed", "{pkg_fee}");
+    let fee_err = pkg_fee["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .and_then(|v| v["error"].as_str())
+        .unwrap_or("");
+    assert_eq!(fee_err, "max-fee-exceeded", "{pkg_fee}");
+    use bitcoin::consensus::encode::serialize;
+    let modest_again = hex_encode(serialize(&modest));
+    let again = dispatch(&ctx, "submitpackage", vec![json!([modest_again])]).unwrap();
+    assert_eq!(again["package_msg"], "success", "{again}");
+    let row = again["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .cloned()
+        .unwrap_or(json!(null));
+    assert!(row.get("error").is_none(), "already-in-mempool: {again}");
+    assert_eq!(
+        row["txid"].as_str().unwrap(),
+        &modest.compute_txid().to_string(),
+        "{again}"
+    );
+    assert!(
+        row.get("vsize").is_none() && row.get("fees").is_none(),
+        "already-known package row is txid-only: {again}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
+    for (v, code, msg) in [
+        (json!(-1), ERR_INVALID_PARAMETER, "Amount out of range"),
+        (json!("-2"), ERR_INVALID_PARAMETER, "Amount out of range"),
+        (
+            json!(1.5),
+            ERR_INVALID_PARAMETER,
+            "maxfeerate must be an integer sat/vB",
+        ),
+        (
+            json!("nope"),
+            ERR_INVALID_PARAMETER,
+            "maxfeerate must be an integer sat/vB",
+        ),
+        (
+            json!(true),
+            ERR_TYPE_ERROR,
+            "maxfeerate is not a number or string",
+        ),
+        (
+            json!([]),
+            ERR_TYPE_ERROR,
+            "maxfeerate is not a number or string",
+        ),
+    ] {
+        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v]).unwrap_err();
+        assert_eq!(e["code"], code, "{e}");
+        assert_eq!(e["message"], msg, "{e}");
+    }
 }
 
 #[test]
@@ -1749,6 +1823,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
             .contains("maxburnamount"),
         "amount−1 sat must reject: {short}"
     );
+    pin_maxburn_json_shapes(&ctx, &hex);
     let pkg = dispatch(&ctx, "submitpackage", vec![json!([hex.clone()])]).unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
     let err = pkg["tx-results"]
@@ -1774,6 +1849,81 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     .unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
+    let n0 = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": 0
+        })),
+    )
+    .unwrap_err();
+    assert!(
+        n0["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "numeric 0 BTC must still cap burn: {n0}"
+    );
+    let flt = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": 0.0
+        })),
+    )
+    .unwrap_err();
+    assert!(
+        flt["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "float 0.0 BTC must still cap burn: {flt}"
+    );
+    let neg = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": -1
+        })),
+    )
+    .unwrap_err();
+    assert_eq!(neg["code"], ERR_INVALID_PARAMETER, "{neg}");
+    assert_eq!(neg["message"], "Amount out of range", "{neg}");
+    let typ = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": true
+        })),
+    )
+    .unwrap_err();
+    assert_eq!(typ["code"], ERR_TYPE_ERROR, "{typ}");
+    assert_eq!(typ["message"], "Amount is not a number or string", "{typ}");
+    for bad in [json!(""), json!("0.000000001"), json!("x.0")] {
+        let e = dispatch(
+            ctx,
+            "sendrawtransaction",
+            named(json!({
+                "hexstring": hex,
+                "maxfeerate": 0,
+                "maxburnamount": bad
+            })),
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{e}");
+        assert_eq!(e["message"], "Invalid amount", "{e}");
+    }
 }
 
 #[test]
