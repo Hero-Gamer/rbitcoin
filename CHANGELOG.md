@@ -18,6 +18,12 @@ before 1.0).
 
 ### Added
 
+- **RPC exact `maxfeerate` / `maxburnamount` + scantxoutset arms:**
+  `sendrawtransaction` at default 0.10 BTC/kvB accepts; one sat over is
+  `max-fee-exceeded`; `maxfeerate=0` still admits the huge-fee tx.
+  `maxburnamount` equal to the OP_RETURN sat accepts; amount−1 rejects.
+  `scantxoutset` `abort` / `status` / empty scanobjects / unknown action.
+
 - **Process Esplora `/blocks` paging + one WS:** `esplora_broadcast_visible_in_rpc_and_electrum`
   `GET /blocks` is 10 newest; `/blocks/0` is genesis-only; `/blocks/:tip`
   starts at the tip. `/block/:hash/txs/25` last page is shorter than 25;

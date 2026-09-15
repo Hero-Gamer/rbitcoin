@@ -1421,6 +1421,27 @@ fn miniwallet_raw_scan_and_gettxout() {
     let waited = dispatch(&ctx, "waitforblockheight", vec![json!(2), json!(100)]).unwrap();
     assert_eq!(waited["height"], 2);
 
+    assert_eq!(
+        dispatch(&ctx, "scantxoutset", vec![json!("status")]).unwrap(),
+        Value::Null
+    );
+    assert_eq!(
+        dispatch(&ctx, "scantxoutset", vec![json!("abort")]).unwrap(),
+        json!(false)
+    );
+    let empty = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([])]).unwrap();
+    assert_eq!(empty["success"], true);
+    assert_eq!(empty["unspents"].as_array().unwrap().len(), 0, "{empty}");
+    let unknown = dispatch(&ctx, "scantxoutset", vec![json!("nope")]).unwrap_err();
+    assert_eq!(unknown["code"], ERR_INVALID_PARAMETER);
+    assert!(
+        unknown["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Invalid action"),
+        "{unknown}"
+    );
+
     let idx = dispatch(&ctx, "getindexinfo", vec![]).unwrap();
     assert_eq!(idx["txindex"]["synced"], true);
     assert_eq!(idx["txindex"]["best_block_height"], 2);
@@ -1548,13 +1569,22 @@ fn mature_coinbase_spend(
     keep_sat: u64,
     script: ScriptBuf,
 ) -> (String, Transaction) {
+    dispatch(ctx, "generate", vec![json!(101)]).unwrap();
+    spend_generated_coinbase(ctx, 1, keep_sat, script)
+}
+
+fn spend_generated_coinbase(
+    ctx: &RpcContext,
+    height: u32,
+    keep_sat: u64,
+    script: ScriptBuf,
+) -> (String, Transaction) {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    dispatch(ctx, "generate", vec![json!(101)]).unwrap();
-    let hash1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
-    let blk = dispatch(ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+    let hash = dispatch(ctx, "getblockhash", vec![json!(height)]).unwrap();
+    let blk = dispatch(ctx, "getblock", vec![hash, json!(2)]).unwrap();
     let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
     let spend = Transaction {
         version: TxVersion::TWO,
@@ -1580,10 +1610,42 @@ fn mature_coinbase_spend_hex(ctx: &RpcContext, keep_sat: u64) -> (String, Transa
     mature_coinbase_spend(ctx, keep_sat, ScriptBuf::from_bytes(vec![0x51]))
 }
 
+fn generated_coinbase_value(ctx: &RpcContext, height: u32) -> u64 {
+    let hash = dispatch(ctx, "getblockhash", vec![json!(height)]).unwrap();
+    let blk = dispatch(ctx, "getblock", vec![hash, json!(2)]).unwrap();
+    (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64
+}
+
+fn default_max_raw_fee_sat(weight: u64) -> u64 {
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
+    10_000_000u64.saturating_mul(vsize) / 1000
+}
+
+fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
+    let cb = generated_coinbase_value(ctx, 1);
+    let probe = spend_generated_coinbase(ctx, 1, cb - 1, ScriptBuf::from_bytes(vec![0x51])).1;
+    let max_fee = default_max_raw_fee_sat(probe.weight().to_wu());
+    assert!(max_fee > 0 && max_fee + 1 < cb, "max_fee={max_fee} cb={cb}");
+    let (at_hex, _) =
+        spend_generated_coinbase(ctx, 1, cb - max_fee, ScriptBuf::from_bytes(vec![0x51]));
+    let ok = dispatch(ctx, "sendrawtransaction", vec![json!(at_hex)]).unwrap();
+    assert!(
+        ok.as_str().is_some(),
+        "exact 0.10 BTC/kvB must accept: {ok}"
+    );
+    let (over_hex, _) =
+        spend_generated_coinbase(ctx, 2, cb - max_fee - 1, ScriptBuf::from_bytes(vec![0x51]));
+    let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
+    assert_eq!(e["message"], "max-fee-exceeded", "{e}");
+}
+
 #[test]
 fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (hex, spend) = mature_coinbase_spend_hex(&ctx, 1_000);
+    dispatch(&ctx, "generate", vec![json!(103)]).unwrap();
+    pin_sendraw_maxfeerate_at_default_and_one_sat_over(&ctx);
+    let (hex, spend) = spend_generated_coinbase(&ctx, 3, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
     assert!(
         e["message"]
@@ -1625,11 +1687,8 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
 #[test]
 fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (hex, spend) = mature_coinbase_spend(
-        &ctx,
-        50_0000_0000 - 1_000,
-        ScriptBuf::from_bytes(vec![0x6a]),
-    );
+    let burn = 1_000u64;
+    let (hex, spend) = mature_coinbase_spend(&ctx, burn, ScriptBuf::from_bytes(vec![0x6a]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
     assert!(
         e["message"]
@@ -1637,6 +1696,23 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
             .unwrap_or("")
             .contains("maxburnamount"),
         "{e}"
+    );
+    let short = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": "0.00000999"
+        })),
+    )
+    .unwrap_err();
+    assert!(
+        short["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "amount−1 sat must reject: {short}"
     );
     let pkg = dispatch(&ctx, "submitpackage", vec![json!([hex.clone()])]).unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
@@ -1657,7 +1733,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
         named(json!({
             "hexstring": hex,
             "maxfeerate": 0,
-            "maxburnamount": 50
+            "maxburnamount": "0.00001000"
         })),
     )
     .unwrap();
