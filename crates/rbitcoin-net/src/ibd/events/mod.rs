@@ -471,11 +471,13 @@ pub(crate) fn apply_peer_event(
                     s.first_data_ms,
                     Instant::now(),
                 );
-                if let Some(bps) = s.rate.bps() {
-                    let first = s.first_data_ms;
-                    let lat = first.saturating_sub(s.connected_ms);
-                    peer_book.note_speed(s.addr, lat, bps);
-                }
+                let lat = s.first_data_ms.saturating_sub(s.connected_ms);
+                peer_book.apply_ibd_dead_speed(
+                    s.addr,
+                    lat,
+                    s.rate.bps(),
+                    st.addr_cooldown.contains_key(&s.addr),
+                );
             }
             release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
         }
