@@ -217,7 +217,7 @@ pub struct NodeConfig {
     pub block_version: Option<i32>,
     /// Core `-blockmintxfee` as BTC/kvB text (`None` = default 1 sat/kvB).
     pub block_min_tx_fee_btc: Option<String>,
-    /// Opt-in BIP152 extra compact-block prefill (default **off**).
+    /// BIP152 extra compact-block prefill (default **on**; `--prefillcompact=0` disables).
     pub prefill_compact: bool,
 }
 
@@ -257,7 +257,7 @@ impl Default for NodeConfig {
             max_tip_age_secs: None,
             block_version: None,
             block_min_tx_fee_btc: None,
-            prefill_compact: false,
+            prefill_compact: true,
         }
     }
 }
@@ -953,13 +953,8 @@ mod tests {
     }
 
     #[test]
-    fn prefillcompact_cli_conf_default_off() {
+    fn prefillcompact_cli_conf_default_on() {
         let mut c = NodeConfig::default();
-        assert!(!c.prefill_compact);
-        assert_eq!(
-            c.apply_kv("prefillcompact", "1").unwrap(),
-            ConfApply::Applied
-        );
         assert!(c.prefill_compact);
         assert_eq!(
             c.apply_kv("prefillcompact", "0").unwrap(),
@@ -967,10 +962,15 @@ mod tests {
         );
         assert!(!c.prefill_compact);
         assert_eq!(
-            c.apply_kv("prefill_compact", "1").unwrap(),
+            c.apply_kv("prefillcompact", "1").unwrap(),
             ConfApply::Applied
         );
         assert!(c.prefill_compact);
+        assert_eq!(
+            c.apply_kv("prefill_compact", "0").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(!c.prefill_compact);
     }
 
     #[test]
@@ -1453,7 +1453,7 @@ mod tests {
         let plain = NodeConfig::default();
         assert!(plain.mempool.persist);
         assert!(!plain.mempool.blocksonly);
-        assert!(!plain.prefill_compact);
+        assert!(plain.prefill_compact);
         assert!(plain.test_activation_heights.is_empty());
         assert_eq!(
             NodeConfig {

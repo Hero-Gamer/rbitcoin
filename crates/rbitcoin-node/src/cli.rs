@@ -46,7 +46,7 @@ where
     [--maxoutbound|--max-outbound N] [--maxinbound N] [--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
     [--testactivationheight name@height] [--persistmempool[=0|1]] [--whitelist SPEC] \\\n\
-    [--blocksonly] [--prefillcompact] [--minrelaytxfee BTC] \\\n\
+    [--blocksonly] [--prefillcompact[=0|1]] [--minrelaytxfee BTC] \\\n\
     [--limitclustercount N] [--limitclustersize KVB] [--peertimeout SECS] \\\n\
     [--externalip IP] \\\n\
     [--minimumchainwork HEX] \\\n\
@@ -447,6 +447,18 @@ mod tests {
             Ok(OperatorArgs::Ready { config, .. }) => config,
             other => panic!("expected assembled config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prefillcompact_omitted_is_on_zero_disables() {
+        let omitted = ready_config(["rbitcoin-node"]);
+        assert!(omitted.prefill_compact);
+        let off = ready_config(["rbitcoin-node", "--prefillcompact=0"]);
+        assert!(!off.prefill_compact);
+        let on = ready_config(["rbitcoin-node", "--prefillcompact"]);
+        assert!(on.prefill_compact);
+        let on_eq = ready_config(["rbitcoin-node", "--prefillcompact=1"]);
+        assert!(on_eq.prefill_compact);
     }
 
     #[test]

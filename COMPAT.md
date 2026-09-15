@@ -47,7 +47,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Mempool structure | Cluster graph + chunks | Cluster mempool (same lineage) |
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
-| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve. Fill is live mempool + orphanage + `extra_compact` (cap 100). Outbound extra prefill is **off** unless `--prefillcompact` (10 KiB cap, extra-pool last) | v1/v2 high-bandwidth + `extra_txn` cache (`-blockreconstructionextratxn`); Core #35558 prefill still unmerged |
+| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve. Fill is live mempool + orphanage + `extra_compact` (cap 100). Outbound extra prefill is **on** unless `--prefillcompact=0` (10 KiB cap, extra-pool last) | v1/v2 high-bandwidth + `extra_txn` cache (`-blockreconstructionextratxn`); Core #35558 prefill still unmerged |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | GetAddr | Core `MAX_ADDR_TO_SEND` / `MAX_PCT_ADDR_TO_SEND` (**1000** / **23%**), 24h per-bind cache. Named copies in `rbitcoin-net` — do not “improve” without a named reason to diverge. `MAX_ADDR_MAN` (8192) is **our** HashMap DoS cap and must stay above `1000/0.23` | Core new/tried buckets (~80k); same 1000 / 23% |
 | Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
@@ -68,7 +68,7 @@ shape is worth later; not scheduled (no Open Q-id).
 
 Inbound `cmpctblock` may prefill any well-formed indexes (BIP152). We always
 log reconstruct fill sources and `fetched=` `blocktxn` bytes. **Sending** extra
-prefills (beyond coinbase) is off unless `--prefillcompact`.
+prefills (beyond coinbase) is on unless `--prefillcompact=0`.
 
 ## Core-class JSON-RPC (subset)
 

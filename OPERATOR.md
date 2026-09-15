@@ -378,7 +378,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--minrelaytxfee BTC` | same | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempoolexpiry HOURS` | same | unset — hub default; min 1 |
 | `--blocksonly` | same | off |
-| `--prefillcompact` | conf `prefillcompact=` | **off** — extra BIP152 compact prefills (10 KiB cap) |
+| `--prefillcompact[=0\|1]` | conf `prefillcompact=` | **on** — extra BIP152 compact prefills (10 KiB cap); `=0` disables |
 | `--persistmempool[=0\|1]` | same | on |
 | `--whitelist SPEC` | same | empty |
 | `--limitclustercount N` | same | unset — hub default |
@@ -738,7 +738,7 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
 - **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool/orphan/`extra_compact` short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
-  Outbound extra prefill (beyond coinbase) is **off** unless `--prefillcompact`.
+  Outbound extra prefill (beyond coinbase) is **on** unless `--prefillcompact=0`.
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
