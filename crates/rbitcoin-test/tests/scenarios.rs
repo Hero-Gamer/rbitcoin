@@ -25,6 +25,59 @@ fn exit_success(c: ExitCode) -> bool {
     format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
 }
 
+fn pin_conf_unknown_key_and_peertimeout(td: &TestDatadir) {
+    let unknown_dir = td.path().join("from-conf-unknown");
+    std::fs::create_dir_all(&unknown_dir).unwrap();
+    let unknown_conf = unknown_dir.join("rbitcoin.conf");
+    std::fs::write(&unknown_conf, "network=regtest\nunknown_key=1\n").unwrap();
+    assert!(
+        exit_success(node_cli_main([
+            "rbitcoin-node",
+            "--datadir",
+            unknown_dir.join("data").to_str().unwrap(),
+            "--conf",
+            unknown_conf.to_str().unwrap(),
+            "--smoke",
+        ])),
+        "unknown conf key must be ignored"
+    );
+
+    for (name, body) in [
+        ("minrelay-neg", "network=regtest\nminrelaytxfee=-1\n"),
+        ("network-nope", "network=nope\n"),
+    ] {
+        let d = td.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("rbitcoin.conf");
+        std::fs::write(&p, body).unwrap();
+        assert!(
+            !exit_success(node_cli_main([
+                "rbitcoin-node",
+                "--datadir",
+                d.join("data").to_str().unwrap(),
+                "--conf",
+                p.to_str().unwrap(),
+                "--smoke",
+            ])),
+            "{name} must fail start"
+        );
+    }
+
+    assert!(
+        exit_success(node_cli_main([
+            "rbitcoin-node",
+            "--datadir",
+            td.path().join("peertimeout-one").to_str().unwrap(),
+            "--network",
+            "regtest",
+            "--peertimeout",
+            "1",
+            "--smoke",
+        ])),
+        "--peertimeout=1 must smoke"
+    );
+}
+
 // ─── Lifecycle / CLI / surface smoke (collapsed) ────────────────────────────
 
 #[allow(clippy::cognitive_complexity)] // one fixture, many CLI/surface arms
@@ -285,6 +338,7 @@ fn node_cli_and_surface_smoke() {
         "0",
         "--smoke",
     ])));
+    pin_conf_unknown_key_and_peertimeout(&td);
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "a", "b"])));
 
     // Serialize process-wide env mutation (parallel `cargo test` races).

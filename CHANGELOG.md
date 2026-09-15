@@ -18,6 +18,11 @@ before 1.0).
 
 ### Added
 
+- **CLI unknown conf key + `--peertimeout=1`:** `node_cli_and_surface_smoke`
+  `--conf` with `unknown_key=1` still `--smoke`s. Conf `minrelaytxfee=-1`
+  and `network=nope` fail start. `--peertimeout=1` smokes; `0` still
+  InitError. Conf parse guts stay.
+
 - **Mempool leftover `slots.tmp`:** `analog_milestone_and_mempool_persist`
   plants leftover `slots.tmp` after a clean flush; `MempoolHub` open
   finishes the rename and live count matches. Truncated `tx.body` vs

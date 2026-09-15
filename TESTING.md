@@ -260,7 +260,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 
 | ID | Layer | Description |
 |----|-------|-------------|
-| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peertimeout=0`, log-level/mempool/electrum/inhibit), help/version. Signet: genesis header plus height-1 BIP325 connect |
+| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peertimeout=0` refuse / `=1` smoke, unknown conf key ignored, `minrelaytxfee=-1` and `network=nope` conf fail), help/version. Signet: genesis header plus height-1 BIP325 connect |
 | `three_stage_confirm_and_parent_pin_surface` | Consensus+query | Split load→scripts→write; parent pin; load ready timeout/cancel; instance-owned `last_write` / `last_pin` / `take_window` meters |
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. `DEFAULT_BODY_DEPTH == 16` stays a unit. |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
