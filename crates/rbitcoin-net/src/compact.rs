@@ -465,6 +465,12 @@ pub fn prefill_indexes(block: &Block, fill: &CmpctFillSets) -> Vec<usize> {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefillPlan {
+    pub hash: BlockHash,
+    pub indexes: Vec<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

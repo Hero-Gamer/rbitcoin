@@ -1738,6 +1738,11 @@ fn log_cmpct_filled(hub: &ChainHub, hsi: &HeaderAndShortIds, block: &Block, fetc
         .unwrap_or_default();
     let stats = crate::compact::reconstruct_stats(hsi, block, &fill, fetched);
     rbitcoin_log::info!("{stats}");
+    hub.remember_cmpct_prefill(
+        block.block_hash(),
+        block.header.prev_blockhash,
+        crate::compact::prefill_indexes(block, &fill),
+    );
 }
 
 fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {

@@ -268,6 +268,8 @@ pub struct ChainHub {
     mining: MiningKnobs,
     /// Core `-maxtipage` seconds. Default 24h.
     max_tip_age_secs: AtomicU64,
+    prefill_compact: AtomicBool,
+    prefill_plan: std::sync::Mutex<Option<crate::compact::PrefillPlan>>,
     /// Block hashes we already issued getdata for (any peer).
     asked_blocks: RwLock<HashSet<BlockHash>>,
     /// `prefix[h] = work through height h` on the best chain. Process cache;
@@ -318,6 +320,8 @@ impl ChainHub {
             minimum_chain_work: RwLock::new(None),
             mining: MiningKnobs::new(),
             max_tip_age_secs: AtomicU64::new(DEFAULT_MAX_TIP_AGE_SECS),
+            prefill_compact: AtomicBool::new(false),
+            prefill_plan: std::sync::Mutex::new(None),
             asked_blocks: RwLock::new(HashSet::new()),
             chain_work_prefix: RwLock::new(Vec::new()),
             finished_ibd: AtomicBool::new(false),
@@ -385,6 +389,35 @@ impl ChainHub {
 
     pub fn max_tip_age_secs(&self) -> u64 {
         self.max_tip_age_secs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_prefill_compact(&self, on: bool) {
+        self.prefill_compact.store(on, Ordering::Relaxed);
+    }
+
+    pub fn prefill_compact(&self) -> bool {
+        self.prefill_compact.load(Ordering::Relaxed)
+    }
+
+    pub fn remember_cmpct_prefill(&self, hash: BlockHash, prev: BlockHash, indexes: Vec<usize>) {
+        if !self.prefill_compact() {
+            return;
+        }
+        if self.tip_hash() != Some(prev) {
+            return;
+        }
+        *self.prefill_plan.lock().expect("prefill plan") =
+            Some(crate::compact::PrefillPlan { hash, indexes });
+    }
+
+    pub fn cmpct_prefill_indexes(&self, hash: &BlockHash) -> Option<Vec<usize>> {
+        if !self.prefill_compact() {
+            return None;
+        }
+        let g = self.prefill_plan.lock().expect("prefill plan");
+        g.as_ref()
+            .filter(|p| p.hash == *hash)
+            .map(|p| p.indexes.clone())
     }
 
     /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
@@ -2705,6 +2738,40 @@ mod tests {
 
     fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
         super::tiny_regtest_hub_labeled("chain")
+    }
+
+    #[test]
+    fn reconstruct_prefill_plan_requires_knob_and_tip_child() {
+        let (_dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let tip = hub.tip_hash().expect("genesis");
+        let child = BlockHash::from_byte_array([2; 32]);
+        hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
+        assert!(
+            hub.cmpct_prefill_indexes(&child).is_none(),
+            "default knob off stores nothing"
+        );
+        hub.set_prefill_compact(true);
+        hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
+        assert_eq!(hub.cmpct_prefill_indexes(&child), Some(vec![0, 1]));
+        hub.remember_cmpct_prefill(child, BlockHash::from_byte_array([3; 32]), vec![0, 2]);
+        assert_eq!(
+            hub.cmpct_prefill_indexes(&child),
+            Some(vec![0, 1]),
+            "non tip-child must not replace"
+        );
+        hub.set_prefill_compact(false);
+        hub.remember_cmpct_prefill(child, tip, vec![0, 9]);
+        assert!(
+            hub.cmpct_prefill_indexes(&child).is_none(),
+            "knob off hides the plan"
+        );
+        hub.set_prefill_compact(true);
+        assert_eq!(
+            hub.cmpct_prefill_indexes(&child),
+            Some(vec![0, 1]),
+            "off remember must not overwrite"
+        );
     }
 
     fn coinbase(height: u32) -> Transaction {
