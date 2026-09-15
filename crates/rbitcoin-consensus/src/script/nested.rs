@@ -98,7 +98,7 @@ pub(crate) fn verify_p2sh_legacy(
     Ok(())
 }
 
-/// Core `CScript::IsPushOnly`: every opcode ≤ OP_16 (includes OP_1NEGATE / OP_RESERVED).
+/// Push-only: every opcode ≤ OP_16 (includes OP_1NEGATE / OP_RESERVED).
 fn script_is_push_only(script: &Script) -> bool {
     for ins in script.instructions() {
         match ins {

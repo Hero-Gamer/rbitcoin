@@ -34,6 +34,12 @@ before 1.0).
   after the switch is `--min-chain-work` + `--max-tip-age`; RPC
   `initialblockdownload` is the Core alias for that latch.
 
+- **Dialect:** crate/README/IBD text says **relational archive** / Class A/B/C /
+  densify (not “libbitcoin-class”). Production rustdoc states local invariants
+  instead of Core C++ field names. Script comments use BIP/rule language.
+  Disconnect score in P2P logs (not banlist). Native serve/cmpct lines use
+  `tx=` (not Hungarian `ntx=`).
+
 - **Coverage ratchet is merge-base, not tip of master:** PRs must not lower
   the **displayed 2-decimal** production LCOV percent vs the **highest**
   green-`master` snapshot whose SHA is an ancestor of

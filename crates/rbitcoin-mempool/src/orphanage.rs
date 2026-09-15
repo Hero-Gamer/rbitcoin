@@ -1,28 +1,22 @@
 //! Transaction orphanage for txs missing in-mempool / chain parents.
 //!
-//! Sized after Bitcoin Core's `TxOrphanage` defaults (master 2024+):
-//! - **404_000 weight reserved per peer** (`DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER`)
-//! - **Global usage** ≈ reserved × peer budget (we use a fixed ~25-peer budget →
-//!   **~10.1M weight** unique orphans — same order as Core with a modest announcer set)
-//! - **Latency/count** secondary bound (Core global latency score default **3000**;
-//!   we cap unique orphans at **1000** — between legacy 100-tx default and modern score)
-//! - Per-tx max **404_000 weight** (standard tx weight)
+//! Weight budget: 404_000 WU reserved per peer × 25-peer budget → ~10.1M WU
+//! unique orphans; unique-count cap 3000. Per-tx max 404_000 WU.
 //!
-//! Eviction: FIFO by insert order when over weight or count (simple DoS bound;
-//! Core picks DoSiest peer's oldest announcement — we are single-process).
+//! Eviction: FIFO by insert order when over weight or count.
 
 use bitcoin::{Transaction, Txid, Wtxid};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-/// Core `DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER`.
+/// Reserved orphan weight per peer.
 pub const ORPHAN_RESERVED_WEIGHT_PER_PEER: u64 = 404_000;
-/// Peer multiplier for a fixed global weight budget (Core scales by announcer peers).
+/// Peer multiplier for a fixed global weight budget.
 pub const ORPHAN_PEER_BUDGET: u64 = 25;
 /// Global unique orphan weight cap (404k × 25 ≈ 10.1M WU).
 pub const DEFAULT_ORPHAN_MAX_WEIGHT: u64 = ORPHAN_RESERVED_WEIGHT_PER_PEER * ORPHAN_PEER_BUDGET;
-/// Secondary unique-count cap (Core `DEFAULT_MAX_ORPHANAGE_LATENCY_SCORE` = 3000).
+/// Secondary unique-count cap.
 pub const DEFAULT_ORPHAN_MAX_COUNT: usize = 3_000;
-/// Core `MAX_STANDARD_TX_WEIGHT` — refuse larger orphans.
+/// Refuse orphans heavier than a standard tx.
 pub const MAX_ORPHAN_TX_WEIGHT: u64 = 404_000;
 
 #[derive(Debug, Clone)]

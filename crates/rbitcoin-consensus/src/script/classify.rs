@@ -18,12 +18,11 @@ pub(crate) enum ScriptKind {
     Bare,
 }
 
-/// Core anyone-can-spend templates only. **Empty** `scriptPubKey` is **not** ACS
-/// (EvalScript leaves empty stack → fail without TRUE). Only explicit `OP_TRUE`.
+/// Anyone-can-spend templates only. **Empty** `scriptPubKey` is **not** ACS
+/// (empty stack → fail without TRUE). Only explicit `OP_TRUE`.
 ///
-/// **Not** a short-circuit past `EvalScript(scriptSig)`: Core still runs the
-/// scriptSig (CLTV/CSV may live there). Callers must evaluate scriptSig first
-/// or use the bare path.
+/// **Not** a short-circuit past scriptSig: scriptSig still runs (CLTV/CSV may
+/// live there). Callers must evaluate scriptSig first or use the bare path.
 pub(crate) fn is_anyone_can_spend(script: &Script) -> bool {
     script.as_bytes() == [0x51]
 }

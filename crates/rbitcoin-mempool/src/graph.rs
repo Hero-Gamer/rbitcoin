@@ -1,18 +1,18 @@
 //! In-memory TxGraph: clusters, topo linearization, chunk bounds.
 //!
 //! Cluster = maximal connected component via in-mempool parent/child edges
-//! (spend of another mempool output). Limits match plan §3.2 / Core-class caps.
+//! (spend of another mempool output). Caps: 64 txs / 101 kvB (plan §3.2).
 
 use bitcoin::{OutPoint, Transaction, Txid, Wtxid};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Hard cap on txs in one cluster (Core `DEFAULT_CLUSTER_LIMIT` = 64).
+/// Hard cap on txs in one cluster.
 pub const MAX_CLUSTER_COUNT: usize = 64;
-/// Hard cap on total **virtual size** of one cluster (Core `DEFAULT_CLUSTER_SIZE_LIMIT_KVB` = 101).
+/// Hard cap on total **virtual size** of one cluster (101 kvB).
 ///
-/// Measured as Σ `get_virtual_size(weight)` over cluster members (= Core kvB limit in vbytes).
+/// Measured as Σ `get_virtual_size(weight)` over cluster members.
 pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
 /// Same limit as weight units: 101_000 vB × 4 WU/vB.
 ///
