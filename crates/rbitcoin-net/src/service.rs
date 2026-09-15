@@ -475,11 +475,15 @@ async fn prepare_outbound_session(
         }
     };
     let wants_addrv2 = provisional.wants_addrv2();
+    let wtxid_relay = provisional.wtxid_relay();
     peers.unregister(provisional_id);
     let sess = peers.register_with_id(provisional_id, peer, bind, &ver, false, typ);
     sess.mark_handshake_complete();
     if wants_addrv2 {
         sess.set_wants_addrv2();
+    }
+    if wtxid_relay {
+        sess.set_wtxid_relay();
     }
     sess.note_recv("version", 100);
     sess.note_recv("verack", 0);

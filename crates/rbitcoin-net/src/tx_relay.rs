@@ -2144,6 +2144,25 @@ impl MempoolHub {
         Some((out, fill))
     }
 
+    /// Best-effort extra-compact insert (ok to miss if a writer holds `inner`).
+    pub fn try_note_extra_compact(&self, tx: &Transaction) -> bool {
+        self.try_note_extra_compact_txs(std::iter::once(tx))
+    }
+
+    /// Best-effort extra-compact insert of compact-seen / `blocktxn` bodies.
+    pub fn try_note_extra_compact_txs<'a>(
+        &self,
+        txs: impl IntoIterator<Item = &'a Transaction>,
+    ) -> bool {
+        let Ok(mut g) = self.inner.try_write() else {
+            return false;
+        };
+        for tx in txs {
+            g.remember_extra_compact(tx);
+        }
+        true
+    }
+
     /// Wtxid membership of `txs` in live graph / extra-compact / orphanage.
     ///
     /// `None` if a writer holds `inner`.
@@ -3293,6 +3312,47 @@ mod tests {
         assert!(
             pref.orphan.contains(&w),
             "prefill wtxids classified in the same read as clone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn try_note_extra_compact_fills_shortid() {
+        use bitcoin::bip152::ShortId;
+        use bitcoin::hashes::Hash;
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([8u8; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(hub.try_note_extra_compact(&tx));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let nonce = 3u64;
+        let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
+        let sid = ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys);
+        let (_map, fill) = hub
+            .try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[])
+            .expect("avail");
+        assert!(
+            fill.extra.contains(&tx.compute_wtxid()),
+            "compact-seen extra must fill short-ids"
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);

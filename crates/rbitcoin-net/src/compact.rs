@@ -373,6 +373,13 @@ fn tx_wire_len(tx: &Transaction) -> usize {
     tx.total_size()
 }
 
+/// Operator line for an outbound `cmpctblock` (announce or getdata serve).
+pub fn cmpct_send_line(hash: BlockHash, ntx: usize, hsi: &HeaderAndShortIds) -> String {
+    let prefill_n = hsi.prefilled_txs.len();
+    let prefill_bytes: usize = hsi.prefilled_txs.iter().map(|p| tx_wire_len(&p.tx)).sum();
+    format!("cmpct announce {hash} ntx={ntx} prefill={prefill_n}/{prefill_bytes}")
+}
+
 /// Fallback to full `getdata` after compact reconstruct failed.
 pub fn reconstruct_getdata_stats(hash: BlockHash, missing_n: usize) -> CmpctReconstructStats {
     CmpctReconstructStats {
@@ -1121,6 +1128,22 @@ mod tests {
         assert_eq!(
             stats.to_string(),
             format!("cmpct reconstruct {hash} getdata missing=3 fetched=0/0")
+        );
+    }
+
+    #[test]
+    fn cmpct_send_line_counts_prefill_bodies() {
+        let b1 = spend(14);
+        let block = sealed_block(vec![coinbase(), b1.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 9, 2, &[0, 1]).unwrap();
+        let line = cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi);
+        let pref_bytes = tx_wire_len(&block.txdata[0]) + tx_wire_len(&b1);
+        assert_eq!(
+            line,
+            format!(
+                "cmpct announce {} ntx=2 prefill=2/{pref_bytes}",
+                block.block_hash()
+            )
         );
     }
 

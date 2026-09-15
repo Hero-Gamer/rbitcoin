@@ -1158,6 +1158,7 @@ impl ActiveMempool {
             .get(txid)
             .cloned()
             .ok_or(AcceptError::Durable("body missing".into()))?;
+        self.remember_extra_compact(&tx);
         self.store.mark_slot_dead(entry.slot)?;
         self.graph.remove(txid, &tx);
         self.bodies.remove(txid);
@@ -1267,6 +1268,11 @@ impl ActiveMempool {
         self.extra_compact.iter().map(|(_, tx)| tx)
     }
 
+    /// Recently seen body for BIP152 extra fill (compact prefill / blocktxn / strip).
+    pub fn remember_extra_compact(&mut self, tx: &Transaction) {
+        self.note_extra(tx);
+    }
+
     pub fn accept_failure_record(tx: &Transaction, e: &AcceptError) -> Option<AcceptFailureRecord> {
         match e {
             AcceptError::InputsDuplicate | AcceptError::Coinbase => {
@@ -1301,6 +1307,9 @@ impl ActiveMempool {
     }
 
     fn note_extra(&mut self, tx: &Transaction) {
+        if tx.is_coinbase() {
+            return;
+        }
         let txid = tx.compute_txid();
         self.extra_compact.retain(|(id, _)| *id != txid);
         if self.extra_compact.len() >= EXTRA_COMPACT_CAP {
@@ -2896,6 +2905,59 @@ mod tests {
             !mp.graph.contains(&child_id),
             "spenders of the parent must leave with it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_txid_notes_extra_compact() {
+        let dir = tmp_dir();
+        let (op, txout, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let tx = spend_tx(op, txout.value.to_sat() - 1_000);
+        let txid = tx.compute_txid();
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+        mp.remove_txid(&txid).unwrap();
+        assert!(
+            mp.extra_compact_txs().any(|t| t.compute_txid() == txid),
+            "confirm/evict strip must keep the body for compact fill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_extra_compact_skips_coinbase() {
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let cb = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(cb.is_coinbase());
+        mp.remember_extra_compact(&cb);
+        assert_eq!(
+            mp.extra_compact_txs().count(),
+            0,
+            "coinbase prefill must not consume extra_compact"
+        );
+        let spend = spend_tx(
+            OutPoint {
+                txid: Txid::from_byte_array([0x11; 32]),
+                vout: 0,
+            },
+            1_000,
+        );
+        mp.remember_extra_compact(&spend);
+        assert_eq!(mp.extra_compact_txs().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

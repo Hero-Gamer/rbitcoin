@@ -242,6 +242,8 @@ pub struct LivePeer {
     v2_transport_ready: AtomicBool,
     /// Peer sent BIP155 `sendaddrv2` (use `addrv2` for self-announce / GETADDR).
     wants_addrv2: AtomicBool,
+    /// Peer sent BIP339 `wtxidrelay` (handshake, before VERACK).
+    wtxid_relay: AtomicBool,
     /// Next self-announce unix seconds (`0` = never sent).
     next_local_addr_send: AtomicU64,
 }
@@ -351,6 +353,14 @@ impl LivePeer {
 
     pub fn wants_addrv2(&self) -> bool {
         self.wants_addrv2.load(Ordering::Relaxed)
+    }
+
+    pub fn set_wtxid_relay(&self) {
+        self.wtxid_relay.store(true, Ordering::Relaxed);
+    }
+
+    pub fn wtxid_relay(&self) -> bool {
+        self.wtxid_relay.load(Ordering::Relaxed)
     }
 
     /// Core `MaybeSendAddr` local-address timer (`AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL`).
@@ -1577,6 +1587,7 @@ impl PeerHub {
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
+            wtxid_relay: AtomicBool::new(false),
             next_local_addr_send: AtomicU64::new(0),
         });
         self.live
