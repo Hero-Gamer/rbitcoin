@@ -3,8 +3,8 @@
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
 //!   request missing hashes (even if soft body-queue depth is over free floor).
-//!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] immediately — confirm is
-//!   frozen until tip+1 is claim-ready.
+//!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] on the shortest inflight
+//!   queues (then highest EWMA). Confirm is frozen until tip+1 is claim-ready.
 //! - **Densify** (tip+1 outward, closest first): fill missing heights up to
 //!   [`CONTIG_DENSIFY_AHEAD`]. Two soft assign limits (no hysteresis):
 //!   - BQ payload **≤ ~100 MiB** → usual densify ahead to the height horizon
@@ -689,9 +689,20 @@ fn demote_zombie_pending_for_fetch(
 /// Matches the absolute stall floor so slow-but-steady 64 KiB ticks stay live.
 const TIP_HOLE_RX_STALE: Duration = Duration::from_secs(30);
 
+/// Prefer peers at or below this inflight count for new tip-hole getdata.
+const TIP_HOLE_SHORT_QUEUE: usize = 2;
+
 fn peer_has_recent_rx(slot: &PeerSlot, now_ms: u64) -> bool {
     slot.rate
         .has_recent_rx(now_ms, TIP_HOLE_RX_STALE.as_millis() as u64)
+}
+
+fn peer_queue_len(slots: &[PeerSlot], pid: usize) -> usize {
+    slots
+        .iter()
+        .find(|s| s.id == pid)
+        .map(|s| s.in_flight.len())
+        .unwrap_or(usize::MAX)
 }
 
 /// Which current owner of a tip-hole hash to drop from **this hash** (not disconnect).
@@ -700,7 +711,11 @@ fn peer_has_recent_rx(slot: &PeerSlot, now_ms: u64) -> bool {
 /// - Some have recent rx, some do not → drop a no-rx owner (quick dead-racer).
 /// - All have recent rx → [`relative_slow_pick`] among those owners (`min_samples` =
 ///   owner count). Tight cluster → none.
-/// - Solo owner: drop only when no recent rx and inflight age ≥ [`TIP_HOLE_RX_STALE`].
+/// - Solo owner: drop when inflight age ≥ [`TIP_HOLE_RX_STALE`] and another
+///   alive peer exists. Peer-level 64 KiB ticks (densify FIFO) are not
+///   progress on this hash; getdata cannot be cancelled, so we stop
+///   counting that owner and race a short queue instead. One live peer
+///   stays so we do not drop the only remaining request.
 pub(crate) fn tip_hole_owner_to_drop(
     owners: &[usize],
     slots: &[PeerSlot],
@@ -724,10 +739,15 @@ pub(crate) fn tip_hole_owner_to_drop(
         }
     }
     if owners.len() == 1 {
+        let aged = Instant::now().duration_since(started_at) >= TIP_HOLE_RX_STALE;
+        let other_alive = slots.iter().filter(|s| s.alive).count() > 1;
         if !recent.is_empty() {
+            if aged && other_alive {
+                return Some(owners[0]);
+            }
             return None;
         }
-        if Instant::now().duration_since(started_at) >= TIP_HOLE_RX_STALE {
+        if aged {
             return Some(owners[0]);
         }
         return None;
@@ -885,7 +905,7 @@ fn steal_hung_densify(
     issued
 }
 
-/// Rank alive peer ids for getdata: prefer peers not in `avoid`, then
+/// Rank alive peer ids for densify getdata: prefer peers not in `avoid`, then
 /// higher live EWMA bps, then lower id. Unsampled peers sort last
 /// among non-avoided (bps=0).
 pub(crate) fn rank_peers_by_speed(
@@ -905,11 +925,34 @@ pub(crate) fn rank_peers_by_speed(
     ranked
 }
 
-/// Cover each tip-hole hash with multi-peer getdata, preferring faster peers.
+/// Rank for tip-hole getdata: short inflight queues first, then higher EWMA.
+pub(crate) fn rank_peers_for_tip_hole(
+    slots: &[PeerSlot],
+    alive: &[usize],
+    avoid: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    let mut ranked: Vec<usize> = alive.to_vec();
+    ranked.sort_by(|&a, &b| {
+        let avoided_a = avoid.contains(&a) as u8;
+        let avoided_b = avoid.contains(&b) as u8;
+        avoided_a.cmp(&avoided_b).then_with(|| {
+            let qa = peer_queue_len(slots, a);
+            let qb = peer_queue_len(slots, b);
+            qa.cmp(&qb).then_with(|| {
+                let bps = |pid: usize| -> u64 { peer_bps(slots, pid) };
+                bps(b).cmp(&bps(a)).then_with(|| a.cmp(&b))
+            })
+        })
+    });
+    ranked
+}
+
+/// Cover each tip-hole hash with multi-peer getdata on short queues.
 ///
 /// While the hole is open, at most one current owner of **this hash** is dropped
-/// per call when a sibling is pulling or that owner is a relative-slow outlier
-/// among owners. The whole race set is never cleared on request age.
+/// per call when a sibling is pulling, that owner is a relative-slow outlier
+/// among owners, or the request is aged and another peer exists. The whole
+/// race set is never cleared on request age.
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -948,7 +991,19 @@ pub(crate) fn cover_tip_holes(
         }
         let mut need = want - already;
         let mut placed_any = false;
-        let ranked = rank_peers_by_speed(&st.slots, alive, &avoid);
+        let ranked = rank_peers_for_tip_hole(&st.slots, alive, &avoid);
+        let short_exists = alive.iter().any(|&pid| {
+            if avoid.contains(&pid) {
+                return false;
+            }
+            let Some(slot) = st.slots.iter().find(|s| s.id == pid && s.alive) else {
+                return false;
+            };
+            if slot.in_flight.contains(&h) {
+                return false;
+            }
+            slot.in_flight.len() <= TIP_HOLE_SHORT_QUEUE
+        });
         for &pid in &ranked {
             if need == 0 {
                 break;
@@ -968,6 +1023,9 @@ pub(crate) fn cover_tip_holes(
                 .map(|e| e.contains_peer(pid))
                 .unwrap_or(false)
             {
+                continue;
+            }
+            if short_exists && st.slots[idx].in_flight.len() > TIP_HOLE_SHORT_QUEUE {
                 continue;
             }
             if st.slots[idx].in_flight.len() >= cfg.per_peer {
@@ -1307,12 +1365,20 @@ mod tests {
         assert_eq!(
             tip_hole_owner_to_drop(&[0], &slots, Instant::now() - Duration::from_secs(7)),
             None,
-            "solo with live rx is kept"
+            "solo with live rx is kept when young"
         );
         assert_eq!(
             tip_hole_owner_to_drop(&[0], &slots, Instant::now() - Duration::from_secs(31)),
+            Some(0),
+            "aged solo owner drops when another alive peer exists, even with densify ticks"
+        );
+        let one = vec![dummy_slot(0)];
+        let mut one = one;
+        one[0].rate.note_rx(ibd_mono_ms().max(1));
+        assert_eq!(
+            tip_hole_owner_to_drop(&[0], &one, Instant::now() - Duration::from_secs(31)),
             None,
-            "solo with live rx kept even if started_at is old"
+            "truly solo (one live peer) with live rx stays"
         );
         slots[0].rate.progress_ms = 0;
         assert_eq!(
@@ -1606,6 +1672,75 @@ mod tests {
         assert!(
             st.inflight[&hole].contains_peer(0),
             "solo slow-but-steady download stays"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cover_tip_holes_aged_solo_drops_when_other_peers_exist() {
+        use super::super::peer_io::ibd_mono_ms;
+        use super::super::state::InflightReq;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(0x55);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.record_height(hole, ht);
+        st.height_to_hash.insert(ht, hole);
+        st.body.mark_missing(hole);
+        let mut req = InflightReq::new(0);
+        req.started_at = Instant::now() - Duration::from_secs(31);
+        st.inflight.insert(hole, req);
+        st.slots[0].in_flight.insert(hole);
+        st.slots[0].rate.note_rx(ibd_mono_ms().max(1));
+        seed_ewma(&mut st.slots[1], 2_000_000);
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = vec![0, 1];
+        let _ = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[hole]);
+        let peers = &st.inflight[&hole].peers;
+        assert!(
+            !peers.contains(&0),
+            "aged owner with densify ticks drops when another peer exists; peers={peers:?}"
+        );
+        assert!(
+            peers.contains(&1),
+            "short-queue peer must take the hole; peers={peers:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cover_tip_holes_prefers_empty_queue_over_full_fast() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let hole = h(0x56);
+        let tip = hub.tip_height().unwrap_or(0);
+        let ht = tip.saturating_add(1);
+        st.record_height(hole, ht);
+        st.height_to_hash.insert(ht, hole);
+        st.body.mark_missing(hole);
+        seed_ewma(&mut st.slots[0], 10_000_000);
+        seed_ewma(&mut st.slots[1], 1_000_000);
+        for i in 0..4u32 {
+            st.slots[0].in_flight.insert(h(1000 + i));
+        }
+        let cfg = IbdConfig::for_test();
+        let alive: Vec<usize> = vec![0, 1];
+        let _ = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[hole]);
+        let peers = &st.inflight[&hole].peers;
+        assert!(
+            peers.contains(&1) && !peers.contains(&0),
+            "empty medium peer beats full fast FIFO; peers={peers:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
