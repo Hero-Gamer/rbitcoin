@@ -40,8 +40,11 @@ never calls this.
 `-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
 127.0.0.1, `--no-seeds`. Node stdio goes to `regtest/debug.log`; only
 `Error:` lines (UA / init) are copied to the shim stderr so TestNode’s
-clean-stop check matches Core. Unknown Core flags fail parse. Operator
-CLI is unchanged.
+clean-stop check matches Core. Unknown Core flags fail parse. The shim maps
+Core names onto kebab `rbitcoin-node` flags (`-maxconnections` → `--max-inbound`
+as `N−11`, `-whitelist=noban` → `--trusted`, `-blocksonly` → `--blocks-only`,
+`-minimumchainwork` → `--min-chain-work`, …). The operator CLI does not accept
+those Core aliases.
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
