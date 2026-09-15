@@ -66,6 +66,29 @@ pub(crate) fn validate_header_hashed(
     pow_hash_meets_target(hash, header.bits, params.pow_limit)
 }
 
+/// Contextual checks when the parent is a known header, not necessarily on the
+/// best chain (`header_at_height` would miss).
+pub fn validate_header_on_parent(
+    params: &ChainParams,
+    height: Height,
+    header: &Header,
+    parent_mtp: u32,
+    expected_bits: CompactTarget,
+) -> Result<(), ConsensusError> {
+    if header.time <= parent_mtp {
+        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+    }
+    check_header_version_and_future_time(params, height, header)?;
+    if header.bits != expected_bits {
+        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+    }
+    pow_hash_meets_target(
+        header.block_hash().to_byte_array(),
+        header.bits,
+        params.pow_limit,
+    )
+}
+
 /// POW vs a **caller-computed** header hash (no second SHA256d).
 pub(crate) fn pow_hash_meets_target(
     hash: [u8; 32],

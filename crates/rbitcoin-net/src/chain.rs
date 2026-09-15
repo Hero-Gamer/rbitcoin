@@ -7,12 +7,12 @@ use crate::cache::BlockCache;
 use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, ScriptBuf, Target, Transaction, Txid, Work};
+use bitcoin::{Block, BlockHash, CompactTarget, ScriptBuf, Target, Transaction, Txid, Work};
 use rbitcoin_consensus::{
     accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
     confirm_wire_load_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
-    mine_regtest_paying, validate_header, ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch,
-    ScriptPreverified, WireLoadPipeline,
+    mine_regtest_paying, validate_header, validate_header_on_parent, ChainParams, Milestone,
+    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -32,6 +32,12 @@ pub struct TipEvent {
     /// New-branch length when this tip came from `accept_branch` (0 = tip-extend).
     /// `p2p_sendheaders`: >8 → announce inv and pause headers.
     pub reorg_branch_len: u32,
+}
+
+struct HeaderSyncNode {
+    fk: Fk,
+    header: Header,
+    height: u32,
 }
 
 /// Never-confirmed side-branch bodies plus first-seen seq (equal-work FIFO).
@@ -1141,7 +1147,7 @@ impl ChainHub {
         }
         let mut out = vec![Fk::NULL; headers.len()];
         let mut recs: Vec<(usize, rbitcoin_store::HeaderRecord)> = Vec::new();
-        let mut in_batch: HashMap<[u8; 32], Fk> = HashMap::new();
+        let mut in_batch: HashMap<[u8; 32], HeaderSyncNode> = HashMap::new();
         let mut next = self.query.store().header_count();
         for (i, header) in headers.iter().enumerate() {
             let hash = header.block_hash().to_byte_array();
@@ -1151,13 +1157,33 @@ impl ChainHub {
                 .map_err(|e| NetError::Consensus(e.to_string()))?
             {
                 out[i] = fk;
-                in_batch.insert(hash, fk);
+                if let Some(h) = self.stored_header_height(&header.block_hash()) {
+                    in_batch.insert(
+                        hash,
+                        HeaderSyncNode {
+                            fk,
+                            header: *header,
+                            height: h,
+                        },
+                    );
+                }
                 continue;
             }
             let prev_fk = self.header_sync_prev_fk(header, &in_batch)?;
+            let height = self
+                .sync_parent_height(&header.prev_blockhash, &in_batch)
+                .map(|p| p.saturating_add(1))
+                .unwrap_or(0);
             next = next.saturating_add(1);
             let fk = Fk(next);
-            in_batch.insert(hash, fk);
+            in_batch.insert(
+                hash,
+                HeaderSyncNode {
+                    fk,
+                    header: *header,
+                    height,
+                },
+            );
             recs.push((i, header_to_record(prev_fk, header, hash)));
             out[i] = fk;
         }
@@ -1180,13 +1206,13 @@ impl ChainHub {
     fn header_sync_prev_fk(
         &self,
         header: &Header,
-        in_batch: &HashMap<[u8; 32], Fk>,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<Fk, NetError> {
         let prev_bytes = header.prev_blockhash.to_byte_array();
         let prev_fk = if prev_bytes == [0u8; 32] {
             Fk::NULL
-        } else if let Some(&fk) = in_batch.get(&prev_bytes) {
-            fk
+        } else if let Some(n) = in_batch.get(&prev_bytes) {
+            n.fk
         } else {
             match self
                 .query
@@ -1202,20 +1228,193 @@ impl ChainHub {
             }
         };
         if prev_bytes != [0u8; 32] {
-            let parent = header.prev_blockhash.to_byte_array();
-            if let Some(ph) = self.query.height_of_hash(&parent).ok().flatten() {
-                validate_header(
-                    self.query.as_ref(),
-                    &self.params,
-                    Height(ph.0.saturating_add(1)),
-                    header,
-                )
-                .map_err(|e| NetError::Consensus(e.to_string()))?;
-            } else if !self.header_claimed_pow_ok(header) {
-                return Err(NetError::Consensus("invalid proof of work".into()));
-            }
+            self.header_sync_contextual(header, in_batch)?;
         }
         Ok(prev_fk)
+    }
+
+    fn header_sync_contextual(
+        &self,
+        header: &Header,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Result<(), NetError> {
+        let parent_hash = header.prev_blockhash;
+        let parent_bytes = parent_hash.to_byte_array();
+        if let Some(ph) = self.query.height_of_hash(&parent_bytes).ok().flatten() {
+            return validate_header(
+                self.query.as_ref(),
+                &self.params,
+                Height(ph.0.saturating_add(1)),
+                header,
+            )
+            .map_err(|e| NetError::Consensus(e.to_string()));
+        }
+        let parent = self
+            .sync_parent_header(&parent_hash, in_batch)
+            .ok_or_else(|| {
+                NetError::Consensus("header parent unknown — ensure parent before child".into())
+            })?;
+        let parent_height = self
+            .sync_parent_height(&parent_hash, in_batch)
+            .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
+        let mtp = self.mtp_off_tip(&parent, in_batch);
+        let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
+        validate_header_on_parent(
+            &self.params,
+            Height(parent_height.saturating_add(1)),
+            header,
+            mtp,
+            expected,
+        )
+        .map_err(|e| NetError::Consensus(e.to_string()))
+    }
+
+    fn sync_parent_header(
+        &self,
+        hash: &BlockHash,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Option<Header> {
+        if let Some(n) = in_batch.get(&hash.to_byte_array()) {
+            return Some(n.header);
+        }
+        self.header_of(hash)
+    }
+
+    fn sync_parent_height(
+        &self,
+        hash: &BlockHash,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Option<u32> {
+        if let Some(n) = in_batch.get(&hash.to_byte_array()) {
+            return Some(n.height);
+        }
+        self.stored_header_height(hash)
+    }
+
+    fn stored_header_height(&self, hash: &BlockHash) -> Option<u32> {
+        if let Some(h) = self.header_height(hash) {
+            return Some(h);
+        }
+        let mut cur = *hash;
+        let mut delta = 0u32;
+        for _ in 0..10_000 {
+            let hdr = self.header_of(&cur)?;
+            let prev = hdr.prev_blockhash;
+            if prev.to_byte_array() == [0u8; 32] {
+                return Some(delta);
+            }
+            if let Some(ph) = self.header_height(&prev) {
+                return Some(ph.saturating_add(1).saturating_add(delta));
+            }
+            cur = prev;
+            delta = delta.saturating_add(1);
+        }
+        None
+    }
+
+    fn mtp_off_tip(&self, parent: &Header, in_batch: &HashMap<[u8; 32], HeaderSyncNode>) -> u32 {
+        let mut times = Vec::with_capacity(11);
+        let mut hdr = *parent;
+        loop {
+            times.push(hdr.time);
+            if times.len() == 11 {
+                break;
+            }
+            if hdr.prev_blockhash.to_byte_array() == [0u8; 32] {
+                break;
+            }
+            match self.sync_parent_header(&hdr.prev_blockhash, in_batch) {
+                Some(p) => hdr = p,
+                None => break,
+            }
+        }
+        rbitcoin_primitives::median_time_past_times(&times)
+    }
+
+    fn expected_bits_off_tip(
+        &self,
+        header: &Header,
+        parent: &Header,
+        parent_height: u32,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Result<CompactTarget, NetError> {
+        let height = parent_height.saturating_add(1);
+        let interval = self.params.difficulty_adjustment_interval();
+        if height == 0 {
+            return Ok(genesis_block(&self.params).header.bits);
+        }
+        if !height.is_multiple_of(interval) {
+            return Ok(self.min_diff_off_tip(header, parent, parent_height, in_batch));
+        }
+        if self.params.no_pow_retargeting() {
+            return Ok(parent.bits);
+        }
+        let first_h = height.saturating_sub(interval);
+        let first = self
+            .header_along_off_tip(parent, parent_height, first_h, in_batch)
+            .ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
+        let timespan = u64::from(parent.time.saturating_sub(first.time));
+        Ok(CompactTarget::from_next_work_required(
+            parent.bits,
+            timespan,
+            &self.params.btc,
+        ))
+    }
+
+    fn min_diff_off_tip(
+        &self,
+        header: &Header,
+        parent: &Header,
+        parent_height: u32,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> CompactTarget {
+        if !self.params.allow_min_difficulty_blocks() {
+            return parent.bits;
+        }
+        let limit = self.params.pow_limit.to_compact_lossy();
+        let spacing = self.params.btc.pow_target_spacing;
+        if u64::from(header.time) > u64::from(parent.time).saturating_add(spacing.saturating_mul(2))
+        {
+            return limit;
+        }
+        let interval = self.params.difficulty_adjustment_interval();
+        let mut h = parent_height;
+        let mut bits = parent.bits;
+        let mut hdr = *parent;
+        while !h.is_multiple_of(interval) && bits == limit {
+            if h == 0 {
+                break;
+            }
+            let Some(p) = self.sync_parent_header(&hdr.prev_blockhash, in_batch) else {
+                break;
+            };
+            hdr = p;
+            h = h.saturating_sub(1);
+            bits = hdr.bits;
+        }
+        bits
+    }
+
+    fn header_along_off_tip(
+        &self,
+        parent: &Header,
+        parent_height: u32,
+        want: u32,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Option<Header> {
+        if want == parent_height {
+            return Some(*parent);
+        }
+        if want > parent_height {
+            return None;
+        }
+        let mut hdr = *parent;
+        let mut h = parent_height;
+        while h > want {
+            hdr = self.sync_parent_header(&hdr.prev_blockhash, in_batch)?;
+            h = h.saturating_sub(1);
+        }
+        Some(hdr)
     }
 
     /// Contiguous tip-extension slice for one-shot load (owned Block).
@@ -3386,6 +3585,116 @@ mod tests {
             hub.ensure_header(&bad).is_err(),
             "persist must not accept nBits/POW that confirm would reject"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ensure_header_fork_child_rejects_old_time_and_wrong_bits() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_000, 1);
+        hub.ensure_header(&b1.header).unwrap();
+        let before = hub.query.store().header_count();
+
+        let mut old = b1.header;
+        old.prev_blockhash = b1.block_hash();
+        old.time = b1.header.time;
+        old.merkle_root = bitcoin::TxMerkleNode::from_byte_array([1u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut old);
+        let err = hub.ensure_header(&old).unwrap_err();
+        assert!(
+            err.to_string().contains("median-time-past"),
+            "fork child with time==parent must fail MTP: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+
+        let mut wrong_bits = b1.header;
+        wrong_bits.prev_blockhash = b1.block_hash();
+        wrong_bits.time = b1.header.time.saturating_add(600);
+        wrong_bits.bits = CompactTarget::from_consensus(0x207f_fffe);
+        wrong_bits.merkle_root = bitcoin::TxMerkleNode::from_byte_array([2u8; 32]);
+        let target = Target::from_compact(wrong_bits.bits);
+        for nonce in 0..u32::MAX {
+            wrong_bits.nonce = nonce;
+            if wrong_bits.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        let err = hub.ensure_header(&wrong_bits).unwrap_err();
+        assert!(
+            err.to_string().contains("proof of work bits"),
+            "fork child with nBits != parent continuation must fail: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+
+        let mut low_ver = b1.header;
+        low_ver.prev_blockhash = b1.block_hash();
+        low_ver.time = b1.header.time.saturating_add(600);
+        low_ver.version = Version::from_consensus(1);
+        low_ver.merkle_root = bitcoin::TxMerkleNode::from_byte_array([3u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut low_ver);
+        let err = hub.ensure_header(&low_ver).unwrap_err();
+        assert!(
+            err.to_string().contains("bad-version"),
+            "fork child below BIP65 nVersion: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+
+        let mut h2 = b1.header;
+        h2.prev_blockhash = b1.block_hash();
+        h2.time = b1.header.time.saturating_add(600);
+        h2.merkle_root = bitcoin::TxMerkleNode::from_byte_array([4u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut h2);
+        let n = hub
+            .ensure_headers_batch(&[b1.header, h2])
+            .expect("in-batch parent of a valid fork child")
+            .len();
+        assert_eq!(n, 2);
+        assert!(hub.query.store().header_count() > before);
+
+        let mut far = h2;
+        far.prev_blockhash = h2.block_hash();
+        far.time = h2.time.saturating_add(1_201);
+        far.merkle_root = bitcoin::TxMerkleNode::from_byte_array([5u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut far);
+        hub.ensure_header(&far)
+            .expect("regtest min-diff after 2×spacing must persist pow_limit bits");
+
+        let mut batch_old = h2;
+        batch_old.prev_blockhash = h2.block_hash();
+        batch_old.time = b1.header.time;
+        batch_old.merkle_root = bitcoin::TxMerkleNode::from_byte_array([6u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut batch_old);
+        let after_far = hub.query.store().header_count();
+        let err = hub
+            .ensure_headers_batch(&[h2, batch_old])
+            .expect_err("batch must fail closed on MTP");
+        assert!(
+            err.to_string().contains("median-time-past"),
+            "in-batch MTP fail: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), after_far);
+
+        let empty = HashMap::new();
+        assert_eq!(hub.stored_header_height(&b1.block_hash()), Some(1));
+        assert!(hub
+            .stored_header_height(&BlockHash::from_byte_array([0xab; 32]))
+            .is_none());
+        let mtp = hub.mtp_off_tip(&b1.header, &empty);
+        assert!(mtp <= b1.header.time);
+        let child_bits = hub
+            .expected_bits_off_tip(&h2, &b1.header, 1, &empty)
+            .unwrap();
+        assert_eq!(child_bits, b1.header.bits);
+        let mut far_bits = h2;
+        far_bits.time = b1.header.time.saturating_add(10_000);
+        let md = hub.min_diff_off_tip(&far_bits, &b1.header, 1, &empty);
+        assert_eq!(md, hub.params.pow_limit.to_compact_lossy());
+        let genesis_hdr = hub.header_of(&gen).expect("genesis header");
+        assert!(hub.header_along_off_tip(&b1.header, 1, 0, &empty).is_some());
+        assert!(hub.header_along_off_tip(&b1.header, 1, 2, &empty).is_none());
+        let _ = genesis_hdr;
         let _ = std::fs::remove_dir_all(dir);
     }
 
