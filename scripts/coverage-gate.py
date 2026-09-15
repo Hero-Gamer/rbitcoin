@@ -4,9 +4,10 @@
 Baseline is the **highest** published master coverage job whose SHA is an
 ancestor of `git merge-base(HEAD, origin/master)` (the fork point). Master
 jobs that landed after the PR branched are ignored so the target does not
-move while the PR is open. Unrounded: lh/lf >= base_lh/base_lf  ⇔
-lh * base_lf >= lf * base_lh. 90% is only a floor when that snapshot is
-missing (offline local). GitHub Actions must fetch history (fail closed).
+move while the PR is open. Never-falls compares the **displayed** 2-decimal
+percent (round-half-up hundredths), not raw LH: llvm-cov jitters a few hits
+on the same tree. 90% is only a floor when that snapshot is missing
+(offline local). GitHub Actions must fetch history (fail closed).
 """
 from __future__ import annotations
 
@@ -31,7 +32,14 @@ FETCH_TIMEOUT_S = 15
 
 
 def pct_display(lh: int, lf: int) -> str:
-    return f"{100.0 * lh / lf:.2f}"
+    return f"{pct_hundredths(lh, lf) / 100:.2f}"
+
+
+def pct_hundredths(lh: int, lf: int) -> int:
+    """Round-half-up hundredths of a percent: 103267/113171 → 9125 (91.25%)."""
+    if lf <= 0:
+        return 0
+    return (10000 * lh + lf // 2) // lf
 
 
 def passes_floor(lh: int, lf: int, floor: int = FLOOR_PCT) -> bool:
@@ -39,7 +47,12 @@ def passes_floor(lh: int, lf: int, floor: int = FLOOR_PCT) -> bool:
 
 
 def passes_ratchet(lh: int, lf: int, base_lh: int, base_lf: int) -> bool:
-    return lf > 0 and base_lf > 0 and lh * base_lf >= lf * base_lh
+    """True iff displayed 2-decimal % does not fall (llvm-cov LH jitters)."""
+    return (
+        lf > 0
+        and base_lf > 0
+        and pct_hundredths(lh, lf) >= pct_hundredths(base_lh, base_lf)
+    )
 
 
 def _fetch_text(src: str) -> str:
@@ -269,7 +282,7 @@ def decide(
         msg = (
             f"FAIL: line coverage {pct_display(lh, lf)}% ({lh}/{lf}) < "
             f"{label} {pct_display(base_lh, base_lf)}% ({base_lh}/{base_lf}{sha_note}); "
-            f"unrounded LH*base_LF < LF*base_LH"
+            f"displayed 2-decimal percent fell"
         )
         return False, msg, status
     status["ok"] = True

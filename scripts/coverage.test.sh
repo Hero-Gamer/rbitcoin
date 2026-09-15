@@ -153,11 +153,18 @@ assert_gate_fail() {
 base="$(mktemp)"
 python3 "$ROOT/scripts/coverage-badge.py" \
   --lh 101175 --lf 110953 --gate 90 --sha b1510f783e3f --date 2026-09-15 --out "$base"
+base_jitter="$(mktemp)"
+python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 103271 --lf 113171 --gate 90 --sha 91ccb5f085f6 --date 2026-09-15 --out "$base_jitter"
 
 assert_gate_pass "equal ratio vs master baseline passes" \
   --lh 101175 --lf 110953 --baseline "$base"
-assert_gate_fail "one fewer hit vs master fails (still ≥90%)" \
+assert_gate_pass "few-hit llvm-cov jitter still same 2-decimal percent" \
   --lh 101174 --lf 110953 --baseline "$base"
+assert_gate_pass "production-scale 4-hit jitter (103267 vs 103271 / 113171) passes" \
+  --lh 103267 --lf 113171 --baseline "$base_jitter"
+assert_gate_fail "displayed 2-decimal percent drop still fails" \
+  --lh 101160 --lf 110953 --baseline "$base"
 assert_gate_fail "90.50% vs 91.19% master fails" \
   --lh 905 --lf 1000 --baseline "$base"
 assert_gate_pass "higher ratio vs master passes" \
@@ -207,7 +214,7 @@ assert d["base_lh"] == 101175 and d["base_lf"] == 110953, d
 assert d["mode"] == "ratchet", d
 PY
 assert_ok "status-out JSON names ratchet baseline" true
-rm -f "$st" "$base"
+rm -f "$st" "$base" "$base_jitter"
 
 # Merge-base ratchet: highest master snapshot at or before the fork point,
 # not whatever origin/master has published while the PR was open.

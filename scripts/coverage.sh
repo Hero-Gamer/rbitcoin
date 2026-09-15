@@ -88,12 +88,12 @@ PY
     echo "FAIL: no LCOV totals (missing coverage/lcov.info or empty LF)" >&2
     exit 1
   fi
-  # Display uses 2 decimals only; the gate uses unrounded LH/LF (integer cross-multiply).
+  # Display and gate both use 2-decimal percent (llvm-cov LH jitters).
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
   echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files)"
   echo "Line coverage gate: never below highest master coverage at or before merge-base; ${LCOV_PCT}% now"
-  echo "Gate math: pass iff LH*base_LF >= LF*base_LH (unrounded; 90% floor if no snapshot)"
+  echo "Gate math: pass iff displayed 2-decimal % does not fall (llvm-cov LH jitters; 90% floor if no snapshot)"
 
   # Optional HTML diagnostic (not the pass condition).
   HTML_PRESENT=0

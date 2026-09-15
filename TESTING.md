@@ -151,12 +151,13 @@ reads it; rustup users export it). Override coverage dir:
 | Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **must not fall** vs the **highest** green-`master` snapshot whose SHA is an ancestor of `git merge-base(PR tip, origin/master)`. **90%** is only a floor when that snapshot is missing (offline local). |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
-CI fails if the unrounded ratio `LH/LF` is below that merge-base snapshot
-(`LH * base_LF < LF * base_LH`). Equal is a pass. Master jobs that landed
-**after** the PR branched are ignored, so a cooking PR is not racing a
-moving target. A PR that adds uncovered production lines enough to drop
-the ratio vs **its fork point** is red even when still above 90%. Rebase
-onto current `master` to pick up a newer snapshot. Test modules
+CI fails if the **displayed 2-decimal percent** falls vs that merge-base
+snapshot (round-half-up hundredths of `LH/LF`). Raw hit counts jitter a
+few lines under llvm-cov on the same tree; a 3–4 hit wobble that still
+prints `91.25%` is a pass. A drop from `91.25%` to `91.24%` is red even
+when still above 90%. Master jobs that landed **after** the PR branched
+are ignored, so a cooking PR is not racing a moving target. Rebase onto
+current `master` to pick up a newer snapshot. Test modules
 (`*_tests.rs`, `/tests/`, `testutil.rs`, crate `rbitcoin-test`) are omitted
 from `LH`/`LF`. `#[cfg(test)]` arms inside production files still count.
 GitHub Actions **fail closed** if history cannot be fetched or no snapshot
