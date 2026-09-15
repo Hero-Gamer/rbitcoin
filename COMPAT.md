@@ -78,8 +78,10 @@ short-id map and costs a `getblocktxn`. Growing the ring to Core’s extra-txn
 shape is worth later; not scheduled (no Open Q-id).
 
 Inbound `cmpctblock` may prefill any well-formed indexes (BIP152). We always
-log reconstruct fill sources and `fetched=` `blocktxn` bytes. **Sending** extra
-prefills (beyond coinbase) is on unless `--prefillcompact=0`.
+log reconstruct fill sources and `fetched=` `blocktxn` bytes, and outbound
+`cmpct announce … prefill=N/bytes` when we send `cmpctblock` (tip announce or
+`MSG_CMPCT_BLOCK` getdata). **Sending** extra prefills (beyond coinbase) is on
+unless `--prefillcompact=0`.
 
 ## Core-class JSON-RPC (subset)
 

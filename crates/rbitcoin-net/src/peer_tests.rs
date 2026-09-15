@@ -6460,8 +6460,22 @@ fn prefillcompact_announce_and_getdata_follow_knob() {
 
         hub.set_prefill_compact(true);
         hub.remember_cmpct_prefill(hash, prev, vec![0, 1]);
+        rbitcoin_log::capture_logs(true);
         let on = cmpct_announce_from_block(&hub, &block, 2).expect("announce on");
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
         assert_eq!(prefilled_n(&on), 2, "knob on packs extra index");
+        let NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: on_hsi,
+        }) = &on
+        else {
+            panic!("announce on");
+        };
+        let want = crate::compact::cmpct_send_line(hash, block.txdata.len(), on_hsi);
+        assert!(
+            logs.iter().any(|(_, m)| m == &want),
+            "outbound prefill must be logged at send, got {logs:?}"
+        );
 
         hub.remember_cmpct_prefill(hash, prev, vec![0, 99]);
         let fallback = cmpct_announce_from_block(&hub, &block, 2)

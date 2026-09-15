@@ -2340,6 +2340,14 @@ async fn serve_getdata(
                         if let Ok(hsi) =
                             HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref)
                         {
+                            rbitcoin_log::info!(
+                                "{}",
+                                crate::compact::cmpct_send_line(
+                                    block.block_hash(),
+                                    block.txdata.len(),
+                                    &hsi
+                                )
+                            );
                             let _ = try_queue_served_block(
                                 out_tx,
                                 inflight,
@@ -3277,6 +3285,10 @@ fn cmpct_announce_from_block(
     let hsi = HeaderAndShortIds::from_block(block, nonce, ver, &pref)
         .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
         .ok()?;
+    rbitcoin_log::info!(
+        "{}",
+        crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
+    );
     Some(NetworkMessage::CmpctBlock(CmpctBlock {
         compact_block: hsi,
     }))
