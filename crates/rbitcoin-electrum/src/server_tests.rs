@@ -362,13 +362,10 @@ fn negotiate_protocol_intersection_and_asof_dialect() {
     assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);
     assert_eq!(negotiate_protocol(&json!(["c"])).unwrap(), PROTOCOL_MAX);
     assert_eq!(negotiate_protocol(&json!(["c", "1.4"])).unwrap(), "1.4");
-    assert_eq!(
-        negotiate_protocol(&json!(["c", "1.4.2"])).unwrap(),
-        PROTOCOL_MAX
-    );
+    assert_eq!(negotiate_protocol(&json!(["c", "1.4.2"])).unwrap(), "1.4.2");
     assert_eq!(
         negotiate_protocol(&json!(["c", ["1.4", "1.4.2"]])).unwrap(),
-        PROTOCOL_MAX
+        "1.4.2"
     );
     assert_eq!(
         negotiate_protocol(&json!(["c", PROTOCOL_ASOF])).unwrap(),
@@ -378,10 +375,11 @@ fn negotiate_protocol_intersection_and_asof_dialect() {
         negotiate_protocol(&json!(["c", ["1.4", PROTOCOL_ASOF]])).unwrap(),
         PROTOCOL_ASOF
     );
-    assert!(negotiate_protocol(&json!(["c", "1.5"]))
+    assert_eq!(negotiate_protocol(&json!(["c", "1.6"])).unwrap(), "1.6");
+    assert!(negotiate_protocol(&json!(["c", "1.7"]))
         .unwrap_err()
         .contains("unsupported"));
-    assert!(negotiate_protocol(&json!(["c", ["1.4.3", "1.5"]]))
+    assert!(negotiate_protocol(&json!(["c", ["1.6.1", "1.7"]]))
         .unwrap_err()
         .contains("unsupported"));
 }
@@ -3321,6 +3319,129 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
         &mut sh_subs,
     )
     .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wallet_protocol_1_6_outpoint_and_sp_subscribe() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut conn = ElectrumConn::new();
+    let info = dispatch_with_join(
+        "mempool.get_info",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(info["minrelaytxfee"].as_f64().unwrap() > 0.0, "{info}");
+    assert_eq!(info["unbroadcastcount"], 0);
+
+    let st = dispatch_with_join(
+        "blockchain.outpoint.get_status",
+        &json!([format!("{:064}", 0), 0]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(st["spent"], false, "{st}");
+
+    let sub = dispatch_with_join(
+        "blockchain.outpoint.subscribe",
+        &json!([format!("{:064}", 0), 0]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(sub["spent"], false);
+    assert_eq!(conn.outpoint_subs.len(), 1);
+    let un = dispatch_with_join(
+        "blockchain.outpoint.unsubscribe",
+        &json!([format!("{:064}", 0), 0]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(un, json!(true));
+
+    let err = dispatch_with_join(
+        "blockchain.transaction.broadcast_package",
+        &json!([["00"]]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("mempool")
+            || err.contains("reject")
+            || err.contains("IO")
+            || err.contains("decode")
+            || err.contains("odd"),
+        "{err}"
+    );
+
+    let sp = dispatch_with_join(
+        "blockchain.silentpayments.subscribe",
+        &json!([
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+            "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36",
+            0
+        ]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(sp["start_height"], 0);
+    assert!(sp["address"].as_str().unwrap().contains("sp"), "{sp}");
+    assert_eq!(sp["labels"], json!([0]));
+
+    conn.protocol = "1.6".into();
+    let hdrs = dispatch_with_join(
+        "blockchain.block.headers",
+        &json!([0, 1]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(
+        hdrs.get("headers").is_some() || hdrs.get("hex").is_some(),
+        "{hdrs}"
+    );
+    conn.protocol = "1.4.2".into();
+    let hdrs14 = dispatch_with_join(
+        "blockchain.block.headers",
+        &json!([0, 1]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(hdrs14.get("hex").is_some(), "{hdrs14}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

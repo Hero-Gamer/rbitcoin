@@ -11,6 +11,12 @@ before 1.0).
 
 ### Added
 
+- **Wallet-protocol leftovers:** Electrum **1.6** `blockchain.transaction.broadcast_package`
+  (local `accept_package`) and `mempool.get_info`; `protocol_max` **1.6** with
+  1.6 `block.headers` as a list. Electrum **1.7** `blockchain.outpoint.*`.
+  Frigate `blockchain.silentpayments.subscribe` (session scan key). Esplora
+  `/fees/recommended` (sat/vB). P2P BIP331 and Electrum TLS/Tor still open.
+
 - **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
   pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
   as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent

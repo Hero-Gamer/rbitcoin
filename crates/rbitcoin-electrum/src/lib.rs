@@ -10,6 +10,7 @@
 //! Other tweaks clients (kiss-bdk) use the same stream without that probe.
 
 mod server;
+mod silent_scan;
 mod tweaks;
 mod unspent;
 

@@ -115,29 +115,27 @@ Per-method notes, auth, and the shindex matrix live in
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below. `server.version` negotiates: omitted → `1.4.2`; `"1.4"` → `1.4`; `["1.4","1.4.2"]` → `1.4.2`; `"1.4.2-asof"` (or a range containing it) → as-of dialect. First call wins. `features.protocol_max` is `1.4.2`; `features.asof_protocol` is `1.4.2-asof`. `features.genesis_hash` is display-order hex (refuse a wrong-chain server before a tweaks scan). `features.tweaks` / `silent_payments` advertise the method; they are not a substitute for the stream. |
+| server.version / banner / features | done | Banner: libre-relay-class. `server.version[0]` is `rbitcoin-electrs <workspace.package.version>` — **not electrs**; see below. `server.version` negotiates: omitted → `1.6`; `"1.4"` → `1.4`; `["1.4","1.4.2"]` → `1.4.2`; `["1.4","1.6"]` → `1.6`; `"1.4.2-asof"` (or a range containing it) → as-of dialect. First call wins. `features.protocol_max` is `1.6`; `features.asof_protocol` is `1.4.2-asof`. `features.genesis_hash` is display-order hex (refuse a wrong-chain server before a tweaks scan). `features.tweaks` / `silent_payments` advertise the method; they are not a substitute for the stream. |
 | blockchain.tweaks.subscribe | done | **Stream**, not a one-shot result: JSON-RPC `result` is the **first** height only; remaining heights are unsolicited notifications; `{"message":"done"}` ends the **chunk** (60s wall at a wave boundary, or the requested `count` if sooner) — Cake electrs clamps `count` to 1000 instead. Cake Wallet resubscribes from `syncHeight+1` ([cake_wallet#3574](https://github.com/cake-tech/cake_wallet/issues/3574) persist still lags one event). [kiss-bdk](https://github.com/kkdao/kiss-bdk) today treats `done` as the asked range finished ([kiss-bdk#10](https://github.com/kkdao/kiss-bdk/issues/10)). Each height carries tweak + txid + taproot `output_pubkeys` (client scans locally; no block fetch). Naive walk, or `--sptweaks` thin index (`len:tweak` only; one `txout` span per wave; the first height shares that span when indexed). Pre-taproot: **one** notify with ≤1024 empty height keys (Cake `fromJson` last key is progress); probe `[0,1,false]` stays `{"0": {}}`. Param `[2]` (Cake `historicalMode`): `false` **cut-through** (omit confirmed-spent P2TR outs / txs); `true` keeps spent outs. Serve-time `--sptweaks-dust` (default **1000**) omits P2TR outs with `value <=` the floor (`0` = all; **546** matches Cake electrs `sp_min_dust`). Sparrow Silent Payments uses Frigate `blockchain.silentpayments.subscribe` (server-side scan) — **not** this method. Cake isolate may still hardcode `electrs.cakewallet.com`. |
 | headers / block headers | done | Tip push on subscribe |
 | scripthash history / balance / listunspent | done | Unconf when mempool attached; `get_history` optional BCH-style `from_height` / exclusive `to_height` (`-1` = tip + mempool); 1-arg = full history; unconfirmed `get_history` rows include `fee` (same as `get_mempool`); `listunspent` mempool height is `0` or `-1` (unconfirmed parent); **subscribe status always full**; `blockchain.scripthash.unsubscribe` returns whether the connection was watching (frees the 1000-sub cap). `listunspent` loads `txid.body` only for unspent creates; one TCP connection reuses the last SH outs+spent join until SH-view **hash** changes. Confirmed methods stamp live tip: a RAM SH head (pending write-behind) joins with durable SH so mempool can drop confirmed txs without a hole. Durable Class B seed waits until after tip announce. `get_history` skips mempool rows already in the confirmed list. `server.features.chain_tip = true`. Trailing **`asof:<blockhash>`** after the official args (`server.features.asof` / `asof_protocol = 1.4.2-asof`): confirmed rows as of that still-live ancestor **at or behind visible SH** (durable + pending), **no** mempool; stamp is the asof block; unknown hash or ahead of visible SH → `asof not on chain`. Prefix keeps it off the future positional-string landmine. Requires negotiated `1.4.2-asof` (first `server.version` only). Electrum `protocol_max` stays `1.4.2`. |
 | scripthash.get_mempool / subscribe | done | Status on mempool announce **and** when SH applies a height that creates or spends the hash (posting-list probe; no Class A expand on a miss). Headers subscribe still live tip. Reorg (`TipNotify.reorg_from_height`) restatuses every watch even if the new block misses the script. Status preimage is `txid:height:blockhash:` for confirmed rows (mempool rows stay `txid:height:`). Row **order** is confirmed height-asc then mempool tail, same as `get_history`. `unsubscribe` is implemented. |
 | transaction.get / get_merkle | done | get falls back to mempool unless `asof:`; confirmed responses stamp `chain_tip`. Trailing `asof:<blockhash>` (same dialect as scripthash): get returns the tx only if confirmed at or behind that ancestor (**no** mempool); get_merkle rejects a `height` above the asof pin (`asof not on chain`). |
-| transaction.broadcast | done | Mempool accept + P2P inv. `broadcast_package` is Electrum **1.6** — wait for P2P package relay, then bump (below). |
-| relayfee / estimatefee / histogram | done | Libre min + live median |
+| transaction.broadcast | done | Mempool accept + P2P inv. `broadcast_package` wraps `accept_package` (Electrum **1.6**; P2P BIP331 still Q-48). |
+| relayfee / estimatefee / histogram / `mempool.get_info` | done | Libre min + live median. `mempool.get_info` is 1.6 (`minrelaytxfee` replaces `relayfee` for 1.6 clients; `relayfee` stays for 1.4). |
+| outpoint.get_status / subscribe / unsubscribe | done | Electrum **1.7** methods; `protocol_max` stays **1.6** until `scriptpubkey.*`. Spent = confirmed-strong or mempool. |
+| silentpayments.subscribe / unsubscribe | done | Frigate remote-scanner: session-only scan key; historical + tip notifies via tweak index / naive `tweaks_for_height`. Not Cake `tweaks.subscribe`. |
 | TLS | external | terminate at reverse proxy; node is plain TCP |
 
 ### Protocol versions
 
-`features.protocol_max` is **1.4.2** on purpose (plus dialect `1.4.2-asof`).
-Electrum 4.8 wallets speak 1.4–1.6; ElectrumX advertises 1.7. Do **not**
-raise the number ahead of the methods.
+`features.protocol_max` is **1.6** (plus dialect `1.4.2-asof`).
+Electrum 4.8 wallets speak 1.4–1.6; ElectrumX advertises 1.7. `block.headers`
+is concatenated `hex` for 1.4.x and a `headers` list for 1.6.
+`scriptpubkey.*` still missing — do **not** advertise 1.7 yet.
 
-**After P2P package relay** ([`docs/quality.md`](./docs/quality.md) **Q-48** /
-BIP331), implement Electrum **1.6** (`blockchain.transaction.broadcast_package`,
-`mempool.get_info`, `block.headers` as a list, `server.version` first) then
-**1.7** (`scriptpubkey.*`, outpoint subscribe) and raise `protocol_max` in
-the same work. Dual-serve `scripthash.*` until 1.7 clients exist. RPC
-`submitpackage` / Esplora `POST /txs/package` already accept packages; the
-Electrum bump waits on the P2P command so 1.6 is not a lie.
+P2P BIP331 package messages remain **Q-48**. Local Electrum
+`broadcast_package` uses the same `accept_package` as RPC/Esplora.
 
 ### Why `server.version` says electrs
 
@@ -156,8 +154,9 @@ probe.
 server never sees a scan key. A client that treats the JSON-RPC call as
 request/response reads one height and stops. Sparrow’s Silent Payments
 path talks Frigate `blockchain.silentpayments.subscribe` (scan key on
-the server). We do **not** implement that RPC. Sparrow still uses this
-node as a normal Electrum backend (scripthash / history / broadcast).
+the server, RAM-only for the session). That RPC is implemented on the
+tweak index (or naive height walk). `tweaks.subscribe` remains the Cake
+client-local scan.
 | DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
 
 ### Chain view (confirmed-tx snapshot token)
@@ -213,7 +212,7 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Tx | done | `/tx/:txid` full JSON, `/hex`, `/raw`, `/status`, Electrum `/merkle-proof`, BIP37 `/merkleblock-proof`, `/outspend(s)` (`vin` from the spent slot; unspent omits it). Mempool-only txs (not in Class A) use the wire body from the mempool hub (`vin`/`vout`/`size`/`weight`/`fee`, `status.confirmed` false) including `GET /tx/:txid/status`. Live `/outspend(s)` overlay mempool spends of confirmed coins; `?asof=` omits mempool. `?asof=<hash>` on `/status` and `/outspend(s)`: confirmed/spent as of that ancestor; 404 if not on chain. |
 | Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]` + `/txs/summary[/:last_seen_txid]` (dialect; next row). `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` and `/txs/mempool` use full Esplora tx JSON for mempool-only rows (wire from the hub). Last **one** SH join reused across sequential REST calls until SH-view **hash** changes; concurrent different SHs re-join. Needs SH finalize. Stamp is visible SH (durable + pending write-behind), matching live tip while jobs sit in RAM. `?asof=<hash>` on `/`, `/utxo`, `/txs`, `/txs/chain`, `/txs/summary`: confirmed join at that ancestor **at or behind visible SH**, **no** mempool; headers are the asof hash; 404 if not on chain or ahead of visible SH. |
 | `/txs/summary` | dialect | **Not** in Blockstream Esplora [`API.md`](https://github.com/Blockstream/esplora/blob/master/API.md). Compact `{txid, value, height, time}` like mempool.space `/address/:addr/txs/summary`. Confirmed only (25/page, newest first); path cursor `/:last_seen_txid` like Esplora `/txs/chain`, not mempool.space `?after_txid=`. `value` is net sats for that script in that tx (funded − spent). `time` is the confirming header timestamp (`0` if the header is missing). Mempool rows stay on `/txs` and `/txs/mempool`. Over `--max-sh-creates` → **503**. |
-| Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates` |
+| Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates`, mempool.space `/fees/recommended` and `/v1/fees/recommended` (sat/vB tiers) |
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
 | Unknown path | 404 | plain body |
