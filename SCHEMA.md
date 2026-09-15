@@ -52,13 +52,13 @@ Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
 (schema 17 uses directories; `--sptweaks` backfill regenerates).  
 **17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
 `schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 23 **before** `TxTable::open` (so a following
+Empty 17 indexes rewrite `meta` to 24 **before** `TxTable::open` (so a following
 head rebuild cannot trip the refuse). Occupied 17 Class A with creates is the
 schema-22 Class A refuse (not an index wipe).  
 **18/19→22 open:** Occupied Class A with creates is the schema-22 Class A refuse.
 If Class A is empty and `tx.head` occupancy or any `scripthash*` data exists:
 `schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)`.
-Empty 18/19 indexes rewrite `meta` to 23 **before** `ScriptHashTable::open` /
+Empty 18/19 indexes rewrite `meta` to 24 **before** `ScriptHashTable::open` /
 `TxTable::open`. `meta=22` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
 **18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
 A **20** binary refuses leftover pack8 Paged (mode 10).  
@@ -73,9 +73,9 @@ index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* the
 ```  
 **21→22 open:** occupied Class A with creates:
 `schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.
-Empty 21 rewrites `store/meta` to 23 and unlinks leftover `spent.off`.
-Table file headers 13–22 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
-Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 23.
+Empty 21 rewrites `store/meta` to 24 and unlinks leftover `spent.off`.
+Table file headers 13–24 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 24.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
 **23→24 open:** rewrite `header.body` 88 B rows to 96 B (`size:u32` + `weight:u32` = 0) via `header.body.grow` then rename; rewrite `meta` to 24. Class A tx stems kept. Empty 23 rewrites `meta`. A 23 binary refuses 24 `meta`. Crash with leftover `.grow` discards it and retries; 96-byte body with meta 23 only rewrites `meta`.
 **Endianness:** little-endian for all multi-byte integers.
@@ -92,7 +92,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |--------|----------------|
 | Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
-| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21/22/23. Flat `*.idx.meta` **refused**. |
+| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21–24. Flat `*.idx.meta` **refused**. |
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **dir** (sharded). Leftover file body **refused**. Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
@@ -136,7 +136,7 @@ Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
 | Spent spend fk | u40 | 2^40 ids ≈ 1.1e12 creates; census ~1.42e9 at h=962k. `fk ≥ 2^40` is Corrupt (no wrap) |
 | Spent vin | u16 | Consensus max inputs at 400 kWU is ~2.4k. `vin ≥ 2^16` is Corrupt |
 | Height / `confirmed[]` index | u32 | ~1e6 heights now; 10y adds ~0.5e6; year 2106 is **timestamp**, not height |
-| Loc strides | u8 (create) / u16 (inwit) | Overflow sidecar when txout ≥ 2048 B aligned or `n_out ≥ 256`; inwit ≥ 512 KiB |
+| Loc strides | u8 (create) / u16 (inwit) | Overflow sidecar: `create.loc.ovf` **u32** strides + **u32** `n_out` (schema 23); `inwit.loc.ovf` u32 strides. Sentinel when txout ≥ 2048 B aligned or `n_out ≥ 256`; inwit ≥ 512 KiB |
 | `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
 | SH megakey page | 4 KiB delta stream | Page chain; not a single-integer cap |
 | `sp_tweaks` off | u32 per segment | Already segmented |
@@ -240,7 +240,7 @@ the hot volume.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **17** |
+| 4 | 2 | Schema version (u16) — live **24** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **13–24** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -398,7 +398,7 @@ packs until write of the last height whose TipOnly had started at note
 (`lookup_started_hi`; just-written abs; fill of that write runs first). Write
 does not pread `create.loc`. Occupied 21 Class A
 is refused. Occupied 22 rewrites `create.loc.ovf` 12 B → 16 B. Leftover
-`{txout,spent,inwit}.idx` and `spent.off` are unlinked on empty 21/22/23 open.
+`{txout,spent,inwit}.idx` and `spent.off` are unlinked on empty 21–24 open.
 
 `spent_abs(off, vout) = off + 8×vout`.
 

@@ -1436,6 +1436,24 @@ impl MempoolHub {
         self.unindex_evicted(&gone);
     }
 
+    fn rollback_package_accepted(&self, accepted: &[AcceptResult]) {
+        let victims: Vec<Transaction> = accepted
+            .iter()
+            .flat_map(|r| r.replaced_txs.iter().cloned())
+            .collect();
+        let mut gone = Vec::new();
+        {
+            let mut g = self.lock_write();
+            for r in accepted.iter().rev() {
+                gone.extend(g.remove_txid_tree(&r.txid));
+            }
+        }
+        self.unindex_evicted(&gone);
+        for tx in victims {
+            let _ = self.accept_tx(&tx);
+        }
+    }
+
     /// Drop hub relay / sh / fee-delta / template state for txs already
     /// removed from the live graph (`remove_for_block_spent`, 1p1c rollback).
     fn unindex_evicted(&self, gone: &[Txid]) {
@@ -1722,14 +1740,7 @@ impl MempoolHub {
                 Ok(p) => p,
                 Err(e) => {
                     if !accepted.is_empty() {
-                        let mut gone = Vec::new();
-                        {
-                            let mut g = self.lock_write();
-                            for r in accepted.iter().rev() {
-                                gone.extend(g.remove_txid_tree(&r.txid));
-                            }
-                        }
-                        self.unindex_evicted(&gone);
+                        self.rollback_package_accepted(&accepted);
                     }
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
@@ -1752,14 +1763,7 @@ impl MempoolHub {
                     accepted.push(r);
                 }
                 Err(e) => {
-                    let mut gone = Vec::new();
-                    {
-                        let mut g = self.lock_write();
-                        for r in accepted.iter().rev() {
-                            gone.extend(g.remove_txid_tree(&r.txid));
-                        }
-                    }
-                    self.unindex_evicted(&gone);
+                    self.rollback_package_accepted(&accepted);
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());
@@ -3807,6 +3811,101 @@ mod tests {
         );
         assert_eq!(hub.orphan_count(), 0, "accept_package must not park");
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn accept_package_child_fail_restores_rbf_victims() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let q = Arc::new(q);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let low = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let low_id = low.compute_txid();
+        hub.accept_tx(&low).expect("low fee live");
+        let high = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_0000_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let high_id = high.compute_txid();
+        let mut bad_child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: high_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = hub
+            .accept_package(&[high, bad_child])
+            .expect_err("annex child must fail");
+        assert!(
+            matches!(err, AcceptError::Policy("libre annex")),
+            "got {err}"
+        );
+        assert!(!hub.contains(&high_id));
+        assert!(
+            hub.contains(&low_id),
+            "hub package rollback must restore the RBF victim"
+        );
+        let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 

@@ -3486,7 +3486,9 @@ fn persist_pending_header_path(
     }
     path.reverse();
     for hdr in &path {
-        let _ = hub.ensure_header(hdr);
+        if hub.ensure_header(hdr).is_err() {
+            break;
+        }
     }
 }
 

@@ -9,7 +9,17 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
+  as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent
+  `outspend/0` on the mined tip.
+
 ### Changed
+
+- **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
+  names `create.loc.ovf` u32/u32; empty-open paths rewrite `meta` to 24.
 
 - **Coverage gate is never-falls:** PRs must not lower production LCOV
   `LH`/`LF` vs last green `master` (`badges/coverage.json`). 90% remains
@@ -30,6 +40,13 @@ before 1.0).
   `Corrupt("invariant: height_by_hash confirmed header missing")`.
 
 ### Fixed
+
+- **Package rollback restores RBF victims:** a later package member fail
+  re-admits txs the accepted members had replaced.
+
+- **Pending-fork headers check nBits and MTP:** `ensure_header` no longer
+  persists a header-only child on claimed POW alone. Wrong bits or
+  `time <=` parent MTP is rejected; a persist walk stops at the first error.
 
 - **Package admit is all-or-nothing:** `accept_package` / RPC `submitpackage`
   rollback uses `remove_txid_tree` (hub `unindex_evicted`). Min-relay waiver
@@ -56,6 +73,11 @@ before 1.0).
   does not leave the preference set.
 
 ### Added
+
+- **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
+  as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent
+  `outspend/0` on the mined tip.
 
 - **Cheap Esplora pages (schema 24):** `header.body` stores BIP144 size and
   BIP141 weight so `/blocks` and `GET /block/:hash` JSON skip reconstruct
