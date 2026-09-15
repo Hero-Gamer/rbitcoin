@@ -944,7 +944,11 @@ impl Query {
             for (&(hfk, _, _), &(size, weight)) in
                 plan.per_header_ranges.iter().zip(plan.per_header_sw.iter())
             {
-                self.store.headers.set_size_weight(hfk, size, weight)?;
+                match self.store.headers.set_size_weight(hfk, size, weight) {
+                    Ok(()) => {}
+                    Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;

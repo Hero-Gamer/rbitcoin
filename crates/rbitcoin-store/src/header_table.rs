@@ -334,9 +334,7 @@ impl HeaderTable {
             if occ == n96 {
                 return Ok(());
             }
-            if occ == n88 {
-                n88
-            } else if occ == 0 {
+            if occ == n88 || occ == 0 {
                 n88
             } else {
                 return Err(StoreError::Corrupt("header body size"));
