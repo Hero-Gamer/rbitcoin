@@ -3662,6 +3662,101 @@ mod tests {
     }
 
     #[test]
+    fn accept_package_child_fail_restores_rbf_victims() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let q = Arc::new(q);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let low = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let low_id = low.compute_txid();
+        hub.accept_tx(&low).expect("low fee live");
+        let high = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_0000_0000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let high_id = high.compute_txid();
+        let mut bad_child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: high_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = hub
+            .accept_package(&[high, bad_child])
+            .expect_err("annex child must fail");
+        assert!(
+            matches!(err, AcceptError::Policy("libre annex")),
+            "got {err}"
+        );
+        assert!(!hub.contains(&high_id));
+        assert!(
+            hub.contains(&low_id),
+            "hub package rollback must restore the RBF victim"
+        );
+        let _ = std::fs::remove_dir_all(&mp);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn query_utxo_provider_miss_is_none() {
         let store_dir = tmp();
         let q = Query::open_or_create_tiny(&store_dir).unwrap();

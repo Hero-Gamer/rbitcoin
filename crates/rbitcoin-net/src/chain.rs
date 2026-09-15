@@ -3627,6 +3627,54 @@ mod tests {
             "fork child with nBits != parent continuation must fail: {err}"
         );
         assert_eq!(hub.query.store().header_count(), before);
+
+        let mut low_ver = b1.header;
+        low_ver.prev_blockhash = b1.block_hash();
+        low_ver.time = b1.header.time.saturating_add(600);
+        low_ver.version = Version::from_consensus(1);
+        low_ver.merkle_root = bitcoin::TxMerkleNode::from_byte_array([3u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut low_ver);
+        let err = hub.ensure_header(&low_ver).unwrap_err();
+        assert!(
+            err.to_string().contains("bad-version"),
+            "fork child below BIP65 nVersion: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+
+        let mut h2 = b1.header;
+        h2.prev_blockhash = b1.block_hash();
+        h2.time = b1.header.time.saturating_add(600);
+        h2.merkle_root = bitcoin::TxMerkleNode::from_byte_array([4u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut h2);
+        let n = hub
+            .ensure_headers_batch(&[b1.header, h2])
+            .expect("in-batch parent of a valid fork child")
+            .len();
+        assert_eq!(n, 2);
+        assert!(hub.query.store().header_count() > before);
+
+        let mut far = h2;
+        far.prev_blockhash = h2.block_hash();
+        far.time = h2.time.saturating_add(1_201);
+        far.merkle_root = bitcoin::TxMerkleNode::from_byte_array([5u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut far);
+        hub.ensure_header(&far)
+            .expect("regtest min-diff after 2×spacing must persist pow_limit bits");
+
+        let mut batch_old = h2;
+        batch_old.prev_blockhash = h2.block_hash();
+        batch_old.time = b1.header.time;
+        batch_old.merkle_root = bitcoin::TxMerkleNode::from_byte_array([6u8; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut batch_old);
+        let after_far = hub.query.store().header_count();
+        let err = hub
+            .ensure_headers_batch(&[h2, batch_old])
+            .expect_err("batch must fail closed on MTP");
+        assert!(
+            err.to_string().contains("median-time-past"),
+            "in-batch MTP fail: {err}"
+        );
+        assert_eq!(hub.query.store().header_count(), after_far);
         let _ = std::fs::remove_dir_all(dir);
     }
 
