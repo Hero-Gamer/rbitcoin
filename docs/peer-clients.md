@@ -139,7 +139,7 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **S05** | Coinbase `<=` subsidy + fees | journey exact 50 BTC empty pads; `p1_block_subsidy_halvings` | journey `subsidy+1` sat |
 | **S06** | Tx `out <= in` | journey `in==out` (zero fee) | journey `in+1` |
 | **S07** | Scripts succeed | journey anyone-can-spend `OP_TRUE`; Core `script_tests` / `tx_valid` | Core `tx_invalid` / `script_tests` reject rows |
-| **S08** | BIP68 relative finality | journey `nSequence=10` at height 101; `bip68_height_relative_lock` | journey `nSequence=200` at 101; `finality_tests` 109/110 edge |
+| **S08** | BIP68 relative finality | journey `nSequence=10` at height 101; time-type after MTP clears; `bip68_height_relative_lock` | journey `nSequence=200` at 101; time-type just short; `finality_tests` 109/110 edge |
 | **S09** | Coinbase maturity 100 | journey spend at height 101 (`created+100`) | journey spend at height 100 |
 
 Connect-path journey: `rbitcoin-test` `header_and_spending_boundaries`.
