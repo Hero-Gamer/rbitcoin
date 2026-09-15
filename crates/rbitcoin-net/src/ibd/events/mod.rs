@@ -541,6 +541,9 @@ pub(crate) fn apply_confirm_events(
                 archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                 st.max_ready_height = st.max_ready_height.max(tip);
                 max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
+                if let Some(f) = feed {
+                    f.release_isolate_if_tip(tip);
+                }
             }
             super::confirm::ConfirmEvent::Reject {
                 height,
@@ -607,7 +610,8 @@ pub(crate) fn apply_confirm_reject(
     let class = class.isolate_if_batched(batch_len);
     if class == ConfirmRejectClass::Cascade && batch_len > 1 {
         if let Some(f) = feed {
-            f.request_single_block();
+            let until = height.saturating_add(batch_len as u32).saturating_sub(1);
+            f.request_single_block(until);
         }
     }
     if class != ConfirmRejectClass::Cancelled {

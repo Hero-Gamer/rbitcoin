@@ -279,7 +279,7 @@ fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
     );
 
     let feed = Arc::new(ConfirmFeed::new());
-    feed.request_single_block();
+    feed.request_single_block(u32::MAX - 1);
     let (ev_tx, ev_rx) = std::sync::mpsc::channel();
     let accepted = Arc::new(AtomicU32::new(0));
     let (engine, _queues) = spawn_confirm_engine(
@@ -1756,6 +1756,67 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         !feed_fault.single_block(),
         "engine fault is not a cascade isolate"
     );
+}
+
+#[test]
+fn isolate_clears_only_after_original_batch_last_height() {
+    use super::{emit_confirm_reject, ConfirmFeed, ConfirmRejectClass};
+
+    let feed = ConfirmFeed::new();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let hash = BlockHash::from_byte_array([0x0a; 32]);
+    emit_confirm_reject(
+        &tx,
+        &feed,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        8,
+    )
+    .unwrap();
+    assert!(feed.single_block());
+    feed.release_isolate_if_tip(100);
+    assert!(
+        feed.single_block(),
+        "first n=1 accept must not re-pack the rest of the failed wave"
+    );
+    feed.release_isolate_if_tip(106);
+    assert!(feed.single_block(), "tip still below last height of the wave");
+    feed.release_isolate_if_tip(107);
+    assert!(
+        !feed.single_block(),
+        "tip through the original batch last height clears isolate"
+    );
+
+    let feed_n1 = ConfirmFeed::new();
+    emit_confirm_reject(
+        &tx,
+        &feed_n1,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        8,
+    )
+    .unwrap();
+    assert!(feed_n1.single_block());
+    emit_confirm_reject(
+        &tx,
+        &feed_n1,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        1,
+    )
+    .unwrap();
+    assert!(
+        feed_n1.single_block(),
+        "n=1 consensus reject must not clear isolate"
+    );
+    feed_n1.clear();
+    assert!(!feed_n1.single_block(), "rewind clear drops isolate");
 }
 
 #[test]

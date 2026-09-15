@@ -2039,6 +2039,200 @@ fn compact_child_of_invalid_disconnects_cached_same_stays() {
 }
 
 #[test]
+fn on_block_releases_cmpct_fill_after_pending() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::Network;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            payload,
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-fill-rel");
+        hub.ensure_genesis().unwrap();
+        let gen = hub
+            .query
+            .reconstruct_block_by_hash(&hub.tip_hash().unwrap().to_byte_array())
+            .unwrap()
+            .unwrap();
+        let hash = gen.block_hash();
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let session = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+        assert!(session.try_cmpct_fill(hash));
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState {
+            wants_headers: false,
+            wtxid_relay: false,
+            send_cmpct: false,
+            cmpct_version: 2u32,
+            pending_headers: HashMap::new(),
+            pending_blocks: PendingBlocks::new(),
+            pending_cmpct: HashMap::new(),
+            from_this_peer: CappedSet::new(),
+            requested_blocks: HashSet::from([hash]),
+            ban_score: 0u32,
+        };
+        handle_peer_frame(
+            frame_for(NetworkMessage::Block(gen)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(&session),
+        )
+        .await
+        .unwrap();
+        assert!(
+            session.try_cmpct_fill(hash),
+            "full block must release the pending compact fill slot"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
+fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::{
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+    use bitcoin::Network;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            payload,
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-merkle-fail");
+        hub.ensure_genesis().unwrap();
+        let gen = hub
+            .query
+            .reconstruct_block_by_hash(&hub.tip_hash().unwrap().to_byte_array())
+            .unwrap()
+            .unwrap();
+        let mut hsi = HeaderAndShortIds::from_block(&gen, 1, 2, &[0]).unwrap();
+        hsi.header.nonce = hsi.header.nonce.wrapping_add(1);
+        hsi.prefilled_txs[0].tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let hash = hsi.header.block_hash();
+        assert!(!hub.has_block(&hash));
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let session = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState {
+            wants_headers: false,
+            wtxid_relay: false,
+            send_cmpct: false,
+            cmpct_version: 2u32,
+            pending_headers: HashMap::new(),
+            pending_blocks: PendingBlocks::new(),
+            pending_cmpct: HashMap::new(),
+            from_this_peer: CappedSet::new(),
+            requested_blocks: HashSet::new(),
+            ban_score: 0u32,
+        };
+        let frame = frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: hsi.clone(),
+        }));
+        handle_peer_frame(frame.clone(), &hub, &out_tx, &mut follow, Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(follow.ban_score, 0, "first merkle-mutated unique fill GetData");
+        assert!(
+            session.has_failed_cmpct(&hash),
+            "unique-fill merkle fail must count as a failed compact"
+        );
+        assert!(
+            !hub.is_block_invalid(&hash),
+            "merkle-mutated compact must not BLOCK_FAILED the header"
+        );
+        handle_peer_frame(frame, &hub, &out_tx, &mut follow, Some(&session))
+            .await
+            .unwrap();
+        assert!(
+            follow.ban_score >= BAN_SCORE_THRESHOLD,
+            "second merkle-mutated unique fill must disconnect"
+        );
+        assert!(
+            !hub.is_block_invalid(&hash),
+            "still not BLOCK_FAILED after disconnect"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
 fn handle_peer_frame_control_and_inv_paths() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;

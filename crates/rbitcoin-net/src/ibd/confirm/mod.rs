@@ -184,6 +184,8 @@ pub(crate) struct ConfirmFeed {
     epoch: AtomicU64,
     /// Next lookup wave claims one height (isolate a multi-block consensus fail).
     force_single: AtomicBool,
+    /// Clear [`Self::force_single`] once confirmed tip reaches this height (`u32::MAX` = none).
+    force_single_until: AtomicU32,
 }
 
 pub(crate) struct ConfirmFeedInner {
@@ -207,6 +209,7 @@ impl ConfirmFeed {
             stop: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             force_single: AtomicBool::new(false),
+            force_single_until: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -221,12 +224,21 @@ impl ConfirmFeed {
         g.claimed_epoch.get(&first_h).is_some_and(|&e| e != live)
     }
 
-    pub(crate) fn request_single_block(&self) {
+    pub(crate) fn request_single_block(&self, until: u32) {
+        self.force_single_until.store(until, Ordering::Release);
         self.force_single.store(true, Ordering::Release);
     }
 
     pub(crate) fn single_block(&self) -> bool {
         self.force_single.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn release_isolate_if_tip(&self, tip: u32) {
+        let until = self.force_single_until.load(Ordering::Acquire);
+        if until != u32::MAX && tip >= until {
+            self.force_single.store(false, Ordering::Release);
+            self.force_single_until.store(u32::MAX, Ordering::Release);
+        }
     }
 
     /// Note readiness (wire lives in the body queue — denserels reloads it).
@@ -310,6 +322,7 @@ impl ConfirmFeed {
         drop(g);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.force_single.store(false, Ordering::Release);
+        self.force_single_until.store(u32::MAX, Ordering::Release);
         self.cv.notify_all();
     }
 
@@ -609,7 +622,8 @@ fn emit_confirm_reject(
 ) -> Result<(), std::sync::mpsc::SendError<ConfirmEvent>> {
     let class = class.isolate_if_batched(batch_len);
     if class == ConfirmRejectClass::Cascade && batch_len > 1 {
-        feed.request_single_block();
+        let until = height.saturating_add(batch_len as u32).saturating_sub(1);
+        feed.request_single_block(until);
     }
     tx.send(ConfirmEvent::Reject {
         height,
