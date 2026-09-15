@@ -49,21 +49,21 @@ pub(crate) fn compact_ordered(ordered: &mut VecDeque<BlockHash>, ordered_set: &H
     *ordered = next;
 }
 
-/// Densify slots per peer: drip while a tip hole exists, else half of `per_peer`.
+/// Densify slots per peer: none while a tip hole exists, else half of `per_peer`.
 ///
-/// When tip+1 is a fetch hole, densify must **not** fill every peer to
-/// `per_peer` (16) or tip multi-peer getdata has nowhere to land — mainnet
-/// sat hole=1 with conf_blks=0 while bq/feed grew tens of thousands of far
-/// bodies and peers kept making densify progress (never stall-disconnect).
+/// When tip+1 is a fetch hole, new densify would sit in Core's getdata FIFO
+/// ahead of (or mixed with) tip-hole requests — mainnet sat hole=1 with
+/// conf_blks=0 while bq/feed grew far bodies. Existing inflight densify may
+/// finish; assign issues no further far getdata until the prefix is in hand.
 pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
     if tip_hole {
-        2
+        0
     } else {
         (per_peer / 2).max(1)
     }
 }
 
-/// Per-peer densify cap: drip 2 while a tip hole is open; otherwise half of
+/// Per-peer densify cap: 0 while a tip hole is open; otherwise half of
 /// `per_peer`, or `per_peer` when this peer's EWMA bps is ≥ 2× pack median
 /// and the pack is not a tight cluster.
 pub(crate) fn densify_slots_for_peer(
@@ -148,7 +148,7 @@ mod tests {
     /// far_slots / feed_cap scale / soft-cap density (pure policy helpers).
     #[test]
     fn assign_policy_helpers_surface() {
-        assert_eq!(far_slots_per_peer(16, true), 2);
+        assert_eq!(far_slots_per_peer(16, true), 0);
         assert_eq!(far_slots_per_peer(16, false), 8);
         assert_eq!(far_slots_per_peer(8, false), 4);
 
@@ -163,12 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn densify_slots_tip_hole_is_two_for_all() {
+    fn densify_slots_tip_hole_is_zero_for_all() {
         assert_eq!(
             densify_slots_for_peer(16, true, Some(10_000_000), Some(1_000_000), false),
-            2
+            0
         );
-        assert_eq!(densify_slots_for_peer(16, true, None, None, true), 2);
+        assert_eq!(densify_slots_for_peer(16, true, None, None, true), 0);
     }
 
     #[test]

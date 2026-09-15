@@ -488,7 +488,8 @@ onto loadq). Peer speed is one EWMA of all received bytes while that peer has
 block getdata in flight. Tip-batch getdata races up to 4 peers (preferring
 higher EWMA). A hole owner with no qualifying rx is dropped from that hash
 when a sibling is pulling; the whole race set is not cleared on getdata age.
-Densify default is 8 in-flight hashes per peer (2 while a tip hole is open);
+Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
+so getdata queues can drain for tip+1);
 16 only for an EWMA outlier at ≥ 2× pack median. WARN
 `ibd: peer[…] stalled` is 30s without qualifying rx (≥64 KiB stream or a
 block / decode-fail / NotFound event) after work start. WARN

@@ -13,6 +13,8 @@
 //!   - BQ payload **≥ assign-stop** (default 1 GiB) → holes only within the
 //!     ~1 min tip-rate window **and** not past fetched_hi (do not grow past
 //!     fetched; do not densify far holes outside the window)
+//!   - While a tip-fetch hole is open: **no new densify** (cap 0) so peer
+//!     getdata queues can drain for tip+1.
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -1238,9 +1240,51 @@ mod tests {
     #[test]
     fn densify_yields_peer_slots_while_tip_hole_open() {
         use super::super::assign_plan::far_slots_per_peer;
-        assert_eq!(far_slots_per_peer(16, true), 2);
+        assert_eq!(far_slots_per_peer(16, true), 0);
         assert!(far_slots_per_peer(16, true) < 16);
         assert_eq!(far_slots_per_peer(16, false), 8);
+    }
+
+    #[test]
+    fn densify_does_not_issue_far_while_tip_plus_one_hole() {
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, 40);
+        for ht in path_lo.saturating_add(1)..=path_lo.saturating_add(31) {
+            hub.query
+                .block_queue_offer(ht, h(ht).to_byte_array(), 1, &[0u8; 80])
+                .unwrap();
+            st.body.mark_pending(h(ht));
+        }
+        seed_ewma(&mut st.slots[0], 2_000_000);
+        seed_ewma(&mut st.slots[1], 2_000_000);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assert!(
+            st.inflight.contains_key(&h(path_lo)),
+            "tip+1 must still be requested"
+        );
+        let extra: Vec<u32> = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .filter(|&ht| ht != path_lo)
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "far densify must not issue while tip+1 is a fetch hole; extra={extra:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
