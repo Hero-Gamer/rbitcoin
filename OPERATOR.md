@@ -368,10 +368,12 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--asmap PATH` | conf `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `--noseeds` | seeds on |
 | `--shindex` | conf `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--max-sh-creates N` | conf `max_sh_creates` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
 | `--sptweaks` | conf `sptweaks=1` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sptweaks-dust SATS` | conf `sptweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen ADDR` | | disabled (**requires** `--shindex`) |
 | `--esplora-listen ADDR` | | disabled (Esplora REST; **requires** `--shindex`) |
+| `--esplora-block-template` | conf `esplora_block_template=1` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc-listen ADDR` | conf `rpc_listen` | disabled — Core-class JSON-RPC subset |
 | `--rpcuser` / `--rpcpassword` | conf `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
 | `--rpcworkqueue N` | conf `rpcworkqueue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
@@ -1022,8 +1024,11 @@ always on; terminate TLS at a reverse proxy.
 
 **Requires `--shindex`.** Without it the node refuses to start.
 
-**Explicit non-goals:** explorer search/`address-prefix`, Liquid, mining
-templates, mempool.space-style catalogue UI APIs.
+**Explicit non-goals:** explorer search/`address-prefix`, Liquid,
+mempool.space-style catalogue UI APIs. Opt-in `GET /block-template` is GBT
+(`--esplora-block-template`), not a stratum/pool stack. Compact
+`/address|scripthash/…/txs/summary` is a mempool.space-shaped dialect (not
+Blockstream Esplora `API.md`); surface: [`COMPAT.md`](./COMPAT.md).
 
 ```bash
 ./target/release/rbitcoin-node \
@@ -1059,7 +1064,7 @@ rbitcoin-cli --datadir ./datadir-mainnet getblockcount
 | WebSocket | `/v1/ws` (+ `/ws`); **separate** WS connection cap (default 64) so upgrades do not starve REST |
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
-| Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`), `/txs/mempool`; complete after SH tip finalize |
+| Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](./COMPAT.md)); complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
 | Unknown / non-goal | **404** (explorer-only APIs e.g. address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. |
