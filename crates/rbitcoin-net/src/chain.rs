@@ -2689,7 +2689,12 @@ pub fn received_tx_log() -> &'static str {
 }
 
 /// Tip-follow / wire accept (`connect_at`). IBD bulk confirm does not emit this.
-pub fn log_update_tip_line(height: u32, hash: &BlockHash, header: &Header, tx_count: usize) -> String {
+pub fn log_update_tip_line(
+    height: u32,
+    hash: &BlockHash,
+    header: &Header,
+    tx_count: usize,
+) -> String {
     let time = header.time;
     let ver = header.version.to_consensus();
     format!("tip: best={hash} height={height} version={ver} tx={tx_count} date={time}")
