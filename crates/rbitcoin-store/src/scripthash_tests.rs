@@ -469,6 +469,28 @@ fn create_count_inline_slab_no_page_io_extent_stamps() {
     assert_eq!(t.take_page_ios(), 1, "extent count is last-page only");
     assert_eq!(t.create_count(&sh3).unwrap(), 300);
     assert_eq!(t.take_page_ios(), 1);
+    let ShHeadValue::Extent { last_page } = t.head_value(&sh3).unwrap().unwrap() else {
+        panic!("extent");
+    };
+    let home = t.key_home(&sh3).unwrap();
+    let body = t.body_for(&sh3, home);
+    let mut page = [0u8; SH_PAGE_SIZE];
+    body.read_at(last_page, &mut page).unwrap();
+    crate::scripthash_pages::sh_page_set_extent_creates(&mut page, 0);
+    body.write_at(last_page, &page).unwrap();
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    let walk_ios = t.take_page_ios();
+    assert!(walk_ios > 1, "unstamped extent walks pages, ios={walk_ios}");
+    put_create(&t, rec(sh3, 301, 0));
+    assert_eq!(t.entries(&sh3).unwrap().len(), 301);
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 301);
+    assert_eq!(
+        t.take_page_ios(),
+        1,
+        "append stamps reserved so count is last-page only"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

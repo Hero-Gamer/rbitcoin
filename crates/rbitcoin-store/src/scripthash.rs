@@ -1374,7 +1374,8 @@ impl ScriptHashTable {
     }
 
     /// Create count without expanding Class A. Inline/slab use pack8 `used`.
-    /// Extent reads last-page reserved (`0` = walk once, then stamp).
+    /// Extent reads last-page reserved (`0` = walk pages; no write — appender
+    /// stamps reserved on pack).
     pub fn create_count(&self, scripthash: &[u8; 32]) -> Result<u32, StoreError> {
         let Some((val, home)) = self.locate_head(scripthash)? else {
             return Ok(0);
@@ -1395,10 +1396,7 @@ impl ScriptHashTable {
             return Ok(n);
         }
         let fks = self.collect_entries_from(body, &val)?;
-        let n = u32::try_from(fks.len()).unwrap_or(u32::MAX);
-        crate::scripthash_pages::sh_page_set_extent_creates(&mut page, n);
-        body.write_at(last_page, &page)?;
-        Ok(n)
+        Ok(u32::try_from(fks.len()).unwrap_or(u32::MAX))
     }
 
     /// Live create_tx_fks for a scripthash (oldest → newest).
@@ -2124,6 +2122,10 @@ impl ScriptHashTable {
                 f
             }
         };
+        if creates == 0 && extent.is_some() {
+            let existing = self.collect_entries_from(body, &ShHeadValue::extent(last_page))?;
+            creates = u32::try_from(existing.len()).unwrap_or(u32::MAX);
+        }
         for fk in tail {
             if !sh_page_try_append(&mut page, *fk)? {
                 let new_off = self.alloc_page(body, alloc)?;

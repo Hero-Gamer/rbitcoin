@@ -4,7 +4,7 @@
 **Status:** 24 is `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied
 23 rewrites 88 B rows via `header.body.grow` then rename (size/weight 0 until
 confirm stamps or lazy fill). SH extent last-page reserved (offset 20) is create
-count (`0` = unknown). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
+count (`0` = unknown; readers walk, appender stamps on pack/append). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
 u32) so a consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22
 Class A rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `inwit.loc` (no
 Class A `{txout,spent,inwit}.idx`), LAYOUT17 without `output_count`, and spent
