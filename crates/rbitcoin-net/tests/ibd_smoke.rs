@@ -72,6 +72,13 @@ fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
     block
 }
 
+async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 async fn start_node(dir: &std::path::Path) -> P2PNode {
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     P2PNode::start(
@@ -100,6 +107,7 @@ fn seed_chain(node: &P2PNode, blocks: u32) {
 /// Cancel flag exits IBD cooperatively without hanging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ibd_cancellable_exits_when_flag_set() {
+    let _live = live_p2p_lock().await;
     let seed_dir = tmp_dir("seed-cancel");
     let peer_dir = tmp_dir("peer-cancel");
 
@@ -130,6 +138,7 @@ async fn ibd_cancellable_exits_when_flag_set() {
 /// Empty peer list is a clean protocol error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ibd_no_peers_errors() {
+    let _live = live_p2p_lock().await;
     let dir = tmp_dir("empty");
     let node = start_node(&dir).await;
     let err = node.sync(&[], IbdConfig::for_test()).await.unwrap_err();
@@ -141,6 +150,7 @@ async fn ibd_no_peers_errors() {
 /// Unreachable peer → dial fail / no peers connected (main-loop error arm).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ibd_unreachable_peer_errors() {
+    let _live = live_p2p_lock().await;
     let dir = tmp_dir("unreachable");
     let node = start_node(&dir).await;
     let mut cfg = IbdConfig::for_test();

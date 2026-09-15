@@ -484,7 +484,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                      (saw_connecting={saw_connecting} still={connecting})"
                 );
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
         }
         drop(raw);
 
