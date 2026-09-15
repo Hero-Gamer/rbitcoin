@@ -18,6 +18,11 @@ before 1.0).
 
 ### Added
 
+- **Genesis+1 IBD + empty headers EOF vs lag:** `two_node_header_and_block_sync`
+  is genesis+1 (8-block dual-seeder stays `ibd_two_peers`). Empty `headers`
+  with lag keeps header sync; drained most-work path latches `headers_done`.
+  Inflight-16 is B7.
+
 - **Serve window 16 vs 17:** inbound `getdata` of 20 witness blocks serves
   `MAX_SERVE_BLOCKS` (16); the 17th is not queued
   (`getdata_skips_reconstruct_when_serve_inflight_at_cap`). Compact live pad

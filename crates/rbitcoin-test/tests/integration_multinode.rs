@@ -1,6 +1,6 @@
 //! Multi-node P2P integration tests (all default `cargo test` + coverage).
 //!
-//! Single-hop IBD (8 blocks), cold reconstruct serve (10 blocks), dead-peer
+//! Single-hop IBD (genesis+1), cold reconstruct serve (10 blocks), dead-peer
 //! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
 //! fill, product `run_p2p --blocksonly --connect`. Hard wall timeouts; hang-free on
 //! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
@@ -198,7 +198,7 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: serde_json::Value) -> s
         .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}"))
 }
 
-/// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default suite).
+/// Two nodes, seed has genesis+1, peer IBD-syncs the short path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
     let fut = async {
@@ -207,19 +207,19 @@ async fn two_node_header_and_block_sync() {
         let peer_dir = TempDir::new().unwrap();
 
         let seed = start_node(&seed_dir).await;
-        seed_chain(&seed, 8).await;
-        assert_eq!(seed.cache.tip_height(), Some(8));
-        assert_eq!(seed.query.tip_height(), Some(Height(8)));
+        seed_chain(&seed, 1).await;
+        assert_eq!(seed.cache.tip_height(), Some(1));
+        assert_eq!(seed.query.tip_height(), Some(Height(1)));
 
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
-        assert!(n >= 8, "downloaded {n}");
-        peer.wait_height(8, Duration::from_secs(5))
+        assert!(n >= 1, "downloaded {n}");
+        peer.wait_height(1, Duration::from_secs(5))
             .await
             .expect("tip");
 
         // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
-        assert_eq!(peer.query.tip_height(), Some(Height(8)));
+        assert_eq!(peer.query.tip_height(), Some(Height(1)));
         assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
         let write = peer.query.confirm_stats().last_write_phases();
         assert!(
