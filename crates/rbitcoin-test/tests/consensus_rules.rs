@@ -151,6 +151,42 @@ fn grind_pow(block: &mut bitcoin::Block) {
     panic!("failed to grind regtest pow");
 }
 
+fn pin_subsidy_interval_two_overlay() {
+    let (_td, q, mut params) = regtest_q();
+    params.overlay_subsidy_halving_interval(2);
+    let g = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
+    let h1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &h1, Milestone::NONE)
+        .expect("interval-1 empty still 50 BTC");
+    assert_eq!(q.tip_height(), Some(Height(1)));
+
+    let old_floor = mine_regtest_block(h1.block_hash(), h1.header.time + 599, 2, vec![]);
+    let err = accept_and_connect_block(&q, &params, Height(2), &old_floor, Milestone::NONE);
+    assert!(
+        matches!(err, Err(ConsensusError::BadBlock(s)) if s.contains("coinbase excess")),
+        "50 BTC at interval must exceed the new 25 BTC floor: {err:?}"
+    );
+
+    let mut excess = mine_regtest_block(h1.block_hash(), h1.header.time + 601, 2, vec![]);
+    excess.txdata[0].output[0].value = Amount::from_sat(25_0000_0000 + 1);
+    excess.header.merkle_root = excess.compute_merkle_root().unwrap();
+    grind_pow(&mut excess);
+    let err = accept_and_connect_block(&q, &params, Height(2), &excess, Milestone::NONE);
+    assert!(
+        matches!(err, Err(ConsensusError::BadBlock(s)) if s.contains("coinbase excess")),
+        "subsidy+1 at new floor: {err:?}"
+    );
+
+    let mut h2 = mine_regtest_block(h1.block_hash(), h1.header.time + 600, 2, vec![]);
+    h2.txdata[0].output[0].value = Amount::from_sat(25_0000_0000);
+    h2.header.merkle_root = h2.compute_merkle_root().unwrap();
+    grind_pow(&mut h2);
+    accept_and_connect_block(&q, &params, Height(2), &h2, Milestone::NONE)
+        .expect("first halving empty is 25 BTC");
+    assert_eq!(q.tip_height(), Some(Height(2)));
+}
+
 #[test]
 fn h7_rejects_header_hash_above_target() {
     let (_td, q, params) = {
@@ -359,4 +395,5 @@ fn header_and_spending_boundaries() {
         "already spent: {err:?}"
     );
     pin_bip68_time_lock(&q, &params, child_txid, good.block_hash(), time);
+    pin_subsidy_interval_two_overlay();
 }

@@ -27,6 +27,29 @@ before 1.0).
 
 ### Added
 
+- **Process Electrum/Esplora on `--blocksonly`:** `node_run_p2p_short` listens
+  Electrum + Esplora after catch-up. `broadcast` / `POST /tx` junk is a
+  decode error; a consensus-invalid tx is hub `broadcast reject` / HTTP 400
+  — not `mempool not available` and not `relay disabled`. P2P/RPC `-blocksonly`
+  pins stay.
+
+- **Subsidy interval=2 overlay; H8 stays the header unit:**
+  `header_and_spending_boundaries` overlays `ChainParams` halving interval=2:
+  empty at interval−1 is still 50 BTC; at interval 25 BTC; `subsidy+1` at
+  the new floor rejects. H8 exact +2h stays
+  `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (not duplicated
+  with `with_now` on the connect pad). Subsidy **table** stays
+  `p1_block_subsidy_halvings`.
+
+- **Held 16 vs 17 park + genesis disconnect + leftover identity:**
+  `reorg_same_height_then_multi_block_branch` parks 16 and 17 equal-work
+  siblings as `valid-headers` (product held cap 320 does not FIFO at 17).
+  `chain_connect_reorg_and_growth` disconnects to genesis, reconnects the
+  suffix, then a poisoned merkle in the last 6 confirmed heights shrinks
+  tip on `Query::open`. `resume_tx_head_resolves_external_prev` leftover
+  TipOnly stamp is the one connected fk; RAM leftover map clobber stays
+  one slot. Held 320 FIFO stays `hold_body_caps_at_320_fifo`.
+
 - **Genesis+1 IBD + empty headers EOF vs lag:** `two_node_header_and_block_sync`
   is genesis+1 (8-block dual-seeder stays `ibd_two_peers`). Empty `headers`
   with lag keeps header sync; drained most-work path latches `headers_done`.

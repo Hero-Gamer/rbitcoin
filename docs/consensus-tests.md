@@ -111,7 +111,7 @@ Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
 | H5 | `bits == expected_next_bits` | `incorrect proof of work bits` | `header_and_spending_boundaries` (regtest: must equal prev) |
 | H6 | Target ≤ `pow_limit` | `target above pow limit` | `header_and_spending_boundaries` (`validate_header` with mainnet `pow_limit`) |
 | H7 | PoW valid for claimed bits | `InvalidPow` | `h7_rejects_header_hash_above_target` + smoke via `mine_regtest_block` accept |
-| H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` + `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` |
+| H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` + `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (exact +2h is the header unit; not duplicated on the connect journey) |
 | H9 | `assemble_run` future-time + BIP34/66/65 nVersion on every block | `time-too-new` / `bad-version` | `check_header_version_and_future_time_regtest` + `h9_version_floors_at_bip34_66_65` + `assemble_second_block_rejects_stale_nversion` |
 | H10 | Testnet min-difficulty after 20 min | `expected_next_bits` = powLimit | `testnet_min_difficulty_after_20_minute_gap` |
 
@@ -134,7 +134,7 @@ version floors and exact +2h).
 | C24 | Signet last 38-byte BIP141 commitment; challenge P2SH|WITNESS|DERSIG|NULLDUMMY (no CLEANSTACK) | accept / `signet solution invalid` | `witness_commitment_index_last_exact_38_byte`, `signet_challenge_op_true_twice_is_not_cleanstack`, `signet_challenge_p2wpkh_empty_witness_rejected` |
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
-| C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings` |
+| C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings`; journey overlay interval=2: `header_and_spending_boundaries` |
 | C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
 
 ## Adding a new rule

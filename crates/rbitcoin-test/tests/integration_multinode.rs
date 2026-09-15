@@ -198,6 +198,53 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: serde_json::Value) -> s
         .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}"))
 }
 
+async fn electrum_rpc(
+    addr: SocketAddr,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    let mut stream = TcpStream::connect(addr).await.expect("electrum connect");
+    let req = serde_json::json!({"id":1,"jsonrpc":"2.0","method":method,"params":params})
+        .to_string()
+        + "\n";
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .await
+        .expect("electrum read");
+    serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("electrum {method} json: {e} body={line}"))
+}
+
+async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).await.expect("esplora connect");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (status, body)
+}
+
 /// Two nodes, seed has genesis+1, peer IBD-syncs the short path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
@@ -1898,12 +1945,7 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         AcceptOutcome::IgnoredWeaker
     ));
     assert!(hub.held_body(&sibling.block_hash()).is_some());
-    let sibling2 = mine_regtest_block(p5_hash, p5.timestamp + 901, 6, vec![]);
-    assert!(matches!(
-        hub.accept_received_block(sibling2.clone()).unwrap(),
-        AcceptOutcome::IgnoredWeaker
-    ));
-    assert!(hub.held_body_count() >= 2);
+    pin_held_sixteen_vs_seventeen(hub, p5_hash, p5.timestamp);
     let tips = hub.chaintips();
     assert!(
         tips.iter()
@@ -1931,6 +1973,45 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         .precious_block(BlockHash::from_byte_array([0xab; 32]))
         .unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
+}
+
+/// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
+/// FIFO eviction at 320 stays `hold_body_caps_at_320_fifo`.
+fn pin_held_sixteen_vs_seventeen(hub: &rbitcoin_net::ChainHub, parent: BlockHash, timestamp: u32) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let mut hashes = Vec::with_capacity(17);
+    for i in 0..17u32 {
+        let b = mine_regtest_block(parent, timestamp.saturating_add(910 + i), 6, vec![]);
+        let h = b.block_hash();
+        assert!(
+            matches!(
+                hub.accept_received_block(b).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ),
+            "equal-work sibling {i} must park"
+        );
+        hashes.push(h);
+        assert!(
+            hub.held_body(&h).is_some(),
+            "sibling {i} must stay held (product cap 320)"
+        );
+    }
+    assert!(
+        hub.held_body(&hashes[0]).is_some(),
+        "17th equal-work sibling must not FIFO-evict the first (cap 320)"
+    );
+    assert!(hub.held_body(&hashes[16]).is_some());
+    assert!(hub.held_body_count() >= 17);
+    let parked = hub
+        .chaintips()
+        .into_iter()
+        .filter(|t| t.status == "valid-headers")
+        .count();
+    assert!(
+        parked >= 16,
+        "16 equal-work siblings as valid-headers, got {parked}"
+    );
 }
 
 /// Same-height competing tip with more work wins; then multi-block reorg to a
@@ -2055,6 +2136,85 @@ async fn pin_blocksonly_relay_off_after_ibd(rpc_addr: SocketAddr) {
     );
 }
 
+async fn pin_blocksonly_electrum_esplora_broadcast(
+    electrum_addr: SocketAddr,
+    esplora_addr: SocketAddr,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use serde_json::json;
+
+    let junk = electrum_rpc(
+        electrum_addr,
+        "blockchain.transaction.broadcast",
+        json!(["zz"]),
+    )
+    .await;
+    let junk_msg = junk["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !junk_msg.contains("mempool not available") && !junk_msg.contains("relay disabled"),
+        "electrum broadcast must admit (decode), got {junk}"
+    );
+    assert!(
+        junk_msg.contains("hex") || junk_msg.contains("Invalid") || junk["error"].is_object(),
+        "non-hex electrum broadcast: {junk}"
+    );
+
+    let miss = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let miss_hex = serialize_hex(&miss);
+    let bad = electrum_rpc(
+        electrum_addr,
+        "blockchain.transaction.broadcast",
+        json!([miss_hex]),
+    )
+    .await;
+    let bad_msg = bad["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        bad_msg.contains("broadcast reject"),
+        "electrum consensus-invalid must hit hub, got {bad}"
+    );
+    assert!(
+        !bad_msg.contains("mempool not available") && !bad_msg.contains("relay disabled"),
+        "electrum broadcast hub-attached: {bad}"
+    );
+
+    let (st, body) = http_post(esplora_addr, "/tx", "zz").await;
+    assert_ne!(
+        st, 503,
+        "esplora POST /tx must not be hub-missing: {st} {body}"
+    );
+    assert!(
+        !body.contains("mempool not available") && !body.contains("relay disabled"),
+        "esplora POST /tx junk: {st} {body}"
+    );
+    let (st, body) = http_post(esplora_addr, "/tx", &miss_hex).await;
+    assert_ne!(st, 503, "esplora POST /tx must hit hub: {st} {body}");
+    assert!(
+        !body.contains("mempool not available") && !body.contains("relay disabled"),
+        "esplora POST /tx consensus-invalid: {st} {body}"
+    );
+    assert_eq!(st, 400, "esplora reject is 400, got {st} {body}");
+}
+
 /// Seeder inbound `tx` after IBD is a protocol violation (`p2p_blocksonly`).
 async fn pin_blocksonly_seeder_tx_disconnects(
     rpc_addr: SocketAddr,
@@ -2130,6 +2290,8 @@ async fn node_run_p2p_short() {
         seed_chain(&seed, 3).await;
         let seed_addr = seed.local_addr;
         let rpc_addr = ephemeral_addr();
+        let electrum_addr = ephemeral_addr();
+        let esplora_addr = ephemeral_addr();
 
         let mut cfg = NodeConfig::default()
             .with_datadir(node_dir.path())
@@ -2138,6 +2300,9 @@ async fn node_run_p2p_short() {
             .with_tiny_heads();
         cfg.listen.connect = vec![seed_addr];
         cfg.listen.use_seeds = false;
+        cfg.listen.electrum = Some(electrum_addr);
+        cfg.listen.esplora = Some(esplora_addr);
+        cfg.shindex = true;
         cfg.rpc.listen = Some(rpc_addr);
         cfg.rpc.user = Some("user".into());
         cfg.rpc.password = Some("pass".into());
@@ -2147,7 +2312,7 @@ async fn node_run_p2p_short() {
 
         let seed_peers = seed.peers.clone();
         let pin = tokio::spawn(async move {
-            wait_listeners(&[rpc_addr]).await;
+            wait_listeners(&[rpc_addr, electrum_addr, esplora_addr]).await;
 
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
@@ -2185,6 +2350,7 @@ async fn node_run_p2p_short() {
             let ping = jsonrpc(rpc_addr, "ping", json!([])).await;
             assert!(ping["result"].is_null(), "{ping}");
             pin_blocksonly_relay_off_after_ibd(rpc_addr).await;
+            pin_blocksonly_electrum_esplora_broadcast(electrum_addr, esplora_addr).await;
 
             let inbound = jsonrpc(
                 rpc_addr,

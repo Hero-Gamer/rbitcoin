@@ -20,6 +20,8 @@ pub struct ChainParams {
     csv_height_overlay: Option<u32>,
     /// `-testactivationheight=segwit@H` overlay (`None` = network default).
     segwit_height_overlay: Option<u32>,
+    /// Subsidy halving interval overlay (`None` = network default).
+    subsidy_halving_overlay: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +57,7 @@ impl ChainParams {
             signet_challenge: None,
             csv_height_overlay: None,
             segwit_height_overlay: None,
+            subsidy_halving_overlay: None,
         }
     }
 
@@ -69,6 +72,7 @@ impl ChainParams {
             signet_challenge: None,
             csv_height_overlay: None,
             segwit_height_overlay: None,
+            subsidy_halving_overlay: None,
         }
     }
 
@@ -83,6 +87,7 @@ impl ChainParams {
             signet_challenge: None,
             csv_height_overlay: None,
             segwit_height_overlay: None,
+            subsidy_halving_overlay: None,
         }
     }
 
@@ -111,6 +116,7 @@ impl ChainParams {
             signet_challenge: Some(challenge),
             csv_height_overlay: None,
             segwit_height_overlay: None,
+            subsidy_halving_overlay: None,
         })
     }
 
@@ -134,11 +140,19 @@ impl ChainParams {
     }
 
     pub fn subsidy_halving_interval(&self) -> u32 {
+        if let Some(n) = self.subsidy_halving_overlay {
+            return n.max(1);
+        }
         if self.network == Network::Regtest {
             150
         } else {
             210_000
         }
+    }
+
+    /// Override the network subsidy halving interval.
+    pub fn overlay_subsidy_halving_interval(&mut self, interval: u32) {
+        self.subsidy_halving_overlay = Some(interval.max(1));
     }
 
     /// Coinbase maturity in blocks (Core default).
