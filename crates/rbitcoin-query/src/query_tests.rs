@@ -1599,6 +1599,70 @@ fn max_sh_creates_refuses_join_before_class_a() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn scripthash_create_count_includes_pending_write_behind() {
+    let (dir, q) = temp_query("sh-count-pending");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    q.commit_class_a_only(&h0, &[t0]).unwrap();
+    q.confirm_block(Height(0), &h0.hash).unwrap();
+    let sh = script_hash(&[0x51]);
+    assert_eq!(q.pending_sh_create_fks(&sh).len(), 1);
+    assert_eq!(q.scripthash_create_count(&sh).unwrap(), 1);
+    q.apply_sh_pending().unwrap();
+    assert!(q.pending_sh_create_fks(&sh).is_empty());
+    assert_eq!(q.scripthash_create_count(&sh).unwrap(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn txs_summary_net_value_is_funded_minus_spent() {
+    let (dir, q) = temp_query("txs-summary-net");
+    let (h0, mut ta0) = coinbase_block(0, Fk::NULL, None);
+    ta0.tx.output_count = 2;
+    ta0.outputs = vec![
+        OutputRecord::unspent(30_0000_0000, vec![0x51]),
+        OutputRecord::unspent(20_0000_0000, vec![0x51]),
+    ];
+    let create_txid = ta0.tx.txid;
+    let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+    let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let mut spend_txid = [0u8; 32];
+    spend_txid[0] = 0x5e;
+    let (h1, _) = coinbase_block(1, hfk0, Some(h0.hash));
+    let spend = TxApply {
+        tx: TxRecord {
+            txid: spend_txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: create_txid,
+            create_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(29_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(1), &h1, &[spend]).unwrap();
+    let sh = script_hash(&[0x51]);
+    let view = q.pin_chain_view().unwrap().unwrap();
+    let filter = HistoryFilter::esplora_chain_page(None);
+    let rows = q
+        .scripthash_history_summary_filtered_in(&sh, &filter, &view)
+        .unwrap();
+    let create_row = rows.iter().find(|r| r.txid == create_txid).unwrap();
+    let spend_row = rows.iter().find(|r| r.txid == spend_txid).unwrap();
+    assert_eq!(create_row.value, 50_0000_0000);
+    assert_eq!(spend_row.value, -1_0000_0000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many error arms
 #[test]
 fn scripthash_join_includes_spend_and_keeps_sibling_utxo() {

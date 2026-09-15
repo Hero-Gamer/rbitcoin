@@ -221,23 +221,23 @@ fn summaries_from_joined(
     filter: &HistoryFilter,
 ) -> Vec<ScriptHashTxSummary> {
     let items = history_items_from_joined(joined, filter);
+    let mut net: HashMap<Fk, i64> = HashMap::new();
+    for rec in joined {
+        net.entry(rec.out.create_tx_fk)
+            .and_modify(|v| *v = v.saturating_add(rec.out.value))
+            .or_insert(rec.out.value);
+        for sp in &rec.spender_fks {
+            net.entry(*sp)
+                .and_modify(|v| *v = v.saturating_sub(rec.out.value))
+                .or_insert(0i64.saturating_sub(rec.out.value));
+        }
+    }
     items
         .into_iter()
-        .map(|it| {
-            let mut value = 0i64;
-            for rec in joined {
-                if rec.out.create_tx_fk == it.tx_fk {
-                    value = value.saturating_add(rec.out.value);
-                }
-                if rec.spender_fks.contains(&it.tx_fk) {
-                    value = value.saturating_sub(rec.out.value);
-                }
-            }
-            ScriptHashTxSummary {
-                txid: it.txid,
-                value,
-                height: it.height,
-            }
+        .map(|it| ScriptHashTxSummary {
+            txid: it.txid,
+            value: net.get(&it.tx_fk).copied().unwrap_or(0),
+            height: it.height,
         })
         .collect()
 }
