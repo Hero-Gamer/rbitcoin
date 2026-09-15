@@ -185,7 +185,18 @@ impl Query {
         if self.get_header_by_hash(hash)?.is_none() {
             return Ok(None);
         }
-        self.ensure_height_by_hash_index(tip)?;
+        if let Err(e) = self.ensure_height_by_hash_index(tip) {
+            match self.tip_height() {
+                Some(live) if live != tip => {
+                    self.ensure_height_by_hash_index(live)?;
+                }
+                None => {
+                    self.invalidate_height_by_hash_index();
+                    return Ok(None);
+                }
+                _ => return Err(e),
+            }
+        }
         let g = self
             .height_by_hash
             .lock()
@@ -196,23 +207,31 @@ impl Query {
     /// Ensure height index matches `tip`.
     ///
     /// Incremental for any `new_tip ≠ prev_tip`. Full walk only when the map
-    /// is empty (`g.tip == None`).
+    /// is empty (`g.tip == None`). A walk that misses a height **above** the
+    /// live published tip (stale snapshot / concurrent disconnect) retries
+    /// the live tip. A miss **at or below** the live tip is Corrupt.
     pub(crate) fn ensure_height_by_hash_index(&self, tip: Height) -> Result<(), QueryError> {
+        match self.ensure_height_by_hash_index_once(tip)? {
+            None => Ok(()),
+            Some(live) => self.ensure_height_by_hash_index_once(live).map(|_| ()),
+        }
+    }
+
+    fn ensure_height_by_hash_index_once(&self, tip: Height) -> Result<Option<Height>, QueryError> {
         let mut g = self
             .height_by_hash
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if g.tip == Some(tip.0) {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(prev_tip) = g.tip {
             if tip.0 > prev_tip {
                 let mut adds = Vec::with_capacity((tip.0 - prev_tip) as usize);
                 for h in prev_tip.saturating_add(1)..=tip.0 {
                     let Some((_, rec)) = self.header_at_height(Height(h))? else {
-                        return Err(StoreError::Corrupt(
-                            "invariant: height_by_hash confirmed header missing",
-                        ));
+                        drop(g);
+                        return self.stale_or_missing(h);
                     };
                     adds.push((rec.hash, h));
                 }
@@ -224,7 +243,7 @@ impl Query {
                     g.map.insert(hash, h);
                 }
                 g.tip = Some(tip.0);
-                return Ok(());
+                return Ok(None);
             }
             if tip.0 < prev_tip {
                 let before = g.map.len() as u64;
@@ -234,15 +253,14 @@ impl Query {
                     before.saturating_sub(g.map.len() as u64),
                 );
                 g.tip = Some(tip.0);
-                return Ok(());
+                return Ok(None);
             }
         }
         let mut adds = Vec::with_capacity((tip.0 as usize).saturating_add(1));
         for h in 0..=tip.0 {
             let Some((_, rec)) = self.header_at_height(Height(h))? else {
-                return Err(StoreError::Corrupt(
-                    "invariant: height_by_hash confirmed header missing",
-                ));
+                drop(g);
+                return self.stale_or_missing(h);
             };
             adds.push((rec.hash, h));
         }
@@ -257,7 +275,20 @@ impl Query {
             g.map.insert(hash, h);
         }
         g.tip = Some(tip.0);
-        Ok(())
+        Ok(None)
+    }
+
+    fn stale_or_missing(&self, missing: u32) -> Result<Option<Height>, QueryError> {
+        match self.tip_height() {
+            Some(live) if live.0 < missing => Ok(Some(live)),
+            None if missing > 0 => {
+                self.invalidate_height_by_hash_index();
+                Ok(None)
+            }
+            _ => Err(StoreError::Corrupt(
+                "invariant: height_by_hash confirmed header missing",
+            )),
+        }
     }
 
     /// Drop height index (tests / multi-height reorg / offline confirmed rewrite).
