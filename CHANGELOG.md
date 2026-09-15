@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Added
+
+- **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
+  as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent
+  `outspend/0` on the mined tip.
+
 ### Changed
 
 - **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
@@ -66,6 +73,11 @@ before 1.0).
   does not leave the preference set.
 
 ### Added
+
+- **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
+  as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent
+  `outspend/0` on the mined tip.
 
 - **Cheap Esplora pages (schema 24):** `header.body` stores BIP144 size and
   BIP141 weight so `/blocks` and `GET /block/:hash` JSON skip reconstruct

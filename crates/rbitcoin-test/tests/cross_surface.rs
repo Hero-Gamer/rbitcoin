@@ -247,6 +247,11 @@ async fn pin_esplora_blocks_summaries(esplora_addr: SocketAddr, tip_height: u64,
     assert_eq!(from_tip.len(), 10, "{body}");
     assert_eq!(from_tip[0]["height"], tip_height, "{body}");
     assert_eq!(from_tip[0]["id"], tip_hash, "{body}");
+
+    let (st, body, past) =
+        esplora_json_array(esplora_addr, &format!("/blocks/{}", tip_height + 1)).await;
+    assert_eq!(st, 200, "GET /blocks/{{tip+1}} clamps: {body}");
+    assert_eq!(past, from_tip, "start past tip clamps to tip: {body}");
 }
 
 /// B12: `/block/:hash/txs/:start` last page shorter than 25; unknown hash 404.
@@ -270,6 +275,38 @@ async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n
     assert_eq!(st, 400, "start not multiple of 25: {body}");
     let (st, body) = http_get(esplora_addr, &format!("/block/{}/txs/0", "00".repeat(32))).await;
     assert_eq!(st, 404, "unknown block txs: {body}");
+
+    let next = u32::try_from((n_tx / 25 + 1) * 25).expect("txs start");
+    let (st, body, empty) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/{next}")).await;
+    assert_eq!(st, 200, "one-past last page: {body}");
+    assert!(empty.is_empty(), "Esplora empty page is [] not 404: {body}");
+}
+
+/// Extra Esplora HTTP leftover: txids, merkle-proof, coinbase outspend.
+async fn pin_esplora_block_txids_merkle_and_outspend(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    cb_txid: &str,
+    n_tx: usize,
+) {
+    let (st, body, ids) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txids")).await;
+    assert_eq!(st, 200, "GET /txids: {body}");
+    assert_eq!(ids.len(), n_tx, "{body}");
+    assert_eq!(ids[0].as_str(), Some(cb_txid), "{body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/merkle-proof")).await;
+    assert_eq!(st, 200, "GET merkle-proof: {body}");
+    let mp: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(mp["block_height"], 106, "{body}");
+    assert_eq!(mp["pos"], 0, "{body}");
+    assert!(mp.get("merkle").is_some(), "{body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/outspend/0")).await;
+    assert_eq!(st, 200, "GET outspend: {body}");
+    let os: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(os["spent"], false, "{body}");
 }
 
 /// B13: one live `want: blocks` + `track-tx` on this `run_p2p` process.
@@ -1046,6 +1083,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         );
     }
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
+    pin_esplora_block_txids_merkle_and_outspend(esplora_addr, new_hash, &cb_txid, txs.len()).await;
     let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
     let immature = Transaction {
         version: TxVersion::TWO,
