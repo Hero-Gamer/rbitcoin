@@ -185,18 +185,7 @@ impl Query {
         if self.get_header_by_hash(hash)?.is_none() {
             return Ok(None);
         }
-        if let Err(e) = self.ensure_height_by_hash_index(tip) {
-            match self.tip_height() {
-                Some(live) if live != tip => {
-                    self.ensure_height_by_hash_index(live)?;
-                }
-                None => {
-                    self.invalidate_height_by_hash_index();
-                    return Ok(None);
-                }
-                _ => return Err(e),
-            }
-        }
+        self.ensure_height_by_hash_index(tip)?;
         let g = self
             .height_by_hash
             .lock()

@@ -570,6 +570,15 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
         "disconnected tip hash is not confirmed"
     );
     assert_height(&q, &hashes[3], 3);
+
+    while let Some(h) = q.tip_height() {
+        q.store.confirmed.disconnect_tip(h).unwrap();
+        q.store.height_fence_pop_tip(h);
+    }
+    assert!(q.tip_height().is_none());
+    q.ensure_height_by_hash_index(Height(5))
+        .expect("unpublished height with no tip clears the map");
+    assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
