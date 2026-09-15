@@ -27,6 +27,10 @@ before 1.0).
 - **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
   names `create.loc.ovf` u32/u32; empty-open paths rewrite `meta` to 24.
 
+- **Owner docs match open():** `docs/invariants.md` names occupied-22/23
+  payload rewrites; `OPERATOR.md` occupied 22/23 rewrite **`meta` first**,
+  then ovf / `header.body`.
+
 - **IBD tip-hole assign:** densify issues no new far getdata while `hole=` is
   open; tip-hole races prefer short inflight queues; an aged hole owner is
   dropped when another peer exists. After the confirm prefix is in hand, at
@@ -38,8 +42,10 @@ before 1.0).
 
 - **`height_by_hash` tip delta:** merged confirm and multi-height shrink
   extend/retain the in-process hash→height map. A full `0..=tip` header walk
-  remains open / `invalidate` only. A hole above the published tip is
-  `Corrupt("invariant: height_by_hash confirmed header missing")`.
+  remains open / `invalidate` only. A miss **at or below** the live tip is
+  `Corrupt("invariant: height_by_hash confirmed header missing")`. A request
+  past the live tip (stale snapshot / concurrent disconnect) retries the
+  live tip so RPC/Esplora get `None`, not Corrupt.
 
 ### Fixed
 

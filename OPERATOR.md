@@ -598,8 +598,8 @@ names the dirs. Corrupt files are **not** repaired in-process.
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
 | **24** | Open. |
-| **23** | Rewrite `header.body` 88 B rows to 96 B (size/weight 0), rewrite `meta` to 24, then open. Class A tx stems kept. |
-| **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B rows to 16 B, rewrite `header.body` 88→96, rewrite `meta` to 24, then open. |
+| **23** | Rewrite `meta` to 24 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. |
+| **22**, occupied Class A | Rewrite `meta` to 24 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 24 `meta` + old ovf/header; this binary retries those file rewrites. |
 | **22**, empty Class A | Rewrite `meta` to 24, then open. |
 | **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 24, then open. |
 | **21**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |

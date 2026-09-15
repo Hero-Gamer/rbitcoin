@@ -17,7 +17,7 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 | **Load miss** | Spend annotate without `spent_range` abs; body decode without idx range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix lookup/load |
 | **Environment** | bulk IO backend uring vs pread/pwrite (single backend trait) | Keep modality only |
 | **Protocol** | BIP30 multi-spender confirmed-strong walk; same-block spends; coinbase null create | Real branches (not soft recovery) |
-| **Format migrate** | (none on current open) leftover fuse8 v1 / flat idx / Shared SH body / Paged pack8 **refuse** | Explicit wipe/rebuild |
+| **Format migrate** | Occupied 22 rewrites `create.loc.ovf` 12 B→16 B; occupied 23 rewrites `header.body` 88 B→96 B; `meta` to live `SCHEMA_VERSION`. Leftover fuse8 v1 / flat idx / Shared SH body / Paged pack8 **refuse** | Soft migrate (tmp+rename) or explicit wipe/rebuild |
 | **API / product** | RPC body from store; Electrum mempool after chain; compact → getdata | Keep |
 
 **Killed dual paths (do not reintroduce):** soft spentness recovery for wrong/missing

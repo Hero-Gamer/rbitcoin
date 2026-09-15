@@ -264,8 +264,9 @@ fn getblockchaininfo_ibd_follows_hub_not_stale_atomic() {
 fn estimatesmartfee_maps_to_product() {
     let (ctx, dir) = ctx_empty();
     let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
-    // Empty mempool → negative feerate with errors.
-    assert!(r["feerate"].as_f64().unwrap() < 0.0 || r.get("rbitcoin_model").is_some());
+    assert_eq!(r["feerate"], json!(-1.0), "{r}");
+    assert_eq!(r["errors"][0], "Insufficient data or empty mempool", "{r}");
+    assert!(r.get("rbitcoin_model").is_none(), "{r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

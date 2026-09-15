@@ -10,7 +10,9 @@
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-use rbitcoin_consensus::{accept_and_connect_block, grind_regtest_pow, ChainParams, Milestone};
+use rbitcoin_consensus::{
+    accept_and_connect_block, grind_regtest_pow, ChainParams, ConsensusError, Milestone,
+};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -111,16 +113,13 @@ fn analog_milestone_and_mempool_persist() {
     grind_regtest_pow(&mut phantom.header);
     let err = accept_and_connect_block(q, &params, Height(h + 1), &phantom, ms_hi)
         .expect_err("prevout must fail");
-    let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("prev")
-            || msg.contains("not found")
-            || msg.contains("missing")
-            || msg.contains("input")
-            || msg.contains("spend")
-            || msg.contains("lookup stage miss")
-            || msg.contains("invariant"),
-        "expected prevout / lookup-miss failure under milestone, got: {err}"
+        matches!(
+            err,
+            ConsensusError::MissingPrevout
+                | ConsensusError::BadTx("bad-txns-inputs-missingorspent")
+        ),
+        "expected missing-prevout class under milestone, got: {err}"
     );
 }
 

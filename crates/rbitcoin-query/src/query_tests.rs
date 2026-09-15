@@ -542,15 +542,68 @@ fn height_by_hash_merged_confirm_extends() {
         "archive-only orphan is not confirmed"
     );
 
-    let hole = q
-        .ensure_height_by_hash_index(Height(6))
-        .expect_err("gap above published tip");
-    assert!(hole.to_string().contains("height_by_hash"), "{hole}");
+    q.ensure_height_by_hash_index(Height(6))
+        .expect("unpublished height above live tip retries live tip");
     let after_hole = q.confirm_stats().take_window();
     assert_eq!(after_hole.height_index_full_n, 0);
     assert_eq!(after_hole.height_index_delta_n, 0);
     assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
     assert_height(&q, &hashes[4], 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
+    let (dir, q) = temp_query("h2h-stale");
+    let hashes = h2h_pad_0_4(&q);
+    q.invalidate_height_by_hash_index();
+    q.store
+        .confirmed
+        .disconnect_tip(Height(4))
+        .expect("shrink confirmed without map ensure");
+    q.store.height_fence_pop_tip(Height(4));
+    assert_eq!(q.tip_height(), Some(Height(3)));
+    q.ensure_height_by_hash_index(Height(4))
+        .expect("stale snapshot of old tip retries live tip");
+    assert!(
+        q.height_of_hash(&hashes[4]).unwrap().is_none(),
+        "disconnected tip hash is not confirmed"
+    );
+    assert_height(&q, &hashes[3], 3);
+    assert_eq!(
+        q.headers_after_locator(&[], BlockHash::from_byte_array(hashes[2]), 5)
+            .unwrap()
+            .len(),
+        1,
+        "null locator + known stop is that one header"
+    );
+    assert!(
+        q.headers_after_locator(&[], BlockHash::from_byte_array([0xee; 32]), 5)
+            .unwrap()
+            .is_empty(),
+        "null locator + unknown stop is empty"
+    );
+    let rec = q.header_at_height(Height(3)).unwrap().unwrap().1;
+    let _ = q
+        .wire_header_from_record_prev(&rec, Some(hashes[2]))
+        .unwrap();
+    assert!(q.sh_lag_heights() >= 1);
+    let _ = q.pin_sh_chain_view().unwrap();
+    let _ = q.pin_sh_chain_view_at(&hashes[3]).unwrap();
+    let _ = q.locator_hashes().unwrap();
+    let _ = q.pin_view(crate::ChainViewKind::ScriptHash, None).unwrap();
+
+    while let Some(h) = q.tip_height() {
+        q.store.confirmed.disconnect_tip(h).unwrap();
+        q.store.height_fence_pop_tip(h);
+    }
+    assert!(q.tip_height().is_none());
+    assert_eq!(q.sh_lag_heights(), 0);
+    assert_eq!(q.locator_hashes().unwrap().len(), 1);
+    assert!(q.pin_chain_view().unwrap().is_none());
+    q.ensure_height_by_hash_index(Height(5))
+        .expect("unpublished height with no tip clears the map");
+    assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
