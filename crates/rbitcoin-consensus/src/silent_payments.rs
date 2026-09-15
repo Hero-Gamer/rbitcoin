@@ -673,6 +673,14 @@ mod tests {
     use rbitcoin_store::{HeaderRecord, TxRecord};
     use serde_json::Value;
     use std::str::FromStr;
+    #[test]
+    fn taproot_matches_scan_rejects_invalid_tweak() {
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(secp(), &sk);
+        assert!(!taproot_matches_scan(&[0u8; 33], &[0u8; 32], &sk, &pk, 0));
+        assert!(!taproot_matches_scan(&[2u8; 33], &[0u8; 32], &sk, &pk, 7));
+    }
+
     fn hex_bytes(s: &str) -> Vec<u8> {
         rbitcoin_primitives::hex_decode(s).expect("hex")
     }

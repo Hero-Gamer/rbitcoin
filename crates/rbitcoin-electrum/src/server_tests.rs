@@ -3362,6 +3362,17 @@ async fn silentpayments_and_outpoint_tcp_notify() {
     let note = read_json(&mut reader).await;
     assert_eq!(note["method"], "blockchain.silentpayments.subscribe");
     assert!(note["params"]["history"].as_array().is_some());
+    let bad = json!({
+        "jsonrpc":"2.0","id":"bad",
+        "method":"blockchain.silentpayments.subscribe",
+        "params":["00", "02"]
+    });
+    let mut bad_line = serde_json::to_string(&bad).unwrap();
+    bad_line.push('\n');
+    wr.write_all(bad_line.as_bytes()).await.unwrap();
+    let bad_res = read_json(&mut reader).await;
+    assert_eq!(bad_res["id"], "bad");
+    assert!(bad_res.get("error").is_some(), "{bad_res}");
 
     let op = json!({
         "jsonrpc":"2.0","id":"op",
@@ -3449,6 +3460,22 @@ fn wallet_protocol_1_6_outpoint_and_sp_subscribe() {
     )
     .unwrap();
     assert_eq!(un, json!(true));
+
+    let unsp = dispatch_with_join(
+        "blockchain.silentpayments.unsubscribe",
+        &json!([
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+            "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36",
+            0
+        ]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(unsp.as_str().unwrap().contains("sp"), "{unsp}");
 
     let err = dispatch_with_join(
         "blockchain.transaction.broadcast_package",
