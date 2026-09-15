@@ -1,5 +1,6 @@
 //! Electrum protocol fixtures against a local server + mature regtest chain.
 
+use bitcoin::hashes::Hash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_electrum::{electrum_scripthash_hex, run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_query::Query;
@@ -168,7 +169,8 @@ async fn electrum_server_version_history_balance() {
 
     let q = Arc::new(q);
     let (tip_tx, _) = broadcast::channel(4);
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    cfg.limits.max_request_bytes = 2048;
     let handle = run_electrum(cfg, q.clone(), params.clone(), tip_tx.clone(), None)
         .await
         .expect("electrum listen");
@@ -447,6 +449,115 @@ async fn electrum_server_version_history_balance() {
     .await;
     assert_eq!(v["result"]["block_height"].as_u64(), Some(1));
     assert!(v["result"]["merkle"].as_array().is_some());
+    let v = rpc(
+        &mut stream,
+        27,
+        "blockchain.transaction.get_merkle",
+        json!([txid_hex, 2]),
+    )
+    .await;
+    let merkle_msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        merkle_msg.contains("not found"),
+        "wrong height for known txid: {v}"
+    );
+
+    let create_hex =
+        rbitcoin_primitives::display_hash_hex(&chain.matured_coinbase_txid.to_byte_array());
+    let spend_hex = rbitcoin_primitives::display_hash_hex(
+        &chain.blocks.last().unwrap().txdata[1]
+            .compute_txid()
+            .to_byte_array(),
+    );
+    let spend_h = chain.spend_height;
+    let sh_hex = electrum_scripthash_hex(&[0x51]);
+    let full = rpc(
+        &mut stream,
+        21,
+        "blockchain.scripthash.get_history",
+        json!([sh_hex]),
+    )
+    .await;
+    let full_rows = full["result"].as_array().expect("full history");
+    assert!(
+        full_rows.iter().any(|r| r["tx_hash"] == create_hex),
+        "full history missing create: {full}"
+    );
+    assert!(
+        full_rows.iter().any(|r| r["tx_hash"] == spend_hex),
+        "full history missing spend: {full}"
+    );
+    let from_create = rpc(
+        &mut stream,
+        22,
+        "blockchain.scripthash.get_history",
+        json!([sh_hex, 1]),
+    )
+    .await;
+    assert!(
+        from_create["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["tx_hash"] == create_hex),
+        "from_height at first create: {from_create}"
+    );
+    let before_spend = rpc(
+        &mut stream,
+        23,
+        "blockchain.scripthash.get_history",
+        json!([sh_hex, 1, spend_h]),
+    )
+    .await;
+    let before_rows = before_spend["result"].as_array().unwrap();
+    assert!(
+        before_rows.iter().any(|r| r["tx_hash"] == create_hex),
+        "exclusive to_height must keep create: {before_spend}"
+    );
+    assert!(
+        before_rows.iter().all(|r| r["tx_hash"] != spend_hex),
+        "exclusive to_height must hide spend: {before_spend}"
+    );
+    assert!(
+        before_rows.len() < full_rows.len(),
+        "window must be shorter than full history"
+    );
+    let open_to = rpc(
+        &mut stream,
+        24,
+        "blockchain.scripthash.get_history",
+        json!([sh_hex, 1, -1]),
+    )
+    .await;
+    assert!(
+        open_to["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["tx_hash"] == spend_hex),
+        "to_height=-1 must include spend: {open_to}"
+    );
+    let status = rpc(
+        &mut stream,
+        25,
+        "blockchain.scripthash.subscribe",
+        json!([sh_hex]),
+    )
+    .await;
+    let status_s = status["result"].as_str().expect("subscribe status");
+    assert!(!status_s.is_empty(), "{status}");
+    let bad_from = rpc(
+        &mut stream,
+        26,
+        "blockchain.scripthash.get_history",
+        json!([sh_hex, "x"]),
+    )
+    .await;
+    let bad_msg = bad_from["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        bad_msg.contains("expected number"),
+        "invalid from_height: {bad_from}"
+    );
 
     let v = rpc(&mut stream, 14, "blockchain.estimatefee", json!([2])).await;
     assert!(v["result"].as_f64().is_some() || v["result"].as_i64().is_some());
@@ -484,6 +595,33 @@ async fn electrum_server_version_history_balance() {
     // Bad params.
     let v = rpc(&mut stream, 20, "blockchain.block.header", json!(["x"])).await;
     assert!(v.get("error").is_some());
+
+    let mut dos = TcpStream::connect(handle.local_addr).await.unwrap();
+    let v = rpc(&mut dos, 1, "server.ping", json!([])).await;
+    assert!(v.get("result").is_some(), "{v}");
+    let mut at_cap = vec![b'A'; 2047];
+    at_cap.push(b'\n');
+    dos.write_all(&at_cap).await.unwrap();
+    let v = rpc(&mut dos, 2, "server.ping", json!([])).await;
+    assert!(
+        v.get("result").is_some(),
+        "line at max_request_bytes must not close: {v}"
+    );
+    let mut over = vec![b'A'; 2048];
+    over.push(b'\n');
+    dos.write_all(&over).await.unwrap();
+    {
+        let mut reader = BufReader::new(&mut dos);
+        let mut resp = String::new();
+        read_line_timeout(&mut reader, &mut resp, "request line too long").await;
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32600), "{v}");
+        assert_eq!(
+            v["error"]["message"].as_str(),
+            Some("request line too long"),
+            "{v}"
+        );
+    }
 
     handle.shutdown().await;
 }
@@ -671,6 +809,50 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         mem_hits.is_empty(),
         "get_mempool must skip leftover already connected on the tip: {mem}"
     );
+
+    let bad_hex = rpc(
+        &mut stream,
+        4,
+        "blockchain.transaction.broadcast",
+        json!(["zz"]),
+    )
+    .await;
+    let hex_msg = bad_hex["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        hex_msg.contains("hex") || hex_msg.contains("Invalid"),
+        "non-hex broadcast with hub: {bad_hex}"
+    );
+    let miss = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let miss_hex = bitcoin::consensus::encode::serialize_hex(&miss);
+    let bad_tx = rpc(
+        &mut stream,
+        5,
+        "blockchain.transaction.broadcast",
+        json!([miss_hex]),
+    )
+    .await;
+    let tx_msg = bad_tx["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        tx_msg.contains("broadcast reject"),
+        "consensus-invalid broadcast with hub: {bad_tx}"
+    );
+
     handle.shutdown().await;
 }
 
