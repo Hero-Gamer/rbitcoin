@@ -258,7 +258,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         None => None,
     };
     let expiry_hours = config.mempool.expiry_hours;
-    let immediate_relay = config.whitelist.iter().any(|w| w.contains("noban"));
+    let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
     let (mempool, mp_gen, mp_live) = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
@@ -293,10 +293,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if immediate_relay {
         node.peers.set_noban(true);
     }
-    if config.whitelist.iter().any(|w| w.contains("relay")) {
+    if config.relay {
         node.peers.set_relay_perm(true);
     }
-    if config.whitelist.iter().any(|w| w.contains("forcerelay")) {
+    if config.always_relay {
         node.peers.set_forcerelay_perm(true);
         node.peers.set_relay_perm(true);
     }
@@ -398,10 +398,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     )
     .await;
 
-    // Still enter tip-follow when work is below `-minimumchainwork` so later
+    // Still enter tip-follow when work is below `--min-chain-work` so later
     // blocks can raise the tip. Relay / getheaders stay gated on the hub floor.
     if catch_up.is_complete() && !tip_meets_min_work(&config, &node.hub) {
-        info!("ibd: tip work below -minimumchainwork — following without relay");
+        info!("ibd: tip work below --min-chain-work — following without relay");
     }
 
     // tip_follow_ready ≠ sh_tip_ready: follow/relay do not wait on SH materialize.

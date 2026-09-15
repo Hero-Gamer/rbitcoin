@@ -42,25 +42,26 @@ where
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
-    [--milestone|--assumevalid-height HEIGHT] \\\n\
-    [--maxoutbound|--max-outbound N] [--maxinbound N] [--maxconnections N] \\\n\
-    [--mempool-size-mb|--maxmempool N] \\\n\
-    [--testactivationheight name@height] [--persistmempool[=0|1]] [--whitelist SPEC] \\\n\
-    [--blocksonly] [--prefillcompact[=0|1]] [--minrelaytxfee BTC] \\\n\
-    [--limitclustercount N] [--limitclustersize KVB] [--peertimeout SECS] \\\n\
+    [--milestone HEIGHT] \\\n\
+    [--max-outbound N] [--max-inbound N] \\\n\
+    [--mempool-size-mb N] \\\n\
+    [--testactivationheight name@height] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
+    [--blocks-only] [--prefillcompact[=0|1]] [--minrelaytxfee BTC] \\\n\
+    [--limitclustercount N] [--limitclustersize KVB] [--peer-timeout SECS] \\\n\
     [--externalip IP] \\\n\
-    [--minimumchainwork HEX] \\\n\
-    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] [--uacomment STR] \\\n\
+    [--min-chain-work HEX] [--max-tip-age SECS] \\\n\
+    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] [--ua-comment STR] \\\n\
     [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest\n\
-Custom Signet: --signetchallenge HEX [--signetblocktime SECONDS].\n\
+Custom Signet: --signet-challenge HEX [--signet-block-time SECONDS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
 API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
 Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {{datadir}}/ip_asn.dat.\n\
-Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
+Milestone: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
-Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
-Peers: --maxoutbound (default 16 live download), --maxinbound (default 125), --maxconnections Core total (inbound = N-11).\n\
+Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
+Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
+  --trusted / --always-relay / --relay are inbound permission knobs (not Core -whitelist).\n\
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
@@ -71,7 +72,8 @@ Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HD
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
-IBD: up to 1024 concurrent getdata, max 16 in transit per peer.",
+IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\
+  Relay / RPC initialblockdownload after catch-up: --min-chain-work + --max-tip-age (24h).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(OperatorArgs::Help);
@@ -315,16 +317,16 @@ fn is_bool_key(key: &str) -> bool {
             | "sptweaks"
             | "esplora_block_template"
             | "esplorablocktemplate"
-            | "blocksonly"
             | "blocks_only"
             | "prefillcompact"
             | "prefill_compact"
-            | "persistmempool"
             | "persist_mempool"
-            | "noseeds"
             | "no_seeds"
             | "inhibit_suspend"
             | "inhibitsuspend"
+            | "trusted"
+            | "always_relay"
+            | "relay"
     )
 }
 
@@ -383,11 +385,9 @@ fn parse_cli_flag(
 
 fn cli_apply_err(e: crate::error::NodeError) -> ExitCode {
     let s = e.to_string();
-    if s.contains("peertimeout must be a positive integer")
-        || s.contains("minimumchainwork")
-        || s.contains("must be hexadecimal")
-        || s.contains("minimum chain")
+    if s.contains("peer-timeout must be a positive integer")
         || s.contains("Invalid minimum work")
+        || s.contains("must be hexadecimal")
     {
         eprintln!("Error: {e}");
         ExitCode::from(1)
@@ -500,9 +500,10 @@ mod tests {
         assert_eq!(cli0.milestone(), Milestone::NONE);
         assert!(!cli0.milestone().skips_scripts_at(1));
 
-        let alias0 = ready_config(["rbitcoin-node", "--assumevalid-height=0"]);
-        assert_eq!(alias0.milestone_height, 0);
-        assert_eq!(alias0.milestone(), Milestone::NONE);
+        assert!(matches!(
+            operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]),
+            Err(_)
+        ));
 
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -528,9 +529,9 @@ mod tests {
         assert_eq!(cfg.network, Network::Regtest);
         assert_eq!(
             cfg.apply_kv("chain", "signet").unwrap(),
-            crate::config::ConfApply::Applied
+            crate::config::ConfApply::Unknown("chain".into())
         );
-        assert_eq!(cfg.network, Network::Signet);
+        assert_eq!(cfg.network, Network::Regtest);
 
         let dir = tmp_datadir();
         assert_exit(
@@ -540,7 +541,7 @@ mod tests {
                 "--network=regtest",
                 "--datadir",
                 dir.to_str().unwrap(),
-                "--noseeds=1",
+                "--no-seeds=1",
                 "--log-level",
                 "error",
                 "--milestone",
@@ -550,23 +551,10 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
 
-        let dir = tmp_datadir();
         assert_exit(
-            cli_main([
-                "rbitcoin-node",
-                "--smoke",
-                "--chain=regtest",
-                "--datadir",
-                dir.to_str().unwrap(),
-                "--no-seeds",
-                "--log-level",
-                "error",
-                "--milestone",
-                "0",
-            ]),
-            ExitCode::SUCCESS,
+            cli_main(["rbitcoin-node", "--chain=regtest"]),
+            ExitCode::from(2),
         );
-        let _ = std::fs::remove_dir_all(&dir);
 
         let dir = tmp_datadir();
         let conf = dir.join("node.conf");
@@ -612,9 +600,9 @@ mod tests {
             dir.to_str().unwrap(),
             "--testactivationheight=csv@102",
             "--testactivationheight=dersig@50",
-            "--whitelist=noban@127.0.0.1",
+            "--trusted",
             "--limitclustercount=10",
-            "--minimumchainwork=0x65",
+            "--min-chain-work=0x65",
             "--no-seeds",
             "--log-level",
             "error",
@@ -635,7 +623,7 @@ mod tests {
             "regtest",
             "--datadir",
             dir.to_str().unwrap(),
-            "--minimumchainwork=test",
+            "--min-chain-work=test",
             "--log-level",
             "error",
         ]);
@@ -677,15 +665,15 @@ mod tests {
         // Missing values / parse rejects for advanced knobs.
         assert_exit(cli_main(["rbitcoin-node", "--conf"]), ExitCode::from(2));
         assert_exit(
-            cli_main(["rbitcoin-node", "--maxinbound"]),
+            cli_main(["rbitcoin-node", "--max-inbound"]),
             ExitCode::from(2),
         );
         assert_exit(
-            cli_main(["rbitcoin-node", "--maxinbound", "0"]),
+            cli_main(["rbitcoin-node", "--max-inbound", "0"]),
             ExitCode::from(2),
         );
         assert_exit(
-            cli_main(["rbitcoin-node", "--maxinbound", "nope"]),
+            cli_main(["rbitcoin-node", "--max-inbound", "nope"]),
             ExitCode::from(2),
         );
         assert_exit(
@@ -769,9 +757,9 @@ mod tests {
             "signet",
             "--datadir",
             dir.to_str().unwrap(),
-            "--signetchallenge",
+            "--signet-challenge",
             "51",
-            "--signetblocktime",
+            "--signet-block-time",
             "60",
             "--no-seeds",
             "--log-level",
@@ -784,30 +772,43 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_coreish_flags_not_only_env() {
+    fn native_cli_flags_reject_core_aliases() {
         let _g = OPERATOR_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Parse accepts Core-like aliases (not env-only).
         let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-node",
             "--smoke",
-            "--chain",
+            "--network",
             "regtest",
             "--datadir",
             dir.to_str().unwrap(),
-            "--assumevalid-height",
+            "--milestone",
             "0",
-            "--maxconnections",
+            "--max-inbound",
             "5",
-            "--maxmempool",
+            "--mempool-size-mb",
             "8",
             "--log-level",
             "error",
-            "--noseeds",
+            "--no-seeds",
         ]);
         assert_exit(code, ExitCode::SUCCESS);
+        for flag in [
+            "--chain=regtest",
+            "--assumevalid-height=0",
+            "--maxconnections=5",
+            "--maxmempool=8",
+            "--whitelist=noban@127.0.0.1",
+            "--blocksonly",
+            "--minimumchainwork=0x65",
+            "--maxtipage=3600",
+            "--uacomment=x",
+            "--peertimeout=1",
+        ] {
+            assert_exit(cli_main(["rbitcoin-node", flag]), ExitCode::from(2));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -819,7 +820,7 @@ mod tests {
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("node.conf");
-        std::fs::write(&conf, "network=signet\nmaxinbound=33\n").unwrap();
+        std::fs::write(&conf, "network=signet\nmax_inbound=33\n").unwrap();
         let data = dir.join("data");
         let code = cli_main([
             "rbitcoin-node",
@@ -860,7 +861,7 @@ mod tests {
             "--no-seeds",
             "--milestone",
             "0",
-            // no --maxinbound
+            // no --max-inbound
         ]);
         assert_exit(code, ExitCode::SUCCESS);
         assert_eq!(

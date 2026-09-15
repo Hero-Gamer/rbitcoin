@@ -54,7 +54,9 @@ pub struct RpcContext {
     /// Best-effort live peer count (updated by node; 0 if unknown).
     pub connections: Arc<AtomicU64>,
     /// Fallback IBD flag when no [`ChainHub`] is attached (tests / smoke RPC).
-    /// `getblockchaininfo` prefers [`ChainHub::in_ibd`] (Core `IsInitialBlockDownload`).
+    /// `getblockchaininfo` prefers [`ChainHub::in_ibd`] (relay-inhibited:
+    /// `--min-chain-work` + `--max-tip-age` after densify; Core RPC name
+    /// `initialblockdownload`).
     pub initial_block_download: Arc<AtomicBool>,
     /// `getnetworkinfo.subversion` (BIP14 / Core `-uacomment` shape).
     pub subversion: String,
@@ -617,9 +619,11 @@ pub(crate) fn method_help(m: &str) -> String {
                 .into()
         }
         "getblockchaininfo" => "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
-             chainwork is summed header work (regtest 2/block). size_on_disk is a \
-             walk of store file lengths (plus cold inwit when split). \
-             verificationprogress is blocks/headers (1.0 when headers is 0)."
+             initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
+             max-tip-age), not still catching up. chainwork is summed header work\n\
+             (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
+             cold inwit when split). verificationprogress is blocks/headers (1.0 when\n\
+             headers is 0)."
             .into(),
         "getblockstats" => "getblockstats hash_or_height ( stats )\n\
              Reconstruct the block and return fee / UTXO / weight statistics."

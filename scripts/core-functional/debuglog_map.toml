@@ -132,7 +132,11 @@ match = 'txrelay: park '
 emit = ['was not accepted']
 
 [[rule]]
-match = 'Error: configuration error: (.+)$'
+match = 'Error: configuration error: peer-timeout must be a positive integer\.'
+emit = ['Error: peertimeout must be a positive integer.']
+
+[[rule]]
+match = 'Error: configuration error: (?!peer-timeout must be a positive integer\.)(.+)$'
 emit = ['Error: {1}']
 
 [[rule]]

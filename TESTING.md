@@ -269,7 +269,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 
 | ID | Layer | Description |
 |----|-------|-------------|
-| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peertimeout=0` refuse / `=1` smoke, unknown conf key ignored, `minrelaytxfee=-1` and `network=nope` conf fail), help/version. Signet: genesis header plus height-1 BIP325 connect |
+| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peer-timeout=0` refuse / `=1` smoke, unknown conf key ignored, `minrelaytxfee=-1` and `network=nope` conf fail), help/version. Signet: genesis header plus height-1 BIP325 connect |
 | `three_stage_confirm_and_parent_pin_surface` | Consensus+query | Split load→scripts→write; parent pin; load ready timeout/cancel; instance-owned `last_write` / `last_pin` / `take_window` meters |
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. `DEFAULT_BODY_DEPTH == 16` stays a unit. |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
@@ -307,7 +307,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |
 | `tip_follow_after_ibd` | P2P (**default**) | After IBD, follow + one new tip via inv/headers |
 | `tip_follow_getheaders_catches_missed_blocks` | P2P (**default**) | Blocks mined while disconnected fill via post-connect `getheaders` |
-| `node_run_p2p_short` | Node (**default**) | Product `run_p2p --blocksonly` `--connect` to a live seeder (`-maxtipage` so the 3-block pad is not stale IBD); process `getpeerinfo` / `getconnectioncount` / `getnetworkinfo` / `getnettotals` / `ping` while connected (v2 outbound-full-relay); after catch-up `localrelay` / mempool `relay_enabled` stay false and `sendrawtransaction` is not `relay disabled`; Electrum `broadcast` and Esplora `POST /tx` admit decode/consensus errors (not hub-missing / not `relay disabled`); `addconnection inbound` refuses; `disconnectnode` clears `getpeerinfo`; `addnode onetry` reconnects as `manual`; seeder inbound `tx` then disconnects. Exit via `stop`. `max_run_secs=0` stays a node-crate unit |
+| `node_run_p2p_short` | Node (**default**) | Product `run_p2p` `--blocks-only` `--connect` to a live seeder (`--max-tip-age` so the 3-block pad is not stale IBD); process `getpeerinfo` / `getconnectioncount` / `getnetworkinfo` / `getnettotals` / `ping` while connected (v2 outbound-full-relay); after catch-up `localrelay` / mempool `relay_enabled` stay false and `sendrawtransaction` is not `relay disabled`; Electrum `broadcast` and Esplora `POST /tx` admit decode/consensus errors (not hub-missing / not `relay disabled`); `addconnection inbound` refuses; `disconnectnode` clears `getpeerinfo`; `addnode onetry` reconnects as `manual`; seeder inbound `tx` then disconnects. Exit via `stop`. `max_run_secs=0` stays a node-crate unit |
 
 Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_head`,
 `double_archive_keeps_tx_height_for_coinbase_maturity`, `mega_batch_duplicate_header_is_idempotent`,

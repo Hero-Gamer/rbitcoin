@@ -138,16 +138,18 @@ OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -proxy=127.0.0.1:1 -deprecatedrpc=startingheight \
   2>/dev/null)" || OUTX=""
 if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
-  && printf '%s' "$OUTX" | grep -q -- "--whitelist=noban@127.0.0.1" \
+  && printf '%s' "$OUTX" | grep -q -- "--trusted" \
   && printf '%s' "$OUTX" | grep -q -- "--limitclustercount=10" \
   && ! printf '%s' "$OUTX" | grep -q -- "permitbaremultisig" \
-  && printf '%s' "$OUTX" | grep -q -- "--maxconnections=8" \
-  && printf '%s' "$OUTX" | grep -q -- "--minimumchainwork=0x65" \
+  && printf '%s' "$OUTX" | grep -q -- "--max-inbound=1" \
+  && printf '%s' "$OUTX" | grep -q -- "--min-chain-work=0x65" \
   && printf '%s' "$OUTX" | grep -q -- "--blockversion=1337" \
   && printf '%s' "$OUTX" | grep -q -- "--mocktime=1296688602" \
-  && printf '%s' "$OUTX" | grep -q -- "--maxtipage=3600" \
+  && printf '%s' "$OUTX" | grep -q -- "--max-tip-age=3600" \
   && printf '%s' "$OUTX" | grep -q -- "--blockmintxfee=0.00000001" \
   && printf '%s' "$OUTX" | grep -q -- "--externalip=42.42.42.42" \
+  && ! printf '%s' "$OUTX" | grep -q -- "--whitelist" \
+  && ! printf '%s' "$OUTX" | grep -q -- "--maxconnections" \
   && ! printf '%s' "$OUTX" | grep -q -- "limitancestor" \
   && ! printf '%s' "$OUTX" | grep -q -- "txindex" \
   && ! printf '%s' "$OUTX" | grep -q -- "fastprune" \
@@ -162,7 +164,7 @@ fi
 
 OUTNO="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -nopersistmempool -printpriority=1 -addresstype=legacy 2>/dev/null)" || OUTNO=""
-if printf '%s' "$OUTNO" | grep -q -- "--persistmempool=0" \
+if printf '%s' "$OUTNO" | grep -q -- "--persist-mempool=0" \
   && ! printf '%s' "$OUTNO" | grep -q -- "printpriority" \
   && ! printf '%s' "$OUTNO" | grep -q -- "addresstype"; then
   echo "ok - -nopersistmempool forwarded, printpriority/addresstype ignored"
@@ -192,11 +194,44 @@ else
 fi
 
 OUT4="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -uacomment=testnode0 2>/dev/null)"
-if printf '%s' "$OUT4" | grep -q -- '--uacomment=testnode0'; then
-  echo "ok - uacomment forwarded"
+if printf '%s' "$OUT4" | grep -q -- '--ua-comment=testnode0'; then
+  echo "ok - uacomment mapped to --ua-comment"
   PASS=$((PASS + 1))
 else
-  echo "not ok - uacomment forwarded (got: $OUT4)"
+  echo "not ok - uacomment mapped to --ua-comment (got: $OUT4)"
+  FAIL=$((FAIL + 1))
+fi
+
+OUTMC="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -maxconnections=32 2>/dev/null)" || OUTMC=""
+if printf '%s' "$OUTMC" | grep -q -- '--max-inbound=21' \
+  && ! printf '%s' "$OUTMC" | grep -q -- maxconnections; then
+  echo "ok - maxconnections=32 maps to --max-inbound=21"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - maxconnections=32 maps to --max-inbound=21 (got: $OUTMC)"
+  FAIL=$((FAIL + 1))
+fi
+
+OUTWL="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
+  -whitelist=noban,relay,forcerelay@127.0.0.1 2>/dev/null)" || OUTWL=""
+if printf '%s' "$OUTWL" | grep -q -- '--trusted' \
+  && printf '%s' "$OUTWL" | grep -q -- '--relay' \
+  && printf '%s' "$OUTWL" | grep -q -- '--always-relay' \
+  && ! printf '%s' "$OUTWL" | grep -q -- whitelist; then
+  echo "ok - whitelist bits map to --trusted/--relay/--always-relay"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - whitelist bits map (got: $OUTWL)"
+  FAIL=$((FAIL + 1))
+fi
+
+OUTBO="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -blocksonly 2>/dev/null)" || OUTBO=""
+if printf '%s' "$OUTBO" | grep -q -- '--blocks-only' \
+  && ! printf '%s' "$OUTBO" | grep -q -- blocksonly; then
+  echo "ok - -blocksonly maps to --blocks-only"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -blocksonly maps to --blocks-only (got: $OUTBO)"
   FAIL=$((FAIL + 1))
 fi
 
@@ -294,7 +329,7 @@ assert_fail_msg "conf port +18444" "Error: Invalid port specified in -port: '+18
 # the shim must emit Core's line (no extra prefix). Fake node, no cargo.
 FAKE_INIT="$WORKDIR/rbitcoin-node-initerr"
 printf '%s\n' '#!/bin/sh' \
-  'echo "Error: configuration error: peertimeout must be a positive integer."' \
+  'echo "Error: configuration error: peer-timeout must be a positive integer."' \
   'exit 1' >"$FAKE_INIT"
 chmod +x "$FAKE_INIT"
 INIT_DD="$WORKDIR/initerr-peertimeout"

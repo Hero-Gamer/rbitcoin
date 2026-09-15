@@ -25,6 +25,15 @@ before 1.0).
   Core functional `assert_debug_log` / InitError needles stay in
   `scripts/core-functional/debuglog_map.toml` (no `--log-dialect` flag).
 
+- **Operator CLI is kebab-only:** `--min-chain-work`, `--max-tip-age`,
+  `--max-inbound`, `--blocks-only`, `--trusted` / `--always-relay` / `--relay`,
+  `--ua-comment`, `--peer-timeout`, `--signet-challenge`. No Core aliases on
+  `rbitcoin-node` (no `--maxconnections` / `--whitelist` / `--assumevalid-height`).
+  Core names stay on the functional `bitcoind` shim (`N−11` inbound from
+  `-maxconnections`). Densify/`enter_tip_mode` is catch-up; relay-inhibited
+  after the switch is `--min-chain-work` + `--max-tip-age`; RPC
+  `initialblockdownload` is the Core alias for that latch.
+
 - **Coverage ratchet is merge-base, not tip of master:** PRs must not lower
   the **displayed 2-decimal** production LCOV percent vs the **highest**
   green-`master` snapshot whose SHA is an ancestor of

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Test-only bitcoind → rbitcoin-node adapter. Not the operator CLI.
 
-Maps Core TestNode argv + bitcoin.conf onto rbitcoin-node flags.
-`-datadir=DIR` becomes `--datadir DIR/regtest` so the cookie lands at
-`DIR/regtest/.cookie` (what BitcoinTestFramework tails).
+Maps Core TestNode argv + bitcoin.conf onto kebab rbitcoin-node flags
+(no Core aliases on the node). `-datadir=DIR` becomes `--datadir DIR/regtest`
+so the cookie lands at `DIR/regtest/.cookie` (what BitcoinTestFramework tails).
 
 Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
 `rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
@@ -149,10 +149,81 @@ IGNORE_FLAGS = frozenset(
 )
 
 
-def forward_flag(key: str, val: str | None) -> str:
+def inbound_from_maxconnections(total: int) -> int:
+    """Core `-maxconnections=N` inbound = max(1, N-11) (10 outbound + feeler)."""
+    return max(1, int(total) - 11)
+
+
+def whitelist_node_args(spec: str) -> list[str]:
+    """Core `-whitelist=` bits → `--trusted` / `--always-relay` / `--relay`."""
+    if "@" in spec:
+        head = spec.split("@", 1)[0]
+    else:
+        bits = {
+            p.strip().lower()
+            for p in spec.replace("+", ",").split(",")
+            if p.strip()
+        }
+        known = {
+            "noban",
+            "relay",
+            "forcerelay",
+            "mempool",
+            "download",
+            "addr",
+            "in",
+            "all",
+        }
+        head = spec if bits and bits <= known else "noban,relay"
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in head.replace("+", ",").split(","):
+        p = part.strip().lower()
+        flag = {
+            "noban": "--trusted",
+            "forcerelay": "--always-relay",
+            "relay": "--relay",
+            "all": None,
+        }.get(p)
+        if p == "all":
+            for f in ("--trusted", "--always-relay", "--relay"):
+                if f not in seen:
+                    seen.add(f)
+                    out.append(f)
+            continue
+        if flag and flag not in seen:
+            seen.add(flag)
+            out.append(flag)
+    return out
+
+
+CORE_TO_NODE = {
+    "persistmempool": "persist-mempool",
+    "blocksonly": "blocks-only",
+    "peertimeout": "peer-timeout",
+    "minimumchainwork": "min-chain-work",
+    "maxtipage": "max-tip-age",
+}
+
+
+def node_args(key: str, val: str | None) -> list[str]:
+    """Map one Core flag onto rbitcoin-node argv (kebab; no Core aliases)."""
+    if key == "maxconnections":
+        if val is None:
+            return ["--max-inbound"]
+        try:
+            n = inbound_from_maxconnections(int(val))
+        except ValueError:
+            return [f"--max-inbound={val}"]
+        return [f"--max-inbound={n}"]
+    if key == "whitelist":
+        return whitelist_node_args(val or "")
+    if key == "uacomment":
+        return [f"--ua-comment={val or ''}"]
+    name = CORE_TO_NODE.get(key, key)
     if val is None:
-        return f"--{key}"
-    return f"--{key}={val}"
+        return [f"--{name}"]
+    return [f"--{name}={val}"]
 
 
 def read_conf(path: Path) -> dict[str, str]:
@@ -260,7 +331,6 @@ def translate(
     log_level: str | None = None
     want_help = False
     want_version = False
-    uacomments: list[str] = []
     extra_node_args: list[str] = []
     wipe_mempool = False
     blocksdir_arg: Path | None = None
@@ -344,7 +414,7 @@ def translate(
         elif key == "regtest":
             network = "regtest"
         elif key == "uacomment":
-            uacomments.append(val or "")
+            extra_node_args.extend(node_args(key, val))
         elif key in ("h", "help"):
             want_help = True
         elif key == "version":
@@ -364,15 +434,13 @@ def translate(
             # restart cannot reload a stale dump (mining_basic.py).
             if val is not None and str(val).lower() in ("0", "false", "off", "no"):
                 wipe_mempool = True
-            extra_node_args.append(forward_flag(key, val))
+            extra_node_args.extend(node_args(key, val))
         elif key in IGNORE_FLAGS:
             pass
         elif key in FORWARD_FLAGS:
-            extra_node_args.append(forward_flag(key, val))
+            extra_node_args.extend(node_args(key, val))
         elif key == "maxconnections":
-            extra_node_args.append(
-                f"--maxconnections={val}" if val is not None else "--maxconnections"
-            )
+            extra_node_args.extend(node_args(key, val))
         else:
             print("Error parsing command line arguments", file=sys.stderr)
             raise SystemExit(1)
@@ -455,8 +523,6 @@ def translate(
         cmd += ["--listen", extra]
     if log_level:
         cmd += ["--log-level", log_level]
-    for c in uacomments:
-        cmd += [f"--uacomment={c}"]
     cmd += extra_node_args
 
     # Core debug.log "Bound to …" announcements (feature_port.py).
