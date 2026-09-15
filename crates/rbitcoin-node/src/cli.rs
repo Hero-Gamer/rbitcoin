@@ -41,7 +41,7 @@ where
                     "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
-    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
+    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound N] [--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
@@ -62,6 +62,7 @@ Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound (default 125), --maxconnections Core total (inbound = N-11).\n\
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+  --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
 Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sptweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\

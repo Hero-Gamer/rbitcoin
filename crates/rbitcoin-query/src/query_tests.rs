@@ -1574,6 +1574,31 @@ fn scripthash_history_expands_creates_via_load_creates_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn max_sh_creates_refuses_join_before_class_a() {
+    let (dir, q) = temp_query("max-sh-creates");
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent);
+        parent = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let sh = script_hash(&[0x51]);
+    q.set_max_sh_creates(2);
+    let err = q.scripthash_chain_stats(&sh).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Rejected(m) if m == Query::MAX_SH_CREATES_MSG),
+        "{err}"
+    );
+    q.set_max_sh_creates(0);
+    let stats = q.scripthash_chain_stats(&sh).unwrap();
+    assert!(stats.funded_txo_count >= 3);
+    q.set_max_sh_creates(3);
+    assert!(q.scripthash_chain_stats(&sh).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many error arms
 #[test]
 fn scripthash_join_includes_spend_and_keeps_sibling_utxo() {

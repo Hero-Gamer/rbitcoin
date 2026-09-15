@@ -1047,6 +1047,7 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
+    query.set_max_sh_creates(config.max_sh_creates);
     if let Err(e) =
         query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
     {

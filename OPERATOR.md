@@ -761,6 +761,11 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 
 **Electrum or Esplora without `--shindex` fails at process start** (clear config error).
 
+`--max-sh-creates N` (conf `max_sh_creates`) is **0** by default (full join). When
+`N > 0`, Electrum and Esplora refuse a scripthash with more than N creates
+before Class A expand: Esplora **503** / Electrum JSON-RPC error
+`scripthash join exceeds --max-sh-creates`.
+
 Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 
 - **During IBD with shindex=1:** modest extra work (run stream); after IBD, bulk materialize is typically **tens of minutes to a few hours**.

@@ -397,6 +397,13 @@ impl Query {
         to_height: Option<i64>,
         view: &ChainView,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        let cap = self.max_sh_creates();
+        if cap > 0 {
+            let n = self.scripthash_create_count(scripthash)?;
+            if n > cap {
+                return Err(StoreError::Rejected(Query::MAX_SH_CREATES_MSG));
+            }
+        }
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.create_fks(scripthash)?;
         let pages_us = t_pages.elapsed().as_micros();

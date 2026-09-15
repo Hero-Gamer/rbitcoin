@@ -295,6 +295,8 @@ pub struct Query {
     height_by_hash: Mutex<HeightByHashIndex>,
     /// `reconstruct_archived_block` calls (`/raw` and Esplora size/weight).
     reconstruct_archived: AtomicU64,
+    /// 0 = unlimited. Electrum + Esplora SH joins refuse above this create count.
+    max_sh_creates: AtomicU32,
     /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
     thin_tweak_body_bytes: AtomicU64,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
@@ -392,6 +394,7 @@ impl Query {
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
             reconstruct_archived: AtomicU64::new(0),
+            max_sh_creates: AtomicU32::new(0),
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(0),
             disconnect_height: AtomicU32::new(0),
@@ -543,6 +546,16 @@ impl Query {
     /// Sample-and-reset archived wire-block reconstructs (Esplora `/raw` vs summary).
     pub fn sample_reset_reconstruct_archived(&self) -> u64 {
         self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    pub const MAX_SH_CREATES_MSG: &'static str = "scripthash join exceeds --max-sh-creates";
+
+    pub fn set_max_sh_creates(&self, n: u32) {
+        self.max_sh_creates.store(n, AtomicOrdering::Relaxed);
+    }
+
+    pub fn max_sh_creates(&self) -> u32 {
+        self.max_sh_creates.load(AtomicOrdering::Relaxed)
     }
 
     pub(crate) fn note_reconstruct_archived(&self) {

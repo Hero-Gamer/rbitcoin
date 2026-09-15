@@ -28,6 +28,8 @@ pub enum StoreError {
     Layout(String),
     /// Published chain prefix moved (reorg) during a confirmed-tx read. Retry.
     Stale(&'static str),
+    /// Request refused (DoS cap) — not on-disk corruption.
+    Rejected(&'static str),
 }
 
 impl StoreError {
@@ -79,6 +81,7 @@ impl fmt::Display for StoreError {
             StoreError::Unavailable => f.write_str("io_uring unavailable"),
             StoreError::Layout(m) => write!(f, "{m}"),
             StoreError::Stale(m) => write!(f, "{m}"),
+            StoreError::Rejected(m) => f.write_str(m),
         }
     }
 }
@@ -121,6 +124,7 @@ mod tests {
             StoreError::Unavailable,
             StoreError::Layout("inwit is on a cold datadir".into()),
             StoreError::Stale("chain view moved"),
+            StoreError::Rejected("scripthash join exceeds --max-sh-creates"),
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
         assert_eq!(texts[0], "invalid store magic");
@@ -136,6 +140,7 @@ mod tests {
         assert_eq!(texts[9], "io_uring unavailable");
         assert_eq!(texts[10], "inwit is on a cold datadir");
         assert_eq!(texts[11], "chain view moved");
+        assert_eq!(texts[12], "scripthash join exceeds --max-sh-creates");
         for e in &arms {
             assert!(e.source().is_none());
         }

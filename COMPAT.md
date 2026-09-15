@@ -33,6 +33,10 @@ surfaces). Those need reverse indexes and explorer-only APIs we deliberately
 omit. Block/tx **by full id** and address/**exact** scripthash history exist so
 wallets and APIs can verify and sync—not so we become mempool.space.
 
+`--max-sh-creates N` (default **0** = unlimited) refuses Electrum/Esplora SH
+joins with more than N creates: Esplora HTTP **503**, Electrum JSON-RPC error
+`scripthash join exceeds --max-sh-creates`. Stats stay full when under the cap.
+
 **Product:** `/tx/:txid/outspend/:vout` and `/outspends` emit Blockstream
 `vin` (spending input index) from the schema-22 spent slot. Mempool overlay
 uses the hub tx’s input index. Unspent remains `{spent:false}` with no `vin`.

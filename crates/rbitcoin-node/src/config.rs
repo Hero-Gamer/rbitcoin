@@ -183,6 +183,8 @@ pub struct NodeConfig {
     /// Electrum tweaks: omit P2TR outs with `value <=` this (sats). `0` serves
     /// all. Default [`rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST`] (1000).
     pub sptweaks_dust: u64,
+    /// 0 = unlimited. Electrum + Esplora refuse SH joins above this create count.
+    pub max_sh_creates: u32,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     pub milestone_height: u32,
     /// Set when conf or CLI applied `milestone` / `assumevalid_height` (including 0).
@@ -240,6 +242,7 @@ impl Default for NodeConfig {
             shindex: false,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
+            max_sh_creates: 0,
             milestone_height: 0,
             milestone_explicit: false,
             inhibit_suspend: false,
@@ -607,6 +610,11 @@ impl NodeConfig {
                 self.sptweaks_dust = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf sptweaks_dust: {e}")))?;
+            }
+            "max_sh_creates" | "maxshcreates" => {
+                self.max_sh_creates = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf max_sh_creates: {e}")))?;
             }
             "rpc_listen" | "rpclisten" => {
                 self.rpc.listen = Some(
