@@ -587,12 +587,20 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
     let _ = q
         .wire_header_from_record_prev(&rec, Some(hashes[2]))
         .unwrap();
+    assert!(q.sh_lag_heights() >= 1);
+    let _ = q.pin_sh_chain_view().unwrap();
+    let _ = q.pin_sh_chain_view_at(&hashes[3]).unwrap();
+    let _ = q.locator_hashes().unwrap();
+    let _ = q.pin_view(crate::ChainViewKind::ScriptHash, None).unwrap();
 
     while let Some(h) = q.tip_height() {
         q.store.confirmed.disconnect_tip(h).unwrap();
         q.store.height_fence_pop_tip(h);
     }
     assert!(q.tip_height().is_none());
+    assert_eq!(q.sh_lag_heights(), 0);
+    assert_eq!(q.locator_hashes().unwrap().len(), 1);
+    assert!(q.pin_chain_view().unwrap().is_none());
     q.ensure_height_by_hash_index(Height(5))
         .expect("unpublished height with no tip clears the map");
     assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
