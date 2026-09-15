@@ -6124,3 +6124,127 @@ fn outbound_feefilter_sats_ibd_even_when_relay_off() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn prefillcompact_announce_and_getdata_follow_knob() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::mine_regtest_paying;
+    use rbitcoin_primitives::Height;
+    use tokio::runtime::Builder;
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("prefillcompact-ann");
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let tip = hub.tip_hash().expect("tip");
+        let tip_time = hub.tip_header().expect("hdr").time;
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let extra = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let block = mine_regtest_paying(
+            tip,
+            tip_time + 600,
+            103,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![extra],
+        );
+        let hash = block.block_hash();
+        let prev = block.header.prev_blockhash;
+
+        let prefilled_n = |msg: &NetworkMessage| -> usize {
+            match msg {
+                NetworkMessage::CmpctBlock(CmpctBlock { compact_block }) => {
+                    compact_block.prefilled_txs.len()
+                }
+                other => panic!("expected cmpctblock, got {other:?}"),
+            }
+        };
+
+        let off = cmpct_announce_from_block(&hub, &block, 2).expect("announce");
+        assert_eq!(prefilled_n(&off), 1, "default coinbase-only");
+
+        hub.set_prefill_compact(true);
+        hub.remember_cmpct_prefill(hash, prev, vec![0, 1]);
+        let on = cmpct_announce_from_block(&hub, &block, 2).expect("announce on");
+        assert_eq!(prefilled_n(&on), 2, "knob on packs extra index");
+
+        hub.remember_cmpct_prefill(hash, prev, vec![0, 99]);
+        let fallback = cmpct_announce_from_block(&hub, &block, 2)
+            .expect("invalid prefill indexes must not drop announce");
+        assert_eq!(
+            prefilled_n(&fallback),
+            1,
+            "InvalidPrefill falls back to coinbase"
+        );
+        hub.remember_cmpct_prefill(hash, prev, vec![0, 1]);
+
+        match hub.accept_received_block(block.clone()) {
+            Ok(crate::chain::AcceptOutcome::Accepted { .. }) => {}
+            other => panic!("2-tx block must connect: {other:?}"),
+        }
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState {
+            wants_headers: false,
+            wtxid_relay: false,
+            send_cmpct: true,
+            cmpct_version: 2,
+            pending_headers: HashMap::new(),
+            pending_blocks: PendingBlocks::new(),
+            pending_cmpct: HashMap::new(),
+            from_this_peer: CappedSet::new(),
+            requested_blocks: HashSet::new(),
+            ban_score: 0,
+        };
+        let magic = Magic::from(bitcoin::Network::Regtest);
+        let raw = bitcoin::p2p::message::RawNetworkMessage::new(
+            magic,
+            NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)]),
+        );
+        let full = bitcoin::consensus::encode::serialize(&raw);
+        handle_peer_frame(
+            FramedMessage {
+                magic,
+                command: full[4..16].try_into().unwrap(),
+                payload: full[24..].to_vec(),
+            },
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let served = out_rx.try_recv().expect("getdata cmpct").expect_msg();
+        assert_eq!(prefilled_n(&served), 2, "getdata uses the same plan");
+
+        hub.set_prefill_compact(false);
+        let off_again = cmpct_announce_msg(&hub, &hash, 2).expect("announce off");
+        assert_eq!(prefilled_n(&off_again), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}

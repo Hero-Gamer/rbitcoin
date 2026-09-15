@@ -1701,19 +1701,29 @@ struct PendingCmpct {
 /// Clone only mempool bodies whose short-ids appear in `hsi` (never `list_live`).
 fn mempool_shortid_avail(
     hub: &ChainHub,
-    header: &bitcoin::block::Header,
-    nonce: u64,
+    hsi: &HeaderAndShortIds,
     version: u32,
-    short_ids: &[bitcoin::bip152::ShortId],
-) -> HashMap<bitcoin::bip152::ShortId, Vec<Transaction>> {
-    hub.mempool()
-        .and_then(|mp| mp.try_clone_matching_shortids(header, nonce, version, short_ids))
-        .unwrap_or_default()
+) -> (
+    HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
+    Option<crate::compact::CmpctFillSets>,
+) {
+    let pref: Vec<bitcoin::Wtxid> = hsi
+        .prefilled_txs
+        .iter()
+        .map(|p| p.tx.compute_wtxid())
+        .collect();
+    match hub
+        .mempool()
+        .and_then(|mp| mp.try_cmpct_avail(&hsi.header, hsi.nonce, version, &hsi.short_ids, &pref))
+    {
+        Some((txs, fill)) => (txs, Some(fill)),
+        None => (HashMap::new(), None),
+    }
 }
 
 #[derive(Debug)]
 enum CmpctReconstruct {
-    Block(Block),
+    Block(Block, Option<Box<crate::compact::CmpctFillSets>>),
     Missing(Vec<u64>),
 }
 
@@ -1723,12 +1733,38 @@ fn try_reconstruct_cmpct(
     hsi: &HeaderAndShortIds,
     version: u32,
 ) -> Option<CmpctReconstruct> {
-    let owned = mempool_shortid_avail(hub, &hsi.header, hsi.nonce, version, &hsi.short_ids);
+    let (owned, fill) = mempool_shortid_avail(hub, hsi, version);
     match crate::compact::try_reconstruct(hsi, &owned, version) {
-        Ok(block) => Some(CmpctReconstruct::Block(block)),
+        Ok(block) => Some(CmpctReconstruct::Block(block, fill.map(Box::new))),
         Err(_) if hub.mempool().is_none() => None,
         Err(m) => Some(CmpctReconstruct::Missing(m)),
     }
+}
+
+fn log_cmpct_filled(
+    hub: &ChainHub,
+    hsi: &HeaderAndShortIds,
+    block: &Block,
+    fetched: &[u64],
+    fill: Option<&crate::compact::CmpctFillSets>,
+) {
+    let stats = crate::compact::reconstruct_stats(
+        hsi,
+        block,
+        fill.unwrap_or(&crate::compact::CmpctFillSets::default()),
+        fetched,
+    );
+    rbitcoin_log::info!("{stats}");
+    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill) {
+        hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
+    }
+}
+
+fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {
+    rbitcoin_log::info!(
+        "{}",
+        crate::compact::reconstruct_getdata_stats(hash, missing_n)
+    );
 }
 
 /// Flush due / unbroadcast tx INVs onto every live session writer.
@@ -1920,15 +1956,10 @@ fn apply_cmpct_blocktxn(
     hub: &ChainHub,
     pc: &PendingCmpct,
     bt: &BlockTransactions,
-) -> Result<Block, ()> {
-    let owned = mempool_shortid_avail(
-        hub,
-        &pc.hsi.header,
-        pc.hsi.nonce,
-        pc.version,
-        &pc.hsi.short_ids,
-    );
+) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
+    let (owned, fill) = mempool_shortid_avail(hub, &pc.hsi, pc.version);
     crate::compact::apply_block_transactions(&pc.hsi, &pc.missing, bt, &owned, pc.version)
+        .map(|block| (block, fill))
         .map_err(|_| ())
 }
 
@@ -2270,8 +2301,9 @@ async fn serve_getdata(
                             try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
                     } else {
                         let ver = follow.cmpct_version.clamp(1, 2);
+                        let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
                         if let Ok(hsi) =
-                            HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &[0])
+                            HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref)
                         {
                             let _ = try_queue_served_block(
                                 out_tx,
@@ -2747,7 +2779,8 @@ async fn on_cmpctblock(
             take_requested_block(hub, &mut follow.requested_blocks, &hash);
         } else {
             match try_reconstruct_cmpct(hub, &hsi, 2) {
-                Some(CmpctReconstruct::Block(block)) => {
+                Some(CmpctReconstruct::Block(block, fill)) => {
+                    log_cmpct_filled(hub, &hsi, &block, &[], fill.as_deref());
                     follow.requested_blocks.remove(&hash);
                     follow.pending_cmpct.remove(&hash);
                     relay_new_pow_valid_block(hub, &block, session);
@@ -2783,6 +2816,7 @@ async fn on_cmpctblock(
                 }
                 Some(CmpctReconstruct::Missing(missing)) => {
                     if missing.is_empty() {
+                        log_cmpct_getdata(hash, 0);
                         queue_out(
                             out_tx,
                             NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2791,6 +2825,7 @@ async fn on_cmpctblock(
                         && !follow.pending_cmpct.contains_key(&hash)
                     {
                         follow.ban_score = follow.ban_score.saturating_add(10);
+                        log_cmpct_getdata(hash, missing.len());
                         queue_out(
                             out_tx,
                             NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2827,10 +2862,15 @@ async fn on_cmpctblock(
                                     txs_request: crate::compact::missing_request(hash, &missing),
                                 }),
                             )?;
+                            rbitcoin_log::debug!(
+                                "cmpct reconstruct {hash} missing={} awaiting blocktxn",
+                                missing.len()
+                            );
                         }
                     }
                 }
                 None => {
+                    log_cmpct_getdata(hash, 0);
                     queue_out(
                         out_tx,
                         NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2857,7 +2897,8 @@ async fn on_blocktxn(
     }
     if let Some(pc) = follow.pending_cmpct.remove(&hash) {
         match apply_cmpct_blocktxn(hub, &pc, bt) {
-            Ok(block) => {
+            Ok((block, fill)) => {
+                log_cmpct_filled(hub, &pc.hsi, &block, &pc.missing, fill.as_ref());
                 relay_new_pow_valid_block(hub, &block, session);
                 match hub.accept_received_block_async(block.clone()).await {
                     Ok(AcceptOutcome::Accepted { .. }) => {
@@ -2935,6 +2976,7 @@ async fn on_blocktxn(
             }
             Err(()) => {
                 rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+                log_cmpct_getdata(hash, pc.missing.len());
                 if let Some(s) = session {
                     s.note_failed_cmpct(hash);
                     s.release_cmpct_taken(hash);
@@ -3167,10 +3209,20 @@ fn peer_has_header(
     false
 }
 
-/// BIP152 compact tip announcement (coinbase prefilled) from an in-RAM body.
-fn cmpct_announce_from_block(block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
+/// BIP152 compact tip announcement from an in-RAM body.
+fn cmpct_announce_from_block(
+    hub: &ChainHub,
+    block: &Block,
+    cmpct_version: u32,
+) -> Option<NetworkMessage> {
     let nonce = rand_nonce();
-    let hsi = HeaderAndShortIds::from_block(block, nonce, cmpct_version.clamp(1, 2), &[0]).ok()?;
+    let ver = cmpct_version.clamp(1, 2);
+    let pref = hub
+        .cmpct_prefill_indexes(&block.block_hash())
+        .unwrap_or_else(|| vec![0]);
+    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, &pref)
+        .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
+        .ok()?;
     Some(NetworkMessage::CmpctBlock(CmpctBlock {
         compact_block: hsi,
     }))
@@ -3184,7 +3236,7 @@ fn cmpct_announce_msg(
     cmpct_version: u32,
 ) -> Option<NetworkMessage> {
     let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), hash).ok()??;
-    cmpct_announce_from_block(&block, cmpct_version)
+    cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
 /// Core `NewPoWValidBlock`: send `cmpctblock` to HB peers as soon as a
@@ -3209,6 +3261,7 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
     if block.header.prev_blockhash != tip {
         return;
     }
+    hub.remember_cmpct_prefill_from_block(block);
     if hub.ensure_header(&block.header).is_err() {
         return;
     }
@@ -3229,7 +3282,7 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
         let Some(out) = s.writer() else {
             continue;
         };
-        let Some(msg) = cmpct_announce_from_block(block, 2) else {
+        let Some(msg) = cmpct_announce_from_block(hub, block, 2) else {
             continue;
         };
         if queue_cmpct_tip_announce(&out, msg).is_ok() {
