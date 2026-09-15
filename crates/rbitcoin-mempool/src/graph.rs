@@ -64,15 +64,13 @@ pub fn frontier_feerate_from_chunks(chunks: &[Chunk], target_wu: u64) -> Option<
         return None;
     }
     let mut cum = 0u64;
-    let mut last_rate = chunks[0].fee_rate_sat_per_kvb();
     for ch in chunks {
-        last_rate = ch.fee_rate_sat_per_kvb();
         cum = cum.saturating_add(ch.weight);
         if cum >= target_wu {
-            return Some(last_rate.max(1));
+            return Some(ch.fee_rate_sat_per_kvb().max(1));
         }
     }
-    Some(last_rate.max(1))
+    None
 }
 
 /// Weight strictly above `rate_sat_per_kvb` from a best-first chunk list.
@@ -1064,6 +1062,10 @@ mod tests {
         assert_eq!(
             frontier_feerate_from_chunks(&ch, 1),
             g.frontier_feerate_sat_per_kvb(1)
+        );
+        assert!(
+            frontier_feerate_from_chunks(&ch, wa + wb + 1).is_none(),
+            "under-full target must not use last_chunk as a far-horizon rate"
         );
         assert_eq!(weight_above_from_chunks(&ch, 0), g.weight_above_feerate(0));
         // Cache: after a build, further calls do not increment rebuilds.

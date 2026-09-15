@@ -37,7 +37,10 @@ pub use accept::{
     DEFAULT_MAX_MEMPOOL_WEIGHT, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
 };
 pub use error::MempoolError;
-pub use fee_est::{default_candidate_rates, min_rate_for_capacity, BLOCK_WEIGHT_WU};
+pub use fee_est::{
+    blend_sat_kvb, default_candidate_rates, enforce_monotone_desc, fine_candidate_rates,
+    historical_far_sat_kvb, min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU,
+};
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,

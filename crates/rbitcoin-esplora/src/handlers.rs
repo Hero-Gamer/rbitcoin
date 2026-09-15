@@ -1120,7 +1120,7 @@ fn fee_estimates_sync(st: &AppState) -> Response {
             let sat_vb = if btc_kb < 0.0 {
                 1.0
             } else {
-                btc_kb * 100_000.0
+                (btc_kb * 1_000_000.0).round() / 10.0
             };
             obj.insert(t.to_string(), json!(sat_vb));
         }
