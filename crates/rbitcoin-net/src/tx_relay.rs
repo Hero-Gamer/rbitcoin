@@ -1619,10 +1619,14 @@ impl MempoolHub {
                 Ok(p) => p,
                 Err(e) => {
                     if !accepted.is_empty() {
-                        let mut g = self.lock_write();
-                        for r in accepted.iter().rev() {
-                            let _ = g.remove_txid(&r.txid);
+                        let mut gone = Vec::new();
+                        {
+                            let mut g = self.lock_write();
+                            for r in accepted.iter().rev() {
+                                gone.extend(g.remove_txid_tree(&r.txid));
+                            }
                         }
+                        self.unindex_evicted(&gone);
                     }
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
@@ -1645,10 +1649,14 @@ impl MempoolHub {
                     accepted.push(r);
                 }
                 Err(e) => {
-                    let mut g = self.lock_write();
-                    for r in accepted.iter().rev() {
-                        let _ = g.remove_txid(&r.txid);
+                    let mut gone = Vec::new();
+                    {
+                        let mut g = self.lock_write();
+                        for r in accepted.iter().rev() {
+                            gone.extend(g.remove_txid_tree(&r.txid));
+                        }
                     }
+                    self.unindex_evicted(&gone);
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());

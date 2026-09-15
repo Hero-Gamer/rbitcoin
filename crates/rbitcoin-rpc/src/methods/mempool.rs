@@ -970,12 +970,12 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     }
     let mut tx_results = serde_json::Map::new();
     let mut replaced = Vec::new();
-    let mut all_ok = true;
+    let mut pre_fail = false;
     for tx in &txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
         if burn_exceeds_max(tx, max_burn) {
-            all_ok = false;
+            pre_fail = true;
             tx_results.insert(
                 wtxid,
                 json!({
@@ -983,10 +983,8 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
                     "error": MAX_BURN_MSG,
                 }),
             );
-            continue;
-        }
-        if rpc_tx_fee_exceeds_max(ctx, tx, max_feerate) {
-            all_ok = false;
+        } else if rpc_tx_fee_exceeds_max(ctx, tx, max_feerate) {
+            pre_fail = true;
             tx_results.insert(
                 wtxid,
                 json!({
@@ -994,42 +992,64 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
                     "error": "max-fee-exceeded",
                 }),
             );
-            continue;
         }
-        match mp.accept_tx(tx) {
-            Ok(ok) => {
-                mp.note_unbroadcast(ok.txid);
-                for old in &ok.replaced {
-                    replaced.push(hash_hex_display(&old.to_byte_array()));
+    }
+    if pre_fail {
+        return Ok(json!({
+            "package_msg": "transaction failed",
+            "tx-results": tx_results,
+            "replaced-transactions": replaced,
+        }));
+    }
+    let mut to_admit = Vec::new();
+    for tx in &txs {
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let txid_s = hash_hex_display(&tx.compute_txid().to_byte_array());
+        if mp.contains(&tx.compute_txid()) {
+            tx_results.insert(wtxid, json!({ "txid": txid_s }));
+        } else {
+            to_admit.push(tx.clone());
+        }
+    }
+    if !to_admit.is_empty() {
+        match mp.accept_package(&to_admit) {
+            Ok(oks) => {
+                for (tx, ok) in to_admit.iter().zip(oks.iter()) {
+                    mp.note_unbroadcast(ok.txid);
+                    for old in &ok.replaced {
+                        replaced.push(hash_hex_display(&old.to_byte_array()));
+                    }
+                    tx_results.insert(
+                        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+                        json!({
+                            "txid": hash_hex_display(&ok.txid.to_byte_array()),
+                            "vsize": ok.weight / 4,
+                            "fees": { "base": sat_btc_json(ok.fee_sat as i64) },
+                        }),
+                    );
                 }
-                tx_results.insert(
-                    wtxid,
-                    json!({
-                        "txid": txid,
-                        "vsize": ok.weight / 4,
-                        "fees": { "base": sat_btc_json(ok.fee_sat as i64) },
-                    }),
-                );
             }
             Err(e) => {
                 let reason = accept_reject_reason(&e);
-                if reason == "txn-already-in-mempool" {
-                    tx_results.insert(wtxid, json!({ "txid": txid }));
-                    continue;
+                for tx in &to_admit {
+                    tx_results.insert(
+                        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+                        json!({
+                            "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                            "error": reason,
+                        }),
+                    );
                 }
-                all_ok = false;
-                tx_results.insert(
-                    wtxid,
-                    json!({
-                        "txid": txid,
-                        "error": reason,
-                    }),
-                );
+                return Ok(json!({
+                    "package_msg": "transaction failed",
+                    "tx-results": tx_results,
+                    "replaced-transactions": replaced,
+                }));
             }
         }
     }
     Ok(json!({
-        "package_msg": if all_ok { "success" } else { "transaction failed" },
+        "package_msg": "success",
         "tx-results": tx_results,
         "replaced-transactions": replaced,
     }))

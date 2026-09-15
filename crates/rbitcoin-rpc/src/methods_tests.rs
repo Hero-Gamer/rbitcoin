@@ -1742,6 +1742,50 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
 }
 
 #[test]
+fn submitpackage_child_fail_leaves_no_package_txs() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) =
+        mature_coinbase_spend(&ctx, 49_0000_0000, ScriptBuf::from_bytes(vec![0x51]));
+    let bad = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let bad_hex = hex_encode(serialize(&bad));
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, bad_hex])],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert!(
+        !ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "child-fail must not leave the parent live"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scantxoutset_txout_fallback_without_shindex() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     ctx.query.set_sh_index_enabled(false);
