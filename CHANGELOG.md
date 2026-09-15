@@ -11,6 +11,10 @@ before 1.0).
 
 ### Changed
 
+- **Coverage gate is never-falls:** PRs must not lower production LCOV
+  `LH`/`LF` vs last green `master` (`badges/coverage.json`). 90% remains
+  only a floor when that baseline is missing. [`TESTING.md`](TESTING.md).
+
 - **IBD tip-hole assign:** densify issues no new far getdata while `hole=` is
   open; tip-hole races prefer short inflight queues; an aged hole owner is
   dropped when another peer exists. After the confirm prefix is in hand, at

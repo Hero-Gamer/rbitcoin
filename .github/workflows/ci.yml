@@ -184,8 +184,9 @@ jobs:
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
 
-  # Line-coverage gate (≥90% production-file LCOV LH/LF). Slow; waits for the
-  # fast gates so a red fmt/clippy/test does not start this job. Required.
+  # Line-coverage gate (never below last green master LCOV LH/LF; 90% floor).
+  # Slow; waits for the fast gates so a red fmt/clippy/test does not start
+  # this job. Required.
   coverage:
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]

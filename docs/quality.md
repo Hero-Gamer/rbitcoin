@@ -69,7 +69,7 @@ level peers cannot ignore.
 
 Not Open, not Completed — see **Won't fix** for retired Q-ids.
 
-- 100% line-coverage theater (gate is **≥90%** LCOV + property-focused tests)
+- 100% line-coverage theater (gate is **never-falls vs last green master**, 90% floor, + property-focused tests)
 - Rewriting secp256k1 / rust-bitcoin / tokio “to reduce deps”
 - Flattening purpose-built io_uring machines to batched `pread` (see [`io-modality.md`](./io-modality.md))
 - Core-compatible full RPC surface; graphical block-explorer APIs
@@ -181,7 +181,7 @@ head drain, BIP141 nonce skip. Wallet-client last-slot SH join + optional
 
 | ID | Item | Resolution |
 |----|------|------------|
-| **Q-52** | CRAP report on coverage LCOV | `scripts/coverage-crap.sh` after the ≥90% gate; `coverage/crap.json`. Regression gate: **Q-55**. |
+| **Q-52** | CRAP report on coverage LCOV | `scripts/coverage-crap.sh` after the never-falls gate; `coverage/crap.json`. Regression gate: **Q-55**. |
 | **Q-53** | Miri on primitives | `scripts/miri.sh` → `cargo miri test -p rbitcoin-primitives`. Nightly `miri.yml`. Islands: **Q-56**. |
 | **Q-50** | Perf meter residual coverage | Named write/lookup/load inventory + explicit `other=`. Fat `other=` later is confirm-perf, not a meter program |
 | **Q-36** | Perf log diet | Default INFO is `ibd: progress`. `ibd: perf` / `ibd: sizes` / `ibd: perf_dbg` at DEBUG |
