@@ -73,37 +73,57 @@ That file is the only playbook (changelog cut, Highlights, tag, `vX.Y.x`,
 ## Ship via worktree + pull request
 
 ```text
-worktree branch → many small commits → one PR → poll GitHub Actions → green PR
+one session worktree → topic branch per PR → many small commits → poll CI → green
 ```
 
 A plan is **not complete** until that PR’s **required** checks are green.
 
+**One git worktree per agent session**, not per PR. Reuse it so `target/dev`
+stays warm. Topic branches still change per PR.
+
 ```bash
+# once per session
 git fetch origin
-git worktree add -b <area>/<short-name> /tmp/rbtc-<short> origin/master
-export CARGO_TARGET_DIR=/tmp/rbtc-<short>/target/dev
+git worktree add /tmp/rbtc-<session> origin/master
+cd /tmp/rbtc-<session>
+git switch -c <area>/<short-name>
+export CARGO_TARGET_DIR=/tmp/rbtc-<session>/target/dev
+git config --worktree user.name 'rearden-grok[bot]'
+git config --worktree user.email '317016512+rearden-grok[bot]@users.noreply.github.com'
+
+# next PR in the same session (do not add another worktree)
+git fetch origin
+git switch -C <area>/<next-short> origin/master
 ```
 
 | Rule | Detail |
 |------|--------|
 | Base | Current `origin/master` (or `main`) |
 | Branch | Topic name — **never** commit the plan onto `master` |
-| `CARGO_TARGET_DIR` | Inside the worktree (`…/target/dev`) |
+| Worktree | **One** `/tmp/rbtc-<session>` for the session. Do **not** `git worktree add` per PR. |
+| `CARGO_TARGET_DIR` | Inside the session worktree (`…/target/dev`) |
 | Identity | Worktree-only `git config --worktree user.name` / `user.email` for bot commits |
 | Remotes | Worktrees **share** `origin`. Fetch/pull is HTTPS; `pushurl` is SSH. Never `git remote set-url origin` (collapses the split). |
 
-### After merge cleanup
+### After merge (keep the session worktree)
 
-Once the PR is **merged** (not while open):
+Once the PR is **merged** (not while open), delete the **topic branch** only:
 
 ```bash
-git worktree remove /tmp/rbtc-<short>
-git branch -d <area>/<short-name>
-git push https://github.com/reardencode/rbitcoin.git --delete <area>/<short-name>
+git fetch origin --prune
+git switch -C <area>/<next-short> origin/master   # or stay detached on origin/master
+git branch -d <area>/<merged-short>
+git push https://github.com/reardencode/rbitcoin.git --delete <area>/<merged-short>
+```
+
+Remove the worktree when the **session** ends, not after each PR:
+
+```bash
+git worktree remove /tmp/rbtc-<session>
 git fetch origin --prune
 ```
 
-Keep `master` / `main`, the primary checkout, and any **open-PR** worktree.
+Keep `master` / `main`, the primary checkout, and other sessions’ worktrees.
 Do **not** delete a branch that still has an open PR. Do **not**
 `git push --delete master`.
 
@@ -218,7 +238,8 @@ Green-then-refactor is fine as **two** commits when each stands alone.
 1. Pass targeted tests for what you touched.
 2. Commit. A plan is **many commits, one PR**.
 3. `cargo clippy --workspace --all-targets -- -D warnings`, then push the
-   worktree branch and open or update the plan PR. Poll to green.
+   topic branch (same session worktree) and open or update the plan PR. Poll
+   to green.
 
 Operator musl/release binaries are [`docs/releases.md`](docs/releases.md) /
 [`docs/reproducible-builds.md`](docs/reproducible-builds.md) — not a plan-PR
