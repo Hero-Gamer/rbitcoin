@@ -55,7 +55,7 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 |-----------|-------------|---------------------------|
 | **Hopeless advertised tip** | Connecting headers with `header_branch_vs_tip` **Less** and announced height **+ 288 < our tip** | `request_disconnect` (no ban). `noban` keeps the session. |
 | **`follow_live`** | ≤ `max_outbound` | Stale extra at cap **rotates** one random outbound full-relay (not `noban`) then dials a replacement. |
-| **GetData serve inflight** | **16** full `Block`/`CmpctBlock` per session writer | Writer saturating-decrements after send so unpaired compact tip announce cannot wrap to `usize::MAX`. Announce is not counted on this cap (a burst would starve reconstruct). Extra inv hashes not reconstructed. |
+| **GetData serve inflight** | **16** full `Block`/`CmpctBlock` per session writer | Writer saturating-decrements after send so unpaired compact tip announce cannot wrap to `usize::MAX`. Announce is not counted on this cap (a burst would starve reconstruct). Extra inv hashes in the same inbound `getdata` past 16 are dropped (not a Core `ProcessGetData` leftover queue). |
 | **Tip-follow catch-up getdata** | **16** (`MAX_SERVE_BLOCKS`) hashes per ask | `requested` tracks inflight; after those bodies connect, drain asks the next window. Asking the whole header path left hashes stuck while the peer served only 16. |
 | **`from_this_peer`** / **`announced_wtx`** | **50_000** txids / wtxids per session | Insertion-order FIFO at cap (re-insert is a no-op; oldest dropped). ~32 B extra deque RAM per peer at full. |
 | **`pending_blocks`** | **128** decoded bodies / session | Insert evicts the **oldest** hash (FIFO). Unsolicited BIP130 window still 16. |

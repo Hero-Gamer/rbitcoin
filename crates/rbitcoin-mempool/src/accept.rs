@@ -1044,19 +1044,39 @@ impl ActiveMempool {
         Ok(())
     }
 
+    /// Last tx is a child; every other member is an in-package ancestor of it.
+    fn package_is_child_with_parents(txs: &[Transaction]) -> bool {
+        if txs.len() < 2 {
+            return false;
+        }
+        let ids: BTreeMap<Txid, usize> = txs
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| (tx.compute_txid(), i))
+            .collect();
+        let child = txs.len() - 1;
+        let mut ancestors = BTreeSet::new();
+        let mut stack = vec![child];
+        while let Some(i) = stack.pop() {
+            for inp in &txs[i].input {
+                let Some(&pi) = ids.get(&inp.previous_output.txid) else {
+                    continue;
+                };
+                if ancestors.insert(txs[pi].compute_txid()) {
+                    stack.push(pi);
+                }
+            }
+        }
+        !ancestors.is_empty() && ancestors.len() + 1 == txs.len()
+    }
+
     /// Combined ancestor/CPFP package fee vs total weight against `sat_kvb`.
     pub fn package_meets_min_relay(
         txs: &[Transaction],
         utxos: &impl UtxoProvider,
         sat_kvb: u64,
     ) -> bool {
-        let pkg_ids: BTreeSet<Txid> = txs.iter().map(Transaction::compute_txid).collect();
-        let linked = txs.iter().any(|tx| {
-            tx.input
-                .iter()
-                .any(|inp| pkg_ids.contains(&inp.previous_output.txid))
-        });
-        if !linked {
+        if !Self::package_is_child_with_parents(txs) {
             return false;
         }
         let mut created: BTreeMap<Txid, Vec<u64>> = BTreeMap::new();
@@ -1117,7 +1137,7 @@ impl ActiveMempool {
                 }
                 Err(e) => {
                     for r in accepted.iter().rev() {
-                        let _ = self.remove_txid(&r.txid);
+                        let _ = self.remove_txid_tree(&r.txid);
                     }
                     return Err(e);
                 }
@@ -2939,6 +2959,130 @@ mod tests {
             .expect("combined package meets min-relay");
         assert_eq!(res.len(), 2);
         assert_eq!(mp.live_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_package_unrelated_below_min_not_waived() {
+        let dir = tmp_dir();
+        let op_a = OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let op_p = OutPoint {
+            txid: Txid::from_byte_array([0xcd; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        map.insert(
+            op_a,
+            coin(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }),
+        );
+        map.insert(
+            op_p,
+            coin(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }),
+        );
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_min_relay_sat_kvb(50_000);
+        let extra = spend_tx(op_a, 99_800);
+        let parent = spend_tx(op_p, 99_800);
+        let parent_id = parent.compute_txid();
+        let child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            1_000,
+        );
+        assert!(
+            !ActiveMempool::package_meets_min_relay(
+                &[extra.clone(), parent.clone(), child.clone()],
+                &utxos,
+                50_000
+            ),
+            "unrelated extra is not a child-with-parents tree"
+        );
+        let err = mp
+            .accept_package(&[extra.clone(), parent, child], &utxos, TIP_OK)
+            .expect_err("extra below min-relay must not ride the 1p1c waiver");
+        assert!(
+            matches!(err, AcceptError::Policy("min relay fee")),
+            "got {err}"
+        );
+        assert_eq!(mp.live_count(), 0, "package rollback must leave nothing");
+        assert!(!mp.graph.contains(&extra.compute_txid()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_package_child_fail_evicts_spenders() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_min_relay_sat_kvb(50_000);
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::from_sat(49_800),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+            ],
+        };
+        let parent_id = parent.compute_txid();
+        let spender = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            1_000,
+        );
+        let spender_id = spender.compute_txid();
+        let err = mp.accept_tx(&spender, &utxos, TIP_OK).unwrap_err();
+        assert!(matches!(err, AcceptError::Orphaned { .. }), "got {err}");
+        assert_eq!(mp.orphan_count(), 1);
+        let mut bad_child = spend_tx(
+            OutPoint {
+                txid: parent_id,
+                vout: 1,
+            },
+            1_000,
+        );
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = mp
+            .accept_package(&[parent, bad_child], &utxos, TIP_OK)
+            .expect_err("annex child must fail");
+        assert!(
+            matches!(err, AcceptError::Policy("libre annex")),
+            "got {err}"
+        );
+        assert!(
+            !mp.graph.contains(&parent_id),
+            "below-min-relay parent must roll back"
+        );
+        assert!(
+            !mp.graph.contains(&spender_id),
+            "promoted spender of the parent must leave with it"
+        );
+        assert_eq!(mp.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

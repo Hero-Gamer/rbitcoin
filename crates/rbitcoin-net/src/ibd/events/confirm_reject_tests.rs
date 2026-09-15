@@ -1691,6 +1691,7 @@ fn post_lookup_reject_rewinds_taken_hi() {
     ];
     for &(err, rewind) in cases {
         hub.query.set_lookup_taken_hi(Some(2));
+        hub.query.set_lookup_started_hi(Some(2));
         assert!(
             hub.query.lookup_already_taken(2),
             "precondition: height 2 is taken before {err}"
@@ -1701,6 +1702,11 @@ fn post_lookup_reject_rewinds_taken_hi() {
                 hub.query.lookup_taken_hi(),
                 tip,
                 "{err} must rewind taken_hi to confirmed tip"
+            );
+            assert_eq!(
+                hub.query.lookup_started_hi(),
+                tip,
+                "{err} must rewind started_hi with taken_hi"
             );
             assert!(
                 !hub.query.lookup_already_taken(2),
@@ -2291,6 +2297,29 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         );
     }
     assert!(st.headers_done);
+
+    st.headers_done = false;
+    st.empty_header_streak = 1;
+    st.max_peer_height = 313_000;
+    st.ordered.clear();
+    st.ordered_set.clear();
+    st.inflight.clear();
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(
+        st.headers_done,
+        "empty-EOF latches even when advertised height is far ahead"
+    );
 
     use super::super::MAX_PEER_POOL;
     for i in 0..MAX_PEER_POOL {

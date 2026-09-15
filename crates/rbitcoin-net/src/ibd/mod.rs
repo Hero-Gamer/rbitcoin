@@ -887,10 +887,9 @@ pub async fn ibd_cancellable(
             last_status = Instant::now();
         }
 
-        // Exit when the connected best chain has no remainder and peers are
-        // not advertising a header hole. Never exit solely on headers_done
-        // while max_peer_height still dwarfs our tip (signet: false
-        // headers_done at h≈2000 with peers at ~313k). See `exit` module.
+        // Exit when the connected best chain has no remainder. Empty-EOF
+        // (`headers_done`) means we do not chase advertised height (less-work
+        // fork / bogus `version.start_height`). See `ibd_caught_up`.
         let tip_h = hub.tip_height().unwrap_or(0);
         if ibd_caught_up(&st, tip_h) {
             offer_confirm_ready(

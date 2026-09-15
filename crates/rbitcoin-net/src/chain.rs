@@ -1697,15 +1697,19 @@ impl ChainHub {
         if branch.is_none() && !self.is_connected(&hash) {
             return Err(NetError::Consensus("Block not found".into()));
         }
+        let prev = *self.precious.read().unwrap();
         *self.precious.write().unwrap() = Some(hash);
-        if let Some(branch) = branch {
+        let result = if let Some(branch) = branch {
             match self.accept_branch_inner(&branch) {
-                Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => {}
-                Err(e) => return Err(e),
-                Ok(_) => {}
+                Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => Ok(()),
+                other => other.map(|_| ()),
             }
         } else {
-            let _ = self.try_apply_held()?;
+            self.try_apply_held().map(|_| ())
+        };
+        if let Err(e) = result {
+            *self.precious.write().unwrap() = prev;
+            return Err(e);
         }
         Ok(())
     }
@@ -3891,6 +3895,53 @@ mod tests {
             "reconsider must not park the old tip"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn precious_invalid_does_not_leave_preference() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let mut prev = gen;
+        let mut main = Vec::new();
+        for i in 0..3u32 {
+            let b = mine(prev, 1_300_040_000 + i, i + 1);
+            prev = b.block_hash();
+            main.push(b);
+        }
+        for b in &main {
+            hub.accept_block(b.clone()).unwrap();
+        }
+        let mut prev = gen;
+        let mut eq = Vec::new();
+        for i in 0..3u32 {
+            let b = mine(prev, 1_300_041_000 + i, i + 1);
+            prev = b.block_hash();
+            eq.push(b);
+        }
+        for b in &eq {
+            hub.accept_received_block(b.clone()).unwrap();
+        }
+        hub.precious_block(eq[2].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
+        hub.precious_block(main[2].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), main[2].block_hash());
+
+        hub.invalidate_block(eq[2].block_hash()).unwrap();
+        let err = hub.precious_block(eq[2].block_hash()).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("invalid"),
+            "{err}"
+        );
+        hub.reconsider_block(eq[2].block_hash()).unwrap();
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            main[2].block_hash(),
+            "failed precious must not leave a preference reconsider would honor"
+        );
+        hub.precious_block(eq[2].block_hash()).unwrap();
+        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
         let _ = std::fs::remove_dir_all(dir);
     }
 

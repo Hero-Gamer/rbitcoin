@@ -24,7 +24,7 @@ Esplora** (with `--shindex`) for address/script history.
 | `--rpcuser` / `--rpcpassword` | unset | HTTP Basic credentials |
 | Cookie | **on** when listen set and no user/pass | `{datadir}/.cookie` as `user:password` |
 | `--shindex` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
-| `--rpcworkqueue N` | **unset** | Unlimited in-flight HTTP RPC and unlimited JSON-RPC array batch. When set, a batch with more than N methods is HTTP 500 `Work queue depth exceeded` (same as a full queue) |
+| `--rpcworkqueue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
 
 TLS is external (reverse proxy). Non-loopback binds still use cookie or user/pass
 (always authenticated).
@@ -92,7 +92,7 @@ still wait for durable SH when shindex is on.
 | `decoderawtransaction` | All networks. Decode hex. Optional `iswitness`: `false` refuses a BIP141 marker (`-22 TX decode failed`). Extra trailing bytes also `-22`. `scriptSig.asm` is rust-bitcoin, not Core `ScriptToAsmStr` sighash suffixes. Coinbase vin is `txid`/`vout`/`scriptSig` (not Core's `coinbase` key). |
 | `decodescript` | All networks. `asm`, Core-style `type`, `hex`, and `address` when `Address::from_script` succeeds. No `p2sh` wrap, `segwit` wrap, or `desc` / miniscript. |
 | `validateaddress` | All networks. Valid: `isvalid`, `address`, `scriptPubKey`, `isscript`, `iswitness`, plus `witness_version` / `witness_program` when segwit. Invalid (parse fail or wrong chain): `{isvalid: false}` only — no `error` / `error_locations`. |
-| `sendrawtransaction` / `testmempoolaccept` | Relay must be enabled. `sendrawtransaction` is live accept. `testmempoolaccept` is dry-run (`MempoolHub::test_accept`: prepare + scripts + RBF/cluster checks, no commit / announce / RBF eviction / orphan park). RPC-submit only: `maxfeerate` default **0.10 BTC/kvB** (`0` unlimited; `>1` is a parameter error `1BTC/kvB`); over-cap is `max-fee-exceeded` before admit. `maxburnamount` default **0** (valued unspendable / OP_RETURN outs). P2P `accept_tx` does not apply these caps. |
+| `sendrawtransaction` / `testmempoolaccept` | `sendrawtransaction` is live accept (RPC still admits under `-blocksonly`; serving-only refuse is IBD / tip-not-ready `relay disabled`). `testmempoolaccept` is dry-run (`MempoolHub::test_accept`: prepare + scripts + RBF/cluster checks, no commit / announce / RBF eviction / orphan park). RPC-submit only: `maxfeerate` is **sat/vB** (default **10000**; `0` unlimited; `>= 100000` is `-8`). sendraw over-cap is `-25` configured-max text; `testmempoolaccept` reject-reason stays `max-fee-exceeded`. `maxburnamount` default **0** (valued unspendable / OP_RETURN outs). P2P `accept_tx` does not apply these caps. Core functional tests still speak BTC/kvB via `scripts/core-functional/rpc_proxy.py`. |
 | `estimatesmartfee` | **10-minute inclusion frontier** — not Core historical multi-horizon. See [`mempool-fee-estimation.md`](./mempool-fee-estimation.md). |
 | `estimaterawfee` | Same 10-minute frontier product as `estimatesmartfee` (Core RPC name for harness scripts). Not Core historical `estimaterawfee` buckets. |
 | `getnetworkhashps` | Dummy **2-work-per-block / elapsed** over `nblocks` (default 120) ending at `height` (default tip). **Not** Core `GetNetworkHashPS` (nBits / chainwork). Matches regtest 2 work/block. |
@@ -102,7 +102,7 @@ still wait for durable SH when shindex is on.
 | `getmempoolcluster` | All networks. Cluster weight / chunks from the live graph (modified fees). Same prefix-maximal chunks as mining selection. |
 | `getmempoolancestors` / `getmempooldescendants` | All networks. Exclusive walks of the live cluster graph. `verbose` reuses `getmempoolentry` fields. |
 | `getmempoolfeeratediagram` | All networks. Mining chunks as `{weight, fee}` points (decreasing feerate). |
-| `submitpackage` | All networks. Sequential `accept_tx` (parent can stay if the child fails). No package-level feerate (a 0-fee CPFP parent is rejected on its own min-relay). `package_msg` / `tx-results` / `replaced-transactions`. Per-tx RPC `maxfeerate` / `maxburnamount` (same defaults as sendraw) before admit. |
+| `submitpackage` | All networks. `MempoolHub::accept_package` after RPC `maxfeerate` / `maxburnamount` pre-checks (all-or-nothing; child-fail rollback evicts spenders of a committed parent). Min-relay waiver is a child-with-parents ancestor tree only. `package_msg` / `tx-results` / `replaced-transactions`. |
 | `gettxspendingprevout` | All networks. Live mempool spender of each `{txid,vout}`. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |

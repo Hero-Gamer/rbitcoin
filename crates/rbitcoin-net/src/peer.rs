@@ -1736,6 +1736,7 @@ fn try_reconstruct_cmpct(
     let (owned, fill) = mempool_shortid_avail(hub, hsi, version);
     match crate::compact::try_reconstruct(hsi, &owned, version) {
         Ok(block) => Some(CmpctReconstruct::Block(block, fill.map(Box::new))),
+        Err(m) if m.is_empty() => Some(CmpctReconstruct::Missing(m)),
         Err(_) if hub.mempool().is_none() => None,
         Err(m) => Some(CmpctReconstruct::Missing(m)),
     }
@@ -2656,7 +2657,7 @@ async fn on_block(
         }
     }
     let _ = hub.ensure_header(&block.header);
-    follow.pending_cmpct.remove(&hash);
+    drop_pending_cmpct(follow, session, hash);
     follow.requested_blocks.remove(&hash);
     follow.pending_headers.entry(hash).or_insert(block.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
@@ -2699,6 +2700,17 @@ async fn on_block(
     Ok(())
 }
 
+fn drop_pending_cmpct(
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) {
+    follow.pending_cmpct.remove(&hash);
+    if let Some(s) = session {
+        s.release_cmpct_taken(hash);
+    }
+}
+
 async fn on_cmpctblock(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -2708,6 +2720,11 @@ async fn on_cmpctblock(
 ) -> Result<(), NetError> {
     let hsi = cb.compact_block.clone();
     let hash = hsi.header.block_hash();
+    if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
+        rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
         s.note_best_known(hash);
@@ -2782,7 +2799,7 @@ async fn on_cmpctblock(
                 Some(CmpctReconstruct::Block(block, fill)) => {
                     log_cmpct_filled(hub, &hsi, &block, &[], fill.as_deref());
                     follow.requested_blocks.remove(&hash);
-                    follow.pending_cmpct.remove(&hash);
+                    drop_pending_cmpct(follow, session, hash);
                     relay_new_pow_valid_block(hub, &block, session);
                     match hub.accept_received_block_async(block.clone()).await {
                         Ok(AcceptOutcome::Accepted { .. }) => {
@@ -2817,6 +2834,9 @@ async fn on_cmpctblock(
                 Some(CmpctReconstruct::Missing(missing)) => {
                     if missing.is_empty() {
                         log_cmpct_getdata(hash, 0);
+                        if let Some(s) = session {
+                            s.note_failed_cmpct(hash);
+                        }
                         queue_out(
                             out_tx,
                             NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),

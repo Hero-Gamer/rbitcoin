@@ -382,7 +382,23 @@ fn getnetworkinfo_localrelay_follows_mempool_relay() {
     let msg = e["message"].as_str().unwrap_or("");
     assert!(
         !msg.contains("relay disabled"),
-        "RPC sendraw must accept while -blocksonly, got {e}"
+        "decode of 00 is not serving-only refuse, got {e}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blocksonly_sendraw_admits_valid_tx() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+    let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    let off = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(off["localrelay"], false, "{off}");
+    let ok = dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    assert_eq!(
+        ok.as_str().unwrap(),
+        &spend.compute_txid().to_string(),
+        "{ok}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1618,7 +1634,7 @@ fn generated_coinbase_value(ctx: &RpcContext, height: u32) -> u64 {
 
 fn default_max_raw_fee_sat(weight: u64) -> u64 {
     let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
-    10_000_000u64.saturating_mul(vsize) / 1000
+    10_000u64.saturating_mul(vsize)
 }
 
 fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
@@ -1631,27 +1647,31 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(at_hex)]).unwrap();
     assert!(
         ok.as_str().is_some(),
-        "exact 0.10 BTC/kvB must accept: {ok}"
+        "exact default 10000 sat/vB must accept: {ok}"
     );
     let (over_hex, _) =
         spend_generated_coinbase(ctx, 2, cb - max_fee - 1, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
-    assert_eq!(e["message"], "max-fee-exceeded", "{e}");
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
+    assert_eq!(
+        e["message"], "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+        "{e}"
+    );
 }
 
 #[test]
 fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(103)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(105)]).unwrap();
     pin_sendraw_maxfeerate_at_default_and_one_sat_over(&ctx);
     let (hex, spend) = spend_generated_coinbase(&ctx, 3, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
     assert!(
         e["message"]
             .as_str()
             .unwrap_or("")
-            .contains("max-fee-exceeded"),
+            .contains("maximum configured by user"),
         "{e}"
     );
     let tma = dispatch(&ctx, "testmempoolaccept", vec![json!([hex.clone()])]).unwrap();
@@ -1676,12 +1696,101 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     )
     .unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
-    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(2)]).unwrap_err();
-    assert!(
-        over["message"].as_str().unwrap_or("").contains("1BTC/kvB"),
+    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(100_000)]).unwrap_err();
+    assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
+    assert_eq!(
+        over["message"], "feerate >= 100000 sat/vB is not accepted",
         "{over}"
     );
+    let cb4 = generated_coinbase_value(&ctx, 4);
+    let (modest_hex, modest) =
+        spend_generated_coinbase(&ctx, 4, cb4 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let ok99 = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(modest_hex), json!(99_999)],
+    )
+    .unwrap();
+    assert_eq!(
+        ok99.as_str().unwrap(),
+        &modest.compute_txid().to_string(),
+        "{ok99}"
+    );
+    pin_maxfeerate_json_shapes(&ctx);
+    let cb5 = generated_coinbase_value(&ctx, 5);
+    let (str_hex, str_tx) =
+        spend_generated_coinbase(&ctx, 5, cb5 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let ok_str = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(str_hex), json!("99999")],
+    )
+    .unwrap();
+    assert_eq!(
+        ok_str.as_str().unwrap(),
+        &str_tx.compute_txid().to_string(),
+        "{ok_str}"
+    );
+    let (huge_hex, _) = spend_generated_coinbase(&ctx, 6, 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let pkg_fee = dispatch(&ctx, "submitpackage", vec![json!([huge_hex])]).unwrap();
+    assert_eq!(pkg_fee["package_msg"], "transaction failed", "{pkg_fee}");
+    let fee_err = pkg_fee["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .and_then(|v| v["error"].as_str())
+        .unwrap_or("");
+    assert_eq!(fee_err, "max-fee-exceeded", "{pkg_fee}");
+    use bitcoin::consensus::encode::serialize;
+    let modest_again = hex_encode(serialize(&modest));
+    let again = dispatch(&ctx, "submitpackage", vec![json!([modest_again])]).unwrap();
+    assert_eq!(again["package_msg"], "success", "{again}");
+    let row = again["tx-results"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .cloned()
+        .unwrap_or(json!(null));
+    assert!(row.get("error").is_none(), "already-in-mempool: {again}");
+    assert_eq!(
+        row["txid"].as_str().unwrap(),
+        &modest.compute_txid().to_string(),
+        "{again}"
+    );
+    assert!(
+        row.get("vsize").is_none() && row.get("fees").is_none(),
+        "already-known package row is txid-only: {again}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
+    for (v, code, msg) in [
+        (json!(-1), ERR_INVALID_PARAMETER, "Amount out of range"),
+        (json!("-2"), ERR_INVALID_PARAMETER, "Amount out of range"),
+        (
+            json!(1.5),
+            ERR_INVALID_PARAMETER,
+            "maxfeerate must be an integer sat/vB",
+        ),
+        (
+            json!("nope"),
+            ERR_INVALID_PARAMETER,
+            "maxfeerate must be an integer sat/vB",
+        ),
+        (
+            json!(true),
+            ERR_TYPE_ERROR,
+            "maxfeerate is not a number or string",
+        ),
+        (
+            json!([]),
+            ERR_TYPE_ERROR,
+            "maxfeerate is not a number or string",
+        ),
+    ] {
+        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v]).unwrap_err();
+        assert_eq!(e["code"], code, "{e}");
+        assert_eq!(e["message"], msg, "{e}");
+    }
 }
 
 #[test]
@@ -1714,6 +1823,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
             .contains("maxburnamount"),
         "amount−1 sat must reject: {short}"
     );
+    pin_maxburn_json_shapes(&ctx, &hex);
     let pkg = dispatch(&ctx, "submitpackage", vec![json!([hex.clone()])]).unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
     let err = pkg["tx-results"]
@@ -1738,6 +1848,128 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     )
     .unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
+    let n0 = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": 0
+        })),
+    )
+    .unwrap_err();
+    assert!(
+        n0["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "numeric 0 BTC must still cap burn: {n0}"
+    );
+    let flt = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": 0.0
+        })),
+    )
+    .unwrap_err();
+    assert!(
+        flt["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "float 0.0 BTC must still cap burn: {flt}"
+    );
+    let neg = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": -1
+        })),
+    )
+    .unwrap_err();
+    assert_eq!(neg["code"], ERR_INVALID_PARAMETER, "{neg}");
+    assert_eq!(neg["message"], "Amount out of range", "{neg}");
+    let typ = dispatch(
+        ctx,
+        "sendrawtransaction",
+        named(json!({
+            "hexstring": hex,
+            "maxfeerate": 0,
+            "maxburnamount": true
+        })),
+    )
+    .unwrap_err();
+    assert_eq!(typ["code"], ERR_TYPE_ERROR, "{typ}");
+    assert_eq!(typ["message"], "Amount is not a number or string", "{typ}");
+    for bad in [json!(""), json!("0.000000001"), json!("x.0")] {
+        let e = dispatch(
+            ctx,
+            "sendrawtransaction",
+            named(json!({
+                "hexstring": hex,
+                "maxfeerate": 0,
+                "maxburnamount": bad
+            })),
+        )
+        .unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{e}");
+        assert_eq!(e["message"], "Invalid amount", "{e}");
+    }
+}
+
+#[test]
+fn submitpackage_child_fail_leaves_no_package_txs() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let bad = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]),
+        }],
+        output: vec![TxOut {
+            value: parent.output[0].value + Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let bad_hex = hex_encode(serialize(&bad));
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, bad_hex]), json!(0)],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert!(
+        !ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "child-fail must not leave the parent live"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2295,6 +2527,12 @@ fn invalidate_reconsider_tip() {
     let miss = dispatch(&ctx, "preciousblock", vec![json!("00".repeat(32))]).unwrap_err();
     assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(miss["message"], "Block not found");
+    let after_err = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    assert_eq!(
+        after_err,
+        json!(tip),
+        "not-found precious must not move tip"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

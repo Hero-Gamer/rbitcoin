@@ -536,7 +536,7 @@ mod tests {
         assert!(!super::should_unlatch_headers_done(&at, 100));
     }
 
-    /// Unlatch `headers_done` on lag>2 even with leftover inflight; never at lag≤2.
+    /// Unlatch only a 1–2 block connecting-header hole. lag>2 is not a chase.
     #[test]
     fn should_unlatch_headers_done() {
         use super::super::state::InflightReq;

@@ -279,7 +279,7 @@ fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
     );
 
     let feed = Arc::new(ConfirmFeed::new());
-    feed.request_single_block();
+    feed.request_single_block(u32::MAX - 1);
     let (ev_tx, ev_rx) = std::sync::mpsc::channel();
     let accepted = Arc::new(AtomicU32::new(0));
     let (engine, _queues) = spawn_confirm_engine(
@@ -1701,9 +1701,10 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         8,
     )
     .unwrap();
-    assert!(
-        feed.single_block(),
-        "batched consensus must isolate to one-block retry"
+    assert_eq!(
+        feed.isolate_until(),
+        18,
+        "batched consensus must isolate through last height of the wave"
     );
     match rx.try_recv() {
         Ok(ConfirmEvent::Reject {
@@ -1727,8 +1728,9 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         1,
     )
     .unwrap();
-    assert!(
-        !feed_one.single_block(),
+    assert_eq!(
+        feed_one.isolate_until(),
+        u32::MAX,
         "single-block consensus stays blacklistable"
     );
     match rx.try_recv() {
@@ -1752,9 +1754,82 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         8,
     )
     .unwrap();
-    assert!(
-        !feed_fault.single_block(),
+    assert_eq!(
+        feed_fault.isolate_until(),
+        u32::MAX,
         "engine fault is not a cascade isolate"
+    );
+}
+
+#[test]
+fn isolate_clears_only_after_original_batch_last_height() {
+    use super::{emit_confirm_reject, ConfirmFeed, ConfirmRejectClass};
+
+    let feed = ConfirmFeed::new();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let hash = BlockHash::from_byte_array([0x0a; 32]);
+    emit_confirm_reject(
+        &tx,
+        &feed,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(feed.isolate_until(), 107);
+    feed.release_isolate_if_tip(100);
+    assert_eq!(
+        feed.isolate_until(),
+        107,
+        "first n=1 accept must not re-pack the rest of the failed wave"
+    );
+    feed.release_isolate_if_tip(106);
+    assert_eq!(
+        feed.isolate_until(),
+        107,
+        "tip still below last height of the wave"
+    );
+    feed.release_isolate_if_tip(107);
+    assert_eq!(
+        feed.isolate_until(),
+        u32::MAX,
+        "tip through the original batch last height clears isolate"
+    );
+
+    let feed_n1 = ConfirmFeed::new();
+    emit_confirm_reject(
+        &tx,
+        &feed_n1,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(feed_n1.isolate_until(), 107);
+    emit_confirm_reject(
+        &tx,
+        &feed_n1,
+        100,
+        hash,
+        ConfirmRejectClass::ConsensusInvalid,
+        "script failed".into(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        feed_n1.isolate_until(),
+        107,
+        "n=1 consensus reject must not clear isolate"
+    );
+    feed_n1.clear();
+    assert_eq!(
+        feed_n1.isolate_until(),
+        u32::MAX,
+        "rewind clear drops isolate"
     );
 }
 
