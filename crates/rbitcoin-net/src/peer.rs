@@ -1731,6 +1731,22 @@ fn try_reconstruct_cmpct(
     }
 }
 
+fn log_cmpct_filled(hub: &ChainHub, hsi: &HeaderAndShortIds, block: &Block, fetched: &[u64]) {
+    let fill = hub
+        .mempool()
+        .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata))
+        .unwrap_or_default();
+    let stats = crate::compact::reconstruct_stats(hsi, block, &fill, fetched);
+    rbitcoin_log::info!("{stats}");
+}
+
+fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {
+    rbitcoin_log::info!(
+        "{}",
+        crate::compact::reconstruct_getdata_stats(hash, missing_n)
+    );
+}
+
 /// Flush due / unbroadcast tx INVs onto every live session writer.
 /// Used by RPC sendraw and whitelist-relay accept (`p2p_blocksonly`).
 pub fn flush_tx_invs(hub: &ChainHub, peers: &crate::peers::PeerHub) {
@@ -2748,6 +2764,7 @@ async fn on_cmpctblock(
         } else {
             match try_reconstruct_cmpct(hub, &hsi, 2) {
                 Some(CmpctReconstruct::Block(block)) => {
+                    log_cmpct_filled(hub, &hsi, &block, &[]);
                     follow.requested_blocks.remove(&hash);
                     follow.pending_cmpct.remove(&hash);
                     relay_new_pow_valid_block(hub, &block, session);
@@ -2783,6 +2800,7 @@ async fn on_cmpctblock(
                 }
                 Some(CmpctReconstruct::Missing(missing)) => {
                     if missing.is_empty() {
+                        log_cmpct_getdata(hash, 0);
                         queue_out(
                             out_tx,
                             NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2791,6 +2809,7 @@ async fn on_cmpctblock(
                         && !follow.pending_cmpct.contains_key(&hash)
                     {
                         follow.ban_score = follow.ban_score.saturating_add(10);
+                        log_cmpct_getdata(hash, missing.len());
                         queue_out(
                             out_tx,
                             NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2827,10 +2846,15 @@ async fn on_cmpctblock(
                                     txs_request: crate::compact::missing_request(hash, &missing),
                                 }),
                             )?;
+                            rbitcoin_log::debug!(
+                                "cmpct reconstruct {hash} missing={} awaiting blocktxn",
+                                missing.len()
+                            );
                         }
                     }
                 }
                 None => {
+                    log_cmpct_getdata(hash, 0);
                     queue_out(
                         out_tx,
                         NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
@@ -2858,6 +2882,7 @@ async fn on_blocktxn(
     if let Some(pc) = follow.pending_cmpct.remove(&hash) {
         match apply_cmpct_blocktxn(hub, &pc, bt) {
             Ok(block) => {
+                log_cmpct_filled(hub, &pc.hsi, &block, &pc.missing);
                 relay_new_pow_valid_block(hub, &block, session);
                 match hub.accept_received_block_async(block.clone()).await {
                     Ok(AcceptOutcome::Accepted { .. }) => {
@@ -2935,6 +2960,7 @@ async fn on_blocktxn(
             }
             Err(()) => {
                 rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+                log_cmpct_getdata(hash, pc.missing.len());
                 if let Some(s) = session {
                     s.note_failed_cmpct(hash);
                     s.release_cmpct_taken(hash);

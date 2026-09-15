@@ -6,11 +6,13 @@
 
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::block::Header;
+use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::Magic;
-use bitcoin::{Block, BlockHash, Transaction};
+use bitcoin::{Block, BlockHash, Transaction, Wtxid};
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 /// Build siphash short-id → transaction map for compact fill (version 1 = txid, 2 = wtxid).
 pub fn shortid_map_from_txs<'a>(
@@ -282,6 +284,151 @@ fn finish_reconstructed(header: Header, txdata: Vec<Transaction>) -> Result<Bloc
         return Err(Vec::new());
     }
     Ok(block)
+}
+
+/// Wtxid membership at reconstruct time (live graph / extra-compact / orphanage).
+#[derive(Clone, Debug, Default)]
+pub struct CmpctFillSets {
+    pub mempool: HashSet<Wtxid>,
+    pub extra: HashSet<Wtxid>,
+    pub orphan: HashSet<Wtxid>,
+}
+
+/// One compact reconstruct outcome for the operator INFO line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CmpctReconstructStats {
+    pub hash: BlockHash,
+    pub ntx: usize,
+    pub getdata: bool,
+    pub missing_n: usize,
+    pub prefill_n: usize,
+    pub prefill_bytes: usize,
+    pub mempool_n: usize,
+    pub mempool_bytes: usize,
+    pub extra_n: usize,
+    pub extra_bytes: usize,
+    pub orphan_n: usize,
+    pub orphan_bytes: usize,
+    pub redundant_prefill_n: usize,
+    pub redundant_prefill_bytes: usize,
+    pub fetched_n: usize,
+    pub fetched_bytes: usize,
+}
+
+impl Default for CmpctReconstructStats {
+    fn default() -> Self {
+        Self {
+            hash: BlockHash::from_byte_array([0; 32]),
+            ntx: 0,
+            getdata: false,
+            missing_n: 0,
+            prefill_n: 0,
+            prefill_bytes: 0,
+            mempool_n: 0,
+            mempool_bytes: 0,
+            extra_n: 0,
+            extra_bytes: 0,
+            orphan_n: 0,
+            orphan_bytes: 0,
+            redundant_prefill_n: 0,
+            redundant_prefill_bytes: 0,
+            fetched_n: 0,
+            fetched_bytes: 0,
+        }
+    }
+}
+
+impl fmt::Display for CmpctReconstructStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.getdata {
+            write!(
+                f,
+                "cmpct reconstruct {} getdata missing={} fetched=0/0",
+                self.hash, self.missing_n
+            )
+        } else {
+            write!(
+                f,
+                "cmpct reconstruct {} ntx={} prefill={}/{} mempool={}/{} extra={}/{} orphan={}/{} redundant_prefill={}/{} fetched={}/{}",
+                self.hash,
+                self.ntx,
+                self.prefill_n,
+                self.prefill_bytes,
+                self.mempool_n,
+                self.mempool_bytes,
+                self.extra_n,
+                self.extra_bytes,
+                self.orphan_n,
+                self.orphan_bytes,
+                self.redundant_prefill_n,
+                self.redundant_prefill_bytes,
+                self.fetched_n,
+                self.fetched_bytes,
+            )
+        }
+    }
+}
+
+fn tx_wire_len(tx: &Transaction) -> usize {
+    bitcoin::consensus::encode::serialize(tx).len()
+}
+
+/// Fallback to full `getdata` after compact reconstruct failed.
+pub fn reconstruct_getdata_stats(hash: BlockHash, missing_n: usize) -> CmpctReconstructStats {
+    CmpctReconstructStats {
+        hash,
+        getdata: true,
+        missing_n,
+        ..CmpctReconstructStats::default()
+    }
+}
+
+/// Classify a completed reconstruct: fill sources plus `blocktxn` fetch size.
+pub fn reconstruct_stats(
+    hsi: &HeaderAndShortIds,
+    block: &Block,
+    fill: &CmpctFillSets,
+    fetched_indexes: &[u64],
+) -> CmpctReconstructStats {
+    let prefilled: HashSet<usize> = prefilled_absolute_indexes(hsi)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    let fetched: HashSet<usize> = fetched_indexes.iter().map(|i| *i as usize).collect();
+    let mut stats = CmpctReconstructStats {
+        hash: block.block_hash(),
+        ntx: block.txdata.len(),
+        ..CmpctReconstructStats::default()
+    };
+    for (abs, tx) in block.txdata.iter().enumerate() {
+        let bytes = tx_wire_len(tx);
+        let wtxid = tx.compute_wtxid();
+        if prefilled.contains(&abs) {
+            stats.prefill_n += 1;
+            stats.prefill_bytes += bytes;
+            if fill.mempool.contains(&wtxid) {
+                stats.redundant_prefill_n += 1;
+                stats.redundant_prefill_bytes += bytes;
+            }
+            continue;
+        }
+        if fetched.contains(&abs) {
+            stats.fetched_n += 1;
+            stats.fetched_bytes += bytes;
+            continue;
+        }
+        if fill.mempool.contains(&wtxid) {
+            stats.mempool_n += 1;
+            stats.mempool_bytes += bytes;
+        } else if fill.extra.contains(&wtxid) {
+            stats.extra_n += 1;
+            stats.extra_bytes += bytes;
+        } else if fill.orphan.contains(&wtxid) {
+            stats.orphan_n += 1;
+            stats.orphan_bytes += bytes;
+        }
+    }
+    stats
 }
 
 #[cfg(test)]
@@ -810,5 +957,125 @@ mod tests {
         assert!(!hub.is_block_invalid(&block.block_hash()));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cmpct_reconstruct_stats_first_shot_all_mempool_fetched_zero() {
+        let b1 = spend(1);
+        let b2 = spend(2);
+        let block = sealed_block(vec![coinbase(), b1.clone(), b2.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 0xdead_beef, 2, &[]).unwrap();
+        let recon = try_reconstruct(
+            &hsi,
+            &shortid_map_from_txs(&block.header, hsi.nonce, 2, [&b1, &b2]),
+            2,
+        )
+        .expect("full fill");
+        let fill = CmpctFillSets {
+            mempool: [b1.compute_wtxid(), b2.compute_wtxid()]
+                .into_iter()
+                .collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        };
+        let stats = reconstruct_stats(&hsi, &recon, &fill, &[]);
+        assert_eq!(stats.fetched_n, 0);
+        assert_eq!(stats.fetched_bytes, 0);
+        assert_eq!(stats.mempool_n, 2);
+        assert_eq!(stats.prefill_n, 1);
+        assert!(!stats.getdata);
+        let line = stats.to_string();
+        assert!(
+            line.starts_with(&format!("cmpct reconstruct {}", recon.block_hash())),
+            "{line}"
+        );
+        assert!(line.contains("fetched=0/0"), "{line}");
+        assert!(line.contains("ntx=3"), "{line}");
+    }
+
+    #[test]
+    fn cmpct_reconstruct_stats_blocktxn_fetched_bytes() {
+        let b1 = spend(5);
+        let b2 = spend(6);
+        let block = sealed_block(vec![coinbase(), b1.clone(), b2.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 3, 2, &[]).unwrap();
+        let avail = shortid_map_from_txs(&block.header, hsi.nonce, 2, [&b1]);
+        let missing = try_reconstruct(&hsi, &avail, 2).unwrap_err();
+        let txn = BlockTransactions {
+            block_hash: block.block_hash(),
+            transactions: vec![b2.clone()],
+        };
+        let recon = apply_block_transactions(&hsi, &missing, &txn, &avail, 2).unwrap();
+        let fill = CmpctFillSets {
+            mempool: [b1.compute_wtxid()].into_iter().collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        };
+        let stats = reconstruct_stats(&hsi, &recon, &fill, &missing);
+        let fetched_bytes = bitcoin::consensus::encode::serialize(&b2).len();
+        assert_eq!(stats.fetched_n, 1);
+        assert_eq!(stats.fetched_bytes, fetched_bytes);
+        assert_eq!(stats.mempool_n, 1);
+        assert_eq!(stats.extra_n, 0);
+        let line = stats.to_string();
+        assert!(
+            line.contains(&format!("fetched=1/{fetched_bytes}")),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn cmpct_reconstruct_stats_redundant_prefill_in_mempool() {
+        let b1 = spend(12);
+        let block = sealed_block(vec![coinbase(), b1.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 7, 2, &[0, 1]).unwrap();
+        let empty: HashMap<ShortId, Vec<&Transaction>> = HashMap::new();
+        let recon = try_reconstruct(&hsi, &empty, 2).expect("prefilled");
+        let fill = CmpctFillSets {
+            mempool: [b1.compute_wtxid()].into_iter().collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        };
+        let stats = reconstruct_stats(&hsi, &recon, &fill, &[]);
+        let b1_bytes = bitcoin::consensus::encode::serialize(&b1).len();
+        assert_eq!(stats.prefill_n, 2);
+        assert_eq!(stats.redundant_prefill_n, 1);
+        assert_eq!(stats.redundant_prefill_bytes, b1_bytes);
+        assert_eq!(stats.mempool_n, 0);
+        assert_eq!(stats.fetched_n, 0);
+    }
+
+    #[test]
+    fn cmpct_reconstruct_stats_extra_disjoint_from_mempool() {
+        let b1 = spend(13);
+        let block = sealed_block(vec![coinbase(), b1.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 8, 2, &[]).unwrap();
+        let recon = try_reconstruct(
+            &hsi,
+            &shortid_map_from_txs(&block.header, hsi.nonce, 2, [&b1]),
+            2,
+        )
+        .expect("extra fill");
+        let fill = CmpctFillSets {
+            mempool: Default::default(),
+            extra: [b1.compute_wtxid()].into_iter().collect(),
+            orphan: Default::default(),
+        };
+        let stats = reconstruct_stats(&hsi, &recon, &fill, &[]);
+        assert_eq!(stats.extra_n, 1);
+        assert_eq!(stats.mempool_n, 0);
+        assert_eq!(stats.fetched_n, 0);
+    }
+
+    #[test]
+    fn cmpct_reconstruct_stats_getdata_line() {
+        let hash = BlockHash::from_byte_array([0xab; 32]);
+        let stats = reconstruct_getdata_stats(hash, 3);
+        assert!(stats.getdata);
+        assert_eq!(stats.fetched_n, 0);
+        assert_eq!(
+            stats.to_string(),
+            format!("cmpct reconstruct {hash} getdata missing=3 fetched=0/0")
+        );
     }
 }

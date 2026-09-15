@@ -2081,6 +2081,31 @@ impl MempoolHub {
         Some(out)
     }
 
+    /// Wtxid membership of `txs` in live graph / extra-compact / orphanage.
+    ///
+    /// `None` if a writer holds `inner`.
+    pub fn try_cmpct_fill_sets(
+        &self,
+        txs: &[Transaction],
+    ) -> Option<crate::compact::CmpctFillSets> {
+        use bitcoin::Wtxid;
+        let g = self.inner.try_read().ok()?;
+        let extra: std::collections::HashSet<Wtxid> =
+            g.extra_compact_txs().map(|tx| tx.compute_wtxid()).collect();
+        let mut sets = crate::compact::CmpctFillSets::default();
+        for tx in txs {
+            let w = tx.compute_wtxid();
+            if g.graph.contains_wtxid(&w) {
+                sets.mempool.insert(w);
+            } else if extra.contains(&w) {
+                sets.extra.insert(w);
+            } else if g.orphanage.contains_wtxid(&w) {
+                sets.orphan.insert(w);
+            }
+        }
+        Some(sets)
+    }
+
     /// Ancestor/descendant counts and vsize/fee sums (no live-set scan).
     pub fn graph_stats(&self, txid: &Txid) -> Option<crate::MempoolGraphStats> {
         self.lock_read().graph.graph_stats(txid)
