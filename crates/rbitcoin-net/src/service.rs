@@ -194,7 +194,7 @@ impl P2PNode {
         }
     }
 
-    /// IBD / catch-up: multi-peer download window across `peers` (libbitcoin-class).
+    /// IBD / catch-up: multi-peer densify across `peers`.
     ///
     /// This is the only history-sync path. Tip-follow is [`Self::follow_from`].
     pub async fn sync(&self, peers: &[SocketAddr], cfg: IbdConfig) -> Result<u32, NetError> {

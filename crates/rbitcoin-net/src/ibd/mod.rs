@@ -1,4 +1,4 @@
-//! Concurrent multi-peer block download (libbitcoin-class windowed IBD).
+//! Concurrent multi-peer block download (densify + per-peer inflight).
 //!
 //! **Unified height-ordered path (current):**
 //! - N outbound peer workers (TCP + cmd/event channels); decode on blocking pool
@@ -144,7 +144,7 @@ pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
 /// rate). Also used as the hard receive refuse horizon past tip.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 65_536;
 
-/// Tunables for IBD (defaults lean libbitcoin/Core-ish).
+/// Tunables for densify (per-peer inflight + confirm window).
 #[derive(Clone, Debug)]
 pub struct IbdConfig {
     /// Max concurrent unique block getdata (in-flight). Not tip-distance.

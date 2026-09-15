@@ -6,7 +6,7 @@ Bitcoin **full node** in Rust aimed at **production server-side** use: multi-pee
 IBD, tip follow, block/tx relay (tip mode), optional **Core-class JSON-RPC**, and
 in-process **Electrum + optional Esplora REST for wallet clients** (scripthash
 index via `--shindex`, default off; not a graphical block-explorer stack) — built
-around a **libbitcoin-class relational archive** and a **pure-Rust
+around a **relational archive (Class A/B/C)** and a **pure-Rust
 consensus/script** path.
 
 > **0.6.99** is the in-tree version (pre-**0.7.0**). Last published GitHub
@@ -33,7 +33,7 @@ consensus/script** path.
 
 Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electrum
 backends are **external indexers** of another node. rbitcoin does neither:
-**no UTXO set** (libbitcoin-class archive), **Electrum + txindex in-process**.
+**no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
 - **~200 GiB** hot pin/annotate set (schema 17); **~700 GiB** with cold `inwit` —
   census in [`SCHEMA.md`](./SCHEMA.md), `--shindex` costs in [`OPERATOR.md`](./OPERATOR.md)

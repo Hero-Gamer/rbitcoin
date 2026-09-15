@@ -443,7 +443,7 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 
 ## v3 and earlier (sketch)
 
-Early mmap relational store (libbitcoin-class tables):
+Early mmap relational tables (refused ancestor; Class A/B/C already in spirit):
 
 - Class A / B / C split already present in spirit.
 - Fatter heads (full keys, lower load thresholds, more rehash churn).
