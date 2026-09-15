@@ -54,10 +54,10 @@ impl TxPrecompute {
             (wtxid, wire.len())
         };
         let (sigops, out_sum) = sigops_and_out_sum(tx);
-        let (sha_prevouts, sha_sequences, sha_outputs) = if sighash {
+        let [sha_prevouts, sha_sequences, sha_outputs] = if sighash {
             sighash_midstates(tx)
         } else {
-            (None, None, None)
+            [None, None, None]
         };
         Self {
             txid,
@@ -321,7 +321,7 @@ fn sigops_and_out_sum(tx: &Transaction) -> (u64, u64) {
     (sigops, out_sum)
 }
 
-fn sighash_midstates(tx: &Transaction) -> (Option<[u8; 32]>, Option<[u8; 32]>, Option<[u8; 32]>) {
+fn sighash_midstates(tx: &Transaction) -> [Option<[u8; 32]>; 3] {
     let mut sha_prev = sha256::Hash::engine();
     let mut sha_seq = sha256::Hash::engine();
     let mut sha_out = sha256::Hash::engine();
@@ -332,11 +332,11 @@ fn sighash_midstates(tx: &Transaction) -> (Option<[u8; 32]>, Option<[u8; 32]>, O
     for txout in &tx.output {
         let _ = txout.consensus_encode(&mut sha_out);
     }
-    (
+    [
         Some(sha256::Hash::from_engine(sha_prev).to_byte_array()),
         Some(sha256::Hash::from_engine(sha_seq).to_byte_array()),
         Some(sha256::Hash::from_engine(sha_out).to_byte_array()),
-    )
+    ]
 }
 
 /// Decode a P2P block payload once: rust-bitcoin `Block` plus per-tx pres from

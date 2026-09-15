@@ -25,6 +25,9 @@ use std::sync::Arc;
 /// encodes Class A; records pins own [`OutputRecord`] scripts (tests / SH).
 pub type CreatePin = Arc<CreatePinInner>;
 
+/// One header's wire block + txids for Class A plan/commit.
+pub type WirePlanNeed<'a> = (Fk, &'a Arc<bitcoin::Block>, &'a [[u8; 32]]);
+
 /// [`CreatePin`] payload.
 #[derive(Debug)]
 pub enum CreatePinInner {
@@ -679,10 +682,7 @@ fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
 
 impl Query {
     /// Class A plan + fill packed ins + commit from wire blocks. Does not set tip.
-    pub fn archive_class_a_from_wire(
-        &self,
-        items: &[(Fk, &Arc<bitcoin::Block>, &[[u8; 32]])],
-    ) -> Result<(), QueryError> {
+    pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -732,7 +732,7 @@ impl Query {
     /// packed ins from `Arc<Block>` + edges. `body_est` uses wire compact sizes.
     pub fn archive_plan_batch_from_wire(
         &self,
-        need: &[(Fk, &Arc<bitcoin::Block>, &[[u8; 32]])],
+        need: &[WirePlanNeed<'_>],
         next_tx_start: u64,
         in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
@@ -1166,7 +1166,7 @@ impl Query {
 #[cfg(test)]
 mod tests {
     use crate::testutil::FixtureChain;
-    use crate::{Query, TxApply};
+    use crate::{Query, TxApply, WirePlanNeed};
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
     use std::sync::Arc;
@@ -1208,7 +1208,7 @@ mod tests {
         in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<crate::ArchiveWritePlan, crate::QueryError> {
-        let wires: Vec<(Fk, Arc<bitcoin::Block>, Vec<[u8; 32]>)> = need
+        let wires: Vec<_> = need
             .iter()
             .filter(|(_, txs)| !txs.is_empty())
             .map(|(fk, txs)| {
@@ -1216,7 +1216,7 @@ mod tests {
                 (*fk, Arc::new(b), ids)
             })
             .collect();
-        let refs: Vec<(Fk, &Arc<bitcoin::Block>, &[[u8; 32]])> = wires
+        let refs: Vec<WirePlanNeed<'_>> = wires
             .iter()
             .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
             .collect();

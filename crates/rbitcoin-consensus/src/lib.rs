@@ -82,7 +82,7 @@ pub use silent_payments::{
 use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::{Query, TxApply};
+use rbitcoin_query::{Query, TxApply, WirePlanNeed};
 use rbitcoin_store::HeaderRecord;
 use std::sync::Arc;
 
@@ -292,13 +292,13 @@ pub fn commit_class_a_run(
     milestone: Milestone,
 ) -> Result<(), ConsensusError> {
     let _ = milestone;
-    let mut owned: Vec<(Fk, Arc<Block>, Vec<[u8; 32]>)> = Vec::with_capacity(blocks.len());
+    let mut owned = Vec::with_capacity(blocks.len());
     for (_, block) in blocks {
         let (header, txids) = class_a_header_and_txids(query, params, block)?;
         let fk = query.ensure_header(&header).map_err(ConsensusError::from)?;
         owned.push((fk, Arc::new(block.clone()), txids));
     }
-    let refs: Vec<(Fk, &Arc<Block>, &[[u8; 32]])> = owned
+    let refs: Vec<WirePlanNeed<'_>> = owned
         .iter()
         .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
         .collect();
