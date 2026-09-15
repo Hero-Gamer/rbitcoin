@@ -4,8 +4,8 @@ What an operator or library user should be able to **count on** at **1.0**.
 Day-to-day ranked work stays in [`quality.md`](./quality.md).
 
 **Today (0.6.99):** in-tree toward **0.7.0**. Last published tag is **0.6.1**
-(`v0.6.x` patch line). Schema **21**
-can still refuse a named index wipe ([`SCHEMA.md`](../SCHEMA.md)).
+(`v0.6.x` patch line). Current bytes and refuse:
+[`SCHEMA.md`](../SCHEMA.md) (`SCHEMA_VERSION = 24`).
 Electrum/Esplora need `--shindex` (default off). BIP324 v2-only. Install is
 a GitHub Release (Linux musl; Windows/Darwin snapshots). Nightly
 differential fuzz vs Core v31.1 is continuous (**Q-30**). Core functional
