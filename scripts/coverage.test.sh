@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Contract: LCOV gate ignores test files (not substring "test"), runs default
-# workspace tests (Tier A IBD included), writes Shields JSON. Does not run llvm-cov.
+# workspace tests (Tier A IBD included), never-falls vs master, writes Shields
+# JSON. Does not run llvm-cov.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -121,6 +122,110 @@ rm -f "$tmp"
 out="$(BADGE_DRY_RUN=1 "$ROOT/scripts/publish-coverage-badge.sh")"
 assert_ok "publish dry-run names badges/coverage.json" \
   grep -q "badges/coverage.json" <<<"$out"
+
+GATE="$ROOT/scripts/coverage-gate.py"
+assert_ok "coverage-gate.py exists" test -f "$GATE"
+
+assert_gate_pass() {
+  local name="$1"
+  shift
+  if python3 "$GATE" "$@" >/dev/null; then
+    echo "ok - $name"
+    PASS=$((PASS + 1))
+  else
+    echo "not ok - $name"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_gate_fail() {
+  local name="$1"
+  shift
+  if python3 "$GATE" "$@" >/dev/null 2>&1; then
+    echo "not ok - $name (wanted fail)"
+    FAIL=$((FAIL + 1))
+  else
+    echo "ok - $name"
+    PASS=$((PASS + 1))
+  fi
+}
+
+base="$(mktemp)"
+python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 101175 --lf 110953 --gate 90 --sha b1510f783e3f --date 2026-09-15 --out "$base"
+
+assert_gate_pass "equal ratio vs master baseline passes" \
+  --lh 101175 --lf 110953 --baseline "$base"
+assert_gate_fail "one fewer hit vs master fails (still ≥90%)" \
+  --lh 101174 --lf 110953 --baseline "$base"
+assert_gate_fail "90.50% vs 91.19% master fails" \
+  --lh 905 --lf 1000 --baseline "$base"
+assert_gate_pass "higher ratio vs master passes" \
+  --lh 101586 --lf 111297 --baseline "$base"
+assert_gate_pass "same ratio on a larger tree passes" \
+  --lh 202350 --lf 221906 --baseline "$base"
+assert_gate_pass "file:// baseline URL works" \
+  --lh 101175 --lf 110953 --baseline "file://${base}"
+
+assert_gate_pass "floor-only 90.00% passes" --lh 90 --lf 100 --floor-only
+assert_gate_fail "floor-only 89.99% fails" --lh 8999 --lf 10000 --floor-only
+
+if GITHUB_ACTIONS=true python3 "$GATE" --lh 90 --lf 100 \
+  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null 2>&1; then
+  echo "not ok - CI fetch fail is an error (wanted fail)"
+  FAIL=$((FAIL + 1))
+else
+  echo "ok - CI fetch fail is an error"
+  PASS=$((PASS + 1))
+fi
+if env -u GITHUB_ACTIONS python3 "$GATE" --lh 90 --lf 100 \
+  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null; then
+  echo "ok - local fetch fail falls back to 90% floor (pass)"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - local fetch fail falls back to 90% floor (pass)"
+  FAIL=$((FAIL + 1))
+fi
+if env -u GITHUB_ACTIONS python3 "$GATE" --lh 89 --lf 100 \
+  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null 2>&1; then
+  echo "not ok - local fetch fail falls back to 90% floor (fail under)"
+  FAIL=$((FAIL + 1))
+else
+  echo "ok - local fetch fail falls back to 90% floor (fail under)"
+  PASS=$((PASS + 1))
+fi
+
+st="$(mktemp)"
+python3 "$GATE" --lh 101586 --lf 111297 --baseline "$base" --status-out "$st" >/dev/null
+python3 - "$st" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text())
+assert d["ok"] is True, d
+assert d["lh"] == 101586 and d["lf"] == 111297, d
+assert d["base_lh"] == 101175 and d["base_lf"] == 110953, d
+assert d["mode"] == "ratchet", d
+PY
+assert_ok "status-out JSON names ratchet baseline" true
+rm -f "$st" "$base"
+
+tmp="$(mktemp)"
+python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 905 --lf 1000 --gate 90 --base-lh 101175 --base-lf 110953 \
+  --sha deadbeef --date 2026-09-15 --out "$tmp"
+python3 - "$tmp" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text())
+assert d["color"] == "red", d
+assert d["base_lh"] == 101175, d
+assert d["base_lf"] == 110953, d
+PY
+assert_ok "badge is red when below master even if ≥90%" true
+rm -f "$tmp"
+
+assert_ok "coverage.sh calls coverage-gate.py" \
+  grep -q "coverage-gate.py" "$COV"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "coverage.test.sh: $PASS passed, $FAIL failed"

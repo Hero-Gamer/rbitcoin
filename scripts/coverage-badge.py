@@ -14,13 +14,20 @@ def badge_payload(
     sha: str,
     scope: str,
     date: Optional[str] = None,
+    base_lh: Optional[int] = None,
+    base_lf: Optional[int] = None,
 ) -> Dict:
     if lf <= 0:
         raise SystemExit("lf must be > 0")
     pct = 100.0 * lh / lf
     message = f"{pct:.2f}%"
-    color = "brightgreen" if lh * 100 >= lf * gate else "red"
-    return {
+    floor_ok = lh * 100 >= lf * gate
+    if base_lh is not None and base_lf:
+        ratchet_ok = lh * base_lf >= lf * base_lh
+        color = "brightgreen" if floor_ok and ratchet_ok else "red"
+    else:
+        color = "brightgreen" if floor_ok else "red"
+    out = {
         "schemaVersion": 1,
         "label": "coverage",
         "message": message,
@@ -33,6 +40,11 @@ def badge_payload(
         "sha": sha[:12],
         "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     }
+    if base_lh is not None and base_lf:
+        out["base_lh"] = base_lh
+        out["base_lf"] = base_lf
+        out["base_pct"] = round(100.0 * base_lh / base_lf, 2)
+    return out
 
 
 def main() -> None:
@@ -43,6 +55,8 @@ def main() -> None:
     p.add_argument("--sha", default="")
     p.add_argument("--scope", default="production")
     p.add_argument("--date", default="")
+    p.add_argument("--base-lh", type=int, default=None)
+    p.add_argument("--base-lf", type=int, default=None)
     p.add_argument("--out", required=True)
     args = p.parse_args()
     payload = badge_payload(
@@ -52,6 +66,8 @@ def main() -> None:
         args.sha,
         args.scope,
         args.date or None,
+        args.base_lh,
+        args.base_lf,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
