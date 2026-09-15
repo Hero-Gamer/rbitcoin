@@ -55,7 +55,8 @@ proxy TLS for Electrum; do not expose plain Electrum to the internet.
 ```
 
 Default mainnet **does not** pass `--electrum-listen` — enable Electrum only
-after tip (see below).
+after tip (see below). Slow or constrained uplinks: [`OPERATOR.md`](../OPERATOR.md)
+(Slow / constrained uplink) — `--max-outbound 8` is the IBD floor.
 
 ### Milestone (script validation)
 

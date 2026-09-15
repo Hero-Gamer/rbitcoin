@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 
 /// How long to avoid redialing an address after a stall disconnect.
 pub(crate) const STALL_ADDR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Second stall/relative-slow kick of the same addr this process.
+pub(crate) const STALL_ADDR_COOLDOWN_2: Duration = Duration::from_secs(30 * 60);
+/// Third and later kicks this process.
+pub(crate) const STALL_ADDR_COOLDOWN_3: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Bulk cluster: `median <= min * this` → tight pack, never relative-disconnect.
 /// Uses median/min (not max/min) so one fast peer does not open the gate.
@@ -454,6 +458,32 @@ pub(crate) fn expire_addr_cooldown(cooldown: &mut HashMap<SocketAddr, Instant>, 
     cooldown.retain(|_, until| *until > now);
 }
 
+/// Cooldown after the Nth stall/relative-slow kick of this addr this process.
+pub(crate) fn kick_cooldown_for(strikes: u8) -> Duration {
+    match strikes {
+        0 | 1 => STALL_ADDR_COOLDOWN,
+        2 => STALL_ADDR_COOLDOWN_2,
+        _ => STALL_ADDR_COOLDOWN_3,
+    }
+}
+
+/// Bump the process-local strike count and set `addr_cooldown`.
+pub(crate) fn record_stall_kick(
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    strikes: &mut HashMap<SocketAddr, u8>,
+    addr: SocketAddr,
+    now: Instant,
+) -> Duration {
+    let n = {
+        let e = strikes.entry(addr).or_insert(0);
+        *e = e.saturating_add(1);
+        *e
+    };
+    let d = kick_cooldown_for(n);
+    addr_cooldown.insert(addr, now + d);
+    d
+}
+
 /// Handshake with no block bytes: last-resort + stall cooldown (not a stall disconnect).
 pub(crate) fn note_dead_without_block_bytes(
     book: &mut AddrMan,
@@ -481,16 +511,26 @@ pub(crate) fn disconnect_stalled_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
     stall: Duration,
 ) {
-    disconnect_stalled_block_peers_at(slots, inflight, addr_cooldown, now, stall, ibd_mono_ms());
+    disconnect_stalled_block_peers_at(
+        slots,
+        inflight,
+        addr_cooldown,
+        addr_strikes,
+        now,
+        stall,
+        ibd_mono_ms(),
+    );
 }
 
 pub(crate) fn disconnect_stalled_block_peers_at(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
     stall: Duration,
     now_ms: u64,
@@ -504,10 +544,10 @@ pub(crate) fn disconnect_stalled_block_peers_at(
         .map(|s| (s.id, s.in_flight.len(), s.addr))
         .collect();
     for (id, n_work, addr) in stalled_peers {
+        let cool = record_stall_kick(addr_cooldown, addr_strikes, addr, now);
         warn!(
-            "ibd: peer[{id}] {addr} stalled (no block progress for {stall:?}, {n_work} in-flight) — disconnect + reassign (cooldown {STALL_ADDR_COOLDOWN:?})"
+            "ibd: peer[{id}] {addr} stalled (no block progress for {stall:?}, {n_work} in-flight) — disconnect + reassign (cooldown {cool:?})"
         );
-        addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
         if let Some(s) = slots.iter_mut().find(|s| s.id == id) {
             let _ = s.cmd_tx.send(PeerCmd::Shutdown);
             s.task.abort();
@@ -526,6 +566,7 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
@@ -568,10 +609,10 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     let med = median_u64(&bps_list);
     let lo = bps_list.first().copied().unwrap_or(0);
     let hi = bps_list.last().copied().unwrap_or(0);
+    let cool = record_stall_kick(addr_cooldown, addr_strikes, addr, now);
     warn!(
-        "ibd: peer[{id}] {addr} relative-slow (bps={bps} med={med} spread={lo}..{hi}, {n_work} in-flight) — disconnect + reassign (cooldown {STALL_ADDR_COOLDOWN:?})"
+        "ibd: peer[{id}] {addr} relative-slow (bps={bps} med={med} spread={lo}..{hi}, {n_work} in-flight) — disconnect + reassign (cooldown {cool:?})"
     );
-    addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
     if let Some(s) = slots.iter_mut().find(|s| s.id == id) {
         let _ = s.cmd_tx.send(PeerCmd::Shutdown);
         s.task.abort();
@@ -963,10 +1004,12 @@ mod tests {
         let mut inflight = HashMap::new();
         inflight.insert(h, super::super::state::InflightReq::new(5));
         let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
         disconnect_stalled_block_peers_at(
             std::slice::from_mut(&mut slot),
             &mut inflight,
             &mut cooldown,
+            &mut strikes,
             Instant::now(),
             Duration::from_secs(30),
             30_001,
@@ -986,10 +1029,12 @@ mod tests {
         let mut inflight = HashMap::new();
         inflight.insert(h, super::super::state::InflightReq::new(6));
         let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
         disconnect_stalled_block_peers_at(
             std::slice::from_mut(&mut slot),
             &mut inflight,
             &mut cooldown,
+            &mut strikes,
             Instant::now(),
             Duration::from_secs(30),
             45_000,
@@ -1002,10 +1047,12 @@ mod tests {
     fn disconnect_stalled_releases_and_cools_addr() {
         let now = Instant::now();
         let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
         disconnect_stalled_block_peers(
             &mut [dummy_slot(7, addr(13), true)],
             &mut HashMap::new(),
             &mut cooldown,
+            &mut strikes,
             now,
             Duration::from_secs(30),
         );
@@ -1117,12 +1164,14 @@ mod tests {
         let mut slots = [dummy_slot(1, addr(40), true)];
         let mut inflight = HashMap::new();
         let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
         let mut suspect = Some((1usize, 0u64));
         let mut last_kick_ms = 0u64;
         disconnect_relative_slow_block_peers(
             &mut slots,
             &mut inflight,
             &mut cooldown,
+            &mut strikes,
             Instant::now(),
             &mut suspect,
             &mut last_kick_ms,
@@ -1151,5 +1200,50 @@ mod tests {
         let samples = mature_relative_slow_samples(&[young, mature]);
         assert!(samples.iter().all(|s| s.peer_id != 0));
         assert!(samples.iter().any(|s| s.peer_id == 1));
+    }
+
+    #[test]
+    fn kick_cooldown_escalates_on_repeat_strikes() {
+        assert_eq!(kick_cooldown_for(0), STALL_ADDR_COOLDOWN);
+        assert_eq!(kick_cooldown_for(1), STALL_ADDR_COOLDOWN);
+        assert_eq!(kick_cooldown_for(2), STALL_ADDR_COOLDOWN_2);
+        assert_eq!(kick_cooldown_for(3), STALL_ADDR_COOLDOWN_3);
+        assert_eq!(kick_cooldown_for(9), STALL_ADDR_COOLDOWN_3);
+
+        let a = addr(70);
+        let t0 = Instant::now();
+        let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
+        let d1 = record_stall_kick(&mut cooldown, &mut strikes, a, t0);
+        assert_eq!(d1, STALL_ADDR_COOLDOWN);
+        assert_eq!(cooldown.get(&a).copied(), Some(t0 + STALL_ADDR_COOLDOWN));
+        let d2 = record_stall_kick(&mut cooldown, &mut strikes, a, t0);
+        assert_eq!(d2, STALL_ADDR_COOLDOWN_2);
+        let until2 = cooldown.get(&a).copied().unwrap();
+        assert_eq!(until2, t0 + STALL_ADDR_COOLDOWN_2);
+        assert!(until2 > t0 + STALL_ADDR_COOLDOWN);
+        let d3 = record_stall_kick(&mut cooldown, &mut strikes, a, t0);
+        assert_eq!(d3, STALL_ADDR_COOLDOWN_3);
+        expire_addr_cooldown(
+            &mut cooldown,
+            t0 + STALL_ADDR_COOLDOWN + Duration::from_secs(1),
+        );
+        assert!(
+            cooldown.contains_key(&a),
+            "second-kick 30m ban still holds after 10m+1s"
+        );
+        expire_addr_cooldown(
+            &mut cooldown,
+            t0 + STALL_ADDR_COOLDOWN_2 + Duration::from_secs(1),
+        );
+        assert!(
+            cooldown.contains_key(&a),
+            "third-kick 2h ban still holds after 30m+1s"
+        );
+        expire_addr_cooldown(
+            &mut cooldown,
+            t0 + STALL_ADDR_COOLDOWN_3 + Duration::from_secs(1),
+        );
+        assert!(!cooldown.contains_key(&a));
     }
 }

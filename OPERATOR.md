@@ -485,18 +485,20 @@ Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / pe
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken
 onto loadq). Peer speed is one EWMA of all received bytes while that peer has
-block getdata in flight. Tip-batch getdata races up to 4 peers (preferring
-higher EWMA). A hole owner with no qualifying rx is dropped from that hash
-when a sibling is pulling; the whole race set is not cleared on getdata age.
-Densify default is 8 in-flight hashes per peer (2 while a tip hole is open);
+block getdata in flight. Tip-batch getdata races up to 4 peers (shortest inflight
+queue, then higher EWMA). A hole owner with no qualifying rx is dropped from
+that hash when a sibling is pulling; an aged solo owner is dropped when
+another peer exists (densify ticks are not progress on this hash). When
+`hole=` is 0, at most one extra racer is added on the first later gap in the
+32-window, and only if that owner is missing, aged ≥30s, or ≤ pack-median/4.
+Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
+so getdata queues can drain for tip+1);
 16 only for an EWMA outlier at ≥ 2× pack median. WARN
 `ibd: peer[…] stalled` is 30s without qualifying rx (≥64 KiB stream or a
 block / decode-fail / NotFound event) after work start. WARN
-`ibd: peer[…] relative-slow (bps= med= spread=…)` disconnects a clear
-quarter-median outlier only after ~60s pack warm-up, 30s of inflight EWMA,
-and 2s of the same peer failing Gate B (at most one kick per 5s). Cluster
-gate is median/min (not max/min), so one fast peer does not peel the pack.
-`bps=0` is stall, not relative-slow. A uniformly slow pipe is kept.
+`ibd: peer[…] relative-slow` is a quarter-median outlier (cluster gate keeps a
+uniformly slow pack). Slow or constrained uplinks: [Slow / constrained uplink
+(IBD)](#slow--constrained-uplink-ibd).
 
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until a later lookup wave snapshots drain+fence past the pack height and load finishes that wave's last in-flight read. Not a coins cache.
 
@@ -1138,6 +1140,21 @@ Hash-head in-place rehash is gone. An undersized leftover `header.head` may
 be rewritten once at open via `header.head.grow` then rename
 (`store: header.head open-grow`). An empty target-sized `header.head` with a
 non-empty `header.body` is refused (wipe those files and reindex).
+
+## Slow / constrained uplink (IBD)
+
+`--max-outbound` / `maxoutbound` is the IBD download peer count (default **16**).
+IBD `target_peers` is that value clamped to **8..=32**, so `--max-outbound 4`
+still dials 8 catch-up peers. Concurrent block getdata is about `N × 16`
+(`IbdConfig::per_peer` is code-only 16, Core-like; there is no
+`--maxblocksperpeer`).
+
+On a typical home uplink use **8**. That is also the floor on a tight link:
+more peers will not raise a saturated wire and can make `relative-slow` peel a
+mixed pack. A quiet `relative-slow` log on a uniformly slow line is intended
+(cluster gate). `--connect` a known-fast peer if you have one. While `hole=` is
+open, densify issues no new far getdata and tip-hole races prefer short queues
+— that is recovery on a slow line, not a reason to raise outbound.
 
 ## Consensus notes (historical mainnet)
 

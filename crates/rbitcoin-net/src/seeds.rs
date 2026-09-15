@@ -510,6 +510,33 @@ impl AddrMan {
         }
     }
 
+    /// IBD stall / relative-slow: force `SLOW`, clear `FAST` (mid-range samples
+    /// would otherwise leave a prior FAST bit and keep `dial_tier` 0).
+    pub fn note_ibd_slow(&mut self, addr: SocketAddr) {
+        self.add(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
+            f.insert(PeerFlags::HAS_CONNECTED);
+            f.insert(PeerFlags::SLOW);
+            f.remove(PeerFlags::FAST);
+        }
+    }
+
+    /// `Dead` speed sample, then IBD-outlier override when `ibd_outlier`.
+    pub fn apply_ibd_dead_speed(
+        &mut self,
+        addr: SocketAddr,
+        latency_ms: u64,
+        bps: Option<u64>,
+        ibd_outlier: bool,
+    ) {
+        if let Some(bps) = bps {
+            self.note_speed(addr, latency_ms, bps);
+        }
+        if ibd_outlier {
+            self.note_ibd_slow(addr);
+        }
+    }
+
     /// Ranked dial list: tier 0 first (untried / fast / good history), then slow,
     /// then failed-last-connect. Within a tier, IPv4 before IPv6.
     ///
@@ -1215,6 +1242,47 @@ mod tests {
         f.apply_speed_sample(150, PeerFlags::FAST_BPS_MIN / 2);
         assert!(f.is_fast());
         assert!(!f.is_slow());
+    }
+
+    #[test]
+    fn note_ibd_slow_clears_fast_and_is_tier_one() {
+        let mut am = AddrMan::new();
+        let a = addr(11);
+        am.note_speed(a, 40, PeerFlags::FAST_BPS_MIN + 100);
+        assert!(am.flags(&a).is_fast());
+        assert_eq!(am.flags(&a).dial_tier(), 0);
+        am.note_ibd_slow(a);
+        assert!(am.flags(&a).is_slow(), "IBD outlier must be SLOW");
+        assert!(!am.flags(&a).is_fast(), "IBD outlier must not keep FAST");
+        assert_eq!(am.flags(&a).dial_tier(), 1);
+    }
+
+    #[test]
+    fn apply_ibd_dead_speed_outlier_mid_range_does_not_restore_fast() {
+        let mut am = AddrMan::new();
+        let a = addr(12);
+        am.note_speed(a, 40, PeerFlags::FAST_BPS_MIN + 100);
+        assert!(am.flags(&a).is_fast());
+        // Relative-slow kick sample is often 150–500 KB/s (above SLOW_BPS_MAX).
+        am.apply_ibd_dead_speed(a, 150, Some(300_000), true);
+        assert!(
+            am.flags(&a).is_slow() && !am.flags(&a).is_fast(),
+            "cooldown Dead mid-range must not restore FAST: {:?}",
+            am.flags(&a)
+        );
+        assert_eq!(am.flags(&a).dial_tier(), 1);
+    }
+
+    #[test]
+    fn apply_ibd_dead_speed_without_outlier_keeps_mid_range_fast() {
+        let mut am = AddrMan::new();
+        let a = addr(13);
+        am.note_speed(a, 40, PeerFlags::FAST_BPS_MIN + 100);
+        am.apply_ibd_dead_speed(a, 150, Some(300_000), false);
+        assert!(
+            am.flags(&a).is_fast() && !am.flags(&a).is_slow(),
+            "graceful Dead mid-range still leaves prior FAST"
+        );
     }
 
     #[test]

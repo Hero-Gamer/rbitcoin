@@ -114,6 +114,8 @@ pub(crate) struct IbdWorkState {
     pub assign_rot: usize,
     /// Stall-disconnect cooldowns (addr → until).
     pub addr_cooldown: HashMap<SocketAddr, Instant>,
+    /// Process-local stall/relative-slow kick counts (not persisted).
+    pub addr_strikes: HashMap<SocketAddr, u8>,
     /// Relative-slow hysteresis: peer id + first Gate B fail ms.
     pub relative_slow_suspect: Option<(usize, u64)>,
     /// Mono ms of last relative-slow disconnect (`0` = never).
@@ -179,6 +181,7 @@ impl IbdWorkState {
             header_req_seq: 0,
             assign_rot: 0,
             addr_cooldown: HashMap::new(),
+            addr_strikes: HashMap::new(),
             relative_slow_suspect: None,
             relative_slow_last_kick_ms: 0,
             reorg: IbdReorgState::new(),
