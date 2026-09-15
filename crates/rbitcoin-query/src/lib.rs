@@ -33,7 +33,7 @@ pub use soft_densify::{
     soft_confirm_window_n, soft_densify_band_hi, BQ_SOFT_FREE_BYTES,
 };
 pub use sp_tweaks::{ThinTweakRangeLimits, ThinTweakRow};
-pub use tx_precompute::{pres_for_tip, TxPrecompute};
+pub use tx_precompute::{decode_block_precomputes, pres_for_tip, TxPrecompute};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -152,7 +152,9 @@ pub mod process_mem_stats {
     }
 }
 
-pub use archive::{input_records_from_wire, ArchiveWritePlan, CreatePin};
+pub use archive::{
+    input_records_from_wire, ArchiveWritePlan, CreatePin, CreatePinInner, WirePlanNeed,
+};
 pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
@@ -161,7 +163,7 @@ pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
 pub use connect::{spawn_sh_writebehind, ConfirmPrepared};
-pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher};
+pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSet};
 pub use in_flight::InFlight;
 pub use scripthash::{
     HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance, ScriptHashChainStats,

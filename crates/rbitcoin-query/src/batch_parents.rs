@@ -87,12 +87,12 @@ impl PinOuts {
         }
     }
 
-    fn get(&self, vout: u32) -> Option<&OutputRecord> {
+    fn get_parts(&self, vout: u32) -> Option<(i64, &[u8])> {
         match self {
-            Self::Full { pin, .. } => pin.1.get(vout as usize),
+            Self::Full { pin, .. } => pin.out_parts(vout),
             Self::Sparse { outs, .. } => {
                 let i = outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
-                Some(&outs[i].1)
+                Some((outs[i].1.value, outs[i].1.script.as_slice()))
             }
         }
     }
@@ -109,7 +109,7 @@ impl PinOuts {
     }
 
     fn has_all_live(&self, live: &[(u32, OutputRecord)]) -> bool {
-        live.iter().all(|(v, _)| self.get(*v).is_some())
+        live.iter().all(|(v, _)| self.get_parts(*v).is_some())
     }
 
     fn already_covers(&self, live: &[(u32, OutputRecord)], checked: &[u32]) -> bool {
@@ -119,7 +119,7 @@ impl PinOuts {
     #[cfg(test)]
     fn live_len(&self) -> usize {
         match self {
-            Self::Full { pin, .. } => pin.1.len(),
+            Self::Full { pin, .. } => pin.n_out(),
             Self::Sparse { outs, .. } => outs.len(),
         }
     }
@@ -129,7 +129,7 @@ impl PinOuts {
             Self::Sparse { outs, .. } => outs.clone(),
             Self::Full { pin, checked, .. } => checked
                 .iter()
-                .filter_map(|&v| pin.1.get(v as usize).cloned().map(|o| (v, o)))
+                .filter_map(|&v| pin.out_record(v).map(|o| (v, o)))
                 .collect(),
         }
     }
@@ -138,7 +138,7 @@ impl PinOuts {
     fn compose(&self, live: &[(u32, OutputRecord)], checked: &[u32]) -> Self {
         match self {
             Self::Full { pin, checked: ch } => {
-                let extra = live.iter().any(|(v, _)| pin.1.get(*v as usize).is_none());
+                let extra = live.iter().any(|(v, _)| pin.out_parts(*v).is_none());
                 if extra {
                     let mut outs = self.sparse_live();
                     for (v, o) in live {
@@ -327,7 +327,7 @@ impl SharedParentPin {
             Some(false) => CB_FALSE,
             None => CB_UNKNOWN,
         };
-        let tx = pin.0.clone();
+        let tx = pin.tx().clone();
         Self {
             tx,
             coinbase: AtomicU8::new(cb),
@@ -601,13 +601,10 @@ impl BatchParents {
                 let outs = p.load_outs();
                 let need_outs = !outs.covers_need(&checked);
                 if need_outs {
-                    let live = {
-                        let (_tx, rows) = pin.as_ref();
-                        checked
-                            .iter()
-                            .filter_map(|&v| rows.get(v as usize).cloned().map(|o| (v, o)))
-                            .collect::<Vec<_>>()
-                    };
+                    let live = checked
+                        .iter()
+                        .filter_map(|&v| pin.out_record(v).map(|o| (v, o)))
+                        .collect::<Vec<_>>();
                     p.apply_pin_delta(
                         Some((live, checked.as_slice())),
                         coinbase,
@@ -656,8 +653,8 @@ impl BatchParents {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
         let outs = e.load_outs();
-        let o = outs.get(vout)?;
-        Some((e.tx.clone(), o.clone()))
+        let (value, script) = outs.get_parts(vout)?;
+        Some((e.tx.clone(), OutputRecord::unspent(value, script.to_vec())))
     }
 
     /// Assemble hot path: value + borrowed script bytes + parent txid.
@@ -702,20 +699,20 @@ impl BatchParents {
                 let st = self.sticky_outs.borrow();
                 if let Some((sid, snap)) = st.as_ref() {
                     if *sid == id {
-                        let o = snap.get(vout)?;
-                        return Some(f(o.value, o.script.as_slice(), txid));
+                        let (value, script) = snap.get_parts(vout)?;
+                        return Some(f(value, script, txid));
                     }
                 }
             }
             let snap = e.load_outs();
-            let o = snap.get(vout)?;
-            let r = f(o.value, o.script.as_slice(), txid);
+            let (value, script) = snap.get_parts(vout)?;
+            let r = f(value, script, txid);
             *self.sticky_outs.borrow_mut() = Some((id, Arc::clone(&snap)));
             return Some(r);
         }
         let outs = e.load_outs();
-        let o = outs.get(vout)?;
-        Some(f(o.value, o.script.as_slice(), txid))
+        let (value, script) = outs.get_parts(vout)?;
+        Some(f(value, script, txid))
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -940,7 +937,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        e.load_outs().get(vout).is_some()
+        e.load_outs().get_parts(vout).is_some()
     }
 
     pub fn pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
@@ -1001,17 +998,17 @@ impl BatchParents {
         if covered {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some(o) = body.get(v) {
-                    live.push((v, o.clone()));
+                if let Some((value, script)) = body.get_parts(v) {
+                    live.push((v, OutputRecord::unspent(value, script.to_vec())));
                 }
             }
             return Some((e.tx.clone(), live, true));
         }
-        if vouts.iter().all(|v| body.get(*v).is_some()) {
+        if vouts.iter().all(|v| body.get_parts(*v).is_some()) {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some(o) = body.get(v) {
-                    live.push((v, o.clone()));
+                if let Some((value, script)) = body.get_parts(v) {
+                    live.push((v, OutputRecord::unspent(value, script.to_vec())));
                 }
             }
             return Some((e.tx.clone(), live, false));
@@ -1123,11 +1120,10 @@ mod tests {
     /// Vacant CreatePin insert must keep the script allocation (no PinOuts clone).
     #[test]
     fn insert_create_pin_shares_script_bytes() {
-        use crate::CreatePin;
-        use std::sync::Arc;
+        use crate::CreatePinInner;
         let script = vec![0x51u8; 4096];
-        let pin: CreatePin = Arc::new((tx(9), vec![OutputRecord::unspent(50, script)]));
-        let expect = pin.1[0].script.as_ptr();
+        let pin = CreatePinInner::records(tx(9), vec![OutputRecord::unspent(50, script)]);
+        let expect = pin.out_parts(0).expect("vout 0").1.as_ptr();
         let mut bp = BatchParents::new();
         bp.insert_create_pin(
             Fk(9),
@@ -1239,7 +1235,7 @@ mod tests {
         let pin_ptr = {
             let e = bp.pins.get(&9).expect("pin");
             let outs = e.load_outs();
-            outs.get(0).expect("vout 0").script.as_ptr()
+            outs.get_parts(0).expect("vout 0").1.as_ptr()
         };
         let hit = bp
             .get_parent_txout_parts(Fk(9), 0, |value, spk, txid| {
@@ -1403,7 +1399,7 @@ mod tests {
         );
         let after = pin.load_outs();
         assert!(
-            after.covers_need(&[0]) && after.get(1).is_some(),
+            after.covers_need(&[0]) && after.get_parts(1).is_some(),
             "Occupied empty-checked new live must still widen"
         );
         assert!(!Arc::ptr_eq(&before, &after));
@@ -1428,8 +1424,8 @@ mod tests {
         pin.merge_outs(vec![(1, rec)], &[1]);
         let snap = pin.load_outs();
         assert_eq!(snap.live_len(), 2);
-        assert_eq!(snap.get(1).expect("vout 1").script.len(), 4096);
-        assert_eq!(snap.get(1).unwrap().script, script);
+        assert_eq!(snap.get_parts(1).expect("vout 1").1.len(), 4096);
+        assert_eq!(snap.get_parts(1).unwrap().1, script);
     }
 
     #[test]

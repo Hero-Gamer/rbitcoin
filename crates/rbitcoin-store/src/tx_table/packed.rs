@@ -9,11 +9,95 @@ pub(super) fn encode_output_run_secret(
     secret: Option<&crate::store_secret::StoreSecret>,
 ) {
     for r in recs {
-        let start = out.len();
-        r.encode_into(out);
-        if let Some(sec) = secret {
-            xor_script_region_in_output(out, start, sec);
-        }
+        encode_unspent_output_into_secret(r.value, &r.script, out, secret);
+    }
+}
+
+/// Encode one unspent output (optional at-rest XOR of scriptPubKey).
+pub fn encode_unspent_output_into_secret(
+    value: i64,
+    script: &[u8],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
+    let start = out.len();
+    OutputRecord::encode_unspent_into(value, script, out);
+    if let Some(sec) = secret {
+        xor_script_region_in_output(out, start, sec);
+    }
+}
+
+/// Class A append pin: tx meta + outs (records or encode-from-wire).
+pub trait PackedCreate {
+    fn packed_txid(&self) -> [u8; 32];
+    fn packed_tx(&self) -> &TxRecord;
+    fn packed_n_out(&self) -> u32;
+    fn packed_outs_est(&self) -> usize;
+    fn packed_has_negative_amount(&self) -> bool;
+    fn encode_txout_body(
+        &self,
+        buf: &mut Vec<u8>,
+        secret: Option<&crate::store_secret::StoreSecret>,
+    );
+}
+
+impl<T: PackedCreate + ?Sized> PackedCreate for std::sync::Arc<T> {
+    #[inline]
+    fn packed_txid(&self) -> [u8; 32] {
+        (**self).packed_txid()
+    }
+    #[inline]
+    fn packed_tx(&self) -> &TxRecord {
+        (**self).packed_tx()
+    }
+    #[inline]
+    fn packed_n_out(&self) -> u32 {
+        (**self).packed_n_out()
+    }
+    #[inline]
+    fn packed_outs_est(&self) -> usize {
+        (**self).packed_outs_est()
+    }
+    #[inline]
+    fn packed_has_negative_amount(&self) -> bool {
+        (**self).packed_has_negative_amount()
+    }
+    fn encode_txout_body(
+        &self,
+        buf: &mut Vec<u8>,
+        secret: Option<&crate::store_secret::StoreSecret>,
+    ) {
+        (**self).encode_txout_body(buf, secret);
+    }
+}
+
+impl PackedCreate for std::sync::Arc<(TxRecord, Vec<OutputRecord>)> {
+    #[inline]
+    fn packed_txid(&self) -> [u8; 32] {
+        self.0.txid
+    }
+    #[inline]
+    fn packed_tx(&self) -> &TxRecord {
+        &self.0
+    }
+    #[inline]
+    fn packed_has_negative_amount(&self) -> bool {
+        self.1.iter().any(|o| o.value < 0)
+    }
+    #[inline]
+    fn packed_n_out(&self) -> u32 {
+        self.1.len() as u32
+    }
+    #[inline]
+    fn packed_outs_est(&self) -> usize {
+        16 + TxRecord::BODY_META_LEN + self.1.iter().map(|o| o.encoded_len()).sum::<usize>()
+    }
+    fn encode_txout_body(
+        &self,
+        buf: &mut Vec<u8>,
+        secret: Option<&crate::store_secret::StoreSecret>,
+    ) {
+        encode_txout_meta_and_outs(&self.0, &self.1, buf, secret);
     }
 }
 
@@ -464,6 +548,17 @@ pub fn encode_packed_tx_with_secret(
     secret: Option<&crate::store_secret::StoreSecret>,
 ) {
     debug_assert_eq!(inputs.len() as u32, tx.input_count);
+    debug_assert_eq!(outputs.len() as u32, tx.output_count);
+    encode_txout_meta_and_outs(tx, outputs, out, secret);
+}
+
+/// `txout.body` meta + output run (no input-count assert).
+pub fn encode_txout_meta_and_outs(
+    tx: &TxRecord,
+    outputs: &[OutputRecord],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
     debug_assert_eq!(outputs.len() as u32, tx.output_count);
     let mut meta = tx.clone();
     meta.input_start_fk = Fk::NULL;
@@ -995,5 +1090,18 @@ mod scan_p2tr_tests {
         assert_eq!(meta.output_count, 3);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);
+    }
+
+    #[test]
+    fn encode_unspent_into_matches_output_record() {
+        let rec = OutputRecord::unspent(50_0000_0000, vec![0x00, 0x14, 0xaa]);
+        let mut from_rec = Vec::new();
+        rec.encode_into(&mut from_rec);
+        let mut from_parts = Vec::new();
+        OutputRecord::encode_unspent_into(rec.value, &rec.script, &mut from_parts);
+        assert_eq!(from_rec, from_parts);
+        let mut via_secret = Vec::new();
+        encode_unspent_output_into_secret(rec.value, &rec.script, &mut via_secret, None);
+        assert_eq!(from_rec, via_secret);
     }
 }

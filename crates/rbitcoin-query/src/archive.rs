@@ -14,25 +14,205 @@
 //! prior plan that is still queued/committing (not yet in head).
 
 use super::*;
+use rbitcoin_store::{encode_txout_meta_and_outs, encode_unspent_output_into_secret, PackedCreate};
+use std::sync::Arc;
 
-/// Shared immutable create pin: tx meta + full outs.
+/// Shared immutable create pin: tx meta + outs (records or wire).
 ///
 /// One Arc per create — plan `packed` pin half, `batch_pin`, and prep-ahead
 /// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
-pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>)>;
+/// Wire pins borrow `scriptPubKey` from [`Arc<bitcoin::Block>`] until write
+/// encodes Class A; records pins own [`OutputRecord`] scripts (tests / SH).
+pub type CreatePin = Arc<CreatePinInner>;
+
+/// One header's wire block + txids for Class A plan/commit.
+pub type WirePlanNeed<'a> = (Fk, &'a Arc<bitcoin::Block>, &'a [[u8; 32]]);
+
+/// [`CreatePin`] payload.
+#[derive(Debug)]
+pub enum CreatePinInner {
+    Records {
+        tx: TxRecord,
+        outs: Vec<OutputRecord>,
+    },
+    Wire {
+        block: Arc<bitcoin::Block>,
+        tx_index: u32,
+        tx: TxRecord,
+    },
+}
+
+impl CreatePinInner {
+    pub fn records(tx: TxRecord, outs: Vec<OutputRecord>) -> CreatePin {
+        Arc::new(Self::Records { tx, outs })
+    }
+
+    pub fn wire(block: Arc<bitcoin::Block>, tx_index: u32, tx: TxRecord) -> CreatePin {
+        Arc::new(Self::Wire {
+            block,
+            tx_index,
+            tx,
+        })
+    }
+
+    #[inline]
+    pub fn tx(&self) -> &TxRecord {
+        match self {
+            Self::Records { tx, .. } | Self::Wire { tx, .. } => tx,
+        }
+    }
+
+    #[inline]
+    pub fn n_out(&self) -> usize {
+        match self {
+            Self::Records { outs, .. } => outs.len(),
+            Self::Wire {
+                block, tx_index, ..
+            } => block
+                .txdata
+                .get(*tx_index as usize)
+                .map(|t| t.output.len())
+                .unwrap_or(0),
+        }
+    }
+
+    #[inline]
+    pub fn out_parts(&self, vout: u32) -> Option<(i64, &[u8])> {
+        match self {
+            Self::Records { outs, .. } => {
+                let o = outs.get(vout as usize)?;
+                Some((o.value, o.script.as_slice()))
+            }
+            Self::Wire {
+                block, tx_index, ..
+            } => {
+                let o = block
+                    .txdata
+                    .get(*tx_index as usize)?
+                    .output
+                    .get(vout as usize)?;
+                Some((o.value.to_sat() as i64, o.script_pubkey.as_bytes()))
+            }
+        }
+    }
+
+    pub fn out_record(&self, vout: u32) -> Option<OutputRecord> {
+        let (value, script) = self.out_parts(vout)?;
+        Some(OutputRecord::unspent(value, script.to_vec()))
+    }
+
+    pub fn for_each_script(&self, mut f: impl FnMut(&[u8])) {
+        match self {
+            Self::Records { outs, .. } => {
+                for o in outs {
+                    f(o.script.as_slice());
+                }
+            }
+            Self::Wire {
+                block, tx_index, ..
+            } => {
+                if let Some(tx) = block.txdata.get(*tx_index as usize) {
+                    for o in &tx.output {
+                        f(o.script_pubkey.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn wire_tx(&self) -> Option<&bitcoin::Transaction> {
+        match self {
+            Self::Wire {
+                block, tx_index, ..
+            } => block.txdata.get(*tx_index as usize),
+            Self::Records { .. } => None,
+        }
+    }
+}
+
+impl PackedCreate for CreatePinInner {
+    #[inline]
+    fn packed_txid(&self) -> [u8; 32] {
+        self.tx().txid
+    }
+    #[inline]
+    fn packed_tx(&self) -> &TxRecord {
+        self.tx()
+    }
+    #[inline]
+    fn packed_n_out(&self) -> u32 {
+        self.n_out() as u32
+    }
+    #[inline]
+    fn packed_has_negative_amount(&self) -> bool {
+        match self {
+            Self::Records { outs, .. } => outs.iter().any(|o| o.value < 0),
+            Self::Wire { .. } => false,
+        }
+    }
+    fn packed_outs_est(&self) -> usize {
+        let scripts: usize = match self {
+            Self::Records { outs, .. } => outs.iter().map(|o| o.encoded_len()).sum(),
+            Self::Wire { .. } => self
+                .wire_tx()
+                .map(|tx| {
+                    tx.output
+                        .iter()
+                        .map(|o| OutputRecord::encoded_len_for_script(o.script_pubkey.len()))
+                        .sum()
+                })
+                .unwrap_or(0),
+        };
+        16 + TxRecord::BODY_META_LEN + scripts
+    }
+    fn encode_txout_body(&self, buf: &mut Vec<u8>, secret: Option<&rbitcoin_store::StoreSecret>) {
+        match self {
+            Self::Records { tx, outs } => {
+                encode_txout_meta_and_outs(tx, outs, buf, secret);
+            }
+            Self::Wire { tx, .. } => {
+                let mut meta = tx.clone();
+                meta.input_start_fk = Fk::NULL;
+                meta.output_start_fk = Fk::NULL;
+                meta.encode_body_meta_into(buf);
+                if let Some(wtx) = self.wire_tx() {
+                    for o in &wtx.output {
+                        encode_unspent_output_into_secret(
+                            o.value.to_sat() as i64,
+                            o.script_pubkey.as_bytes(),
+                            buf,
+                            secret,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Approx heap bytes for one [`CreatePin`] payload (for IBD `sizes` metering).
 ///
 /// Counts owned output scripts + fixed record overhead — not Arc
 /// refcount sharing (each strong Arc still "owns" the allocation once).
+/// Wire pins meter scriptPubKey lengths on the shared [`bitcoin::Block`].
 #[inline]
 pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
-    let (_tx, outs) = pin.as_ref();
     let mut n = 96usize; // TxRecord + Arc shell overhead (order-of-magnitude)
-    for o in outs {
-        n = n.saturating_add(24).saturating_add(o.script.len());
+    match pin.as_ref() {
+        CreatePinInner::Records { outs, .. } => {
+            for o in outs {
+                n = n.saturating_add(24).saturating_add(o.script.len());
+            }
+            n = n.saturating_add(outs.capacity().saturating_mul(24));
+        }
+        CreatePinInner::Wire { .. } => {
+            if let Some(tx) = pin.wire_tx() {
+                for o in &tx.output {
+                    n = n.saturating_add(24).saturating_add(o.script_pubkey.len());
+                }
+            }
+        }
     }
-    n = n.saturating_add(outs.capacity().saturating_mul(24)); // Vec spare
     n
 }
 
@@ -369,20 +549,18 @@ struct PlanRow {
     tx_fk: Fk,
     tx: TxRecord,
     ins: Vec<PlanIn>,
-    outs: Vec<OutputRecord>,
     packed_ins: Vec<InputRecord>,
     ins_est: u64,
+    block: Arc<bitcoin::Block>,
+    tx_index: u32,
 }
 
 fn collect_plan_need_external(
     work: &[PlanRow],
-    batch_map: &std::collections::HashMap<[u8; 32], Fk>,
+    batch_map: &crate::TxidMap<Fk>,
     carried_need: Option<&[[u8; 32]]>,
 ) -> Vec<[u8; 32]> {
-    use std::collections::HashSet;
-    use std::hash::BuildHasherDefault;
-    let mut need_external: HashSet<[u8; 32], BuildHasherDefault<crate::TxidHasher>> =
-        HashSet::with_hasher(BuildHasherDefault::default());
+    let mut need_external: crate::TxidSet = crate::TxidSet::with_hasher(Default::default());
     if let Some(keys) = carried_need {
         for &prev in keys {
             if prev == [0u8; 32] || batch_map.contains_key(&prev) {
@@ -511,10 +689,7 @@ fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
 
 impl Query {
     /// Class A plan + fill packed ins + commit from wire blocks. Does not set tip.
-    pub fn archive_class_a_from_wire(
-        &self,
-        items: &[(Fk, &bitcoin::Block, &[[u8; 32]])],
-    ) -> Result<(), QueryError> {
+    pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -536,7 +711,7 @@ impl Query {
         if plan.is_empty() {
             return Ok(());
         }
-        let blocks: Vec<&bitcoin::Block> = need.iter().map(|(_, b, _)| *b).collect();
+        let blocks: Vec<&bitcoin::Block> = need.iter().map(|(_, b, _)| b.as_ref()).collect();
         plan.fill_packed_ins_from_blocks(&blocks)?;
         self.archive_commit_plan(plan)?;
         Ok(())
@@ -564,13 +739,12 @@ impl Query {
     /// packed ins from `Arc<Block>` + edges. `body_est` uses wire compact sizes.
     pub fn archive_plan_batch_from_wire(
         &self,
-        need: &[(Fk, &bitcoin::Block, &[[u8; 32]])],
+        need: &[WirePlanNeed<'_>],
         next_tx_start: u64,
         in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
         carried_need: Option<&[[u8; 32]]>,
     ) -> Result<ArchiveWritePlan, QueryError> {
-        use std::collections::{HashMap, HashSet};
         use std::time::Instant;
 
         self.on_load_pack()?;
@@ -582,7 +756,7 @@ impl Query {
         let n_headers = need.iter().filter(|(_, b, _)| !b.txdata.is_empty()).count() as u64;
 
         let t_assign = Instant::now();
-        let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
+        let mut batch_map: crate::TxidMap<Fk> = crate::TxidMap::default();
         let mut work: Vec<PlanRow> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut per_header_sw: Vec<(u32, u32)> = Vec::with_capacity(need.len());
@@ -596,32 +770,24 @@ impl Query {
             }
             let first_tx_fk = Fk(next_tx);
             let n_txs = block.txdata.len() as u32;
-            let mut seen_in_block: HashSet<[u8; 32]> = HashSet::with_capacity(block.txdata.len());
-            for (tx, txid) in block.txdata.iter().zip(txids.iter()) {
-                if !seen_in_block.insert(*txid) {
+            for (tx_index, (tx, txid)) in block.txdata.iter().zip(txids.iter()).enumerate() {
+                let tx_fk = Fk(next_tx);
+                next_tx += 1;
+                if batch_map.insert(*txid, tx_fk).is_some() {
                     return Err(StoreError::Corrupt(
                         "duplicate txid in block body (consensus violation)",
                     ));
                 }
-                let tx_fk = Fk(next_tx);
-                next_tx += 1;
                 let rec = tx_record_from_wire(tx, *txid);
-                batch_map.insert(*txid, tx_fk);
                 let ins: Vec<PlanIn> = tx.input.iter().map(plan_in_from_txin).collect();
-                let outs: Vec<OutputRecord> = tx
-                    .output
-                    .iter()
-                    .map(|o| {
-                        OutputRecord::unspent(o.value.to_sat() as i64, o.script_pubkey.to_bytes())
-                    })
-                    .collect();
                 work.push(PlanRow {
                     tx_fk,
                     tx: rec,
                     ins,
-                    outs,
                     packed_ins: Vec::new(),
                     ins_est: wire_ins_est(tx),
+                    block: Arc::clone(block),
+                    tx_index: tx_index as u32,
                 });
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
@@ -646,7 +812,7 @@ impl Query {
     fn finish_archive_plan(
         &self,
         work: Vec<PlanRow>,
-        batch_map: std::collections::HashMap<[u8; 32], Fk>,
+        batch_map: crate::TxidMap<Fk>,
         per_header_ranges: Vec<(Fk, Fk, u32)>,
         n_headers: u64,
         assign_ns: u64,
@@ -706,9 +872,10 @@ impl Query {
                 tx_fk,
                 tx,
                 ins,
-                outs,
                 mut packed_ins,
                 ins_est,
+                block,
+                tx_index,
             } = row;
             let mut tx_edges: Vec<crate::SpendEdge> = Vec::with_capacity(ins.len());
             for (i, inp) in ins.iter().enumerate() {
@@ -788,11 +955,11 @@ impl Query {
             } else {
                 packed_ins.iter().map(|x| x.encoded_len() as u64).sum()
             };
-            let pin = std::sync::Arc::new((tx, outs));
+            let pin = CreatePinInner::wire(block, tx_index, tx);
             body_est = body_est
                 .saturating_add((1 + TxRecord::ENCODED_LEN) as u64)
                 .saturating_add(ins_bytes)
-                .saturating_add(pin.1.iter().map(|x| x.encoded_len() as u64).sum::<u64>());
+                .saturating_add(pin.packed_outs_est() as u64);
             batch_pin.push(std::sync::Arc::clone(&pin));
             packed.push((pin, packed_ins));
         }
@@ -814,7 +981,7 @@ impl Query {
         let batch_creates: Vec<([u8; 32], Fk)> = packed
             .iter()
             .zip(planned_fks.iter())
-            .map(|((pin, _), fk)| (pin.0.txid, *fk))
+            .map(|((pin, _), fk)| (pin.tx().txid, *fk))
             .collect();
 
         // Finish is cheap: body_est + batch_creates only.
@@ -918,7 +1085,7 @@ impl Query {
                 .packed
                 .iter()
                 .zip(got_tx_fks.iter())
-                .map(|((pin, _), fk)| (pin.0.txid, *fk))
+                .map(|((pin, _), fk)| (pin.tx().txid, *fk))
                 .collect();
             self.drain_pending_tx_head_if_full()?;
             self.store.txs.head_note_pending(&heads);
@@ -1006,9 +1173,10 @@ impl Query {
 #[cfg(test)]
 mod tests {
     use crate::testutil::FixtureChain;
-    use crate::{Query, TxApply};
+    use crate::{Query, TxApply, WirePlanNeed};
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::Arc;
 
     fn temp_query(label: &str) -> (crate::testutil::TempDir, Query) {
         crate::testutil::tiny_query_labeled(label)
@@ -1047,15 +1215,15 @@ mod tests {
         in_flight: &crate::InFlight,
         skeleton: Option<&crate::BatchParentIds>,
     ) -> Result<crate::ArchiveWritePlan, crate::QueryError> {
-        let wires: Vec<(Fk, bitcoin::Block, Vec<[u8; 32]>)> = need
+        let wires: Vec<_> = need
             .iter()
             .filter(|(_, txs)| !txs.is_empty())
             .map(|(fk, txs)| {
                 let (b, ids) = crate::testutil::block_from_applies(txs);
-                (*fk, b, ids)
+                (*fk, Arc::new(b), ids)
             })
             .collect();
-        let refs: Vec<(Fk, &bitcoin::Block, &[[u8; 32]])> = wires
+        let refs: Vec<WirePlanNeed<'_>> = wires
             .iter()
             .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
             .collect();
@@ -1077,7 +1245,7 @@ mod tests {
             skeleton,
             skeleton.is_some().then_some(carried.as_slice()),
         )?;
-        let blocks: Vec<&bitcoin::Block> = wires.iter().map(|(_, b, _)| b).collect();
+        let blocks: Vec<&bitcoin::Block> = wires.iter().map(|(_, b, _)| b.as_ref()).collect();
         plan.fill_packed_ins_from_blocks(&blocks)?;
         Ok(plan)
     }
@@ -1185,14 +1353,13 @@ mod tests {
                 assert_eq!(Arc::strong_count(pin), 3);
             }
         }
-        for ((pin, ins), _) in plan.packed.iter().zip(plan.batch_pin.iter()) {
-            let (tx, outs) = pin.as_ref();
+        for ((pin, _ins), _) in plan.packed.iter().zip(plan.batch_pin.iter()) {
             let mut raw = Vec::new();
-            rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
+            rbitcoin_store::PackedCreate::encode_txout_body(pin.as_ref(), &mut raw, None);
             let (meta, dec_outs, _) =
                 rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw, 1).unwrap();
             assert_eq!(meta.output_count as usize, dec_outs.len());
-            assert_eq!(outs.len(), dec_outs.len());
+            assert_eq!(pin.n_out(), dec_outs.len());
         }
         assert_eq!(ifo.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1856,11 +2023,10 @@ mod tests {
     /// RAM loc after prune (mainnet 133433).
     #[test]
     fn plan_inflight_skeleton_miss_fills_loc_by_fk() {
-        use std::sync::Arc;
         let (dir, q) = temp_query("plan-inflight-skel-miss");
         let parent = coinbase_apply(1);
         let parent_txid = parent.tx.txid;
-        let pin: crate::CreatePin = Arc::new((parent.tx.clone(), parent.outputs.clone()));
+        let pin = crate::CreatePinInner::records(parent.tx.clone(), parent.outputs.clone());
         q.store
             .txs
             .put_full_batch_indexed(
@@ -2136,11 +2302,17 @@ mod tests {
     /// D1: wire planner never builds TxApply; packed ins empty; CreatePin matches wire outs.
     #[test]
     fn plan_batch_from_wire_skips_tx_apply() {
+        use std::sync::Arc;
         let (dir, q) = temp_query("plan-from-wire");
         let (block, txids, script_sig) = wire_parent_child_big_script_sig();
-        let parent_spk = block.txdata[0].output[0].script_pubkey.to_bytes();
-        let child_spk = block.txdata[1].output[0].script_pubkey.to_bytes();
         let parent_txid = txids[0];
+        let block = Arc::new(block);
+        let parent_spk = block.txdata[0].output[0].script_pubkey.as_bytes();
+        let child_spk = block.txdata[1].output[0].script_pubkey.as_bytes();
+        let parent_ptr = parent_spk.as_ptr();
+        let child_ptr = child_spk.as_ptr();
+        let parent_spk = parent_spk.to_vec();
+        let child_spk = child_spk.to_vec();
         let mut plan = q
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
@@ -2155,13 +2327,31 @@ mod tests {
             plan.packed.iter().all(|(_, ins)| ins.is_empty()),
             "wire planner must not clone script_sig into packed ins"
         );
-        plan.fill_packed_ins_from_blocks(&[&block])
+        assert_eq!(
+            plan.batch_pin[0]
+                .out_parts(0)
+                .expect("parent out")
+                .1
+                .as_ptr(),
+            parent_ptr,
+            "plan must not copy scriptPubKey"
+        );
+        assert_eq!(
+            plan.batch_pin[1]
+                .out_parts(0)
+                .expect("child out")
+                .1
+                .as_ptr(),
+            child_ptr,
+            "plan must not copy scriptPubKey"
+        );
+        plan.fill_packed_ins_from_blocks(&[block.as_ref()])
             .expect("write fill");
         assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
         assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_pin.len(), 2);
-        assert_eq!(plan.batch_pin[0].1[0].script, parent_spk);
-        assert_eq!(plan.batch_pin[1].1[0].script, child_spk);
+        assert_eq!(plan.batch_pin[0].out_parts(0).unwrap().1, parent_spk);
+        assert_eq!(plan.batch_pin[1].out_parts(0).unwrap().1, child_spk);
         let cb = plan.edges.get(&1).expect("coinbase edges");
         assert_eq!(cb.len(), 1);
         assert!(cb[0].create_fk.is_null());
@@ -2285,6 +2475,7 @@ mod tests {
         };
         let child = child_spend(parent_txid, 0x66);
         let (block, txids) = crate::testutil::block_from_applies(std::slice::from_ref(&child));
+        let block = Arc::new(block);
         let err = q
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
@@ -2378,7 +2569,7 @@ mod tests {
             t[0] = 0x93;
             t
         };
-        let pin: crate::CreatePin = Arc::new((
+        let pin = crate::CreatePinInner::records(
             rbitcoin_store::TxRecord {
                 txid: parent_txid,
                 version: 1,
@@ -2389,7 +2580,7 @@ mod tests {
                 output_count: 1,
             },
             vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
-        ));
+        );
         let mut log = crate::InFlight::new();
         log.note_pins([(Fk(93), &pin)], None);
         let ifo = &log;
@@ -2458,7 +2649,7 @@ mod tests {
         plan_a
             .external_parents
             .insert(99, crate::ParentIdent::with_body([9u8; 32], (0, 1)));
-        let txid = plan_a.batch_pin[0].0.txid;
+        let txid = plan_a.batch_pin[0].tx().txid;
         let fk = plan_a.planned_fks[0];
         plan_a.freeze_after_pin();
         assert!(plan_a.external_parents.is_empty());
@@ -2580,7 +2771,7 @@ mod tests {
         plan.per_header_ranges = vec![(Fk(10), Fk(1), 2), (Fk(20), Fk(3), 1)];
         // Minimal packed rows so retain can compact.
         let dummy_pin = |i: u8| {
-            std::sync::Arc::new((
+            crate::CreatePinInner::records(
                 TxRecord {
                     txid: [i; 32],
                     version: 1,
@@ -2591,7 +2782,7 @@ mod tests {
                     output_count: 0,
                 },
                 Vec::new(),
-            ))
+            )
         };
         plan.packed = vec![
             (dummy_pin(1), Vec::new()),
@@ -2616,7 +2807,7 @@ mod tests {
     #[test]
     fn retain_headers_needing_body_edge_matrix() {
         let dummy_pin = |i: u8| {
-            std::sync::Arc::new((
+            crate::CreatePinInner::records(
                 TxRecord {
                     txid: [i; 32],
                     version: 1,
@@ -2627,7 +2818,7 @@ mod tests {
                     output_count: 0,
                 },
                 Vec::new(),
-            ))
+            )
         };
 
         // No per_header_ranges: keep iff packed non-empty.
@@ -2687,7 +2878,7 @@ mod tests {
 
     #[test]
     fn retain_headers_missing_first_fk_is_corrupt() {
-        let dummy_pin = std::sync::Arc::new((
+        let dummy_pin = crate::CreatePinInner::records(
             TxRecord {
                 txid: [5u8; 32],
                 version: 1,
@@ -2698,7 +2889,7 @@ mod tests {
                 output_count: 0,
             },
             Vec::new(),
-        ));
+        );
         let mut plan = super::ArchiveWritePlan::empty();
         plan.planned_fks = vec![Fk(5)];
         plan.per_header_ranges = vec![(Fk(10), Fk(99), 1)];

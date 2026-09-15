@@ -800,9 +800,9 @@ impl Store {
     ///
     /// `pin` is `(TxRecord, outs)`. `spent_overlay` is per-item `(vout, spend_fk, vin)`
     /// (empty = all zeros).
-    pub fn put_tx_full_batch_from_pins(
+    pub fn put_tx_full_batch_from_pins<P: crate::tx_table::PackedCreate>(
         &self,
-        items: &[crate::tx_table::PinInItem],
+        items: &[(P, Vec<crate::InputRecord>)],
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {

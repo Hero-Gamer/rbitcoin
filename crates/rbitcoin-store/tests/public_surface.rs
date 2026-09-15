@@ -7,7 +7,8 @@ use rbitcoin_store::{
     block_header_hash, block_wire_input_count, clear_unsorted_shard_dir,
     collect_unsorted_shard_files, decode_inwit_secret, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    encode_packed_tx, encode_packed_tx_with_secret, ensure_nofile_budget, free_gib_label,
+    encode_packed_tx, encode_packed_tx_with_secret, encode_txout_meta_and_outs,
+    encode_unspent_output_into_secret, ensure_nofile_budget, free_gib_label,
     is_probe_exhausted_error, is_store_corrupt_display, leftover_probe_diag_ready,
     leftover_probe_diag_recorded, list_materialize_claims, list_runs, load_tweak_wave,
     materialize_sh_unsorted_from_class_a, merkle_root_from_txids, next_run_path, output_flags,
@@ -15,9 +16,9 @@ use rbitcoin_store::{
     unsorted_collect_workers, unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir,
     write_sorted_run, BlockQueue, ColdProgress, FkMap, FkSet, HeadOpenOpts, HeadResizeSizeSnapshot,
     HeadScale, HeaderRecord, HeightFence, IdxBodyJob, IdxBodyMode, InputRecord, OutputRecord,
-    PointRecord, QueuedBlockMeta, ReadIoBackend, ScriptHashRecord, ShHeadValue, SpTweaksTable,
-    Store, StoreError, StoreLayout, StoreSecret, TakenRaw, TxRecord, U32Map, U64IdentityHasher,
-    U64Map, U64Set, WriteIoBackend, INCLUDE_HWM_NAME, SH_HEADS_CAP,
+    PackedCreate, PointRecord, QueuedBlockMeta, ReadIoBackend, ScriptHashRecord, ShHeadValue,
+    SpTweaksTable, Store, StoreError, StoreLayout, StoreSecret, TakenRaw, TxRecord, U32Map,
+    U64IdentityHasher, U64Map, U64Set, WriteIoBackend, INCLUDE_HWM_NAME, SH_HEADS_CAP,
 };
 
 #[test]
@@ -48,6 +49,7 @@ fn crate_root_exports_cross_crate_names() {
     let _ = std::any::type_name::<InputRecord>();
     let _ = std::any::type_name::<OutputRecord>();
     let _ = std::any::type_name::<TxRecord>();
+    let _ = std::any::type_name::<dyn PackedCreate>();
     let _ = std::any::type_name::<SpTweaksTable>();
     let _ = std::any::type_name::<ReadIoBackend>();
     let _ = std::any::type_name::<WriteIoBackend>();
@@ -76,6 +78,8 @@ fn crate_root_exports_cross_crate_names() {
     let _ = decode_packed_tx_with_spender_rels_secret;
     let _ = encode_packed_tx;
     let _ = encode_packed_tx_with_secret;
+    let _ = encode_txout_meta_and_outs;
+    let _ = encode_unspent_output_into_secret;
     let _ = free_gib_label;
     let _ = is_probe_exhausted_error;
     let _ = is_store_corrupt_display;

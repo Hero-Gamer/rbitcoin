@@ -14,7 +14,7 @@ use std::sync::Arc;
 fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
     let mut txid = [0u8; 32];
     txid[..8].copy_from_slice(&id.to_le_bytes());
-    Arc::new((
+    rbitcoin_query::CreatePinInner::records(
         TxRecord {
             txid,
             version: 1,
@@ -25,7 +25,7 @@ fn test_pin(id: u64) -> rbitcoin_query::CreatePin {
             output_count: 0,
         },
         vec![OutputRecord::unspent(1, vec![0x51])],
-    ))
+    )
 }
 
 /// Pack stays until a later wave snapshots drain+fence past its height (not pack height alone).
@@ -637,7 +637,7 @@ fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
     log.note_pins([(Fk(42), &p)], Some(1));
     log.prune_below_height(Some(0));
     assert!(
-        log.get_create_fk(&p.0.txid).is_some(),
+        log.get_create_fk(&p.tx().txid).is_some(),
         "occupied/fence lag must not drop height > tip"
     );
 }
@@ -842,11 +842,11 @@ fn marked_load_batch_drops_inflight_below_after_read() {
     assert_eq!(log.pack_count(), 2, "unmarked batch does not drop");
     log.prune_below_height(Some(10));
     assert!(
-        log.get_create_fk(&a.0.txid).is_none(),
+        log.get_create_fk(&a.tx().txid).is_none(),
         "height 5 is below noted 10 after last-batch in-flight read"
     );
     assert!(
-        log.get_create_fk(&b.0.txid).is_some(),
+        log.get_create_fk(&b.tx().txid).is_some(),
         "height 20 stays until a later wave snapshots past it"
     );
 }

@@ -43,8 +43,43 @@ impl TxPrecompute {
         Self::from_tx_inner(tx, false)
     }
 
+    /// Ids from the **wire slice** (wtxid = `sha256d(wire)`; txid = that when
+    /// stripped == wire). `sighash` fills BIP143/341 midstates like [`Self::from_tx`].
+    pub fn from_tx_wire(tx: &Transaction, wire: &[u8], sighash: bool) -> Self {
+        let has_witness = uses_segwit_serialization(tx);
+        let wtxid = sha256d::Hash::hash(wire).to_byte_array();
+        let (txid, base_size) = if has_witness {
+            hash_stripped_txid(tx)
+        } else {
+            (wtxid, wire.len())
+        };
+        let (sigops, out_sum) = sigops_and_out_sum(tx);
+        let [sha_prevouts, sha_sequences, sha_outputs] = if sighash {
+            sighash_midstates(tx)
+        } else {
+            [None, None, None]
+        };
+        Self {
+            txid,
+            wtxid,
+            base_size,
+            total_size: wire.len(),
+            sigops,
+            out_sum,
+            has_witness,
+            sha_prevouts,
+            sha_sequences,
+            sha_outputs,
+            sha_amounts: None,
+            sha_scriptpubkeys: None,
+        }
+    }
+
     fn from_tx_inner(tx: &Transaction, sighash: bool) -> Self {
         let has_witness = uses_segwit_serialization(tx);
+        if !has_witness {
+            return Self::from_tx_legacy_one_engine(tx, sighash);
+        }
 
         let mut txid_eng = sha256d::Hash::engine();
         let mut wtxid_eng = sha256d::Hash::engine();
@@ -58,10 +93,8 @@ impl TxPrecompute {
 
         base_size += enc(&mut txid_eng, &tx.version);
         total_size += enc(&mut wtxid_eng, &tx.version);
-        if has_witness {
-            total_size += enc(&mut wtxid_eng, &0u8);
-            total_size += enc(&mut wtxid_eng, &1u8);
-        }
+        total_size += enc(&mut wtxid_eng, &0u8);
+        total_size += enc(&mut wtxid_eng, &1u8);
 
         let n_in = VarInt(tx.input.len() as u64);
         base_size += enc(&mut txid_eng, &n_in);
@@ -99,10 +132,8 @@ impl TxPrecompute {
             out_sum = out_sum.saturating_add(v);
         }
 
-        if has_witness {
-            for txin in &tx.input {
-                total_size += enc(&mut wtxid_eng, &txin.witness);
-            }
+        for txin in &tx.input {
+            total_size += enc(&mut wtxid_eng, &txin.witness);
         }
 
         base_size += enc(&mut txid_eng, &tx.lock_time);
@@ -116,6 +147,60 @@ impl TxPrecompute {
             sigops,
             out_sum,
             has_witness,
+            sha_prevouts: sha_prev.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            sha_sequences: sha_seq.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            sha_outputs: sha_out.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            sha_amounts: None,
+            sha_scriptpubkeys: None,
+        }
+    }
+
+    /// Non-witness tx: stripped == wire, so one SHA256d engine (wtxid = txid).
+    fn from_tx_legacy_one_engine(tx: &Transaction, sighash: bool) -> Self {
+        let mut eng = sha256d::Hash::engine();
+        let mut sha_prev = sighash.then(sha256::Hash::engine);
+        let mut sha_seq = sighash.then(sha256::Hash::engine);
+        let mut sha_out = sighash.then(sha256::Hash::engine);
+        let mut base_size = 0usize;
+        let mut sigops = 0u64;
+        let mut out_sum = 0u64;
+
+        base_size += enc(&mut eng, &tx.version);
+        let n_in = VarInt(tx.input.len() as u64);
+        base_size += enc(&mut eng, &n_in);
+        for txin in &tx.input {
+            base_size += enc(&mut eng, &txin.previous_output);
+            if let Some(ref mut e) = sha_prev {
+                let _ = txin.previous_output.consensus_encode(e);
+            }
+            base_size += enc(&mut eng, &txin.script_sig);
+            sigops = sigops.saturating_add(script_sigop_count(txin.script_sig.as_bytes(), false));
+            base_size += enc(&mut eng, &txin.sequence);
+            if let Some(ref mut e) = sha_seq {
+                let _ = txin.sequence.consensus_encode(e);
+            }
+        }
+        let n_out = VarInt(tx.output.len() as u64);
+        base_size += enc(&mut eng, &n_out);
+        for txout in &tx.output {
+            base_size += enc(&mut eng, txout);
+            if let Some(ref mut e) = sha_out {
+                let _ = txout.consensus_encode(e);
+            }
+            sigops =
+                sigops.saturating_add(script_sigop_count(txout.script_pubkey.as_bytes(), false));
+            out_sum = out_sum.saturating_add(txout.value.to_sat());
+        }
+        base_size += enc(&mut eng, &tx.lock_time);
+        let txid = sha256d::Hash::from_engine(eng).to_byte_array();
+        Self {
+            txid,
+            wtxid: txid,
+            base_size,
+            total_size: base_size,
+            sigops,
+            out_sum,
+            has_witness: false,
             sha_prevouts: sha_prev.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
             sha_sequences: sha_seq.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
             sha_outputs: sha_out.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
@@ -201,6 +286,88 @@ pub fn pres_for_tip(
         v.push(c);
     }
     (Arc::from(v), skip)
+}
+
+fn hash_stripped_txid(tx: &Transaction) -> ([u8; 32], usize) {
+    let mut eng = sha256d::Hash::engine();
+    let mut base_size = 0usize;
+    base_size += enc(&mut eng, &tx.version);
+    let n_in = VarInt(tx.input.len() as u64);
+    base_size += enc(&mut eng, &n_in);
+    for txin in &tx.input {
+        base_size += enc(&mut eng, &txin.previous_output);
+        base_size += enc(&mut eng, &txin.script_sig);
+        base_size += enc(&mut eng, &txin.sequence);
+    }
+    let n_out = VarInt(tx.output.len() as u64);
+    base_size += enc(&mut eng, &n_out);
+    for txout in &tx.output {
+        base_size += enc(&mut eng, txout);
+    }
+    base_size += enc(&mut eng, &tx.lock_time);
+    (sha256d::Hash::from_engine(eng).to_byte_array(), base_size)
+}
+
+fn sigops_and_out_sum(tx: &Transaction) -> (u64, u64) {
+    let mut sigops = 0u64;
+    let mut out_sum = 0u64;
+    for txin in &tx.input {
+        sigops = sigops.saturating_add(script_sigop_count(txin.script_sig.as_bytes(), false));
+    }
+    for txout in &tx.output {
+        sigops = sigops.saturating_add(script_sigop_count(txout.script_pubkey.as_bytes(), false));
+        out_sum = out_sum.saturating_add(txout.value.to_sat());
+    }
+    (sigops, out_sum)
+}
+
+fn sighash_midstates(tx: &Transaction) -> [Option<[u8; 32]>; 3] {
+    let mut sha_prev = sha256::Hash::engine();
+    let mut sha_seq = sha256::Hash::engine();
+    let mut sha_out = sha256::Hash::engine();
+    for txin in &tx.input {
+        let _ = txin.previous_output.consensus_encode(&mut sha_prev);
+        let _ = txin.sequence.consensus_encode(&mut sha_seq);
+    }
+    for txout in &tx.output {
+        let _ = txout.consensus_encode(&mut sha_out);
+    }
+    [
+        Some(sha256::Hash::from_engine(sha_prev).to_byte_array()),
+        Some(sha256::Hash::from_engine(sha_seq).to_byte_array()),
+        Some(sha256::Hash::from_engine(sha_out).to_byte_array()),
+    ]
+}
+
+/// Decode a P2P block payload once: rust-bitcoin `Block` plus per-tx pres from
+/// each tx's **wire slice** (no second consensus_encode into SHA engines).
+///
+/// Third value is `from_tx_wire` wall ns (IBD `precompute=`).
+pub fn decode_block_precomputes(
+    payload: &[u8],
+    sighash: bool,
+) -> Option<(bitcoin::block::Block, Vec<TxPrecompute>, u64)> {
+    use bitcoin::block::Header;
+    use bitcoin::consensus::encode::{Decodable, VarInt};
+    use std::io::Cursor;
+    use std::time::Instant;
+    let mut cur = Cursor::new(payload);
+    let header = Header::consensus_decode(&mut cur).ok()?;
+    let n = VarInt::consensus_decode(&mut cur).ok()?.0 as usize;
+    let mut txdata = Vec::with_capacity(n);
+    let mut pres = Vec::with_capacity(n);
+    let mut hash_ns = 0u64;
+    for _ in 0..n {
+        let start = cur.position() as usize;
+        let tx = Transaction::consensus_decode(&mut cur).ok()?;
+        let end = cur.position() as usize;
+        let wire = payload.get(start..end)?;
+        let t = Instant::now();
+        pres.push(TxPrecompute::from_tx_wire(&tx, wire, sighash));
+        hash_ns = hash_ns.saturating_add(t.elapsed().as_nanos() as u64);
+        txdata.push(tx);
+    }
+    Some((bitcoin::block::Block { header, txdata }, pres, hash_ns))
 }
 
 fn enc(w: &mut impl bitcoin::io::Write, v: &impl Encodable) -> usize {
@@ -384,6 +551,48 @@ mod tests {
             TxPrecompute::from_tx_connect(&tx).wtxid,
             tx.compute_wtxid().to_byte_array()
         );
+    }
+
+    #[test]
+    fn from_tx_wire_matches_from_tx_on_legacy_and_witness() {
+        use bitcoin::consensus::encode::serialize;
+        for tx in [legacy_1in(), p2wpkh_like()] {
+            let raw = serialize(&tx);
+            let w = TxPrecompute::from_tx_wire(&tx, &raw, true);
+            let full = TxPrecompute::from_tx(&tx);
+            assert_eq!(w.txid, full.txid, "txid");
+            assert_eq!(w.wtxid, full.wtxid, "wtxid");
+            assert_eq!(w.base_size, full.base_size, "base_size");
+            assert_eq!(w.total_size, full.total_size, "total_size");
+            assert_eq!(w.sigops, full.sigops, "sigops");
+            assert_eq!(w.out_sum, full.out_sum, "out_sum");
+            assert_eq!(w.has_witness, full.has_witness, "has_witness");
+            assert_eq!(w.sha_prevouts, full.sha_prevouts);
+            assert_eq!(w.wtxid, sha256d::Hash::hash(&raw).to_byte_array());
+            let c = TxPrecompute::from_tx_wire(&tx, &raw, false);
+            assert_eq!(c.txid, full.txid);
+            assert_eq!(c.wtxid, full.wtxid);
+            assert_eq!(c.sha_prevouts, None);
+            if !c.has_witness {
+                assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_block_precomputes_hashes_payload_slices() {
+        use bitcoin::blockdata::constants::genesis_block;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::Network;
+        let genesis = genesis_block(Network::Regtest);
+        let raw = serialize(&genesis);
+        let (block, pres, _ns) = super::decode_block_precomputes(&raw, false).expect("decode");
+        assert_eq!(block.header, genesis.header);
+        assert_eq!(pres.len(), genesis.txdata.len());
+        let want = TxPrecompute::from_tx_connect(&genesis.txdata[0]);
+        assert_eq!(pres[0].txid, want.txid);
+        assert_eq!(pres[0].wtxid, want.wtxid);
+        assert_eq!(pres[0].sha_prevouts, None);
     }
 
     #[test]

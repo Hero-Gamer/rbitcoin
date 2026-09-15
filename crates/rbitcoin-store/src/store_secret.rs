@@ -119,10 +119,30 @@ impl StoreSecret {
     }
 
     /// XOR `buf` in place (encode and decode are the same operation).
+    ///
+    /// Same stream as [`Self::xor_key_byte`]: 8-byte words, then a tail.
     #[inline]
     pub fn xor_bytes(&self, start_off: u64, buf: &mut [u8]) {
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b ^= self.xor_key_byte(start_off.saturating_add(i as u64));
+        const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+        let secret = &self.bytes;
+        let mut off = start_off;
+        let mut chunks = buf.chunks_exact_mut(8);
+        for chunk in chunks.by_ref() {
+            let mut k = [0u8; 8];
+            for (j, kb) in k.iter_mut().enumerate() {
+                let o = off.wrapping_add(j as u64);
+                *kb = secret[(o as usize) % SECRET_LEN] ^ ((o.wrapping_mul(GOLDEN) >> 56) as u8);
+            }
+            let mut word = [0u8; 8];
+            word.copy_from_slice(chunk);
+            chunk
+                .copy_from_slice(&(u64::from_ne_bytes(word) ^ u64::from_ne_bytes(k)).to_ne_bytes());
+            off = off.wrapping_add(8);
+        }
+        for b in chunks.into_remainder() {
+            let mix = (off.wrapping_mul(GOLDEN) >> 56) as u8;
+            *b ^= secret[(off as usize) % SECRET_LEN] ^ mix;
+            off = off.wrapping_add(1);
         }
     }
 
@@ -170,6 +190,24 @@ mod tests {
         assert_ne!(buf, plain, "obfuscated must differ from plaintext");
         s.xor_bytes(100, &mut buf);
         assert_eq!(buf, plain);
+    }
+
+    #[test]
+    fn xor_bytes_matches_key_byte_stream() {
+        let s = StoreSecret::from_bytes([0x3c; 32]);
+        let lens = [0usize, 1, 7, 8, 9, 15, 16, 31, 32, 33, 64, 127, 256, 1000];
+        let starts = [0u64, 1, 7, 8, 31, 32, 33, 100, 1_000_003];
+        for &start in &starts {
+            for &len in &lens {
+                let mut got = vec![0x5a_u8; len];
+                s.xor_bytes(start, &mut got);
+                let mut want = vec![0x5a_u8; len];
+                for (i, b) in want.iter_mut().enumerate() {
+                    *b ^= s.xor_key_byte(start.wrapping_add(i as u64));
+                }
+                assert_eq!(got, want, "start={start} len={len}");
+            }
+        }
     }
 
     #[test]

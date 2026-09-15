@@ -8,13 +8,11 @@
 
 use super::*;
 use crate::milestone::Milestone;
-use bitcoin::consensus::Decodable;
 use rbitcoin_query::{
     BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map,
 };
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
-use std::io::Cursor;
 use std::sync::Arc;
 
 /// Hard cap on BQ heights in one TipOnly wave (~1 week of 10-minute blocks).
@@ -114,7 +112,7 @@ pub struct BqResolveWaveStats {
     pub work_ns: u64,
     /// `consensus_decode` of still-raw BQ payloads (this wave).
     pub decode_ns: u64,
-    /// `TxPrecompute::from_tx` / `from_tx_connect` after decode (this wave).
+    /// `from_tx_wire` on payload slices (`precompute=`).
     pub precompute_ns: u64,
     /// `push_resolve_keys` (this wave).
     pub collect_ns: u64,
@@ -158,11 +156,6 @@ fn push_resolve_keys(
         }
     }
     spends
-}
-
-fn decode_bq_block(payload: &[u8]) -> Option<Block> {
-    let mut cur = Cursor::new(payload);
-    Block::consensus_decode(&mut cur).ok()
 }
 
 /// TipOnly-resolve external parents for `heights` still on the BQ.
@@ -269,26 +262,15 @@ pub fn confirm_bq_resolve_wave_capped(
                 continue;
             };
             let t_dec = Instant::now();
-            let Some(block) = decode_bq_block(&payload) else {
+            let Some((block, pres_vec, pre_ns)) =
+                rbitcoin_query::decode_block_precomputes(&payload, !milestone.skips_scripts_at(h))
+            else {
                 continue;
             };
-            stats.decode_ns = stats
-                .decode_ns
-                .saturating_add(t_dec.elapsed().as_nanos() as u64);
-            let t_pre = Instant::now();
-            let pres: Vec<TxPrecompute> = if milestone.skips_scripts_at(h) {
-                block
-                    .txdata
-                    .iter()
-                    .map(TxPrecompute::from_tx_connect)
-                    .collect()
-            } else {
-                block.txdata.iter().map(TxPrecompute::from_tx).collect()
-            };
-            stats.precompute_ns = stats
-                .precompute_ns
-                .saturating_add(t_pre.elapsed().as_nanos() as u64);
-            let pres = Arc::<[TxPrecompute]>::from(pres);
+            let wall = t_dec.elapsed().as_nanos() as u64;
+            stats.decode_ns = stats.decode_ns.saturating_add(wall.saturating_sub(pre_ns));
+            stats.precompute_ns = stats.precompute_ns.saturating_add(pre_ns);
+            let pres = Arc::<[TxPrecompute]>::from(pres_vec);
             let block = Arc::new(block);
             wires.push((
                 h,
@@ -715,7 +697,7 @@ mod tests {
         let spend_pre = &wave.items[0].2.pres[1];
         assert!(
             spend_pre.sha_prevouts.is_some(),
-            "Milestone::NONE must from_tx (sighash midstates present)"
+            "Milestone::NONE must from_tx_wire (sighash midstates present)"
         );
         assert_eq!(spend_pre.txid, b1.txdata[1].compute_txid().to_byte_array());
         let _ = std::fs::remove_dir_all(&path);
@@ -884,7 +866,10 @@ mod tests {
             st.decode_ns, 0,
             "hold must not consensus_decode; n_inputs is stamped at enqueue"
         );
-        assert_eq!(st.precompute_ns, 0, "hold must not TxPrecompute::from_tx");
+        assert_eq!(
+            st.precompute_ns, 0,
+            "hold must not TxPrecompute::from_tx_wire"
+        );
         assert_eq!(
             q.block_queue_take_raw_clone_n(),
             0,
@@ -1177,7 +1162,7 @@ mod tests {
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let parent_txid = [0x22u8; 32];
         let parent_fk = rbitcoin_primitives::Fk(99);
-        let pin = std::sync::Arc::new((
+        let pin = rbitcoin_query::CreatePinInner::records(
             TxRecord {
                 txid: parent_txid,
                 version: 1,
@@ -1188,7 +1173,7 @@ mod tests {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
-        ));
+        );
         let mut log = InFlight::new();
         log.note_pins([(parent_fk, &pin)], Some(1));
         // Production: a wave that snapshotted drain+fence at genesis keeps height 1.
@@ -1261,7 +1246,7 @@ mod tests {
 
         let parent_txid = [0x33u8; 32];
         let parent_fk = rbitcoin_primitives::Fk(99);
-        let pin = std::sync::Arc::new((
+        let pin = rbitcoin_query::CreatePinInner::records(
             TxRecord {
                 txid: parent_txid,
                 version: 1,
@@ -1272,7 +1257,7 @@ mod tests {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
-        ));
+        );
         let mut log = InFlight::new();
         log.note_pins([(parent_fk, &pin)], Some(1));
         log.prune_below_height(q.drain_and_fence_hi());
@@ -1381,10 +1366,10 @@ mod tests {
             }],
         };
         let txids = vec![child.compute_txid().to_byte_array()];
-        let block = bitcoin::Block {
+        let block = std::sync::Arc::new(bitcoin::Block {
             header: b1.header,
             txdata: vec![child],
-        };
+        });
         let err = q
             .archive_plan_batch_from_wire(
                 &[(rbitcoin_primitives::Fk(1), &block, txids.as_slice())],

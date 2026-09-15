@@ -10,7 +10,7 @@ use super::*;
 #[derive(Debug, Default, Clone)]
 pub struct ParentPinStamp {
     /// prev_txid → create_fk_id (plan=None edges; empty after `take_from_plan`).
-    pub resolved: HashMap<[u8; 32], u64, std::hash::BuildHasherDefault<rbitcoin_query::TxidHasher>>,
+    pub resolved: rbitcoin_query::TxidMap<u64>,
     /// create_fk_id → identity (txid + optional body/spent/pin).
     pub idents: rbitcoin_query::U64Map<rbitcoin_query::ParentIdent>,
     /// create_fk_id → spent need-vouts (packed at lookup; load pin reuses).
@@ -23,7 +23,7 @@ impl ParentPinStamp {
     /// `resolved` stays empty: plan path pins from packed `create_fk`.
     pub(crate) fn take_from_plan(plan: &mut rbitcoin_query::ArchiveWritePlan) -> Self {
         Self {
-            resolved: HashMap::with_hasher(Default::default()),
+            resolved: rbitcoin_query::TxidMap::with_hasher(Default::default()),
             idents: std::mem::take(&mut plan.external_parents),
             parent_vouts: std::mem::take(&mut plan.external_parent_vouts),
         }
@@ -181,7 +181,7 @@ pub(super) fn stamp_parent_pin_archived(
     skeleton: Option<&rbitcoin_query::BatchParentIds>,
     carried_need: Option<&[[u8; 32]]>,
 ) -> Result<ParentPinStamp, ConsensusError> {
-    let mut same_batch: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut same_batch: rbitcoin_query::TxidMap<u64> = rbitcoin_query::TxidMap::default();
     for m in metas {
         for (tid, fk) in m.txids.iter().zip(m.tx_fks.iter()) {
             if let Some(id) = fk.get() {
@@ -189,7 +189,7 @@ pub(super) fn stamp_parent_pin_archived(
             }
         }
     }
-    let mut need_external: HashMap<[u8; 32], ()> = HashMap::new();
+    let mut need_external: rbitcoin_query::TxidMap<()> = rbitcoin_query::TxidMap::default();
     if skeleton.is_some() {
         for &prev in carried_need.unwrap_or(&[]) {
             if same_batch.contains_key(&prev) {
@@ -236,7 +236,7 @@ pub(super) fn stamp_parent_pin_archived(
     )
     .map_err(ConsensusError::from)?;
     let mut stamp = ParentPinStamp {
-        resolved: HashMap::with_capacity_and_hasher(
+        resolved: rbitcoin_query::TxidMap::with_capacity_and_hasher(
             ext.resolved.len().saturating_add(same_batch.len()),
             Default::default(),
         ),
@@ -490,7 +490,7 @@ pub(super) fn wire_lookup_phase(
                 .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
                     "invariant: need-body header_fk not in batch",
                 )))?;
-            need.push((*fk, wire_blocks[i].as_ref(), metas[i].txids.as_slice()));
+            need.push((*fk, &wire_blocks[i], metas[i].txids.as_slice()));
         }
         let plan = match pipeline {
             Some(p) => query
@@ -751,10 +751,20 @@ mod tests {
             plan.packed.iter().all(|(_, ins)| ins.is_empty()),
             "wire planner packed ins stay empty"
         );
-        let want = items[0].1.txdata[0].output[0].script_pubkey.to_bytes();
+        let want = items[0].1.txdata[0].output[0].script_pubkey.as_bytes();
         assert_eq!(
-            plan.batch_pin[0].1[0].script, want,
+            plan.batch_pin[0].out_parts(0).expect("coinbase out").1,
+            want,
             "CreatePin outs from wire script_pubkey"
+        );
+        assert_eq!(
+            plan.batch_pin[0]
+                .out_parts(0)
+                .expect("coinbase out")
+                .1
+                .as_ptr(),
+            want.as_ptr(),
+            "plan must not copy scriptPubKey"
         );
         let _ = std::fs::remove_dir_all(&path);
     }

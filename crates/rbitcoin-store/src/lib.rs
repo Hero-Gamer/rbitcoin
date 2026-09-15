@@ -96,8 +96,9 @@ pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{
     decode_inwit_secret, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    encode_packed_tx, encode_packed_tx_with_secret, spend_meta_backend, spent_abs, InputRecord,
-    OutputRecord, TxRecord,
+    encode_packed_tx, encode_packed_tx_with_secret, encode_txout_meta_and_outs,
+    encode_unspent_output_into_secret, spend_meta_backend, spent_abs, InputRecord, OutputRecord,
+    PackedCreate, TxRecord,
 };
 pub(crate) use uring_session::IoCtx;
 pub use uring_session::{

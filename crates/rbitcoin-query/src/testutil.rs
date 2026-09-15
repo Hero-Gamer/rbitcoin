@@ -93,6 +93,7 @@ impl FixtureChain for Query {
             return Ok(fk);
         }
         let (block, txids) = block_from_applies(txs);
+        let block = std::sync::Arc::new(block);
         self.archive_class_a_from_wire(&[(fk, &block, txids.as_slice())])?;
         Ok(fk)
     }

@@ -586,10 +586,9 @@ impl Query {
         write_pin: Option<&CreatePin>,
     ) -> Result<(), QueryError> {
         if let Some(pin) = write_pin {
-            let (_tx, outputs) = pin.as_ref();
-            for o in outputs.iter() {
-                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
-            }
+            pin.for_each_script(|script| {
+                out.push(ScriptHashRecord::from_fk(script_hash(script), tx_fk));
+            });
             crate::note_confirm(&self.confirm_stats().sh_collect_pin, 1);
             return Ok(());
         }

@@ -68,8 +68,8 @@ impl InFlight {
     ) {
         let mut keys = HeightKeys::default();
         for (fk, pin) in pins {
-            self.note_create_fk(pin.0.txid, fk);
-            keys.txids.push((pin.0.txid, fk));
+            self.note_create_fk(pin.tx().txid, fk);
+            keys.txids.push((pin.tx().txid, fk));
             if let Some(id) = fk.get() {
                 self.outs.insert(id, Arc::clone(pin));
                 keys.out_ids.push(id);
@@ -219,6 +219,7 @@ impl InFlight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::CreatePinInner;
     use rbitcoin_store::{OutputRecord, TxRecord};
 
     fn pin(id: u64) -> CreatePin {
@@ -228,7 +229,7 @@ mod tests {
     }
 
     fn pin_with_txid(txid: [u8; 32]) -> CreatePin {
-        Arc::new((
+        CreatePinInner::records(
             TxRecord {
                 txid,
                 version: 1,
@@ -239,7 +240,7 @@ mod tests {
                 output_count: 1,
             },
             vec![OutputRecord::unspent(1, vec![0x51])],
-        ))
+        )
     }
 
     #[test]
@@ -280,9 +281,9 @@ mod tests {
     fn get_misses_until_note() {
         let mut m = InFlight::new();
         let p = pin(1);
-        assert!(m.get_create_fk(&p.0.txid).is_none());
+        assert!(m.get_create_fk(&p.tx().txid).is_none());
         m.note_pins([(Fk(1), &p)], Some(1));
-        assert!(m.get_create_fk(&p.0.txid).is_some());
+        assert!(m.get_create_fk(&p.tx().txid).is_some());
         assert!(m.get_out(1).is_some());
     }
 
@@ -314,18 +315,18 @@ mod tests {
 
         m.prune_below_height(Some(5));
         assert!(
-            m.get_create_fk(&confirmed.0.txid).is_some(),
+            m.get_create_fk(&confirmed.tx().txid).is_some(),
             "equality keeps (drop is strictly below)"
         );
-        assert!(m.get_create_fk(&ahead.0.txid).is_some());
+        assert!(m.get_create_fk(&ahead.tx().txid).is_some());
 
         m.prune_below_height(Some(6));
         assert!(
-            m.get_create_fk(&confirmed.0.txid).is_none(),
+            m.get_create_fk(&confirmed.tx().txid).is_none(),
             "height 5 is below noted 6"
         );
         assert!(
-            m.get_create_fk(&ahead.0.txid).is_some(),
+            m.get_create_fk(&ahead.tx().txid).is_some(),
             "height == noted keeps"
         );
 
@@ -341,8 +342,8 @@ mod tests {
         m.note_pins([(Fk(10), &a)], Some(1));
         m.note_pins([(Fk(20), &b)], None);
         m.prune_below_height(Some(99));
-        assert!(m.get_create_fk(&a.0.txid).is_none());
-        assert!(m.get_create_fk(&b.0.txid).is_some(), "untagged stays");
+        assert!(m.get_create_fk(&a.tx().txid).is_none());
+        assert!(m.get_create_fk(&b.tx().txid).is_some(), "untagged stays");
     }
 
     #[test]
@@ -374,9 +375,9 @@ mod tests {
         m.note_pins([(Fk(20), &b)], Some(3));
         m.note_pins([(Fk(30), &c)], None);
         m.drop_from_height(3);
-        assert!(m.get_create_fk(&a.0.txid).is_some());
-        assert!(m.get_create_fk(&b.0.txid).is_none());
-        assert!(m.get_create_fk(&c.0.txid).is_some(), "untagged stays");
+        assert!(m.get_create_fk(&a.tx().txid).is_some());
+        assert!(m.get_create_fk(&b.tx().txid).is_none());
+        assert!(m.get_create_fk(&c.tx().txid).is_some(), "untagged stays");
     }
 
     #[test]
