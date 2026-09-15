@@ -18,6 +18,14 @@ before 1.0).
 
 ### Added
 
+- **Subsidy interval=2 overlay; H8 stays the header unit:**
+  `header_and_spending_boundaries` overlays `ChainParams` halving interval=2:
+  empty at interval−1 is still 50 BTC; at interval 25 BTC; `subsidy+1` at
+  the new floor rejects. H8 exact +2h stays
+  `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (not duplicated
+  with `with_now` on the connect pad). Subsidy **table** stays
+  `p1_block_subsidy_halvings`.
+
 - **Held 16 vs 17 park + genesis disconnect + leftover identity:**
   `reorg_same_height_then_multi_block_branch` parks 16 and 17 equal-work
   siblings as `valid-headers` (product held cap 320 does not FIFO at 17).

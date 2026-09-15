@@ -136,7 +136,7 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **S02** | Prevout exists *(merged into S03 in `spec.h`)* | journey OP_TRUE spend of height-1 coinbase | journey: random txid → `MissingPrevout`; journey child-before-parent same-block |
 | **S03** | Prevout still unspent | journey first spend | journey second spend of same outpoint; journey same-block two spends |
 | **S04** | Sigop **cost** `<= 80_000` | `s11_rejects_excessive_legacy_sigops` (20 000×CHECKSIG) | same (`20_001` → cost 80 004); `sigop_cost_tests::*` (P2SH/witness) |
-| **S05** | Coinbase `<=` subsidy + fees | journey exact 50 BTC empty pads; `p1_block_subsidy_halvings` | journey `subsidy+1` sat |
+| **S05** | Coinbase `<=` subsidy + fees | journey exact 50 BTC empty pads; overlay interval=2 25 BTC; `p1_block_subsidy_halvings` | journey `subsidy+1` sat; overlay 50 BTC at interval |
 | **S06** | Tx `out <= in` | journey `in==out` (zero fee) | journey `in+1` |
 | **S07** | Scripts succeed | journey anyone-can-spend `OP_TRUE`; Core `script_tests` / `tx_valid` | Core `tx_invalid` / `script_tests` reject rows |
 | **S08** | BIP68 relative finality | journey `nSequence=10` at height 101; time-type after MTP clears; `bip68_height_relative_lock` | journey `nSequence=200` at 101; time-type just short; `finality_tests` 109/110 edge |
