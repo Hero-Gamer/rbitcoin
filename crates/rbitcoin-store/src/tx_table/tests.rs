@@ -1722,6 +1722,30 @@ fn output_negative_value_is_corrupt() {
 }
 
 #[test]
+fn put_full_batch_from_pins_negative_value_is_corrupt() {
+    let dir = tempfile_dir("from-pins-neg");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [9u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(-1, vec![0x51])];
+    let pin = std::sync::Arc::new((tx, outs));
+    let err = t
+        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .unwrap_err();
+    assert!(format!("{err}").contains("txout amount negative"), "{err}");
+    assert_eq!(t.count(), 0, "negative pin append must not write Class A");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn output_noncanonical_mantissa_is_corrupt() {
     let mut enc = Vec::new();
     enc.push(SCRIPT_KIND_V17_OP_TRUE | (1 << 4));

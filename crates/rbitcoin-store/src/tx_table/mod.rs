@@ -834,6 +834,11 @@ impl TxTable {
         self.create_loc.range_batch(fks)
     }
 
+    /// Truncate `create.loc` to `n` rows without touching Class A bodies.
+    pub fn create_loc_truncate_to_count(&self, n: u64) -> Result<(), StoreError> {
+        self.create_loc.truncate_to_count(n)
+    }
+
     pub(crate) fn fill_txout_job_ranges(
         &self,
         jobs: &mut [crate::IdxBodyJob],
@@ -1749,6 +1754,9 @@ impl TxTable {
             let n_out = pin.as_ref().1.len() as u32;
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
+            }
+            if pin.as_ref().1.iter().any(|o| o.value < 0) {
+                return Err(StoreError::Corrupt("txout amount negative"));
             }
             let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
             for &(vout, fk, vin) in pairs {
