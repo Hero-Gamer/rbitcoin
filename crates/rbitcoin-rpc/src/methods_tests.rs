@@ -382,7 +382,23 @@ fn getnetworkinfo_localrelay_follows_mempool_relay() {
     let msg = e["message"].as_str().unwrap_or("");
     assert!(
         !msg.contains("relay disabled"),
-        "RPC sendraw must accept while -blocksonly, got {e}"
+        "decode of 00 is not serving-only refuse, got {e}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blocksonly_sendraw_admits_valid_tx() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
+    let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    let off = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(off["localrelay"], false, "{off}");
+    let ok = dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    assert_eq!(
+        ok.as_str().unwrap(),
+        &spend.compute_txid().to_string(),
+        "{ok}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1636,8 +1652,12 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
     let (over_hex, _) =
         spend_generated_coinbase(ctx, 2, cb - max_fee - 1, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
-    assert_eq!(e["message"], "max-fee-exceeded", "{e}");
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
+    assert_eq!(
+        e["message"],
+        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+        "{e}"
+    );
 }
 
 #[test]
@@ -1647,11 +1667,12 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     pin_sendraw_maxfeerate_at_default_and_one_sat_over(&ctx);
     let (hex, spend) = spend_generated_coinbase(&ctx, 3, 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
     assert!(
         e["message"]
             .as_str()
             .unwrap_or("")
-            .contains("max-fee-exceeded"),
+            .contains("maximum configured by user"),
         "{e}"
     );
     let tma = dispatch(&ctx, "testmempoolaccept", vec![json!([hex.clone()])]).unwrap();
@@ -1676,10 +1697,26 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     )
     .unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
-    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(2)]).unwrap_err();
-    assert!(
-        over["message"].as_str().unwrap_or("").contains("1BTC/kvB"),
+    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(1)]).unwrap_err();
+    assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
+    assert_eq!(
+        over["message"],
+        "Fee rates larger than or equal to 1BTC/kvB are not accepted",
         "{over}"
+    );
+    let cb4 = generated_coinbase_value(&ctx, 4);
+    let (modest_hex, modest) =
+        spend_generated_coinbase(&ctx, 4, cb4 - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let ok99 = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(modest_hex), json!(0.99)],
+    )
+    .unwrap();
+    assert_eq!(
+        ok99.as_str().unwrap(),
+        &modest.compute_txid().to_string(),
+        "{ok99}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2339,6 +2376,8 @@ fn invalidate_reconsider_tip() {
     let miss = dispatch(&ctx, "preciousblock", vec![json!("00".repeat(32))]).unwrap_err();
     assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(miss["message"], "Block not found");
+    let after_err = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    assert_eq!(after_err, json!(tip), "not-found precious must not move tip");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

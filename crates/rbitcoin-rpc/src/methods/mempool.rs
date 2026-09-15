@@ -301,7 +301,7 @@ fn amount_sat_from_json(v: &Value) -> Result<u64, Value> {
     }
 }
 
-/// RPC-submit `maxfeerate` (BTC/kvB). Omitted → 0.10. `0` → unlimited. `>1` → param error.
+/// RPC-submit `maxfeerate` (BTC/kvB). Omitted → 0.10. `0` → unlimited. `>=1` → param error.
 ///
 /// Wallet protection on `sendrawtransaction` / `testmempoolaccept` / `submitpackage`
 /// only. P2P `accept_tx` does not read this cap.
@@ -310,10 +310,10 @@ fn opt_maxfeerate_sat_kvb(params: &RpcParams, index: usize) -> Result<u64, Value
         None | Some(Value::Null) => Ok(DEFAULT_MAX_RAW_TX_FEE_SAT_KVB),
         Some(v) => {
             let sat = amount_sat_from_json(v)?;
-            if sat > MAX_ALLOWED_FEERATE_SAT_KVB {
+            if sat >= MAX_ALLOWED_FEERATE_SAT_KVB {
                 return Err(rpc_error(
                     ERR_INVALID_PARAMETER,
-                    "Fee rates larger than 1BTC/kvB are not allowed",
+                    "Fee rates larger than or equal to 1BTC/kvB are not accepted",
                 ));
             }
             Ok(sat)
@@ -434,7 +434,10 @@ pub(crate) fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result
         return Err(rpc_error(ERR_INVALID_PARAMETER, MAX_BURN_MSG));
     }
     if rpc_tx_fee_exceeds_max(ctx, &tx, max_feerate) {
-        return Err(rpc_error(ERR_VERIFY_REJECTED, "max-fee-exceeded"));
+        return Err(rpc_error(
+            ERR_VERIFY_ERROR,
+            "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+        ));
     }
     // `-blocksonly` leaves P2P relay off but RPC still accepts
     // (`p2p_blocksonly.py` sendrawtransaction).
