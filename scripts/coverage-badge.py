@@ -23,7 +23,11 @@ def badge_payload(
     message = f"{pct:.2f}%"
     floor_ok = lh * 100 >= lf * gate
     if base_lh is not None and base_lf:
-        ratchet_ok = lh * base_lf >= lf * base_lh
+        # Same 2-decimal compare as coverage-gate.passes_ratchet (llvm-cov jitter).
+        def hundredths(h: int, f: int) -> int:
+            return (10000 * h + f // 2) // f if f > 0 else 0
+
+        ratchet_ok = hundredths(lh, lf) >= hundredths(base_lh, base_lf)
         color = "brightgreen" if floor_ok and ratchet_ok else "red"
     else:
         color = "brightgreen" if floor_ok else "red"

@@ -19,9 +19,11 @@ before 1.0).
 ### Changed
 
 - **Coverage ratchet is merge-base, not tip of master:** PRs must not lower
-  production LCOV `LH`/`LF` vs the **highest** green-`master` snapshot whose
-  SHA is an ancestor of `git merge-base(PR tip, origin/master)`. Master jobs
-  that landed after the branch forked are ignored. History:
+  the **displayed 2-decimal** production LCOV percent vs the **highest**
+  green-`master` snapshot whose SHA is an ancestor of
+  `git merge-base(PR tip, origin/master)`. Raw LH jitters a few hits under
+  llvm-cov; a wobble that still prints the same `91.25%` is a pass. Master
+  jobs that landed after the branch forked are ignored. History:
   `badges/coverage-history.jsonl`. [`TESTING.md`](TESTING.md).
 
 - **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
