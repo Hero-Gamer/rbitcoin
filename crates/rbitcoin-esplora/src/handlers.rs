@@ -63,11 +63,9 @@ pub(crate) fn block_summary_json(
         .get_range(header_fk)?
         .map(|(_, n)| n)
         .unwrap_or(0);
-    let block = query
-        .reconstruct_archived_block(hash)?
+    let (size, weight) = query
+        .block_size_weight(header_fk)?
         .ok_or(rbitcoin_store::StoreError::NotFound)?;
-    let size = block.total_size() as u64;
-    let weight = block.weight().to_wu();
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
@@ -1307,9 +1305,10 @@ mod pure_helper_tests {
         assert!(block_summary_json(&q, &[0x11; 32]).is_err());
         let _ = q.sample_reset_reconstruct_archived();
         let _ = block_summary_json(&q, &hash).expect("summary again");
-        assert!(
-            q.sample_reset_reconstruct_archived() >= 1,
-            "block JSON reconstructs for consensus size/weight"
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "block JSON uses stamped size/weight"
         );
         assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
         assert!(q.sample_reset_reconstruct_archived() >= 1);
