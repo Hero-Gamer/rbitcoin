@@ -2296,6 +2296,29 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     }
     assert!(st.headers_done);
 
+    st.headers_done = false;
+    st.empty_header_streak = 1;
+    st.max_peer_height = 313_000;
+    st.ordered.clear();
+    st.ordered_set.clear();
+    st.inflight.clear();
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::Headers {
+            peer: 1,
+            headers: vec![],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(
+        st.headers_done,
+        "empty-EOF latches even when advertised height is far ahead"
+    );
+
     use super::super::MAX_PEER_POOL;
     for i in 0..MAX_PEER_POOL {
         book.add(SocketAddr::new(

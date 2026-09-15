@@ -319,7 +319,7 @@ fn header_and_spending_boundaries() {
     let csv_block = mine_regtest_block(tip, time, 101, vec![csv_early]);
     let err = accept_and_connect_block(&q, &params, Height(101), &csv_block, Milestone::NONE);
     assert!(
-        err.is_err(),
+        matches!(err, Err(ConsensusError::BadTx("bad-txns-nonfinal"))),
         "relative lock 200 at height 101 must reject, got {err:?}"
     );
 
@@ -356,7 +356,7 @@ fn header_and_spending_boundaries() {
     let bad_order = mine_regtest_block(tip, time, 101, vec![child, parent]);
     let err = accept_and_connect_block(&q, &params, Height(101), &bad_order, Milestone::NONE);
     assert!(
-        err.is_err(),
+        matches!(err, Err(ConsensusError::MissingPrevout)),
         "child-before-parent must not become tip: {err:?}"
     );
     assert_eq!(q.tip_height(), Some(Height(100)));

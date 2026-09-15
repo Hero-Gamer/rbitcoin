@@ -1782,7 +1782,10 @@ fn isolate_clears_only_after_original_batch_last_height() {
         "first n=1 accept must not re-pack the rest of the failed wave"
     );
     feed.release_isolate_if_tip(106);
-    assert!(feed.single_block(), "tip still below last height of the wave");
+    assert!(
+        feed.single_block(),
+        "tip still below last height of the wave"
+    );
     feed.release_isolate_if_tip(107);
     assert!(
         !feed.single_block(),

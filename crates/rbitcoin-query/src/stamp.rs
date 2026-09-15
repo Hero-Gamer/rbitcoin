@@ -497,8 +497,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
-
     #[test]
     fn inflight_hit_adopts_skeleton_loc() {
         let (dir, q) = tmp_store();

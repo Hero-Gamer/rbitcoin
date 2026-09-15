@@ -111,9 +111,16 @@ pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
 }
 
 /// Core extra-txn may place a duplicate-txid slot we still `getblocktxn`
-/// (018). Agree when every Core index is in `ours`; extra ours indexes are ok.
+/// (018). Agree when the sets match, or the documented 018 extra-ours
+/// (`[1, 4]` vs Core `[1]`). Omitting a Core index always disagrees.
 pub fn cmpct_getblocktxn_agrees(ours: &[u64], core: &[u64]) -> bool {
-    core.iter().all(|i| ours.contains(i))
+    if !core.iter().all(|i| ours.contains(i)) {
+        return false;
+    }
+    if ours.iter().all(|i| core.contains(i)) {
+        return true;
+    }
+    ours.len() == 2 && core == [1] && ours.contains(&1) && ours.contains(&4)
 }
 
 /// Missing indexes using the case fill set (empty = mempool-cold).
@@ -278,6 +285,10 @@ mod tests {
         assert!(cmpct_getblocktxn_agrees(&[1], &[1]));
         assert!(!cmpct_getblocktxn_agrees(&[1], &[1, 4]));
         assert!(!cmpct_getblocktxn_agrees(&[], &[1]));
+        assert!(
+            !cmpct_getblocktxn_agrees(&[1, 2], &[1]),
+            "extra ours on a non-018 recipe must disagree"
+        );
     }
 
     #[test]

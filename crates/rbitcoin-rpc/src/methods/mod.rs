@@ -659,7 +659,7 @@ pub(crate) fn method_help(m: &str) -> String {
             .into(),
         "sendrawtransaction" => {
             "sendrawtransaction hexstring (maxfeerate) (maxburnamount)\n\
-             RPC submit only. Default maxfeerate 0.10 BTC/kvB (0 unlimited; >1 BTC/kvB is a parameter error). \
+             RPC submit only. Default maxfeerate 0.10 BTC/kvB (0 unlimited; >=1 BTC/kvB is a parameter error). \
              Default maxburnamount 0. P2P relay is not capped."
                 .into()
         }

@@ -1654,8 +1654,7 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
     assert_eq!(
-        e["message"],
-        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+        e["message"], "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
         "{e}"
     );
 }
@@ -1700,8 +1699,7 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(1)]).unwrap_err();
     assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
     assert_eq!(
-        over["message"],
-        "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+        over["message"], "Fee rates larger than or equal to 1BTC/kvB are not accepted",
         "{over}"
     );
     let cb4 = generated_coinbase_value(&ctx, 4);
@@ -1805,12 +1803,7 @@ fn submitpackage_child_fail_leaves_no_package_txs() {
         }],
     };
     let bad_hex = hex_encode(serialize(&bad));
-    let pkg = dispatch(
-        &ctx,
-        "submitpackage",
-        vec![json!([parent_hex, bad_hex])],
-    )
-    .unwrap();
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, bad_hex])]).unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
     assert!(
         !ctx.mempool
@@ -2377,7 +2370,11 @@ fn invalidate_reconsider_tip() {
     assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(miss["message"], "Block not found");
     let after_err = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
-    assert_eq!(after_err, json!(tip), "not-found precious must not move tip");
+    assert_eq!(
+        after_err,
+        json!(tip),
+        "not-found precious must not move tip"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

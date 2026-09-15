@@ -55,7 +55,11 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
-| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli` | Full Core RPC |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpcworkqueue` is HTTP occupancy (503 when full); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
+| GetData serve | Reconstruct/serve **16** (`MAX_SERVE_BLOCKS`) hashes per inbound message; leftover hashes in that `getdata` are dropped (RAM cap) | Core `ProcessGetData` can keep serving leftover hashes |
+| Inbound eviction victim | After Core-shaped protect (netgroup / recent block / recent tx / min-ping), disconnect the **longest-connected** remaining inbound | Core `SelectNodeToEvict` youngest in the oldest netgroup |
+| `--sptweaks-dust` | Serve-time floor default **1000** sat (omit P2TR outs `value <=` floor). **546** matches Cake electrs. Not Cake/Electrum protocol | n/a (Electrum tweaks are not Core) |
+| IBD empty-headers EOF | Empty `headers` to **our locator** + idle path latches `headers_done` even if a peer advertises a taller less-work height / junk `version.start_height` | Core header sync follows most-work; advertised `start_height` is not a remaining header count |
 
 Compact reconstruct fills short-ids from the live mempool graph, the
 orphanage, and a small `extra_compact` ring (RBF-replaced bodies and min-relay

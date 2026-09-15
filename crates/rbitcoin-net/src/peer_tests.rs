@@ -2041,10 +2041,10 @@ fn compact_child_of_invalid_disconnects_cached_same_stays() {
 #[test]
 fn on_block_releases_cmpct_fill_after_pending() {
     use bitcoin::consensus::encode::serialize;
-    use bitcoin::Network;
-    use bitcoin::p2p::message_network::VersionMessage;
     use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
     use bitcoin::p2p::ServiceFlags;
+    use bitcoin::Network;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::runtime::Builder;
 
@@ -2127,10 +2127,8 @@ fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
     use bitcoin::p2p::message_network::VersionMessage;
     use bitcoin::p2p::ServiceFlags;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-    };
     use bitcoin::Network;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::runtime::Builder;
 
@@ -2208,7 +2206,10 @@ fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
         handle_peer_frame(frame.clone(), &hub, &out_tx, &mut follow, Some(&session))
             .await
             .unwrap();
-        assert_eq!(follow.ban_score, 0, "first merkle-mutated unique fill GetData");
+        assert_eq!(
+            follow.ban_score, 0,
+            "first merkle-mutated unique fill GetData"
+        );
         assert!(
             session.has_failed_cmpct(&hash),
             "unique-fill merkle fail must count as a failed compact"

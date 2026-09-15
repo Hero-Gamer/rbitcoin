@@ -374,7 +374,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--esplora-listen ADDR` | | disabled (Esplora REST; **requires** `--shindex`) |
 | `--rpc-listen ADDR` | conf `rpc_listen` | disabled — Core-class JSON-RPC subset |
 | `--rpcuser` / `--rpcpassword` | conf `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
-| `--rpcworkqueue N` | conf `rpcworkqueue=` | unset — unlimited in-flight RPC and unlimited JSON-RPC array batch. When set, a batch with more than N methods is the same HTTP 500 as a full work queue |
+| `--rpcworkqueue N` | conf `rpcworkqueue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
 | `--minrelaytxfee BTC` | same | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempoolexpiry HOURS` | same | unset — hub default; min 1 |
 | `--blocksonly` | same | off |
@@ -744,7 +744,8 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
-  Esplora `POST /txs/package`. No P2P package command (BIP331 is not in
+  Esplora `POST /txs/package` (all-or-nothing; min-relay waiver is a
+  child-with-parents ancestor tree). No P2P package command (BIP331 is not in
   rust-bitcoin 0.32).
 
 ## Scripthash index (`--shindex`)

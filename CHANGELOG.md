@@ -25,6 +25,31 @@ before 1.0).
   remains open / `invalidate` only. A hole above the published tip is
   `Corrupt("invariant: height_by_hash confirmed header missing")`.
 
+### Fixed
+
+- **Package admit is all-or-nothing:** `accept_package` / RPC `submitpackage`
+  rollback uses `remove_txid_tree` (hub `unindex_evicted`). Min-relay waiver
+  is a child-with-parents ancestor tree only.
+
+- **Compact fill + isolate:** a full `block` for a pending compact releases
+  the Q-60 fill slot. Unique-fill merkle fail counts as a failed compact
+  (second attempt disconnects; hash is not `BLOCK_FAILED`). Isolate after a
+  multi-block consensus fail stays one-block until confirmed tip passes the
+  original wave’s last height.
+
+- **Store/query fail-closed:** poisoned held identity pread does not
+  libc-complete; loc 8-wide prefix-sum is SSE2; negative output encode is
+  Corrupt; loc-by-fk miss after Class A is Corrupt; reject rewind moves
+  lookup-started-high with consume-high.
+
+- **RPC honesty:** `maxfeerate >= 1` BTC/kvB is `-8` (Core message);
+  sendraw over-cap is `-25` configured-max (`testmempoolaccept` stays
+  `max-fee-exceeded`); `--rpcworkqueue` full permit is HTTP 503 (one POST
+  is one slot); `-blocksonly` sendraw of a valid tx still admits.
+
+- **`preciousblock`:** equal-work sibling still activates; an error path
+  does not leave the preference set.
+
 ### Added
 
 - **Compact reconstruct stats and extra prefill:** each compact

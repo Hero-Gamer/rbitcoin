@@ -435,8 +435,8 @@ mod tests {
 
     #[test]
     fn testmempoolaccept_params_disable_maxfeerate() {
-        // Core v31: maxfeerate=0 means accept any fee rate. Values >1 BTC/kvB
-        // are rejected as RPC parameters ("Fee rates larger than 1BTC/kvB").
+        // Core v31: maxfeerate=0 means accept any fee rate. Values >=1 BTC/kvB
+        // are rejected as RPC parameters ("larger than or equal to 1BTC/kvB").
         assert_eq!(testmempoolaccept_params(&["ab"]), r#"[["ab"], 0]"#);
         assert_eq!(
             testmempoolaccept_params(&["aa", "bb"]),

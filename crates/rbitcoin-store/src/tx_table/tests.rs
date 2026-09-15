@@ -1718,10 +1718,7 @@ fn output_exp_nibble_10_is_corrupt() {
 fn output_negative_value_is_corrupt() {
     let rec = OutputRecord::unspent(-1, vec![0x51]);
     let err = rec.try_encode_into(&mut Vec::new()).unwrap_err();
-    assert!(
-        format!("{err}").contains("txout amount negative"),
-        "{err}"
-    );
+    assert!(format!("{err}").contains("txout amount negative"), "{err}");
 }
 
 #[test]

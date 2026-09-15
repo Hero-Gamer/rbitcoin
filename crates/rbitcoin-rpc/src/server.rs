@@ -731,8 +731,14 @@ mod tests {
             batch.to_string().as_bytes(),
         )
         .await;
-        assert_eq!(st, 200, "one POST is one occupancy even with 2 methods: {body:?}");
-        let arr = body.as_ref().and_then(|v| v.as_array()).expect("batch json");
+        assert_eq!(
+            st, 200,
+            "one POST is one occupancy even with 2 methods: {body:?}"
+        );
+        let arr = body
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .expect("batch json");
         assert_eq!(arr.len(), 2, "{body:?}");
 
         let mut hits = Vec::new();
