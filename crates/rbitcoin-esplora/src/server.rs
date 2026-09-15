@@ -19,7 +19,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -259,6 +259,23 @@ pub const DEFAULT_MAX_TRACK_ADDRESSES: usize = 64;
 /// Default max tracked txids per WS connection (pending set).
 pub const DEFAULT_MAX_TRACK_TXS: usize = 64;
 
+/// Opt-in `GET /block-template` builder (node injects GBT; tests inject a stub).
+#[derive(Clone)]
+pub struct BlockTemplateFn(pub Arc<dyn Fn() -> Result<Value, String> + Send + Sync>);
+
+impl std::fmt::Debug for BlockTemplateFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlockTemplateFn")
+    }
+}
+
+pub(crate) struct GbtCache {
+    pub(crate) at: Instant,
+    pub(crate) tip: [u8; 32],
+    pub(crate) updates: u64,
+    pub(crate) body: Value,
+}
+
 /// Esplora HTTP server config (listen + shared DoS floor + WS caps).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
@@ -275,6 +292,8 @@ pub struct EsploraConfig {
     pub max_track_addresses: usize,
     /// Max tracked txids per WS connection.
     pub max_track_txs: usize,
+    /// `None` → `GET /block-template` is 404 (default).
+    pub block_template: Option<BlockTemplateFn>,
 }
 
 impl EsploraConfig {
@@ -291,6 +310,7 @@ impl EsploraConfig {
             max_ws_message_bytes: DEFAULT_MAX_WS_MESSAGE_BYTES,
             max_track_addresses: DEFAULT_MAX_TRACK_ADDRESSES,
             max_track_txs: DEFAULT_MAX_TRACK_TXS,
+            block_template: None,
         }
     }
 }
@@ -324,6 +344,8 @@ pub(crate) struct AppState {
     /// Last scripthash join (tip-fenced). HTTP is not session-oriented; one
     /// slot still covers Casa `/scripthash` → `/txs` → `/utxo` and chain pages.
     pub(crate) sh_join: Arc<Mutex<Option<ShJoinSlot>>>,
+    pub(crate) block_template: Option<BlockTemplateFn>,
+    pub(crate) gbt_cache: Arc<Mutex<Option<GbtCache>>>,
 }
 
 impl AppState {
@@ -378,10 +400,13 @@ pub async fn run_esplora(
         max_track_addresses: config.max_track_addresses.max(1),
         max_track_txs: config.max_track_txs.max(1),
         sh_join: Arc::new(Mutex::new(None)),
+        block_template: config.block_template,
+        gbt_cache: Arc::new(Mutex::new(None)),
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).
     let rest = Router::new()
+        .route("/block-template", get(handlers::block_template))
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/blocks", get(handlers::blocks_tip))
@@ -857,6 +882,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_template_default_404() {
+        let (dir, q) = temp_query("gbt-404");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 404, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn block_template_enabled_cache_and_503() {
+        let (dir, q) = temp_query("gbt-on");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        let prev = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&calls);
+        let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"height": 1, "rules": ["segwit"]}))
+        })));
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let (st, raw, body) = http_get_raw(addr, "/block-template").await;
+        assert_eq!(st, 200, "{body}");
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "{raw}"
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["height"], 1);
+        let (st, _) = http_get(addr, "/block-template").await;
+        assert_eq!(st, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "15s cache");
+        let (h1, t1) = coinbase(1, prev, Some(h0.hash));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let (st, _) = http_get(addr, "/block-template").await;
+        assert_eq!(st, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "tip change invalidates");
+        handle.shutdown().await;
+
+        let calls2 = Arc::new(AtomicU64::new(0));
+        let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Err("no hub".into()))));
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 503, "{body}");
+        assert!(body.contains("no hub"), "{body}");
+        let _ = calls2;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn chain_view_tip_header_matches_hash_body() {
         let (dir, q) = temp_query("chain-view-hdr");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -962,6 +1048,8 @@ mod tests {
             max_track_addresses: 1,
             max_track_txs: 1,
             sh_join: Arc::new(Mutex::new(None)),
+            block_template: None,
+            gbt_cache: Arc::new(Mutex::new(None)),
         };
         async fn die_tip(State(st): State<AppState>) -> &'static str {
             st.query.disconnect_tip().unwrap();

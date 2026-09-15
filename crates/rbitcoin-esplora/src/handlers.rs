@@ -2,7 +2,7 @@
 
 use crate::server::{
     block_hash_hex, maybe_attach_view, mempool_wire, not_found, parse_hash32, pin_or_reject,
-    plain_ok, store_err, AppState, AsOf,
+    plain_ok, store_err, AppState, AsOf, GbtCache,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
@@ -26,6 +26,7 @@ use rbitcoin_query::{
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 /// Best-chain wire block for Esplora (archived reconstruct; no extra PoW rehash gate).
 fn best_chain_block(
@@ -550,6 +551,64 @@ fn outspend_json(
         }
     }
     Ok(json!({ "spent": false }))
+}
+
+pub async fn block_template(State(st): State<AppState>) -> Response {
+    if st.block_template.is_none() {
+        return not_found();
+    }
+    spawn_join(move || block_template_sync(&st)).await
+}
+
+fn block_template_sync(st: &AppState) -> Response {
+    let Some(fun) = st.block_template.as_ref() else {
+        return not_found();
+    };
+    let Some(h) = st.query.tip_height() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response();
+    };
+    let tip = match st.query.header_at_height(h) {
+        Ok(Some((_, rec))) => rec.hash,
+        Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
+        Err(e) => return store_err(e),
+    };
+    let updates = st
+        .mempool
+        .as_ref()
+        .map(|m| m.template_updates())
+        .unwrap_or(0);
+    {
+        let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = cache.as_ref() {
+            if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
+                return gbt_json(&c.body);
+            }
+        }
+    }
+    match (fun.0)() {
+        Ok(body) => {
+            *st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(GbtCache {
+                at: Instant::now(),
+                tip,
+                updates,
+                body: body.clone(),
+            });
+            gbt_json(&body)
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+fn gbt_json(body: &Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 pub(crate) async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
@@ -1492,6 +1551,8 @@ mod pure_helper_tests {
             max_track_addresses: 64,
             max_track_txs: 64,
             sh_join: Arc::new(Mutex::new(None)),
+            block_template: None,
+            gbt_cache: Arc::new(Mutex::new(None)),
         };
         let sh = script_hash(&[0x51]);
         reset_body_ok_reads();

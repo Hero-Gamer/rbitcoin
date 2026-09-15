@@ -23,6 +23,7 @@ rbitcoin-rpc = { workspace = true }
 rbitcoin-electrum = { workspace = true }
 rbitcoin-esplora = { workspace = true }
 bitcoin = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 mimalloc = { workspace = true }
 

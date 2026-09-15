@@ -28,9 +28,9 @@ clients that already know their addresses/scripthashes or exact txids/block
 ids).
 
 **Non-goal:** power a **graphical block explorer** product (search boxes,
-address-prefix autocomplete, “browse everything” UX, Liquid/mining template
-surfaces). Those need reverse indexes and explorer-only APIs we deliberately
-omit. Block/tx **by full id** and address/**exact** scripthash history exist so
+address-prefix autocomplete, “browse everything” UX, Liquid). Those need reverse
+indexes and explorer-only APIs we deliberately omit. Opt-in `GET /block-template`
+is GBT (same JSON as RPC), not explorer search. Block/tx **by full id** and address/**exact** scripthash history exist so
 wallets and APIs can verify and sync—not so we become mempool.space.
 
 `--max-sh-creates N` (default **0** = unlimited) refuses Electrum/Esplora SH
@@ -204,7 +204,8 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
 | Unknown path | 404 | plain body |
-| **Non-goal / never** | — | Graphical explorer features: `address-prefix` search, Liquid/assets, mining `block-template`, explorer UI-only APIs |
+| `GET /block-template` | opt-in | `--esplora-block-template` (default off → **404**). Same JSON as RPC `getblocktemplate` `{"rules":["segwit"]}` template mode. **503** without tip. `Cache-Control: no-store`. 15 s cache, invalidated on tip or mempool `template_updates`. No proposal/longpoll HTTP. |
+| **Non-goal / never** | — | Graphical explorer features: `address-prefix` search, Liquid/assets, explorer UI-only APIs |
 
 ## Esplora WebSocket (wallet live subset)
 

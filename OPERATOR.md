@@ -761,6 +761,10 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 
 **Electrum or Esplora without `--shindex` fails at process start** (clear config error).
 
+`--esplora-block-template` (conf `esplora_block_template=1`) enables
+`GET /block-template` on the Esplora listen (same JSON as RPC
+`getblocktemplate` template mode). Default **off** (404).
+
 `--max-sh-creates N` (conf `max_sh_creates`) is **0** by default (full join). When
 `N > 0`, Electrum and Esplora refuse a scripthash with more than N creates
 before Class A expand: Esplora **503** / Electrum JSON-RPC error
@@ -1057,7 +1061,7 @@ rbitcoin-cli --datadir ./datadir-mainnet getblockcount
 | Address / scripthash | chain_stats, utxo, history pages (25 + `last_seen_txid`), `/txs/mempool`; complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
-| Unknown / non-goal | **404** (explorer-only APIs e.g. address-prefix; Liquid; mining template) |
+| Unknown / non-goal | **404** (explorer-only APIs e.g. address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.  
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.

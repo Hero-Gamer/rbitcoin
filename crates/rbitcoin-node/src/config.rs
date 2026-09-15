@@ -185,6 +185,8 @@ pub struct NodeConfig {
     pub sptweaks_dust: u64,
     /// 0 = unlimited. Electrum + Esplora refuse SH joins above this create count.
     pub max_sh_creates: u32,
+    /// Opt-in Esplora `GET /block-template` (GBT template JSON). Default off.
+    pub esplora_block_template: bool,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     pub milestone_height: u32,
     /// Set when conf or CLI applied `milestone` / `assumevalid_height` (including 0).
@@ -243,6 +245,7 @@ impl Default for NodeConfig {
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: 0,
+            esplora_block_template: false,
             milestone_height: 0,
             milestone_explicit: false,
             inhibit_suspend: false,
@@ -615,6 +618,10 @@ impl NodeConfig {
                 self.max_sh_creates = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf max_sh_creates: {e}")))?;
+            }
+            "esplora_block_template" | "esplorablocktemplate" => {
+                self.esplora_block_template = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
             }
             "rpc_listen" | "rpclisten" => {
                 self.rpc.listen = Some(
