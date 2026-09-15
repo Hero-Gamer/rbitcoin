@@ -18,6 +18,11 @@ before 1.0).
 
 ### Added
 
+- **Mempool leftover `slots.tmp`:** `analog_milestone_and_mempool_persist`
+  plants leftover `slots.tmp` after a clean flush; `MempoolHub` open
+  finishes the rename and live count matches. Truncated `tx.body` vs
+  slots refuses (not a silent empty pool). Compact crash guts stay.
+
 - **RPC exact `maxfeerate` / `maxburnamount` + scantxoutset arms:**
   `sendrawtransaction` at default 0.10 BTC/kvB accepts; one sat over is
   `max-fee-exceeded`; `maxfeerate=0` still admits the huge-fee tx.

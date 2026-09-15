@@ -54,6 +54,7 @@ fn analog_milestone_and_mempool_persist() {
     );
     assert_eq!(hub2.live_count(), 1);
     drop(hub2);
+    pin_leftover_slots_tmp_and_truncated_body(&mp_dir, &q_arc, &want);
 
     let q = q_arc.as_ref();
     let mut bad = spend_anyone_can_spend(spend_txid, 0, Amount::from_sat(47_0000_0000));
@@ -120,6 +121,36 @@ fn analog_milestone_and_mempool_persist() {
             || msg.contains("lookup stage miss")
             || msg.contains("invariant"),
         "expected prevout / lookup-miss failure under milestone, got: {err}"
+    );
+}
+
+fn pin_leftover_slots_tmp_and_truncated_body(mp_dir: &Path, q: &Arc<Query>, want: &bitcoin::Txid) {
+    std::fs::copy(mp_dir.join("slots"), mp_dir.join("slots.tmp")).unwrap();
+    assert!(mp_dir.join("slots.tmp").exists());
+    let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
+        .expect("open finishes leftover slots.tmp");
+    assert!(
+        !mp_dir.join("slots.tmp").exists(),
+        "leftover slots.tmp must be renamed away"
+    );
+    assert_eq!(hub.live_count(), 1);
+    assert!(hub.contains(want));
+    drop(hub);
+
+    let body = mp_dir.join("tx.body");
+    let bytes = std::fs::read(&body).unwrap();
+    assert!(bytes.len() > 1, "flushed body");
+    std::fs::write(&body, &bytes[..bytes.len() / 2]).unwrap();
+    let err = match MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000) {
+        Ok(_) => panic!("truncated body vs slots must refuse"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_lowercase().contains("corrupt")
+            || err.to_lowercase().contains("slot")
+            || err.to_lowercase().contains("body")
+            || err.to_lowercase().contains("range"),
+        "expected disagree refuse, got {err}"
     );
 }
 
