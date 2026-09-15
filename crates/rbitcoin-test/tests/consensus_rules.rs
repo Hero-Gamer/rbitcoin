@@ -27,35 +27,89 @@ fn connect_genesis(q: &Query, params: &ChainParams) {
 
 // ─── Header rules ───────────────────────────────────────────────────────────
 
-#[test]
-fn h4_rejects_checkpoint_mismatch() {
-    let (_td, q, mut params) = regtest_q();
-    connect_genesis(&q, &params);
-    // Inject a fake checkpoint at height 1 that no valid block can match.
-    params.checkpoints.push(Checkpoint {
+fn pin_h4_checkpoint_and_h6_pow_limit(
+    q: &Query,
+    params: &ChainParams,
+    genesis: &bitcoin::Block,
+    b1: &bitcoin::Block,
+) {
+    let mut matched = params.clone();
+    matched.checkpoints.push(Checkpoint {
+        height: 1,
+        hash: b1.block_hash(),
+    });
+    validate_header(q, &matched, Height(1), &b1.header).expect("h4 checkpoint match");
+
+    let mut mismatch = params.clone();
+    mismatch.checkpoints.push(Checkpoint {
         height: 1,
         hash: BlockHash::from_byte_array([0xcc; 32]),
     });
-    let g = regtest_genesis();
-    let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
-    let err = validate_header(&q, &params, Height(1), &b1.header).unwrap_err();
+    let err = validate_header(q, &mismatch, Height(1), &b1.header).unwrap_err();
     assert!(
         matches!(err, ConsensusError::BadHeader(s) if s.contains("checkpoint")),
-        "{err:?}"
+        "h4 mismatch: {err:?}"
+    );
+
+    let near = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
+    let mut tight = params.clone();
+    tight.pow_limit = ChainParams::mainnet().pow_limit;
+    let err = validate_header(q, &tight, Height(1), &near.header).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadHeader(s) if s.contains("pow limit")),
+        "h6: {err:?}"
     );
 }
 
-#[test]
-fn h6_target_above_pow_limit_is_detectable() {
-    // We reject `target > pow_limit` in validate_header; assert the comparison
-    // fixture (mainnet limit vs too-easy compact) holds so the branch is reachable.
-    let main = ChainParams::mainnet();
-    let too_easy = CompactTarget::from_consensus(0x2200_ffff);
-    let t = bitcoin::Target::from_compact(too_easy);
+fn pin_bip68_time_lock(
+    q: &Query,
+    params: &ChainParams,
+    child_txid: bitcoin::Txid,
+    mut tip: BlockHash,
+    mut time: u32,
+) {
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::Sequence;
+
+    let create_h = q.tip_height().expect("tip").0;
+    let coin_mtp = median_time_past(q, Height(create_h.saturating_sub(1))).unwrap();
+    let type_flag = 1u32 << 22;
+    let n = 2u32;
+    let min_time = i64::from(coin_mtp) + ((n as i64) << 9) - 1;
+
+    let mut csv_time = spend_anyone_can_spend(child_txid, 0, Amount::from_sat(48_0000_0000));
+    csv_time.version = TxVersion::TWO;
+    csv_time.input[0].sequence = Sequence::from_consensus(type_flag | n);
+
+    let early_h = create_h + 1;
+    let prev_mtp = median_time_past(q, Height(create_h)).unwrap();
     assert!(
-        t > main.pow_limit,
-        "fixture target should exceed mainnet pow limit"
+        min_time >= i64::from(prev_mtp),
+        "fixture: n=2 still locked at {early_h} min_time={min_time} prev_mtp={prev_mtp}"
     );
+    let early = mine_regtest_block(tip, time + 600, early_h, vec![csv_time.clone()]);
+    let err = accept_and_connect_block(q, params, Height(early_h), &early, Milestone::NONE);
+    assert!(
+        matches!(err, Err(ConsensusError::BadTx(s)) if s.contains("nonfinal")),
+        "bip68 time just short: {err:?}"
+    );
+
+    let mut next_h = early_h;
+    loop {
+        let mtp = median_time_past(q, q.tip_height().unwrap()).unwrap();
+        if i64::from(mtp) > min_time {
+            break;
+        }
+        if next_h > create_h + 20 {
+            panic!("mtp never exceeded bip68 min_time={min_time} mtp={mtp} h={next_h}");
+        }
+        (tip, time) = pad_empty_from(q, params, tip, time, next_h, next_h);
+        next_h += 1;
+    }
+    let ok_h = q.tip_height().unwrap().0 + 1;
+    let ok = mine_regtest_block(tip, time + 600, ok_h, vec![csv_time]);
+    accept_and_connect_block(q, params, Height(ok_h), &ok, Milestone::NONE)
+        .expect("bip68 time after MTP clears");
 }
 
 #[test]
@@ -160,6 +214,7 @@ fn header_and_spending_boundaries() {
     );
 
     let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    pin_h4_checkpoint_and_h6_pow_limit(&q, &params, &g, &b1);
     validate_header(&q, &params, Height(1), &b1.header).expect("valid parent, pow, bits");
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
     let cb_txid = b1.txdata[0].compute_txid();
@@ -285,6 +340,7 @@ fn header_and_spending_boundaries() {
     parent.lock_time = LockTime::from_height(100).unwrap();
     parent.input[0].sequence = Sequence::from_consensus(10);
     let child = spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(49_0000_0000));
+    let child_txid = child.compute_txid();
     let good = mine_regtest_block(tip, time, 101, vec![parent, child]);
     accept_and_connect_block(&q, &params, Height(101), &good, Milestone::NONE).expect(
         "parent-before-child, exact subsidy, in==out, OP_TRUE, seq=10, mature, locktime 100",
@@ -302,4 +358,5 @@ fn header_and_spending_boundaries() {
             ),
         "already spent: {err:?}"
     );
+    pin_bip68_time_lock(&q, &params, child_txid, good.block_hash(), time);
 }

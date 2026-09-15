@@ -18,6 +18,13 @@ before 1.0).
 
 ### Added
 
+- **Connect-path H4/H6 and BIP68 time:** `header_and_spending_boundaries`
+  accepts a matching height-1 checkpoint, rejects a mismatch, and
+  `validate_header` of a too-easy compact against mainnet `pow_limit` is
+  `target above pow limit`. Same pad: BIP68 time-type `nSequence` of the
+  height-101 child is `bad-txns-nonfinal` while prev MTP is short, then
+  accepts after empty pads raise MTP. `finality_tests` / H8 units stay.
+
 - **Process `-blocksonly` on live `run_p2p`:** `node_run_p2p_short` sets
   `mempool.blocksonly` and `-maxtipage` (so the 3-block 2011 pad leaves
   `IsInitialBlockDownload`). After catch-up, `getnetworkinfo` `localrelay`
