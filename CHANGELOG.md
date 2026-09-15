@@ -17,6 +17,8 @@ before 1.0).
   most one extra racer on the first in-window gap, and only if that owner is
   missing, aged, or a quarter-median lemon. Repeat stall/relative-slow kicks
   lengthen AddrMan cooldown (10m / 30m / 2h) and force the SLOW flag.
+  [`OPERATOR.md`](OPERATOR.md) notes `--max-outbound 8` on a constrained
+  uplink (IBD floor; no new per-peer flag).
 
 - **`height_by_hash` tip delta:** merged confirm and multi-height shrink
   extend/retain the in-process hash→height map. A full `0..=tip` header walk
