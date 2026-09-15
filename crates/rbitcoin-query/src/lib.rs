@@ -165,7 +165,7 @@ pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher};
 pub use in_flight::InFlight;
 pub use scripthash::{
     HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance, ScriptHashChainStats,
-    ScriptHashHistoryItem, ScriptHashUtxo, ShJoinSlot,
+    ScriptHashHistoryItem, ScriptHashTxSummary, ScriptHashUtxo, ShJoinSlot,
 };
 pub use stamp::{
     fill_missing_parent_ranges, stamp_external_parents, BatchParentIds, ExternalParentStamp,

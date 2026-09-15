@@ -20,7 +20,9 @@ use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network, OutPoint, Txid};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{median_time_past_times, Height};
-use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
+use rbitcoin_query::{
+    ChainViewKind, HistoryFilter, Query, ScriptHashChainStats, ScriptHashTxSummary,
+};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -840,6 +842,112 @@ fn chain_page(
         return not_found();
     };
     chain_page_sh(st, &sh, after, asof)
+}
+
+pub async fn scripthash_txs_summary(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    spawn_join(move || summary_page(&st, &sh_hex, None, asof)).await
+}
+
+pub async fn scripthash_txs_summary_cursor(
+    State(st): State<AppState>,
+    Path((sh_hex, last)): Path<(String, String)>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(after) = parse_hash32(&last) else {
+        return not_found();
+    };
+    spawn_join(move || summary_page(&st, &sh_hex, Some(after), asof)).await
+}
+
+pub async fn address_txs_summary(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    match resolve_address_sh(&addr_s, st.network) {
+        Ok(sh) => spawn_join(move || summary_page_sh(&st, &sh, None, asof)).await,
+        Err(_) => not_found(),
+    }
+}
+
+pub async fn address_txs_summary_cursor(
+    State(st): State<AppState>,
+    Path((addr_s, last)): Path<(String, String)>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(after) = parse_hash32(&last) else {
+        return not_found();
+    };
+    match resolve_address_sh(&addr_s, st.network) {
+        Ok(sh) => spawn_join(move || summary_page_sh(&st, &sh, Some(after), asof)).await,
+        Err(_) => not_found(),
+    }
+}
+
+fn summary_page(
+    st: &AppState,
+    sh_hex: &str,
+    after: Option<[u8; 32]>,
+    asof: Option<[u8; 32]>,
+) -> Response {
+    let Ok(sh) = parse_hash32(sh_hex) else {
+        return not_found();
+    };
+    summary_page_sh(st, &sh, after, asof)
+}
+
+fn summary_page_sh(
+    st: &AppState,
+    sh: &[u8; 32],
+    after: Option<[u8; 32]>,
+    asof: Option<[u8; 32]>,
+) -> Response {
+    let filter = HistoryFilter::esplora_chain_page(after);
+    let (items, view) = match sh_at_view(
+        st,
+        asof,
+        |q, view| q.scripthash_history_summary_filtered_in(sh, &filter, view),
+        |q, slot, view| q.scripthash_history_summary_filtered_slot_in(sh, &filter, slot, view),
+        Vec::new(),
+    ) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    maybe_attach_view(
+        match summaries_json(&st.query, &items) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
+        view,
+    )
+}
+
+fn summaries_json(
+    query: &Query,
+    items: &[ScriptHashTxSummary],
+) -> Result<Value, rbitcoin_query::QueryError> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let time = if it.height >= 0 {
+            query
+                .header_at_height(Height(it.height as u32))?
+                .map(|(_, rec)| rec.timestamp)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        out.push(json!({
+            "txid": block_hash_hex(&it.txid),
+            "value": it.value,
+            "height": it.height,
+            "time": time,
+        }));
+    }
+    Ok(Value::Array(out))
 }
 
 fn chain_page_sh(

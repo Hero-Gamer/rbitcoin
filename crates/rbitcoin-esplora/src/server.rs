@@ -412,6 +412,14 @@ pub async fn run_esplora(
         .route("/address/{addr}/utxo", get(handlers::address_utxo))
         .route("/address/{addr}/txs", get(handlers::address_txs))
         .route(
+            "/address/{addr}/txs/summary",
+            get(handlers::address_txs_summary),
+        )
+        .route(
+            "/address/{addr}/txs/summary/{last}",
+            get(handlers::address_txs_summary_cursor),
+        )
+        .route(
             "/address/{addr}/txs/mempool",
             get(handlers::address_txs_mempool),
         )
@@ -426,6 +434,14 @@ pub async fn run_esplora(
         .route("/scripthash/{hash}", get(handlers::scripthash_info))
         .route("/scripthash/{hash}/utxo", get(handlers::scripthash_utxo))
         .route("/scripthash/{hash}/txs", get(handlers::scripthash_txs))
+        .route(
+            "/scripthash/{hash}/txs/summary",
+            get(handlers::scripthash_txs_summary),
+        )
+        .route(
+            "/scripthash/{hash}/txs/summary/{last}",
+            get(handlers::scripthash_txs_summary_cursor),
+        )
         .route(
             "/scripthash/{hash}/txs/mempool",
             get(handlers::scripthash_txs_mempool),
@@ -1285,6 +1301,15 @@ mod tests {
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(info["chain_stats"]["tx_count"].as_u64().unwrap() >= 4);
         assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 4);
+
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/summary")).await;
+        assert_eq!(st, 200, "{body}");
+        let sum: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(!sum.is_empty());
+        assert!(sum[0].get("txid").is_some());
+        assert!(sum[0].get("value").is_some());
+        assert!(sum[0].get("height").is_some());
+        assert!(sum[0].get("time").is_some());
 
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
         assert_eq!(st, 200, "{body}");

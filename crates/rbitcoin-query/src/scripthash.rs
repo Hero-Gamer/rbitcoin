@@ -38,6 +38,14 @@ pub struct ScriptHashHistoryItem {
     pub fee: Option<i64>,
 }
 
+/// Light history row (mempool.space `/txs/summary` shape without `time`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashTxSummary {
+    pub txid: [u8; 32],
+    pub value: i64,
+    pub height: i64,
+}
+
 /// Sort order for [`apply_history_filter`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum HistoryOrder {
@@ -206,6 +214,32 @@ fn history_items_from_joined(
         })
         .collect();
     apply_history_filter(&items, filter)
+}
+
+fn summaries_from_joined(
+    joined: &[ShJoinedOut],
+    filter: &HistoryFilter,
+) -> Vec<ScriptHashTxSummary> {
+    let items = history_items_from_joined(joined, filter);
+    items
+        .into_iter()
+        .map(|it| {
+            let mut value = 0i64;
+            for rec in joined {
+                if rec.out.create_tx_fk == it.tx_fk {
+                    value = value.saturating_add(rec.out.value);
+                }
+                if rec.spender_fks.contains(&it.tx_fk) {
+                    value = value.saturating_sub(rec.out.value);
+                }
+            }
+            ScriptHashTxSummary {
+                txid: it.txid,
+                value,
+                height: it.height,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -833,6 +867,38 @@ impl Query {
             .joined;
         self.enrich_joined(recs, ShJoinNeed::HISTORY)?;
         Ok(history_items_from_joined(recs, filter))
+    }
+
+    pub fn scripthash_history_summary_filtered_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+        let joined = self.sh_join(scripthash, ShJoinNeed::HISTORY, filter.to_height, view)?;
+        Ok(summaries_from_joined(&joined, filter))
+    }
+
+    pub fn scripthash_history_summary_filtered_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+        let hit = slot
+            .as_ref()
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
+        if !hit && filter.to_height.is_some() {
+            return self.scripthash_history_summary_filtered_in(scripthash, filter, view);
+        }
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        let recs = &mut slot
+            .as_mut()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.enrich_joined(recs, ShJoinNeed::HISTORY)?;
+        Ok(summaries_from_joined(recs, filter))
     }
 
     /// Confirmed txs in `height` that create or spend a posting-list out for `scripthash`.
