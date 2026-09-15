@@ -3675,6 +3675,26 @@ mod tests {
             "in-batch MTP fail: {err}"
         );
         assert_eq!(hub.query.store().header_count(), after_far);
+
+        let empty = HashMap::new();
+        assert_eq!(hub.stored_header_height(&b1.block_hash()), Some(1));
+        assert!(hub
+            .stored_header_height(&BlockHash::from_byte_array([0xab; 32]))
+            .is_none());
+        let mtp = hub.mtp_off_tip(&b1.header, &empty);
+        assert!(mtp <= b1.header.time);
+        let child_bits = hub
+            .expected_bits_off_tip(&h2, &b1.header, 1, &empty)
+            .unwrap();
+        assert_eq!(child_bits, b1.header.bits);
+        let mut far_bits = h2;
+        far_bits.time = b1.header.time.saturating_add(10_000);
+        let md = hub.min_diff_off_tip(&far_bits, &b1.header, 1, &empty);
+        assert_eq!(md, hub.params.pow_limit.to_compact_lossy());
+        let genesis_hdr = hub.header_of(&gen).expect("genesis header");
+        assert!(hub.header_along_off_tip(&b1.header, 1, 0, &empty).is_some());
+        assert!(hub.header_along_off_tip(&b1.header, 1, 2, &empty).is_none());
+        let _ = genesis_hdr;
         let _ = std::fs::remove_dir_all(dir);
     }
 
