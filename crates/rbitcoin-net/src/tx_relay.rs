@@ -10,10 +10,10 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    blend_sat_kvb, enforce_monotone_desc, fine_candidate_rates, frontier_feerate_from_chunks,
-    historical_far_sat_kvb, min_rate_for_capacity, percentile_sat, weight_above_from_chunks,
-    AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter,
-    UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    blend_sat_kvb, enforce_monotone_desc, fine_candidate_rates, flow_for_depth,
+    frontier_feerate_from_chunks, historical_far_sat_kvb, min_rate_for_capacity, percentile_sat,
+    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
+    Chunk, Coin, FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -1667,12 +1667,7 @@ impl MempoolHub {
                     &candidates,
                 )
             });
-            let flow = match (projected, frontier) {
-                (Some(p), Some(f)) => Some(p.max(f)),
-                (Some(p), None) => Some(p),
-                (None, Some(f)) => Some(f),
-                (None, None) => None,
-            };
+            let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
             let mut rate = blend_sat_kvb(flow, hist, depth);
             if depth <= 1 {
                 if let (Some(r), Some(floor)) = (rate, confirm_floor) {
@@ -2915,8 +2910,15 @@ mod tests {
             assert!(!hub.fee_histogram().is_empty());
             let e1 = hub.estimate_fee_btc_per_kb(1);
             let e5 = hub.estimate_fee_btc_per_kb(5);
-            let e20 = hub.estimate_fee_btc_per_kb(20);
-            assert!(e1 >= 0.0 && e5 >= 0.0 && e20 >= 0.0);
+            let e144 = hub.estimate_fee_btc_per_kb(144);
+            assert!(
+                e1 >= 0.0 && e5 >= 0.0,
+                "near under-full live stock: e1={e1} e5={e5}"
+            );
+            assert!(
+                e144 < 0.0,
+                "far without block history is insufficient, got {e144}"
+            );
             let spent = hub.spent_outpoints();
             assert!(spent.contains(&op0));
             let rows = hub.scripthash_mempool(&sh);

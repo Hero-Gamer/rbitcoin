@@ -46,15 +46,18 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    Inflow horizon is capped at ~4 admit half-lives so a 150 s EMA is not
    stretched to a week.
 5. **Frontier** is the marginal chunk at `N×4e6` WU. If the pool is thinner
-   than N blocks, stock does **not** set R (no last-chunk-as-far).
+   than N blocks, stock does **not** set a far rate (no last-chunk-as-far).
+   Near depths (`w≥0.5`, N=1–5) with any live stock still answer min-relay
+   (the next few blocks have room).
 6. **Far / blend:** `R = w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`.
    `R_hist` is the 85th percentile (or median if <12 samples) of per-block
    p10 confirmed package feerates. Then enforce `R(1) ≥ R(2) ≥ …`.
 7. **N=1** may additionally clip to the confirm-memory median. Long N does not.
 
 **Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits),
-`R_flow` is frontier only (under-full → none). If `R_hist` is also empty,
-the API returns “insufficient” (`-1` / Esplora `1.0`).
+`R_flow` is frontier, or min-relay on an under-full **near** depth with live
+stock. If `R_hist` is also empty, **far** APIs return “insufficient”
+(`-1` / Esplora `1.0`).
 
 ### Parameters (code constants, not env)
 

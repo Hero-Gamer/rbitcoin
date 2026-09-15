@@ -19,10 +19,11 @@ before 1.0).
 ### Changed
 
 - **Fee estimates blend live flow with block history:** Near targets invert
-  stock + capped admit-EMA (0.1 sat/vB candidates; under-full pool does not
-  set a last-chunk far rate). Far targets (144/504/1008) follow per-block p10
-  of confirmed packages. Mid depths use `w=exp(-(N-1)/6)`. Confirm-memory
-  clips N=1 only. Esplora `/fee-estimates` rounds to 0.1 sat/vB.
+  stock + capped admit-EMA (0.1 sat/vB candidates; under-full pool with live
+  stock answers min-relay for N=1–5, not a last-chunk far rate). Far targets
+  (144/504/1008) follow per-block p10 of confirmed packages (insufficient
+  without history). Mid depths use `w=exp(-(N-1)/6)`. Confirm-memory clips
+  N=1 only. Esplora `/fee-estimates` rounds to 0.1 sat/vB.
   [`docs/mempool-fee-estimation.md`](docs/mempool-fee-estimation.md).
 
 - **Operator logs:** tip-follow and P2P INFO/TRACE use rbitcoin lines

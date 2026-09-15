@@ -157,6 +157,8 @@ pub fn fine_candidate_rates() -> Vec<u64> {
 pub const INFLOW_HORIZON_CAP_SECS: u64 = 600;
 /// Blend length in blocks (~1 hour). `w(1)=1`, `w(6)≈0.43`, `w(144)≈0`.
 pub const BLEND_N0: f64 = 6.0;
+/// Under-full pool may still answer min-relay when `blend_weight ≥` this (N=1–5).
+pub const NEAR_BLEND_FLOOR: f64 = 0.5;
 const MIN_CANDIDATE_SAT_PER_KVB: u64 = 100;
 
 /// Horizon used for inflow projection (capped; not N×10 minutes for N=144).
@@ -168,6 +170,36 @@ pub fn inflow_horizon_secs(n_blocks: u32) -> u64 {
 pub fn blend_weight(n_blocks: u32) -> f64 {
     let n = f64::from(n_blocks.max(1));
     (-(n - 1.0) / BLEND_N0).exp()
+}
+
+/// Combine projected inflow with the N-block frontier.
+///
+/// If the pool is thinner than N blocks, live stock does not set a far rate
+/// (`w < NEAR_BLEND_FLOOR`). Near depths with any live stock still answer
+/// min-relay (everything fits now).
+pub fn flow_for_depth(
+    projected: Option<u64>,
+    frontier: Option<u64>,
+    has_live_stock: bool,
+    n_blocks: u32,
+    min_relay: u64,
+) -> Option<u64> {
+    let mut flow = match (projected, frontier) {
+        (Some(p), Some(f)) => Some(p.max(f)),
+        (Some(p), None) => Some(p),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
+    if frontier.is_none() {
+        if blend_weight(n_blocks) >= NEAR_BLEND_FLOOR {
+            if flow.is_none() && has_live_stock {
+                flow = Some(min_relay);
+            }
+        } else {
+            flow = None;
+        }
+    }
+    flow
 }
 
 /// `w·flow + (1-w)·hist`. Missing side drops out.
@@ -312,5 +344,30 @@ mod tests {
         assert_eq!(inflow_horizon_secs(144), INFLOW_HORIZON_CAP_SECS);
         assert!(fine_candidate_rates().len() > default_candidate_rates().len());
         assert_eq!(fine_candidate_rates()[0], 100);
+    }
+
+    #[test]
+    fn underfull_live_stock_defines_near_not_far() {
+        assert!(blend_weight(5) >= NEAR_BLEND_FLOOR);
+        assert!(blend_weight(6) < NEAR_BLEND_FLOOR);
+        let min_r = 100u64;
+        assert_eq!(flow_for_depth(None, None, true, 1, min_r), Some(min_r));
+        assert_eq!(flow_for_depth(None, None, true, 5, min_r), Some(min_r));
+        assert_eq!(flow_for_depth(None, None, true, 6, min_r), None);
+        assert_eq!(flow_for_depth(None, None, true, 144, min_r), None);
+        assert_eq!(flow_for_depth(None, None, false, 1, min_r), None);
+        assert_eq!(
+            flow_for_depth(Some(5_000), None, true, 1, min_r),
+            Some(5_000)
+        );
+        assert_eq!(flow_for_depth(Some(5_000), None, true, 144, min_r), None);
+        assert_eq!(
+            flow_for_depth(Some(4_000), Some(3_000), true, 1, min_r),
+            Some(4_000)
+        );
+        assert_eq!(
+            flow_for_depth(None, Some(3_000), true, 144, min_r),
+            Some(3_000)
+        );
     }
 }

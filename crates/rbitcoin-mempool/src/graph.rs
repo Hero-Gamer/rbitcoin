@@ -868,10 +868,7 @@ impl TxGraph {
     }
 
     /// Feerate (sat/kvB) of the chunk that fills cumulative weight `target_wu`
-    /// walking best-first. `None` if the pool is empty.
-    ///
-    /// If total pool weight is below `target_wu`, returns the **lowest** chunk
-    /// rate present (still need min-relay floor at the hub).
+    /// walking best-first. `None` if the pool is empty or thinner than `target_wu`.
     pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
         frontier_feerate_from_chunks(&self.mining_chunks_best_first(), target_wu)
     }
