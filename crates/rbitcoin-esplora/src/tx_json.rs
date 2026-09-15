@@ -512,6 +512,8 @@ mod tests {
                 nonce,
                 merkle_root: merkle,
                 hash,
+                size: 0,
+                weight: 0,
             };
             let mut txid = [0u8; 32];
             txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -638,6 +640,8 @@ mod tests {
             nonce: 0,
             merkle_root: merkle0,
             hash: merkle0,
+            size: 0,
+            weight: 0,
         };
         let mut create_txid = [0u8; 32];
         create_txid[31] = 0xcb;
@@ -673,6 +677,8 @@ mod tests {
             nonce: 1,
             merkle_root: [0x11; 32],
             hash: hash1,
+            size: 0,
+            weight: 0,
         };
         let mut spend1_txid = [0u8; 32];
         spend1_txid[0] = 0x11;
@@ -709,6 +715,8 @@ mod tests {
             nonce: 2,
             merkle_root: [0x22; 32],
             hash: hash2,
+            size: 0,
+            weight: 0,
         };
         let mut spend2_txid = [0u8; 32];
         spend2_txid[0] = 0x22;

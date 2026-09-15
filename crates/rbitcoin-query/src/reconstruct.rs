@@ -306,6 +306,34 @@ impl Query {
             .map(Some)
     }
 
+    /// BIP144 size and BIP141 weight for a header row.
+    ///
+    /// Stamped values are a hit (no reconstruct). `(0, 0)` reconstructs once,
+    /// patches the row, and returns the numbers. Unknown `header_fk` is `None`.
+    pub fn block_size_weight(&self, header_fk: Fk) -> Result<Option<(u32, u32)>, QueryError> {
+        let rec = match self.store.headers.get(header_fk) {
+            Ok(r) => r,
+            Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if rec.size != 0 || rec.weight != 0 {
+            return Ok(Some((rec.size, rec.weight)));
+        }
+        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Ok(None);
+        };
+        self.note_reconstruct_archived();
+        let block = self.reconstruct_archived_block_from_parts(rec, tx_fks)?;
+        let size = u32::try_from(block.total_size())
+            .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+        let weight = u32::try_from(block.weight().to_wu())
+            .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+        self.store
+            .headers
+            .set_size_weight(header_fk, size, weight)?;
+        Ok(Some((size, weight)))
+    }
+
     /// Wire rebuild when header row + tx fk list are already known.
     pub fn reconstruct_archived_block_from_parts(
         &self,

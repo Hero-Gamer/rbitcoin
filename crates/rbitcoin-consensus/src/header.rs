@@ -318,6 +318,8 @@ mod median_time_past_tests {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());

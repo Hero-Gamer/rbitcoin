@@ -440,6 +440,61 @@ fn put_create_batch_many_uses_pages() {
 }
 
 #[test]
+fn create_count_inline_slab_no_page_io_extent_stamps() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh1 = script_hash(&[0x01]);
+    put_create(&t, rec(sh1, 1, 0));
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh1).unwrap(), 1);
+    assert_eq!(t.take_page_ios(), 0, "inline count is pack8 used");
+
+    let sh2 = script_hash(&[0x02]);
+    for i in 1..=5u64 {
+        put_create(&t, rec(sh2, i, 0));
+    }
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh2).unwrap(), 5);
+    assert_eq!(t.take_page_ios(), 0, "slab count is pack8 used");
+
+    let sh3 = script_hash(&[0x03]);
+    let recs: Vec<_> = (1..=300u64).map(|i| rec(sh3, i, 0)).collect();
+    assert_eq!(put_create_batch(&t, recs), 300);
+    match t.head_value(&sh3).unwrap().unwrap() {
+        ShHeadValue::Extent { .. } => {}
+        other => panic!("expected extent, got {other:?}"),
+    }
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    assert_eq!(t.take_page_ios(), 1, "extent count is last-page only");
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    assert_eq!(t.take_page_ios(), 1);
+    let ShHeadValue::Extent { last_page } = t.head_value(&sh3).unwrap().unwrap() else {
+        panic!("extent");
+    };
+    let home = t.key_home(&sh3).unwrap();
+    let body = t.body_for(&sh3, home);
+    let mut page = [0u8; SH_PAGE_SIZE];
+    body.read_at(last_page, &mut page).unwrap();
+    crate::scripthash_pages::sh_page_set_extent_creates(&mut page, 0);
+    body.write_at(last_page, &page).unwrap();
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    let walk_ios = t.take_page_ios();
+    assert!(walk_ios > 1, "unstamped extent walks pages, ios={walk_ios}");
+    put_create(&t, rec(sh3, 301, 0));
+    assert_eq!(t.entries(&sh3).unwrap().len(), 301);
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 301);
+    assert_eq!(
+        t.take_page_ios(),
+        1,
+        "append stamps reserved so count is last-page only"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn put_create_batch_chains() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();

@@ -2,7 +2,7 @@
 
 use crate::server::{
     block_hash_hex, maybe_attach_view, mempool_wire, not_found, parse_hash32, pin_or_reject,
-    plain_ok, store_err, AppState, AsOf,
+    plain_ok, store_err, AppState, AsOf, GbtCache,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
@@ -20,10 +20,13 @@ use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network, OutPoint, Txid};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{median_time_past_times, Height};
-use rbitcoin_query::{ChainViewKind, HistoryFilter, Query, ScriptHashChainStats};
+use rbitcoin_query::{
+    ChainViewKind, HistoryFilter, Query, ScriptHashChainStats, ScriptHashTxSummary,
+};
 use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 /// Best-chain wire block for Esplora (archived reconstruct; no extra PoW rehash gate).
 fn best_chain_block(
@@ -63,11 +66,9 @@ pub(crate) fn block_summary_json(
         .get_range(header_fk)?
         .map(|(_, n)| n)
         .unwrap_or(0);
-    let block = query
-        .reconstruct_archived_block(hash)?
+    let (size, weight) = query
+        .block_size_weight(header_fk)?
         .ok_or(rbitcoin_store::StoreError::NotFound)?;
-    let size = block.total_size() as u64;
-    let weight = block.weight().to_wu();
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = median_time_past(query, height)?;
@@ -552,6 +553,62 @@ fn outspend_json(
     Ok(json!({ "spent": false }))
 }
 
+pub async fn block_template(State(st): State<AppState>) -> Response {
+    if st.block_template.is_none() {
+        return not_found();
+    }
+    spawn_join(move || block_template_sync(&st)).await
+}
+
+fn block_template_sync(st: &AppState) -> Response {
+    let Some(fun) = st.block_template.as_ref() else {
+        return not_found();
+    };
+    let Some(h) = st.query.tip_height() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response();
+    };
+    let tip = match st.query.header_at_height(h) {
+        Ok(Some((_, rec))) => rec.hash,
+        Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
+        Err(e) => return store_err(e),
+    };
+    let updates = st
+        .mempool
+        .as_ref()
+        .map(|m| m.template_updates())
+        .unwrap_or(0);
+    let mut cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(c) = cache.as_ref() {
+        if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
+            return gbt_json(&c.body);
+        }
+    }
+    match (fun.0)() {
+        Ok(body) => {
+            *cache = Some(GbtCache {
+                at: Instant::now(),
+                tip,
+                updates,
+                body: body.clone(),
+            });
+            gbt_json(&body)
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+fn gbt_json(body: &Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 pub(crate) async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
     match tokio::task::spawn_blocking(move || {
         let _g = rbitcoin_net::BlockingRegion::enter();
@@ -842,6 +899,112 @@ fn chain_page(
         return not_found();
     };
     chain_page_sh(st, &sh, after, asof)
+}
+
+pub async fn scripthash_txs_summary(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    spawn_join(move || summary_page(&st, &sh_hex, None, asof)).await
+}
+
+pub async fn scripthash_txs_summary_cursor(
+    State(st): State<AppState>,
+    Path((sh_hex, last)): Path<(String, String)>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(after) = parse_hash32(&last) else {
+        return not_found();
+    };
+    spawn_join(move || summary_page(&st, &sh_hex, Some(after), asof)).await
+}
+
+pub async fn address_txs_summary(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    match resolve_address_sh(&addr_s, st.network) {
+        Ok(sh) => spawn_join(move || summary_page_sh(&st, &sh, None, asof)).await,
+        Err(_) => not_found(),
+    }
+}
+
+pub async fn address_txs_summary_cursor(
+    State(st): State<AppState>,
+    Path((addr_s, last)): Path<(String, String)>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(after) = parse_hash32(&last) else {
+        return not_found();
+    };
+    match resolve_address_sh(&addr_s, st.network) {
+        Ok(sh) => spawn_join(move || summary_page_sh(&st, &sh, Some(after), asof)).await,
+        Err(_) => not_found(),
+    }
+}
+
+fn summary_page(
+    st: &AppState,
+    sh_hex: &str,
+    after: Option<[u8; 32]>,
+    asof: Option<[u8; 32]>,
+) -> Response {
+    let Ok(sh) = parse_hash32(sh_hex) else {
+        return not_found();
+    };
+    summary_page_sh(st, &sh, after, asof)
+}
+
+fn summary_page_sh(
+    st: &AppState,
+    sh: &[u8; 32],
+    after: Option<[u8; 32]>,
+    asof: Option<[u8; 32]>,
+) -> Response {
+    let filter = HistoryFilter::esplora_chain_page(after);
+    let (items, view) = match sh_at_view(
+        st,
+        asof,
+        |q, view| q.scripthash_history_summary_filtered_in(sh, &filter, view),
+        |q, slot, view| q.scripthash_history_summary_filtered_slot_in(sh, &filter, slot, view),
+        Vec::new(),
+    ) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    maybe_attach_view(
+        match summaries_json(&st.query, &items) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => store_err(e),
+        },
+        view,
+    )
+}
+
+fn summaries_json(
+    query: &Query,
+    items: &[ScriptHashTxSummary],
+) -> Result<Value, rbitcoin_query::QueryError> {
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let time = if it.height >= 0 {
+            query
+                .header_at_height(Height(it.height as u32))?
+                .map(|(_, rec)| rec.timestamp)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        out.push(json!({
+            "txid": block_hash_hex(&it.txid),
+            "value": it.value,
+            "height": it.height,
+            "time": time,
+        }));
+    }
+    Ok(Value::Array(out))
 }
 
 fn chain_page_sh(
@@ -1181,6 +1344,8 @@ mod pure_helper_tests {
             nonce: 0,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let ta = TxApply {
             tx: TxRecord {
@@ -1305,9 +1470,10 @@ mod pure_helper_tests {
         assert!(block_summary_json(&q, &[0x11; 32]).is_err());
         let _ = q.sample_reset_reconstruct_archived();
         let _ = block_summary_json(&q, &hash).expect("summary again");
-        assert!(
-            q.sample_reset_reconstruct_archived() >= 1,
-            "block JSON reconstructs for consensus size/weight"
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "block JSON uses stamped size/weight"
         );
         assert!(q.reconstruct_archived_block(&hash).unwrap().is_some());
         assert!(q.sample_reset_reconstruct_archived() >= 1);
@@ -1344,6 +1510,8 @@ mod pure_helper_tests {
                 nonce: h,
                 merkle_root: merkle,
                 hash,
+                size: 0,
+                weight: 0,
             };
             let mut txid = [0xcb; 32];
             txid[0] = h as u8;
@@ -1381,6 +1549,8 @@ mod pure_helper_tests {
             max_track_addresses: 64,
             max_track_txs: 64,
             sh_join: Arc::new(Mutex::new(None)),
+            block_template: None,
+            gbt_cache: Arc::new(Mutex::new(None)),
         };
         let sh = script_hash(&[0x51]);
         reset_body_ok_reads();

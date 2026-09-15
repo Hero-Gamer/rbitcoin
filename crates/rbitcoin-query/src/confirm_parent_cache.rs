@@ -153,6 +153,8 @@ mod tests {
             nonce: 0,
             merkle_root: [0u8; 32],
             hash,
+            size: 0,
+            weight: 0,
         }
     }
 

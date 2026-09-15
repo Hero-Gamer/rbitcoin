@@ -1894,6 +1894,8 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
         nonce: 0,
         merkle_root: [0xab; 32],
         hash: [0xab; 32],
+        size: 0,
+        weight: 0,
     };
     let mut txid0 = [0u8; 32];
     txid0[31] = 0xcb;
@@ -1922,6 +1924,8 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut spend_txid = [0u8; 32];
     spend_txid[0] = 0x11;

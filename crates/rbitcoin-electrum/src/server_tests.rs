@@ -280,6 +280,8 @@ fn restatus_notes_scans_intermediate_tick_heights() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let mut txid0 = [0u8; 32];
     txid0[0] = 0xa0;
@@ -313,6 +315,8 @@ fn restatus_notes_scans_intermediate_tick_heights() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut txid1 = [0u8; 32];
     txid1[0] = 0xa1;
@@ -669,6 +673,8 @@ async fn chain_view_get_history_stamps_tip_and_changes_on_replace() {
             nonce: 0,
             merkle_root: merkle,
             hash: merkle,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0xcb; 32];
         txid[31] = 0;
@@ -993,6 +999,8 @@ fn dispatch_on_connected_chain() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1226,6 +1234,8 @@ fn electrum_sh_stamp_follows_pending_before_durable_apply() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let ta0 = TxApply {
         tx: TxRecord {
@@ -1258,6 +1268,8 @@ fn electrum_sh_stamp_follows_pending_before_durable_apply() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut txid1 = [0u8; 32];
     txid1[0] = 0x11;
@@ -1377,6 +1389,8 @@ fn dispatch_casa_sequence_reuses_sh_join_slot() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1459,6 +1473,100 @@ fn dispatch_casa_sequence_reuses_sh_join_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn max_sh_creates_is_electrum_rpc_error_and_ping_still_works() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..3u32 {
+        let version = 1;
+        let timestamp = h + 1;
+        let bits = 0x207fffff;
+        let nonce = h;
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[5] = 0xec;
+        let hash = match parent_hash {
+            None => merkle,
+            Some(ph) => {
+                rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
+            }
+        };
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version,
+            timestamp,
+            bits,
+            nonce,
+            merkle_root: merkle,
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+
+    q.set_max_sh_creates(2);
+    let mut conn = ElectrumConn::new();
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let err = dispatch_with_join(
+        "blockchain.scripthash.get_balance",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("scripthash join exceeds --max-sh-creates"),
+        "{err}"
+    );
+    let ping = dispatch_with_join(
+        "server.ping",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(ping.is_null(), "{ping}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// BCH-style optional `from_height`/`to_height` on get_history; status stays full.
 #[test]
 fn get_history_height_window_and_status_full() {
@@ -1491,6 +1599,8 @@ fn get_history_height_window_and_status_full() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1618,6 +1728,8 @@ async fn tip_push_and_lagged_client() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -1708,6 +1820,8 @@ fn chain_view_status_includes_blockhash() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0xcb; 32];
     txid[31] = 0;
@@ -1814,6 +1928,8 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -1879,6 +1995,8 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
         nonce: 1,
         merkle_root: hash_b,
         hash: hash_b,
+        size: 0,
+        weight: 0,
     };
     let mut txid_b = [0u8; 32];
     txid_b[0] = 0x99;
@@ -1954,6 +2072,8 @@ fn dispatch_with_mempool_and_param_errors() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -2770,6 +2890,8 @@ fn tweaks_rpc_result_is_first_height_only() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -2835,6 +2957,8 @@ async fn tweaks_subscribe_zero_chunk_dones_after_wave0_then_resubscribe() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -2944,6 +3068,8 @@ async fn tweaks_subscribe_pre_taproot_collapses_empty_heights() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());

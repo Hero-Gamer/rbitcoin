@@ -704,6 +704,8 @@ fn expected_bits_extending_uses_header_plan_when_period_start_above_tip() {
         nonce: 2016,
         merkle_root: hash_first,
         hash: hash_first,
+        size: 0,
+        weight: 0,
     };
     let first_fk = q.store().put_header(&first_rec).unwrap();
     q.confirm_parent_cache().put_header_plan(
@@ -1436,6 +1438,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         )],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        per_header_sw: vec![],
         edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
@@ -1494,6 +1497,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         packed: vec![],
         planned_fks: vec![],
         per_header_ranges: vec![],
+        per_header_sw: vec![],
         edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
@@ -1822,6 +1826,7 @@ fn pin_sparse_need_high_vout_only() {
         packed: vec![(Arc::clone(&spend_pin), spend_ins)],
         planned_fks: vec![Fk(2)],
         per_header_ranges: vec![],
+        per_header_sw: vec![],
         edges: Default::default(),
         spends: vec![],
         batch_creates: vec![],
@@ -2555,6 +2560,8 @@ fn already_at_height_retries_post_commit_spend_annotate() {
         nonce: 0,
         merkle_root: [0xab; 32],
         hash: [0xab; 32],
+        size: 0,
+        weight: 0,
     };
     let mut txid0 = [0u8; 32];
     txid0[31] = 0xcb;
@@ -2583,6 +2590,8 @@ fn already_at_height_retries_post_commit_spend_annotate() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut spend_txid = [0u8; 32];
     spend_txid[0] = 0x11;

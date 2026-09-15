@@ -472,6 +472,8 @@ mod tests {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         }
     }
 

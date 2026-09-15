@@ -329,6 +329,8 @@ fn confirm_reject_blacklist_surface() {
         nonce: 0xae,
         merkle_root: [0xae; 32],
         hash: h(0xae).to_byte_array(),
+        size: 0,
+        weight: 0,
     };
     let hfk = q.put_header(&hdr).unwrap();
     // Associate a dummy Class A range so clear_body has something to drop.

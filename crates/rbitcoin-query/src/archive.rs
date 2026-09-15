@@ -36,6 +36,14 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     n
 }
 
+fn block_size_weight(block: &bitcoin::Block) -> Result<(u32, u32), StoreError> {
+    let size = u32::try_from(block.total_size())
+        .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+    let weight = u32::try_from(block.weight().to_wu())
+        .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+    Ok((size, weight))
+}
+
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
@@ -48,6 +56,8 @@ pub struct ArchiveWritePlan {
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
+    /// BIP144 size + BIP141 weight per [`Self::per_header_ranges`] row.
+    pub per_header_sw: Vec<(u32, u32)>,
     /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
     pub edges: crate::SpendEdges,
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
@@ -75,6 +85,7 @@ impl ArchiveWritePlan {
             packed: Vec::new(),
             planned_fks: Vec::new(),
             per_header_ranges: Vec::new(),
+            per_header_sw: Vec::new(),
             edges: crate::SpendEdges::default(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
@@ -107,6 +118,12 @@ impl ArchiveWritePlan {
             ));
         }
         let mut i = 0usize;
+        if self.per_header_sw.is_empty() {
+            self.per_header_sw = blocks
+                .iter()
+                .map(|b| block_size_weight(b))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
         for ((_, _, n), block) in self.per_header_ranges.iter().zip(blocks.iter()) {
             if block.txdata.len() != *n as usize {
                 return Err(StoreError::Corrupt(
@@ -249,11 +266,15 @@ impl ArchiveWritePlan {
         }
         let mut keep_fks: crate::U64Set = crate::U64Set::default();
         let mut new_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(self.per_header_ranges.len());
-        for &(hfk, first, n) in &self.per_header_ranges {
+        let mut new_sw: Vec<(u32, u32)> = Vec::with_capacity(self.per_header_ranges.len());
+        for (i, &(hfk, first, n)) in self.per_header_ranges.iter().enumerate() {
             if has_body(hfk)? {
                 continue;
             }
             new_ranges.push((hfk, first, n));
+            if i < self.per_header_sw.len() {
+                new_sw.push(self.per_header_sw[i]);
+            }
             let start = self
                 .planned_fks
                 .iter()
@@ -298,6 +319,7 @@ impl ArchiveWritePlan {
         self.planned_fks = new_fks;
         self.batch_pin = new_pin;
         self.per_header_ranges = new_ranges;
+        self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
         self.spends
             .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
@@ -327,6 +349,7 @@ impl ArchiveWritePlan {
         self.packed.append(&mut other.packed);
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
+        self.per_header_sw.append(&mut other.per_header_sw);
         self.edges.extend(other.edges);
         self.spends.append(&mut other.spends);
         self.batch_creates.append(&mut other.batch_creates);
@@ -562,6 +585,7 @@ impl Query {
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut work: Vec<PlanRow> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
+        let mut per_header_sw: Vec<(u32, u32)> = Vec::with_capacity(need.len());
 
         for (header_fk, block, txids) in need {
             if block.txdata.is_empty() {
@@ -601,9 +625,10 @@ impl Query {
                 });
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
+            per_header_sw.push(block_size_weight(block)?);
         }
         let assign_ns = t_assign.elapsed().as_nanos() as u64;
-        self.finish_archive_plan(
+        let mut plan = self.finish_archive_plan(
             work,
             batch_map,
             per_header_ranges,
@@ -612,7 +637,9 @@ impl Query {
             in_flight,
             skeleton,
             carried_need,
-        )
+        )?;
+        plan.per_header_sw = per_header_sw;
+        Ok(plan)
     }
 
     #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
@@ -811,6 +838,7 @@ impl Query {
             packed,
             planned_fks,
             per_header_ranges,
+            per_header_sw: Vec::new(),
             edges,
             spends,
             batch_creates,
@@ -908,6 +936,20 @@ impl Query {
             self.store
                 .header_txs
                 .put_ranges_batch(&plan.per_header_ranges)?;
+        }
+        if !plan.per_header_sw.is_empty() {
+            if plan.per_header_sw.len() != plan.per_header_ranges.len() {
+                return Err(StoreError::Corrupt("invariant: header size/weight length"));
+            }
+            for (&(hfk, _, _), &(size, weight)) in
+                plan.per_header_ranges.iter().zip(plan.per_header_sw.iter())
+            {
+                match self.store.headers.set_size_weight(hfk, size, weight) {
+                    Ok(()) => {}
+                    Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
@@ -1054,12 +1096,40 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
-        let hfk = q
-            .commit_class_a_only(&header, &[coinbase_apply(1)])
-            .unwrap();
+        let txs = [coinbase_apply(1)];
+        let (block, _) = crate::testutil::block_from_applies(&txs);
+        let hfk = q.commit_class_a_only(&header, &txs).unwrap();
         assert!(q.tip_height().is_none(), "Class A helper must not set tip");
         assert!(q.store().header_txs.has_body(hfk).unwrap());
+        let rec = q.store().headers.get(hfk).unwrap();
+        assert_eq!(
+            rec.size,
+            u32::try_from(block.total_size()).unwrap(),
+            "confirm write stamps BIP144 size"
+        );
+        assert_eq!(
+            rec.weight,
+            u32::try_from(block.weight().to_wu()).unwrap(),
+            "confirm write stamps BIP141 weight"
+        );
+        let _ = q.sample_reset_reconstruct_archived();
+        let hit = q.block_size_weight(hfk).unwrap().unwrap();
+        assert_eq!(hit, (rec.size, rec.weight));
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "stamped size/weight must not reconstruct"
+        );
+        q.store().headers.set_size_weight(hfk, 0, 0).unwrap();
+        let filled = q.block_size_weight(hfk).unwrap().unwrap();
+        assert_eq!(filled, hit);
+        assert_eq!(q.sample_reset_reconstruct_archived(), 1);
+        let _ = q.block_size_weight(hfk).unwrap();
+        assert_eq!(q.sample_reset_reconstruct_archived(), 0);
+        assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1076,6 +1146,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [3u8; 32],
+            size: 0,
+            weight: 0,
         };
         let ta = coinbase_apply(1);
         let sig = ta.inputs[0].script_sig.clone();
@@ -1398,6 +1470,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [9u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.confirm_parent_cache()
             .put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
@@ -1598,6 +1672,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         assert_eq!(q.tx_body_count(), 1);
@@ -1706,6 +1782,8 @@ mod tests {
                 nonce: 1,
                 merkle_root: [1u8; 32],
                 hash: [1u8; 32],
+                size: 0,
+                weight: 0,
             };
             q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
             let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1748,6 +1826,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1904,6 +1984,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1941,6 +2023,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = q
             .commit_class_a_only(&header, &[coinbase_apply(1)])
@@ -2440,6 +2524,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = q.ensure_header(&header).unwrap();
         let need = vec![(hfk, vec![coinbase_apply(42)])];

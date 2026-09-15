@@ -1373,6 +1373,32 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    /// Create count without expanding Class A. Inline/slab use pack8 `used`.
+    /// Extent reads last-page reserved (`0` = walk pages; no write — appender
+    /// stamps reserved on pack).
+    pub fn create_count(&self, scripthash: &[u8; 32]) -> Result<u32, StoreError> {
+        let Some((val, home)) = self.locate_head(scripthash)? else {
+            return Ok(0);
+        };
+        let used = val.used();
+        if used != u32::MAX {
+            return Ok(used);
+        }
+        let body = self.body_for(scripthash, home);
+        let ShHeadValue::Extent { last_page } = val else {
+            return Ok(0);
+        };
+        let mut page = [0u8; SH_PAGE_SIZE];
+        self.page_ios.fetch_add(1, Ordering::Relaxed);
+        body.read_at(last_page, &mut page)?;
+        let n = crate::scripthash_pages::sh_page_extent_creates(&page);
+        if n > 0 {
+            return Ok(n);
+        }
+        let fks = self.collect_entries_from(body, &val)?;
+        Ok(u32::try_from(fks.len()).unwrap_or(u32::MAX))
+    }
+
     /// Live create_tx_fks for a scripthash (oldest → newest).
     pub fn create_fks(&self, scripthash: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         let Some((val, home)) = self.locate_head(scripthash)? else {
@@ -2057,6 +2083,7 @@ impl ScriptHashTable {
             let raw: Vec<u64> = live[start..end].iter().map(|fk| fk.0).collect();
             if pi + 1 == n_pages {
                 sh_page_pack_extent_last_fks(&mut page, &raw, base, n_pages as u32, 0)?;
+                crate::scripthash_pages::sh_page_set_extent_creates(&mut page, live.len() as u32);
             } else {
                 let next = off.saturating_add(SH_PAGE_SIZE as u64);
                 sh_page_pack_fks(&mut page, &raw, next)?;
@@ -2081,6 +2108,7 @@ impl ScriptHashTable {
         let mut last = last_page;
         let mut page = [0u8; SH_PAGE_SIZE];
         body.read_at(last, &mut page)?;
+        let mut creates = crate::scripthash_pages::sh_page_extent_creates(&page);
         let mut extent = sh_page_extent(&page)?;
         let chain_first = {
             let f = if sh_page_is_last(&page)? {
@@ -2094,6 +2122,10 @@ impl ScriptHashTable {
                 f
             }
         };
+        if creates == 0 && extent.is_some() {
+            let existing = self.collect_entries_from(body, &ShHeadValue::extent(last_page))?;
+            creates = u32::try_from(existing.len()).unwrap_or(u32::MAX);
+        }
         for fk in tail {
             if !sh_page_try_append(&mut page, *fk)? {
                 let new_off = self.alloc_page(body, alloc)?;
@@ -2103,6 +2135,10 @@ impl ScriptHashTable {
                     let glued = new_off == base.saturating_add(u64::from(n) * SH_PAGE_SIZE as u64);
                     let new_n = if glued { n.saturating_add(1) } else { n };
                     sh_page_pack_extent_last_fks(&mut page, &[fk.0], base, new_n, 0)?;
+                    if creates > 0 {
+                        creates = creates.saturating_add(1);
+                        crate::scripthash_pages::sh_page_set_extent_creates(&mut page, creates);
+                    }
                     extent = Some((base, new_n));
                 } else {
                     sh_page_init_empty(&mut page);
@@ -2110,7 +2146,12 @@ impl ScriptHashTable {
                     assert!(sh_page_try_append(&mut page, *fk)?);
                 }
                 last = new_off;
+            } else if creates > 0 {
+                creates = creates.saturating_add(1);
             }
+        }
+        if creates > 0 {
+            crate::scripthash_pages::sh_page_set_extent_creates(&mut page, creates);
         }
         body.write_at(last, &page)?;
         Ok(last)
@@ -3140,6 +3181,7 @@ impl<'a> ScriptHashBulkSession<'a> {
                     n_pages as u32,
                     0,
                 )?;
+                crate::scripthash_pages::sh_page_set_extent_creates(&mut page, fks.len() as u32);
             }
             debug_assert!(self.body_buf.is_empty());
             self.body().write_at(off, &page)?;

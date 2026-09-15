@@ -183,6 +183,10 @@ pub struct NodeConfig {
     /// Electrum tweaks: omit P2TR outs with `value <=` this (sats). `0` serves
     /// all. Default [`rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST`] (1000).
     pub sptweaks_dust: u64,
+    /// 0 = unlimited. Electrum + Esplora refuse SH joins above this create count.
+    pub max_sh_creates: u32,
+    /// Opt-in Esplora `GET /block-template` (GBT template JSON). Default off.
+    pub esplora_block_template: bool,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     pub milestone_height: u32,
     /// Set when conf or CLI applied `milestone` / `assumevalid_height` (including 0).
@@ -240,6 +244,8 @@ impl Default for NodeConfig {
             shindex: false,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
+            max_sh_creates: 0,
+            esplora_block_template: false,
             milestone_height: 0,
             milestone_explicit: false,
             inhibit_suspend: false,
@@ -608,6 +614,15 @@ impl NodeConfig {
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf sptweaks_dust: {e}")))?;
             }
+            "max_sh_creates" | "maxshcreates" => {
+                self.max_sh_creates = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf max_sh_creates: {e}")))?;
+            }
+            "esplora_block_template" | "esplorablocktemplate" => {
+                self.esplora_block_template = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
+            }
             "rpc_listen" | "rpclisten" => {
                 self.rpc.listen = Some(
                     val.parse()
@@ -927,6 +942,35 @@ mod tests {
             ConfApply::Unknown(k) => assert_eq!(k, "not-a-real-key"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn max_sh_creates_and_esplora_block_template_apply_kv() {
+        let mut c = NodeConfig::default();
+        assert_eq!(c.max_sh_creates, 0);
+        assert!(!c.esplora_block_template);
+        assert_eq!(
+            c.apply_kv("max_sh_creates", "100").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.max_sh_creates, 100);
+        assert_eq!(c.apply_kv("maxshcreates", "7").unwrap(), ConfApply::Applied);
+        assert_eq!(c.max_sh_creates, 7);
+        let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
+        assert!(
+            format!("{bad}").contains("max_sh_creates"),
+            "garbage must name the knob: {bad}"
+        );
+        assert_eq!(
+            c.apply_kv("esplora_block_template", "1").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(c.esplora_block_template);
+        assert_eq!(
+            c.apply_kv("esplorablocktemplate", "0").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(!c.esplora_block_template);
     }
 
     #[test]

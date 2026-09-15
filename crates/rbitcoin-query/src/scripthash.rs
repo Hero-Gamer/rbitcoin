@@ -38,6 +38,14 @@ pub struct ScriptHashHistoryItem {
     pub fee: Option<i64>,
 }
 
+/// Light history row (mempool.space `/txs/summary` shape without `time`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashTxSummary {
+    pub txid: [u8; 32],
+    pub value: i64,
+    pub height: i64,
+}
+
 /// Sort order for [`apply_history_filter`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum HistoryOrder {
@@ -206,6 +214,32 @@ fn history_items_from_joined(
         })
         .collect();
     apply_history_filter(&items, filter)
+}
+
+fn summaries_from_joined(
+    joined: &[ShJoinedOut],
+    filter: &HistoryFilter,
+) -> Vec<ScriptHashTxSummary> {
+    let items = history_items_from_joined(joined, filter);
+    let mut net: HashMap<Fk, i64> = HashMap::new();
+    for rec in joined {
+        net.entry(rec.out.create_tx_fk)
+            .and_modify(|v| *v = v.saturating_add(rec.out.value))
+            .or_insert(rec.out.value);
+        for sp in &rec.spender_fks {
+            net.entry(*sp)
+                .and_modify(|v| *v = v.saturating_sub(rec.out.value))
+                .or_insert(0i64.saturating_sub(rec.out.value));
+        }
+    }
+    items
+        .into_iter()
+        .map(|it| ScriptHashTxSummary {
+            txid: it.txid,
+            value: net.get(&it.tx_fk).copied().unwrap_or(0),
+            height: it.height,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -397,6 +431,13 @@ impl Query {
         to_height: Option<i64>,
         view: &ChainView,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        let cap = self.max_sh_creates();
+        if cap > 0 {
+            let n = self.scripthash_create_count(scripthash)?;
+            if n > cap {
+                return Err(StoreError::Rejected(Query::MAX_SH_CREATES_MSG));
+            }
+        }
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.create_fks(scripthash)?;
         let pages_us = t_pages.elapsed().as_micros();
@@ -828,6 +869,38 @@ impl Query {
         Ok(history_items_from_joined(recs, filter))
     }
 
+    pub fn scripthash_history_summary_filtered_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+        let joined = self.sh_join(scripthash, ShJoinNeed::HISTORY, filter.to_height, view)?;
+        Ok(summaries_from_joined(&joined, filter))
+    }
+
+    pub fn scripthash_history_summary_filtered_slot_in(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &mut Option<ShJoinSlot>,
+        view: &ChainView,
+    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+        let hit = slot
+            .as_ref()
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
+        if !hit && filter.to_height.is_some() {
+            return self.scripthash_history_summary_filtered_in(scripthash, filter, view);
+        }
+        self.ensure_sh_join_slot_in(scripthash, slot, view)?;
+        let recs = &mut slot
+            .as_mut()
+            .ok_or(StoreError::Corrupt("invariant: SH join slot missing"))?
+            .joined;
+        self.enrich_joined(recs, ShJoinNeed::HISTORY)?;
+        Ok(summaries_from_joined(recs, filter))
+    }
+
     /// Confirmed txs in `height` that create or spend a posting-list out for `scripthash`.
     ///
     /// Intersects the SH posting list with the block's tx fks and input
@@ -1117,6 +1190,13 @@ impl Query {
             }
         }
         Ok(out)
+    }
+
+    /// Durable SH create count plus pending write-behind for this key.
+    pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
+        let durable = self.store.scripthash.create_count(scripthash)?;
+        let pending = self.pending_sh_create_fks(scripthash).len() as u32;
+        Ok(durable.saturating_add(pending))
     }
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.

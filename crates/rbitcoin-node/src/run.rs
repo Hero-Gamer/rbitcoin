@@ -3,7 +3,7 @@ use crate::error::NodeError;
 use crate::regtest_rpc::HubRegtest;
 use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, ElectrumHandle, TipNotify};
-use rbitcoin_esplora::{run_esplora, EsploraConfig, EsploraHandle};
+use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandle};
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
     default_port, format_serve_perf, format_tip_perf_sizes, netgroup, read_proc_rss,
@@ -12,11 +12,13 @@ use rbitcoin_net::{
 };
 use rbitcoin_primitives::Network;
 use rbitcoin_query::{spawn_sh_writebehind, Query};
-use rbitcoin_rpc::{run_rpc, RpcConfig, RpcHandle, RpcRegtest};
+use rbitcoin_rpc::{
+    gbt_template, run_rpc, RpcActive, RpcConfig, RpcContext, RpcHandle, RpcRegtest,
+};
 use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
@@ -568,8 +570,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         sh_tip_ready,
         config.listen.esplora,
         config.network,
+        config.esplora_block_template,
         &shutdown,
-        &node.hub,
+        Arc::clone(&node.hub),
         &mempool,
     )
     .await;
@@ -1047,6 +1050,7 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
+    query.set_max_sh_creates(config.max_sh_creates);
     if let Err(e) =
         query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
     {
@@ -1274,8 +1278,9 @@ async fn start_esplora_if_ready(
     sh_tip_ready: bool,
     addr: Option<SocketAddr>,
     network: Network,
+    enable_block_template: bool,
     shutdown: &Shutdown,
-    hub: &ChainHub,
+    hub: Arc<ChainHub>,
     mempool: &std::sync::Arc<MempoolHub>,
 ) -> (Vec<EsploraHandle>, Option<tokio::task::JoinHandle<()>>) {
     let Some(addr) = addr else {
@@ -1299,7 +1304,38 @@ async fn start_esplora_if_ready(
         Arc::clone(&shutdown.flag),
         Some,
     );
-    let ecfg = EsploraConfig::with_network(addr, btc_net);
+    let mut ecfg = EsploraConfig::with_network(addr, btc_net);
+    if enable_block_template {
+        let q = Arc::clone(&hub.query);
+        let mp = Arc::clone(mempool);
+        let chain = Arc::clone(&hub);
+        ecfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+            let ctx = RpcContext {
+                query: Arc::clone(&q),
+                mempool: Some(Arc::clone(&mp)),
+                network,
+                start: Instant::now(),
+                stop: Arc::new(AtomicBool::new(false)),
+                connections: Arc::new(AtomicU64::new(0)),
+                initial_block_download: Arc::new(AtomicBool::new(false)),
+                subversion: String::new(),
+                regtest: None,
+                peers: None,
+                chain: Some(Arc::clone(&chain)),
+                addrman: None,
+                logpath: String::new(),
+                active: Arc::new(std::sync::Mutex::new(RpcActive::default())),
+                alert_notify: None,
+                alert_fired: Arc::new(AtomicBool::new(false)),
+            };
+            gbt_template(&ctx).map_err(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("block-template")
+                    .to_string()
+            })
+        })));
+    }
     let max_conn = ecfg.limits.max_connections;
     let max_body = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
@@ -1881,6 +1917,8 @@ mod tests {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());

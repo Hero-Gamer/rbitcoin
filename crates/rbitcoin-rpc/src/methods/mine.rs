@@ -612,7 +612,7 @@ pub(crate) fn gbt_longpoll_id(ctx: &RpcContext) -> String {
     format!("{tip}{updates}")
 }
 
-pub(crate) fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
+pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     let tip_h = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     let next_h = tip_h.saturating_add(1);
     let (prev_hex, tip_time, tip_bits) = if let Some(h) = ctx.query.tip_height() {

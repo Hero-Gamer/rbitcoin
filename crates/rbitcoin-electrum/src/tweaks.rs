@@ -686,6 +686,8 @@ mod tests {
                 nonce: h,
                 merkle_root: merkle,
                 hash,
+                size: 0,
+                weight: 0,
             };
             let mut txid = [0u8; 32];
             txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -790,6 +792,8 @@ mod tests {
                 nonce: h,
                 merkle_root: merkle,
                 hash,
+                size: 0,
+                weight: 0,
             };
             let mut txid = [0u8; 32];
             txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -878,6 +882,8 @@ mod tests {
             nonce: 0,
             merkle_root: merkle0,
             hash: merkle0,
+            size: 0,
+            weight: 0,
         };
         let fk0 = q
             .connect_block(
@@ -912,6 +918,8 @@ mod tests {
             nonce: 1,
             merkle_root: [0x11; 32],
             hash: hash1,
+            size: 0,
+            weight: 0,
         };
         let fk1 = q
             .connect_block(
@@ -959,6 +967,8 @@ mod tests {
             nonce: 2,
             merkle_root: [0x22; 32],
             hash: hash2,
+            size: 0,
+            weight: 0,
         };
         q.connect_block(
             Height(2),

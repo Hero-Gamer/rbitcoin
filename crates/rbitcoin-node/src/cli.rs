@@ -41,7 +41,7 @@ where
                     "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
-    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
+    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
     [--milestone|--assumevalid-height HEIGHT] \\\n\
     [--maxoutbound|--max-outbound N] [--maxinbound N] [--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
@@ -62,6 +62,8 @@ Milestone / assumevalid-height: skip script/sig checks at/below HEIGHT.\n\
 Mempool: --mempool-size-mb / --maxmempool (default ~300 MiB weight budget).\n\
 Peers: --maxoutbound (default 16 live download), --maxinbound (default 125), --maxconnections Core total (inbound = N-11).\n\
 Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+  --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
+  --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
 Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sptweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
@@ -311,6 +313,8 @@ fn is_bool_key(key: &str) -> bool {
         key,
         "shindex"
             | "sptweaks"
+            | "esplora_block_template"
+            | "esplorablocktemplate"
             | "blocksonly"
             | "blocks_only"
             | "prefillcompact"
@@ -459,6 +463,23 @@ mod tests {
         assert!(on.prefill_compact);
         let on_eq = ready_config(["rbitcoin-node", "--prefillcompact=1"]);
         assert!(on_eq.prefill_compact);
+    }
+
+    #[test]
+    fn max_sh_creates_and_esplora_block_template_cli_hyphens() {
+        let omitted = ready_config(["rbitcoin-node"]);
+        assert_eq!(omitted.max_sh_creates, 0);
+        assert!(!omitted.esplora_block_template);
+        let n = ready_config(["rbitcoin-node", "--max-sh-creates", "42"]);
+        assert_eq!(n.max_sh_creates, 42);
+        let eq = ready_config(["rbitcoin-node", "--max-sh-creates=9"]);
+        assert_eq!(eq.max_sh_creates, 9);
+        let gbt = ready_config(["rbitcoin-node", "--esplora-block-template"]);
+        assert!(gbt.esplora_block_template);
+        let gbt_eq = ready_config(["rbitcoin-node", "--esplora-block-template=1"]);
+        assert!(gbt_eq.esplora_block_template);
+        let off = ready_config(["rbitcoin-node", "--esplora-block-template=0"]);
+        assert!(!off.esplora_block_template);
     }
 
     #[test]

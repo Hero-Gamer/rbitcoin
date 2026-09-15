@@ -330,6 +330,9 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
+        if meta_ver <= 23 {
+            HeaderTable::rewrite_v23_body(&path)?;
+        }
         unlink_leftover_spent_off(&path)?;
         if class_a_has_creates(&path) && txout_meta_lacks_layout17(&path) {
             return Err(StoreError::Corrupt(
@@ -1721,6 +1724,65 @@ mod tests {
     }
 
     #[test]
+    fn occupied_schema23_header_body_opens_as_24() {
+        use crate::file::{TableFile, FILE_HEADER_LEN};
+        use crate::header_table::{HeaderRecord, HEADER_RECORD_LEN_V23};
+        let dir = tmp();
+        let hash = [0x44u8; 32];
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            let hdr = HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 1,
+                bits: 0x1d00ffff,
+                nonce: 1,
+                merkle_root: [1u8; 32],
+                hash,
+                size: 0,
+                weight: 0,
+            };
+            s.put_header(&hdr).unwrap();
+            s.flush().unwrap();
+        }
+        {
+            let body_path = dir.join("header.body");
+            let src = TableFile::open(&body_path, rbitcoin_primitives::TableKind::Header).unwrap();
+            let rec = HeaderRecord::decode(&{
+                let mut b = [0u8; crate::header_table::HEADER_RECORD_LEN];
+                src.read_at(FILE_HEADER_LEN as u64, &mut b).unwrap();
+                b
+            })
+            .unwrap();
+            drop(src);
+            let dst = TableFile::create(
+                dir.join("header.body.v23tmp"),
+                rbitcoin_primitives::TableKind::Header,
+            )
+            .unwrap();
+            dst.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23())
+                .unwrap();
+            dst.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64)
+                .unwrap();
+            dst.flush().unwrap();
+            drop(dst);
+            std::fs::rename(dir.join("header.body.v23tmp"), dir.join("header.body")).unwrap();
+            let mut meta = STORE_MAGIC.to_vec();
+            meta.extend_from_slice(&23u16.to_le_bytes());
+            std::fs::write(dir.join("meta"), meta).unwrap();
+        }
+        let s = Store::open_tiny(&dir).unwrap();
+        let got = s.headers.get_by_hash(&hash).unwrap().unwrap().1;
+        assert_eq!(got.hash, hash);
+        assert_eq!(got.size, 0);
+        assert_eq!(got.weight, 0);
+        drop(s);
+        let meta = std::fs::read(dir.join("meta")).unwrap();
+        assert_eq!(u16::from_le_bytes([meta[4], meta[5]]), SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn open_refuses_shared_file_scripthash_body() {
         let dir = tmp();
         {
@@ -1873,6 +1935,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = s.put_header(&hdr).unwrap();
         // Two txs: coinbase + one non-cb (contiguous Class A ids).
@@ -1962,6 +2026,8 @@ mod tests {
             nonce: 1,
             merkle_root: [3u8; 32],
             hash: [4u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = s.put_header(&hdr).unwrap();
         assert_eq!(s.get_header(hfk).unwrap().hash, [4u8; 32]);
@@ -2224,7 +2290,7 @@ mod tests {
             "schema 22 open must keep create.loc"
         );
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 23);
+        assert_eq!(SCHEMA_VERSION, 24);
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
@@ -2369,7 +2435,7 @@ mod tests {
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 23);
+        assert_eq!(SCHEMA_VERSION, 24);
         assert!(
             !dir.join("spent.off").exists(),
             "empty 21 open must unlink leftover spent.off"

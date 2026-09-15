@@ -1,22 +1,25 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 23` (`rbitcoin_primitives`).  
-**Status:** 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out` u32) so a
-consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22 Class A
-rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `inwit.loc` (no Class A
-`{txout,spent,inwit}.idx`), LAYOUT17 without `output_count`, and spent slots flags
-+ u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bits 4–7 =
-decimal exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`). Encoding is
-canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa divisible
-by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
+**Version:** `SCHEMA_VERSION = 24` (`rbitcoin_primitives`).  
+**Status:** 24 is `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied
+23 rewrites 88 B rows via `header.body.grow` then rename (size/weight 0 until
+confirm stamps or lazy fill). SH extent last-page reserved (offset 20) is create
+count (`0` = unknown; readers walk, appender stamps on pack/append). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
+u32) so a consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22
+Class A rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `inwit.loc` (no
+Class A `{txout,spent,inwit}.idx`), LAYOUT17 without `output_count`, and spent
+slots flags + u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bits
+4–7 = decimal exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`). Encoding
+is canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa
+divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
 15–21 LAYOUT17 Class A with creates is **refused**
-(wipe datadir and redo IBD). Empty 15–22 rewrite `meta` to 23 and unlink leftover
-`spent.off` and leftover `*.idx`. A 22 binary refuses 23 `meta`. Occupied schema
+(wipe datadir and redo IBD). Empty 15–23 rewrite `meta` to 24 and unlink leftover
+`spent.off` and leftover `*.idx`. A 23 binary refuses 24 `meta`. Occupied schema
 18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
-dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 23; `tx.head` rebuilds
+dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 24; `tx.head` rebuilds
 from Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
 `meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
-Class A is **refused**. Empty 17 indexes rewrite `meta` to 23.
+Class A is **refused**. Empty 17 indexes rewrite `meta` to 24.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -74,6 +77,7 @@ Empty 21 rewrites `store/meta` to 23 and unlinks leftover `spent.off`.
 Table file headers 13–22 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 23.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
+**23→24 open:** rewrite `header.body` 88 B rows to 96 B (`size:u32` + `weight:u32` = 0) via `header.body.grow` then rename; rewrite `meta` to 24. Class A tx stems kept. Empty 23 rewrites `meta`. A 23 binary refuses 24 `meta`. Crash with leftover `.grow` discards it and retries; 96-byte body with meta 23 only rewrites `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -287,7 +291,10 @@ Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`)
 
 ## Class A — headers
 
-### `header.body` record (fixed 88 bytes)
+### `header.body` record (fixed 96 bytes)
+
+Consensus fields are the first 88 bytes (schema 23). Trailing size/weight are 0
+until confirm stamps them (headers are `ensure`d before the block body exists).
 
 | Field | Type |
 |-------|------|
@@ -298,6 +305,8 @@ Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`)
 | nonce | u32 |
 | merkle_root | [u8; 32] |
 | hash | [u8; 32] |
+| size | u32 |
+| weight | u32 |
 
 ### `header.head`
 

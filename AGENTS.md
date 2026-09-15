@@ -116,11 +116,12 @@ Suite, budgets, coverage: [`TESTING.md`](TESTING.md).
 |------|-----|
 | **Each plan step / single-shot** | Targeted `cargo test -p <crate> …` (or slim scenario). `cargo fmt --all` if dirty. |
 | **Compile inner loop** | `cargo check -p <crate> --lib` (or that same `--lib` test filter). **Not** `cargo check --tests` / multi-crate `--tests` after every edit. `--tests` once per green slice. |
-| **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, workspace clippy, `nix build .#rbitcoin-musl` |
+| **Before push** | `cargo clippy --workspace --all-targets -- -D warnings` (same as CI `clippy`). Do not open a PR whose first clippy run is GitHub Actions. |
+| **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, `nix build .#rbitcoin-musl` |
 | **Exception** | User asked for a local full suite, or you cannot push and must prove gates offline |
 
-Do **not** wait out a host IBD or a 90% coverage run in the agent VM. GitHub
-Actions is the workspace/coverage/clippy gate.
+Do **not** wait out a host IBD or a 90% coverage run in the agent VM. Coverage
+stays a GitHub Actions gate. Clippy does not.
 
 Do **not** delete a large type/module and chase `dead_code` / unresolved
 across crates. Wrap the old API around the new one, switch one caller, delete
@@ -215,14 +216,12 @@ Green-then-refactor is fine as **two** commits when each stands alone.
 
 1. Pass targeted tests for what you touched.
 2. Commit. A plan is **many commits, one PR**.
-3. Push the worktree branch and open or update the plan PR. Poll to green.
-4. **Musl install only after merge onto `master`/`main`**, tree clean, and the
-   node/cli binary changed. Commands: [`docs/reproducible-builds.md`](docs/reproducible-builds.md)
-   / [`OPERATOR.md`](OPERATOR.md). Do **not** `nix build .#rbitcoin-musl` on a
-   feature branch or with uncommitted edits. Do **not** run
-   `./scripts/repro-check.sh` as the day-to-day install (release / digest gate
-   only). Do **not** ship `nix-shell` / host `cargo build --release` as the
-   operator binary (Nix/host glibc; dies off-store).
+3. `cargo clippy --workspace --all-targets -- -D warnings`, then push the
+   worktree branch and open or update the plan PR. Poll to green.
+
+Operator musl/release binaries are [`docs/releases.md`](docs/releases.md) /
+[`docs/reproducible-builds.md`](docs/reproducible-builds.md) — not a plan-PR
+step. Do **not** `nix build .#rbitcoin-musl` on a feature branch.
 
 ## Test-driven development
 

@@ -524,7 +524,7 @@ fn poison_confirmed_merkle_root(store: &std::path::Path, fk: Fk, rec: &HeaderRec
     let enc = rec.encode();
     let path = store.join("header.body");
     let mut bytes = std::fs::read(&path).unwrap();
-    let off = 16 + ((fk.0 - 1) as usize) * 88;
+    let off = 16 + ((fk.0 - 1) as usize) * enc.len();
     bytes[off..off + enc.len()].copy_from_slice(&enc);
     std::fs::write(&path, bytes).unwrap();
 }
@@ -550,6 +550,8 @@ fn pin_disconnect_to_genesis_reconnect_and_tip_shrink(
                 nonce: 0,
                 merkle_root: [0; 32],
                 hash: [1; 32],
+                size: 0,
+                weight: 0,
             },
             &[]
         )
@@ -616,6 +618,8 @@ fn chain_connect_reorg_and_growth() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let ta = TxApply {
             tx: TxRecord {

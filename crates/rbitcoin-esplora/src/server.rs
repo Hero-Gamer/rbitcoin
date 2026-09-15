@@ -19,7 +19,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -259,6 +259,23 @@ pub const DEFAULT_MAX_TRACK_ADDRESSES: usize = 64;
 /// Default max tracked txids per WS connection (pending set).
 pub const DEFAULT_MAX_TRACK_TXS: usize = 64;
 
+/// Opt-in `GET /block-template` builder (node injects GBT; tests inject a stub).
+#[derive(Clone)]
+pub struct BlockTemplateFn(pub Arc<dyn Fn() -> Result<Value, String> + Send + Sync>);
+
+impl std::fmt::Debug for BlockTemplateFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlockTemplateFn")
+    }
+}
+
+pub(crate) struct GbtCache {
+    pub(crate) at: Instant,
+    pub(crate) tip: [u8; 32],
+    pub(crate) updates: u64,
+    pub(crate) body: Value,
+}
+
 /// Esplora HTTP server config (listen + shared DoS floor + WS caps).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
@@ -275,6 +292,8 @@ pub struct EsploraConfig {
     pub max_track_addresses: usize,
     /// Max tracked txids per WS connection.
     pub max_track_txs: usize,
+    /// `None` → `GET /block-template` is 404 (default).
+    pub block_template: Option<BlockTemplateFn>,
 }
 
 impl EsploraConfig {
@@ -291,6 +310,7 @@ impl EsploraConfig {
             max_ws_message_bytes: DEFAULT_MAX_WS_MESSAGE_BYTES,
             max_track_addresses: DEFAULT_MAX_TRACK_ADDRESSES,
             max_track_txs: DEFAULT_MAX_TRACK_TXS,
+            block_template: None,
         }
     }
 }
@@ -324,6 +344,8 @@ pub(crate) struct AppState {
     /// Last scripthash join (tip-fenced). HTTP is not session-oriented; one
     /// slot still covers Casa `/scripthash` → `/txs` → `/utxo` and chain pages.
     pub(crate) sh_join: Arc<Mutex<Option<ShJoinSlot>>>,
+    pub(crate) block_template: Option<BlockTemplateFn>,
+    pub(crate) gbt_cache: Arc<Mutex<Option<GbtCache>>>,
 }
 
 impl AppState {
@@ -378,10 +400,13 @@ pub async fn run_esplora(
         max_track_addresses: config.max_track_addresses.max(1),
         max_track_txs: config.max_track_txs.max(1),
         sh_join: Arc::new(Mutex::new(None)),
+        block_template: config.block_template,
+        gbt_cache: Arc::new(Mutex::new(None)),
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).
     let rest = Router::new()
+        .route("/block-template", get(handlers::block_template))
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
         .route("/blocks", get(handlers::blocks_tip))
@@ -412,6 +437,14 @@ pub async fn run_esplora(
         .route("/address/{addr}/utxo", get(handlers::address_utxo))
         .route("/address/{addr}/txs", get(handlers::address_txs))
         .route(
+            "/address/{addr}/txs/summary",
+            get(handlers::address_txs_summary),
+        )
+        .route(
+            "/address/{addr}/txs/summary/{last}",
+            get(handlers::address_txs_summary_cursor),
+        )
+        .route(
             "/address/{addr}/txs/mempool",
             get(handlers::address_txs_mempool),
         )
@@ -426,6 +459,14 @@ pub async fn run_esplora(
         .route("/scripthash/{hash}", get(handlers::scripthash_info))
         .route("/scripthash/{hash}/utxo", get(handlers::scripthash_utxo))
         .route("/scripthash/{hash}/txs", get(handlers::scripthash_txs))
+        .route(
+            "/scripthash/{hash}/txs/summary",
+            get(handlers::scripthash_txs_summary),
+        )
+        .route(
+            "/scripthash/{hash}/txs/summary/{last}",
+            get(handlers::scripthash_txs_summary_cursor),
+        )
         .route(
             "/scripthash/{hash}/txs/mempool",
             get(handlers::scripthash_txs_mempool),
@@ -645,6 +686,7 @@ pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
     match e {
         StoreError::NotFound => not_found(),
         StoreError::Stale(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
+        StoreError::Rejected(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),
     }
 }
@@ -709,6 +751,8 @@ mod tests {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -838,6 +882,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_template_default_404() {
+        let (dir, q) = temp_query("gbt-404");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 404, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn block_template_enabled_no_tip_is_503() {
+        let (dir, q) = temp_query("gbt-notip");
+        let q = Arc::new(q);
+        let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Ok(json!({"height": 1})))));
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 503, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn max_sh_creates_is_esplora_503() {
+        let (dir, q) = temp_query("esplora-sh-cap");
+        let mut prev = Fk::NULL;
+        let mut parent = None;
+        for h in 0..3u32 {
+            let (header, ta) = coinbase(h, prev, parent);
+            parent = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        q.set_max_sh_creates(2);
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let sh = block_hash_hex(&rbitcoin_store::script_hash(&[0x51]));
+        let (st, body) = http_get(handle.local_addr, &format!("/scripthash/{sh}")).await;
+        assert_eq!(st, 503, "{body}");
+        assert!(
+            body.contains("scripthash join exceeds --max-sh-creates"),
+            "{body}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn block_template_enabled_cache_and_503() {
+        let (dir, q) = temp_query("gbt-on");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        let prev = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let q = Arc::new(q);
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&calls);
+        let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"height": 1, "rules": ["segwit"]}))
+        })));
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let (st, raw, body) = http_get_raw(addr, "/block-template").await;
+        assert_eq!(st, 200, "{body}");
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "{raw}"
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["height"], 1);
+        let (st, _) = http_get(addr, "/block-template").await;
+        assert_eq!(st, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "15s cache");
+        let (h1, t1) = coinbase(1, prev, Some(h0.hash));
+        q.connect_block(Height(1), &h1, &[t1]).unwrap();
+        let (st, _) = http_get(addr, "/block-template").await;
+        assert_eq!(st, 200);
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "tip change invalidates");
+        handle.shutdown().await;
+
+        let calls2 = Arc::new(AtomicU64::new(0));
+        let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Err("no hub".into()))));
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 503, "{body}");
+        assert!(body.contains("no hub"), "{body}");
+        let _ = calls2;
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn chain_view_tip_header_matches_hash_body() {
         let (dir, q) = temp_query("chain-view-hdr");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -943,6 +1086,8 @@ mod tests {
             max_track_addresses: 1,
             max_track_txs: 1,
             sh_join: Arc::new(Mutex::new(None)),
+            block_template: None,
+            gbt_cache: Arc::new(Mutex::new(None)),
         };
         async fn die_tip(State(st): State<AppState>) -> &'static str {
             st.query.disconnect_tip().unwrap();
@@ -1283,6 +1428,15 @@ mod tests {
         assert!(info["chain_stats"]["tx_count"].as_u64().unwrap() >= 4);
         assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 4);
 
+        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/summary")).await;
+        assert_eq!(st, 200, "{body}");
+        let sum: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert!(!sum.is_empty());
+        assert!(sum[0].get("txid").is_some());
+        assert!(sum[0].get("value").is_some());
+        assert!(sum[0].get("height").is_some());
+        assert!(sum[0].get("time").is_some());
+
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
         assert_eq!(st, 200, "{body}");
         let utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
@@ -1385,9 +1539,10 @@ mod tests {
         assert!(bj.get("difficulty").is_some());
         assert!(bj.get("mediantime").is_some());
         assert_eq!(bj["previousblockhash"], block_hash_hex(&hashes[0]));
-        assert!(
-            q.sample_reset_reconstruct_archived() >= 1,
-            "/block JSON reconstructs for consensus size/weight"
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "/block JSON uses stamped size/weight"
         );
         assert!(bj["bits"].is_u64(), "Esplora bits is u32: {}", bj["bits"]);
         assert_eq!(bj["bits"], 0x207fffff);
@@ -1442,9 +1597,13 @@ mod tests {
         let list1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(list1[0]["height"], 1);
         assert_eq!(list1.len(), 2);
-        assert!(
-            q.sample_reset_reconstruct_archived() >= 1,
-            "/blocks summaries use consensus size/weight"
+        let _ = q.sample_reset_reconstruct_archived();
+        let (st, _) = http_get(addr, "/blocks").await;
+        assert_eq!(st, 200);
+        assert_eq!(
+            q.sample_reset_reconstruct_archived(),
+            0,
+            "/blocks summaries use stamped size/weight"
         );
 
         let txid0 = block_hash_hex(&coinbase_txids[0]);
