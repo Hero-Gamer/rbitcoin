@@ -292,6 +292,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Does **not** pin same-process RAM BQ residue (`rehydrate_block_queue_into_confirm` in `ibd/archive.rs`) |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
+| `reorg_same_height_then_multi_block_branch` | P2P/chain (default) | Same-height rival then multi-block reorg to height 6; `getchaintips` `active` vs `valid-fork`; equal-work siblings park as `valid-headers`; `precious_block` the loser; less work ignored; unknown hash `Block not found`. Held cap 320 FIFO stays `hold_body_caps_at_320_fifo` |
 | `three_node_relay_path` | P2P (**default**) | Leaf IBD-syncs from a mid node that already synced (hop serve) |
 | `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |
 | `tip_follow_after_ibd` | P2P (**default**) | After IBD, follow + one new tip via inv/headers |
