@@ -342,69 +342,75 @@ sections below and [`COMPAT.md`](./COMPAT.md).
 
 ## CLI (operator-first)
 
-Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
+Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` is kebab-only
+(no Core aliases). Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
+`-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
+([`docs/core-functional.md`](docs/core-functional.md)).
+
+Clean smoke:
 
 ```bash
 ./target/release/rbitcoin-node --smoke --datadir /tmp/rb-smoke --network regtest
 ```
 
-| Flag | Core-ish alias | Default |
-|------|----------------|---------|
-| `--datadir PATH` | same | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
-| `--datadir-cold PATH` | conf `datadir-cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
-| `--network NET` | `--chain` | `mainnet` |
-| `--signetchallenge HEX` | `--signet-challenge` | default global Signet challenge |
-| `--signetblocktime SECONDS` | `--signet-block-time` | 600; requires a custom challenge |
-| `--listen ADDR` | | bind later default port |
-| `--connect ADDR` | (repeatable) | seeds |
-| `--milestone HEIGHT` | `--assumevalid-height` | network default (mainnet 840000) |
-| `--max-outbound N` | `--maxoutbound` | 16 live download peers |
-| `--maxinbound N` | | 125 inbound sessions |
-| `--maxconnections N` | | Core total slots; inbound = `N − 11` (10 outbound + feeler) |
-| `--mempool-size-mb N` | `--maxmempool` | ~300 MiB weight |
+| Flag | Conf | Default |
+|------|------|---------|
+| `--datadir PATH` | `datadir=` | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
+| `--datadir-cold PATH` | `datadir-cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
+| `--network NET` | `network=` | `mainnet` |
+| `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
+| `--signet-block-time SECONDS` | `signet_block_time=` | 600; requires a custom challenge |
+| `--listen ADDR` | `listen=` | bind later default port |
+| `--connect ADDR` | `connect=` (repeatable) | seeds |
+| `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
+| `--max-outbound N` | `max_outbound=` | 16 live download peers |
+| `--max-inbound N` | `max_inbound=` | 125 inbound sessions |
+| `--mempool-size-mb N` | `mempool_size_mb=` | ~300 MiB weight |
 | `--conf FILE` | | none |
-| `--log-level LEVEL` | | `info` |
-| `--api-log PATH` | conf `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
-| `--asmap PATH` | conf `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
-| `--no-seeds` | `--noseeds` | seeds on |
-| `--shindex` | conf `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
-| `--max-sh-creates N` | conf `max_sh_creates` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
-| `--sptweaks` | conf `sptweaks=1` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
-| `--sptweaks-dust SATS` | conf `sptweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
-| `--electrum-listen ADDR` | | disabled (**requires** `--shindex`) |
-| `--esplora-listen ADDR` | | disabled (Esplora REST; **requires** `--shindex`) |
-| `--esplora-block-template` | conf `esplora_block_template=1` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
-| `--rpc-listen ADDR` | conf `rpc_listen` | disabled — Core-class JSON-RPC subset |
-| `--rpcuser` / `--rpcpassword` | conf `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
-| `--rpcworkqueue N` | conf `rpcworkqueue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
-| `--minrelaytxfee BTC` | same | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
-| `--mempoolexpiry HOURS` | same | unset — hub default; min 1 |
-| `--blocksonly` | same | off |
-| `--prefillcompact[=0\|1]` | conf `prefillcompact=` | **on** — extra BIP152 compact prefills (10 KiB cap); `=0` disables |
-| `--persistmempool[=0\|1]` | same | on |
-| `--whitelist SPEC` | same | empty |
-| `--limitclustercount N` | same | unset — hub default |
-| `--limitclustersize KVB` | same | unset — hub default |
-| `--peertimeout SECS` | same | unset — net default; `0` is InitError |
-| `--externalip IP` | same | empty — `getnetworkinfo.localaddresses` |
-| `--seednode HOST` | same | extra seeds (repeatable) |
-| `--mocktime UNIX` | same | unset — wall clock; `0` allowed |
-| `--maxtipage SECS` | same | unset — hub IBD-age |
-| `--blockversion N` | same | unset — generate/template version overlay |
-| `--blockmintxfee BTC` | same | unset — template min tx fee; garbage/negatives fail start |
-| `--alertnotify CMD` | same | unset — `%s` = warning; fires once |
-| `--startupnotify CMD` | same | unset |
-| `--testactivationheight name@H` | same | empty — buried deployment overlay |
-| `--minimumchainwork HEX` | same | unset |
-| `--uacomment STR` | same | empty — BIP14 subversion |
-| `--max-run-secs N` | conf `max_run_secs=` | unset — process exit after N seconds |
+| `--log-level LEVEL` | `log_level=` | `info` |
+| `--api-log PATH` | `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
+| `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
+| `--no-seeds` | `no_seeds=` | seeds on |
+| `--shindex` | `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--max-sh-creates N` | `max_sh_creates` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
+| `--sptweaks` | `sptweaks=1` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
+| `--sptweaks-dust SATS` | `sptweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
+| `--electrum-listen ADDR` | `electrum_listen=` | disabled (**requires** `--shindex`) |
+| `--esplora-listen ADDR` | `esplora_listen=` | disabled (Esplora REST; **requires** `--shindex`) |
+| `--esplora-block-template` | `esplora_block_template=1` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
+| `--rpc-listen ADDR` | `rpc_listen` | disabled — Core-class JSON-RPC subset |
+| `--rpcuser` / `--rpcpassword` | `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
+| `--rpcworkqueue N` | `rpcworkqueue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
+| `--minrelaytxfee BTC` | `minrelaytxfee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
+| `--mempoolexpiry HOURS` | `mempoolexpiry=` | unset — hub default; min 1 |
+| `--blocks-only` | `blocks_only=` | off |
+| `--prefillcompact[=0\|1]` | `prefillcompact=` | **on** — extra BIP152 compact prefills (10 KiB cap); `=0` disables |
+| `--persist-mempool[=0\|1]` | `persist_mempool=` | on |
+| `--trusted` | `trusted=` | off — inbound is not evicted/banned |
+| `--always-relay` | `always_relay=` | off — always announce inbound txs |
+| `--relay` | `relay=` | off — permit tx relay to inbound while `--blocks-only` |
+| `--limitclustercount N` | `limitclustercount=` | unset — hub default |
+| `--limitclustersize KVB` | `limitclustersize=` | unset — hub default |
+| `--peer-timeout SECS` | `peer_timeout=` | unset — net default; `0` is InitError |
+| `--externalip IP` | `externalip=` | empty — `getnetworkinfo.localaddresses` |
+| `--seednode HOST` | `seednode=` | extra seeds (repeatable) |
+| `--mocktime UNIX` | `mocktime=` | unset — wall clock; `0` allowed |
+| `--max-tip-age SECS` | `max_tip_age=` | unset — hub relay-inhibited age (default 24h) |
+| `--blockversion N` | `blockversion=` | unset — generate/template version overlay |
+| `--blockmintxfee BTC` | `blockmintxfee=` | unset — template min tx fee; garbage/negatives fail start |
+| `--alertnotify CMD` | `alertnotify=` | unset — `%s` = warning; fires once |
+| `--startupnotify CMD` | `startupnotify=` | unset |
+| `--testactivationheight name@H` | `testactivationheight=` | empty — buried deployment overlay |
+| `--min-chain-work HEX` | `min_chain_work=` | unset — densify/relay work floor |
+| `--ua-comment STR` | `ua_comment=` | empty — BIP14 subversion |
+| `--max-run-secs N` | `max_run_secs=` | unset — process exit after N seconds |
 | `--inhibit-suspend` | | off |
 
 Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
 
 ```
 network=signet
-maxinbound=64
+max_inbound=64
 mempool_size_mb=100
 ```
 
@@ -450,14 +456,16 @@ Default: **info**. CLI wins over env.
 
 ### Tip-follow (every block)
 
-After IBD, each accepted tip extension logs one **info** line (Core-like):
+After IBD, each accepted tip extension logs one **info** line:
 
 ```
-UpdateTip: new best=<hash> height=<n> version=<v> tx=<n> date=<unix> progress=tip
+tip: best=<hash> height=<n> version=<v> tx=<n> date=<unix>
 ```
 
 Emitted from the tip-follow / wire accept path (`ChainHub::connect_at`). IBD bulk
 confirm does **not** spam this line per block — use the periodic IBD status below.
+Core functional tests still grep `UpdateTip: …` via the debug.log map
+([`docs/core-functional.md`](docs/core-functional.md)).
 
 ### Tip-follow status lines (after catch-up + tip SH ready)
 
@@ -465,10 +473,17 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 |------|-------|-----|
 | `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= ntx= avg_us= max_us=` |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
-| `UpdateTip` | INFO | New best hash/height after connect |
+| `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
-| `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `UpdateTip` at info) |
-| `received getdata for: wtx` | TRACE | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
+| `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `tip: best=` at info) |
+| `p2p: getdata wtx` | TRACE | One line per peer `MSG_WTX` getdata (counts are on `tip: perf`) |
+| `p2p: received tx` | TRACE | One inbound tx |
+| `p2p: headers sync` | INFO | Headers path that meets min-work (or a noban peer) |
+| `p2p: ignore low-work headers` | INFO | Headers announcement below `--min-chain-work` |
+| `p2p: header … missing pow proof` | INFO | Unrequested header without anti-DoS POW |
+| `p2p: accept dropped … (prev not found)` | INFO | Unrequested block whose parent is unknown |
+| `p2p: initial getheaders` | INFO | First getheaders after connect |
+| `p2p: headers sync timeout` | INFO | Headers-sync peer stalled (`disconnect` or `keep`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
 Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` / `ibd: sizes` / `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
@@ -541,8 +556,8 @@ Token meanings and ring depth: [`docs/io-modality.md`](docs/io-modality.md).
 | IBD concurrent getdata | **1024** | code `IbdConfig::window` |
 | Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
 | Live IBD peers | **16** | `--max-outbound` |
-| Inbound P2P sessions | **125** | `--maxinbound`, or `--maxconnections` (Core total → inbound `N−11`). At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
-| Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` / `--assumevalid-height` (`0` = full scripts) |
+| Inbound P2P sessions | **125** | `--max-inbound`. At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
+| Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](docs/io-modality.md) |
 | Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` |
@@ -1113,15 +1128,15 @@ mkdir -p ./datadir-custom-signet
 ./target/release/rbitcoin-node \
   --datadir ./datadir-custom-signet \
   --network signet \
-  --signetchallenge 51 \
-  --signetblocktime 60 \
+  --signet-challenge 51 \
+  --signet-block-time 60 \
   --connect 192.0.2.1:38333 \
   --listen 0.0.0.0:38333 \
   --milestone 0 \
   --log-level info
 ```
 
-The equivalent conf-file keys are `signetchallenge` and `signetblocktime`.
+The equivalent conf-file keys are `signet_challenge` and `signet_block_time`.
 Replace the illustrative `OP_TRUE` challenge and documentation-only peer with
 the parameters supplied by the custom Signet operator.
 
@@ -1164,7 +1179,7 @@ non-empty `header.body` is refused (wipe those files and reindex).
 
 ## Slow / constrained uplink (IBD)
 
-`--max-outbound` / `maxoutbound` is the IBD download peer count (default **16**).
+`--max-outbound` / `max_outbound` is the IBD download peer count (default **16**).
 IBD `target_peers` is that value clamped to **8..=32**, so `--max-outbound 4`
 still dials 8 catch-up peers. Concurrent block getdata is about `N × 16`
 (`IbdConfig::per_peer` is code-only 16, Core-like; there is no

@@ -10,17 +10,6 @@ use std::path::{Path, PathBuf};
 /// Default max concurrent inbound P2P sessions (same as net `DEFAULT_MAX_INBOUND`).
 pub const DEFAULT_MAX_INBOUND: u32 = rbitcoin_net::DEFAULT_MAX_INBOUND as u32;
 
-/// Core `-maxconnections=N` reserves this many slots for outbound full/block-relay
-/// peers plus one feeler (`10 + 1`). Inbound capacity is `N - reserve`.
-pub const CORE_MAXCONNECTIONS_OUTBOUND_RESERVE: u32 = 11;
-
-/// Core total-slot flag → inbound session cap.
-pub fn inbound_from_maxconnections(total: u32) -> u32 {
-    total
-        .saturating_sub(CORE_MAXCONNECTIONS_OUTBOUND_RESERVE)
-        .max(1)
-}
-
 /// Parse Core BTC/kvB (`0.00000001`) to sat/kvB. Negatives and junk fail.
 pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
     let s = s.trim();
@@ -189,7 +178,7 @@ pub struct NodeConfig {
     pub esplora_block_template: bool,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     pub milestone_height: u32,
-    /// Set when conf or CLI applied `milestone` / `assumevalid_height` (including 0).
+    /// Set when conf or CLI applied `milestone` (including 0).
     pub milestone_explicit: bool,
     /// When true, ask systemd (if available) to block automatic suspend/idle.
     pub inhibit_suspend: bool,
@@ -201,21 +190,25 @@ pub struct NodeConfig {
     pub api_log: Option<PathBuf>,
     /// Core `-asmap` path. `None` = try `{datadir}/ip_asn.dat` if present.
     pub asmap: Option<PathBuf>,
-    /// Core `-uacomment` fragments (BIP14 parens in subversion).
+    /// `--ua-comment` fragments (BIP14 parens in subversion).
     pub uacomments: Vec<String>,
     /// Core `-testactivationheight=name@height` (regtest).
     pub test_activation_heights: Vec<(String, u32)>,
-    /// Core `-whitelist=` permission strings (stored; noban honor follows PeerHub).
-    pub whitelist: Vec<String>,
+    /// Do not evict/ban inbound (`--trusted`; Core functional `-whitelist=noban`).
+    pub trusted: bool,
+    /// Always announce inbound txs (`--always-relay`; Core `forcerelay`).
+    pub always_relay: bool,
+    /// Permit tx relay to inbound while `--blocks-only` (`--relay`; Core `relay`).
+    pub relay: bool,
     /// Core `-startupnotify` shell command (run once after start).
     pub startup_notify: Option<String>,
     /// Core `-alertnotify` shell command (`%s` = warning text).
     pub alert_notify: Option<String>,
-    /// Core `-minimumchainwork` (32-byte BE work). `None` = no extra IBD floor.
+    /// `--min-chain-work` (32-byte BE work). `None` = no extra densify/relay floor.
     pub minimum_chain_work: Option<[u8; 32]>,
     /// Core `-mocktime` at start (`None` = wall clock).
     pub mock_time: Option<i64>,
-    /// Core `-maxtipage` seconds (`None` = 24h default on ChainHub).
+    /// `--max-tip-age` seconds (`None` = 24h default on ChainHub).
     pub max_tip_age_secs: Option<u64>,
     /// Core `-blockversion` GBT override (`None` = default).
     pub block_version: Option<i32>,
@@ -255,7 +248,9 @@ impl Default for NodeConfig {
             asmap: None,
             uacomments: Vec::new(),
             test_activation_heights: Vec::new(),
-            whitelist: Vec::new(),
+            trusted: false,
+            always_relay: false,
+            relay: false,
             startup_notify: None,
             alert_notify: None,
             minimum_chain_work: None,
@@ -383,17 +378,17 @@ impl NodeConfig {
             && self.network != Network::Signet
         {
             return Err(NodeError::Config(
-                "signetchallenge and signetblocktime require network=signet".into(),
+                "signet-challenge and signet-block-time require network=signet".into(),
             ));
         }
         if self.signet_block_time.is_some() && self.signet_challenge.is_none() {
             return Err(NodeError::Config(
-                "signetblocktime requires signetchallenge".into(),
+                "signet-block-time requires signet-challenge".into(),
             ));
         }
         if self.signet_block_time == Some(0) {
             return Err(NodeError::Config(
-                "signetblocktime must be greater than zero".into(),
+                "signet-block-time must be greater than zero".into(),
             ));
         }
         if self.listen.electrum.is_some() && !self.shindex {
@@ -483,15 +478,15 @@ impl NodeConfig {
         }
     }
 
-    /// Load a simple `key=value` conf (Core-style lines; `#` comments).
+    /// Load a simple `key=value` conf (`#` comments). Hyphens and underscores match.
     ///
-    /// Supported keys: `datadir`, `datadir-cold` / `datadir_cold`, `network` / `chain`, `listen`, `connect` (repeatable),
-    /// `milestone` / `assumevalid_height`, `maxoutbound` / `max_outbound`,
-    /// `maxinbound` / `max_inbound`, `maxconnections` (Core total → inbound N-11),
-    /// `mempool_size_mb` / `maxmempool`,
+    /// Operator keys: `datadir`, `datadir_cold`, `network`, `listen`, `connect` (repeatable),
+    /// `milestone`, `max_outbound`, `max_inbound`, `mempool_size_mb`,
     /// `log_level`, `api_log`, `asmap`, `electrum_listen`, `esplora_listen`,
     /// `shindex`, `sptweaks`, `sptweaks_dust`, `rpc_listen`, `rpcuser`, `rpcpassword`,
-    /// `noseeds` / `no_seeds`, `signetchallenge`, and `signetblocktime`.
+    /// `no_seeds`, `signet_challenge`, `signet_block_time`, `min_chain_work`,
+    /// `max_tip_age`, `blocks_only`, `persist_mempool`, `trusted`, `always_relay`,
+    /// `relay`, `ua_comment`, `peer_timeout`. Core names are the functional shim only.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -505,7 +500,7 @@ impl NodeConfig {
             let (key, val) = match line.split_once('=') {
                 Some((k, v)) => (k.trim(), v.trim()),
                 None => {
-                    // Boolean Core-style flags: `noseeds=1` preferred; bare `regtest=1`.
+                    // Boolean flags: `no_seeds=1` preferred; bare `regtest`.
                     if line.eq_ignore_ascii_case("regtest") {
                         self.network = Network::Regtest;
                         continue;
@@ -541,10 +536,10 @@ impl NodeConfig {
 
     /// Apply one conf / CLI-equivalent `key=value`. Unknown keys are not errors.
     pub fn apply_kv(&mut self, key: &str, val: &str) -> Result<ConfApply, NodeError> {
-        let key_l = key.to_ascii_lowercase();
+        let key_l = key.to_ascii_lowercase().replace('-', "_");
         match key_l.as_str() {
             "datadir" => self.datadir.path = PathBuf::from(val),
-            "datadir-cold" | "datadir_cold" | "datadircold" => {
+            "datadir_cold" | "datadircold" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
                         "conf datadir-cold requires a path".into(),
@@ -552,20 +547,20 @@ impl NodeConfig {
                 }
                 self.datadir.cold = Some(PathBuf::from(val));
             }
-            "network" | "chain" => {
+            "network" => {
                 self.network = Network::parse(val)
                     .map_err(|e| NodeError::Config(format!("conf network: {e}")))?;
             }
-            "signetchallenge" | "signet_challenge" => {
+            "signet_challenge" => {
                 self.signet_challenge = Some(
                     parse_signet_challenge(val)
-                        .map_err(|e| NodeError::Config(format!("conf signetchallenge: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf signet-challenge: {e}")))?,
                 );
             }
-            "signetblocktime" | "signet_block_time" => {
+            "signet_block_time" => {
                 self.signet_block_time = Some(
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf signetblocktime: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf signet-block-time: {e}")))?,
                 );
             }
             "listen" => {
@@ -631,25 +626,32 @@ impl NodeConfig {
             }
             "rpcuser" | "rpc_user" => self.rpc.user = Some(val.to_string()),
             "rpcpassword" | "rpc_password" => self.rpc.password = Some(val.to_string()),
-            "uacomment" => self.uacomments.push(val.to_string()),
+            "ua_comment" => self.uacomments.push(val.to_string()),
             "testactivationheight" | "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
                     .map_err(|e| NodeError::Config(format!("conf testactivationheight: {e}")))?;
                 self.test_activation_heights
                     .push((name.to_string(), height));
             }
-            "persistmempool" | "persist_mempool" => {
+            "persist_mempool" => {
                 self.mempool.persist = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf persistmempool: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf persist-mempool: {e}")))?;
             }
-            "whitelist" => {
-                if !val.is_empty() {
-                    self.whitelist.push(val.to_string());
-                }
+            "trusted" => {
+                self.trusted = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf trusted: {e}")))?;
             }
-            "blocksonly" | "blocks_only" => {
+            "always_relay" => {
+                self.always_relay = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf always-relay: {e}")))?;
+            }
+            "relay" => {
+                self.relay = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf relay: {e}")))?;
+            }
+            "blocks_only" => {
                 self.mempool.blocksonly = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf blocksonly: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf blocks-only: {e}")))?;
             }
             "prefillcompact" | "prefill_compact" => {
                 self.prefill_compact = parse_conf_bool(val)
@@ -700,57 +702,47 @@ impl NodeConfig {
                     .map_err(|e| NodeError::Config(format!("conf externalip: {e}")))?;
                 self.listen.external_ips.push(ip);
             }
-            "peertimeout" | "peer_timeout" => {
+            "peer_timeout" => {
                 let n: u64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf peertimeout: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf peer-timeout: {e}")))?;
                 if n == 0 {
                     return Err(NodeError::Config(
-                        "peertimeout must be a positive integer.".into(),
+                        "peer-timeout must be a positive integer.".into(),
                     ));
                 }
                 self.listen.peer_timeout_secs = Some(n);
             }
-            "minimumchainwork" | "minimum_chain_work" => {
+            "min_chain_work" => {
                 self.minimum_chain_work =
                     Some(parse_minimum_chain_work(val).map_err(NodeError::Config)?);
             }
-            "milestone" | "assumevalid_height" | "assumevalidheight" => {
+            "milestone" => {
                 self.milestone_height = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf milestone: {e}")))?;
                 self.milestone_explicit = true;
             }
-            "maxoutbound" | "max_outbound" => {
+            "max_outbound" => {
                 let n: u32 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf maxoutbound: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max-outbound: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config("conf maxoutbound must be >= 1".into()));
+                    return Err(NodeError::Config("conf max-outbound must be >= 1".into()));
                 }
                 self.listen.max_outbound = n;
             }
-            "maxinbound" | "max_inbound" => {
+            "max_inbound" => {
                 let n: u32 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf maxinbound: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max-inbound: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config("conf maxinbound must be >= 1".into()));
+                    return Err(NodeError::Config("conf max-inbound must be >= 1".into()));
                 }
                 self.listen.max_inbound = n;
                 self.listen.max_inbound_explicit = true;
             }
-            "maxconnections" => {
-                let total: u32 = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf maxconnections: {e}")))?;
-                if total == 0 {
-                    return Err(NodeError::Config("conf maxconnections must be >= 1".into()));
-                }
-                self.listen.max_inbound = inbound_from_maxconnections(total);
-                self.listen.max_inbound_explicit = true;
-            }
-            "mempool_size_mb" | "maxmempool" => {
+            "mempool_size_mb" => {
                 let mb: u64 = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf mempool_size_mb: {e}")))?;
@@ -807,12 +799,12 @@ impl NodeConfig {
                 }
                 self.mock_time = Some(n);
             }
-            "maxtipage" | "max_tip_age" => {
+            "max_tip_age" => {
                 let n: i64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf maxtipage: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max-tip-age: {e}")))?;
                 if n < 0 {
-                    return Err(NodeError::Config("conf maxtipage must be >= 0".into()));
+                    return Err(NodeError::Config("conf max-tip-age must be >= 0".into()));
                 }
                 self.max_tip_age_secs = Some(n as u64);
             }
@@ -837,11 +829,11 @@ impl NodeConfig {
                     self.alert_notify = Some(val.to_string());
                 }
             }
-            "noseeds" | "no_seeds" => self.listen.use_seeds = !is_conf_true(val),
+            "no_seeds" => self.listen.use_seeds = !is_conf_true(val),
             "regtest" if is_conf_true(val) => self.network = Network::Regtest,
             "signet" if is_conf_true(val) => self.network = Network::Signet,
             "testnet" if is_conf_true(val) => self.network = Network::Testnet,
-            other => return Ok(ConfApply::Unknown(other.to_string())),
+            _ => return Ok(ConfApply::Unknown(key.to_string())),
         }
         Ok(ConfApply::Applied)
     }
@@ -877,7 +869,7 @@ fn parse_conf_bool(val: &str) -> Result<bool, String> {
     }
 }
 
-/// Core `-minimumchainwork=<hex>` (optional `0x`, at most 64 hex digits).
+/// `--min-chain-work=<hex>` (optional `0x`, at most 64 hex digits).
 pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
     let hex = spec
         .strip_prefix("0x")
@@ -899,7 +891,7 @@ pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
 }
 
 impl NodeConfig {
-    /// True when tip work meets `-minimumchainwork` (or the flag is unset).
+    /// True when tip work meets `--min-chain-work` (or the flag is unset).
     pub fn meets_minimum_chain_work(&self, tip_work_be: [u8; 32]) -> bool {
         match self.minimum_chain_work {
             None => true,
@@ -1106,8 +1098,8 @@ mod tests {
             &conf,
             "# test conf\n\
              network=signet\n\
-             maxinbound=40\n\
-             maxoutbound=8\n\
+             max_inbound=40\n\
+             max_outbound=8\n\
              mempool_size_mb=50\n\
              milestone=100\n\
              log_level=debug\n\
@@ -1186,29 +1178,73 @@ mod tests {
     }
 
     #[test]
-    fn maxconnections_derives_inbound_like_core() {
-        assert_eq!(CORE_MAXCONNECTIONS_OUTBOUND_RESERVE, 11);
-        assert_eq!(inbound_from_maxconnections(32), 21);
-        assert_eq!(inbound_from_maxconnections(125), 114);
-        assert_eq!(inbound_from_maxconnections(11), 1);
-        assert_eq!(inbound_from_maxconnections(1), 1);
+    fn max_inbound_conf_is_explicit_not_core_total_slots() {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("mc.conf");
-        std::fs::write(&conf, "maxconnections=32\n").unwrap();
+        let conf = dir.join("mi.conf");
+        std::fs::write(&conf, "max_inbound=40\n").unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
-        assert_eq!(cfg.listen.max_inbound, 21);
+        assert_eq!(cfg.listen.max_inbound, 40);
         assert!(cfg.listen.max_inbound_explicit);
-        let conf2 = dir.join("mi.conf");
-        std::fs::write(&conf2, "maxinbound=40\n").unwrap();
+
+        let conf2 = dir.join("mc.conf");
+        std::fs::write(&conf2, "maxconnections=32\n").unwrap();
         let mut cfg2 = NodeConfig::default().with_datadir(dir.join("d2"));
         cfg2.merge_conf_file(&conf2).unwrap();
         assert_eq!(
-            cfg2.listen.max_inbound, 40,
-            "maxinbound stays explicit inbound"
+            cfg2.listen.max_inbound, DEFAULT_MAX_INBOUND,
+            "Core maxconnections is unknown on the node (shim-only)"
         );
+        assert!(!cfg2.listen.max_inbound_explicit);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_permission_and_ibd_knobs_apply() {
+        let mut cfg = NodeConfig::default();
+        assert_eq!(cfg.apply_kv("trusted", "1").unwrap(), ConfApply::Applied);
+        assert!(cfg.trusted);
+        assert_eq!(
+            cfg.apply_kv("always-relay", "1").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(cfg.always_relay);
+        assert_eq!(cfg.apply_kv("relay", "1").unwrap(), ConfApply::Applied);
+        assert!(cfg.relay);
+        assert_eq!(
+            cfg.apply_kv("min-chain-work", "0x65").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(cfg.minimum_chain_work.is_some());
+        assert_eq!(
+            cfg.apply_kv("max-tip-age", "3600").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(cfg.max_tip_age_secs, Some(3600));
+        assert_eq!(
+            cfg.apply_kv("blocks-only", "1").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(cfg.mempool.blocksonly);
+        assert_eq!(cfg.apply_kv("ua-comment", "x").unwrap(), ConfApply::Applied);
+        assert_eq!(cfg.uacomments.as_slice(), ["x"]);
+        assert_eq!(
+            cfg.apply_kv("chain", "regtest").unwrap(),
+            ConfApply::Unknown("chain".into())
+        );
+        assert_eq!(
+            cfg.apply_kv("whitelist", "noban@127.0.0.1").unwrap(),
+            ConfApply::Unknown("whitelist".into())
+        );
+        assert_eq!(
+            cfg.apply_kv("maxconnections", "32").unwrap(),
+            ConfApply::Unknown("maxconnections".into())
+        );
+        assert_eq!(
+            cfg.apply_kv("assumevalid_height", "0").unwrap(),
+            ConfApply::Unknown("assumevalid_height".into())
+        );
     }
 
     #[test]
@@ -1219,8 +1255,8 @@ mod tests {
         std::fs::write(
             &conf,
             "network=signet\n\
-             signetchallenge=51\n\
-             signetblocktime=60\n",
+             signet_challenge=51\n\
+             signet_block_time=60\n",
         )
         .unwrap();
 
@@ -1307,7 +1343,7 @@ mod tests {
              # comment\n\
              ; also\n\
              \n\
-             noseeds=1\n",
+             no_seeds=1\n",
         )
         .unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
@@ -1424,11 +1460,11 @@ mod tests {
              esplora_listen=127.0.0.1:3000\n\
              rpc_listen=127.0.0.1:8332\n\
              milestone=100\n\
-             maxoutbound=8\n\
-             maxinbound=32\n\
+             max_outbound=8\n\
+             max_inbound=32\n\
              mempool_size_mb=50\n\
              log_level=info\n\
-             noseeds=0\n\
+             no_seeds=0\n\
              unknown_key=1\n\
              network=regtest\n",
         )
@@ -1449,7 +1485,7 @@ mod tests {
         assert!(cfg.listen.max_inbound_explicit);
         assert_eq!(cfg.mempool.max_weight, 50_000_000);
         assert_eq!(cfg.conf_log_level.as_deref(), Some("info"));
-        assert!(cfg.listen.use_seeds); // noseeds=0 → seeds on
+        assert!(cfg.listen.use_seeds); // no_seeds=0 → seeds on
 
         // Error paths: bad listen / electrum / mempool 0 / empty log_level.
         for (body, needle) in [

@@ -2483,10 +2483,9 @@ impl ChainHub {
         let n_tx = block.txdata.len();
         let owned = Arc::try_unwrap(block).unwrap_or_else(|a| (*a).clone());
         let _ = self.cache.push_best(owned);
-        // Tip-follow / wire accept path: log every accepted tip block (Core-like
-        // UpdateTip). IBD bulk confirm uses note_confirmed_tip without this line;
-        // IBD retains periodic progress/perf status instead.
-        log_update_tip(height, &hash, &header, n_tx);
+        // Tip-follow / wire accept: one info line per height. IBD bulk confirm
+        // uses note_confirmed_tip without this line; IBD retains periodic status.
+        info!("{}", log_update_tip_line(height, &hash, &header, n_tx));
         log_tip_accept_sh(&self.query, height, n_tx, wall_ns, mp_strip_ns, pres_ns);
         let event = TipEvent {
             height,
@@ -2647,33 +2646,27 @@ impl ChainHub {
     }
 }
 
-/// Core-like per-block tip log for tip-follow / wire accept (`connect_at`).
-///
-/// Format is intentionally close to Bitcoin Core `UpdateTip` so operators can
-/// grep one line per height. IBD does not call this for every confirm batch.
-/// `p2p_unrequested_blocks.py` needle when minchainwork rejects an unrequested header.
 pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
-    format!(
-        "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
-    )
+    format!("p2p: header {hash} missing pow proof — not stored")
 }
 
-/// `p2p_headers_sync_with_minchainwork.py` low-work skip.
+pub fn accept_prev_not_found_log(hash: impl std::fmt::Display) -> String {
+    format!("p2p: accept dropped {hash} (prev not found)")
+}
+
 pub fn ignoring_low_work_chain_log(height: u32) -> String {
-    format!("[net] Ignoring low-work chain (height={height})")
+    format!("p2p: ignore low-work headers height={height}")
 }
 
-/// Core `ProcessNewBlockHeaders` IBD progress (noban / sufficient-work).
 pub fn synchronizing_blockheaders_log(height: u32) -> String {
-    format!("Synchronizing blockheaders, height: {height}")
+    format!("p2p: headers sync height={height}")
 }
 
-/// `p2p_initial_headers_sync.py` first getheaders after connect.
 pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
-    format!("initial getheaders ({locator_height}) to peer={peer}")
+    format!("p2p: initial getheaders height={locator_height} peer={peer}")
 }
 
-/// Core `HEADERS_DOWNLOAD_TIMEOUT_BASE` (15 min) + 1 ms per header-interval.
+/// `HEADERS_DOWNLOAD_TIMEOUT_BASE` (15 min) + 1 ms per header-interval.
 pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
     let since = now.saturating_sub(best_header_time);
     // ceil(1ms * since / 600s) in seconds == ceil(since / 600_000).
@@ -2682,30 +2675,26 @@ pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
 }
 
 pub fn headers_timeout_disconnect_log(peer: u64) -> String {
-    format!("Timeout downloading headers, disconnecting peer={peer}")
+    format!("p2p: headers sync timeout, disconnect peer={peer}")
 }
 
 pub fn headers_timeout_noban_log(peer: u64) -> String {
-    format!("Timeout downloading headers from noban peer, not disconnecting peer={peer}")
+    format!("p2p: headers sync timeout, keep peer={peer}")
 }
 
-/// Core `p2p_blocksonly.py` debug.log needle. Per-item; emit at **trace**.
 pub fn received_getdata_wtx_log(wtxid: impl std::fmt::Display, peer: u64) -> String {
-    format!("received getdata for: wtx {wtxid} peer={peer}")
+    format!("p2p: getdata wtx {wtxid} peer={peer}")
 }
 
-/// Core `p2p_ibd_txrelay.py` debug.log needle. Emit at **trace**.
 pub fn received_tx_log() -> &'static str {
-    "received: tx"
+    "p2p: received tx"
 }
 
-pub fn log_update_tip(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) {
+/// Tip-follow / wire accept (`connect_at`). IBD bulk confirm does not emit this.
+pub fn log_update_tip_line(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) -> String {
     let time = header.time;
     let ver = header.version.to_consensus();
-    info!(
-        "UpdateTip: new best={hash} height={height} version={ver} \
-         tx={n_tx} date={time} progress=tip"
-    );
+    format!("tip: best={hash} height={height} version={ver} tx={n_tx} date={time}")
 }
 
 /// Clear confirm + Class C SH meters before a tip-follow accept sample window.
@@ -3226,35 +3215,37 @@ mod tests {
         let h = BlockHash::from_byte_array([0x11; 32]);
         assert_eq!(
             accept_block_header_nodos_log(h),
-            format!(
-                "AcceptBlockHeader: not adding new block header {h}, missing anti-dos proof-of-work validation"
-            )
+            format!("p2p: header {h} missing pow proof — not stored")
+        );
+        assert_eq!(
+            accept_prev_not_found_log(h),
+            format!("p2p: accept dropped {h} (prev not found)")
         );
         assert_eq!(
             ignoring_low_work_chain_log(14),
-            "[net] Ignoring low-work chain (height=14)"
+            "p2p: ignore low-work headers height=14"
         );
         assert_eq!(
             synchronizing_blockheaders_log(14),
-            "Synchronizing blockheaders, height: 14"
+            "p2p: headers sync height=14"
         );
         assert_eq!(
             initial_getheaders_log(0, 0),
-            "initial getheaders (0) to peer=0"
+            "p2p: initial getheaders height=0 peer=0"
         );
         assert_eq!(
             headers_timeout_disconnect_log(0),
-            "Timeout downloading headers, disconnecting peer=0"
+            "p2p: headers sync timeout, disconnect peer=0"
         );
         assert_eq!(
             headers_timeout_noban_log(0),
-            "Timeout downloading headers from noban peer, not disconnecting peer=0"
+            "p2p: headers sync timeout, keep peer=0"
         );
         assert_eq!(
             received_getdata_wtx_log("aabbccdd", 3),
-            "received getdata for: wtx aabbccdd peer=3"
+            "p2p: getdata wtx aabbccdd peer=3"
         );
-        assert_eq!(received_tx_log(), "received: tx");
+        assert_eq!(received_tx_log(), "p2p: received tx");
         // Test formula: now=1_000_000, genesis=0 → variable = ceil(1e6/6e5)=2.
         assert_eq!(
             headers_download_timeout_secs(1_000_000, 0),
@@ -3703,30 +3694,23 @@ mod tests {
 
     #[test]
     fn tip_follow_accept_logs_update_tip_per_block() {
-        // Shipped path: accept_block → connect_at → log_update_tip (info).
-        // Assert helper formats Core-like line; accept advances tip once per block.
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         let b1 = mine(gen, 1_300_000_000, 1);
         let h = b1.header;
         let hash = b1.block_hash();
-        let line_probe = {
-            // Drive the shipped log helper (same args connect_at uses).
-            log_update_tip(1, &hash, &h, b1.txdata.len());
+        let line_probe = log_update_tip_line(1, &hash, &h, b1.txdata.len());
+        assert_eq!(
+            line_probe,
             format!(
-                "UpdateTip: new best={hash} height=1 version={} tx={} date={} progress=tip",
+                "tip: best={hash} height=1 version={} tx={} date={}",
                 h.version.to_consensus(),
                 b1.txdata.len(),
                 h.time
             )
-        };
-        assert!(
-            line_probe.starts_with("UpdateTip: new best="),
-            "tip log must be Core-like UpdateTip: {line_probe}"
         );
-        assert!(line_probe.contains("height=1"));
-        assert!(line_probe.contains("progress=tip"));
+        assert!(!line_probe.contains("UpdateTip"), "{line_probe}");
         assert!(matches!(
             hub.accept_block(b1).unwrap(),
             AcceptOutcome::Accepted { height: 1 }

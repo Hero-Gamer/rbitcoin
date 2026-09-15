@@ -70,11 +70,11 @@ fn pin_conf_unknown_key_and_peertimeout(td: &TestDatadir) {
             td.path().join("peertimeout-one").to_str().unwrap(),
             "--network",
             "regtest",
-            "--peertimeout",
+            "--peer-timeout",
             "1",
             "--smoke",
         ])),
-        "--peertimeout=1 must smoke"
+        "--peer-timeout=1 must smoke"
     );
 }
 
@@ -317,7 +317,7 @@ fn node_cli_and_surface_smoke() {
     let conf = conf_dir.join("rbitcoin.conf");
     std::fs::write(
         &conf,
-        "network=regtest\nmaxoutbound=3\nlog_level=warn\nno_seeds=1\n",
+        "network=regtest\nmax_outbound=3\nlog_level=warn\nno_seeds=1\n",
     )
     .unwrap();
     assert!(exit_success(node_cli_main([
@@ -334,7 +334,7 @@ fn node_cli_and_surface_smoke() {
         td.path().join("peertimeout-zero").to_str().unwrap(),
         "--network",
         "regtest",
-        "--peertimeout",
+        "--peer-timeout",
         "0",
         "--smoke",
     ])));

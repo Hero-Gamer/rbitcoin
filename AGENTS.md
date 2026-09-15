@@ -181,14 +181,29 @@ listed reads. CodeQL **dismiss** stays operator (`security_events` is read).
 git fetch origin
 git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
 gh pr create --repo reardencode/rbitcoin --head <area>/<short-name> --title "…" --body "…"
+gh pr view --repo reardencode/rbitcoin --json mergeable,mergeStateStatus
 gh pr checks --watch
 ```
 
 No `-u` on push (that would retarget the branch remote away from `origin`).
 
+**Unmergeable ⇒ tests do not run.** If `mergeable` is `CONFLICTING` or
+`mergeStateStatus` is `DIRTY` (or `BEHIND` when the branch is not on current
+`origin/master`), required **test** CI does not start. `gh pr checks --watch`
+will sit on skipped/missing `test` — that is not a flake. Rebase onto
+`origin/master`, lease-force the topic branch, then poll. Do not `gh run rerun`
+to wake jobs that never queued.
+
+```bash
+git fetch origin
+git rebase origin/master
+git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
+```
+
 | Rule | Detail |
 |------|--------|
 | **One PR per plan** | Push more commits to the same branch. |
+| **Mergeable first** | Conflicted / behind PRs skip test CI. Rebase, then poll. |
 | **Poll until green** | Do not walk away and call the plan done. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
 | **No post-green PR-cite** | After required checks are green, do **not** push a docs-only follow-up whose only change is inserting this PR's number into CHANGELOG / quality.md / similar. That wastes a full CI run. Cite in the **PR body**. Owner docs can omit the GitHub number, or pick it up later in a docs change that was already needed. |

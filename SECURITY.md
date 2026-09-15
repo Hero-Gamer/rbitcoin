@@ -48,7 +48,7 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   invalid chain data or rejecting valid data. Report both.
 - **P2P:** BIP324 v2-only. DoS parity with Bitcoin Core is **not** claimed, but
   mitigations are intentional operator surface: max inbound sessions
-  (`--maxinbound` / `--maxconnections`, default 125), per-session message/byte
+  (`--max-inbound`, default 125), per-session message/byte
   rate windows, misbehavior score disconnect.
 - **Electrum and Esplora (wallet-client backends):** plain TCP/HTTP; TLS is an
   operator reverse-proxy concern. Intended for **wallet software**, not as a

@@ -3,11 +3,11 @@ use rbitcoin_store::StoreError;
 use std::fmt;
 use std::path::PathBuf;
 
-/// Core `MAX_FUTURE_BLOCK_TIME` (two hours). Startup refuses a tip beyond this.
+/// Two-hour tip-time cap vs the node clock. Startup refuses a tip beyond this.
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
-/// Core load-abort text (`rpc_blockchain._test_max_future_block_time` FULL_TEXT).
-pub const FUTURE_BLOCK_DB_MSG: &str = "The block database contains a block which appears to be from the future. This may be due to your computer's date and time being set incorrectly. Only rebuild the block database if you are sure that your computer's date and time are correct.\nPlease restart with -reindex or -reindex-chainstate to recover.";
+/// Startup abort when the store tip is more than [`MAX_FUTURE_BLOCK_TIME`] ahead.
+pub const FUTURE_BLOCK_DB_MSG: &str = "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mocktime). Wipe the datadir and redo IBD only if you are sure the clock is correct.";
 
 pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
     u64::from(tip_time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME)
@@ -16,7 +16,7 @@ pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
 #[derive(Debug)]
 pub enum NodeError {
     Config(String),
-    /// Tip time is more than two hours ahead of the node clock (Core load abort).
+    /// Tip time is more than two hours ahead of the node clock.
     FutureTip,
     Network(ParseNetworkError),
     Datadir {
@@ -79,6 +79,14 @@ mod tests {
 
         let fut = NodeError::FutureTip;
         assert_eq!(format!("{fut}"), FUTURE_BLOCK_DB_MSG);
+        assert!(
+            format!("{fut}").contains("more than two hours ahead of the node clock"),
+            "{fut}"
+        );
+        assert!(
+            !format!("{fut}").contains("reindex-chainstate"),
+            "operator text must not name Core -reindex-chainstate: {fut}"
+        );
         assert!(fut.source().is_none());
 
         let net: NodeError = ParseNetworkError { input: "x".into() }.into();
