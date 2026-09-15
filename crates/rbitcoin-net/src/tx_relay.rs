@@ -160,7 +160,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         match self.query.is_outpoint_spent(&tid, op.vout) {
             Ok(true) => return ChainPrevout::KnownUnavailable,
             Ok(false) => {}
-            Err(_) => return ChainPrevout::Unknown,
+            Err(_) => return ChainPrevout::KnownUnavailable,
         }
         let Some(out) = self
             .query
@@ -3150,6 +3150,40 @@ mod tests {
         );
         hub.note_recent_confirmed(std::slice::from_ref(&confirmed));
         assert!(hub.try_contains_wtxid(&confirmed.compute_wtxid()));
+        assert!(
+            hub.try_contains(&confirmed.compute_txid()),
+            "recent-confirmed ring AlreadyHave for txid"
+        );
+        hub.note_recent_confirmed(std::slice::from_ref(&confirmed));
+        hub.clear_recent_confirmed();
+        assert!(
+            !hub.try_contains_wtxid(&confirmed.compute_wtxid()),
+            "reorg must drop wtxid AlreadyHave"
+        );
+        assert!(hub.try_contains(&confirmed.compute_txid()));
+        let oob = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed.compute_txid(),
+                    vout: 99,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let err = hub.accept_tx(&oob).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(_)),
+            "confirmed create missing vout must not park, got {err}"
+        );
+        assert_eq!(hub.orphan_count(), 0);
 
         let _ = hub.sample_reset_perf();
         let timed = Transaction {
