@@ -357,6 +357,10 @@ impl RecentConfirmed {
     }
 
     fn note_block(&mut self, txs: &[Transaction]) {
+        self.note_block_capped(txs, RECENT_CONFIRMED_CAP);
+    }
+
+    fn note_block_capped(&mut self, txs: &[Transaction], cap: usize) {
         for tx in txs {
             let txid = tx.compute_txid();
             let wtxid = tx.compute_wtxid();
@@ -365,7 +369,7 @@ impl RecentConfirmed {
             }
             self.wtxids.insert(wtxid);
             self.order.push_back((txid, wtxid));
-            if self.order.len() > RECENT_CONFIRMED_CAP {
+            if self.order.len() > cap {
                 if let Some((old_t, old_w)) = self.order.pop_front() {
                     self.txids.remove(&old_t);
                     self.wtxids.remove(&old_w);
@@ -2676,6 +2680,20 @@ mod tests {
     }
 
     #[test]
+    fn recent_confirmed_evicts_oldest_over_cap() {
+        let mut r = RecentConfirmed::new();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let a = spend_true(Txid::from_byte_array([1u8; 32]), 1, spk.clone());
+        let b = spend_true(Txid::from_byte_array([2u8; 32]), 1, spk);
+        r.note_block_capped(std::slice::from_ref(&a), 1);
+        r.note_block_capped(std::slice::from_ref(&b), 1);
+        assert!(!r.contains_txid(&a.compute_txid()));
+        assert!(!r.contains_wtxid(&a.compute_wtxid()));
+        assert!(r.contains_txid(&b.compute_txid()));
+        assert!(r.contains_wtxid(&b.compute_wtxid()));
+    }
+
+    #[test]
     fn sh_index_insert_overwrite_and_remove_miss() {
         let mut idx = MempoolShIndex::new();
         let t = Txid::from_byte_array([1u8; 32]);
@@ -3188,6 +3206,31 @@ mod tests {
             "confirmed create missing vout must not park, got {err}"
         );
         assert_eq!(hub.orphan_count(), 0);
+
+        hub.remove_for_block(&[child.compute_txid()]);
+        q.disconnect_tip().unwrap();
+        let ghost = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(confirmed.output[0].value.to_sat() - 2_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let err = hub.accept_tx(&ghost).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::Orphaned { .. }),
+            "disconnected create (no height) must park, got {err}"
+        );
 
         let _ = hub.sample_reset_perf();
         let timed = Transaction {

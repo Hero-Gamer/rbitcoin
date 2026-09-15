@@ -81,7 +81,7 @@ ring to Core’s extra-txn shape is worth later; not scheduled (no Open Q-id).
 
 Inbound `tx` whose prevouts are spent or missing on a confirmed create is
 `MissingPrevout`, not an orphan park. INV AlreadyHave is live mempool +
-orphanage + a recent-confirmed txid/wtxid ring (filled at tip connect) +
+orphanage + a recent-confirmed txid/wtxid ring (filled at tip connect and IBD write) +
 Class A `tx_fk_by_txid_tip`. Re-delivery of an already-parked orphan still
 GETDATAs missing parents (TTL) but does not log a second `txrelay: park`.
 

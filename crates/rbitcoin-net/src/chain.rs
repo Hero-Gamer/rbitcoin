@@ -4819,10 +4819,13 @@ mod tests {
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         let b1 = mine(gen, 1_300_004_000, 1);
+        let cb_txid = b1.txdata[0].compute_txid();
+        let cb_wtxid = b1.txdata[0].compute_wtxid();
         let loaded = hub.confirm_wire_load_phase(&[(Height(1), b1)]).unwrap();
         assert!(loaded.is_some());
         let batch = loaded.unwrap();
         let script_out = confirm_scripts_phase(batch.batch).unwrap();
+        let mp = attach_mp(dir.path(), &hub);
         let write_out = hub.confirm_write(script_out.batch).unwrap();
         assert_eq!(write_out.len(), 1);
         assert!(matches!(
@@ -4830,6 +4833,11 @@ mod tests {
             AcceptOutcome::Accepted { height: 1 }
         ));
         assert_eq!(hub.tip_height(), Some(1));
+        assert!(
+            mp.try_contains_wtxid(&cb_wtxid),
+            "IBD confirm_write must fill recent-confirmed wtxid"
+        );
+        assert!(mp.try_contains(&cb_txid));
 
         let _ = std::fs::remove_dir_all(dir);
     }
