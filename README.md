@@ -83,8 +83,8 @@ cargo build -p rbitcoin-node -p rbitcoin-cli
 ```
 
 Linux-only optional pin (`nix develop` / `nix-shell`, same `flake.lock` as
-release). Agents use a worktree branch and let Actions run workspace/coverage
-gates — [`AGENTS.md`](./AGENTS.md).
+release). Agents use one worktree per session (topic branch per PR) and let
+Actions run workspace/coverage gates — [`AGENTS.md`](./AGENTS.md).
 
 ### Portable static release (Linux operator)
 

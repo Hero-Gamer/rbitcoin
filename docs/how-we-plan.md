@@ -292,10 +292,10 @@ Before closing a step:
 
 Before closing a **plan**:
 
-- [ ] Work landed on a worktree topic branch (not local `master`)  
+- [ ] Work landed on a session-worktree topic branch (not local `master`)  
 - [ ] One PR contains the plan’s commits  
 - [ ] Required GitHub Actions checks on that PR are green  
-- [ ] After merge: worktree removed; local and remote topic branches deleted 
+- [ ] After merge: topic branch deleted locally and on `origin`; session worktree kept until the session ends 
 
 
 ---

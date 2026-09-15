@@ -235,12 +235,12 @@ checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
 `ast-grep`, `test`, `windows`, `macos`, `coverage`) so a red run shows which gate
 failed without digging into a monolithic job log.
 
-**Agents** implement on a **git worktree** topic branch, commit per plan step,
-and open **one PR** per plan. They do **not** run the full workspace suite or
-coverage locally by default — they poll these Actions jobs to green. After
-merge they remove the worktree and delete the local **and** remote topic
-branch. See [`AGENTS.md`](./AGENTS.md) (worktree + PR, after-merge cleanup)
-and [`docs/how-we-plan.md`](./docs/how-we-plan.md).
+**Agents** implement in **one git worktree per session**, a topic branch per
+PR, commit per plan step, and open **one PR** per plan. They do **not** run
+the full workspace suite or coverage locally by default — they poll these
+Actions jobs to green. After merge they delete the local **and** remote topic
+branch and keep the session worktree. See [`AGENTS.md`](./AGENTS.md)
+(worktree + PR) and [`docs/how-we-plan.md`](./docs/how-we-plan.md).
 
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):
 
