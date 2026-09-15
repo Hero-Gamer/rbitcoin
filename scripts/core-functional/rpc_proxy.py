@@ -2,8 +2,8 @@
 """Test-only JSON-RPC proxy in front of rbitcoin-node.
 
 Not the operator product. Core functional tests speak to this process.
-Node methods are forwarded unchanged. Wallet/utility methods are handled
-locally in later steps.
+Node methods are forwarded; `maxfeerate` BTC/kvB is rewritten to sat/vB.
+Wallet/utility methods are handled locally in later steps.
 """
 
 from __future__ import annotations
@@ -19,6 +19,53 @@ from typing import Any, Callable
 
 # GBT longpoll can sit ~80s; stay under Core's client-side patience.
 FORWARD_TIMEOUT_S = 180.0
+
+# Node maxfeerate is sat/vB. Core tests speak BTC/kvB.
+_MAXFEERATE_METHODS = {
+    "sendrawtransaction": 1,
+    "testmempoolaccept": 1,
+    "submitpackage": 1,
+}
+_CORE_MAXFEERATE_MSG = (
+    "Fee rates larger than or equal to 1BTC/kvB are not accepted"
+)
+
+
+def core_btc_kvb_to_sat_vb(value: Any) -> int:
+    """Core `maxfeerate` BTC/kvB → node sat/vB. `>= 1` is Core `-8`."""
+    if value is None:
+        raise RpcError(-8, "Invalid amount")
+    if isinstance(value, bool):
+        raise RpcError(-8, "Invalid amount")
+    if isinstance(value, int):
+        btc = float(value)
+    elif isinstance(value, float):
+        btc = value
+    elif isinstance(value, str):
+        try:
+            btc = float(value.strip())
+        except ValueError as e:
+            raise RpcError(-8, "Invalid amount") from e
+    else:
+        raise RpcError(-8, "Invalid amount")
+    if btc < 0:
+        raise RpcError(-8, "Amount out of range")
+    if btc >= 1:
+        raise RpcError(-8, _CORE_MAXFEERATE_MSG)
+    return int(round(btc * 100_000))
+
+
+def rewrite_core_maxfeerate(item: dict[str, Any]) -> None:
+    method = item.get("method")
+    idx = _MAXFEERATE_METHODS.get(method) if isinstance(method, str) else None
+    if idx is None:
+        return
+    params = item.get("params", [])
+    if isinstance(params, list):
+        if len(params) > idx and params[idx] is not None:
+            params[idx] = core_btc_kvb_to_sat_vb(params[idx])
+    elif isinstance(params, dict) and "maxfeerate" in params:
+        params["maxfeerate"] = core_btc_kvb_to_sat_vb(params["maxfeerate"])
 
 
 class RpcError(Exception):
@@ -82,12 +129,28 @@ class RpcProxy:
             payload = json.loads(raw.decode() or "null")
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self.forward_raw(raw)
-        if isinstance(payload, list):
-            return self.forward_raw(raw)
-        if isinstance(payload, dict):
-            method = payload.get("method")
-            if isinstance(method, str) and method in self._handlers:
-                return 200, json.dumps(self._one(payload)).encode()
+        try:
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict):
+                        rewrite_core_maxfeerate(item)
+                return self.forward_raw(json.dumps(payload).encode())
+            if isinstance(payload, dict):
+                rewrite_core_maxfeerate(payload)
+                method = payload.get("method")
+                if isinstance(method, str) and method in self._handlers:
+                    return 200, json.dumps(self._one(payload)).encode()
+                return self.forward_raw(json.dumps(payload).encode())
+        except RpcError as e:
+            req_id = payload.get("id") if isinstance(payload, dict) else None
+            body = json.dumps(
+                {
+                    "result": None,
+                    "error": {"code": e.code, "message": e.message},
+                    "id": req_id,
+                }
+            ).encode()
+            return 200, body
         return self.forward_raw(raw)
 
     def forward_raw(self, raw: bytes) -> tuple[int, bytes]:

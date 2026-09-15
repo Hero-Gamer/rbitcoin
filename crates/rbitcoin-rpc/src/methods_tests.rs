@@ -1634,7 +1634,7 @@ fn generated_coinbase_value(ctx: &RpcContext, height: u32) -> u64 {
 
 fn default_max_raw_fee_sat(weight: u64) -> u64 {
     let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
-    10_000_000u64.saturating_mul(vsize) / 1000
+    10_000u64.saturating_mul(vsize)
 }
 
 fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
@@ -1647,7 +1647,7 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext) {
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(at_hex)]).unwrap();
     assert!(
         ok.as_str().is_some(),
-        "exact 0.10 BTC/kvB must accept: {ok}"
+        "exact default 10000 sat/vB must accept: {ok}"
     );
     let (over_hex, _) =
         spend_generated_coinbase(ctx, 2, cb - max_fee - 1, ScriptBuf::from_bytes(vec![0x51]));
@@ -1696,10 +1696,10 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     )
     .unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
-    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(1)]).unwrap_err();
+    let over = dispatch(&ctx, "sendrawtransaction", vec![json!(hex), json!(100_000)]).unwrap_err();
     assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
     assert_eq!(
-        over["message"], "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+        over["message"], "feerate >= 100000 sat/vB is not accepted",
         "{over}"
     );
     let cb4 = generated_coinbase_value(&ctx, 4);
@@ -1708,7 +1708,7 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
     let ok99 = dispatch(
         &ctx,
         "sendrawtransaction",
-        vec![json!(modest_hex), json!(0.99)],
+        vec![json!(modest_hex), json!(99_999)],
     )
     .unwrap();
     assert_eq!(

@@ -11,7 +11,30 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from rpc_proxy import RpcProxy, esplora_port, node_rpc_port
+from rpc_proxy import (
+    RpcError,
+    RpcProxy,
+    core_btc_kvb_to_sat_vb,
+    esplora_port,
+    node_rpc_port,
+    rewrite_core_maxfeerate,
+)
+
+assert core_btc_kvb_to_sat_vb(0) == 0
+assert core_btc_kvb_to_sat_vb(0.1) == 10_000
+assert core_btc_kvb_to_sat_vb("0.10") == 10_000
+try:
+    core_btc_kvb_to_sat_vb(1)
+    raise SystemExit("expected -8 for 1 BTC/kvB")
+except RpcError as e:
+    assert e.code == -8
+    assert "1BTC/kvB" in e.message
+item = {
+    "method": "sendrawtransaction",
+    "params": ["00", 0.1],
+}
+rewrite_core_maxfeerate(item)
+assert item["params"][1] == 10_000, item
 
 assert node_rpc_port(18443) == 28443
 assert esplora_port(18443) == 38443

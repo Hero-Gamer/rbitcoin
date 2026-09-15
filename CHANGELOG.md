@@ -42,10 +42,11 @@ before 1.0).
   Corrupt; loc-by-fk miss after Class A is Corrupt; reject rewind moves
   lookup-started-high with consume-high.
 
-- **RPC honesty:** `maxfeerate >= 1` BTC/kvB is `-8` (Core message);
-  sendraw over-cap is `-25` configured-max (`testmempoolaccept` stays
-  `max-fee-exceeded`); `--rpcworkqueue` full permit is HTTP 503 (one POST
-  is one slot); `-blocksonly` sendraw of a valid tx still admits.
+- **RPC honesty:** `maxfeerate` is sat/vB (default 10000; `>= 100000` is
+  `-8`). sendraw over-cap is `-25` configured-max (`testmempoolaccept`
+  stays `max-fee-exceeded`); `--rpcworkqueue` full permit is HTTP 503
+  (one POST is one slot); `-blocksonly` sendraw of a valid tx still admits.
+  Core BTC/kvB `maxfeerate` is the functional-harness proxy only.
 
 - **`preciousblock`:** equal-work sibling still activates; an error path
   does not leave the preference set.
