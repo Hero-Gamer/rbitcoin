@@ -117,7 +117,7 @@ also sends it, we announce and request `MSG_WTX` inventory.
 `POST /txs/package`. No P2P package command. BIP331 `NetworkMessage` needs a
 rust-bitcoin upgrade.
 
-**Misbehavior:** per-session ban score (threshold 100) for unsolicited/bad compact
+**Misbehavior:** per-session disconnect score (threshold 100) for unsolicited/bad compact
 payloads and oversized pending-cmpct pressure; disconnects the peer.
 
 **BIP324 v2 only** — discovery is v2-filtered (`x809` DNS + `P2P_V2` gossip);
@@ -131,7 +131,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 | Disk / RAM | Multi‑100 GiB Class A; segmented 25-bit `tx.head.*` + fuse8 in RAM (~1.5 GiB); sealed BDZ `g` FdOnly (not anon heap) |
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
-| Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB** (Core-class); **scripts verified on accept** |
+| Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB**; **scripts verified on accept** |
 | Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=14`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=14 · scriptq=4 · writeq=14 |
 | Not Core/Fulcrum | No production SLA; 0.6.99 is high-scrutiny 0.x; schema unstable until 1.0; reindex on incompatible layout changes |
 

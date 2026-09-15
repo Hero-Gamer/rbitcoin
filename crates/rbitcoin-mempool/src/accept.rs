@@ -93,7 +93,7 @@ impl UtxoProvider for MapUtxoProvider {
     }
 }
 
-/// Max txs in one ancestor package (Core-class package limit).
+/// Max txs in one ancestor package.
 pub const MAX_PACKAGE_COUNT: usize = 25;
 /// Max total weight (WU) of one package.
 pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
@@ -322,7 +322,7 @@ pub struct ActiveMempool {
     bodies: std::collections::HashMap<Txid, Transaction>,
     /// Evict worst chunks when live weight exceeds this.
     pub max_weight: u64,
-    /// Side pool of txs waiting on missing parents (Core-class weight budget).
+    /// Side pool of txs waiting on missing parents (weight budget).
     pub orphanage: Orphanage,
     /// Stage µs for the most recent top-level [`Self::accept_tx`] / package member
     /// (includes nested orphan promote for that accept). Sampled by MempoolHub.
@@ -480,7 +480,7 @@ impl ActiveMempool {
     /// bump generation so a crash keeps the batch.
     ///
     /// When prevouts are missing from both mempool and chain UTXO, the tx is
-    /// parked in the [`Orphanage`] (Core-class weight budget) and
+    /// parked in the [`Orphanage`] (weight budget) and
     /// [`AcceptError::Orphaned`] is returned — not a hard peer reject.
     ///
     /// `tip` is the confirmed tip for maturity / `is_final_tx` / BIP68 (next block
@@ -2814,7 +2814,7 @@ mod tests {
             Err(AcceptError::Duplicate(_))
         ));
 
-        // Missing prevout → parked in orphanage (Core-class soft accept).
+        // Missing prevout → parked in orphanage (soft accept).
         let (_op2, _, empty) = chain_utxo(50_000);
         let missing = spend_tx(
             OutPoint {

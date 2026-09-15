@@ -685,7 +685,7 @@ mod tests {
             DialFailKind::Network
         );
         assert_eq!(
-            classify_dial_err(&NetError::Protocol("ban score")),
+            classify_dial_err(&NetError::Protocol("misbehavior")),
             DialFailKind::Network
         );
     }

@@ -24,9 +24,9 @@ use bitcoin::{Amount, Sequence, Transaction, TxOut};
 use super::crypto;
 use crate::error::ConsensusError;
 
-/// Core-aligned stack element count (main + alt).
+/// Stack element cap (main + alt).
 const MAX_STACK_SIZE: usize = 1000;
-/// Core `MAX_SCRIPT_ELEMENT_SIZE` (push / witness stack item cap).
+/// Push / witness stack item cap.
 pub(crate) const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 /// BIP342 `VALIDATION_WEIGHT_OFFSET` / `VALIDATION_WEIGHT_PER_SIGOP_PASSED`.
 const TAPSCRIPT_VALIDATION_WEIGHT_OFFSET: i64 = 50;
@@ -154,30 +154,30 @@ pub(crate) struct EvalContext<'a> {
     pub bip112_active: bool,
     /// When true, ECDSA signatures must be strict DER (BIP66 / SCRIPT_VERIFY_DERSIG).
     pub bip66_active: bool,
-    /// Core `SCRIPT_VERIFY_MINIMALDATA`: minimal push opcodes + minimal scriptnums.
+    /// Minimal push opcodes + minimal script integers.
     /// Not always consensus (standard flag); enabled when fixture/job requests it.
     pub minimal_data: bool,
-    /// Core `SCRIPT_VERIFY_NULLFAIL`: non-empty sig that fails CHECK(MULTI)SIG → hard fail.
+    /// Non-empty sig that fails CHECK(MULTI)SIG → hard fail.
     pub nullfail: bool,
-    /// Core `SCRIPT_VERIFY_LOW_S`: high-S ECDSA signatures hard-fail (standardness).
+    /// High-S ECDSA signatures hard-fail (standardness).
     pub low_s: bool,
-    /// Core `SCRIPT_VERIFY_STRICTENC`: DER + defined hashtype + compressed/uncompressed keys.
+    /// DER + defined hashtype + compressed/uncompressed keys.
     pub strictenc: bool,
-    /// Core `SCRIPT_VERIFY_NULLDUMMY` (BIP147): CMS dummy must be empty.
+    /// BIP147: CMS dummy must be empty.
     pub null_dummy: bool,
-    /// Core `SCRIPT_VERIFY_MINIMALIF`: IF/NOTIF argument must be empty or exact 0x01.
+    /// IF/NOTIF argument must be empty or exact 0x01.
     /// Always on for TapScript; optional flag for legacy/v0.
     pub minimal_if: bool,
-    /// Core `SCRIPT_VERIFY_WITNESS_PUBKEYTYPE`: only compressed keys in witness scripts.
+    /// Only compressed keys in witness scripts.
     pub witness_pubkeytype: bool,
-    /// Core `SCRIPT_VERIFY_CONST_SCRIPTCODE`.
+    /// Reject CODESEPARATOR / FindAndDelete that would mutate scriptCode.
     pub const_scriptcode: bool,
     /// BIP342: instruction index of last executed OP_CODESEPARATOR, or `0xFFFFFFFF`.
     ///
-    /// Counted like Core's `opcode_pos` (one per GetOp/instruction, not byte offset).
+    /// Counted one per instruction, not byte offset.
     codeseparator_pos: Cell<u32>,
     /// Base / WitnessV0: byte offset into `script_code` of the first opcode **after**
-    /// the last executed OP_CODESEPARATOR (Core `pbegincodehash`). `None` = full script.
+    /// the last executed OP_CODESEPARATOR. `None` = full script.
     ///
     /// BIP143 / legacy CHECKSIG use this truncated script as `scriptCode`.
     codeseparator_script_off: Cell<Option<usize>>,
@@ -451,7 +451,7 @@ pub(crate) fn eval_script(
                 let code = op.to_u8();
 
                 // Legacy / v0: opcodes > OP_16 count toward 201 even when skipped,
-                // including OP_IF / NOTIF / ELSE / ENDIF (Core nOpCount).
+                // including OP_IF / NOTIF / ELSE / ENDIF.
                 if enforce_op_limit && code > 0x60 {
                     op_count += 1;
                     if op_count > MAX_OPS_LEGACY {
@@ -821,7 +821,7 @@ pub(crate) fn eval_script(
                             continue;
                         }
                         require_n(stack, 1)?;
-                        // Core: CScriptNum(..., fRequireMinimal, 5) for locktime.
+                        // BIP65 locktime: 5-byte script integer, minimal encoding when required.
                         let locktime = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
                         if locktime < 0 {
                             return Err(ConsensusError::Script("CLTV negative".into()));
@@ -1116,7 +1116,7 @@ fn op_checkmultisig(
     Ok(())
 }
 
-/// Core `FindAndDelete`: remove every occurrence of a data-push of `data` from `script`.
+/// Remove every occurrence of a data-push of `data` from `script`.
 ///
 /// Used for legacy (Base) CHECKSIG / CHECKMULTISIG so a signature cannot sign itself
 /// when it appears inside scriptCode (mainnet block 290329: P2SH redeem embeds a sig).
@@ -1197,10 +1197,10 @@ fn script_code_bytes<'a>(ctx: &'a EvalContext<'_>) -> &'a [u8] {
     }
 }
 
-/// Core `CTransactionSignatureSerializer::SerializeScriptCode`: when hashing a
-/// legacy (BASE) scriptCode, **skip every `OP_CODESEPARATOR` opcode** (0xab).
+/// When hashing a legacy (BASE) scriptCode, **skip every `OP_CODESEPARATOR`
+/// opcode** (0xab).
 ///
-/// This is distinct from `pbegincodehash` truncation (which only drops bytes
+/// This is distinct from codeseparator truncation (which only drops bytes
 /// *before* the last executed CODESEPARATOR). Separators that remain *after*
 /// that point are still omitted from the serialized scriptCode. Without this,
 /// redeem scripts that embed CODESEPARATOR (e.g. mainnet block 443992 P2SH
@@ -1257,12 +1257,12 @@ pub(crate) fn strip_op_codeseparator(script: &[u8]) -> Vec<u8> {
 /// Legacy / witness-v0 CHECKSIG.
 ///
 /// Empty signature → soft false. Encoding failures under DERSIG / LOW_S /
-/// STRICTENC hard-fail (Core `CheckSignatureEncoding` / `CheckPubKeyEncoding`).
-/// NULLFAIL hard-fails a non-empty signature that does not verify.
+/// STRICTENC hard-fail. NULLFAIL hard-fails a non-empty signature that does not
+/// verify.
 ///
 /// `script_code_override`: when `Some`, use these bytes as scriptCode for sighash
 /// (CHECKMULTISIG pre-deletes **all** stack sigs). When `None`, Base path applies
-/// FindAndDelete of **this** signature only (Core EvalChecksigPreTapscript).
+/// FindAndDelete of **this** signature only.
 fn checksig_legacy(
     sig: &[u8],
     pubkey: &[u8],
@@ -1507,7 +1507,7 @@ fn scriptnum_encode(mut n: i64) -> Vec<u8> {
     out
 }
 
-/// Core `CheckMinimalPush`: data must use the shortest opcode form.
+/// Data must use the shortest opcode form.
 fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
     if data.is_empty() {
         return opcode == 0x00;
@@ -1537,7 +1537,7 @@ fn scriptnum_decode(v: &[u8], require_minimal: bool) -> Result<i64, ConsensusErr
 
 /// Decode a script number with explicit max byte length.
 /// CLTV/CSV use `max_len = 5` so full u32 locktime/sequence ranges encode as
-/// positive script numbers (Core `CScriptNum(..., 5)`).
+/// positive script numbers (5-byte width).
 fn scriptnum_decode_width(
     v: &[u8],
     max_len: usize,
@@ -1563,7 +1563,7 @@ fn scriptnum_decode_width(
     Ok(result)
 }
 
-/// Core `CScriptNum` fRequireMinimal encoding check.
+/// Minimal script-integer encoding (no extra leading zero bytes).
 fn scriptnum_is_minimal(vch: &[u8]) -> bool {
     if vch.is_empty() {
         return true;

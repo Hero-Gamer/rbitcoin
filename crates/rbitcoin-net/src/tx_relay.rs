@@ -412,7 +412,7 @@ pub struct MempoolHub {
     inv_flush: broadcast::Sender<()>,
     /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
-    /// Recently confirmed txid/wtxid for INV AlreadyHave (Core `m_recent_confirmed_transactions`).
+    /// Recently confirmed txid/wtxid for INV AlreadyHave.
     recent_confirmed: Mutex<RecentConfirmed>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
@@ -467,7 +467,7 @@ pub struct MempoolHub {
     fee_deltas: Mutex<HashMap<Txid, i64>>,
     /// Monotonic template generation (admit / remove / prioritise). GBT longpoll.
     template_updates: AtomicU64,
-    /// Core whitelist `noban` — INV immediately instead of waiting on mocktime.
+    /// INV immediately instead of waiting on mocktime.
     immediate_relay: AtomicBool,
     /// Last `setmocktime` (0 = wall). Used to age mempool txs for delayed INV.
     mock_now: AtomicU64,
@@ -476,9 +476,9 @@ pub struct MempoolHub {
     /// Monotonic accept generation for `p2p_tx_privacy` (skip pre-handshake txs).
     next_accept_gen: AtomicU64,
     accept_gen: Mutex<HashMap<Wtxid, u64>>,
-    /// Core `-mempoolexpiry` in seconds (default 336h).
+    /// Mempool expiry in seconds (default 336h).
     expiry_secs: AtomicU64,
-    /// Core `-minrelaytxfee` overlay (sat/kvB). Session FeeFilter reads this
+    /// Min-relay overlay (sat/kvB). Session FeeFilter reads this
     /// without taking `inner`.
     min_relay_sat_kvb: AtomicU64,
     /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
@@ -1889,7 +1889,7 @@ impl MempoolHub {
         n + gone.len()
     }
 
-    /// Unique txs parked waiting on missing parents (Core-class orphanage).
+    /// Unique txs parked waiting on missing parents.
     pub fn orphan_count(&self) -> usize {
         self.lock_read().orphan_count()
     }
@@ -1991,7 +1991,7 @@ impl MempoolHub {
         self.next_relay_seq.load(Ordering::Relaxed)
     }
 
-    /// Core `info_for_relay`: entry_sequence < peer's last INV sequence.
+    /// True when entry_sequence < peer's last INV sequence.
     pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
         self.relay_seq
             .lock()
@@ -2089,7 +2089,7 @@ impl MempoolHub {
         self.template_updates.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Generation for `getblocktemplate.longpollid` (Core `nTransactionsUpdated`).
+    /// Generation for `getblocktemplate.longpollid`.
     pub fn template_updates(&self) -> u64 {
         self.template_updates.load(Ordering::Relaxed)
     }
@@ -2317,12 +2317,12 @@ impl MempoolHub {
         Some((stats, a_mod, d_mod, chunk_fee, chunk_w))
     }
 
-    /// Core `-limitclustercount` / `-limitclustersize` overlay (None = keep default).
+    /// Cluster count/size overlay (`None` = keep default).
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
         self.lock_write().set_cluster_limits(count, size_kvb);
     }
 
-    /// Core `-minrelaytxfee` overlay (sat/kvB). `0` admits any non-negative fee.
+    /// Min-relay overlay (sat/kvB). `0` admits any non-negative fee.
     pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
         self.min_relay_sat_kvb.store(sat_kvb, Ordering::Release);
         self.lock_write().set_min_relay_sat_kvb(sat_kvb);
@@ -2348,7 +2348,7 @@ impl MempoolHub {
         Some(set.into_iter().collect())
     }
 
-    /// Direct in-mempool parents and children (Core `depends` / `spentby`).
+    /// Direct in-mempool parents and children (`depends` / `spentby`).
     pub fn depends_spentby(&self, txid: &Txid) -> Option<(Vec<Txid>, Vec<Txid>)> {
         let g = self.lock_read();
         let e = g.graph.get(txid)?;
@@ -2423,7 +2423,7 @@ impl MempoolHub {
         }
     }
 
-    /// Core `mockscheduler`: re-INV still-unbroadcast local txs (15m due-now).
+    /// Re-INV still-unbroadcast local txs (15m due-now).
     pub fn rebroadcast_unbroadcast(&self) {
         let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().iter().copied().collect();
         for txid in ids {
@@ -3405,7 +3405,7 @@ mod tests {
         hub.set_relay_enabled(true);
         assert!(hub.relay_enabled());
         assert_eq!(hub.live_count(), 0);
-        // Without chain UTXO, accept parks as orphan (Core-class soft path).
+        // Without chain UTXO, accept parks as orphan (soft path).
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,

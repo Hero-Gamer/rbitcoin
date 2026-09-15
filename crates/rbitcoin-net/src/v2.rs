@@ -73,7 +73,7 @@ pub fn v2_packet_decryption_failure_log() -> &'static str {
     "V2 transport error: packet decryption failure"
 }
 
-/// Raw TCP bytes observed after connect (Core `nRecvBytes` / `nSendBytes`).
+/// Raw TCP bytes observed after connect.
 #[derive(Clone, Debug)]
 pub struct WireBytes {
     pub recv: Arc<AtomicU64>,

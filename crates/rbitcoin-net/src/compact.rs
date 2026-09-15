@@ -298,7 +298,7 @@ pub struct CmpctFillSets {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CmpctReconstructStats {
     pub hash: BlockHash,
-    pub ntx: usize,
+    pub tx_count: usize,
     pub getdata: bool,
     pub missing_n: usize,
     pub prefill_n: usize,
@@ -319,7 +319,7 @@ impl Default for CmpctReconstructStats {
     fn default() -> Self {
         Self {
             hash: BlockHash::from_byte_array([0; 32]),
-            ntx: 0,
+            tx_count: 0,
             getdata: false,
             missing_n: 0,
             prefill_n: 0,
@@ -349,9 +349,9 @@ impl fmt::Display for CmpctReconstructStats {
         } else {
             write!(
                 f,
-                "cmpct reconstruct {} ntx={} prefill={}/{} mempool={}/{} extra={}/{} orphan={}/{} redundant_prefill={}/{} fetched={}/{}",
+                "cmpct reconstruct {} tx={} prefill={}/{} mempool={}/{} extra={}/{} orphan={}/{} redundant_prefill={}/{} fetched={}/{}",
                 self.hash,
-                self.ntx,
+                self.tx_count,
                 self.prefill_n,
                 self.prefill_bytes,
                 self.mempool_n,
@@ -374,10 +374,10 @@ fn tx_wire_len(tx: &Transaction) -> usize {
 }
 
 /// Operator line for an outbound `cmpctblock` (announce or getdata serve).
-pub fn cmpct_send_line(hash: BlockHash, ntx: usize, hsi: &HeaderAndShortIds) -> String {
+pub fn cmpct_send_line(hash: BlockHash, tx_count: usize, hsi: &HeaderAndShortIds) -> String {
     let prefill_n = hsi.prefilled_txs.len();
     let prefill_bytes: usize = hsi.prefilled_txs.iter().map(|p| tx_wire_len(&p.tx)).sum();
-    format!("cmpct announce {hash} ntx={ntx} prefill={prefill_n}/{prefill_bytes}")
+    format!("cmpct announce {hash} tx={tx_count} prefill={prefill_n}/{prefill_bytes}")
 }
 
 /// Fallback to full `getdata` after compact reconstruct failed.
@@ -404,7 +404,7 @@ pub fn reconstruct_stats(
     let fetched: HashSet<usize> = fetched_indexes.iter().map(|i| *i as usize).collect();
     let mut stats = CmpctReconstructStats {
         hash: block.block_hash(),
-        ntx: block.txdata.len(),
+        tx_count: block.txdata.len(),
         ..CmpctReconstructStats::default()
     };
     for (abs, tx) in block.txdata.iter().enumerate() {
@@ -1042,7 +1042,8 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("fetched=0/0"), "{line}");
-        assert!(line.contains("ntx=3"), "{line}");
+        assert!(line.contains("tx=3"), "{line}");
+        assert!(!line.contains("ntx="), "{line}");
     }
 
     #[test]
@@ -1141,7 +1142,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "cmpct announce {} ntx=2 prefill=2/{pref_bytes}",
+                "cmpct announce {} tx=2 prefill=2/{pref_bytes}",
                 block.block_hash()
             )
         );

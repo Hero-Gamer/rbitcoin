@@ -1,4 +1,4 @@
-//! Pure-Rust script / signature verification (no libbitcoinconsensus).
+//! Pure-Rust script / signature verification.
 //!
 //! Verification is a pure function of `(tx, input_index, prevout TxOut)`.
 //! Prevouts are resolved by connect (wave / light UTXO create_fk /
@@ -87,9 +87,9 @@ fn annotate_script_err(
 ///
 /// Layout (one classify, no dual typed/bare routes for the same program):
 /// 1. If `witness_active` and spk is a BIP141 program → typed/unknown-version path
-///    (malleation / wrong length / discourage / ACS). Never EvalScript as bare.
+///    (malleation / wrong length / discourage / ACS). Never interpret as a bare script.
 /// 2. Else classify once → P2PKH / P2SH / bare. Pre-segwit (`!witness_active`),
-///    v0/v1 program templates fall through to bare EvalScript like Core.
+///    v0/v1 program templates fall through to the bare interpreter.
 #[inline]
 fn sighash_cache<'a, 't>(
     cache: &'a mut Option<bitcoin::sighash::SighashCache<&'t Transaction>>,
@@ -129,9 +129,9 @@ pub(crate) fn verify_input<'a>(
         ScriptKind::P2pkh => {
             // Fast path: exact `<sig> <pubkey>` scriptSig. Historical mainnet has
             // non-standard P2PKH scriptSigs that still leave a valid stack for
-            // scriptPubKey (e.g. height 218596: "p2pkh scriptSig len"). Core always
-            // EvalScript(scriptSig)+EvalScript(scriptPubKey) — fall back only for
-            // scriptSig *shape* errors (not DER/ECDSA), so bip66 failure codes stay.
+            // scriptPubKey (e.g. height 218596: "p2pkh scriptSig len"). Fall back
+            // only for scriptSig *shape* errors (not DER/ECDSA), so bip66 failure
+            // codes stay.
             match p2pkh::verify(job, input_index, tx, sighash_cache(cache, tx)) {
                 Ok(()) => Ok(()),
                 Err(e) if p2pkh_scriptsig_shape_error(&e) => {
@@ -203,7 +203,7 @@ fn verify_native_witness<'a>(
 }
 
 /// True when the P2PKH fast path failed because scriptSig is not exactly two
-/// data pushes (still may be valid under full EvalScript like Core).
+/// data pushes (still may be valid under the full interpreter).
 fn p2pkh_scriptsig_shape_error(err: &ConsensusError) -> bool {
     match err {
         ConsensusError::Script(msg) => {
@@ -222,11 +222,11 @@ fn verify_bare(
     tx: &Transaction,
     prevout: &TxOut,
 ) -> Result<(), ConsensusError> {
-    // Core `VerifyScript`: fully **EvalScript(scriptSig)** then **EvalScript(scriptPubKey)**
-    // with a shared stack. scriptSig is **not** push-only in consensus for bare spends
-    // (SIGPUSHONLY is policy / BIP16-P2SH only). Mainnet block 163685 has bare spends
-    // whose scriptSig runs `OP_CODESEPARATOR` + `OP_CHECKMULTISIG` (sig left of codesep;
-    // pubkey script after), then a pre-BIP65 `OP_NOP2`/`CLTV`+`DROP` scriptPubKey.
+    // Fully run scriptSig, then scriptPubKey, sharing one stack. scriptSig is
+    // not push-only in consensus for bare spends (SIGPUSHONLY is policy / BIP16-P2SH
+    // only). Mainnet block 163685 has bare spends whose scriptSig runs
+    // `OP_CODESEPARATOR` + `OP_CHECKMULTISIG` (sig left of codesep; pubkey script
+    // after), then a pre-BIP65 `OP_NOP2`/`CLTV`+`DROP` scriptPubKey.
     let input = &tx.input[input_index];
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let ss = input.script_sig.as_script();
@@ -299,7 +299,7 @@ pub(crate) mod crypto {
         Ok((sig, sighash_ty))
     }
 
-    /// BIP66 / Bitcoin Core `IsValidSignatureEncoding`.
+    /// BIP66 strict DER signature encoding.
     ///
     /// `sig` is the full scriptSig push including the trailing hashtype byte.
     /// Rejects non-minimal integer encodings (high-bit without `0x00` pad, excess
@@ -358,7 +358,7 @@ pub(crate) mod crypto {
         PublicKey::from_slice(raw).map_err(|_| ConsensusError::Script("pubkey".into()))
     }
 
-    /// Core `IsLowDERSignature` S half: true when S ≤ n/2 (already low).
+    /// True when S ≤ n/2 (already low).
     ///
     /// Compares compact form before/after libsecp `normalize_s` (this crate's
     /// `normalize_s` returns `()`, not a bool).
@@ -369,7 +369,7 @@ pub(crate) mod crypto {
         before == n.serialize_compact()
     }
 
-    /// Core `IsDefinedHashtypeSignature`: base type in {ALL,NONE,SINGLE}, optional ACP.
+    /// Base hashtype in {ALL,NONE,SINGLE}, optional ACP.
     pub fn is_defined_hashtype(sig_raw: &[u8]) -> bool {
         if sig_raw.is_empty() {
             return false;
@@ -379,8 +379,7 @@ pub(crate) mod crypto {
         (1..=3).contains(&base) // ALL=1 NONE=2 SINGLE=3
     }
 
-    /// Core `IsCompressedOrUncompressedPubKey` (STRICTENC): 02/03+32 or 04+64.
-    /// Hybrid 06/07 keys are rejected.
+    /// STRICTENC: 02/03+32 or 04+64. Hybrid 06/07 keys are rejected.
     pub fn is_compressed_or_uncompressed_pubkey(pk: &[u8]) -> bool {
         match pk.first() {
             Some(0x02 | 0x03) if pk.len() == 33 => true,
@@ -389,7 +388,7 @@ pub(crate) mod crypto {
         }
     }
 
-    /// Core `IsCompressedPubKey` (WITNESS_PUBKEYTYPE): 02/03 + 32 bytes only.
+    /// WITNESS_PUBKEYTYPE: 02/03 + 32 bytes only.
     pub fn is_compressed_pubkey(pk: &[u8]) -> bool {
         matches!(pk.first(), Some(0x02 | 0x03)) && pk.len() == 33
     }

@@ -42,10 +42,10 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
 
-/// Core `10 * AVG_ADDRESS_BROADCAST_INTERVAL` (30s) for addr-fetch lifetime.
+/// Addr-fetch sessions expire after this many seconds.
 const ADDRFETCH_TIMEOUT_SECS: u64 = 300;
 
-/// Core `MAX_BLOCKS_TO_ANNOUNCE`: more than this on a reorg falls back to inv.
+/// On a reorg larger than this, announce via inv instead of a header list.
 const MAX_BLOCKS_TO_ANNOUNCE: u32 = 8;
 
 /// True when a session error is a missing store row (not peer malice / corrupt IO).
@@ -63,8 +63,12 @@ pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
     }
 }
 
-/// Per-session misbehavior score that triggers disconnect (Core-like order).
+/// Per-session misbehavior score that triggers disconnect.
 pub const BAN_SCORE_THRESHOLD: u32 = 100;
+
+pub(crate) fn misbehavior_disconnect_log(peer: &str, score: u32) -> String {
+    format!("p2p: {peer} misbehavior {score} ≥ {BAN_SCORE_THRESHOLD} — disconnect")
+}
 
 /// `-blocksonly` (relay off, no whitelist `relay`) or a block-relay-only
 /// session must not receive txs / tx invs (`p2p_blocksonly`).
@@ -179,10 +183,10 @@ pub fn local_service_flags() -> ServiceFlags {
     crate::seeds::required_seed_services()
 }
 
-/// Core `NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` (~24h at 10m spacing).
+/// NETWORK_LIMITED is enough when the tip is shallower than this (~24h at 10m).
 pub const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: i64 = 144;
 
-/// Core `CNode::ExpectServicesFromConn`.
+/// Outbound-full, block-relay, and addr-fetch sessions must offer NETWORK.
 pub fn expect_services_from_conn(typ: crate::peers::PeerConnType) -> bool {
     matches!(
         typ,
@@ -192,7 +196,7 @@ pub fn expect_services_from_conn(typ: crate::peers::PeerConnType) -> bool {
     )
 }
 
-/// Core `PeerManagerImpl::GetDesirableServiceFlags`.
+/// Service bits we want from a peer given what they offered and how deep the tip is.
 pub fn desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> ServiceFlags {
     if offered.has(ServiceFlags::NETWORK_LIMITED)
         && tip_depth_blocks < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
@@ -203,7 +207,7 @@ pub fn desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> 
     }
 }
 
-/// Core `PeerManagerImpl::HasAllDesirableServiceFlags`.
+/// Whether offered flags already include what we want for this tip depth.
 pub fn has_all_desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: i64) -> bool {
     let want = desirable_service_flags(offered, tip_depth_blocks);
     offered.has(want)
@@ -225,14 +229,12 @@ pub fn version_handshake_timeout_log(peer: u64) -> String {
     format!("version handshake timeout, disconnecting peer={peer}")
 }
 
-/// Copied from Core `src/net_processing.cpp` `MAX_ADDR_TO_SEND`.
-/// Max addresses in one ADDR / addrv2. Interop copy — do not change without
+/// Max addresses in one ADDR / addrv2. Interop size — do not change without
 /// a named reason to diverge (see COMPAT.md).
 pub const MAX_ADDR_TO_SEND: usize = 1000;
 
-/// Copied from Core `src/net_processing.cpp` `MAX_PCT_ADDR_TO_SEND`.
 /// GetAddr returns at most this percent of AddrMan (then `MAX_ADDR_TO_SEND`).
-/// Interop copy — do not change without a named reason to diverge
+/// Interop size — do not change without a named reason to diverge
 /// (see COMPAT.md).
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
@@ -260,7 +262,7 @@ pub fn unsupported_before_verack_log(cmd: &str, peer: u64) -> String {
     format!("Unsupported message \"{cmd}\" prior to verack from peer={peer}")
 }
 
-/// Core `MIN_PEER_PROTO_VERSION` (31800).
+/// Disconnect peers advertising protocol version below this.
 pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
 
 pub fn obsolete_version_log(version: i32, peer: u64) -> String {
@@ -324,7 +326,7 @@ pub fn non_version_before_handshake_log(cmd: &str, peer: u64) -> String {
     format!("non-version message before version handshake. Message \"{cmd}\" from peer={peer}")
 }
 
-/// Core `ApproximateBestBlockDepth`: `(now - tip_time) / pow_target_spacing`.
+/// Tip age in blocks: `(now - tip_time) / pow_target_spacing`.
 pub fn approximate_best_block_depth(hub: &ChainHub) -> i64 {
     let Some(h) = hub.tip_header() else {
         return i64::MAX;
@@ -1400,11 +1402,11 @@ pub async fn peer_session_with(
                         Err(NetError::MessageTooLarge(n)) => {
                             follow.ban_score = follow.ban_score.saturating_add(OVERSIZE_BAN_SCORE);
                             rbitcoin_log::warn!(
-                                "p2p: {peer_s} oversize frame ({n}) ban_score={}",
+                                "p2p: {peer_s} oversize frame ({n}) misbehavior={}",
                                 follow.ban_score
                             );
                             if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                                return Err(NetError::Protocol("peer ban score threshold"));
+                                return Err(NetError::Protocol("peer misbehavior threshold"));
                             }
                             return Err(NetError::MessageTooLarge(n));
                         }
@@ -1427,11 +1429,11 @@ pub async fn peer_session_with(
                     if !rate.note(frame_len) {
                         follow.ban_score = follow.ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
                         rbitcoin_log::warn!(
-                            "p2p: {peer_s} rate limit exceeded ban_score={}",
+                            "p2p: {peer_s} rate limit exceeded misbehavior={}",
                             follow.ban_score
                         );
                         if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                            return Err(NetError::Protocol("peer ban score threshold"));
+                            return Err(NetError::Protocol("peer misbehavior threshold"));
                         }
                         continue;
                     }
@@ -1467,10 +1469,10 @@ pub async fn peer_session_with(
                     }
                     if follow.ban_score >= BAN_SCORE_THRESHOLD {
                         rbitcoin_log::warn!(
-                            "p2p: {peer_s} ban score {} ≥ {BAN_SCORE_THRESHOLD} — disconnect",
-                            follow.ban_score
+                            "{}",
+                            misbehavior_disconnect_log(&peer_s, follow.ban_score)
                         );
-                        return Err(NetError::Protocol("peer ban score threshold"));
+                        return Err(NetError::Protocol("peer misbehavior threshold"));
                     }
                 }
             }
@@ -1976,7 +1978,7 @@ fn queue_due_tx_invs(
         }
     }
     if n > 0 {
-        // Core `m_last_inv_sequence`: only txs that existed at INV time.
+        // Only INV txs that existed when this INV was built.
         // Never snap to current_relay_seq() — a later accept can race in
         // and make the new entry servable (mempool_reorg.py:122).
         session.note_tx_inv_seq(max_ann.max(session.last_inv_sequence()));
@@ -3325,9 +3327,9 @@ fn cmpct_announce_msg(
     cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
-/// Core `NewPoWValidBlock`: send `cmpctblock` to HB peers as soon as a
-/// reconstructed/received body has a PoW-valid header that extends our tip,
-/// **before** `tip-accept` connect. Does not mark the block connected.
+/// Send `cmpctblock` to HB peers as soon as a reconstructed/received body has
+/// a PoW-valid header that extends our tip, **before** `tip-accept` connect.
+/// Does not mark the block connected.
 ///
 /// Only the current tip-child (not a reorg branch). Sender is skipped.
 fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate::peers::LivePeer>) {
@@ -4031,16 +4033,16 @@ fn encode_served_witness_block(
     crate::reactor::assert_not_reactor("getdata reconstruct");
     let t0 = std::time::Instant::now();
     if let Some(block) = cache.get_block(hash) {
-        let ntx = block.txdata.len() as u32;
+        let tx_count = block.txdata.len() as u32;
         let encoded = crate::v2::encode_v2_contents(NetworkMessage::Block(block))?;
         let payload_len = encoded.len().saturating_sub(1);
-        crate::serve_perf::note_serve(ntx, payload_len, t0.elapsed().as_nanos());
+        crate::serve_perf::note_serve(tx_count, payload_len, t0.elapsed().as_nanos());
         return Ok(Some(encoded));
     }
     match query.witness_block_bytes_by_hash(&hash.to_byte_array()) {
         Ok(Some(payload)) => {
-            let ntx = payload_tx_count(&payload);
-            crate::serve_perf::note_serve(ntx, payload.len(), t0.elapsed().as_nanos());
+            let tx_count = payload_tx_count(&payload);
+            crate::serve_perf::note_serve(tx_count, payload.len(), t0.elapsed().as_nanos());
             let mut contents = Vec::with_capacity(1 + payload.len());
             contents.push(2);
             contents.extend_from_slice(&payload);

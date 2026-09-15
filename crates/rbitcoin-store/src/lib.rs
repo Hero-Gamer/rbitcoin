@@ -1,4 +1,4 @@
-//! Map-free relational store (libbitcoin-class tables; fd pread/pwrite + uring).
+//! Map-free relational store (Class A/B/C; fd pread/pwrite + uring).
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.

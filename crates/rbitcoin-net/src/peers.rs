@@ -82,12 +82,12 @@ impl<T> CappedSet<T> {
     }
 }
 
-/// How we classified the session (Core `connection_type`).
+/// How we classified the session (`getpeerinfo.connection_type`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerConnType {
     Inbound,
     OutboundFullRelay,
-    /// Core `addnode` / `connect_nodes` (`connection_type` = `manual`).
+    /// Operator addnode / connect (`connection_type` = `manual`).
     Manual,
     BlockRelay,
     AddrFetch,
@@ -170,15 +170,15 @@ pub struct LivePeer {
     pub hb_from: AtomicBool,
     /// Session should send `sendcmpct` (`PendingSendCmpct` as u8).
     pub pending_sendcmpct: std::sync::atomic::AtomicU8,
-    /// Last header we announced to this peer (Core `pindexBestHeaderSent`).
+    /// Last header we announced to this peer.
     best_header_sent: Mutex<Option<BlockHash>>,
-    /// Best connected block this peer advertised (Core `pindexBestKnownBlock`).
+    /// Best connected block this peer advertised.
     best_known: Mutex<Option<BlockHash>>,
     /// Block hashes this peer just sent us — do not announce them back.
     recently_from: Mutex<HashSet<BlockHash>>,
     /// We already sent inv-triggered getheaders this session (before sync).
     inv_asked_headers: AtomicBool,
-    /// Core `fSyncStarted` — this peer is the initial headers-sync peer.
+    /// This session is the headers-sync peer (or one of them after catch-up).
     sync_started: AtomicBool,
     /// Unix seconds when initial headers sync times out (`0` = none).
     headers_sync_timeout: AtomicU64,
@@ -189,19 +189,19 @@ pub struct LivePeer {
     announced_wtx: Mutex<CappedSet<Wtxid>>,
     /// Compact fill slots taken by this session (hub-global `cmpct_fills`).
     taken_cmpct: Mutex<Vec<BlockHash>>,
-    /// Mempool sequence at last tx INV (Core `m_last_inv_sequence`, starts at 1).
+    /// Mempool sequence at last tx INV (starts at 1).
     last_inv_sequence: AtomicU64,
-    /// Queued tx INV hashes not yet sent (Core `m_tx_inventory_to_send`).
+    /// Queued tx INV hashes not yet sent.
     inv_to_send: AtomicU32,
     /// Last clock we considered for delayed tx INV (`0` = not initialized).
     last_tx_inv_now: AtomicU64,
     /// Set when mocktime jumps; next ping/tick announces mempool txs.
     tx_inv_requested: AtomicBool,
-    /// Outstanding ping nonce (`0` = none). Core `m_ping_nonce_sent`.
+    /// Outstanding ping nonce (`0` = none).
     ping_nonce_sent: AtomicU64,
-    /// When the last ping was sent, or `0` if never (`m_ping_start` seconds).
+    /// When the last ping was sent, or `0` if never.
     ping_start_secs: AtomicU64,
-    /// RPC `ping` queued a probe (`m_ping_queued`).
+    /// RPC `ping` queued a probe.
     ping_queued: AtomicBool,
     pingtime: Mutex<Option<f64>>,
     minping: Mutex<Option<f64>>,
@@ -222,7 +222,7 @@ pub struct LivePeer {
     inflight: Mutex<Vec<u32>>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
     out_tx: Mutex<Option<mpsc::UnboundedSender<PeerOut>>>,
-    /// Unix seconds when this session was registered (Core `m_connected`).
+    /// Unix seconds when this session was registered.
     connected_at: AtomicU64,
     /// Skip INV for mempool txs with `accept_gen < floor` (post-verack privacy).
     inv_gen_floor: AtomicU64,
@@ -363,7 +363,7 @@ impl LivePeer {
         self.wtxid_relay.load(Ordering::Relaxed)
     }
 
-    /// Core `MaybeSendAddr` local-address timer (`AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL`).
+    /// Whether the local-address broadcast timer has elapsed (~24h).
     pub fn take_local_addr_due(&self, now: u64) -> Option<SocketAddr> {
         const DAY: u64 = 24 * 60 * 60;
         let hub = self.owner.upgrade()?;
@@ -551,7 +551,7 @@ impl LivePeer {
         self.services & service_flags_u64(ServiceFlags::NETWORK) != 0
     }
 
-    /// Core `CanServeBlocks`: NETWORK or NETWORK_LIMITED.
+    /// NETWORK or NETWORK_LIMITED — this peer can serve blocks.
     pub fn can_serve_blocks(&self) -> bool {
         let net = service_flags_u64(ServiceFlags::NETWORK);
         let lim = service_flags_u64(ServiceFlags::NETWORK_LIMITED);
@@ -750,7 +750,7 @@ impl LivePeer {
         self.age_inv_seen_gen.store(gen, Ordering::Relaxed);
     }
 
-    /// Core `MaybeSendPing`: timeout first, then RPC-queued / interval probe.
+    /// Timeout first, then RPC-queued / interval probe.
     ///
     /// Never-sent peers keep `ping_start_secs == 0`, so any `now_secs` above
     /// 120 is interval-due (same comparison as a last ping at Unix epoch 0).
@@ -899,7 +899,7 @@ impl LivePeer {
     }
 }
 
-/// Result of Core `MaybeSendPing`.
+/// Result of [`LivePeer::take_ping_action`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PingAction {
     Send { nonce: u64 },
@@ -954,19 +954,19 @@ pub struct PeerInfo {
     pub last_transaction: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,
-    /// Core `m_last_inv_sequence` (`getpeerinfo.last_inv_sequence`).
+    /// `getpeerinfo.last_inv_sequence`.
     pub last_inv_sequence: u64,
-    /// Core `m_tx_inventory_to_send` size (`getpeerinfo.inv_to_send`).
+    /// `getpeerinfo.inv_to_send` (queued tx INV count).
     pub inv_to_send: u32,
     /// Raw TCP bytes (`getpeerinfo.bytesrecv`), including BIP324 handshake.
     pub bytesrecv: u64,
     /// Raw TCP bytes (`getpeerinfo.bytessent`), including BIP324 handshake.
     pub bytessent: u64,
-    /// Core whitelist permission strings (`relay`, `noban`, …).
+    /// RPC permission strings (`relay`, `noban`, …).
     pub permissions: Vec<String>,
     /// Block heights in flight from this peer (`getpeerinfo.inflight`).
     pub inflight: Vec<u32>,
-    /// Core `mapped_as` when an asmap mapped this peer (omit/`None` otherwise).
+    /// `getpeerinfo.mapped_as` when an asmap mapped this peer (omit/`None` otherwise).
     pub mapped_as: Option<u32>,
 }
 
@@ -981,15 +981,15 @@ pub struct PeerHub {
     hb_selected: Mutex<Vec<u64>>,
     /// `setmocktime` seconds; `0` means wall clock.
     mock_now: AtomicU64,
-    /// Core `nSyncStarted`.
-    n_sync_started: AtomicU64,
+    /// Count of sessions currently in headers-sync.
+    headers_sync_peers: AtomicU64,
     /// Last inv hash that started headers sync with a not-yet-sync peer.
     last_inv_headers_sync: Mutex<Option<BlockHash>>,
-    /// Core whitelist `noban` — do not disconnect a stalling headers-sync peer.
+    /// Trusted inbound — do not disconnect a stalling headers-sync peer.
     noban: AtomicBool,
-    /// Core whitelist `relay` — accept txs even when the node is `-blocksonly`.
+    /// Accept txs even when the node is blocks-only.
     relay_perm: AtomicBool,
-    /// Core whitelist `forcerelay` — no outbound `feefilter` (relay all).
+    /// No outbound `feefilter` (relay all).
     forcerelay_perm: AtomicBool,
     /// Parallel compact-fill slots per block: up to 2 inbound + 1 outbound.
     cmpct_fills: Mutex<HashMap<BlockHash, (u8, bool)>>,
@@ -1000,11 +1000,11 @@ pub struct PeerHub {
     /// Per-listen GetAddr cache: canonical bind → (cached_at, addrs).
     addr_response_cache:
         Mutex<HashMap<SocketAddr, (u64, Vec<(u32, bitcoin::p2p::address::Address)>)>>,
-    /// Core `-peertimeout` seconds (VERSION/VERACK). Default 60.
+    /// VERSION/VERACK handshake timeout seconds. Default 60.
     peer_timeout_secs: AtomicU64,
-    /// Core `-externalip` addresses we advertise (`getnetworkinfo.localaddresses`).
+    /// Addresses we advertise (`getnetworkinfo.localaddresses`).
     external_ips: Mutex<Vec<IpAddr>>,
-    /// P2P listen port used with `-externalip`.
+    /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
 }
@@ -1064,7 +1064,7 @@ impl PeerHub {
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
             mock_now: AtomicU64::new(0),
-            n_sync_started: AtomicU64::new(0),
+            headers_sync_peers: AtomicU64::new(0),
             last_inv_headers_sync: Mutex::new(None),
             noban: AtomicBool::new(false),
             relay_perm: AtomicBool::new(false),
@@ -1100,7 +1100,7 @@ impl PeerHub {
         self.listen_port.store(port, Ordering::Relaxed);
     }
 
-    /// Core `LOCAL_MANUAL` (`-externalip`) rows for `getnetworkinfo.localaddresses`.
+    /// `getnetworkinfo.localaddresses` rows for operator-advertised IPs.
     pub fn rpc_local_addresses(&self) -> Vec<(String, u16, i32)> {
         const LOCAL_MANUAL: i32 = 4;
         let port = self.listen_port.load(Ordering::Relaxed);
@@ -1221,7 +1221,7 @@ impl PeerHub {
             .remove(&nonce);
     }
 
-    /// Core `CConnman::CheckIncomingNonce`: `false` means connected to self.
+    /// `false` means this inbound nonce matches an outbound handshake (self-connect).
     pub fn check_incoming_nonce(&self, nonce: u64) -> bool {
         !self
             .pending_outbound_nonces
@@ -1274,7 +1274,7 @@ impl PeerHub {
         self.noban.store(v, Ordering::Relaxed);
     }
 
-    /// Core whitelist `noban` — bypass low-work header anti-DoS.
+    /// Bypass low-work header anti-DoS.
     pub fn is_noban(&self) -> bool {
         self.noban.load(Ordering::Relaxed)
     }
@@ -1283,7 +1283,7 @@ impl PeerHub {
         self.relay_perm.store(v, Ordering::Relaxed);
     }
 
-    /// Core whitelist `relay` — P2P txs allowed while `-blocksonly`.
+    /// P2P txs allowed while the node is blocks-only.
     pub fn is_relay_perm(&self) -> bool {
         self.relay_perm.load(Ordering::Relaxed)
     }
@@ -1292,7 +1292,7 @@ impl PeerHub {
         self.forcerelay_perm.store(v, Ordering::Relaxed);
     }
 
-    /// Core whitelist `forcerelay` — do not send `feefilter`.
+    /// Do not send `feefilter`.
     pub fn is_forcerelay_perm(&self) -> bool {
         self.forcerelay_perm.load(Ordering::Relaxed)
     }
@@ -1317,14 +1317,14 @@ impl PeerHub {
             // Two sessions can observe 0 after a noban timeout; only one
             // extra getheaders (`p2p_initial_headers_sync` count==1).
             if self
-                .n_sync_started
+                .headers_sync_peers
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
                 return false;
             }
         } else {
-            self.n_sync_started.fetch_add(1, Ordering::Relaxed);
+            self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
         }
         peer.sync_started.store(true, Ordering::Relaxed);
         let timeout = crate::chain::headers_download_timeout_secs(now, best_header_time);
@@ -1354,13 +1354,13 @@ impl PeerHub {
 
     fn end_headers_sync(&self, peer: &LivePeer) {
         if peer.sync_started.swap(false, Ordering::Relaxed) {
-            self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
+            self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
             peer.headers_sync_timeout.store(0, Ordering::Relaxed);
         }
     }
 
     fn check_headers_sync_timeouts(&self, now: u64) {
-        let n = self.n_sync_started.load(Ordering::Relaxed);
+        let n = self.headers_sync_peers.load(Ordering::Relaxed);
         if n != 1 {
             return;
         }
@@ -1389,7 +1389,7 @@ impl PeerHub {
                 // In-flight getheaders timed out; allow a new one
                 // (`p2p_initial_headers_sync` noban recipient).
                 let _ = p.take_awaiting_headers();
-                self.n_sync_started.fetch_sub(1, Ordering::Relaxed);
+                self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
             } else {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_disconnect_log(p.id));
                 p.request_disconnect();
@@ -1472,7 +1472,7 @@ impl PeerHub {
         *self.dial_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
-    /// Placeholder row after TCP connect, before VERSION (Core `CNode` timing).
+    /// Placeholder row after TCP connect, before VERSION.
     pub fn register_connecting(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -1820,7 +1820,7 @@ impl PeerHub {
         true
     }
 
-    /// Core `AttemptToEvictConnection`: disconnect one unprotected inbound.
+    /// Disconnect one unprotected inbound when inbound slots are full.
     pub fn try_evict_inbound(&self) -> bool {
         let noban = self.is_noban();
         let now = self.now_secs();

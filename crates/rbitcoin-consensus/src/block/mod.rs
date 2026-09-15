@@ -340,7 +340,7 @@ pub fn legacy_sigop_count(tx: &Transaction) -> u64 {
 
 pub(crate) use rbitcoin_primitives::script_sigop_count;
 
-/// Last push in a script for P2SH/BIP141 sigops (Core `CScript::GetSigOpCount(scriptSig)`).
+/// Last push in a script for P2SH/BIP141 sigops.
 ///
 /// Opcode `> OP_16` or a truncated push → no redeem (0 sigops). OP_N / OP_1NEGATE
 /// count as an empty push.
@@ -480,10 +480,10 @@ fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool, segwit: bool
     n
 }
 
-/// GBT `sigops`: Core `GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR`.
+/// GBT `sigops`: legacy sigop count × witness scale factor.
 ///
-/// Full `GetTransactionSigOpCost` also adds P2SH/witness when prevouts are
-/// known; template rows use this scaled legacy count (P2PK output = 4).
+/// Full sigop cost also adds P2SH/witness when prevouts are known; template
+/// rows use this scaled legacy count (P2PK output = 4).
 pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
     legacy_sigop_count(tx).saturating_mul(4)
 }
@@ -550,13 +550,8 @@ pub(crate) fn merkle_root_bytes(leaves: &[[u8; 32]]) -> [u8; 32] {
     rbitcoin_store::merkle_root_from_txids(leaves)
 }
 
-/// BIP34: coinbase scriptSig must start with the block height, encoded as Bitcoin
-/// Core's `CScript << int64` push (not raw CScriptNum for small values).
-///
-/// Core `CScript::push_int64`:
-/// - 0 → `OP_0` (0x00)
-/// - 1..=16 → `OP_1`..=`OP_16` (0x51..=0x60)
-/// - else → minimal CScriptNum (`len || little-endian bytes`, sign-aware)
+/// BIP34: coinbase scriptSig must start with the block height as a script integer
+/// push: 0 → `OP_0`; 1..=16 → `OP_1`..=`OP_16`; else minimal sign-aware little-endian.
 pub(crate) fn check_bip34_coinbase(
     coinbase: &Transaction,
     height: u32,
@@ -1659,9 +1654,9 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 
 /// Whether this job can skip `verify_job_all_inputs`.
 ///
-/// OP_TRUE scriptPubKey alone is **not** sufficient: Core still
-/// `EvalScript(scriptSig)` (CLTV/CSV may live there). Only skip when every
-/// input is a pure ACS spend (empty scriptSig + empty witness + OP_TRUE spk).
+/// OP_TRUE scriptPubKey alone is **not** sufficient: scriptSig still runs
+/// (CLTV/CSV may live there). Only skip when every input is a pure ACS spend
+/// (empty scriptSig + empty witness + OP_TRUE spk).
 #[inline]
 fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
     let tx: &bitcoin::Transaction = &job.tx;
@@ -1710,7 +1705,7 @@ struct ResolvedPrevout {
 /// BIP65/113 nLockTime threshold: values below are block heights, above are unix times.
 pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
-/// Core `IsFinalTx`: absolute locktime vs block height / time cutoff.
+/// Absolute locktime vs block height / time cutoff.
 ///
 /// `lock_time_cutoff` is the comparison time: **MTP of the previous block** after
 /// BIP113 (CSV package), else the block header timestamp.

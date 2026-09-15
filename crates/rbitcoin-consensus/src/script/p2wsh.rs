@@ -30,10 +30,10 @@ pub(crate) fn verify_with_scripthash(
     if input.witness.is_empty() {
         return Err(ConsensusError::Script("p2wsh empty witness".into()));
     }
-    // Core `VerifyWitnessProgram` P2WSH: pop witnessScript first, then enforce
-    // MAX_SCRIPT_ELEMENT_SIZE on the **remaining** stack only. The witnessScript
-    // itself may exceed 520 (capped by MAX_SCRIPT_SIZE 10_000 during eval) —
-    // applying 520 to the script rejects valid mainnet spends (e.g. h=842472).
+    // P2WSH: pop witnessScript first, then enforce MAX_SCRIPT_ELEMENT_SIZE on
+    // the **remaining** stack only. The witnessScript itself may exceed 520
+    // (capped by MAX_SCRIPT_SIZE 10_000 during eval) — applying 520 to the
+    // script rejects valid mainnet spends (e.g. h=842472).
     let wit_len = input.witness.len();
     let script_bytes = input
         .witness

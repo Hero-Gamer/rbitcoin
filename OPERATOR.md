@@ -471,7 +471,7 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 
 | Line | Level | Use |
 |------|-------|-----|
-| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= ntx= avg_us= max_us=` |
+| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= tx= avg_us= max_us=` |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
 | `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
@@ -735,7 +735,7 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - **BIP324 v2 only** — plaintext v1 peers disconnect (`peer does not speak BIP324 v2`).
 - **IBD `getdata` serve** reconstructs witness blocks from contiguous Class A
   spans (`txout.body` + `inwit.body`), off the session reactor. Serve volume
-  is on DEBUG `tip: perf` (`serve n= bytes= ntx= avg_us= max_us=`), not a
+  is on DEBUG `tip: perf` (`serve n= bytes= tx= avg_us= max_us=`), not a
   per-block line. Host throughput probe:
   `python3 scripts/ibd-serve-bench.py 127.0.0.1:8333` (needs `cryptography`
   and a BIP324 client; see [`TESTING.md`](TESTING.md) § P2P serve bench).
@@ -760,7 +760,7 @@ Do **not** wipe `store/` for mempool slot/full errors.
   Generate / `submitblock` / full-block NewPoWValid pack txs that were not in the
   live mempool (`try_read` only; skip packing if the mempool lock is busy).
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
-- Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
+- Session **misbehavior score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
   Esplora `POST /txs/package` (all-or-nothing; min-relay waiver is a
   child-with-parents ancestor tree). No P2P package command (BIP331 is not in

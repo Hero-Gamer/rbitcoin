@@ -207,8 +207,8 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
-/// Core `BLOCK_MUTATED`: reconstructed compact/body does not match the header.
-/// Do not cache the hash as `BLOCK_FAILED`.
+/// Reconstructed compact/body does not match the header.
+/// Do not cache the hash as permanently failed.
 fn reject_is_mutated(reason: &str) -> bool {
     reason.contains("merkle")
         || reason.contains("bad-txnmrklroot")
@@ -227,15 +227,13 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
-/// Core `DEFAULT_MAX_TIP_AGE` (24h).
+/// Default tip recency window (24h).
 pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// Core `FeeFilterRounder::round(MAX_MONEY)` with v31.1 default minrelay 100 sat/kvB
-/// (`p2p_ibd_txrelay.py` `MAX_FEE_FILTER`).
+/// IBD fee filter (`p2p_ibd_txrelay.py` `MAX_FEE_FILTER`).
 pub const IBD_FEEFILTER_SAT_KVB: u64 = 9_936_506;
 
-/// Core `STALE_RELAY_AGE_LIMIT` (one month). Stale blocks older than this vs the
-/// best header are not served (`p2p_fingerprint`).
+/// Stale blocks older than this vs the best header are not served (`p2p_fingerprint`).
 pub const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Thread-safe chain façade used by peer sessions.
@@ -269,10 +267,10 @@ pub struct ChainHub {
     header_tips: RwLock<HeaderTips>,
     /// Set around `accept_branch` connect so each `TipEvent` carries branch length.
     announce_reorg_len: AtomicU32,
-    /// Core `-minimumchainwork` (32-byte BE). `None` = no extra floor.
+    /// Min-chain-work floor (32-byte BE). `None` = no extra floor.
     minimum_chain_work: RwLock<Option<[u8; 32]>>,
     mining: MiningKnobs,
-    /// Core `-maxtipage` seconds. Default 24h.
+    /// Tip recency seconds. Default 24h.
     max_tip_age_secs: AtomicU64,
     prefill_compact: AtomicBool,
     prefill_plan: std::sync::Mutex<Option<crate::compact::PrefillPlan>>,
@@ -281,7 +279,7 @@ pub struct ChainHub {
     /// `prefix[h] = work through height h` on the best chain. Process cache;
     /// rebuilt from wire headers when short, truncated on disconnect.
     chain_work_prefix: RwLock<Vec<Work>>,
-    /// Core `m_cached_finished_ibd`: once we leave IBD, stay out.
+    /// Once the relay-inhibited latch clears, stay out.
     finished_ibd: AtomicBool,
     #[cfg(test)]
     block_at_height_calls: AtomicU64,
@@ -362,12 +360,12 @@ impl ChainHub {
         self.mining.gbt_assembled.load(Ordering::Relaxed)
     }
 
-    /// Core `-blockversion`. Non-zero overrides GBT `version`.
+    /// Non-zero overrides GBT `version`.
     pub fn set_block_version(&self, v: i32) {
         self.mining.block_version.store(v, Ordering::Relaxed);
     }
 
-    /// GBT `version`: `-blockversion` or Core TOP_BITS | testdummy (bit 28).
+    /// GBT `version`: override or versionbits TOP_BITS | testdummy (bit 28).
     pub fn gbt_block_version(&self) -> i32 {
         let v = self.mining.block_version.load(Ordering::Relaxed);
         if v != 0 {
@@ -377,7 +375,7 @@ impl ChainHub {
         }
     }
 
-    /// Core `-blockmintxfee` (sat/kvB). Default 1.
+    /// Block min tx fee (sat/kvB). Default 1.
     pub fn set_block_min_tx_fee_sat_kvb(&self, sat_kvb: u64) {
         self.mining
             .block_min_tx_fee_sat_kvb
@@ -388,7 +386,7 @@ impl ChainHub {
         self.mining.block_min_tx_fee_sat_kvb.load(Ordering::Relaxed)
     }
 
-    /// Core `-maxtipage` (seconds). Default [`DEFAULT_MAX_TIP_AGE_SECS`].
+    /// Tip recency (seconds). Default [`DEFAULT_MAX_TIP_AGE_SECS`].
     pub fn set_max_tip_age_secs(&self, secs: u64) {
         self.max_tip_age_secs.store(secs, Ordering::Relaxed);
     }
@@ -453,7 +451,7 @@ impl ChainHub {
             .map(|p| p.indexes.clone())
     }
 
-    /// Core `-minimumchainwork`. Below the floor: no getheaders serve, no tip relay.
+    /// Min-chain-work floor. Below the floor: no getheaders serve, no tip relay.
     pub fn set_minimum_chain_work(&self, w: Option<[u8; 32]>) {
         *self.minimum_chain_work.write().unwrap() = w;
     }
@@ -544,7 +542,7 @@ impl ChainHub {
         }
     }
 
-    /// Core `-minimumchainwork` floor (32-byte BE), if set.
+    /// Min-chain-work floor (32-byte BE), if set.
     pub fn min_chain_work_floor(&self) -> Option<[u8; 32]> {
         *self.minimum_chain_work.read().unwrap()
     }
@@ -562,7 +560,7 @@ impl ChainHub {
             .unwrap_or_else(|| Work::from_be_bytes([0u8; 32])))
     }
 
-    /// Core `nMaxTipAge` (`-maxtipage`): tip time vs [`Self::clock`].
+    /// Tip recency vs [`Self::clock`] (default 24h).
     pub fn tip_is_stale_for_ibd(&self) -> bool {
         let Some(h) = self.tip_header() else {
             return true;
@@ -570,8 +568,8 @@ impl ChainHub {
         self.clock.now_secs().saturating_sub(u64::from(h.time)) > self.max_tip_age_secs()
     }
 
-    /// Core `IsInitialBlockDownload`: tip too old **or** work below `-minimumchainwork`.
-    /// Latches false after the first leave (Core `m_cached_finished_ibd`).
+    /// Relay-inhibited: tip too old **or** work below the min-chain-work floor.
+    /// Latches false after the first leave.
     pub fn in_ibd(&self) -> bool {
         if self.finished_ibd.load(Ordering::Acquire) {
             return false;
@@ -583,8 +581,8 @@ impl ChainHub {
         ibd
     }
 
-    /// Core `StaleBlockRequestAllowed`: active-chain always; stale only if
-    /// best-header time minus block time is under one month.
+    /// Active-chain always; stale only if best-header time minus block time
+    /// is under one month.
     pub fn stale_relay_allowed(&self, hash: &BlockHash) -> bool {
         if self.is_connected(hash) {
             return true;
@@ -969,8 +967,8 @@ impl ChainHub {
         self.drop_held(hash);
     }
 
-    /// Core `BLOCK_FAILED` vs `BLOCK_MUTATED`. A reconstructed compact with the
-    /// right header hash and wrong txs must not poison later getdata of that hash.
+    /// A reconstructed compact with the right header hash and wrong txs must
+    /// not poison later getdata of that hash.
     fn remember_failed_accept(&self, offered: BlockHash, e: &NetError) {
         let hash = e
             .failing_block_hash()
@@ -1074,7 +1072,7 @@ impl ChainHub {
         })
     }
 
-    /// Core `submitheader`: decode already succeeded. Missing parent, invalid
+    /// `submitheader`: decode already succeeded. Missing parent, invalid
     /// parent, and MTP are reject strings (`RPC_VERIFY_ERROR` / `-25`).
     pub fn process_submitted_header(&self, header: &Header) -> Result<(), String> {
         let hash = header.block_hash();
@@ -1574,7 +1572,7 @@ impl ChainHub {
         Ok(())
     }
 
-    /// Core `UpdateTime`: `max(MTP+1, GetTime())`.
+    /// Block time is `max(MTP+1, now)`.
     fn generate_block_time(&self, tip_h: u32, tip_time: u32) -> u32 {
         let now = self.clock.now_secs() as u32;
         let mtp = rbitcoin_consensus::median_time_past(self.query.as_ref(), Height(tip_h))
@@ -1584,7 +1582,7 @@ impl ChainHub {
 
     /// Mine one block paying `script_pubkey` without connecting it.
     ///
-    /// Core `generateblock … submit=false` returns the hex for `submitheader`.
+    /// `generateblock` with `submit=false` returns the hex for `submitheader`.
     pub fn assemble_block_to_script(
         &self,
         script_pubkey: ScriptBuf,
@@ -2480,13 +2478,13 @@ impl ChainHub {
         let mp_strip_ns = t_mp.elapsed().as_nanos() as u64;
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
         self.confirmed.write().unwrap().insert(hash);
-        let n_tx = block.txdata.len();
+        let tx_count = block.txdata.len();
         let owned = Arc::try_unwrap(block).unwrap_or_else(|a| (*a).clone());
         let _ = self.cache.push_best(owned);
         // Tip-follow / wire accept: one info line per height. IBD bulk confirm
         // uses note_confirmed_tip without this line; IBD retains periodic status.
-        info!("{}", log_update_tip_line(height, &hash, &header, n_tx));
-        log_tip_accept_sh(&self.query, height, n_tx, wall_ns, mp_strip_ns, pres_ns);
+        info!("{}", log_update_tip_line(height, &hash, &header, tx_count));
+        log_tip_accept_sh(&self.query, height, tx_count, wall_ns, mp_strip_ns, pres_ns);
         let event = TipEvent {
             height,
             hash,
@@ -2666,7 +2664,7 @@ pub fn initial_getheaders_log(locator_height: u32, peer: u64) -> String {
     format!("p2p: initial getheaders height={locator_height} peer={peer}")
 }
 
-/// `HEADERS_DOWNLOAD_TIMEOUT_BASE` (15 min) + 1 ms per header-interval.
+/// Headers-sync timeout: 15 min + 1 ms per header-interval.
 pub fn headers_download_timeout_secs(now: u64, best_header_time: u64) -> u64 {
     let since = now.saturating_sub(best_header_time);
     // ceil(1ms * since / 600s) in seconds == ceil(since / 600_000).
@@ -2691,10 +2689,15 @@ pub fn received_tx_log() -> &'static str {
 }
 
 /// Tip-follow / wire accept (`connect_at`). IBD bulk confirm does not emit this.
-pub fn log_update_tip_line(height: u32, hash: &BlockHash, header: &Header, n_tx: usize) -> String {
+pub fn log_update_tip_line(
+    height: u32,
+    hash: &BlockHash,
+    header: &Header,
+    tx_count: usize,
+) -> String {
     let time = header.time;
     let ver = header.version.to_consensus();
-    format!("tip: best={hash} height={height} version={ver} tx={n_tx} date={time}")
+    format!("tip: best={hash} height={height} version={ver} tx={tx_count} date={time}")
 }
 
 /// Clear confirm + Class C SH meters before a tip-follow accept sample window.
@@ -2706,7 +2709,7 @@ fn tip_accept_stats_reset(query: &Query) {
 #[derive(Clone, Debug)]
 pub struct TipAcceptShInput {
     pub height: u32,
-    pub n_tx: usize,
+    pub tx_count: usize,
     pub wall_ns: u64,
     /// Load assemble wall (confirm CONNECT_NS).
     pub load_ns: u64,
@@ -2776,7 +2779,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     };
     // class_c = strong + tip only (table work). SH is parallel and listed separately.
     format!(
-        "tip: accept h={h} tx={n_tx} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
+        "tip: accept h={h} tx={tx_count} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
          class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
          sh={sh_ms}ms sh_lag={sh_lag} \
          (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
@@ -2784,7 +2787,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
          spend={spend_ms}ms tweaks={tweak_ms}ms lookup={lookup_ms}ms struct={structural_ms}ms \
          drain={drain_ms}ms mp_strip={mp_strip_ms}ms pres={pres_ms}ms other={other_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
-        n_tx = i.n_tx,
+        tx_count = i.tx_count,
         sh_lag = i.sh_lag,
         pin = sh.pin,
         cold = sh.cold,
@@ -2798,7 +2801,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
 fn log_tip_accept_sh(
     query: &Query,
     height: u32,
-    n_tx: usize,
+    tx_count: usize,
     wall_ns: u64,
     mp_strip_ns: u64,
     pres_ns: u64,
@@ -2830,7 +2833,7 @@ fn log_tip_accept_sh(
     let class_c_tables_ns = strong_ns.saturating_add(tip_ns);
     let line = format_tip_accept_sh_line(&TipAcceptShInput {
         height,
-        n_tx,
+        tx_count,
         wall_ns,
         load_ns: load_ns.saturating_add(connect_ns),
         script_ns,
@@ -3771,7 +3774,7 @@ mod tests {
     fn format_tip_accept_sh_line_has_sh_breakdown_tokens() {
         let line = format_tip_accept_sh_line(&TipAcceptShInput {
             height: 961_445,
-            n_tx: 4_959,
+            tx_count: 4_959,
             wall_ns: 2_500_000_000,
             load_ns: 100_000_000,
             script_ns: 200_000_000,
@@ -3802,6 +3805,8 @@ mod tests {
             },
         });
         assert!(line.starts_with("tip: accept h=961445"), "{line}");
+        assert!(line.contains("tx=4959"), "{line}");
+        assert!(!line.contains("nTx"), "{line}");
         assert!(line.contains("wall=2500ms"), "{line}");
         assert!(line.contains("class_c=7ms"), "{line}");
         assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
