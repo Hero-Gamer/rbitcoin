@@ -98,8 +98,9 @@ checklist.
   (`live_p2p_lock`). Do not “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
-  functional. Coverage: production LCOV **never-falls** vs last green
-  master (90% floor). Tests assert shipped behavior, not repo text.
+  functional. Coverage: production LCOV **never-falls** vs the highest
+  master snapshot at or before the PR merge-base (90% floor). Tests assert
+  shipped behavior, not repo text.
 - **Operator honesty:** experimental 0.x; milestone skip is loud; CLI/conf
   share `apply_kv`; dummy RPC numbers labeled or gone; COMPAT matches
   shipped surface (including Esplora `/txs/summary` as a dialect).

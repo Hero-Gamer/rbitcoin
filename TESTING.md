@@ -148,22 +148,26 @@ reads it; rustup users export it). Override coverage dir:
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **must not fall** vs last green `master` (`badges/coverage.json`). **90%** is only a floor when that baseline is missing (offline local). |
+| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **must not fall** vs the **highest** green-`master` snapshot whose SHA is an ancestor of `git merge-base(PR tip, origin/master)`. **90%** is only a floor when that snapshot is missing (offline local). |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
-CI fails if the unrounded ratio `LH/LF` is below master’s last published
-`lh`/`lf` (`LH * base_LF < LF * base_LH`). Equal is a pass. A PR that adds
-uncovered production lines enough to drop the ratio is red even when still
-above 90%. Test modules (`*_tests.rs`, `/tests/`, `testutil.rs`, crate
-`rbitcoin-test`) are omitted from `LH`/`LF`. `#[cfg(test)]` arms inside
-production files still count. GitHub Actions **fail closed** if the badge
-cannot be fetched; a local `./scripts/coverage.sh` without the badge uses
-the 90% floor and warns. Override: `COVERAGE_BASELINE` (path or URL),
+CI fails if the unrounded ratio `LH/LF` is below that merge-base snapshot
+(`LH * base_LF < LF * base_LH`). Equal is a pass. Master jobs that landed
+**after** the PR branched are ignored, so a cooking PR is not racing a
+moving target. A PR that adds uncovered production lines enough to drop
+the ratio vs **its fork point** is red even when still above 90%. Rebase
+onto current `master` to pick up a newer snapshot. Test modules
+(`*_tests.rs`, `/tests/`, `testutil.rs`, crate `rbitcoin-test`) are omitted
+from `LH`/`LF`. `#[cfg(test)]` arms inside production files still count.
+GitHub Actions **fail closed** if history cannot be fetched or no snapshot
+is an ancestor of the merge-base; a local `./scripts/coverage.sh` without
+history uses the 90% floor and warns. Override: `COVERAGE_MERGE_BASE`,
+`COVERAGE_HISTORY` / `COVERAGE_HISTORY_URL`, `COVERAGE_BASELINE` /
 `COVERAGE_BASELINE_URL`.
 
 The README badge and rbitcoin.org figure are the last **green `master`**
-`coverage` job (`badges` branch `coverage.json`, Shields endpoint). A red PR
-does not publish.
+`coverage` job (`badges` branch `coverage.json`, Shields endpoint). History
+for the gate is `badges/coverage-history.jsonl`. A red PR does not publish.
 
 `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within
 a line* (for example match or-patterns) even when the line executed. The gate
@@ -222,8 +226,8 @@ to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 2. Identify high-miss production files (largest `LF − LH`).
 3. Add or extend a **scenario** in `rbitcoin-test` or a unit test next to the
    shipped path that drives the real entry point.
-4. Re-run `./scripts/coverage.sh` until the ratio is **≥ last green master**
-   (90% floor only when that baseline is missing).
+4. Re-run `./scripts/coverage.sh` until the ratio is **≥ the merge-base snapshot**
+   (90% floor only when that snapshot is missing).
 
 ## Structural lints, CRAP, Miri
 
@@ -236,7 +240,7 @@ complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
 |------|------------|----|
 | **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Required job `ast-grep` |
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`; report-only (no `--fail-above`) |
-| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, never-falls gate, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
+| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, never-falls vs merge-base, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` + `coverage-history.jsonl` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do

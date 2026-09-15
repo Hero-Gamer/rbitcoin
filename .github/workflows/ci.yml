@@ -184,7 +184,7 @@ jobs:
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
 
-  # Line-coverage gate (never below last green master LCOV LH/LF; 90% floor).
+  # Line-coverage gate (never below highest master LCOV at or before merge-base).
   # Slow; waits for the fast gates so a red fmt/clippy/test does not start
   # this job. Required.
   coverage:
@@ -195,6 +195,8 @@ jobs:
       CARGO_TARGET_DIR: target/cov
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: llvm-tools-preview
@@ -208,6 +210,8 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.6.14,cargo-crap@0.4.3
       - name: coverage (line gate)
+        env:
+          COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: ./scripts/coverage.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
