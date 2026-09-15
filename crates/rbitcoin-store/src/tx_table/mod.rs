@@ -27,11 +27,6 @@ pub(crate) type SparseOutsRow = (TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u
 pub(crate) type PackedTx = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>);
 /// Packed txout decode including spender rels.
 pub(crate) type PackedTxRels = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>);
-/// Shared pin Arc + inputs (Class A append without outs clone).
-pub(crate) type PinInItem = (
-    std::sync::Arc<(TxRecord, Vec<OutputRecord>)>,
-    Vec<InputRecord>,
-);
 /// Prep denserels job: create fk, body range, known txid, loc n_out, need-vouts.
 pub(crate) type OutsByRangeJob = (Fk, (u64, u64), [u8; 32], u32, Vec<u32>);
 /// `(rows, body_ns, decode_ns, extend_n, body_sqe_n, guess_full_n)` from [`TxTable::get_outs_by_range_batch`].
@@ -237,13 +232,26 @@ impl OutputRecord {
         if self.value < 0 {
             return Err(StoreError::Corrupt("txout amount negative"));
         }
+        Self::encode_unspent_into(self.value, &self.script, out);
+        Ok(())
+    }
+
+    /// Same bytes as [`Self::encode_into`] for an unspent `(value, script)` pair.
+    ///
+    /// `value` must be ≥ 0 (Class A append rejects negatives first).
+    pub fn encode_unspent_into(value: i64, script: &[u8], out: &mut Vec<u8>) {
         let flags_at = out.len();
         out.push(0);
-        let (exp, mantissa) = amount_exp_mantissa(self.value as u64);
+        let (exp, mantissa) = amount_exp_mantissa(value as u64);
         write_uleb128(out, mantissa);
-        let kind = encode_script_kind_v17(&self.script, out);
+        let kind = encode_script_kind_v17(script, out);
         out[flags_at] = kind | (exp << 4);
-        Ok(())
+    }
+
+    /// Capacity upper bound matching [`Self::encoded_len`] without an [`OutputRecord`].
+    #[inline]
+    pub fn encoded_len_for_script(script_len: usize) -> usize {
+        1 + 10 + 9 + script_len
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -1710,15 +1718,15 @@ impl TxTable {
         Ok(fks)
     }
 
-    /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin Arc
-    /// (tx + outs + denserels). Encode borrows pin fields — no outs deep clone.
+    /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin
+    /// ([`PackedCreate`]). Encode borrows pin fields — no outs deep clone.
     ///
     /// `spent_overlay` is per-item `(vout, spend_fk, vin)` sole spenders written into
     /// the Class A spent stem. Empty slice = all zeros. Non-empty must be one
     /// inner vec per item.
-    pub fn put_full_batch_from_pins(
+    pub fn put_full_batch_from_pins<P: PackedCreate>(
         &self,
-        items: &[PinInItem],
+        items: &[(P, Vec<InputRecord>)],
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
@@ -1728,34 +1736,25 @@ impl TxTable {
         if !spent_overlay.is_empty() && spent_overlay.len() != items.len() {
             return Err(StoreError::Corrupt("spent overlay length"));
         }
-        let est_out: usize = items
-            .iter()
-            .map(|(pin, _ins)| {
-                let (_tx, outs) = pin.as_ref();
-                16 + TxRecord::BODY_META_LEN + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
-            })
-            .sum();
+        let est_out: usize = items.iter().map(|(pin, _ins)| pin.packed_outs_est()).sum();
         let est_inwit: usize = items
             .iter()
             .map(|(_pin, ins)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
         let est_spent: usize = items
             .iter()
-            .map(|(pin, _ins)| {
-                let (_tx, outs) = pin.as_ref();
-                16 + spent_record_len(outs.len() as u32) as usize
-            })
+            .map(|(pin, _ins)| 16 + spent_record_len(pin.packed_n_out()) as usize)
             .sum();
         let base = self.body.count();
         if self.inwit.count() != base || self.spent.count() != base {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         for (i, (pin, _)) in items.iter().enumerate() {
-            let n_out = pin.as_ref().1.len() as u32;
+            let n_out = pin.packed_n_out();
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
             }
-            if pin.as_ref().1.iter().any(|o| o.value < 0) {
+            if pin.packed_has_negative_amount() {
                 return Err(StoreError::Corrupt("txout amount negative"));
             }
             let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -1766,10 +1765,7 @@ impl TxTable {
                 encode_spent_slot(0, fk, vin)?;
             }
         }
-        let n_outs: Vec<u32> = items
-            .iter()
-            .map(|(pin, _)| pin.as_ref().1.len() as u32)
-            .collect();
+        let n_outs: Vec<u32> = items.iter().map(|(pin, _)| pin.packed_n_out()).collect();
         let (fks, loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
@@ -1777,25 +1773,22 @@ impl TxTable {
             est_spent,
             &n_outs,
             |i, buf| {
-                let (pin, ins) = &items[i];
-                let (tx, outs) = pin.as_ref();
-                encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
+                items[i].0.encode_txout_body(buf, Some(&self.secret));
             },
             |i, buf| encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret)),
             |i, buf| {
-                let (_tx, outs) = items[i].0.as_ref();
+                let n_out = items[i].0.packed_n_out();
                 let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-                encode_spent_slots(outs.len() as u32, pairs, buf)
-                    .expect("spent overlay prechecked");
+                encode_spent_slots(n_out, pairs, buf).expect("spent overlay prechecked");
             },
         )?;
-        let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.0.txid).collect();
+        let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.packed_txid()).collect();
         self.txids.append_batch(base, &ids)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()
                 .zip(fks.iter())
-                .map(|((pin, _), fk)| (pin.0.txid, *fk))
+                .map(|((pin, _), fk)| (pin.packed_txid(), *fk))
                 .collect();
             self.head_insert_many(&heads)?;
         }
