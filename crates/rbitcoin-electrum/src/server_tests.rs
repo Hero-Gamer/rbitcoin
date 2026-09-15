@@ -3632,5 +3632,18 @@ fn broadcast_package_and_mempool_outpoint_spend() {
     .unwrap();
     assert_eq!(st["spent"], true, "{st}");
     assert_eq!(st["height"], 0, "{st}");
+    let parsed = crate::silent_scan::parse_sub(
+        &json!([
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+            "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36",
+            0
+        ]),
+        bitcoin::Network::Testnet4,
+        Some(5),
+    )
+    .unwrap();
+    assert!(parsed.address.starts_with("tsp"), "{}", parsed.address);
+    let hits = crate::silent_scan::scan_hits(&q_arc, &params, &parsed, 0, 5).unwrap();
+    assert!(hits.len() < 10_000, "{}", hits.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
