@@ -450,14 +450,16 @@ Default: **info**. CLI wins over env.
 
 ### Tip-follow (every block)
 
-After IBD, each accepted tip extension logs one **info** line (Core-like):
+After IBD, each accepted tip extension logs one **info** line:
 
 ```
-UpdateTip: new best=<hash> height=<n> version=<v> tx=<n> date=<unix> progress=tip
+tip: best=<hash> height=<n> version=<v> tx=<n> date=<unix>
 ```
 
 Emitted from the tip-follow / wire accept path (`ChainHub::connect_at`). IBD bulk
 confirm does **not** spam this line per block — use the periodic IBD status below.
+Core functional tests still grep `UpdateTip: …` via the debug.log map
+([`docs/core-functional.md`](docs/core-functional.md)).
 
 ### Tip-follow status lines (after catch-up + tip SH ready)
 
@@ -465,10 +467,17 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 |------|-------|-----|
 | `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= ntx= avg_us= max_us=` |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
-| `UpdateTip` | INFO | New best hash/height after connect |
+| `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
-| `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `UpdateTip` at info) |
-| `received getdata for: wtx` | TRACE | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
+| `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `tip: best=` at info) |
+| `p2p: getdata wtx` | TRACE | One line per peer `MSG_WTX` getdata (counts are on `tip: perf`) |
+| `p2p: received tx` | TRACE | One inbound tx |
+| `p2p: headers sync` | INFO | Headers path that meets min-work (or a noban peer) |
+| `p2p: ignore low-work headers` | INFO | Headers announcement below `-minimumchainwork` |
+| `p2p: header … missing pow proof` | INFO | Unrequested header without anti-DoS POW |
+| `p2p: accept dropped … (prev not found)` | INFO | Unrequested block whose parent is unknown |
+| `p2p: initial getheaders` | INFO | First getheaders after connect |
+| `p2p: headers sync timeout` | INFO | Headers-sync peer stalled (`disconnect` or `keep`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
 Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` / `ibd: sizes` / `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).

@@ -169,9 +169,17 @@ python3 scripts/core-functional/check_core_release.py
 
 `debuglog_map.toml` + `map_debuglog.py`: the shim tails node stdio into
 `regtest/debug.log` and appends mapped Core substrings (line-buffered).
-Add a `[[rule]]` (`match` regex → `emit` lines with `{1}` captures) and
-flip the inventory row to `run` when every `assert_debug_log` string the
-test can hit is mapped or emitted natively. Unmapped stays `core-log`.
+**Operator stderr is rbitcoin dialect** (`tip: best=`, `p2p: headers sync`,
+`p2p: getdata wtx`, store-tip-in-the-future abort). Do **not** emit Core
+C++ function names (`UpdateTip`, `AcceptBlockHeader`, …) from the node;
+add a `[[rule]]` (`match` regex → `emit` lines with `{1}` captures) so the
+harness can still grep those needles. Flip the inventory row to `run` when
+every `assert_debug_log` / InitError string the test can hit is mapped.
+Unmapped stays `core-log`. There is no `--log-dialect` flag.
+
+Startup refuse when the store tip is more than two hours ahead of the clock
+is store language on stderr; the shim maps it to Core’s
+`appears to be from the future` InitError paragraph (`rpc_blockchain`).
 
 ```bash
 ./scripts/core-functional/map_debuglog_test.sh

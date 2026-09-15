@@ -1,6 +1,7 @@
 # rbitcoin stderr / log line → Core debug.log substring(s).
 # match is a regex (case-sensitive). emit may use {1}, {2}, … captures.
-# Applied by the bitcoind shim. Unmapped strings stay skip reason core-log.
+# Applied by the bitcoind shim. Operator logs stay native; this file is the
+# only Core debug.log dialect. Unmapped strings stay skip reason core-log.
 
 [[rule]]
 match = 'p2p: trying connection \(([^)]+)\) to (.+)$'
@@ -87,27 +88,31 @@ match = 'sending addrv2 \((\d+) bytes\) peer=(\d+)'
 emit = ['sending addrv2 ({1} bytes) peer={2}']
 
 [[rule]]
-match = 'AcceptBlockHeader: not adding new block header ([0-9a-f]{64}), missing anti-dos proof-of-work validation'
+match = 'p2p: header ([0-9a-f]{64}) missing pow proof — not stored'
 emit = ['AcceptBlockHeader: not adding new block header {1}, missing anti-dos proof-of-work validation']
 
 [[rule]]
-match = '\[net\] Ignoring low-work chain \(height=(\d+)\)'
+match = 'p2p: accept dropped [0-9a-f]{64} \(prev not found\)'
+emit = ['AcceptBlock FAILED (prev-blk-not-found)']
+
+[[rule]]
+match = 'p2p: ignore low-work headers height=(\d+)'
 emit = ['[net] Ignoring low-work chain (height={1})']
 
 [[rule]]
-match = 'initial getheaders \((\d+)\) to peer=(\d+)'
+match = 'p2p: initial getheaders height=(\d+) peer=(\d+)'
 emit = ['initial getheaders ({1}) to peer={2}']
 
 [[rule]]
-match = 'Synchronizing blockheaders, height: (\d+)'
+match = 'p2p: headers sync height=(\d+)'
 emit = ['Synchronizing blockheaders, height: {1}']
 
 [[rule]]
-match = 'Timeout downloading headers, disconnecting peer=(\d+)'
+match = 'p2p: headers sync timeout, disconnect peer=(\d+)'
 emit = ['Timeout downloading headers, disconnecting peer={1}']
 
 [[rule]]
-match = 'Timeout downloading headers from noban peer, not disconnecting peer=(\d+)'
+match = 'p2p: headers sync timeout, keep peer=(\d+)'
 emit = ['Timeout downloading headers from noban peer, not disconnecting peer={1}']
 
 [[rule]]
@@ -119,7 +124,7 @@ match = 'received: addr'
 emit = ['received: addr']
 
 [[rule]]
-match = 'received: tx'
+match = 'p2p: received tx'
 emit = ['received: tx']
 
 [[rule]]
@@ -139,5 +144,13 @@ match = 'transaction \(([0-9a-f]+)\) inv sent in violation of protocol, disconne
 emit = ['transaction ({1}) inv sent in violation of protocol, disconnecting peer']
 
 [[rule]]
-match = 'received getdata for: wtx ([0-9a-f]+) peer'
+match = 'p2p: getdata wtx ([0-9a-f]+) peer'
 emit = ['received getdata for: wtx {1} peer']
+
+[[rule]]
+match = 'tip: best=([0-9a-f]{64}) height=(\d+) version=(-?\d+) tx=(\d+) date=(\d+)'
+emit = ['UpdateTip: new best={1} height={2} version={3} tx={4} date={5} progress=tip']
+
+[[rule]]
+match = 'Store tip time is more than two hours ahead of the node clock'
+emit = ['The block database contains a block which appears to be from the future.']

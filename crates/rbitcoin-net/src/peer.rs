@@ -2,8 +2,9 @@
 
 use crate::cache::BlockCache;
 use crate::chain::{
-    accept_block_header_nodos_log, ignoring_low_work_chain_log, received_getdata_wtx_log,
-    received_tx_log, synchronizing_blockheaders_log, AcceptOutcome, ChainHub,
+    accept_block_header_nodos_log, accept_prev_not_found_log, ignoring_low_work_chain_log,
+    received_getdata_wtx_log, received_tx_log, synchronizing_blockheaders_log, AcceptOutcome,
+    ChainHub,
 };
 use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
@@ -2685,7 +2686,7 @@ async fn on_block(
             && !hub.knows_header(&prev)
             && !follow.pending_headers.contains_key(&prev)
         {
-            rbitcoin_log::info!("AcceptBlock FAILED (prev-blk-not-found)");
+            rbitcoin_log::info!("{}", accept_prev_not_found_log(hash));
             punish_disconnect(&mut follow.ban_score, session);
             return Ok(());
         }
