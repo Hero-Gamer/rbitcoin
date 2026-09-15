@@ -524,7 +524,7 @@ fn poison_confirmed_merkle_root(store: &std::path::Path, fk: Fk, rec: &HeaderRec
     let enc = rec.encode();
     let path = store.join("header.body");
     let mut bytes = std::fs::read(&path).unwrap();
-    let off = 16 + ((fk.0 - 1) as usize) * 88;
+    let off = 16 + ((fk.0 - 1) as usize) * enc.len();
     bytes[off..off + enc.len()].copy_from_slice(&enc);
     std::fs::write(&path, bytes).unwrap();
 }
