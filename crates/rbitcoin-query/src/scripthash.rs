@@ -1119,6 +1119,13 @@ impl Query {
         Ok(out)
     }
 
+    /// Durable SH create count plus pending write-behind for this key.
+    pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
+        let durable = self.store.scripthash.create_count(scripthash)?;
+        let pending = self.pending_sh_create_fks(scripthash).len() as u32;
+        Ok(durable.saturating_add(pending))
+    }
+
     /// Confirmed chain_stats for Esplora address/scripthash routes.
     ///
     /// One expand+spend join (same walk as history / balance / listunspent).

@@ -57,6 +57,8 @@ pub const SH_PAGE_OFF_FKS: usize = SH_PAGE_HEADER_LEN;
 pub const SH_PAGE_EXTENT_HEADER_LEN: usize = 24;
 pub const SH_PAGE_OFF_EXTENT_BASE: usize = 8;
 pub const SH_PAGE_OFF_EXTENT_N: usize = 16;
+/// `ver=2` reserved u32: total create count for this megakey (`0` = unknown).
+pub const SH_PAGE_OFF_EXTENT_CREATES: usize = 20;
 /// Max stream bytes on a `ver=2` page.
 pub const SH_PAGE_EXTENT_STREAM_MAX: usize = SH_PAGE_SIZE - SH_PAGE_EXTENT_HEADER_LEN;
 
@@ -218,6 +220,25 @@ pub fn sh_page_set_extent(
         .copy_from_slice(&extent_base.to_le_bytes());
     page[SH_PAGE_OFF_EXTENT_N..SH_PAGE_OFF_EXTENT_N + 4].copy_from_slice(&extent_n.to_le_bytes());
     Ok(())
+}
+
+pub fn sh_page_extent_creates(page: &[u8; SH_PAGE_SIZE]) -> u32 {
+    if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
+        return 0;
+    }
+    u32::from_le_bytes(
+        page[SH_PAGE_OFF_EXTENT_CREATES..SH_PAGE_OFF_EXTENT_CREATES + 4]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+pub fn sh_page_set_extent_creates(page: &mut [u8; SH_PAGE_SIZE], n: u32) {
+    if page[SH_PAGE_OFF_VER] != SH_PAGE_EXTENT_VER {
+        return;
+    }
+    page[SH_PAGE_OFF_EXTENT_CREATES..SH_PAGE_OFF_EXTENT_CREATES + 4]
+        .copy_from_slice(&n.to_le_bytes());
 }
 
 fn sh_page_write_stream(page: &mut [u8; SH_PAGE_SIZE], fks: &[u64]) -> Result<(), StoreError> {

@@ -440,6 +440,39 @@ fn put_create_batch_many_uses_pages() {
 }
 
 #[test]
+fn create_count_inline_slab_no_page_io_extent_stamps() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh1 = script_hash(&[0x01]);
+    put_create(&t, rec(sh1, 1, 0));
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh1).unwrap(), 1);
+    assert_eq!(t.take_page_ios(), 0, "inline count is pack8 used");
+
+    let sh2 = script_hash(&[0x02]);
+    for i in 1..=5u64 {
+        put_create(&t, rec(sh2, i, 0));
+    }
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh2).unwrap(), 5);
+    assert_eq!(t.take_page_ios(), 0, "slab count is pack8 used");
+
+    let sh3 = script_hash(&[0x03]);
+    let recs: Vec<_> = (1..=300u64).map(|i| rec(sh3, i, 0)).collect();
+    assert_eq!(put_create_batch(&t, recs), 300);
+    match t.head_value(&sh3).unwrap().unwrap() {
+        ShHeadValue::Extent { .. } => {}
+        other => panic!("expected extent, got {other:?}"),
+    }
+    let _ = t.take_page_ios();
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    assert_eq!(t.take_page_ios(), 1, "extent count is last-page only");
+    assert_eq!(t.create_count(&sh3).unwrap(), 300);
+    assert_eq!(t.take_page_ios(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn put_create_batch_chains() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
