@@ -1701,9 +1701,10 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         8,
     )
     .unwrap();
-    assert!(
-        feed.single_block(),
-        "batched consensus must isolate to one-block retry"
+    assert_eq!(
+        feed.isolate_until(),
+        18,
+        "batched consensus must isolate through last height of the wave"
     );
     match rx.try_recv() {
         Ok(ConfirmEvent::Reject {
@@ -1727,8 +1728,9 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         1,
     )
     .unwrap();
-    assert!(
-        !feed_one.single_block(),
+    assert_eq!(
+        feed_one.isolate_until(),
+        u32::MAX,
         "single-block consensus stays blacklistable"
     );
     match rx.try_recv() {
@@ -1752,8 +1754,9 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         8,
     )
     .unwrap();
-    assert!(
-        !feed_fault.single_block(),
+    assert_eq!(
+        feed_fault.isolate_until(),
+        u32::MAX,
         "engine fault is not a cascade isolate"
     );
 }
@@ -1775,20 +1778,23 @@ fn isolate_clears_only_after_original_batch_last_height() {
         8,
     )
     .unwrap();
-    assert!(feed.single_block());
+    assert_eq!(feed.isolate_until(), 107);
     feed.release_isolate_if_tip(100);
-    assert!(
-        feed.single_block(),
+    assert_eq!(
+        feed.isolate_until(),
+        107,
         "first n=1 accept must not re-pack the rest of the failed wave"
     );
     feed.release_isolate_if_tip(106);
-    assert!(
-        feed.single_block(),
+    assert_eq!(
+        feed.isolate_until(),
+        107,
         "tip still below last height of the wave"
     );
     feed.release_isolate_if_tip(107);
-    assert!(
-        !feed.single_block(),
+    assert_eq!(
+        feed.isolate_until(),
+        u32::MAX,
         "tip through the original batch last height clears isolate"
     );
 
@@ -1803,7 +1809,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         8,
     )
     .unwrap();
-    assert!(feed_n1.single_block());
+    assert_eq!(feed_n1.isolate_until(), 107);
     emit_confirm_reject(
         &tx,
         &feed_n1,
@@ -1814,12 +1820,17 @@ fn isolate_clears_only_after_original_batch_last_height() {
         1,
     )
     .unwrap();
-    assert!(
-        feed_n1.single_block(),
+    assert_eq!(
+        feed_n1.isolate_until(),
+        107,
         "n=1 consensus reject must not clear isolate"
     );
     feed_n1.clear();
-    assert!(!feed_n1.single_block(), "rewind clear drops isolate");
+    assert_eq!(
+        feed_n1.isolate_until(),
+        u32::MAX,
+        "rewind clear drops isolate"
+    );
 }
 
 #[test]
