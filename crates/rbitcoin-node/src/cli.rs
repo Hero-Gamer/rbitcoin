@@ -466,6 +466,23 @@ mod tests {
     }
 
     #[test]
+    fn max_sh_creates_and_esplora_block_template_cli_hyphens() {
+        let omitted = ready_config(["rbitcoin-node"]);
+        assert_eq!(omitted.max_sh_creates, 0);
+        assert!(!omitted.esplora_block_template);
+        let n = ready_config(["rbitcoin-node", "--max-sh-creates", "42"]);
+        assert_eq!(n.max_sh_creates, 42);
+        let eq = ready_config(["rbitcoin-node", "--max-sh-creates=9"]);
+        assert_eq!(eq.max_sh_creates, 9);
+        let gbt = ready_config(["rbitcoin-node", "--esplora-block-template"]);
+        assert!(gbt.esplora_block_template);
+        let gbt_eq = ready_config(["rbitcoin-node", "--esplora-block-template=1"]);
+        assert!(gbt_eq.esplora_block_template);
+        let off = ready_config(["rbitcoin-node", "--esplora-block-template=0"]);
+        assert!(!off.esplora_block_template);
+    }
+
+    #[test]
     fn explicit_milestone_zero_sticks_on_mainnet() {
         use rbitcoin_consensus::{default_milestone_height, Milestone};
 

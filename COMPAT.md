@@ -38,9 +38,10 @@ joins with more than N creates: Esplora HTTP **503**, Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates`. Stats stay full when under the cap.
 
 `GET /address/:addr/txs/summary` and `/scripthash/:hash/txs/summary` (optional
-`/:last_seen_txid`) return up to 25 `{txid, value, height, time}` rows
-(mempool.space-shaped; not Blockstream API.md). `value` is net sats for that
-script in that tx. Mempool-only rows use `height` 0 and `time` 0.
+`/:last_seen_txid`) return up to 25 confirmed `{txid, value, height, time}` rows
+(mempool.space-shaped compact fields; not Blockstream API.md), paged like
+`/txs/chain`. `value` is net sats for that script in that tx. Mempool rows stay
+on `/txs` and `/txs/mempool`.
 
 **Product:** `/tx/:txid/outspend/:vout` and `/outspends` emit Blockstream
 `vin` (spending input index) from the schema-22 spent slot. Mempool overlay

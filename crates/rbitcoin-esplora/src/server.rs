@@ -896,6 +896,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_template_enabled_no_tip_is_503() {
+        let (dir, q) = temp_query("gbt-notip");
+        let q = Arc::new(q);
+        let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
+        cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Ok(json!({"height": 1})))));
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let (st, body) = http_get(handle.local_addr, "/block-template").await;
+        assert_eq!(st, 503, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn max_sh_creates_is_esplora_503() {
+        let (dir, q) = temp_query("esplora-sh-cap");
+        let mut prev = Fk::NULL;
+        let mut parent = None;
+        for h in 0..3u32 {
+            let (header, ta) = coinbase(h, prev, parent);
+            parent = Some(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        q.set_max_sh_creates(2);
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let sh = block_hash_hex(&rbitcoin_store::script_hash(&[0x51]));
+        let (st, body) = http_get(handle.local_addr, &format!("/scripthash/{sh}")).await;
+        assert_eq!(st, 503, "{body}");
+        assert!(
+            body.contains("scripthash join exceeds --max-sh-creates"),
+            "{body}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn block_template_enabled_cache_and_503() {
         let (dir, q) = temp_query("gbt-on");
         let (h0, t0) = coinbase(0, Fk::NULL, None);

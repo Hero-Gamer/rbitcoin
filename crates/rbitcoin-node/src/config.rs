@@ -945,6 +945,35 @@ mod tests {
     }
 
     #[test]
+    fn max_sh_creates_and_esplora_block_template_apply_kv() {
+        let mut c = NodeConfig::default();
+        assert_eq!(c.max_sh_creates, 0);
+        assert!(!c.esplora_block_template);
+        assert_eq!(
+            c.apply_kv("max_sh_creates", "100").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.max_sh_creates, 100);
+        assert_eq!(c.apply_kv("maxshcreates", "7").unwrap(), ConfApply::Applied);
+        assert_eq!(c.max_sh_creates, 7);
+        let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
+        assert!(
+            format!("{bad}").contains("max_sh_creates"),
+            "garbage must name the knob: {bad}"
+        );
+        assert_eq!(
+            c.apply_kv("esplora_block_template", "1").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(c.esplora_block_template);
+        assert_eq!(
+            c.apply_kv("esplorablocktemplate", "0").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(!c.esplora_block_template);
+    }
+
+    #[test]
     fn minrelaytxfee_garbage_and_negative_are_config_errors() {
         let mut c = NodeConfig::default();
         let bad = c.apply_kv("minrelaytxfee", "nope").unwrap_err();

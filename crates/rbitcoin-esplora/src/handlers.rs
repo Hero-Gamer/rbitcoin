@@ -577,17 +577,15 @@ fn block_template_sync(st: &AppState) -> Response {
         .as_ref()
         .map(|m| m.template_updates())
         .unwrap_or(0);
-    {
-        let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = cache.as_ref() {
-            if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
-                return gbt_json(&c.body);
-            }
+    let mut cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(c) = cache.as_ref() {
+        if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
+            return gbt_json(&c.body);
         }
     }
     match (fun.0)() {
         Ok(body) => {
-            *st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(GbtCache {
+            *cache = Some(GbtCache {
                 at: Instant::now(),
                 tip,
                 updates,
