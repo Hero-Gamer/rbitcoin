@@ -311,6 +311,7 @@ pub struct Query {
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
+/// `tip == None` means empty (open / invalidate); any other tip is incremental.
 #[derive(Default)]
 struct HeightByHashIndex {
     /// Tip height the map matches (`None` = empty / needs rebuild).

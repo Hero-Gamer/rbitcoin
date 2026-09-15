@@ -9,6 +9,13 @@ before 1.0).
 
 ## [Unreleased]
 
+### Changed
+
+- **`height_by_hash` tip delta:** merged confirm and multi-height shrink
+  extend/retain the in-process hash→height map. A full `0..=tip` header walk
+  remains open / `invalidate` only. A hole above the published tip is
+  `Corrupt("invariant: height_by_hash confirmed header missing")`.
+
 ### Added
 
 - **Process `-blocksonly` on live `run_p2p`:** `node_run_p2p_short` sets

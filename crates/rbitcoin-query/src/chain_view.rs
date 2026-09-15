@@ -162,8 +162,9 @@ impl Query {
     /// Archive may contain orphan header rows (partial connect failures). Those are
     /// not reported here — only hashes reachable as `confirmed[height]`.
     ///
-    /// Uses an in-process `hash → height` map (~60 MiB at mainnet tip), rebuilt when
-    /// tip jumps; tip±1 updates are incremental. Avoids O(tip) header body walks.
+    /// Uses an in-process `hash → height` map (~60 MiB at mainnet tip). Any
+    /// tip extend/shrink is incremental; a full `0..=tip` walk runs only on
+    /// open or after [`Self::invalidate_height_by_hash_index`].
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(None);
@@ -192,7 +193,10 @@ impl Query {
         Ok(g.map.get(hash).copied().map(Height))
     }
 
-    /// Ensure height index matches `tip` (incremental tip±1 when possible).
+    /// Ensure height index matches `tip`.
+    ///
+    /// Incremental for any `new_tip ≠ prev_tip`. Full walk only when the map
+    /// is empty (`g.tip == None`).
     pub(crate) fn ensure_height_by_hash_index(&self, tip: Height) -> Result<(), QueryError> {
         let mut g = self
             .height_by_hash
@@ -202,27 +206,55 @@ impl Query {
             return Ok(());
         }
         if let Some(prev_tip) = g.tip {
-            if tip.0 == prev_tip.saturating_add(1) {
-                if let Some((_, rec)) = self.header_at_height(tip)? {
-                    g.map.insert(rec.hash, tip.0);
-                    g.tip = Some(tip.0);
-                    return Ok(());
+            if tip.0 > prev_tip {
+                let mut adds = Vec::with_capacity((tip.0 - prev_tip) as usize);
+                for h in prev_tip.saturating_add(1)..=tip.0 {
+                    let Some((_, rec)) = self.header_at_height(Height(h))? else {
+                        return Err(StoreError::Corrupt(
+                            "invariant: height_by_hash confirmed header missing",
+                        ));
+                    };
+                    adds.push((rec.hash, h));
                 }
+                crate::note_confirm(
+                    &self.confirm_stats().height_index_delta_n,
+                    adds.len() as u64,
+                );
+                for (hash, h) in adds {
+                    g.map.insert(hash, h);
+                }
+                g.tip = Some(tip.0);
+                return Ok(());
             }
-            if prev_tip == tip.0.saturating_add(1) {
-                // Old tip header may still be loadable via archive by walking map keys —
-                // drop any entry whose height is prev_tip.
-                g.map.retain(|_, h| *h != prev_tip);
+            if tip.0 < prev_tip {
+                let before = g.map.len() as u64;
+                g.map.retain(|_, h| *h <= tip.0);
+                crate::note_confirm(
+                    &self.confirm_stats().height_index_delta_n,
+                    before.saturating_sub(g.map.len() as u64),
+                );
                 g.tip = Some(tip.0);
                 return Ok(());
             }
         }
-        g.map.clear();
-        g.map.reserve((tip.0 as usize).saturating_add(1));
+        let mut adds = Vec::with_capacity((tip.0 as usize).saturating_add(1));
         for h in 0..=tip.0 {
-            if let Some((_, rec)) = self.header_at_height(Height(h))? {
-                g.map.insert(rec.hash, h);
-            }
+            let Some((_, rec)) = self.header_at_height(Height(h))? else {
+                return Err(StoreError::Corrupt(
+                    "invariant: height_by_hash confirmed header missing",
+                ));
+            };
+            adds.push((rec.hash, h));
+        }
+        g.map.clear();
+        g.map.reserve(adds.len());
+        crate::note_confirm(&self.confirm_stats().height_index_full_n, 1);
+        crate::note_confirm(
+            &self.confirm_stats().height_index_full_headers,
+            adds.len() as u64,
+        );
+        for (hash, h) in adds {
+            g.map.insert(hash, h);
         }
         g.tip = Some(tip.0);
         Ok(())
