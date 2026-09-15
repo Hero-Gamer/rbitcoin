@@ -18,6 +18,12 @@ before 1.0).
 
 ### Added
 
+- **Process Electrum/Esplora on `--blocksonly`:** `node_run_p2p_short` listens
+  Electrum + Esplora after catch-up. `broadcast` / `POST /tx` junk is a
+  decode error; a consensus-invalid tx is hub `broadcast reject` / HTTP 400
+  — not `mempool not available` and not `relay disabled`. P2P/RPC `-blocksonly`
+  pins stay.
+
 - **Subsidy interval=2 overlay; H8 stays the header unit:**
   `header_and_spending_boundaries` overlays `ChainParams` halving interval=2:
   empty at interval−1 is still 50 BTC; at interval 25 BTC; `subsidy+1` at
