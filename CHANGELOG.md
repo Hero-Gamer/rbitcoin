@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Live compact unique-fill merkle fail:** `p2p_compact_hb_getblocktxn_and_orphan`
+  plants a mempool bait under a compact short-id whose header merkle is a
+  different extra tx. Reconstruct GetDatas the hash (not `getblocktxn` /
+  `accept_branch`); the header is not `BLOCK_FAILED`; the honest full `block`
+  then connects. Live mutated `block` still disconnects in `on_block`
+  (`bad-txnmrklroot`). Reconstruct units stay.
+
 - **Electrum TCP line cap, merkle height, history window:**
   `electrum_server_version_history_balance` pins request line at
   `max_request_bytes` vs one-past `-32600` `request line too long`,
