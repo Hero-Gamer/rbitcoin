@@ -222,56 +222,52 @@ impl TipWaiters {
     }
 }
 
-/// B12: `/blocks` 10 newest; `/blocks/:start` at 0 and tip; `/txs/:start` last page < 25; unknown 404.
-async fn pin_esplora_blocks_list_and_txs_pages(
-    esplora_addr: SocketAddr,
-    tip_height: u64,
-    tip_hash: &str,
-    n_tx: usize,
-) {
-    let (st, body) = http_get(esplora_addr, "/blocks").await;
+async fn esplora_json_array(esplora_addr: SocketAddr, path: &str) -> (u16, String, Vec<Value>) {
+    let (st, body) = http_get(esplora_addr, path).await;
+    let list = serde_json::from_str(&body).unwrap_or_default();
+    (st, body, list)
+}
+
+/// B12: `/blocks` 10 newest; `/blocks/:start` at 0 and at tip.
+async fn pin_esplora_blocks_summaries(esplora_addr: SocketAddr, tip_height: u64, tip_hash: &str) {
+    let (st, body, list) = esplora_json_array(esplora_addr, "/blocks").await;
     assert_eq!(st, 200, "GET /blocks: {body}");
-    let list: Vec<Value> = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        list.len(),
-        10,
-        "10 newest (or fewer on a short chain): {body}"
-    );
+    assert_eq!(list.len(), 10, "10 newest: {body}");
     assert_eq!(list[0]["height"], tip_height, "{body}");
     assert_eq!(list[9]["height"], tip_height - 9, "{body}");
 
-    let (st, body) = http_get(esplora_addr, "/blocks/0").await;
+    let (st, body, from_zero) = esplora_json_array(esplora_addr, "/blocks/0").await;
     assert_eq!(st, 200, "GET /blocks/0: {body}");
-    let from_zero: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(from_zero.len(), 1, "{body}");
     assert_eq!(from_zero[0]["height"], 0, "{body}");
 
-    let (st, body) = http_get(esplora_addr, &format!("/blocks/{tip_height}")).await;
+    let (st, body, from_tip) =
+        esplora_json_array(esplora_addr, &format!("/blocks/{tip_height}")).await;
     assert_eq!(st, 200, "GET /blocks/{{tip}}: {body}");
-    let from_tip: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(from_tip.len(), 10, "{body}");
     assert_eq!(from_tip[0]["height"], tip_height, "{body}");
     assert_eq!(from_tip[0]["id"], tip_hash, "{body}");
+}
 
-    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/0")).await;
+/// B12: `/block/:hash/txs/:start` last page shorter than 25; unknown hash 404.
+async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n_tx: usize) {
+    let (st, body, page0) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/0")).await;
     assert_eq!(st, 200, "GET /txs/0: {body}");
-    let page0: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(page0.len(), 25, "first page is 25: {body}");
 
-    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/25")).await;
+    let (st, body, last) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/25")).await;
     assert_eq!(st, 200, "GET /txs/25: {body}");
-    let last: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(
         last.len(),
         n_tx.saturating_sub(25),
         "last page shorter than 25: {body}"
     );
-    assert!(last.len() < 25, "last page must be short: {body}");
-    assert!(!last.is_empty(), "last page empty: {body}");
+    assert!(last.len() < 25 && !last.is_empty(), "last page: {body}");
 
     let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/1")).await;
     assert_eq!(st, 400, "start not multiple of 25: {body}");
-
     let (st, body) = http_get(esplora_addr, &format!("/block/{}/txs/0", "00".repeat(32))).await;
     assert_eq!(st, 404, "unknown block txs: {body}");
 }
@@ -297,26 +293,18 @@ async fn spawn_esplora_ws_want_blocks_and_track_tx(
         ))
         .await
         .unwrap();
-        let mut saw_block = false;
-        let mut saw_tx = false;
+        let mut saw = (false, false);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !(saw_block && saw_tx) {
+        while Instant::now() < deadline && !(saw.0 && saw.1) {
             let left = deadline.saturating_duration_since(Instant::now());
-            let Ok(Some(Ok(frame))) = tokio::time::timeout(left, ws.next()).await else {
+            let Ok(Some(Ok(WsMsg::Text(t)))) = tokio::time::timeout(left, ws.next()).await else {
                 break;
             };
-            let WsMsg::Text(t) = frame else {
-                continue;
-            };
             let v: Value = serde_json::from_str(t.as_str()).unwrap_or(json!(null));
-            if v["block"]["height"] == 106 {
-                saw_block = true;
-            }
-            if v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true {
-                saw_tx = true;
-            }
+            saw.0 |= v["block"]["height"] == 106;
+            saw.1 |= v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true;
         }
-        (saw_block, saw_tx)
+        saw
     })
 }
 
@@ -1026,7 +1014,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         txs.len() >= 30,
         "coinbase + RBF + esplora + packages: {blk}"
     );
-    pin_esplora_blocks_list_and_txs_pages(esplora_addr, 106, new_hash, txs.len()).await;
+    pin_esplora_blocks_summaries(esplora_addr, 106, new_hash).await;
+    pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
     assert!(
         txs[0]["vin"][0].get("txid").is_some(),
         "verbosity 2 coinbase vin: {blk}"
