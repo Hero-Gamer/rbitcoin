@@ -1734,15 +1734,18 @@ fn try_reconstruct_cmpct(
 fn log_cmpct_filled(hub: &ChainHub, hsi: &HeaderAndShortIds, block: &Block, fetched: &[u64]) {
     let fill = hub
         .mempool()
-        .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata))
-        .unwrap_or_default();
-    let stats = crate::compact::reconstruct_stats(hsi, block, &fill, fetched);
-    rbitcoin_log::info!("{stats}");
-    hub.remember_cmpct_prefill(
-        block.block_hash(),
-        block.header.prev_blockhash,
-        crate::compact::prefill_indexes(block, &fill),
+        .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata));
+    let stats = crate::compact::reconstruct_stats(
+        hsi,
+        block,
+        fill.as_ref()
+            .unwrap_or(&crate::compact::CmpctFillSets::default()),
+        fetched,
     );
+    rbitcoin_log::info!("{stats}");
+    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill.as_ref()) {
+        hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
+    }
 }
 
 fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {
@@ -3206,10 +3209,13 @@ fn cmpct_announce_from_block(
     cmpct_version: u32,
 ) -> Option<NetworkMessage> {
     let nonce = rand_nonce();
+    let ver = cmpct_version.clamp(1, 2);
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    let hsi = HeaderAndShortIds::from_block(block, nonce, cmpct_version.clamp(1, 2), &pref).ok()?;
+    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, &pref)
+        .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
+        .ok()?;
     Some(NetworkMessage::CmpctBlock(CmpctBlock {
         compact_block: hsi,
     }))

@@ -6191,6 +6191,16 @@ fn prefillcompact_announce_and_getdata_follow_knob() {
         let on = cmpct_announce_from_block(&hub, &block, 2).expect("announce on");
         assert_eq!(prefilled_n(&on), 2, "knob on packs extra index");
 
+        hub.remember_cmpct_prefill(hash, prev, vec![0, 99]);
+        let fallback = cmpct_announce_from_block(&hub, &block, 2)
+            .expect("invalid prefill indexes must not drop announce");
+        assert_eq!(
+            prefilled_n(&fallback),
+            1,
+            "InvalidPrefill falls back to coinbase"
+        );
+        hub.remember_cmpct_prefill(hash, prev, vec![0, 1]);
+
         match hub.accept_received_block(block.clone()) {
             Ok(crate::chain::AcceptOutcome::Accepted { .. }) => {}
             other => panic!("2-tx block must connect: {other:?}"),

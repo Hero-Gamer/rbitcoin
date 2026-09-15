@@ -370,7 +370,7 @@ impl fmt::Display for CmpctReconstructStats {
 }
 
 fn tx_wire_len(tx: &Transaction) -> usize {
-    bitcoin::consensus::encode::serialize(tx).len()
+    tx.total_size()
 }
 
 /// Fallback to full `getdata` after compact reconstruct failed.
@@ -463,6 +463,11 @@ pub fn prefill_indexes(block: &Block, fill: &CmpctFillSets) -> Vec<usize> {
     }
     out.sort_unstable();
     out
+}
+
+/// `None` when membership was not observed (mempool `try_read` missed).
+pub fn outbound_prefill_indexes(block: &Block, fill: Option<&CmpctFillSets>) -> Option<Vec<usize>> {
+    Some(prefill_indexes(block, fill?))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1181,5 +1186,20 @@ mod tests {
         };
         let idx = prefill_indexes(&block, &fill);
         assert_eq!(idx, vec![0, 2]);
+    }
+
+    #[test]
+    fn prefill_indexes_empty_fill_packs_non_coinbase() {
+        let b1 = spend(28);
+        let block = sealed_block(vec![coinbase(), b1]);
+        assert_eq!(
+            prefill_indexes(&block, &CmpctFillSets::default()),
+            vec![0, 1],
+            "unknown membership must not be fed to remember"
+        );
+        assert!(
+            outbound_prefill_indexes(&block, None).is_none(),
+            "missed mempool read is not an empty fill"
+        );
     }
 }
