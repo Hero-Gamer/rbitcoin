@@ -1439,6 +1439,8 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
         nonce: 1,
         merkle_root: merkle1,
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let ta1 = TxApply {
         tx: TxRecord {
@@ -1469,6 +1471,8 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
         nonce: 2,
         merkle_root: merkle2,
         hash: hash2,
+        size: 0,
+        weight: 0,
     };
     let ta2 = TxApply {
         tx: TxRecord {
@@ -1507,6 +1511,8 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
         nonce: 3,
         merkle_root: merkle3,
         hash: hash3,
+        size: 0,
+        weight: 0,
     };
     let ta3 = TxApply {
         tx: TxRecord {

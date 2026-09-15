@@ -280,6 +280,8 @@ fn restatus_notes_scans_intermediate_tick_heights() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let mut txid0 = [0u8; 32];
     txid0[0] = 0xa0;
@@ -313,6 +315,8 @@ fn restatus_notes_scans_intermediate_tick_heights() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut txid1 = [0u8; 32];
     txid1[0] = 0xa1;
@@ -669,6 +673,8 @@ async fn chain_view_get_history_stamps_tip_and_changes_on_replace() {
             nonce: 0,
             merkle_root: merkle,
             hash: merkle,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0xcb; 32];
         txid[31] = 0;
@@ -993,6 +999,8 @@ fn dispatch_on_connected_chain() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1226,6 +1234,8 @@ fn electrum_sh_stamp_follows_pending_before_durable_apply() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let ta0 = TxApply {
         tx: TxRecord {
@@ -1258,6 +1268,8 @@ fn electrum_sh_stamp_follows_pending_before_durable_apply() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let mut txid1 = [0u8; 32];
     txid1[0] = 0x11;
@@ -1377,6 +1389,8 @@ fn dispatch_casa_sequence_reuses_sh_join_slot() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1491,6 +1505,8 @@ fn get_history_height_window_and_status_full() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -1618,6 +1634,8 @@ async fn tip_push_and_lagged_client() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -1708,6 +1726,8 @@ fn chain_view_status_includes_blockhash() {
         nonce: 0,
         merkle_root: merkle,
         hash: merkle,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0xcb; 32];
     txid[31] = 0;
@@ -1814,6 +1834,8 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -1879,6 +1901,8 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
         nonce: 1,
         merkle_root: hash_b,
         hash: hash_b,
+        size: 0,
+        weight: 0,
     };
     let mut txid_b = [0u8; 32];
     txid_b[0] = 0x99;
@@ -1954,6 +1978,8 @@ fn dispatch_with_mempool_and_param_errors() {
         nonce: 0,
         merkle_root: hash,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[31] = 0xcb;
@@ -2770,6 +2796,8 @@ fn tweaks_rpc_result_is_first_height_only() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -2835,6 +2863,8 @@ async fn tweaks_subscribe_zero_chunk_dones_after_wave0_then_resubscribe() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -2944,6 +2974,8 @@ async fn tweaks_subscribe_pre_taproot_collapses_empty_heights() {
             nonce: h,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let mut txid = [0u8; 32];
         txid[0..4].copy_from_slice(&h.to_le_bytes());

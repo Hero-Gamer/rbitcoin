@@ -62,6 +62,9 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **24:** `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied 23
+///         rewrites 88 B rows (`header.body.grow` then rename); zeros until
+///         confirm stamps. SH extent last-page reserved is create count.
 /// **23:** `create.loc.ovf` rows are 16 B (`fk:u64` + strides/`n_out` u32) so a
 ///         ~1 MiB consensus-valid txout (and `n_out > 65535`) stores. Occupied
 ///         22 Class A rewrites 12 B ovf rows and `meta`. Occupied 15–21 Class A
@@ -88,11 +91,12 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 23;
+pub const SCHEMA_VERSION: u16 = 24;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **23** is current (`create.loc.ovf` 16 B). Occupied **22** Class A
+/// Schema **24** is current (`header.body` 96 B). Occupied **23** rewrites
+/// 88 B header rows. Occupied **22** Class A
 /// rewrites 12 B ovf rows. Occupied 21 Class A is refused. Schema **21** empty
 /// Class A rewrites `meta`. Schema **20** table headers still open when Class A
 /// is empty. Schema **18/19** with occupied `tx.head` or `scripthash*` are
@@ -327,8 +331,9 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 23);
+        assert_eq!(SCHEMA_VERSION, 24);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(24));
         assert!(schema_file_openable(23));
         assert!(schema_file_openable(22));
         assert!(schema_file_openable(21));
@@ -341,7 +346,7 @@ mod tests {
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));
-        assert!(!schema_file_openable(24));
+        assert!(!schema_file_openable(25));
         assert!(!schema_file_openable(0));
     }
 

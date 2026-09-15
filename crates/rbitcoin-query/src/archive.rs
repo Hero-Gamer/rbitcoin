@@ -1054,6 +1054,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = q
             .commit_class_a_only(&header, &[coinbase_apply(1)])
@@ -1076,6 +1078,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [3u8; 32],
+            size: 0,
+            weight: 0,
         };
         let ta = coinbase_apply(1);
         let sig = ta.inputs[0].script_sig.clone();
@@ -1398,6 +1402,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [9u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.confirm_parent_cache()
             .put_header_plan(1, Fk(2), rec, vec![Fk(2)], [0u8; 32]);
@@ -1598,6 +1604,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         assert_eq!(q.tx_body_count(), 1);
@@ -1706,6 +1714,8 @@ mod tests {
                 nonce: 1,
                 merkle_root: [1u8; 32],
                 hash: [1u8; 32],
+                size: 0,
+                weight: 0,
             };
             q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
             let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1748,6 +1758,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1904,6 +1916,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [1u8; 32],
+            size: 0,
+            weight: 0,
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
@@ -1941,6 +1955,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = q
             .commit_class_a_only(&header, &[coinbase_apply(1)])
@@ -2440,6 +2456,8 @@ mod tests {
             nonce: 1,
             merkle_root: [1u8; 32],
             hash: [2u8; 32],
+            size: 0,
+            weight: 0,
         };
         let hfk = q.ensure_header(&header).unwrap();
         let need = vec![(hfk, vec![coinbase_apply(42)])];

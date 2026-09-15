@@ -676,6 +676,8 @@ mod tests {
                 nonce: 1,
                 merkle_root: [0u8; 32],
                 hash: [0u8; 32],
+                size: 0,
+                weight: 0,
             },
             tx_fks: Vec::new(),
             txids: Vec::new(),
@@ -766,6 +768,8 @@ mod tests {
             nonce: 1,
             merkle_root: [0u8; 32],
             hash: [0u8; 32],
+            size: 0,
+            weight: 0,
         }
     }
 

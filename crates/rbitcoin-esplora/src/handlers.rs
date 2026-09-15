@@ -1181,6 +1181,8 @@ mod pure_helper_tests {
             nonce: 0,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let ta = TxApply {
             tx: TxRecord {
@@ -1344,6 +1346,8 @@ mod pure_helper_tests {
                 nonce: h,
                 merkle_root: merkle,
                 hash,
+                size: 0,
+                weight: 0,
             };
             let mut txid = [0xcb; 32];
             txid[0] = h as u8;

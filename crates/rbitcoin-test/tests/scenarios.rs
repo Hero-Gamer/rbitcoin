@@ -550,6 +550,8 @@ fn pin_disconnect_to_genesis_reconnect_and_tip_shrink(
                 nonce: 0,
                 merkle_root: [0; 32],
                 hash: [1; 32],
+                size: 0,
+                weight: 0,
             },
             &[]
         )
@@ -616,6 +618,8 @@ fn chain_connect_reorg_and_growth() {
             nonce,
             merkle_root: merkle,
             hash,
+            size: 0,
+            weight: 0,
         };
         let ta = TxApply {
             tx: TxRecord {

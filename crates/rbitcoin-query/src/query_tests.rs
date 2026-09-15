@@ -239,6 +239,8 @@ fn coinbase_block(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRec
         nonce,
         merkle_root: merkle,
         hash,
+        size: 0,
+        weight: 0,
     };
     let mut txid = [0u8; 32];
     txid[0..4].copy_from_slice(&h.to_le_bytes());
@@ -321,6 +323,8 @@ fn spend_op_true(
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let spend = TxApply {
         tx: TxRecord {
@@ -1395,6 +1399,8 @@ fn sh_pending_join_holds_while_job_is_in_flight() {
         nonce: 1,
         merkle_root: [0x22; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     q.commit_class_a_only(
         &h1,
@@ -1596,6 +1602,8 @@ fn scripthash_join_includes_spend_and_keeps_sibling_utxo() {
         nonce: 1,
         merkle_root: [0x11; 32],
         hash: hash1,
+        size: 0,
+        weight: 0,
     };
     let ta1 = TxApply {
         tx: TxRecord {
