@@ -11,6 +11,14 @@ before 1.0).
 
 ### Added
 
+- **`preciousblock` equal-work + held `getchaintips`:** RPC
+  `invalidate_reconsider_tip` parks an equal-work sibling (`submitblock`
+  `inconclusive`), `preciousblock` the loser then the original tip, ignores
+  less work, and unknown hash is `-5` `Block not found`. Hub
+  `reorg_same_height_then_multi_block_branch` pins `valid-fork` vs `active`,
+  held `valid-headers`, FIFO parks, and the same precious/unknown needles.
+  Held cap 320 FIFO stays `hold_body_caps_at_320_fifo`.
+
 - **Live compact unique-fill merkle fail:** `p2p_compact_hb_getblocktxn_and_orphan`
   plants a mempool bait under a compact short-id whose header merkle is a
   different extra tx. Reconstruct GetDatas the hash (not `getblocktxn` /

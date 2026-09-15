@@ -2151,8 +2151,11 @@ fn submitblock_good_and_bad_merkle() {
 
 #[test]
 fn invalidate_reconsider_tip() {
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (addr, _) = p2wpkh_regtest();
+    use bitcoin::consensus::encode::serialize;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let (addr, script) = p2wpkh_regtest();
     dispatch(&ctx, "generatetoaddress", vec![json!(3), json!(addr)]).unwrap();
     assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
     let tip = dispatch(&ctx, "getbestblockhash", vec![])
@@ -2162,8 +2165,60 @@ fn invalidate_reconsider_tip() {
         .to_string();
     dispatch(&ctx, "invalidateblock", vec![json!(tip.clone())]).unwrap();
     assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(2));
-    dispatch(&ctx, "reconsiderblock", vec![json!(tip)]).unwrap();
+    dispatch(&ctx, "reconsiderblock", vec![json!(tip.clone())]).unwrap();
     assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(3));
+
+    let parent = hub.query.header_at_height(Height(2)).unwrap().unwrap().1;
+    let parent_hash = bitcoin::BlockHash::from_byte_array(parent.hash);
+    let sibling = mine_regtest_paying(parent_hash, parent.timestamp + 900, 3, script, vec![]);
+    let sib_hex = sibling.block_hash().to_string();
+    assert_ne!(sib_hex, tip);
+    let parked = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&sibling)))],
+    )
+    .unwrap();
+    assert_eq!(parked, json!("inconclusive"), "{parked}");
+    assert_eq!(
+        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
+        json!(tip)
+    );
+    let tips = dispatch(&ctx, "getchaintips", vec![]).unwrap();
+    let arr = tips.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["status"] == "active" && t["hash"] == tip),
+        "{tips}"
+    );
+    assert!(
+        arr.iter()
+            .any(|t| t["status"] == "valid-headers" && t["hash"] == sib_hex),
+        "{tips}"
+    );
+
+    dispatch(&ctx, "preciousblock", vec![json!(sib_hex.clone())]).unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
+        json!(sib_hex)
+    );
+    dispatch(&ctx, "preciousblock", vec![json!(tip.clone())]).unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
+        json!(tip)
+    );
+
+    let h1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    dispatch(&ctx, "preciousblock", vec![h1]).unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getbestblockhash", vec![]).unwrap(),
+        json!(tip),
+        "precious of less work must not activate"
+    );
+
+    let miss = dispatch(&ctx, "preciousblock", vec![json!("00".repeat(32))]).unwrap_err();
+    assert_eq!(miss["code"], ERR_INVALID_ADDRESS_OR_KEY);
+    assert_eq!(miss["message"], "Block not found");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

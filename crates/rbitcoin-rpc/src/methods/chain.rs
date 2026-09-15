@@ -768,7 +768,13 @@ pub(crate) fn preciousblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     params.reject_unknown(&["blockhash"])?;
     let hub = require_chain(ctx)?;
     let hash = parse_blockhash_param(params)?;
-    hub.precious_block(hash)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    hub.precious_block(hash).map_err(|e| {
+        let s = e.to_string();
+        if s.contains("Block not found") {
+            rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found")
+        } else {
+            rpc_error(ERR_MISC, s)
+        }
+    })?;
     Ok(Value::Null)
 }

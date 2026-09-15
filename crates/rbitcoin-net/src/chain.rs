@@ -1633,8 +1633,12 @@ impl ChainHub {
     }
 
     fn precious_block_inner(&self, hash: BlockHash) -> Result<(), NetError> {
+        let branch = self.assemble_side_branch(hash);
+        if branch.is_none() && !self.is_connected(&hash) {
+            return Err(NetError::Consensus("Block not found".into()));
+        }
         *self.precious.write().unwrap() = Some(hash);
-        if let Some(branch) = self.assemble_side_branch(hash) {
+        if let Some(branch) = branch {
             match self.accept_branch_inner(&branch) {
                 Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => {}
                 Err(e) => return Err(e),
