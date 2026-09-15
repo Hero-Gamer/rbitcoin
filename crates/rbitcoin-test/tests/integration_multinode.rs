@@ -1898,12 +1898,7 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         AcceptOutcome::IgnoredWeaker
     ));
     assert!(hub.held_body(&sibling.block_hash()).is_some());
-    let sibling2 = mine_regtest_block(p5_hash, p5.timestamp + 901, 6, vec![]);
-    assert!(matches!(
-        hub.accept_received_block(sibling2.clone()).unwrap(),
-        AcceptOutcome::IgnoredWeaker
-    ));
-    assert!(hub.held_body_count() >= 2);
+    pin_held_sixteen_vs_seventeen(hub, p5_hash, p5.timestamp);
     let tips = hub.chaintips();
     assert!(
         tips.iter()
@@ -1931,6 +1926,45 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         .precious_block(BlockHash::from_byte_array([0xab; 32]))
         .unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
+}
+
+/// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
+/// FIFO eviction at 320 stays `hold_body_caps_at_320_fifo`.
+fn pin_held_sixteen_vs_seventeen(hub: &rbitcoin_net::ChainHub, parent: BlockHash, timestamp: u32) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let mut hashes = Vec::with_capacity(17);
+    for i in 0..17u32 {
+        let b = mine_regtest_block(parent, timestamp.saturating_add(910 + i), 6, vec![]);
+        let h = b.block_hash();
+        assert!(
+            matches!(
+                hub.accept_received_block(b).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ),
+            "equal-work sibling {i} must park"
+        );
+        hashes.push(h);
+        assert!(
+            hub.held_body(&h).is_some(),
+            "sibling {i} must stay held (product cap 320)"
+        );
+    }
+    assert!(
+        hub.held_body(&hashes[0]).is_some(),
+        "17th equal-work sibling must not FIFO-evict the first (cap 320)"
+    );
+    assert!(hub.held_body(&hashes[16]).is_some());
+    assert!(hub.held_body_count() >= 17);
+    let parked = hub
+        .chaintips()
+        .into_iter()
+        .filter(|t| t.status == "valid-headers")
+        .count();
+    assert!(
+        parked >= 16,
+        "16 equal-work siblings as valid-headers, got {parked}"
+    );
 }
 
 /// Same-height competing tip with more work wins; then multi-block reorg to a

@@ -11,7 +11,7 @@ use rbitcoin_consensus::{accept_and_connect_block, genesis_block, ChainParams, M
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, VERSION};
 use rbitcoin_query::testutil::FixtureChain;
-use rbitcoin_query::Query;
+use rbitcoin_query::{stamp_external_parents, InFlight, Query};
 use rbitcoin_store::{HeaderRecord, Store, StoreError, TxRecord};
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 use rbitcoin_test::{
@@ -518,6 +518,69 @@ fn store_table_header_and_idx_corrupt() {
 
 // ─── Synthetic store growth (no PoW; tiny header.head rolls a generation) ───
 
+fn poison_confirmed_merkle_root(store: &std::path::Path, fk: Fk, rec: &HeaderRecord) {
+    let mut rec = rec.clone();
+    rec.merkle_root = [0xee; 32];
+    let enc = rec.encode();
+    let path = store.join("header.body");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let off = 16 + ((fk.0 - 1) as usize) * 88;
+    bytes[off..off + enc.len()].copy_from_slice(&enc);
+    std::fs::write(&path, bytes).unwrap();
+}
+
+fn pin_disconnect_to_genesis_reconnect_and_tip_shrink(
+    q: Query,
+    td: &TestDatadir,
+    n: u32,
+    saved: &[(HeaderRecord, rbitcoin_query::TxApply)],
+) {
+    for _ in 1..n {
+        q.disconnect_tip().unwrap();
+    }
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    assert!(q
+        .connect_block(
+            Height(0),
+            &HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 0,
+                bits: 1,
+                nonce: 0,
+                merkle_root: [0; 32],
+                hash: [1; 32],
+            },
+            &[]
+        )
+        .is_err());
+    for h in 1..n {
+        let (header, ta) = &saved[h as usize];
+        q.connect_block(Height(h), header, std::slice::from_ref(ta))
+            .unwrap();
+    }
+    assert_eq!(q.tip_height(), Some(Height(n - 1)));
+    let poison_h = Height(n.saturating_sub(3));
+    let (fk, rec) = q.header_at_height(poison_h).unwrap().unwrap();
+    q.flush().unwrap();
+    drop(q);
+    poison_confirmed_merkle_root(&td.store_path(), fk, &rec);
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    let tip = q
+        .tip_height()
+        .expect("open must keep a tip below the poison");
+    assert!(
+        tip.0 < n - 1,
+        "VERIFY_TIP_BLOCKS=6 must shrink past poisoned merkle at {}: {tip:?}",
+        poison_h.0
+    );
+    assert_eq!(
+        tip,
+        Height(n.saturating_sub(4)),
+        "poison at n-3 shrinks to last good n-4"
+    );
+}
+
 #[test]
 fn chain_connect_reorg_and_growth() {
     use rbitcoin_query::TxApply;
@@ -532,6 +595,7 @@ fn chain_connect_reorg_and_growth() {
     const N: u32 = 80;
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
+    let mut saved = Vec::with_capacity(N as usize);
     for h in 0..N {
         let version = 1;
         let timestamp = h;
@@ -574,7 +638,10 @@ fn chain_connect_reorg_and_growth() {
             outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
         parent_hash = Some(header.hash);
-        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        saved.push((header.clone(), ta.clone()));
+        prev = q
+            .connect_block(Height(h), &header, std::slice::from_ref(&ta))
+            .unwrap();
     }
     assert_eq!(q.tip_height(), Some(Height(N - 1)));
     q.flush().unwrap();
@@ -582,23 +649,7 @@ fn chain_connect_reorg_and_growth() {
 
     let q = Query::open_or_create_tiny(td.store_path()).unwrap();
     assert_eq!(q.tip_height(), Some(Height(N - 1)));
-    q.disconnect_tip().unwrap();
-    assert_eq!(q.tip_height(), Some(Height(N - 2)));
-    assert!(q
-        .connect_block(
-            Height(0),
-            &HeaderRecord {
-                prev_fk: Fk::NULL,
-                version: 1,
-                timestamp: 0,
-                bits: 1,
-                nonce: 0,
-                merkle_root: [0; 32],
-                hash: [1; 32],
-            },
-            &[]
-        )
-        .is_err());
+    pin_disconnect_to_genesis_reconnect_and_tip_shrink(q, &td, N, &saved);
 }
 
 // ─── Resume: Class A remains after connect+disconnect (not archive-ahead) ─────
@@ -769,6 +820,31 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
+/// Leftover identity: durable TipOnly is the one connected fk; RAM leftover
+/// maps keep one fk per txid (last write clobbers).
+fn pin_leftover_tiponly_one_fk(q: &Query, cb1: bitcoin::Txid, create_fk: Fk) {
+    let tid = *cb1.as_byte_array();
+    let tip = q
+        .tx_fk_by_txid_tip(&tid)
+        .unwrap()
+        .expect("TipOnly connected instance");
+    let any = q.tx_fk_by_txid(&tid).unwrap().expect("txid head identity");
+    assert_eq!(tip, create_fk);
+    assert_eq!(any, tip, "one fk per txid on leftover head");
+    let stamp =
+        stamp_external_parents(q.store(), &[tid], &InFlight::new(), None, q.confirm_stats())
+            .expect("plan=None leftover TipOnly stamp");
+    assert_eq!(stamp.resolved.get(&tid), Some(&tip));
+    let mut inflight = InFlight::new();
+    inflight.note_creates([(tid, tip)], Some(1));
+    let (_, _, once) = inflight.size_snapshot();
+    let later = Fk(tip.0.saturating_add(1));
+    inflight.note_creates([(tid, later)], Some(2));
+    let (_, _, twice) = inflight.size_snapshot();
+    assert_eq!(twice, once, "creates map stays one slot on clobber");
+    assert_eq!(inflight.get_create_fk(&tid), Some(later));
+}
+
 /// Resume: spend archived with create_fk (archive sticky/head); confirm spends.
 #[test]
 fn resume_tx_head_resolves_external_prev() {
@@ -854,6 +930,7 @@ fn resume_tx_head_resolves_external_prev() {
             1,
             "Direct confirm writes durable spend annotations"
         );
+        pin_leftover_tiponly_one_fk(&q, cb1, inp.create_fk);
     }
 }
 

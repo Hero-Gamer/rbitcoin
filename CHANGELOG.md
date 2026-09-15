@@ -18,6 +18,15 @@ before 1.0).
 
 ### Added
 
+- **Held 16 vs 17 park + genesis disconnect + leftover identity:**
+  `reorg_same_height_then_multi_block_branch` parks 16 and 17 equal-work
+  siblings as `valid-headers` (product held cap 320 does not FIFO at 17).
+  `chain_connect_reorg_and_growth` disconnects to genesis, reconnects the
+  suffix, then a poisoned merkle in the last 6 confirmed heights shrinks
+  tip on `Query::open`. `resume_tx_head_resolves_external_prev` leftover
+  TipOnly stamp is the one connected fk; RAM leftover map clobber stays
+  one slot. Held 320 FIFO stays `hold_body_caps_at_320_fifo`.
+
 - **Genesis+1 IBD + empty headers EOF vs lag:** `two_node_header_and_block_sync`
   is genesis+1 (8-block dual-seeder stays `ibd_two_peers`). Empty `headers`
   with lag keeps header sync; drained most-work path latches `headers_done`.
