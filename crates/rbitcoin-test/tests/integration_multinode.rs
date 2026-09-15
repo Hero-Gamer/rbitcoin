@@ -1758,6 +1758,63 @@ fn reorg_competing_spend_extends_without_multi_fail() {
     assert_eq!(hub.tip_height(), Some(fork_h + 4));
 }
 
+fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let tips = hub.chaintips();
+    assert!(
+        tips.iter()
+            .any(|t| t.status == "active" && t.hash == ext.block_hash() && t.height == 6),
+        "{tips:?}"
+    );
+    assert!(
+        tips.iter().any(|t| t.status == "valid-fork"),
+        "disconnected stem must be valid-fork: {tips:?}"
+    );
+
+    let p5 = hub.query.header_at_height(Height(5)).unwrap().unwrap().1;
+    let p5_hash = BlockHash::from_byte_array(p5.hash);
+    let sibling = mine_regtest_block(p5_hash, p5.timestamp + 900, 6, vec![]);
+    assert!(matches!(
+        hub.accept_received_block(sibling.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    assert!(hub.held_body(&sibling.block_hash()).is_some());
+    let sibling2 = mine_regtest_block(p5_hash, p5.timestamp + 901, 6, vec![]);
+    assert!(matches!(
+        hub.accept_received_block(sibling2.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    assert!(hub.held_body_count() >= 2);
+    let tips = hub.chaintips();
+    assert!(
+        tips.iter()
+            .any(|t| t.status == "valid-headers" && t.hash == sibling.block_hash()),
+        "{tips:?}"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+    hub.precious_block(sibling.block_hash()).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
+    let h1 = BlockHash::from_byte_array(
+        hub.query
+            .header_at_height(Height(1))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash,
+    );
+    hub.precious_block(h1).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "precious of less work must not activate"
+    );
+    let err = hub
+        .precious_block(BlockHash::from_byte_array([0xab; 32]))
+        .unwrap_err();
+    assert!(err.to_string().contains("Block not found"), "{err}");
+}
+
 /// Same-height competing tip with more work wins; then multi-block reorg to a
 /// longer side branch (tip-mode accept path, not IBD body-queue).
 #[test]
@@ -1847,59 +1904,7 @@ fn reorg_same_height_then_multi_block_branch() {
         hub.accept_block(ext.clone()).unwrap(),
         AcceptOutcome::Accepted { height: 6 }
     ));
-
-    let tips = hub.chaintips();
-    assert!(
-        tips.iter()
-            .any(|t| t.status == "active" && t.hash == ext.block_hash() && t.height == 6),
-        "{tips:?}"
-    );
-    assert!(
-        tips.iter().any(|t| t.status == "valid-fork"),
-        "disconnected stem must be valid-fork: {tips:?}"
-    );
-
-    let p5 = hub.query.header_at_height(Height(5)).unwrap().unwrap().1;
-    let p5_hash = BlockHash::from_byte_array(p5.hash);
-    let sibling = mine_regtest_block(p5_hash, p5.timestamp + 900, 6, vec![]);
-    assert!(matches!(
-        hub.accept_received_block(sibling.clone()).unwrap(),
-        AcceptOutcome::IgnoredWeaker
-    ));
-    assert!(hub.held_body(&sibling.block_hash()).is_some());
-    let sibling2 = mine_regtest_block(p5_hash, p5.timestamp + 901, 6, vec![]);
-    assert!(matches!(
-        hub.accept_received_block(sibling2.clone()).unwrap(),
-        AcceptOutcome::IgnoredWeaker
-    ));
-    assert!(hub.held_body_count() >= 2);
-    let tips = hub.chaintips();
-    assert!(
-        tips.iter()
-            .any(|t| t.status == "valid-headers" && t.hash == sibling.block_hash()),
-        "{tips:?}"
-    );
-    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
-    hub.precious_block(sibling.block_hash()).unwrap();
-    assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
-    let h1 = BlockHash::from_byte_array(
-        hub.query
-            .header_at_height(Height(1))
-            .unwrap()
-            .unwrap()
-            .1
-            .hash,
-    );
-    hub.precious_block(h1).unwrap();
-    assert_eq!(
-        hub.tip_hash().unwrap(),
-        sibling.block_hash(),
-        "precious of less work must not activate"
-    );
-    let err = hub
-        .precious_block(BlockHash::from_byte_array([0xab; 32]))
-        .unwrap_err();
-    assert!(err.to_string().contains("Block not found"), "{err}");
+    pin_precious_held_chaintips(&hub, ext);
 }
 
 /// Product `run_p2p`: `--connect` to a live seeder; process RPC while connected.
