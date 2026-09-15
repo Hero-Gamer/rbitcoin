@@ -18,6 +18,13 @@ before 1.0).
 
 ### Added
 
+- **Process wait/longpoll + getblock edges:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  `waitforblockheight` timeout=0 while behind returns the live tip;
+  `waitfornewblock` / `waitforblockheight` and GBT current `longpollid`
+  wake on the pad `generate` (stale id stays immediate). `getblockhash`
+  tip ok / tip+1 is `-8`; unknown `getblock` is `-5`; verbosity 0 is hex
+  and 2 has vin/vout. Wait-on-stop units stay.
+
 - **Connect-path H4/H6 and BIP68 time:** `header_and_spending_boundaries`
   accepts a matching height-1 checkpoint, rejects a mismatch, and
   `validate_header` of a too-easy compact against mainnet `pow_limit` is
