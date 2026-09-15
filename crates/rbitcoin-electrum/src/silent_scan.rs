@@ -159,4 +159,38 @@ mod tests {
         assert!(err.contains("32 bytes"), "{err}");
         let _ = Secp256k1::new();
     }
+
+    #[test]
+    fn parse_sub_labels_start_and_networks() {
+        let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+        let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+        let sub = parse_sub(
+            &json!([scan, spend, "12-20", [0, 1, 1]]),
+            Network::Bitcoin,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(sub.start, 12);
+        assert_eq!(sub.labels, vec![0, 1]);
+        assert!(sub.address.starts_with("sp1"), "{}", sub.address);
+        let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3)).unwrap();
+        assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
+        let ts = match parse_sub(
+            &json!([scan, spend, 600_000_000]),
+            Network::Regtest,
+            Some(0),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("timestamp"),
+        };
+        assert!(ts.contains("timestamp"), "{ts}");
+        let many = json!([scan, spend, 0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]);
+        let too = match parse_sub(&many, Network::Regtest, Some(0)) {
+            Err(e) => e,
+            Ok(_) => panic!("labels"),
+        };
+        assert!(too.contains("too many"), "{too}");
+        let r = subscribe_result(&sub);
+        assert_eq!(r["start_height"], 12);
+    }
 }

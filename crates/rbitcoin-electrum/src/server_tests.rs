@@ -3323,6 +3323,78 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn silentpayments_and_outpoint_tcp_notify() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let q = std::sync::Arc::new(q);
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(cfg, std::sync::Arc::clone(&q), params, tip_tx.clone(), None)
+        .await
+        .expect("listen");
+    let stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
+    async fn read_json(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Value {
+        let mut resp = String::new();
+        tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut resp))
+            .await
+            .unwrap_or_else(|_| panic!("sp stream timeout"))
+            .unwrap();
+        serde_json::from_str(&resp).unwrap_or_else(|e| panic!("sp parse {e}: {resp}"))
+    }
+    let req = json!({
+        "jsonrpc":"2.0","id":"sp",
+        "method":"blockchain.silentpayments.subscribe",
+        "params":[
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+            "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36",
+            0
+        ]
+    });
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await.unwrap();
+    let result = read_json(&mut reader).await;
+    assert_eq!(result["id"], "sp");
+    assert!(result["result"]["address"].as_str().unwrap().contains("sp"));
+    let note = read_json(&mut reader).await;
+    assert_eq!(note["method"], "blockchain.silentpayments.subscribe");
+    assert!(note["params"]["history"].as_array().is_some());
+
+    let op = json!({
+        "jsonrpc":"2.0","id":"op",
+        "method":"blockchain.outpoint.subscribe",
+        "params":[format!("{:064}", 0), 0]
+    });
+    let mut line = serde_json::to_string(&op).unwrap();
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await.unwrap();
+    let op_res = read_json(&mut reader).await;
+    assert_eq!(op_res["id"], "op");
+    assert_eq!(op_res["result"]["spent"], false);
+
+    tip_tx
+        .send(TipNotify {
+            height: 0,
+            header_hex: "00".repeat(160),
+            reorg_from_height: None,
+        })
+        .expect("tip");
+    let mut saw_op = false;
+    for _ in 0..4 {
+        let n = read_json(&mut reader).await;
+        if n["method"] == "blockchain.outpoint.subscribe" {
+            saw_op = true;
+            break;
+        }
+    }
+    assert!(saw_op, "outpoint notify after tip");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn wallet_protocol_1_6_outpoint_and_sp_subscribe() {
     let (dir, q) = tmp_store();
@@ -3414,6 +3486,18 @@ fn wallet_protocol_1_6_outpoint_and_sp_subscribe() {
     assert_eq!(sp["start_height"], 0);
     assert!(sp["address"].as_str().unwrap().contains("sp"), "{sp}");
     assert_eq!(sp["labels"], json!([0]));
+    let parsed = crate::silent_scan::parse_sub(
+        &json!([
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+            "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36",
+            0
+        ]),
+        bitcoin::Network::Regtest,
+        Some(0),
+    )
+    .unwrap();
+    let hits = crate::silent_scan::scan_hits(&q, &params, &parsed, 0, 0).unwrap();
+    assert!(hits.is_empty(), "{hits:?}");
 
     conn.protocol = "1.6".into();
     let hdrs = dispatch_with_join(
