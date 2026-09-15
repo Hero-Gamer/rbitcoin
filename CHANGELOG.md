@@ -78,6 +78,11 @@ before 1.0).
 
 ### Fixed
 
+- **`p2p_timeout_getaddr_and_keepalive_ping` follow handshake:** shrink
+  `peertimeout` to 1s only after the live follow (BIP324 + VERSION). Setting it
+  first let a unix-second heartbeat drop the inbound mid-handshake
+  (`v2 length prefix eof`). v1-magic / pre-verack still use 1s.
+
 - **`cmpct_differential` missing-index split:** Core extra-txn can fill a
   duplicate-txid short-id we still `getblocktxn` (018). Recipe
   `[2, 203, 4, 63]` is ours `[1, 4]` vs Core `[1]`. Agree when Core's indexes
