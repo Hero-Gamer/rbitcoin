@@ -15,7 +15,8 @@ before 1.0).
   (local `accept_package`) and `mempool.get_info`; `protocol_max` **1.6** with
   1.6 `block.headers` as a list. Electrum **1.7** `blockchain.outpoint.*`.
   Frigate `blockchain.silentpayments.subscribe` (session scan key). Esplora
-  `/fees/recommended` (sat/vB). P2P BIP331 and Electrum TLS/Tor still open.
+  `/fees/recommended` (sat/vB). Parked (not now): Electrum TLS/Tor in-binary
+  (**Q-63**), GBT longpoll/Sv2 (**Q-64**), BIP157 filters (**Q-65**).
 
 - **Esplora cross-surface leftover HTTP:** `esplora_broadcast_visible_in_rpc_and_electrum`
   pins `/blocks` start past tip (clamps), `/block/:hash/txs` one-past last page
