@@ -305,4 +305,4 @@ Before closing a **plan**:
 - Extreme Programming: planning game, stories, small releases, TDD, refactoring  
 - Bill Wake — **INVEST** user stories  
 - Vertical story slicing (value through the stack, not layer-by-layer)  
-- Project: [AGENTS.md](../AGENTS.md) (TDD, worktree + PR, musl after merge)
+- Project: [AGENTS.md](../AGENTS.md) (TDD, worktree + PR)
