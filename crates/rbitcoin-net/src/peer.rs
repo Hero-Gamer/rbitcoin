@@ -647,7 +647,8 @@ pub async fn run_feeler(
     .await
 }
 
-pub(crate) async fn run_feeler_timed(
+/// Feeler handshake with an explicit timeout (production uses [`HANDSHAKE_TIMEOUT`]).
+pub async fn run_feeler_timed(
     limit: Duration,
     stream: TcpStream,
     magic: Magic,

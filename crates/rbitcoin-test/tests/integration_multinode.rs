@@ -10,7 +10,10 @@
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
-use rbitcoin_net::{rehydrate_block_queue_residue, IbdConfig, P2PNode};
+use rbitcoin_net::{
+    rehydrate_block_queue_residue, run_feeler_timed, select_inbound_eviction, IbdConfig,
+    InboundEvictCandidate, NetError, P2PNode,
+};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
@@ -1140,6 +1143,67 @@ fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
 }
 
 /// Outbound feeler: VERSION completes, then the session closes (no live follow).
+async fn pin_feeler_handshake_timeout_after_silence() {
+    use bitcoin::p2p::Magic;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, peer) = listener.accept().await.unwrap();
+    let _silent = server;
+    match run_feeler_timed(
+        Duration::from_millis(50),
+        client,
+        Magic::REGTEST,
+        addr,
+        peer,
+        0,
+        "/rbitcoin:test/",
+    )
+    .await
+    {
+        Err(NetError::Timeout) => {}
+        Err(e) => panic!("feeler silence must Timeout, got {e}"),
+        Ok(()) => panic!("feeler succeeded on a silent peer"),
+    }
+}
+
+fn pin_select_node_to_evict_ranking() {
+    fn cand(
+        id: u64,
+        connected_at: u64,
+        min_ping: Option<f64>,
+        last_block: u64,
+        last_tx: u64,
+    ) -> InboundEvictCandidate {
+        InboundEvictCandidate {
+            id,
+            connected_at,
+            min_ping,
+            last_block,
+            last_tx,
+            netgroup: 1,
+            noban: false,
+        }
+    }
+    let mut cands = Vec::new();
+    for i in 0..4 {
+        cands.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
+    }
+    for i in 4..9 {
+        cands.push(cand(i, 200 + i, Some(0.5), 0, 0));
+    }
+    for i in 9..13 {
+        cands.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
+    }
+    for i in 13..21 {
+        cands.push(cand(i, 400 + i, Some(0.01), 0, 0));
+    }
+    let victim = select_inbound_eviction(cands).expect("one unprotected slow");
+    assert!((4..9).contains(&victim), "victim={victim}");
+}
+
 #[tokio::test]
 async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
@@ -1189,6 +1253,7 @@ async fn p2p_feeler_completes_and_closes() {
             "feeler must not leave a completed inbound on the dummy: {:?}",
             dummy.peers.snapshot()
         );
+        pin_feeler_handshake_timeout_after_silence().await;
 
         seed.shutdown().await;
         dummy.shutdown().await;
@@ -1203,6 +1268,7 @@ async fn p2p_feeler_completes_and_closes() {
 async fn p2p_inbound_full_rejects_extra() {
     let fut = async {
         let _live = live_p2p_lock().await;
+        pin_select_node_to_evict_ranking();
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();

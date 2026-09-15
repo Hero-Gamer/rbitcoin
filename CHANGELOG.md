@@ -18,6 +18,12 @@ before 1.0).
 
 ### Added
 
+- **Feeler silence + inbound eviction rank:** `p2p_feeler_completes_and_closes`
+  still completes VERSION then closes; `run_feeler_timed` on a silent socket
+  is `Timeout`. `p2p_inbound_full_rejects_extra` still refuses the extra
+  follow at `max_inbound=1`; `select_inbound_eviction` 21-cand ranking picks
+  an unprotected slow peer. Inbound/outbound/plain silence and noban guts stay.
+
 - **Same-process body-queue residue:** `serve_after_restart_via_reconstruct`
   restart RAM queue is empty. Planted leftover then
   `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads,

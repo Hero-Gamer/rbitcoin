@@ -36,8 +36,7 @@ those lines from the journey first.
 Keep until a **default** journey hits the same lines: store packed / v17 /
 fuse / SH machines, unsorted pack/lag,
 IBD wave fence / 8×8000, SH writebehind / uring CAS, leftover identity,
-handshake format needles, `getaddr_cache_*`, eviction ranking, feeler silence
-timeout, sole-preferred stall KEEP, `stamp_reject_names_*`,
+handshake format needles, `getaddr_cache_*`, sole-preferred stall KEEP, `stamp_reject_names_*`,
 `multi_hop_bad_prev_*`, structure s1–s18, rate-limiter, netgroup, subsidy
 table. Optional leftovers (more HTTP methods on `cross_surface`, a tiny
 legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
@@ -285,8 +284,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `two_node_header_and_block_sync` | P2P (**default**) | Seeder → peer 8-block IBD; peer `last_write` meter |
 | `p2p_timeout_getaddr_and_keepalive_ping` | P2P (**default**) | One pad: v1-magic inbound drops at `peertimeout=1`, obsolete VERSION and pre-verack ping close the peer, full-relay GetAddr cache 1000, headers-sync stall replace, self-connect refuses, AddrFetch `getaddr`/`addrv2` (no `getheaders`), one keepalive ping/pong. Handshake **format** needles stay. Sole-preferred stall KEEP stays a PeerHub unit. |
 | `p2p_compact_hb_getblocktxn_and_orphan` | P2P (**default**) | One mature pad: HB coinbase `cmpctblock`, 2-tx compact → `getblocktxn` + connect, unique short-id fill that fails header merkle → `getdata` (not `getblocktxn`, header not `BLOCK_FAILED`) then honest full `block` connects, orphan child GetData then parent accept (INV AlreadyHave), then live `getblocks` → `inv`, inbound `feefilter`, `filterload` disconnect. Oversize locator and MemPool/`filteradd`/`filterclear` stay PeerHub units. Live mutated `block` disconnects in `on_block`. Does **not** pin depth-10 full-block serve, tokio-worker lock, or park-not-reject logs |
-| `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |
-| `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
+| `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Same test: `run_feeler_timed` silence is `Timeout`. Inbound/outbound/plain silence stay `handshake_timeout_after_silence` |
+| `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Same test: `select_inbound_eviction` 21-cand ranking (4 block + 5 slow + 4 tx + 8 ping → victim in slow). noban-alone stays a unit |
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
 | `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Restart RAM body queue is empty. Same-process `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads, keeps above-tip wire, unknown height stays queued. `has_block` / known-archived keep and tip+1 gap `missing` stay `bq_rehydrate_residue_keep_drop_gap_and_unknown` |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
