@@ -11,6 +11,9 @@ before 1.0).
 
 ### Changed
 
+- **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
+  names `create.loc.ovf` u32/u32; empty-open paths rewrite `meta` to 24.
+
 - **Coverage gate is never-falls:** PRs must not lower production LCOV
   `LH`/`LF` vs last green `master` (`badges/coverage.json`). 90% remains
   only a floor when that baseline is missing. [`TESTING.md`](TESTING.md).
@@ -30,6 +33,13 @@ before 1.0).
   `Corrupt("invariant: height_by_hash confirmed header missing")`.
 
 ### Fixed
+
+- **Package rollback restores RBF victims:** a later package member fail
+  re-admits txs the accepted members had replaced.
+
+- **Pending-fork headers check nBits and MTP:** `ensure_header` no longer
+  persists a header-only child on claimed POW alone. Wrong bits or
+  `time <=` parent MTP is rejected; a persist walk stops at the first error.
 
 - **Package admit is all-or-nothing:** `accept_package` / RPC `submitpackage`
   rollback uses `remove_txid_tree` (hub `unindex_evicted`). Min-relay waiver

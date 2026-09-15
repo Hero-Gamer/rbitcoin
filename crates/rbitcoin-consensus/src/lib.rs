@@ -66,7 +66,9 @@ pub use clock::{with_now, NodeClock};
 pub use convert::header_to_record;
 pub(crate) use convert::{block_to_apply, block_to_apply_with_txids_prev};
 pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, ConsensusError};
-pub use header::{expected_next_bits, median_time_past, validate_header};
+pub use header::{
+    expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
+};
 pub use milestone::Milestone;
 pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
 pub use policy::PolicyResult;
