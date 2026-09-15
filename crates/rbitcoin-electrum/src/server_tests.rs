@@ -3556,3 +3556,81 @@ fn wallet_protocol_1_6_outpoint_and_sp_subscribe() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn broadcast_package_and_mempool_outpoint_spend() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::Encodable;
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{accept_and_connect_block, Milestone};
+    use rbitcoin_net::MempoolHub;
+    use std::sync::Arc;
+
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        103,
+        2,
+    );
+    let q_arc = Arc::new(q);
+    let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q_arc)).unwrap();
+    mp.set_relay_enabled(true);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: spk,
+        }],
+    };
+    let mut raw = Vec::new();
+    parent.consensus_encode(&mut raw).unwrap();
+    let hex = rbitcoin_primitives::hex_encode(&raw);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut conn = ElectrumConn::new();
+    let ok = dispatch_with_join(
+        "blockchain.transaction.broadcast_package",
+        &json!([[hex], true]),
+        &q_arc,
+        &cfg,
+        &params,
+        Some(&mp),
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(ok["package_msg"], "success", "{ok}");
+    let cb = txid_hex(&coinbase_txids[0].to_byte_array());
+    let st = dispatch_with_join(
+        "blockchain.outpoint.get_status",
+        &json!([cb, 0]),
+        &q_arc,
+        &cfg,
+        &params,
+        Some(&mp),
+        &mut conn,
+    )
+    .unwrap();
+    assert_eq!(st["spent"], true, "{st}");
+    assert_eq!(st["height"], 0, "{st}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
