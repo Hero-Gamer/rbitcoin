@@ -621,6 +621,7 @@ pub async fn ibd_cancellable(
                 &mut st.slots,
                 &mut st.inflight,
                 &mut st.addr_cooldown,
+                &mut st.addr_strikes,
                 now,
                 cfg.stall,
             );
@@ -628,6 +629,7 @@ pub async fn ibd_cancellable(
                 &mut st.slots,
                 &mut st.inflight,
                 &mut st.addr_cooldown,
+                &mut st.addr_strikes,
                 now,
                 &mut st.relative_slow_suspect,
                 &mut st.relative_slow_last_kick_ms,
