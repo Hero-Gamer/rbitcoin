@@ -92,8 +92,8 @@ PY
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
   echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files)"
-  echo "Line coverage gate: never below last green master (badges/coverage.json); ${LCOV_PCT}% now"
-  echo "Gate math: pass iff LH*base_LF >= LF*base_LH (unrounded; 90% floor if no baseline)"
+  echo "Line coverage gate: never below highest master coverage at or before merge-base; ${LCOV_PCT}% now"
+  echo "Gate math: pass iff LH*base_LF >= LF*base_LH (unrounded; 90% floor if no snapshot)"
 
   # Optional HTML diagnostic (not the pass condition).
   HTML_PRESENT=0
@@ -115,10 +115,20 @@ PY
     echo "HTML uncovered-line markers (diagnostic): ${UNCOV_TOTAL}"
   fi
 
-  # Unrounded LH/LF vs last green master. Do not use the 2-decimal display string.
+  # Unrounded LH/LF vs highest master snapshot at or before merge-base.
   GATE_JSON="$ROOT/coverage/gate.json"
-  if ! python3 "$ROOT/scripts/coverage-gate.py" \
-    --lh "$LCOV_HIT" --lf "$LCOV_TOT" --status-out "$GATE_JSON"; then
+  GATE_ARGS=(--lh "$LCOV_HIT" --lf "$LCOV_TOT" --status-out "$GATE_JSON")
+  MERGE_BASE="${COVERAGE_MERGE_BASE:-}"
+  if [[ -z "$MERGE_BASE" ]] && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$ROOT" fetch --no-tags origin master:refs/remotes/origin/master >/dev/null 2>&1 || true
+    HEAD_FOR_BASE="${COVERAGE_HEAD_SHA:-${GITHUB_HEAD_SHA:-HEAD}}"
+    MERGE_BASE="$(git -C "$ROOT" merge-base origin/master "$HEAD_FOR_BASE" 2>/dev/null || true)"
+  fi
+  if [[ -n "$MERGE_BASE" ]]; then
+    echo "Coverage merge-base: ${MERGE_BASE}"
+    GATE_ARGS+=(--merge-base "$MERGE_BASE" --git-dir "$ROOT")
+  fi
+  if ! python3 "$ROOT/scripts/coverage-gate.py" "${GATE_ARGS[@]}"; then
     cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
     exit 1
   fi

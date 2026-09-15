@@ -153,10 +153,11 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
    new design notes.
 2. Prefer **high-level functional/integration tests** over unit tests
    ([`TESTING.md`](./TESTING.md)).
-3. Every PR must **not lower** production line coverage vs last green
-   `master` (`badges/coverage.json` LCOV `LH`/`LF`; 90% floor if that
-   baseline is missing). Nightly branch coverage stays ≥90% when measured.
-   Same bar as CI via `./scripts/coverage.sh`.
+3. Every PR must **not lower** production line coverage vs the highest
+   green-`master` snapshot at or before `git merge-base` with `origin/master`
+   (`badges/coverage-history.jsonl`; 90% floor if that snapshot is missing).
+   Nightly branch coverage stays ≥90% when measured. Same bar as CI via
+   `./scripts/coverage.sh`.
 4. Target is **production server-side** node software (wallet backends, etc.).
    Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/end-user wallet/
    mining without an explicit plan change.

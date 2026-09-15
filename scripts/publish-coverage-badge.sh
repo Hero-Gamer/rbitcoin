@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Push coverage/badge.json to the orphan-style `badges` branch as coverage.json.
-# Last green master coverage job wins. Does not touch master.
+# Push coverage/badge.json to the orphan-style `badges` branch as coverage.json
+# and append coverage-history.jsonl (sha, lh, lf, date). Does not touch master.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,7 +9,7 @@ REPO="${GITHUB_REPOSITORY:-reardencode/rbitcoin}"
 BRANCH="badges"
 
 if [[ "${BADGE_DRY_RUN:-}" == "1" ]]; then
-  echo "publish-coverage-badge: $SRC -> $REPO $BRANCH/coverage.json"
+  echo "publish-coverage-badge: $SRC -> $REPO $BRANCH/coverage.json + coverage-history.jsonl"
   exit 0
 fi
 
@@ -44,7 +44,35 @@ else
 fi
 
 cp "$SRC" "$work/coverage.json"
-git -C "$work" add coverage.json
+python3 - "$SRC" "$work/coverage-history.jsonl" <<'PY'
+import json, sys
+from pathlib import Path
+src = json.loads(Path(sys.argv[1]).read_text())
+hist_path = Path(sys.argv[2])
+rows = []
+if hist_path.exists():
+    for line in hist_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+sha = str(src.get("sha") or "")
+if sha:
+    rows = [r for r in rows if str(r.get("sha")) != sha]
+    rows.append(
+        {
+            "sha": sha,
+            "lh": int(src["lh"]),
+            "lf": int(src["lf"]),
+            "date": str(src.get("date") or ""),
+        }
+    )
+    rows = rows[-500:]
+    hist_path.write_text(
+        "".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+PY
+git -C "$work" add coverage.json coverage-history.jsonl
 if git -C "$work" diff --cached --quiet; then
   echo "publish-coverage-badge: unchanged"
   exit 0

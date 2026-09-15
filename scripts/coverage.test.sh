@@ -209,6 +209,87 @@ PY
 assert_ok "status-out JSON names ratchet baseline" true
 rm -f "$st" "$base"
 
+# Merge-base ratchet: highest master snapshot at or before the fork point,
+# not whatever origin/master has published while the PR was open.
+gitrepo="$(mktemp -d)"
+git -C "$gitrepo" init -q
+git -C "$gitrepo" config user.email "gate@test"
+git -C "$gitrepo" config user.name "gate"
+echo a >"$gitrepo/f"
+git -C "$gitrepo" add f
+git -C "$gitrepo" commit -q -m A
+SHA_A="$(git -C "$gitrepo" rev-parse HEAD)"
+echo b >>"$gitrepo/f"
+git -C "$gitrepo" commit -q -am B
+SHA_B="$(git -C "$gitrepo" rev-parse HEAD)"
+echo c >>"$gitrepo/f"
+git -C "$gitrepo" commit -q -am C
+SHA_C="$(git -C "$gitrepo" rev-parse HEAD)"
+hist="$(mktemp)"
+python3 - "$hist" "$SHA_A" "$SHA_B" "$SHA_C" <<'PY'
+import json, sys
+from pathlib import Path
+path, a, b, c = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rows = [
+    {"sha": a, "lh": 900, "lf": 1000, "date": "2026-09-01"},
+    {"sha": b, "lh": 910, "lf": 1000, "date": "2026-09-10"},
+    {"sha": c, "lh": 930, "lf": 1000, "date": "2026-09-15"},
+]
+Path(path).write_text("".join(json.dumps(r) + "\n" for r in rows))
+PY
+
+python3 - "$GATE" "$hist" "$gitrepo" "$SHA_B" "$SHA_C" <<'PY' || exit 1
+import importlib.util, json, sys
+from pathlib import Path
+gate_path, hist, gitrepo, sha_b, sha_c = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location("coverage_gate", gate_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+entries = mod.parse_history(Path(hist).read_text())
+picked = mod.pick_baseline(entries, sha_b, gitrepo)
+assert picked is not None, "expected a baseline at B"
+assert picked["lh"] == 910 and picked["sha"] == sha_b, picked
+# C is after the fork; must not be the baseline for merge-base B.
+assert picked["lh"] != 930
+later = mod.pick_baseline(entries, sha_c, gitrepo)
+assert later["lh"] == 930, later
+print("ok - pick_baseline ignores post-fork master snapshots")
+PY
+assert_ok "pick_baseline ignores post-fork master snapshots" true
+
+python3 - "$GATE" "$hist" "$gitrepo" "$SHA_B" "$SHA_A" <<'PY' || exit 1
+import importlib.util, json, sys
+from pathlib import Path
+gate_path, hist, gitrepo, sha_b, sha_a = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location("coverage_gate", gate_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+entries = mod.parse_history(Path(hist).read_text())
+# Peak before B is A=90% vs B=91% → B wins. Rewrite A higher:
+entries[0]["lh"] = 920
+picked = mod.pick_baseline(entries, sha_b, gitrepo)
+assert picked["lh"] == 920, picked
+print("ok - pick_baseline takes the highest ancestor ratio, not the newest")
+PY
+assert_ok "pick_baseline takes the highest ancestor ratio, not the newest" true
+
+tipbadge="$(mktemp)"
+python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 999 --lf 1000 --gate 90 --sha deadbeefdead --date 2026-09-15 --out "$tipbadge"
+assert_gate_pass "CLI merge-base B does not require beating C" \
+  --lh 910 --lf 1000 --history "$hist" --baseline "$tipbadge" \
+  --merge-base "$SHA_B" --git-dir "$gitrepo"
+assert_gate_fail "CLI merge-base B still fails a real drop vs B" \
+  --lh 909 --lf 1000 --history "$hist" --baseline "$tipbadge" \
+  --merge-base "$SHA_B" --git-dir "$gitrepo"
+assert_gate_fail "CLI merge-base C still requires beating C" \
+  --lh 920 --lf 1000 --history "$hist" --baseline "$tipbadge" \
+  --merge-base "$SHA_C" --git-dir "$gitrepo"
+rm -f "$tipbadge"
+
+rm -f "$hist"
+rm -rf "$gitrepo"
+
 tmp="$(mktemp)"
 python3 "$ROOT/scripts/coverage-badge.py" \
   --lh 905 --lf 1000 --gate 90 --base-lh 101175 --base-lf 110953 \

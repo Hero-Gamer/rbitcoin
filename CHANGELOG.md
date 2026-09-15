@@ -18,12 +18,14 @@ before 1.0).
 
 ### Changed
 
+- **Coverage ratchet is merge-base, not tip of master:** PRs must not lower
+  production LCOV `LH`/`LF` vs the **highest** green-`master` snapshot whose
+  SHA is an ancestor of `git merge-base(PR tip, origin/master)`. Master jobs
+  that landed after the branch forked are ignored. History:
+  `badges/coverage-history.jsonl`. [`TESTING.md`](TESTING.md).
+
 - **SCHEMA.md matches live 24:** common-header version is 24; loc freeze
   names `create.loc.ovf` u32/u32; empty-open paths rewrite `meta` to 24.
-
-- **Coverage gate is never-falls:** PRs must not lower production LCOV
-  `LH`/`LF` vs last green `master` (`badges/coverage.json`). 90% remains
-  only a floor when that baseline is missing. [`TESTING.md`](TESTING.md).
 
 - **IBD tip-hole assign:** densify issues no new far getdata while `hole=` is
   open; tip-hole races prefer short inflight queues; an aged hole owner is
