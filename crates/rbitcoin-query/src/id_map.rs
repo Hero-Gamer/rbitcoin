@@ -59,6 +59,12 @@ pub type OutPointSet =
 /// Immutable `txid → (create_fk, body_range)` for one resolve wave.
 pub type IdMap = HashMap<[u8; 32], (Fk, (u64, u64)), BuildHasherDefault<TxidHasher>>;
 
+/// Confirm-hot `txid → V` (identity hasher; equality still uses the full key).
+pub type TxidMap<V> = HashMap<[u8; 32], V, BuildHasherDefault<TxidHasher>>;
+
+/// Confirm-hot txid set (duplicate / need-key collect).
+pub type TxidSet = std::collections::HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

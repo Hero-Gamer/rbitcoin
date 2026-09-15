@@ -2814,14 +2814,12 @@ fn confirm_noncontiguous_fks_and_mark_spends() {
 /// body re-read (missing store row still succeeds via pin).
 #[test]
 fn sh_collect_write_pin_skips_store() {
-    use std::sync::Arc;
-
     let (dir, q) = temp_query("sh-collect-pin");
 
     let script = vec![0x51, 0xaa, 0xbb];
     let expected_sh = script_hash(&script);
     let fk = Fk(9_876_543);
-    let pin: CreatePin = Arc::new((
+    let pin = CreatePinInner::records(
         TxRecord {
             txid: [0xce; 32],
             version: 1,
@@ -2832,7 +2830,7 @@ fn sh_collect_write_pin_skips_store() {
             output_count: 1,
         },
         vec![OutputRecord::unspent(42, script)],
-    ));
+    );
 
     let mut recs = Vec::new();
     q.collect_scripthash_creates(fk, &mut recs, Some(&pin))
