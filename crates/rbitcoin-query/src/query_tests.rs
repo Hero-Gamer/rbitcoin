@@ -570,6 +570,23 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
         "disconnected tip hash is not confirmed"
     );
     assert_height(&q, &hashes[3], 3);
+    assert_eq!(
+        q.headers_after_locator(&[], BlockHash::from_byte_array(hashes[2]), 5)
+            .unwrap()
+            .len(),
+        1,
+        "null locator + known stop is that one header"
+    );
+    assert!(
+        q.headers_after_locator(&[], BlockHash::from_byte_array([0xee; 32]), 5)
+            .unwrap()
+            .is_empty(),
+        "null locator + unknown stop is empty"
+    );
+    let rec = q.header_at_height(Height(3)).unwrap().unwrap().1;
+    let _ = q
+        .wire_header_from_record_prev(&rec, Some(hashes[2]))
+        .unwrap();
 
     while let Some(h) = q.tip_height() {
         q.store.confirmed.disconnect_tip(h).unwrap();
