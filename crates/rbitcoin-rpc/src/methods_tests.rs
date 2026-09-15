@@ -1783,8 +1783,11 @@ fn submitpackage_child_fail_leaves_no_package_txs() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (parent_hex, parent) =
-        mature_coinbase_spend(&ctx, 49_0000_0000, ScriptBuf::from_bytes(vec![0x51]));
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
     let bad = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -1798,12 +1801,17 @@ fn submitpackage_child_fail_leaves_no_package_txs() {
             witness: Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(1_000),
+            value: parent.output[0].value + Amount::from_sat(1),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
     let bad_hex = hex_encode(serialize(&bad));
-    let pkg = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, bad_hex])]).unwrap();
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, bad_hex]), json!(0)],
+    )
+    .unwrap();
     assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
     assert!(
         !ctx.mempool
