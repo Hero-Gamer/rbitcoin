@@ -4182,6 +4182,83 @@ fn handshake_disconnect_log_needles() {
 }
 
 #[test]
+fn wtxidrelay_prior_to_verack_is_remembered() {
+    use crate::peers::{PeerConnType, PeerHub};
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let sess = peers.register(addr, addr, &ver, true, PeerConnType::Inbound);
+
+    rbitcoin_log::capture_logs(true);
+    let done = apply_pre_verack(
+        Some(sess.as_ref()),
+        &NetworkMessage::WtxidRelay,
+        "wtxidrelay",
+    );
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!done, "wtxidrelay is not verack");
+    assert!(
+        sess.wtxid_relay(),
+        "BIP339 wtxidrelay before verack must stick like sendaddrv2"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|(_, m)| m.contains("Unsupported message \"wtxidrelay\"")),
+        "must not log unsupported wtxidrelay, got {logs:?}"
+    );
+
+    rbitcoin_log::capture_logs(true);
+    let done = apply_pre_verack(
+        Some(sess.as_ref()),
+        &NetworkMessage::SendAddrV2,
+        "sendaddrv2",
+    );
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!done);
+    assert!(sess.wants_addrv2());
+    assert!(
+        !logs
+            .iter()
+            .any(|(_, m)| m.contains("Unsupported message \"sendaddrv2\"")),
+        "sendaddrv2 before verack stays silent, got {logs:?}"
+    );
+
+    rbitcoin_log::capture_logs(true);
+    let done = apply_pre_verack(Some(sess.as_ref()), &NetworkMessage::Ping(1), "ping");
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(!done);
+    assert!(
+        logs.iter()
+            .any(|(_, m)| m.contains("Unsupported message \"ping\" prior to verack")),
+        "ping before verack still logs, got {logs:?}"
+    );
+    assert!(apply_pre_verack(
+        Some(sess.as_ref()),
+        &NetworkMessage::Verack,
+        "verack"
+    ));
+}
+
+#[test]
 fn externalip_is_advertised_once_then_after_a_day() {
     use crate::peers::{PeerConnType, PeerHub};
     use bitcoin::p2p::address::Address;

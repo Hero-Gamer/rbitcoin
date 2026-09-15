@@ -570,6 +570,7 @@ pub(crate) async fn inbound_connect_and_handshake(
     };
     let id = sess.id;
     let wants_addrv2 = sess.wants_addrv2();
+    let wtxid_relay = sess.wtxid_relay();
     peers.unregister(id);
     let sess = peers.register_with_id(
         id,
@@ -582,6 +583,9 @@ pub(crate) async fn inbound_connect_and_handshake(
     sess.mark_handshake_complete();
     if wants_addrv2 {
         sess.set_wants_addrv2();
+    }
+    if wtxid_relay {
+        sess.set_wtxid_relay();
     }
     sess.note_recv("version", 100);
     sess.note_recv("verack", 0);
@@ -904,25 +908,49 @@ async fn wait_peer_verack(
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
         let msg = frame.decode();
-        match msg.payload() {
-            NetworkMessage::Verack => return Ok(()),
-            NetworkMessage::SendAddrV2 => {
-                if let Some(s) = policy.session {
-                    s.set_wants_addrv2();
-                }
+        if apply_pre_verack(policy.session, msg.payload(), &cmd) {
+            return Ok(());
+        }
+        if !matches!(
+            msg.payload(),
+            NetworkMessage::SendAddrV2 | NetworkMessage::WtxidRelay
+        ) {
+            fail_if_handshake_timed_out(policy)?;
+        }
+    }
+}
+
+/// Remember BIP339 / BIP155 features sent before VERACK. `true` = VERACK seen.
+fn apply_pre_verack(
+    session: Option<&crate::peers::LivePeer>,
+    payload: &NetworkMessage,
+    cmd: &str,
+) -> bool {
+    match payload {
+        NetworkMessage::Verack => true,
+        NetworkMessage::SendAddrV2 => {
+            if let Some(s) = session {
+                s.set_wants_addrv2();
             }
-            NetworkMessage::Ping(_) => {
-                if let Some(s) = policy.session {
-                    rbitcoin_log::debug!("{}", ping_prior_to_verack_log(s.id));
-                }
-                fail_if_handshake_timed_out(policy)?;
+            false
+        }
+        NetworkMessage::WtxidRelay => {
+            if let Some(s) = session {
+                s.set_wtxid_relay();
             }
-            _ => {
-                if let Some(s) = policy.session {
-                    rbitcoin_log::debug!("{}", unsupported_before_verack_log(&cmd, s.id));
-                }
-                fail_if_handshake_timed_out(policy)?;
+            false
+        }
+        NetworkMessage::Ping(_) => {
+            if let Some(s) = session {
+                rbitcoin_log::debug!("{}", ping_prior_to_verack_log(s.id));
             }
+            false
+        }
+        _ => {
+            if let Some(s) = session {
+                rbitcoin_log::debug!("{}", unsupported_before_verack_log(cmd, s.id));
+            }
+            false
         }
     }
 }
@@ -1274,6 +1302,9 @@ pub async fn peer_session_with(
     }
 
     let mut follow = PeerFollowState::new();
+    if let Some(s) = meta.session.as_ref() {
+        follow.wtxid_relay = s.wtxid_relay();
+    }
     let mut requested_since: Option<std::time::Instant> = None;
     let mut rate = PeerRateLimiter::default_limits();
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
@@ -2040,7 +2071,7 @@ async fn handle_peer_frame(
         NetworkMessage::FeeFilter(amt) => on_feefilter(session, *amt),
         NetworkMessage::SendHeaders => on_sendheaders(follow),
         NetworkMessage::SendCmpct(sc) => on_sendcmpct(follow, session, sc),
-        NetworkMessage::WtxidRelay => on_wtxid_relay(follow),
+        NetworkMessage::WtxidRelay => on_wtxid_relay(follow, session),
         NetworkMessage::SendAddrV2 => on_sendaddrv2(follow, session),
         NetworkMessage::Addr(list) => on_addr_list(follow, session, list.len())?,
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
@@ -2130,9 +2161,12 @@ fn on_sendcmpct(
     }
 }
 
-fn on_wtxid_relay(follow: &mut PeerFollowState) {
+fn on_wtxid_relay(follow: &mut PeerFollowState, session: Option<&crate::peers::LivePeer>) {
     // BIP339 mutual: we already sent wtxidrelay pre-verack; remember theirs.
     follow.wtxid_relay = true;
+    if let Some(s) = session {
+        s.set_wtxid_relay();
+    }
 }
 
 fn on_sendaddrv2(follow: &mut PeerFollowState, session: Option<&crate::peers::LivePeer>) {
