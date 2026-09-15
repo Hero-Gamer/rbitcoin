@@ -1723,7 +1723,7 @@ fn mempool_shortid_avail(
 
 #[derive(Debug)]
 enum CmpctReconstruct {
-    Block(Block, Option<crate::compact::CmpctFillSets>),
+    Block(Block, Option<Box<crate::compact::CmpctFillSets>>),
     Missing(Vec<u64>),
 }
 
@@ -1735,7 +1735,7 @@ fn try_reconstruct_cmpct(
 ) -> Option<CmpctReconstruct> {
     let (owned, fill) = mempool_shortid_avail(hub, hsi, version);
     match crate::compact::try_reconstruct(hsi, &owned, version) {
-        Ok(block) => Some(CmpctReconstruct::Block(block, fill)),
+        Ok(block) => Some(CmpctReconstruct::Block(block, fill.map(Box::new))),
         Err(_) if hub.mempool().is_none() => None,
         Err(m) => Some(CmpctReconstruct::Missing(m)),
     }
@@ -2780,7 +2780,7 @@ async fn on_cmpctblock(
         } else {
             match try_reconstruct_cmpct(hub, &hsi, 2) {
                 Some(CmpctReconstruct::Block(block, fill)) => {
-                    log_cmpct_filled(hub, &hsi, &block, &[], fill.as_ref());
+                    log_cmpct_filled(hub, &hsi, &block, &[], fill.as_deref());
                     follow.requested_blocks.remove(&hash);
                     follow.pending_cmpct.remove(&hash);
                     relay_new_pow_valid_block(hub, &block, session);
