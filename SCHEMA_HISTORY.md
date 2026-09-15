@@ -45,8 +45,9 @@ Versions below are listed **newest → oldest** after the summary table.
 rewrites via `header.body.grow` then rename; migrated size/weight are 0 until
 confirm stamps or a JSON read lazy-fills. Headers are still `ensure`d before the
 block body exists. Class A tx stems are kept. SH extent `ver=2` last-page
-reserved u32 (offset 20) is create count (`0` = unknown, walk once). Inline/slab
-still use pack8 `used`. A 23 binary refuses 24 `meta`.
+reserved u32 (offset 20) is create count (`0` = unknown: readers walk, appender
+stamps on pack/append). Inline/slab still use pack8 `used`. A 23 binary refuses
+24 `meta`.
 
 ## v23 (create.loc.ovf u32)
 

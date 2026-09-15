@@ -37,11 +37,8 @@ wallets and APIs can verify and sync—not so we become mempool.space.
 joins with more than N creates: Esplora HTTP **503**, Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates`. Stats stay full when under the cap.
 
-`GET /address/:addr/txs/summary` and `/scripthash/:hash/txs/summary` (optional
-`/:last_seen_txid`) return up to 25 confirmed `{txid, value, height, time}` rows
-(mempool.space-shaped compact fields; not Blockstream API.md), paged like
-`/txs/chain`. `value` is net sats for that script in that tx. Mempool rows stay
-on `/txs` and `/txs/mempool`.
+`GET …/txs/summary` is a **dialect** route (not Blockstream Esplora `API.md`).
+Shape and owner row: [Esplora REST surface](#esplora-rest-surface).
 
 **Product:** `/tx/:txid/outspend/:vout` and `/outspends` emit Blockstream
 `vin` (spending input index) from the schema-22 spent slot. Mempool overlay
@@ -204,7 +201,8 @@ via reverse proxy; app `ServeLimits` always on (same model as Electrum).
 | Blocks list | done | `/blocks`, `/blocks/:start_height` (10 summaries, newest-first) |
 | Block | done | `/block/:hash` JSON, `/raw`, `/status`, `/header`, `/txids`, `/txid/:i`, `/txs[/:start]`. JSON `bits` is the compact-target **u32** (Esplora schema, not Core hex). `size` / `weight` are BIP144 total size and BIP141 weight (witness included). |
 | Tx | done | `/tx/:txid` full JSON, `/hex`, `/raw`, `/status`, Electrum `/merkle-proof`, BIP37 `/merkleblock-proof`, `/outspend(s)` (`vin` from the spent slot; unspent omits it). Mempool-only txs (not in Class A) use the wire body from the mempool hub (`vin`/`vout`/`size`/`weight`/`fee`, `status.confirmed` false) including `GET /tx/:txid/status`. Live `/outspend(s)` overlay mempool spends of confirmed coins; `?asof=` omits mempool. `?asof=<hash>` on `/status` and `/outspend(s)`: confirmed/spent as of that ancestor; 404 if not on chain. |
-| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]`; `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` and `/txs/mempool` use full Esplora tx JSON for mempool-only rows (wire from the hub). Last **one** SH join reused across sequential REST calls until SH-view **hash** changes; concurrent different SHs re-join. Needs SH finalize. Stamp is visible SH (durable + pending write-behind), matching live tip while jobs sit in RAM. `?asof=<hash>` on `/`, `/utxo`, `/txs`, `/txs/chain`: confirmed join at that ancestor **at or behind visible SH**, **no** mempool; headers are the asof hash; 404 if not on chain or ahead of visible SH. |
+| Address / scripthash | done | stats + `/utxo` + `/txs` + `/txs/mempool` + `/txs/chain[/:last_seen_txid]` + `/txs/summary[/:last_seen_txid]` (dialect; next row). `/utxo` matches Electrum listunspent (mempool funding + drop mempool-spent confirmed); `/txs` and `/txs/mempool` use full Esplora tx JSON for mempool-only rows (wire from the hub). Last **one** SH join reused across sequential REST calls until SH-view **hash** changes; concurrent different SHs re-join. Needs SH finalize. Stamp is visible SH (durable + pending write-behind), matching live tip while jobs sit in RAM. `?asof=<hash>` on `/`, `/utxo`, `/txs`, `/txs/chain`, `/txs/summary`: confirmed join at that ancestor **at or behind visible SH**, **no** mempool; headers are the asof hash; 404 if not on chain or ahead of visible SH. |
+| `/txs/summary` | dialect | **Not** in Blockstream Esplora [`API.md`](https://github.com/Blockstream/esplora/blob/master/API.md). Compact `{txid, value, height, time}` like mempool.space `/address/:addr/txs/summary`. Confirmed only (25/page, newest first); path cursor `/:last_seen_txid` like Esplora `/txs/chain`, not mempool.space `?after_txid=`. `value` is net sats for that script in that tx (funded − spent). `time` is the confirming header timestamp (`0` if the header is missing). Mempool rows stay on `/txs` and `/txs/mempool`. Over `--max-sh-creates` → **503**. |
 | Mempool / fees | done | `/mempool`, `/mempool/txids`, `/mempool/recent` (accept-order ring), `/fee-estimates` |
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |

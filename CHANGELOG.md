@@ -53,6 +53,16 @@ before 1.0).
 
 ### Added
 
+- **Cheap Esplora pages (schema 24):** `header.body` stores BIP144 size and
+  BIP141 weight so `/blocks` and `GET /block/:hash` JSON skip reconstruct
+  (`/raw` still rebuilds). Occupied 23 rewrites 88→96 B rows. Optional
+  `--max-sh-creates N` (default 0 = unlimited) refuses Electrum/Esplora SH
+  joins over N creates (503 / JSON-RPC error, no truncated stats).
+  `GET /address|scripthash/…/txs/summary` is a compact dialect (not
+  Blockstream Esplora `API.md`; mempool.space-shaped `{txid,value,height,time}`,
+  confirmed `/txs/chain` paging). `--esplora-block-template` enables
+  `GET /block-template` (default 404). Surface: [`COMPAT.md`](COMPAT.md).
+
 - **Compact reconstruct stats and extra prefill:** each compact
   reconstruct logs one INFO `cmpct reconstruct` line from the fill that
   built the block (not a later mempool snapshot). `--prefillcompact`
