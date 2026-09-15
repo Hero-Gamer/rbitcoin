@@ -431,6 +431,40 @@ pub fn reconstruct_stats(
     stats
 }
 
+/// Additional prefill (beyond coinbase) packed into outbound `cmpctblock`.
+pub const EXTRA_PREFILL_BUDGET: usize = 10 * 1024;
+
+/// Sorted prefill indexes: coinbase, then non-mempool primary, then extra-pool.
+///
+/// Packs greedily up to [`EXTRA_PREFILL_BUDGET`] additional witness bytes.
+pub fn prefill_indexes(block: &Block, fill: &CmpctFillSets) -> Vec<usize> {
+    let mut primary = Vec::new();
+    let mut extra = Vec::new();
+    for (i, tx) in block.txdata.iter().enumerate().skip(1) {
+        let w = tx.compute_wtxid();
+        if fill.mempool.contains(&w) {
+            continue;
+        }
+        if fill.extra.contains(&w) {
+            extra.push(i);
+        } else {
+            primary.push(i);
+        }
+    }
+    let mut out = vec![0];
+    let mut used = 0usize;
+    for i in primary.into_iter().chain(extra) {
+        let sz = tx_wire_len(&block.txdata[i]);
+        if used.saturating_add(sz) > EXTRA_PREFILL_BUDGET {
+            continue;
+        }
+        used += sz;
+        out.push(i);
+    }
+    out.sort_unstable();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,5 +1111,69 @@ mod tests {
             stats.to_string(),
             format!("cmpct reconstruct {hash} getdata missing=3 fetched=0/0")
         );
+    }
+
+    fn spend_padded(n: u8, pad: usize) -> Transaction {
+        let mut tx = spend(n);
+        tx.input[0].witness = Witness::from_slice(&[vec![n], vec![0u8; pad]]);
+        tx
+    }
+
+    #[test]
+    fn prefill_indexes_omits_mempool_hits() {
+        let b1 = spend(21);
+        let b2 = spend(22);
+        let block = sealed_block(vec![coinbase(), b1.clone(), b2.clone()]);
+        let fill = CmpctFillSets {
+            mempool: [b1.compute_wtxid()].into_iter().collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        };
+        let idx = prefill_indexes(&block, &fill);
+        assert_eq!(idx, vec![0, 2]);
+    }
+
+    #[test]
+    fn prefill_indexes_all_mempool_is_coinbase_only() {
+        let b1 = spend(23);
+        let block = sealed_block(vec![coinbase(), b1.clone()]);
+        let fill = CmpctFillSets {
+            mempool: [b1.compute_wtxid()].into_iter().collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        };
+        assert_eq!(prefill_indexes(&block, &fill), vec![0]);
+    }
+
+    #[test]
+    fn prefill_indexes_prefers_primary_over_extra_when_budget_tight() {
+        let primary = spend_padded(24, 8_000);
+        let extra = spend_padded(25, 8_000);
+        let block = sealed_block(vec![coinbase(), primary.clone(), extra.clone()]);
+        let fill = CmpctFillSets {
+            mempool: Default::default(),
+            extra: [extra.compute_wtxid()].into_iter().collect(),
+            orphan: Default::default(),
+        };
+        let idx = prefill_indexes(&block, &fill);
+        assert_eq!(idx, vec![0, 1], "extra-pool last; 10 KiB cannot fit both");
+        let extra_len = bitcoin::consensus::encode::serialize(&extra).len();
+        assert!(extra_len > 8_000);
+    }
+
+    #[test]
+    fn prefill_indexes_skips_oversize_extra_keeps_later_small() {
+        let huge = spend_padded(26, EXTRA_PREFILL_BUDGET + 100);
+        let small = spend(27);
+        let block = sealed_block(vec![coinbase(), huge.clone(), small.clone()]);
+        let fill = CmpctFillSets {
+            mempool: Default::default(),
+            extra: [huge.compute_wtxid(), small.compute_wtxid()]
+                .into_iter()
+                .collect(),
+            orphan: Default::default(),
+        };
+        let idx = prefill_indexes(&block, &fill);
+        assert_eq!(idx, vec![0, 2]);
     }
 }
