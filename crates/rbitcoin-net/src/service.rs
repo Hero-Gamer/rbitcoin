@@ -549,6 +549,18 @@ async fn run_outbound_session_with_abort(
     run_prepared_outbound(prepared).await
 }
 
+/// One live [`P2PNode`] topology at a time in this test process.
+///
+/// Process-wide `rbtc-scripts` steal plus confirm OS threads: overlapping
+/// abort heap-corrupts under parallel `--lib` / llvm-cov.
+#[cfg(test)]
+pub(crate) async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// Resolve P2P message magic, including BIP325 custom-Signet derivation.
 pub fn magic_for_params(params: &ChainParams) -> Magic {
     match params.signet_challenge.as_ref() {
@@ -590,8 +602,32 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_p2p_lock_is_exclusive() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let inside = Arc::new(AtomicU32::new(0));
+        let max = Arc::new(AtomicU32::new(0));
+        let run = |inside: Arc<AtomicU32>, max: Arc<AtomicU32>| {
+            tokio::spawn(async move {
+                let _g = live_p2p_lock().await;
+                let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                inside.fetch_sub(1, Ordering::SeqCst);
+            })
+        };
+        let a = run(Arc::clone(&inside), Arc::clone(&max));
+        let b = run(inside, max.clone());
+        a.await.unwrap();
+        b.await.unwrap();
+        assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn shutdown_aborts_lingering_session_task() {
+        let _live = live_p2p_lock().await;
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-p2p-shutdown-{}-{}",
             std::process::id(),

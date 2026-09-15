@@ -5788,6 +5788,7 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     use bitcoin::ScriptBuf;
     use std::time::Duration;
 
+    let _live = crate::service::live_p2p_lock().await;
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -5947,6 +5948,7 @@ async fn disconnect_clears_far_side_getpeerinfo_within_5s() {
     use crate::P2PNode;
     use std::time::Duration;
 
+    let _live = crate::service::live_p2p_lock().await;
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -6043,6 +6045,7 @@ async fn disconnect_after_tip_sync_clears_far_side_within_5s() {
     use bitcoin::ScriptBuf;
     use std::time::Duration;
 
+    let _live = crate::service::live_p2p_lock().await;
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
