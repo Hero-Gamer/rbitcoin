@@ -610,11 +610,15 @@ fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
 }
 
 /// Mature-pad follow: HB coinbase compact, 2-tx compact → getblocktxn + connect,
-/// then orphan child GetData + parent accept (INV of parked child is AlreadyHave).
+/// unique short-id fill that fails header merkle → getdata (not BLOCK_FAILED),
+/// honest full block connects, then orphan child GetData + parent accept
+/// (INV of parked child is AlreadyHave).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_compact_hb_getblocktxn_and_orphan() {
+    use bitcoin::bip152::{HeaderAndShortIds, ShortId};
     use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::p2p::message_blockdata::Inventory;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
     use bitcoin::Amount;
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
@@ -693,6 +697,165 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .expect("2-tx compact via getblocktxn");
         assert_eq!(peer.query.tip_height(), Some(Height(pad_h + 2)));
 
+        let cb3 = seed
+            .query
+            .reconstruct_block_at_height(Height(3))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let cb4 = seed
+            .query
+            .reconstruct_block_at_height(Height(4))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let bait = spend_anyone_can_spend(cb3, 0, Amount::from_sat(49_0000_0000));
+        let honest_extra = spend_anyone_can_spend(cb4, 0, Amount::from_sat(49_0000_0000));
+        let bait_txid = bait.compute_txid();
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::Tx(bait.clone()))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take the compact-fill bait tx (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            5_000,
+            || peer.hub.mempool().is_some_and(|m| m.contains(&bait_txid)),
+            || {
+                format!(
+                    "follower must admit bait tx for unique short-id fill \
+                     (seed={:?} peer={:?})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        let tip_after_extra = seed.hub.tip_hash().expect("tip after 2-tx");
+        let time_after_extra = seed.hub.tip_header().expect("tip time").time;
+        let honest = mine_regtest_block(
+            tip_after_extra,
+            time_after_extra + 600,
+            pad_h + 3,
+            vec![honest_extra],
+        );
+        assert_eq!(honest.txdata.len(), 2, "coinbase + honest extra");
+        let h_honest = honest.block_hash();
+        let mut hsi = HeaderAndShortIds::from_block(&honest, 0xdead_beef, 2, &[]).unwrap();
+        assert_eq!(hsi.short_ids.len(), 1, "one non-coinbase short-id");
+        let keys = ShortId::calculate_siphash_keys(&honest.header, hsi.nonce);
+        hsi.short_ids[0] = ShortId::with_siphash_keys(&bait.compute_wtxid().to_raw_hash(), keys);
+        let getdata_before = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
+            .unwrap_or(0);
+        let getblocktxn_before = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getblocktxn").copied().unwrap_or(0))
+            .unwrap_or(0);
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::CmpctBlock(CmpctBlock {
+                            compact_block: hsi.clone(),
+                        }))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take mutated compact (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            5_000,
+            || {
+                seed.peers.snapshot().into_iter().any(|p| {
+                    p.inbound
+                        && p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0) > getdata_before
+                })
+            },
+            || {
+                format!(
+                    "merkle-mutated unique short-id fill must GetData, not getblocktxn \
+                     (seed={:?} peer={:?} getdata_before={getdata_before} \
+                      getblocktxn_before={getblocktxn_before})",
+                    seed.peers.snapshot(),
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        let getblocktxn_after = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getblocktxn").copied().unwrap_or(0))
+            .unwrap_or(0);
+        assert_eq!(
+            getblocktxn_after, getblocktxn_before,
+            "merkle-mutated unique fill must GetData, not GetBlockTxn"
+        );
+        assert!(
+            !peer.hub.is_block_invalid(&h_honest),
+            "compact merkle fail must not BLOCK_FAILED the header"
+        );
+        assert_eq!(peer.query.tip_height(), Some(Height(pad_h + 2)));
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::Block(honest.clone()))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take honest full block (seed={:?})",
+                    seed.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        peer.wait_tip_hash(h_honest, Duration::from_secs(5))
+            .await
+            .expect("honest block after compact merkle getdata");
+        assert!(
+            !peer.hub.is_block_invalid(&h_honest),
+            "honest getdata recovery must keep the header valid"
+        );
+        let getdata_after_honest = seed
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.inbound)
+            .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
+            .unwrap_or(0);
+
         let cb2 = seed
             .query
             .reconstruct_block_at_height(Height(2))
@@ -734,7 +897,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
                     .find(|p| p.inbound)
                     .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
                     .unwrap_or(0);
-                parked == 1 && getdata > 0
+                parked == 1 && getdata > getdata_after_honest
             },
             || {
                 format!(
