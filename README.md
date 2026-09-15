@@ -27,7 +27,7 @@ consensus/script** path.
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.6.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
-| **Coverage** | Live production-file LCOV (badge; last green `master` `coverage` job). Every PR **≥90%**. Highest published line coverage among bitcoin full nodes — [`TESTING.md`](./TESTING.md) |
+| **Coverage** | Live production-file LCOV (badge; last green `master` `coverage` job). Every PR **must not drop** that ratio. Highest published line coverage among bitcoin full nodes — [`TESTING.md`](./TESTING.md) |
 
 ## Why this node is different
 
@@ -40,7 +40,7 @@ backends are **external indexers** of another node. rbitcoin does neither:
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
 - **Modest RAM** during sync — no multi‑GiB `dbcache` pause
 - **Pure-Rust** consensus/scripts (**no** `libbitcoinconsensus`)
-- **Highest published line coverage** among bitcoin full nodes (live production-file LCOV on the badge; every PR **≥90%**) — [`TESTING.md`](./TESTING.md)
+- **Highest published line coverage** among bitcoin full nodes (live production-file LCOV on the badge; every PR **must not drop** that ratio) — [`TESTING.md`](./TESTING.md)
 - **Reproducible static musl** for ordinary Linux hosts
 
 Core / Fulcrum contrasts: **[`docs/architecture.md`](./docs/architecture.md)**.

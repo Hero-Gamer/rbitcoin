@@ -120,7 +120,7 @@ Suite, budgets, coverage: [`TESTING.md`](TESTING.md).
 | **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, `nix build .#rbitcoin-musl` |
 | **Exception** | User asked for a local full suite, or you cannot push and must prove gates offline |
 
-Do **not** wait out a host IBD or a 90% coverage run in the agent VM. Coverage
+Do **not** wait out a host IBD or a coverage run in the agent VM. Coverage
 stays a GitHub Actions gate. Clippy does not.
 
 Do **not** delete a large type/module and chase `dead_code` / unresolved
@@ -195,8 +195,9 @@ git commit --amend --no-edit   # or fold a real fix into the tip
 git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
 ```
 
-Coverage (≥90% LCOV `LH`/`LF`) is a required CI job — see
-[`TESTING.md`](TESTING.md). If CI `coverage` fails, add a pin and push.
+Coverage (LCOV `LH`/`LF` never below last green `master`) is a required CI
+job — see [`TESTING.md`](TESTING.md). If CI `coverage` fails, add a pin and
+push.
 
 Plans: [`docs/how-we-plan.md`](docs/how-we-plan.md). Each step names
 **Contract, Red, Green, Refactor, Verify**. Many small vertical slices.
