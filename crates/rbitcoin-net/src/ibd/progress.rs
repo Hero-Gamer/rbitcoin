@@ -524,6 +524,13 @@ mod tests {
         let hole_ready = tip_fetch_hole(&hub, &h2h, &mut body2);
         assert_eq!(hole_ready, 0, "BQ-ready tip+1 → hole=0");
 
+        // Later gap at height 5 is not operator hole= (prefix is in hand).
+        let h5 = BlockHash::from_byte_array([5u8; 32]);
+        h2h.insert(5, h5);
+        body2.mark_missing(h5);
+        let hole_later = tip_fetch_hole(&hub, &h2h, &mut body2);
+        assert_eq!(hole_later, 0, "only +5 missing after ready tip+1 → hole=0");
+
         // Confirmed tip block is claim-ready (hub.has_block).
         let ghash = hub.tip_hash().expect("genesis tip");
         assert!(claim_ready(&hub, &mut body2, 0, &ghash));

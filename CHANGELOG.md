@@ -11,6 +11,13 @@ before 1.0).
 
 ### Changed
 
+- **IBD tip-hole assign:** densify issues no new far getdata while `hole=` is
+  open; tip-hole races prefer short inflight queues; an aged hole owner is
+  dropped when another peer exists. After the confirm prefix is in hand, at
+  most one extra racer on the first in-window gap, and only if that owner is
+  missing, aged, or a quarter-median lemon. Repeat stall/relative-slow kicks
+  lengthen AddrMan cooldown (10m / 30m / 2h) and force the SLOW flag.
+
 - **`height_by_hash` tip delta:** merged confirm and multi-height shrink
   extend/retain the in-process hash→height map. A full `0..=tip` header walk
   remains open / `invalidate` only. A hole above the published tip is

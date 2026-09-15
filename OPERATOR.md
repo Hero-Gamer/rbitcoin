@@ -485,9 +485,12 @@ Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / pe
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken
 onto loadq). Peer speed is one EWMA of all received bytes while that peer has
-block getdata in flight. Tip-batch getdata races up to 4 peers (preferring
-higher EWMA). A hole owner with no qualifying rx is dropped from that hash
-when a sibling is pulling; the whole race set is not cleared on getdata age.
+block getdata in flight. Tip-batch getdata races up to 4 peers (shortest inflight
+queue, then higher EWMA). A hole owner with no qualifying rx is dropped from
+that hash when a sibling is pulling; an aged solo owner is dropped when
+another peer exists (densify ticks are not progress on this hash). When
+`hole=` is 0, at most one extra racer is added on the first later gap in the
+32-window, and only if that owner is missing, aged ≥30s, or ≤ pack-median/4.
 Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
 so getdata queues can drain for tip+1);
 16 only for an EWMA outlier at ≥ 2× pack median. WARN

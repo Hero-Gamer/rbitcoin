@@ -105,6 +105,9 @@ pub(crate) const TIP_HOLE_MAX: usize = 32;
 /// single slow peer cannot pin hole=1 for minutes (mainnet: tip stuck with
 /// hole=1, conf_blks=0, bq growing).
 pub(crate) const TIP_HOLE_MAX_PEERS: usize = 4;
+/// Max concurrent getdata peers for a **pre-hole** (first in-window gap after
+/// a claim-ready prefix). One extra racer vs the frozen-prefix cap of 4.
+pub(crate) const PRE_HOLE_MAX_PEERS: usize = 2;
 /// Cap on IBD dial pool after getaddr learning (seeds + discovered).
 ///
 /// Mainnet DNS seeds already return ~300–400 addrs. 256 refused all getaddr
