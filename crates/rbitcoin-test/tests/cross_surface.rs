@@ -1107,12 +1107,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let relay_parent_txid = relay_parent.compute_txid().to_string();
     let relay_child_txid = relay_child.compute_txid().to_string();
     let pkg_hexes = json!([encode_tx(&relay_parent), encode_tx(&relay_child)]);
-    let capped = jsonrpc(
-        rpc_addr,
-        "submitpackage",
-        json!([pkg_hexes.clone(), "0.00000001"]),
-    )
-    .await;
+    let capped = jsonrpc(rpc_addr, "submitpackage", json!([pkg_hexes.clone(), 1])).await;
     assert_eq!(
         capped["result"]["package_msg"], "transaction failed",
         "{capped}"
