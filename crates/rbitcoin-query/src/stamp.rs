@@ -475,6 +475,48 @@ mod tests {
     }
 
     #[test]
+    fn inflight_hit_skeleton_miss_without_loc_after_class_a_is_corrupt() {
+        let (dir, q) = tmp_store();
+        let p = pin(1);
+        let txid = p.0.txid;
+        let fks = q
+            .store
+            .txs
+            .put_full_batch_indexed(
+                &[(
+                    p.0.clone(),
+                    vec![rbitcoin_store::InputRecord::coinbase(
+                        u32::MAX,
+                        vec![0x01],
+                        vec![],
+                    )],
+                    p.1.clone(),
+                )],
+                true,
+            )
+            .unwrap();
+        assert_eq!(fks[0], Fk(1));
+        assert!(q.store.txs.count() >= 1);
+        q.store.txs.create_loc_truncate_to_count(0).unwrap();
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let skel = BatchParentIds::default();
+        let err = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("inflight loc missing after Class A"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn inflight_hit_skeleton_miss_without_loc_leaves_spent_unset() {
         let (dir, q) = tmp_store();
         let p = pin(42);
