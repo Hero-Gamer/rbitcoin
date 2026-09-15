@@ -547,6 +547,7 @@ fn load_fail_rewind_wave<'a>(
     feed.finish(std::iter::once(first_h));
     feed.clear();
     hub.query.set_lookup_taken_hi(hub.tip_height());
+    hub.query.set_lookup_started_hi(hub.tip_height());
 }
 
 pub(crate) fn lookup_ready_hash(feed: &ConfirmFeed, height: u32) -> Option<BlockHash> {

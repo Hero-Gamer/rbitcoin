@@ -344,6 +344,11 @@ fn fill_inflight_spent_from_loc(
             continue;
         };
         let Some(pair) = row else {
+            if fk.get().is_some_and(|id| store.txs.count() >= id) {
+                return Err(rbitcoin_store::StoreError::Corrupt(
+                    "archive: inflight loc missing after Class A",
+                ));
+            }
             continue;
         };
         if let Some(e) = idents.get_mut(&id) {
@@ -491,6 +496,8 @@ mod tests {
         assert_eq!(ident.body, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
 
     #[test]
     fn inflight_hit_adopts_skeleton_loc() {

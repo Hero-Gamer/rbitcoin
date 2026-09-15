@@ -1715,6 +1715,16 @@ fn output_exp_nibble_10_is_corrupt() {
 }
 
 #[test]
+fn output_negative_value_is_corrupt() {
+    let rec = OutputRecord::unspent(-1, vec![0x51]);
+    let err = rec.try_encode_into(&mut Vec::new()).unwrap_err();
+    assert!(
+        format!("{err}").contains("txout amount negative"),
+        "{err}"
+    );
+}
+
+#[test]
 fn output_noncanonical_mantissa_is_corrupt() {
     let mut enc = Vec::new();
     enc.push(SCRIPT_KIND_V17_OP_TRUE | (1 << 4));

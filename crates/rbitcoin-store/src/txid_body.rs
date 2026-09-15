@@ -326,7 +326,7 @@ impl TxidBody {
                     result: i32::MIN,
                 });
             }
-            used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops).unwrap_or(false);
+            used_session = crate::bulk_io::pread_batch_on_ctx(ctx, &mut ops)?;
             if used_session {
                 for (op, (first, blob, _)) in ops.iter().zip(jobs.iter_mut()) {
                     if op.result < 0 || (op.result as usize) != blob.len() {
@@ -431,6 +431,25 @@ mod tests {
         assert!(
             session.take_sqe_n() > 0,
             "get_many_page_grouped_on_session must submit on the held session"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_grouped_poisoned_held_session_is_fail_closed() {
+        use crate::uring_session::{SessionKind, UringSession};
+        let dir = tmp();
+        let t = TxidBody::create(&dir).unwrap();
+        let a = [0x11u8; 32];
+        t.append_batch(0, &[a]).unwrap();
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        session.poison();
+        let err = t
+            .get_many_page_grouped_on_session(&[Fk(1)], &mut session)
+            .expect_err("poisoned identity pread");
+        assert!(
+            err.to_string().contains("poisoned") || err.to_string().contains("io_uring"),
+            "{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

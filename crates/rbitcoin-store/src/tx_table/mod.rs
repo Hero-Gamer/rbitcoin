@@ -230,17 +230,20 @@ impl OutputRecord {
 
     /// Encode `txout` payload (kind nibble + amount exp + ULEB mantissa; no spender).
     pub fn encode_into(&self, out: &mut Vec<u8>) {
+        let _ = self.try_encode_into(out);
+    }
+
+    pub fn try_encode_into(&self, out: &mut Vec<u8>) -> Result<(), StoreError> {
+        if self.value < 0 {
+            return Err(StoreError::Corrupt("txout amount negative"));
+        }
         let flags_at = out.len();
         out.push(0);
-        let v = if self.value < 0 {
-            0u64
-        } else {
-            self.value as u64
-        };
-        let (exp, mantissa) = amount_exp_mantissa(v);
+        let (exp, mantissa) = amount_exp_mantissa(self.value as u64);
         write_uleb128(out, mantissa);
         let kind = encode_script_kind_v17(&self.script, out);
         out[flags_at] = kind | (exp << 4);
+        Ok(())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -319,12 +322,10 @@ impl OutputRecord {
     pub fn encoded_len_exact(&self) -> usize {
         use crate::compact::{classify_script, compact_size_len, uleb128_len};
         use crate::compact::{SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_RAW};
-        let v = if self.value < 0 {
-            0u64
-        } else {
-            self.value as u64
-        };
-        let (_exp, mantissa) = amount_exp_mantissa(v);
+        if self.value < 0 {
+            return 0;
+        }
+        let (_exp, mantissa) = amount_exp_mantissa(self.value as u64);
         let (kind, payload) = classify_script(&self.script);
         let payload_len = match kind {
             SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
@@ -1670,6 +1671,12 @@ impl TxTable {
         }
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
             return Err(StoreError::Corrupt("invariant: create n_out"));
+        }
+        if items
+            .iter()
+            .any(|(_, _, outs)| outs.iter().any(|o| o.value < 0))
+        {
+            return Err(StoreError::Corrupt("txout amount negative"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
         let (fks, _loc) = self.append_stems_one_wave(

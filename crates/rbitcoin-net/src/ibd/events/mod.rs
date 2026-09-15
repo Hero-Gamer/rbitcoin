@@ -616,7 +616,9 @@ pub(crate) fn apply_confirm_reject(
     }
     if class != ConfirmRejectClass::Cancelled {
         if let Some(q) = query {
-            q.set_lookup_taken_hi(hub.and_then(|h| h.tip_height()));
+            let tip = hub.and_then(|h| h.tip_height());
+            q.set_lookup_taken_hi(tip);
+            q.set_lookup_started_hi(tip);
         }
     }
     if class.is_soft() {

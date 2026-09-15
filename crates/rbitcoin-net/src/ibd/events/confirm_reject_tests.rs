@@ -1689,6 +1689,7 @@ fn post_lookup_reject_rewinds_taken_hi() {
     ];
     for &(err, rewind) in cases {
         hub.query.set_lookup_taken_hi(Some(2));
+        hub.query.set_lookup_started_hi(Some(2));
         assert!(
             hub.query.lookup_already_taken(2),
             "precondition: height 2 is taken before {err}"
@@ -1699,6 +1700,11 @@ fn post_lookup_reject_rewinds_taken_hi() {
                 hub.query.lookup_taken_hi(),
                 tip,
                 "{err} must rewind taken_hi to confirmed tip"
+            );
+            assert_eq!(
+                hub.query.lookup_started_hi(),
+                tip,
+                "{err} must rewind started_hi with taken_hi"
             );
             assert!(
                 !hub.query.lookup_already_taken(2),
