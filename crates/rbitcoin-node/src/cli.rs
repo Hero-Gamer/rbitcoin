@@ -500,10 +500,7 @@ mod tests {
         assert_eq!(cli0.milestone(), Milestone::NONE);
         assert!(!cli0.milestone().skips_scripts_at(1));
 
-        assert!(matches!(
-            operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]),
-            Err(_)
-        ));
+        assert!(operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]).is_err());
 
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
