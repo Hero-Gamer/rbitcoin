@@ -739,6 +739,8 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool/orphan/`extra_compact` short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
   Outbound extra prefill (beyond coinbase) is **on** unless `--prefillcompact=0`.
+  Generate / `submitblock` / full-block NewPoWValid pack txs that were not in the
+  live mempool (`try_read` only; skip packing if the mempool lock is busy).
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or

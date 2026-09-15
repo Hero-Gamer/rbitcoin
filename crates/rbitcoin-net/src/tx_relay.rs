@@ -2048,14 +2048,47 @@ impl MempoolHub {
         version: u32,
         short_ids: &[bitcoin::bip152::ShortId],
     ) -> Option<HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>> {
-        use bitcoin::bip152::ShortId;
-        let needed: std::collections::HashSet<ShortId> = short_ids.iter().copied().collect();
-        if needed.is_empty() {
+        if short_ids.is_empty() {
             return Some(HashMap::new());
+        }
+        Some(
+            self.try_cmpct_avail(header, nonce, version, short_ids, &[])?
+                .0,
+        )
+    }
+
+    /// Same `try_read` as compact clone: matching bodies plus fill-source sets.
+    ///
+    /// `prefill_wtxids` are classified even when they have no short-id (redundant
+    /// inbound prefill). `None` if a writer holds `inner`.
+    pub fn try_cmpct_avail(
+        &self,
+        header: &bitcoin::block::Header,
+        nonce: u64,
+        version: u32,
+        short_ids: &[bitcoin::bip152::ShortId],
+        prefill_wtxids: &[bitcoin::Wtxid],
+    ) -> Option<(
+        HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
+        crate::compact::CmpctFillSets,
+    )> {
+        use bitcoin::bip152::ShortId;
+        use bitcoin::Wtxid;
+        let needed: std::collections::HashSet<ShortId> = short_ids.iter().copied().collect();
+        if needed.is_empty() && prefill_wtxids.is_empty() {
+            return Some((HashMap::new(), crate::compact::CmpctFillSets::default()));
         }
         let g = self.inner.try_read().ok()?;
         let keys = ShortId::calculate_siphash_keys(header, nonce);
+        let sid_of = |tx: &Transaction| -> ShortId {
+            if version == 1 {
+                ShortId::with_siphash_keys(&tx.compute_txid().to_raw_hash(), keys)
+            } else {
+                ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys)
+            }
+        };
         let mut out: HashMap<ShortId, Vec<Transaction>> = HashMap::new();
+        let mut fill = crate::compact::CmpctFillSets::default();
         for (txid, e) in g.graph.iter() {
             let sid = if version == 1 {
                 ShortId::with_siphash_keys(&txid.to_raw_hash(), keys)
@@ -2064,21 +2097,43 @@ impl MempoolHub {
             };
             if needed.contains(&sid) {
                 if let Some(tx) = g.get_tx(txid) {
+                    fill.mempool.insert(e.wtxid);
                     out.entry(sid).or_default().push(tx.clone());
                 }
             }
         }
-        for tx in g.orphanage.txs().chain(g.extra_compact_txs()) {
-            let sid = if version == 1 {
-                ShortId::with_siphash_keys(&tx.compute_txid().to_raw_hash(), keys)
-            } else {
-                ShortId::with_siphash_keys(&tx.compute_wtxid().to_raw_hash(), keys)
-            };
+        for tx in g.orphanage.txs() {
+            let sid = sid_of(tx);
             if needed.contains(&sid) {
+                let w = tx.compute_wtxid();
+                if !fill.mempool.contains(&w) {
+                    fill.orphan.insert(w);
+                }
                 out.entry(sid).or_default().push(tx.clone());
             }
         }
-        Some(out)
+        let mut extra: std::collections::HashSet<Wtxid> = std::collections::HashSet::new();
+        for tx in g.extra_compact_txs() {
+            let w = tx.compute_wtxid();
+            extra.insert(w);
+            let sid = sid_of(tx);
+            if needed.contains(&sid) {
+                if !fill.mempool.contains(&w) && !fill.orphan.contains(&w) {
+                    fill.extra.insert(w);
+                }
+                out.entry(sid).or_default().push(tx.clone());
+            }
+        }
+        for w in prefill_wtxids {
+            if g.graph.contains_wtxid(w) {
+                fill.mempool.insert(*w);
+            } else if extra.contains(w) {
+                fill.extra.insert(*w);
+            } else if g.orphanage.contains_wtxid(w) {
+                fill.orphan.insert(*w);
+            }
+        }
+        Some((out, fill))
     }
 
     /// Wtxid membership of `txs` in live graph / extra-compact / orphanage.
@@ -3216,6 +3271,21 @@ mod tests {
         let bodies = got.get(&sid).expect("orphan must fill compact short-id");
         assert_eq!(bodies.len(), 1);
         assert_eq!(bodies[0].compute_txid(), tx.compute_txid());
+        let w = tx.compute_wtxid();
+        let (_map, fill) = hub
+            .try_cmpct_avail(&genesis.header, nonce, 2, &[sid], &[])
+            .expect("avail");
+        assert!(
+            fill.orphan.contains(&w),
+            "clone source is the reconstruct fill"
+        );
+        let (_empty, pref) = hub
+            .try_cmpct_avail(&genesis.header, nonce, 2, &[], &[w])
+            .expect("prefill classify");
+        assert!(
+            pref.orphan.contains(&w),
+            "prefill wtxids classified in the same read as clone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

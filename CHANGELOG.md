@@ -28,11 +28,13 @@ before 1.0).
 ### Added
 
 - **Compact reconstruct stats and extra prefill:** each compact
-  reconstruct logs one INFO `cmpct reconstruct` line (fill sources plus
-  `fetched=` `blocktxn` bytes; `fetched=0/0` is first-shot). `--prefillcompact`
+  reconstruct logs one INFO `cmpct reconstruct` line from the fill that
+  built the block (not a later mempool snapshot). `--prefillcompact`
   / conf `prefillcompact=` (default **on**; `=0` disables) packs extra BIP152
   prefills (10 KiB cap, extra-pool last) on high-bandwidth announce and
-  CompactBlock getdata. Receive any well-formed inbound prefills either way.
+  CompactBlock getdata, including generate / `submitblock` / full-block
+  NewPoWValid when packing does not delay forward (`try_read` only).
+  Receive any well-formed inbound prefills either way.
 
 - **Process Electrum/Esplora on `--blocksonly`:** `node_run_p2p_short` listens
   Electrum + Esplora after catch-up. `broadcast` / `POST /tx` junk is a

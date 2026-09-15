@@ -410,6 +410,33 @@ impl ChainHub {
             Some(crate::compact::PrefillPlan { hash, indexes });
     }
 
+    pub fn remember_cmpct_prefill_from_block(&self, block: &Block) {
+        if !self.prefill_compact() {
+            return;
+        }
+        if self.tip_hash() != Some(block.header.prev_blockhash) {
+            return;
+        }
+        let hash = block.block_hash();
+        {
+            let g = self.prefill_plan.lock().expect("prefill plan");
+            if g.as_ref().is_some_and(|p| p.hash == hash) {
+                return;
+            }
+        }
+        let Some(fill) = self
+            .mempool()
+            .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata))
+        else {
+            return;
+        };
+        self.remember_cmpct_prefill(
+            hash,
+            block.header.prev_blockhash,
+            crate::compact::prefill_indexes(block, &fill),
+        );
+    }
+
     pub fn cmpct_prefill_indexes(&self, hash: &BlockHash) -> Option<Vec<usize>> {
         if !self.prefill_compact() {
             return None;
@@ -1727,6 +1754,7 @@ impl ChainHub {
                     .ok_or(NetError::Protocol("missing tip hash"))?;
                 if prev == tip_hash {
                     let height = tip_h.saturating_add(1);
+                    self.remember_cmpct_prefill_from_block(block.as_ref());
                     self.connect_at(height, block)?;
                     return Ok(AcceptOutcome::Accepted { height });
                 }
@@ -2772,6 +2800,104 @@ mod tests {
             Some(vec![0, 1]),
             "off remember must not overwrite"
         );
+    }
+
+    fn mature_spend_tx(hub: &ChainHub) -> Transaction {
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    fn attach_mp(dir: &std::path::Path, hub: &ChainHub) -> Arc<crate::tx_relay::MempoolHub> {
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+        mp
+    }
+
+    #[test]
+    fn generate_remembers_prefill_for_tx_not_in_mempool() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let _mp = attach_mp(dir.path(), &hub);
+        hub.set_prefill_compact(true);
+        let extra = mature_spend_tx(&hub);
+        let hashes = hub
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![extra])
+            .expect("generate");
+        assert_eq!(
+            hub.cmpct_prefill_indexes(&hashes[0]),
+            Some(vec![0, 1]),
+            "tx absent from mempool must ride the generate announce"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generate_omits_live_mempool_tx_from_prefill() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let mp = attach_mp(dir.path(), &hub);
+        hub.set_prefill_compact(true);
+        let extra = mature_spend_tx(&hub);
+        mp.accept_tx(&extra).expect("in mempool");
+        let hashes = hub
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![extra])
+            .expect("generate");
+        assert_eq!(
+            hub.cmpct_prefill_indexes(&hashes[0]),
+            Some(vec![0]),
+            "live mempool hit must stay coinbase-only after strip"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submit_remembers_prefill_for_tx_not_in_mempool() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let _mp = attach_mp(dir.path(), &hub);
+        hub.set_prefill_compact(true);
+        let extra = mature_spend_tx(&hub);
+        let tip = hub.tip_hash().expect("tip");
+        let tip_time = hub.tip_header().expect("hdr").time;
+        let block = mine_regtest_paying(
+            tip,
+            tip_time + 600,
+            103,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![extra],
+        );
+        let hash = block.block_hash();
+        match hub.accept_received_block(block) {
+            Ok(AcceptOutcome::Accepted { .. }) => {}
+            other => panic!("submit must connect: {other:?}"),
+        }
+        assert_eq!(hub.cmpct_prefill_indexes(&hash), Some(vec![0, 1]));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn coinbase(height: u32) -> Transaction {

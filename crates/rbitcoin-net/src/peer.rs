@@ -1701,19 +1701,29 @@ struct PendingCmpct {
 /// Clone only mempool bodies whose short-ids appear in `hsi` (never `list_live`).
 fn mempool_shortid_avail(
     hub: &ChainHub,
-    header: &bitcoin::block::Header,
-    nonce: u64,
+    hsi: &HeaderAndShortIds,
     version: u32,
-    short_ids: &[bitcoin::bip152::ShortId],
-) -> HashMap<bitcoin::bip152::ShortId, Vec<Transaction>> {
-    hub.mempool()
-        .and_then(|mp| mp.try_clone_matching_shortids(header, nonce, version, short_ids))
-        .unwrap_or_default()
+) -> (
+    HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
+    Option<crate::compact::CmpctFillSets>,
+) {
+    let pref: Vec<bitcoin::Wtxid> = hsi
+        .prefilled_txs
+        .iter()
+        .map(|p| p.tx.compute_wtxid())
+        .collect();
+    match hub
+        .mempool()
+        .and_then(|mp| mp.try_cmpct_avail(&hsi.header, hsi.nonce, version, &hsi.short_ids, &pref))
+    {
+        Some((txs, fill)) => (txs, Some(fill)),
+        None => (HashMap::new(), None),
+    }
 }
 
 #[derive(Debug)]
 enum CmpctReconstruct {
-    Block(Block),
+    Block(Block, Option<crate::compact::CmpctFillSets>),
     Missing(Vec<u64>),
 }
 
@@ -1723,27 +1733,29 @@ fn try_reconstruct_cmpct(
     hsi: &HeaderAndShortIds,
     version: u32,
 ) -> Option<CmpctReconstruct> {
-    let owned = mempool_shortid_avail(hub, &hsi.header, hsi.nonce, version, &hsi.short_ids);
+    let (owned, fill) = mempool_shortid_avail(hub, hsi, version);
     match crate::compact::try_reconstruct(hsi, &owned, version) {
-        Ok(block) => Some(CmpctReconstruct::Block(block)),
+        Ok(block) => Some(CmpctReconstruct::Block(block, fill)),
         Err(_) if hub.mempool().is_none() => None,
         Err(m) => Some(CmpctReconstruct::Missing(m)),
     }
 }
 
-fn log_cmpct_filled(hub: &ChainHub, hsi: &HeaderAndShortIds, block: &Block, fetched: &[u64]) {
-    let fill = hub
-        .mempool()
-        .and_then(|mp| mp.try_cmpct_fill_sets(&block.txdata));
+fn log_cmpct_filled(
+    hub: &ChainHub,
+    hsi: &HeaderAndShortIds,
+    block: &Block,
+    fetched: &[u64],
+    fill: Option<&crate::compact::CmpctFillSets>,
+) {
     let stats = crate::compact::reconstruct_stats(
         hsi,
         block,
-        fill.as_ref()
-            .unwrap_or(&crate::compact::CmpctFillSets::default()),
+        fill.unwrap_or(&crate::compact::CmpctFillSets::default()),
         fetched,
     );
     rbitcoin_log::info!("{stats}");
-    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill.as_ref()) {
+    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill) {
         hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
     }
 }
@@ -1944,15 +1956,10 @@ fn apply_cmpct_blocktxn(
     hub: &ChainHub,
     pc: &PendingCmpct,
     bt: &BlockTransactions,
-) -> Result<Block, ()> {
-    let owned = mempool_shortid_avail(
-        hub,
-        &pc.hsi.header,
-        pc.hsi.nonce,
-        pc.version,
-        &pc.hsi.short_ids,
-    );
+) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
+    let (owned, fill) = mempool_shortid_avail(hub, &pc.hsi, pc.version);
     crate::compact::apply_block_transactions(&pc.hsi, &pc.missing, bt, &owned, pc.version)
+        .map(|block| (block, fill))
         .map_err(|_| ())
 }
 
@@ -2772,8 +2779,8 @@ async fn on_cmpctblock(
             take_requested_block(hub, &mut follow.requested_blocks, &hash);
         } else {
             match try_reconstruct_cmpct(hub, &hsi, 2) {
-                Some(CmpctReconstruct::Block(block)) => {
-                    log_cmpct_filled(hub, &hsi, &block, &[]);
+                Some(CmpctReconstruct::Block(block, fill)) => {
+                    log_cmpct_filled(hub, &hsi, &block, &[], fill.as_ref());
                     follow.requested_blocks.remove(&hash);
                     follow.pending_cmpct.remove(&hash);
                     relay_new_pow_valid_block(hub, &block, session);
@@ -2890,8 +2897,8 @@ async fn on_blocktxn(
     }
     if let Some(pc) = follow.pending_cmpct.remove(&hash) {
         match apply_cmpct_blocktxn(hub, &pc, bt) {
-            Ok(block) => {
-                log_cmpct_filled(hub, &pc.hsi, &block, &pc.missing);
+            Ok((block, fill)) => {
+                log_cmpct_filled(hub, &pc.hsi, &block, &pc.missing, fill.as_ref());
                 relay_new_pow_valid_block(hub, &block, session);
                 match hub.accept_received_block_async(block.clone()).await {
                     Ok(AcceptOutcome::Accepted { .. }) => {
@@ -3254,6 +3261,7 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
     if block.header.prev_blockhash != tip {
         return;
     }
+    hub.remember_cmpct_prefill_from_block(block);
     if hub.ensure_header(&block.header).is_err() {
         return;
     }

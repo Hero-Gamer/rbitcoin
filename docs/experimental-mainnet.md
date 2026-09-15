@@ -104,7 +104,9 @@ Incoming `cmpctblock` is reconstructed from the live mempool, orphanage, and
 `getblocktxn` / `blocktxn`. Full `getdata` MSG_WITNESS_BLOCK remains the
 fallback when mempool is cold or fill fails. We serve `getblocktxn` and
 `MSG_CMPCT_BLOCK` getdata from store/cache. Outbound extra prefill (10 KiB
-cap) is on; `--prefillcompact=0` is coinbase-only. A PoW-valid header that
+cap) is on; `--prefillcompact=0` is coinbase-only. Generate / submit / full-block
+NewPoWValid pack txs that were not in the live mempool without delaying
+forward. A PoW-valid header that
 extends our tip is announced as `cmpctblock` to other HB peers **before**
 connect (Core `NewPoWValidBlock`); connect failure does not take that back.
 
