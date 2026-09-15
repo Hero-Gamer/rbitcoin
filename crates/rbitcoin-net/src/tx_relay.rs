@@ -1333,6 +1333,24 @@ impl MempoolHub {
         self.unindex_evicted(&gone);
     }
 
+    fn rollback_package_accepted(&self, accepted: &[AcceptResult]) {
+        let victims: Vec<Transaction> = accepted
+            .iter()
+            .flat_map(|r| r.replaced_txs.iter().cloned())
+            .collect();
+        let mut gone = Vec::new();
+        {
+            let mut g = self.lock_write();
+            for r in accepted.iter().rev() {
+                gone.extend(g.remove_txid_tree(&r.txid));
+            }
+        }
+        self.unindex_evicted(&gone);
+        for tx in victims {
+            let _ = self.accept_tx(&tx);
+        }
+    }
+
     /// Drop hub relay / sh / fee-delta / template state for txs already
     /// removed from the live graph (`remove_for_block_spent`, 1p1c rollback).
     fn unindex_evicted(&self, gone: &[Txid]) {
@@ -1619,14 +1637,7 @@ impl MempoolHub {
                 Ok(p) => p,
                 Err(e) => {
                     if !accepted.is_empty() {
-                        let mut gone = Vec::new();
-                        {
-                            let mut g = self.lock_write();
-                            for r in accepted.iter().rev() {
-                                gone.extend(g.remove_txid_tree(&r.txid));
-                            }
-                        }
-                        self.unindex_evicted(&gone);
+                        self.rollback_package_accepted(&accepted);
                     }
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
@@ -1649,14 +1660,7 @@ impl MempoolHub {
                     accepted.push(r);
                 }
                 Err(e) => {
-                    let mut gone = Vec::new();
-                    {
-                        let mut g = self.lock_write();
-                        for r in accepted.iter().rev() {
-                            gone.extend(g.remove_txid_tree(&r.txid));
-                        }
-                    }
-                    self.unindex_evicted(&gone);
+                    self.rollback_package_accepted(&accepted);
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());

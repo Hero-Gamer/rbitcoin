@@ -101,6 +101,8 @@ pub struct AcceptResult {
     /// collected **before** RBF removal so wallet address tracks can drop zombie unconfs
     /// even when the old body is gone from the hub.
     pub replaced_scripthashes: Vec<[u8; 32]>,
+    /// Replaced bodies, for package rollback to restore victims.
+    pub replaced_txs: Vec<Transaction>,
 }
 
 /// Why accept failed (policy / graph / durable / consensus script).
@@ -738,6 +740,7 @@ impl ActiveMempool {
         let txid = prep.txid;
 
         let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
+        let mut replaced_txs: Vec<Transaction> = Vec::new();
         for c in &conflict_set {
             if let Some(old_tx) = self.bodies.get(c).cloned() {
                 self.note_extra(&old_tx);
@@ -745,6 +748,7 @@ impl ActiveMempool {
                     replaced_scripthashes
                         .push(Self::electrum_scripthash(o.script_pubkey.as_bytes()));
                 }
+                replaced_txs.push(old_tx);
             }
         }
         replaced_scripthashes.sort_unstable();
@@ -799,6 +803,7 @@ impl ActiveMempool {
             slot,
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes,
+            replaced_txs,
         })
     }
 
@@ -816,6 +821,7 @@ impl ActiveMempool {
             slot: 0,
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes: Vec::new(),
+            replaced_txs: Vec::new(),
         })
     }
 
@@ -1136,14 +1142,30 @@ impl ActiveMempool {
                     accepted.push(r);
                 }
                 Err(e) => {
-                    for r in accepted.iter().rev() {
-                        let _ = self.remove_txid_tree(&r.txid);
-                    }
+                    self.rollback_accepted_package(&accepted, utxos, tip);
                     return Err(e);
                 }
             }
         }
         Ok(accepted)
+    }
+
+    fn rollback_accepted_package(
+        &mut self,
+        accepted: &[AcceptResult],
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) {
+        let victims: Vec<Transaction> = accepted
+            .iter()
+            .flat_map(|r| r.replaced_txs.iter().cloned())
+            .collect();
+        for r in accepted.iter().rev() {
+            let _ = self.remove_txid_tree(&r.txid);
+        }
+        for tx in victims {
+            let _ = self.accept_tx(&tx, utxos, tip);
+        }
     }
 
     /// Durable remove one live tx (confirm / RBF / eviction).
@@ -3145,6 +3167,44 @@ mod tests {
             "promoted spender of the parent must leave with it"
         );
         assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accept_package_child_fail_restores_rbf_victims() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let low = spend_tx(op, 99_000);
+        let low_id = low.compute_txid();
+        mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
+        assert!(mp.graph.contains(&low_id));
+        let high = spend_tx(op, 50_000);
+        let high_id = high.compute_txid();
+        let mut bad_child = spend_tx(
+            OutPoint {
+                txid: high_id,
+                vout: 0,
+            },
+            1_000,
+        );
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = mp
+            .accept_package(&[high, bad_child], &utxos, TIP_OK)
+            .expect_err("annex child must fail");
+        assert!(
+            matches!(err, AcceptError::Policy("libre annex")),
+            "got {err}"
+        );
+        assert!(
+            !mp.graph.contains(&high_id),
+            "replacement must roll back with the failed child"
+        );
+        assert!(
+            mp.graph.contains(&low_id),
+            "RBF victim of a rolled-back package member must be live again"
+        );
+        assert_eq!(mp.live_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
