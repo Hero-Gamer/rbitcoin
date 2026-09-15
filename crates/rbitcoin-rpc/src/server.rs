@@ -759,11 +759,11 @@ mod tests {
             hits.push(r.unwrap().0);
         }
         assert!(
-            hits.iter().any(|&s| s == 503),
+            hits.contains(&503),
             "full permit must HTTP 503, got {hits:?}"
         );
         assert!(
-            hits.iter().any(|&s| s == 200),
+            hits.contains(&200),
             "some occupancy must still succeed, got {hits:?}"
         );
         handle.shutdown().await;
