@@ -18,6 +18,11 @@ before 1.0).
 
 ### Added
 
+- **Serve window 16 vs 17:** inbound `getdata` of 20 witness blocks serves
+  `MAX_SERVE_BLOCKS` (16); the 17th is not queued
+  (`getdata_skips_reconstruct_when_serve_inflight_at_cap`). Compact live pad
+  stays 2-tx / merkle-fail / orphan. Catch-up window guts stay.
+
 - **Feeler silence + inbound eviction rank:** `p2p_feeler_completes_and_closes`
   still completes VERSION then closes; `run_feeler_timed` on a silent socket
   is `Timeout`. `p2p_inbound_full_rejects_extra` still refuses the extra
