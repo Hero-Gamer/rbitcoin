@@ -27,6 +27,13 @@ before 1.0).
 
 ### Added
 
+- **Compact reconstruct stats and optional extra prefill:** each compact
+  reconstruct logs one INFO `cmpct reconstruct` line (fill sources plus
+  `fetched=` `blocktxn` bytes; `fetched=0/0` is first-shot). `--prefillcompact`
+  / conf `prefillcompact=1` (default **off**) packs extra BIP152 prefills
+  (10 KiB cap, extra-pool last) on high-bandwidth announce and CompactBlock
+  getdata. Receive any well-formed inbound prefills either way.
+
 - **Process Electrum/Esplora on `--blocksonly`:** `node_run_p2p_short` listens
   Electrum + Esplora after catch-up. `broadcast` / `POST /tx` junk is a
   decode error; a consensus-invalid tx is hub `broadcast reject` / HTTP 400

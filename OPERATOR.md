@@ -378,6 +378,7 @@ Routine knobs are **CLI / conf**, not required env vars. Clean smoke:
 | `--minrelaytxfee BTC` | same | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempoolexpiry HOURS` | same | unset — hub default; min 1 |
 | `--blocksonly` | same | off |
+| `--prefillcompact` | conf `prefillcompact=` | **off** — extra BIP152 compact prefills (10 KiB cap) |
 | `--persistmempool[=0\|1]` | same | on |
 | `--whitelist SPEC` | same | empty |
 | `--limitclustercount N` | same | unset — hub default |
@@ -463,6 +464,7 @@ confirm does **not** spam this line per block — use the periodic IBD status be
 | `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= ntx= avg_us= max_us=` |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
 | `UpdateTip` | INFO | New best hash/height after connect |
+| `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
 | `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `UpdateTip` at info) |
 | `received getdata for: wtx` | TRACE | One line per peer `MSG_WTX` getdata (Core `p2p_blocksonly` needle; counts are on `tip: perf`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
@@ -734,8 +736,9 @@ Do **not** wipe `store/` for mempool slot/full errors.
   filter. We do not ship a mainnet map. Core publishes maps from the same
   `ip_asn.dat` used by `bitcoind -asmap`.
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
-- **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool short-id fill +
+- **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool/orphan/`extra_compact` short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
+  Outbound extra prefill (beyond coinbase) is **off** unless `--prefillcompact`.
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
 - Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package` via RPC `submitpackage` or
