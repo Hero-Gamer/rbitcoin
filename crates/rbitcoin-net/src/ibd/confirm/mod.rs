@@ -229,6 +229,10 @@ impl ConfirmFeed {
         self.force_single_until.load(Ordering::Acquire)
     }
 
+    pub(crate) fn single_block(&self) -> bool {
+        self.isolate_until() != u32::MAX
+    }
+
     pub(crate) fn release_isolate_if_tip(&self, tip: u32) {
         let until = self.isolate_until();
         if until != u32::MAX && tip >= until {
@@ -2159,7 +2163,7 @@ pub(crate) fn spawn_confirm_engine(
                     confirm_thr_stats::add_lookup_claim(&stats, t_wait.elapsed());
                     continue;
                 }
-                let run_max = if feed.isolate_until() != u32::MAX {
+                let run_max = if feed.single_block() {
                     1usize
                 } else {
                     CONFIRM_RUN_MAX_BLOCKS
