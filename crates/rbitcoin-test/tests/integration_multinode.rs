@@ -10,7 +10,7 @@
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
-use rbitcoin_net::{IbdConfig, P2PNode};
+use rbitcoin_net::{rehydrate_block_queue_residue, IbdConfig, P2PNode};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
@@ -1295,6 +1295,7 @@ async fn serve_after_restart_via_reconstruct() {
             "restarted seeder must not rely on warm RAM cache"
         );
         assert_eq!(seed.query.tip_height(), Some(Height(10)));
+        pin_restart_empty_and_same_process_bq_residue(&seed);
 
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
@@ -1337,6 +1338,56 @@ async fn serve_after_restart_via_reconstruct() {
     tokio::time::timeout(wall, fut)
         .await
         .unwrap_or_else(|_| panic!("serve_after_restart_via_reconstruct wall timeout ({wall:?})"));
+}
+
+fn pin_restart_empty_and_same_process_bq_residue(seed: &P2PNode) {
+    assert_eq!(
+        seed.query.block_queue_count(),
+        0,
+        "restart RAM body queue is empty"
+    );
+    let tip = seed.hub.tip_height().expect("seed tip");
+    let below = tip.saturating_sub(1);
+    let below_hash = seed
+        .query
+        .header_at_height(Height(below))
+        .unwrap()
+        .expect("below-tip header")
+        .1
+        .hash;
+    seed.query
+        .block_queue_offer(below, below_hash, 0, b"stale")
+        .unwrap();
+    seed.query
+        .block_queue_offer(tip + 1, [0xAB; 32], 0, b"")
+        .unwrap();
+    seed.query
+        .block_queue_offer(tip + 2, [0xCD; 32], 0, b"wire")
+        .unwrap();
+    seed.query
+        .block_queue_offer(u32::MAX, [0x11; 32], 0, b"unk")
+        .unwrap();
+
+    let n = rehydrate_block_queue_residue(&seed.hub).expect("same-process rehydrate");
+    assert_eq!(n, 1, "only above-tip wire is ready");
+    assert!(
+        !seed.query.block_queue_has_height(below),
+        "drop at/below tip"
+    );
+    assert!(
+        !seed.query.block_queue_has_height(tip + 1),
+        "empty payload skip"
+    );
+    assert!(
+        seed.query.block_queue_has_height(tip + 2),
+        "keep above-tip wire"
+    );
+    assert!(
+        seed.query.block_queue_has_height(u32::MAX),
+        "unknown height stays queued"
+    );
+    let _ = seed.query.block_queue_dequeue_height(tip + 2);
+    let _ = seed.query.block_queue_dequeue_height(u32::MAX);
 }
 
 /// Mid-node serve after IBD: leaf syncs from mid, not the original seeder.

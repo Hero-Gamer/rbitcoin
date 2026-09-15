@@ -18,6 +18,12 @@ before 1.0).
 
 ### Added
 
+- **Same-process body-queue residue:** `serve_after_restart_via_reconstruct`
+  restart RAM queue is empty. Planted leftover then
+  `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads,
+  keeps above-tip wire, unknown height stays queued. `has_block` /
+  known-archived keep and tip+1 gap `missing` stay crate guts.
+
 - **CLI unknown conf key + `--peertimeout=1`:** `node_cli_and_surface_smoke`
   `--conf` with `unknown_key=1` still `--smoke`s. Conf `minrelaytxfee=-1`
   and `network=nope` fail start. `--peertimeout=1` smokes; `0` still

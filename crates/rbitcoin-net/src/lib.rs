@@ -32,8 +32,8 @@ pub use compact::{
 };
 pub use error::NetError;
 pub use ibd::{
-    format_tip_perf_sizes, read_proc_rss, IbdConfig, ProcRss, TipPerfSizes,
-    DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
+    format_tip_perf_sizes, read_proc_rss, rehydrate_block_queue_residue, IbdConfig, ProcRss,
+    TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
 pub use most_work::sum_work;
 pub use netgroup::netgroup;

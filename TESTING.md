@@ -36,7 +36,6 @@ those lines from the journey first.
 Keep until a **default** journey hits the same lines: store packed / v17 /
 fuse / SH machines, unsorted pack/lag,
 IBD wave fence / 8×8000, SH writebehind / uring CAS, leftover identity,
-RAM body-queue residue rehydrate (process restart empties the queue),
 handshake format needles, `getaddr_cache_*`, eviction ranking, feeler silence
 timeout, sole-preferred stall KEEP, `stamp_reject_names_*`,
 `multi_hop_bad_prev_*`, structure s1–s18, rate-limiter, netgroup, subsidy
@@ -289,7 +288,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `p2p_feeler_completes_and_closes` | P2P (**default**) | Outbound feeler: VERSION then close (`feeler connection completed`). No live follow; dummy has no completed inbound. Does **not** pin feeler silence timeout (`handshake_timeout_after_silence`) |
 | `p2p_inbound_full_rejects_extra` | P2P (**default**) | `max_inbound=1`: second follow is refused; first inbound stays. Does **not** pin SelectNodeToEvict ranking |
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
-| `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Does **not** pin same-process RAM BQ residue (`rehydrate_block_queue_into_confirm` in `ibd/archive.rs`) |
+| `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Restart RAM body queue is empty. Same-process `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads, keeps above-tip wire, unknown height stays queued. `has_block` / known-archived keep and tip+1 gap `missing` stay `bq_rehydrate_residue_keep_drop_gap_and_unknown` |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
 | `reorg_same_height_then_multi_block_branch` | P2P/chain (default) | Same-height rival then multi-block reorg to height 6; `getchaintips` `active` vs `valid-fork`; equal-work siblings park as `valid-headers`; `precious_block` the loser; less work ignored; unknown hash `Block not found`. Held cap 320 FIFO stays `hold_body_caps_at_320_fifo` |

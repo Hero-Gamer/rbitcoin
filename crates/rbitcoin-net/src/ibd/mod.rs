@@ -97,6 +97,17 @@ pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
 /// concurrency scales with peer count (`peers × 16`), not by piling work on few hosts.
 pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
+/// Replay leftover in-RAM body-queue rows with a fresh work state.
+///
+/// IBD start runs the same drop / keep / empty / unknown rules on the live
+/// loop state. A hub that is already serving uses this so those rules run
+/// without a second store open.
+pub fn rehydrate_block_queue_residue(hub: &ChainHub) -> Result<usize, String> {
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let feed = ConfirmFeed::new();
+    rehydrate_block_queue_into_confirm(hub, &mut st, &feed)
+}
+
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
 /// Max concurrent getdata peers for one tip-hole hash.
