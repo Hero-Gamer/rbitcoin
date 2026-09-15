@@ -222,6 +222,104 @@ impl TipWaiters {
     }
 }
 
+/// B12: `/blocks` 10 newest; `/blocks/:start` at 0 and tip; `/txs/:start` last page < 25; unknown 404.
+async fn pin_esplora_blocks_list_and_txs_pages(
+    esplora_addr: SocketAddr,
+    tip_height: u64,
+    tip_hash: &str,
+    n_tx: usize,
+) {
+    let (st, body) = http_get(esplora_addr, "/blocks").await;
+    assert_eq!(st, 200, "GET /blocks: {body}");
+    let list: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        list.len(),
+        10,
+        "10 newest (or fewer on a short chain): {body}"
+    );
+    assert_eq!(list[0]["height"], tip_height, "{body}");
+    assert_eq!(list[9]["height"], tip_height - 9, "{body}");
+
+    let (st, body) = http_get(esplora_addr, "/blocks/0").await;
+    assert_eq!(st, 200, "GET /blocks/0: {body}");
+    let from_zero: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(from_zero.len(), 1, "{body}");
+    assert_eq!(from_zero[0]["height"], 0, "{body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/blocks/{tip_height}")).await;
+    assert_eq!(st, 200, "GET /blocks/{{tip}}: {body}");
+    let from_tip: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(from_tip.len(), 10, "{body}");
+    assert_eq!(from_tip[0]["height"], tip_height, "{body}");
+    assert_eq!(from_tip[0]["id"], tip_hash, "{body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/0")).await;
+    assert_eq!(st, 200, "GET /txs/0: {body}");
+    let page0: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(page0.len(), 25, "first page is 25: {body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/25")).await;
+    assert_eq!(st, 200, "GET /txs/25: {body}");
+    let last: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        last.len(),
+        n_tx.saturating_sub(25),
+        "last page shorter than 25: {body}"
+    );
+    assert!(last.len() < 25, "last page must be short: {body}");
+    assert!(!last.is_empty(), "last page empty: {body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/1")).await;
+    assert_eq!(st, 400, "start not multiple of 25: {body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{}/txs/0", "00".repeat(32))).await;
+    assert_eq!(st, 404, "unknown block txs: {body}");
+}
+
+/// B13: one live `want: blocks` + `track-tx` on this `run_p2p` process.
+async fn spawn_esplora_ws_want_blocks_and_track_tx(
+    esplora_addr: SocketAddr,
+    track_txid: String,
+) -> tokio::task::JoinHandle<(bool, bool)> {
+    tokio::spawn(async move {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let url = format!("ws://{esplora_addr}/v1/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("esplora ws upgrade");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into()))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(
+            format!(r#"{{"track-tx":"{track_txid}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+        let mut saw_block = false;
+        let mut saw_tx = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !(saw_block && saw_tx) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(Ok(frame))) = tokio::time::timeout(left, ws.next()).await else {
+                break;
+            };
+            let WsMsg::Text(t) = frame else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(t.as_str()).unwrap_or(json!(null));
+            if v["block"]["height"] == 106 {
+                saw_block = true;
+            }
+            if v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true {
+                saw_tx = true;
+            }
+        }
+        (saw_block, saw_tx)
+    })
+}
+
 fn encode_tx(tx: &Transaction) -> String {
     let mut raw = Vec::new();
     tx.consensus_encode(&mut raw).unwrap();
@@ -897,6 +995,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     pin_waitforblockheight_timeout_zero_behind(rpc_addr, 105, &tip_hash).await;
     pin_getblock_hash_oob_unknown_and_raw(rpc_addr, 105, &tip_hash).await;
     let waiters = spawn_wait_and_gbt_longpoll(rpc_addr, 106).await;
+    let ws = spawn_esplora_ws_want_blocks_and_track_tx(esplora_addr, pkg_parent_txid.clone()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert_eq!(
@@ -911,12 +1011,22 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let tip = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let new_hash = tip["result"].as_str().expect("new tip");
     waiters.assert_woke_on_new_tip(new_hash, 106).await;
+    let (saw_block, saw_tx) = tokio::time::timeout(Duration::from_secs(10), ws)
+        .await
+        .expect("esplora ws timed out")
+        .expect("esplora ws join");
+    assert!(saw_block, "ws want:blocks must push the generate tip");
+    assert!(
+        saw_tx,
+        "ws track-tx must confirm {pkg_parent_txid} on generate"
+    );
     let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
     assert!(
         txs.len() >= 30,
         "coinbase + RBF + esplora + packages: {blk}"
     );
+    pin_esplora_blocks_list_and_txs_pages(esplora_addr, 106, new_hash, txs.len()).await;
     assert!(
         txs[0]["vin"][0].get("txid").is_some(),
         "verbosity 2 coinbase vin: {blk}"

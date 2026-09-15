@@ -883,6 +883,7 @@ name = "rbitcoin-test"
 version = "0.6.99"
 dependencies = [
  "bitcoin",
+ "futures-util",
  "rbitcoin-cli",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
@@ -896,6 +897,7 @@ dependencies = [
  "rbitcoin-store",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

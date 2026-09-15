@@ -18,6 +18,12 @@ before 1.0).
 
 ### Added
 
+- **Process Esplora `/blocks` paging + one WS:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  `GET /blocks` is 10 newest; `/blocks/0` is genesis-only; `/blocks/:tip`
+  starts at the tip. `/block/:hash/txs/25` last page is shorter than 25;
+  unknown hash is 404. Same process: WS `want: blocks` and `track-tx`
+  confirm on the pad `generate`. Caps 64 vs 65 stay crate tests.
+
 - **Process wait/longpoll + getblock edges:** `esplora_broadcast_visible_in_rpc_and_electrum`
   `waitforblockheight` timeout=0 while behind returns the live tip;
   `waitfornewblock` / `waitforblockheight` and GBT current `longpollid`
