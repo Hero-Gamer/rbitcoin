@@ -480,19 +480,21 @@ mod tests {
     fn inflight_hit_skeleton_miss_without_loc_after_class_a_is_corrupt() {
         let (dir, q) = tmp_store();
         let p = pin(1);
-        let txid = p.0.txid;
+        let txid = p.tx().txid;
         let fks = q
             .store
             .txs
             .put_full_batch_indexed(
                 &[(
-                    p.0.clone(),
+                    p.tx().clone(),
                     vec![rbitcoin_store::InputRecord::coinbase(
                         u32::MAX,
                         vec![0x01],
                         vec![],
                     )],
-                    p.1.clone(),
+                    (0..p.n_out() as u32)
+                        .filter_map(|v| p.out_record(v))
+                        .collect(),
                 )],
                 true,
             )

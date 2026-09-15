@@ -143,6 +143,13 @@ impl PackedCreate for CreatePinInner {
     fn packed_n_out(&self) -> u32 {
         self.n_out() as u32
     }
+    #[inline]
+    fn packed_has_negative_amount(&self) -> bool {
+        match self {
+            Self::Records { outs, .. } => outs.iter().any(|o| o.value < 0),
+            Self::Wire { .. } => false,
+        }
+    }
     fn packed_outs_est(&self) -> usize {
         let scripts: usize = match self {
             Self::Records { outs, .. } => outs.iter().map(|o| o.encoded_len()).sum(),
