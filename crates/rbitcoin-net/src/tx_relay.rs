@@ -11,13 +11,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
     default_candidate_rates, frontier_feerate_from_chunks, min_rate_for_capacity,
-    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainTipCtx, Chunk, Coin,
-    FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
+    Chunk, Coin, FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
-use rbitcoin_store::OutputRecord;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -135,34 +134,47 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
     }
 
     fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
+        match self.chain_prevout(op) {
+            ChainPrevout::Unspent(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    fn chain_prevout(&self, op: &OutPoint) -> ChainPrevout {
         if let Some(m) = self.meter_get_coin {
             m.fetch_add(1, Ordering::Relaxed);
         }
         let tid = op.txid.to_byte_array();
-        let (fk, rec) = self.query.get_tx_by_txid(&tid).ok().flatten()?;
-        // Confirmed-strong spent ⇒ absent (do not admit double-spends of chain UTXOs).
-        if self.query.is_outpoint_spent(&tid, op.vout).ok()? {
-            return None;
+        let Some((fk, rec)) = self.query.get_tx_by_txid(&tid).ok().flatten() else {
+            return ChainPrevout::Unknown;
+        };
+        let Some(create_height) = self.query.store().tx_height_get(fk).ok().flatten() else {
+            return ChainPrevout::Unknown;
+        };
+        let Some(tip) = self.query.tip_height().map(|h| h.0) else {
+            return ChainPrevout::Unknown;
+        };
+        if create_height > tip {
+            return ChainPrevout::Unknown;
         }
-        let out: OutputRecord = self
+        match self.query.is_outpoint_spent(&tid, op.vout) {
+            Ok(true) => return ChainPrevout::KnownUnavailable,
+            Ok(false) => {}
+            Err(_) => return ChainPrevout::KnownUnavailable,
+        }
+        let Some(out) = self
             .query
             .tx_output_at_fk(fk, op.vout)
             .ok()
-            .or_else(|| self.query.tx_output(&rec, op.vout).ok())?;
+            .or_else(|| self.query.tx_output(&rec, op.vout).ok())
+        else {
+            return ChainPrevout::KnownUnavailable;
+        };
         let value = if out.value < 0 {
             Amount::ZERO
         } else {
             Amount::from_sat(out.value as u64)
         };
-        let create_height = self.query.store().tx_height_get(fk).ok().flatten()?;
-        let tip = self.query.tip_height()?.0;
-        // Disconnected creates stay in Class A; they are not chain coins.
-        if create_height > tip {
-            return None;
-        }
-        // Coinbase: null prevout on input 0. `block_tx_fks` only when the input
-        // record is missing (it can miss after a disconnect while the input
-        // still says coinbase — `mempool_reorg`).
         let is_coinbase = match self.query.tx_input_at_fk(fk, &rec, 0) {
             Ok(i) => i.is_coinbase() || i.prev_index == u32::MAX,
             Err(_) => {
@@ -190,7 +202,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             )
             .unwrap_or(0)
         };
-        Some(Coin {
+        ChainPrevout::Unspent(Coin {
             txout: TxOut {
                 value,
                 script_pubkey: ScriptBuf::from_bytes(out.script),
@@ -326,6 +338,60 @@ const DEFAULT_MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
 const PARENT_GETDATA_TTL: Duration = Duration::from_secs(60);
 /// Cap unique parent GETDATA items issued from one park.
 const MAX_PARENTS_PER_PARK: usize = 16;
+/// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
+const RECENT_CONFIRMED_CAP: usize = 65_536;
+
+struct RecentConfirmed {
+    order: VecDeque<(Txid, Wtxid)>,
+    txids: HashSet<Txid>,
+    wtxids: HashSet<Wtxid>,
+}
+
+impl RecentConfirmed {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            txids: HashSet::new(),
+            wtxids: HashSet::new(),
+        }
+    }
+
+    fn note_block(&mut self, txs: &[Transaction]) {
+        self.note_block_capped(txs, RECENT_CONFIRMED_CAP);
+    }
+
+    fn note_block_capped(&mut self, txs: &[Transaction], cap: usize) {
+        for tx in txs {
+            let txid = tx.compute_txid();
+            let wtxid = tx.compute_wtxid();
+            if !self.txids.insert(txid) {
+                continue;
+            }
+            self.wtxids.insert(wtxid);
+            self.order.push_back((txid, wtxid));
+            if self.order.len() > cap {
+                if let Some((old_t, old_w)) = self.order.pop_front() {
+                    self.txids.remove(&old_t);
+                    self.wtxids.remove(&old_w);
+                }
+            }
+        }
+    }
+
+    fn contains_txid(&self, txid: &Txid) -> bool {
+        self.txids.contains(txid)
+    }
+
+    fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
+        self.wtxids.contains(wtxid)
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.txids.clear();
+        self.wtxids.clear();
+    }
+}
 
 struct AdmitSpec {
     report_orphans: bool,
@@ -346,6 +412,8 @@ pub struct MempoolHub {
     inv_flush: broadcast::Sender<()>,
     /// Newest-last ring of successful accepts (Esplora `/mempool/recent`).
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
+    /// Recently confirmed txid/wtxid for INV AlreadyHave (Core `m_recent_confirmed_transactions`).
+    recent_confirmed: Mutex<RecentConfirmed>,
     /// Recently confirmed package feerates (sat/kvB) for estimate floor.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
@@ -474,6 +542,7 @@ impl MempoolHub {
             recent: Mutex::new(std::collections::VecDeque::with_capacity(
                 MEMPOOL_RECENT_CAP,
             )),
+            recent_confirmed: Mutex::new(RecentConfirmed::new()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
             fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             fee_snapshot: ArcSwap::from_pointee(FeeSnapshot::empty(Instant::now())),
@@ -1063,12 +1132,29 @@ impl MempoolHub {
     }
 
     /// Session INV filter: never parks. Busy write → `false` (may re-getdata).
-    /// Live graph **or** orphanage (Core AlreadyHave).
+    /// Live graph, orphanage, recent-confirmed ring, or Class A at tip (Core AlreadyHave).
     pub fn try_contains(&self, txid: &Txid) -> bool {
-        self.inner
+        if self
+            .inner
             .try_read()
             .ok()
             .is_some_and(|g| g.graph.contains(txid) || g.orphanage.contains(txid))
+        {
+            return true;
+        }
+        if self
+            .recent_confirmed
+            .try_lock()
+            .ok()
+            .is_some_and(|r| r.contains_txid(txid))
+        {
+            return true;
+        }
+        self.query
+            .tx_fk_by_txid_tip(&txid.to_byte_array())
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub fn get_tx(&self, txid: &Txid) -> Option<Transaction> {
@@ -1102,10 +1188,31 @@ impl MempoolHub {
     }
 
     pub fn try_contains_wtxid(&self, wtxid: &Wtxid) -> bool {
-        self.inner
+        if self
+            .inner
             .try_read()
             .ok()
             .is_some_and(|g| g.graph.contains_wtxid(wtxid) || g.orphanage.contains_wtxid(wtxid))
+        {
+            return true;
+        }
+        self.recent_confirmed
+            .try_lock()
+            .ok()
+            .is_some_and(|r| r.contains_wtxid(wtxid))
+    }
+
+    /// Remember confirmed bodies for INV AlreadyHave (txid + wtxid).
+    pub(crate) fn note_recent_confirmed(&self, txs: &[Transaction]) {
+        if let Ok(mut r) = self.recent_confirmed.lock() {
+            r.note_block(txs);
+        }
+    }
+
+    pub(crate) fn clear_recent_confirmed(&self) {
+        if let Ok(mut r) = self.recent_confirmed.lock() {
+            r.clear();
+        }
     }
 
     /// Confirmed tip snapshot for mempool structural checks (height + BIP113 MTP).
@@ -2573,6 +2680,20 @@ mod tests {
     }
 
     #[test]
+    fn recent_confirmed_evicts_oldest_over_cap() {
+        let mut r = RecentConfirmed::new();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let a = spend_true(Txid::from_byte_array([1u8; 32]), 1, spk.clone());
+        let b = spend_true(Txid::from_byte_array([2u8; 32]), 1, spk);
+        r.note_block_capped(std::slice::from_ref(&a), 1);
+        r.note_block_capped(std::slice::from_ref(&b), 1);
+        assert!(!r.contains_txid(&a.compute_txid()));
+        assert!(!r.contains_wtxid(&a.compute_wtxid()));
+        assert!(r.contains_txid(&b.compute_txid()));
+        assert!(r.contains_wtxid(&b.compute_wtxid()));
+    }
+
+    #[test]
     fn sh_index_insert_overwrite_and_remove_miss() {
         let mut idx = MempoolShIndex::new();
         let t = Txid::from_byte_array([1u8; 32]);
@@ -3034,6 +3155,81 @@ mod tests {
             !hub.scripthash_mempool(&script_hash(spk.as_bytes()))
                 .is_empty(),
             "output script must still hit SH overlay"
+        );
+        let err = hub.accept_tx(&confirmed).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(_)),
+            "confirmed body must not park as orphan, got {err}"
+        );
+        assert_eq!(hub.orphan_count(), 0);
+        assert!(
+            hub.try_contains(&confirmed.compute_txid()),
+            "INV AlreadyHave for Class A txid"
+        );
+        assert!(
+            !hub.try_contains_wtxid(&confirmed.compute_wtxid()),
+            "wtxid AlreadyHave needs the recent-confirmed ring"
+        );
+        hub.note_recent_confirmed(std::slice::from_ref(&confirmed));
+        assert!(hub.try_contains_wtxid(&confirmed.compute_wtxid()));
+        assert!(
+            hub.try_contains(&confirmed.compute_txid()),
+            "recent-confirmed ring AlreadyHave for txid"
+        );
+        hub.note_recent_confirmed(std::slice::from_ref(&confirmed));
+        hub.clear_recent_confirmed();
+        assert!(
+            !hub.try_contains_wtxid(&confirmed.compute_wtxid()),
+            "reorg must drop wtxid AlreadyHave"
+        );
+        assert!(hub.try_contains(&confirmed.compute_txid()));
+        let oob = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed.compute_txid(),
+                    vout: 99,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let err = hub.accept_tx(&oob).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(_)),
+            "confirmed create missing vout must not park, got {err}"
+        );
+        assert_eq!(hub.orphan_count(), 0);
+
+        hub.remove_for_block(&[child.compute_txid()]);
+        q.disconnect_tip().unwrap();
+        let ghost = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: confirmed.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(confirmed.output[0].value.to_sat() - 2_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let err = hub.accept_tx(&ghost).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::Orphaned { .. }),
+            "disconnected create (no height) must park, got {err}"
         );
 
         let _ = hub.sample_reset_perf();

@@ -54,14 +54,32 @@ pub struct ChainTipCtx {
 /// Resolve prevouts for mempool acceptance (chain UTXO + in-mempool outputs).
 pub trait UtxoProvider {
     /// Unspent confirmed coin, or `None` if missing/spent on the confirmed chain.
+    /// Spent vs never-seen is [`Self::chain_prevout`].
     fn get_coin(&self, op: &OutPoint) -> Option<Coin>;
 
     fn get_txout(&self, op: &OutPoint) -> Option<TxOut> {
         self.get_coin(op).map(|c| c.txout)
     }
 
+    /// Spent/missing vout on a *confirmed* create vs a parent we have never seen.
+    fn chain_prevout(&self, op: &OutPoint) -> ChainPrevout {
+        match self.get_coin(op) {
+            Some(coin) => ChainPrevout::Unspent(coin),
+            None => ChainPrevout::Unknown,
+        }
+    }
+
     /// Spender about to resolve coins (BIP68 time-lock MTP only when needed).
     fn note_spender(&self, _tx: &Transaction) {}
+}
+
+/// Confirmed-chain lookup for one prevout.
+#[derive(Debug, Clone)]
+pub enum ChainPrevout {
+    Unspent(Coin),
+    /// Create is confirmed; output spent, missing vout, or otherwise unusable.
+    KnownUnavailable,
+    Unknown,
 }
 
 /// Map-backed provider for tests and simple callers.
@@ -111,9 +129,11 @@ pub enum AcceptError {
     Policy(&'static str),
     MissingPrevout(OutPoint),
     /// Tx parked in the orphanage waiting on missing parent(s). Not a hard reject.
+    /// `fresh` is true on first insert; re-delivery of the same parked tx is false.
     Orphaned {
         txid: Txid,
         missing: BTreeSet<Txid>,
+        fresh: bool,
     },
     Duplicate(Txid),
     ClusterTooLarge {
@@ -599,7 +619,11 @@ impl ActiveMempool {
         // Already parked: soft re-announce of the same orphan.
         if report_orphans {
             if let Some(missing) = self.orphanage.missing_of(&txid).cloned() {
-                return Err(AcceptError::Orphaned { txid, missing });
+                return Err(AcceptError::Orphaned {
+                    txid,
+                    missing,
+                    fresh: false,
+                });
             }
         }
 
@@ -630,12 +654,17 @@ impl ActiveMempool {
                     Some(o) => (o, None),
                     None => return Err(AcceptError::MissingPrevout(op)),
                 }
-            } else if let Some(coin) = utxos.get_coin(&op) {
-                // Confirmed unspent only — spent/missing create → None (finding 010).
-                (coin.txout.clone(), Some(coin))
             } else {
-                missing_parents.insert(op.txid);
-                continue;
+                match utxos.chain_prevout(&op) {
+                    ChainPrevout::Unspent(coin) => (coin.txout.clone(), Some(coin)),
+                    ChainPrevout::KnownUnavailable => {
+                        return Err(AcceptError::MissingPrevout(op));
+                    }
+                    ChainPrevout::Unknown => {
+                        missing_parents.insert(op.txid);
+                        continue;
+                    }
+                }
             };
             input_value = input_value.saturating_add(txout.value.to_sat());
             prevouts.push(txout);
@@ -653,6 +682,7 @@ impl ActiveMempool {
                 return Err(AcceptError::Orphaned {
                     txid,
                     missing: missing_parents,
+                    fresh: true,
                 });
             }
             return Err(AcceptError::MissingPrevout(
@@ -705,13 +735,18 @@ impl ActiveMempool {
             return AcceptError::Orphaned {
                 txid,
                 missing: parked,
+                fresh: false,
             };
         }
         if missing.is_empty() {
             return AcceptError::MissingPrevout(tx.input[0].previous_output);
         }
         if self.orphanage.insert(tx.clone(), missing.clone()) {
-            AcceptError::Orphaned { txid, missing }
+            AcceptError::Orphaned {
+                txid,
+                missing,
+                fresh: true,
+            }
         } else {
             AcceptError::MissingPrevout(tx.input[0].previous_output)
         }
@@ -843,7 +878,11 @@ impl ActiveMempool {
                 .missing_of(&txid)
                 .cloned()
                 .unwrap_or_default();
-            return Err(AcceptError::Orphaned { txid, missing });
+            return Err(AcceptError::Orphaned {
+                txid,
+                missing,
+                fresh: false,
+            });
         }
 
         let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins)?;
@@ -2413,6 +2452,41 @@ mod tests {
     }
 
     #[test]
+    fn spent_confirmed_prevout_is_missing_not_orphan() {
+        struct KnownSpent {
+            op: OutPoint,
+        }
+        impl UtxoProvider for KnownSpent {
+            fn get_coin(&self, _: &OutPoint) -> Option<Coin> {
+                None
+            }
+            fn chain_prevout(&self, op: &OutPoint) -> ChainPrevout {
+                if op == &self.op {
+                    ChainPrevout::KnownUnavailable
+                } else {
+                    ChainPrevout::Unknown
+                }
+            }
+        }
+        let dir = tmp_dir();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let tx = spend_tx(op, 1);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp
+            .accept_tx(&tx, &KnownSpent { op }, TIP_OK)
+            .expect_err("spent");
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(got) if got == op),
+            "spent confirmed create must not park, got {err}"
+        );
+        assert_eq!(mp.orphan_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn park_orphan_is_graph_only() {
         let dir = tmp_dir();
         let tx = spend_tx(
@@ -2426,7 +2500,18 @@ mod tests {
         let mut missing = BTreeSet::new();
         missing.insert(Txid::from_byte_array([9u8; 32]));
         let e = mp.park_orphan(&tx, missing);
-        assert!(matches!(e, AcceptError::Orphaned { .. }), "{e}");
+        assert!(
+            matches!(e, AcceptError::Orphaned { fresh: true, .. }),
+            "{e}"
+        );
+        assert_eq!(mp.orphan_count(), 1);
+        let mut missing2 = BTreeSet::new();
+        missing2.insert(Txid::from_byte_array([9u8; 32]));
+        let again = mp.park_orphan(&tx, missing2);
+        assert!(
+            matches!(again, AcceptError::Orphaned { fresh: false, .. }),
+            "{again}"
+        );
         assert_eq!(mp.orphan_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2642,6 +2727,7 @@ mod tests {
             AcceptError::Orphaned {
                 txid: Txid::from_byte_array([4; 32]),
                 missing: BTreeSet::new(),
+                fresh: true,
             },
             AcceptError::Duplicate(Txid::from_byte_array([2; 32])),
             AcceptError::ClusterTooLarge {

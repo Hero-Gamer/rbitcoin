@@ -1538,6 +1538,7 @@ impl ChainHub {
                     if let Ok(Some(block)) =
                         self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                     {
+                        mp.note_recent_confirmed(&block.txdata);
                         let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
                         let spent: Vec<_> = block
                             .txdata
@@ -2463,6 +2464,7 @@ impl ChainHub {
         self.header_tips.write().unwrap().remove(&hash);
         let t_mp = std::time::Instant::now();
         if let Some(mp) = self.mempool() {
+            mp.note_recent_confirmed(&block.txdata);
             let ids = Self::strip_txids_from_pres(&pres);
             let spent: Vec<_> = block
                 .txdata
@@ -2523,6 +2525,7 @@ impl ChainHub {
         }
         self.cache.truncate_to_height(keep_height);
         if let Some(mp) = mp {
+            mp.clear_recent_confirmed();
             if !disconnected_txs.is_empty() {
                 let n = mp.reorg_reaccept(&disconnected_txs);
                 if n > 0 {
@@ -4816,10 +4819,13 @@ mod tests {
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         let b1 = mine(gen, 1_300_004_000, 1);
+        let cb_txid = b1.txdata[0].compute_txid();
+        let cb_wtxid = b1.txdata[0].compute_wtxid();
         let loaded = hub.confirm_wire_load_phase(&[(Height(1), b1)]).unwrap();
         assert!(loaded.is_some());
         let batch = loaded.unwrap();
         let script_out = confirm_scripts_phase(batch.batch).unwrap();
+        let mp = attach_mp(dir.path(), &hub);
         let write_out = hub.confirm_write(script_out.batch).unwrap();
         assert_eq!(write_out.len(), 1);
         assert!(matches!(
@@ -4827,6 +4833,11 @@ mod tests {
             AcceptOutcome::Accepted { height: 1 }
         ));
         assert_eq!(hub.tip_height(), Some(1));
+        assert!(
+            mp.try_contains_wtxid(&cb_wtxid),
+            "IBD confirm_write must fill recent-confirmed wtxid"
+        );
+        assert!(mp.try_contains(&cb_txid));
 
         let _ = std::fs::remove_dir_all(dir);
     }

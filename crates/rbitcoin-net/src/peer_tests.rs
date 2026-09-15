@@ -2863,6 +2863,48 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
         }
         assert!(out_rx.try_recv().is_err());
 
+        let genesis_txid =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].compute_txid();
+        handle_peer_frame(
+            frame_for(NetworkMessage::Inv(vec![Inventory::WitnessTransaction(
+                genesis_txid,
+            )])),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "Class A txid INV must not GETDATA"
+        );
+
+        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let mined = hub
+            .query
+            .reconstruct_block_at_height(rbitcoin_primitives::Height(1))
+            .unwrap();
+        let cb = &mined.txdata[0];
+        handle_peer_frame(
+            frame_for(NetworkMessage::Inv(vec![
+                Inventory::WitnessTransaction(cb.compute_txid()),
+                Inventory::WTx(cb.compute_wtxid()),
+            ])),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "recent-confirmed INV must not GETDATA"
+        );
+
         // Accept path with invalid prevout — still exercises Tx arm (inserts from_peer).
         let junk = Transaction {
             version: TxVersion::TWO,
@@ -2948,8 +2990,15 @@ fn tx_accept_log_parks_orphans_silences_duplicates() {
     let e = rbitcoin_mempool::AcceptError::Orphaned {
         txid,
         missing: Default::default(),
+        fresh: true,
     };
     assert!(matches!(tx_accept_log(&e), TxAcceptLog::Park(m) if m.is_empty()));
+    let again = rbitcoin_mempool::AcceptError::Orphaned {
+        txid,
+        missing: Default::default(),
+        fresh: false,
+    };
+    assert!(matches!(tx_accept_log(&again), TxAcceptLog::ParentFetch(_)));
     assert_eq!(
         tx_accept_log(&rbitcoin_mempool::AcceptError::Policy("min relay fee")),
         TxAcceptLog::Reject
@@ -3044,6 +3093,26 @@ fn parked_orphan_tx_is_not_logged_as_reject() {
             logs.iter()
                 .any(|(l, m)| *l == rbitcoin_log::Level::Debug && m.contains("txrelay: park")),
             "expected debug park line, got {logs:?}"
+        );
+
+        rbitcoin_log::capture_logs(true);
+        handle_peer_frame(
+            frame_for(NetworkMessage::Tx(orphan.clone())),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let again = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(hub.mempool().unwrap().orphan_count(), 1);
+        assert!(
+            !again
+                .iter()
+                .any(|(l, m)| *l == rbitcoin_log::Level::Debug && m.contains("txrelay: park")),
+            "re-delivery of a parked orphan must not log park again, got {again:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     });

@@ -3067,13 +3067,23 @@ async fn on_blocktxn(
 enum TxAcceptLog<'a> {
     Silent,
     Park(&'a BTreeSet<bitcoin::Txid>),
+    ParentFetch(&'a BTreeSet<bitcoin::Txid>),
     Reject,
 }
 
 fn tx_accept_log(e: &rbitcoin_mempool::AcceptError) -> TxAcceptLog<'_> {
     match e {
         rbitcoin_mempool::AcceptError::Duplicate(_) => TxAcceptLog::Silent,
-        rbitcoin_mempool::AcceptError::Orphaned { missing, .. } => TxAcceptLog::Park(missing),
+        rbitcoin_mempool::AcceptError::Orphaned {
+            missing,
+            fresh: true,
+            ..
+        } => TxAcceptLog::Park(missing),
+        rbitcoin_mempool::AcceptError::Orphaned {
+            missing,
+            fresh: false,
+            ..
+        } => TxAcceptLog::ParentFetch(missing),
         _ => TxAcceptLog::Reject,
     }
 }
@@ -3147,6 +3157,9 @@ async fn on_tx(
                     TxAcceptLog::Silent => {}
                     TxAcceptLog::Park(missing) => {
                         rbitcoin_log::debug!("txrelay: park {txid}");
+                        queue_orphan_parent_getdata(mp, missing, out_tx)?;
+                    }
+                    TxAcceptLog::ParentFetch(missing) => {
                         queue_orphan_parent_getdata(mp, missing, out_tx)?;
                     }
                     TxAcceptLog::Reject => {

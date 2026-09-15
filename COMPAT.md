@@ -79,6 +79,12 @@ less often than on Core — not never. Eviction still misses the short-id map
 and costs a `getblocktxn` when the ring has already rolled off. Growing the
 ring to Core’s extra-txn shape is worth later; not scheduled (no Open Q-id).
 
+Inbound `tx` whose prevouts are spent or missing on a confirmed create is
+`MissingPrevout`, not an orphan park. INV AlreadyHave is live mempool +
+orphanage + a recent-confirmed txid/wtxid ring (filled at tip connect and IBD write) +
+Class A `tx_fk_by_txid_tip`. Re-delivery of an already-parked orphan still
+GETDATAs missing parents (TTL) but does not log a second `txrelay: park`.
+
 Inbound `cmpctblock` may prefill any well-formed indexes (BIP152). We always
 log reconstruct fill sources and `fetched=` `blocktxn` bytes, and outbound
 `cmpct announce … prefill=N/bytes` when we send `cmpctblock` (tip announce or
