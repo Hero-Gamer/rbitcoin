@@ -2291,8 +2291,9 @@ async fn serve_getdata(
                             try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
                     } else {
                         let ver = follow.cmpct_version.clamp(1, 2);
+                        let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
                         if let Ok(hsi) =
-                            HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &[0])
+                            HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref)
                         {
                             let _ = try_queue_served_block(
                                 out_tx,
@@ -3198,10 +3199,17 @@ fn peer_has_header(
     false
 }
 
-/// BIP152 compact tip announcement (coinbase prefilled) from an in-RAM body.
-fn cmpct_announce_from_block(block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
+/// BIP152 compact tip announcement from an in-RAM body.
+fn cmpct_announce_from_block(
+    hub: &ChainHub,
+    block: &Block,
+    cmpct_version: u32,
+) -> Option<NetworkMessage> {
     let nonce = rand_nonce();
-    let hsi = HeaderAndShortIds::from_block(block, nonce, cmpct_version.clamp(1, 2), &[0]).ok()?;
+    let pref = hub
+        .cmpct_prefill_indexes(&block.block_hash())
+        .unwrap_or_else(|| vec![0]);
+    let hsi = HeaderAndShortIds::from_block(block, nonce, cmpct_version.clamp(1, 2), &pref).ok()?;
     Some(NetworkMessage::CmpctBlock(CmpctBlock {
         compact_block: hsi,
     }))
@@ -3215,7 +3223,7 @@ fn cmpct_announce_msg(
     cmpct_version: u32,
 ) -> Option<NetworkMessage> {
     let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), hash).ok()??;
-    cmpct_announce_from_block(&block, cmpct_version)
+    cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
 /// Core `NewPoWValidBlock`: send `cmpctblock` to HB peers as soon as a
@@ -3260,7 +3268,7 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
         let Some(out) = s.writer() else {
             continue;
         };
-        let Some(msg) = cmpct_announce_from_block(block, 2) else {
+        let Some(msg) = cmpct_announce_from_block(hub, block, 2) else {
             continue;
         };
         if queue_cmpct_tip_announce(&out, msg).is_ok() {

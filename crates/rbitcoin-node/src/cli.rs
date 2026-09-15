@@ -46,7 +46,7 @@ where
     [--maxoutbound|--max-outbound N] [--maxinbound N] [--maxconnections N] \\\n\
     [--mempool-size-mb|--maxmempool N] \\\n\
     [--testactivationheight name@height] [--persistmempool[=0|1]] [--whitelist SPEC] \\\n\
-    [--blocksonly] [--minrelaytxfee BTC] \\\n\
+    [--blocksonly] [--prefillcompact] [--minrelaytxfee BTC] \\\n\
     [--limitclustercount N] [--limitclustersize KVB] [--peertimeout SECS] \\\n\
     [--externalip IP] \\\n\
     [--minimumchainwork HEX] \\\n\
@@ -313,6 +313,8 @@ fn is_bool_key(key: &str) -> bool {
             | "sptweaks"
             | "blocksonly"
             | "blocks_only"
+            | "prefillcompact"
+            | "prefill_compact"
             | "persistmempool"
             | "persist_mempool"
             | "noseeds"
