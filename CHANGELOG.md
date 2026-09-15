@@ -11,6 +11,13 @@ before 1.0).
 
 ### Added
 
+- **Process `-blocksonly` on live `run_p2p`:** `node_run_p2p_short` sets
+  `mempool.blocksonly` and `-maxtipage` (so the 3-block 2011 pad leaves
+  `IsInitialBlockDownload`). After catch-up, `getnetworkinfo` `localrelay`
+  and `getmempoolinfo` `relay_enabled` stay false; `sendrawtransaction` is
+  not the serving-only refuse; a seeder inbound `tx` disconnects the session.
+  PeerHub `p2p_blocksonly` units stay.
+
 - **`preciousblock` equal-work + held `getchaintips`:** RPC
   `invalidate_reconsider_tip` parks an equal-work sibling (`submitblock`
   `inconclusive`), `preciousblock` the loser then the original tip, ignores

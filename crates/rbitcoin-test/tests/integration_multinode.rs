@@ -2,7 +2,7 @@
 //!
 //! Single-hop IBD (8 blocks), cold reconstruct serve (10 blocks), dead-peer
 //! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
-//! fill, product `run_p2p --connect`. Hard wall timeouts; hang-free on
+//! fill, product `run_p2p --blocksonly --connect`. Hard wall timeouts; hang-free on
 //! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
 //! live in the same binary. Live `P2PNode` tests serialize on `live_p2p_lock`
 //! (process-wide script pool); hub-only reorgs do not.
@@ -1908,8 +1908,95 @@ fn reorg_same_height_then_multi_block_branch() {
     pin_precious_held_chaintips(&hub, ext);
 }
 
-/// Product `run_p2p`: `--connect` to a live seeder; process RPC while connected.
-/// `max_run_secs=0` (exit after catch-up, no RPC window) stays a node-crate unit.
+/// After catch-up (`initialblockdownload` false; `-maxtipage` so the 2011
+/// pad is not stale), `-blocksonly` keeps `localrelay` / mempool relay off;
+/// RPC `sendrawtransaction` is not the serving-only refuse.
+async fn pin_blocksonly_relay_off_after_ibd(rpc_addr: SocketAddr) {
+    use serde_json::json;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let bc = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
+        if bc["result"]["initialblockdownload"] == false {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("IBD never cleared after height 3: {bc}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let net = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await;
+    assert_eq!(net["result"]["localrelay"], false, "{net}");
+    let mem = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
+    assert_eq!(mem["result"]["relay_enabled"], false, "{mem}");
+    let raw = jsonrpc(rpc_addr, "sendrawtransaction", json!(["00"])).await;
+    let msg = raw["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("relay disabled"),
+        "RPC sendraw must admit while -blocksonly, got {raw}"
+    );
+}
+
+/// Seeder inbound `tx` after IBD is a protocol violation (`p2p_blocksonly`).
+async fn pin_blocksonly_seeder_tx_disconnects(
+    rpc_addr: SocketAddr,
+    seed_peers: &rbitcoin_net::PeerHub,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use serde_json::json;
+    use std::time::Instant;
+
+    let dummy = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    wait_ms_until(
+        3_000,
+        || {
+            seed_peers.live_peers().into_iter().any(|p| {
+                p.inbound
+                    && p.handshake_complete()
+                    && p.queue_msg(NetworkMessage::Tx(dummy.clone()))
+            })
+        },
+        || {
+            format!(
+                "seed inbound must queue unsolicited tx (seed={:?})",
+                seed_peers.snapshot()
+            )
+        },
+    )
+    .await;
+    let gone_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+        if peers["result"].as_array().is_some_and(|a| a.is_empty()) {
+            break;
+        }
+        if Instant::now() >= gone_deadline {
+            panic!("blocksonly node still connected after unsolicited tx: {peers}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Product `run_p2p --blocksonly`: `--connect` to a live seeder; process RPC
+/// while connected. `max_run_secs=0` stays a node-crate unit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
     let fut = async {
@@ -1938,7 +2025,10 @@ async fn node_run_p2p_short() {
         cfg.rpc.user = Some("user".into());
         cfg.rpc.password = Some("pass".into());
         cfg.max_run_secs = Some(60);
+        cfg.mempool.blocksonly = true;
+        cfg.max_tip_age_secs = Some(u64::MAX);
 
+        let seed_peers = seed.peers.clone();
         let pin = tokio::spawn(async move {
             wait_listeners(&[rpc_addr]).await;
 
@@ -1977,6 +2067,7 @@ async fn node_run_p2p_short() {
             );
             let ping = jsonrpc(rpc_addr, "ping", json!([])).await;
             assert!(ping["result"].is_null(), "{ping}");
+            pin_blocksonly_relay_off_after_ibd(rpc_addr).await;
 
             let inbound = jsonrpc(
                 rpc_addr,
@@ -2029,6 +2120,7 @@ async fn node_run_p2p_short() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
+            pin_blocksonly_seeder_tx_disconnects(rpc_addr, &seed_peers).await;
             let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
         });
 
