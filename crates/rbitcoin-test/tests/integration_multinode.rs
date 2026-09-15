@@ -250,7 +250,6 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         let peer_dir = TempDir::new().unwrap();
         let dummy_dir = TempDir::new().unwrap();
         let seed = start_node(&seed_dir).await;
-        seed.peers.set_peer_timeout_secs(1);
 
         let mut book = AddrMan::new();
         for i in 0..5_000u32 {
@@ -402,6 +401,8 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "self-connect must not complete handshake: {:?}",
             seed.peers.snapshot()
         );
+
+        seed.peers.set_peer_timeout_secs(1);
 
         let mut one = AddrMan::new();
         one.add(std::net::SocketAddr::from(([1, 2, 3, 4], 8333)));
