@@ -727,13 +727,13 @@ impl Query {
 /// Operator line for one confirmed-block disconnect (reorg / restore).
 ///
 /// Hash is Core display-order hex (`BlockHash` `Display`).
-pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], n_tx: usize) -> String {
+pub fn format_disconnect_tip_line(height: u32, hash: &[u8; 32], tx_count: usize) -> String {
     let hash = BlockHash::from_byte_array(*hash);
-    format!("DisconnectTip: hash={hash} height={height} tx={n_tx}")
+    format!("DisconnectTip: hash={hash} height={height} tx={tx_count}")
 }
 
-fn log_disconnect_tip(height: u32, hash: &[u8; 32], n_tx: usize) {
-    rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, n_tx));
+fn log_disconnect_tip(height: u32, hash: &[u8; 32], tx_count: usize) {
+    rbitcoin_log::warn!("{}", format_disconnect_tip_line(height, hash, tx_count));
 }
 
 pub(crate) fn request_sh_writebehind_halt(

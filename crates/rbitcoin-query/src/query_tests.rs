@@ -396,8 +396,12 @@ fn disconnect_tip_logs_each_block_at_least_info() {
     assert_eq!(q.tip_height(), Some(Height(0)));
     let line = crate::connect::format_disconnect_tip_line(1, &hash1, 1);
     assert!(
-        line.contains("height=1"),
-        "disconnect line must name height: {line}"
+        line.contains("tx=1"),
+        "disconnect line must name tx count without Hungarian: {line}"
+    );
+    assert!(
+        !line.contains("nTx") && !line.contains("n_tx"),
+        "disconnect line must not leak Hungarian tx count: {line}"
     );
     assert!(
         line.to_ascii_lowercase().contains("disconnect"),

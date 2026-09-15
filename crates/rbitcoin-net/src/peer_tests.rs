@@ -16,7 +16,7 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
 }
 
 #[test]
-fn p2p_serve_line_names_ntx_bytes_wall() {
+fn p2p_serve_line_names_tx_bytes_wall() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("serve-line");
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
@@ -28,7 +28,7 @@ fn p2p_serve_line_names_ntx_bytes_wall() {
     let s = crate::serve_perf::sample_reset_serve_perf();
     assert!(s.n >= 1, "{s:?}");
     assert!(s.bytes > 0, "{s:?}");
-    assert!(s.ntx >= 1, "{s:?}");
+    assert!(s.tx_count >= 1, "{s:?}");
     let line = crate::serve_perf::format_serve_perf(&s);
     assert!(
         !line.contains("p2p: serve"),
@@ -36,10 +36,24 @@ fn p2p_serve_line_names_ntx_bytes_wall() {
     );
     assert!(line.contains("serve n="), "{line}");
     assert!(line.contains("bytes="), "{line}");
-    assert!(line.contains("ntx="), "{line}");
+    assert!(line.contains("tx="), "{line}");
+    assert!(!line.contains("ntx="), "{line}");
     assert!(line.contains("avg_us="), "{line}");
     assert!(line.contains("max_us="), "{line}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn misbehavior_disconnect_log_is_not_banlist() {
+    let line = misbehavior_disconnect_log("7", 100);
+    assert_eq!(
+        line,
+        format!("p2p: 7 misbehavior 100 ≥ {BAN_SCORE_THRESHOLD} — disconnect")
+    );
+    assert!(
+        !line.to_ascii_lowercase().contains("ban score"),
+        "disconnect log is not banlist language: {line}"
+    );
 }
 
 #[test]
@@ -2411,7 +2425,7 @@ fn handle_peer_frame_control_and_inv_paths() {
             NetworkMessage::CmpctBlock(_)
         ));
 
-        // GetBlockTxn with bad index → ban score.
+        // GetBlockTxn with bad index → disconnect score.
         use bitcoin::bip152::BlockTransactionsRequest;
         handle_peer_frame(
             frame_for(NetworkMessage::GetBlockTxn(GetBlockTxn {

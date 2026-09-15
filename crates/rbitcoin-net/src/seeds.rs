@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::asmap::AsMap;
 use crate::netgroup::{netgroup, select_diverse};
 
-/// Skip a recently dialed addr while any other candidate remains (Core `nLastTry`).
+/// Skip a recently dialed addr while any other candidate remains.
 pub(crate) const DIAL_ATTEMPT_RECENT: Duration = Duration::from_secs(10 * 60);
 
 /// Service bits we advertise and ask DNS seeds for (`NETWORK|WITNESS|P2P_V2` = `0x809`).
@@ -27,7 +27,7 @@ pub fn required_seed_services() -> ServiceFlags {
     ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
 }
 
-/// Core `x<hex>.<seed>` hostname (`strprintf("x%x.%s", nRequiredServiceBits, seed)`).
+/// DNS seed service-bit filter hostname (`x<hex>.<seed>`).
 pub fn dns_seed_query_host(seed: &str, services: ServiceFlags) -> String {
     format!("x{:x}.{seed}", services.to_u64())
 }
