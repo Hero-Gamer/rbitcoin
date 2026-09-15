@@ -69,13 +69,15 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | IBD empty-headers EOF | Empty `headers` to **our locator** + idle path latches `headers_done` even if a peer advertises a taller less-work height / junk `version.start_height` | Core header sync follows most-work; advertised `start_height` is not a remaining header count |
 
 Compact reconstruct fills short-ids from the live mempool graph, the
-orphanage, and a small `extra_compact` ring (RBF-replaced bodies and min-relay
-rejects; cap 100). That is **not** Core’s full `-blockreconstructionextratxn`
-cache of recently seen wire txs. Libre admission (0.1 sat/vB, no dust, full
-RBF) keeps more bodies live than Core standardness, so a larger extra-txn ring
-would hit less often than on Core — not never. Eviction still misses the
-short-id map and costs a `getblocktxn`. Growing the ring to Core’s extra-txn
-shape is worth later; not scheduled (no Open Q-id).
+orphanage, and a small `extra_compact` ring (cap 100): RBF-replaced and
+min-relay-rejected bodies, mempool removals (confirm/evict), inbound
+`cmpctblock` prefills, and `blocktxn` bodies. Coinbase is skipped. That is
+still not Core’s full `-blockreconstructionextratxn` cache of every recently
+seen wire tx. Libre admission (0.1 sat/vB, no dust, full RBF) keeps more
+bodies live than Core standardness, so a larger extra-txn ring would hit
+less often than on Core — not never. Eviction still misses the short-id map
+and costs a `getblocktxn` when the ring has already rolled off. Growing the
+ring to Core’s extra-txn shape is worth later; not scheduled (no Open Q-id).
 
 Inbound `cmpctblock` may prefill any well-formed indexes (BIP152). We always
 log reconstruct fill sources and `fetched=` `blocktxn` bytes, and outbound

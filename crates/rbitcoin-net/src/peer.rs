@@ -2777,6 +2777,9 @@ async fn on_cmpctblock(
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
+    if let Some(mp) = hub.mempool() {
+        mp.try_note_extra_compact_txs(hsi.prefilled_txs.iter().map(|p| &p.tx));
+    }
     // Child of a cached-invalid block: Core `BLOCK_INVALID_PREV`.
     // Same-hash cached invalid via compact stays connected
     // (`p2p_compactblocks` `test_invalid_tx_in_compactblock`).
@@ -2952,6 +2955,9 @@ async fn on_blocktxn(
     bt: &BlockTransactions,
 ) -> Result<(), NetError> {
     let hash = bt.block_hash;
+    if let Some(mp) = hub.mempool() {
+        mp.try_note_extra_compact_txs(bt.transactions.iter());
+    }
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
         rbitcoin_log::info!("previous compact block reconstruction attempt failed");
         punish_disconnect(&mut follow.ban_score, session);

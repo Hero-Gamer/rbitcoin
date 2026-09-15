@@ -3454,6 +3454,156 @@ fn invalid_getdata_type0_still_serves_tip_block() {
     });
 }
 
+/// Compact prefills and `blocktxn` bodies feed `extra_compact` (not coinbase).
+#[test]
+fn cmpctblock_prefill_and_blocktxn_feed_extra_compact() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
+    use bitcoin::block::{Header, Version};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
+        Witness,
+    };
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            payload,
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-extra");
+        hub.ensure_genesis().unwrap();
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        assert!(hub.attach_mempool(mp).is_ok());
+
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![1]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: hub.tip_hash().unwrap(),
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase.clone(), spend.clone()],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[0, 1]).unwrap();
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+                compact_block: hsi,
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let mp = hub.mempool().unwrap();
+        let pref = mp
+            .try_cmpct_fill_sets(&[coinbase.clone(), spend.clone()])
+            .expect("fill");
+        assert!(
+            pref.extra.contains(&spend.compute_wtxid()),
+            "cmpct prefill must feed extra_compact"
+        );
+        assert!(
+            !pref.extra.contains(&coinbase.compute_wtxid()),
+            "coinbase must not occupy extra_compact"
+        );
+
+        let other = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x33; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![2]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(2000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        handle_peer_frame(
+            frame_for(NetworkMessage::BlockTxn(BlockTxn {
+                transactions: BlockTransactions {
+                    block_hash: BlockHash::from_byte_array([0xdd; 32]),
+                    transactions: vec![other.clone()],
+                },
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let fetched = mp
+            .try_cmpct_fill_sets(std::slice::from_ref(&other))
+            .expect("fill");
+        assert!(
+            fetched.extra.contains(&other.compute_wtxid()),
+            "blocktxn bodies must feed extra_compact"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 /// Compact fill with a live mempool hub must not `list_live` every body.
 #[test]
 fn cmpct_helpers_with_mempool_skip_list_live() {
