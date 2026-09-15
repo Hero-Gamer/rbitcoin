@@ -99,6 +99,215 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("rpc {method} json: {e} body={text}"))
 }
 
+/// A9: `waitforblockheight` timeout=0 while behind returns the live tip.
+async fn pin_waitforblockheight_timeout_zero_behind(
+    rpc_addr: SocketAddr,
+    tip_height: u64,
+    tip_hash: &str,
+) {
+    let t0 = Instant::now();
+    let behind = jsonrpc(rpc_addr, "waitforblockheight", json!([tip_height + 50, 0])).await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(1_000),
+        "timeout=0 while behind must not hang: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(behind["result"]["height"], tip_height, "{behind}");
+    assert_eq!(behind["result"]["hash"], tip_hash, "{behind}");
+}
+
+/// B15: `getblockhash` tip ok / tip+1 `-8`; unknown `getblock` `-5`; verbosity 0 hex.
+async fn pin_getblock_hash_oob_unknown_and_raw(
+    rpc_addr: SocketAddr,
+    tip_height: u64,
+    tip_hash: &str,
+) {
+    let ok = jsonrpc(rpc_addr, "getblockhash", json!([tip_height])).await;
+    assert_eq!(ok["result"], tip_hash, "{ok}");
+    let oob = jsonrpc(rpc_addr, "getblockhash", json!([tip_height + 1])).await;
+    assert_eq!(oob["error"]["code"], -8, "{oob}");
+    assert_eq!(
+        oob["error"]["message"], "Block height out of range",
+        "{oob}"
+    );
+    let unknown = jsonrpc(rpc_addr, "getblock", json!(["00".repeat(32)])).await;
+    assert_eq!(unknown["error"]["code"], -5, "{unknown}");
+    assert_eq!(unknown["error"]["message"], "Block not found", "{unknown}");
+    let v0 = jsonrpc(rpc_addr, "getblock", json!([tip_hash, 0])).await;
+    let hex = v0["result"].as_str().expect("verbosity 0 hex");
+    assert!(hex.len() > 160, "raw block hex: {v0}");
+    assert!(
+        hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        "verbosity 0 must be hex: {v0}"
+    );
+}
+
+struct TipWaiters {
+    wait_new: tokio::task::JoinHandle<Value>,
+    wait_height: tokio::task::JoinHandle<Value>,
+    wait_gbt: tokio::task::JoinHandle<Value>,
+    start_hash: String,
+}
+
+/// A9: spawn wait/GBT current-`longpollid` before generate. Stale id stays immediate.
+async fn spawn_wait_and_gbt_longpoll(rpc_addr: SocketAddr, want_height: u64) -> TipWaiters {
+    let start = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
+    let start_hash = start["result"].as_str().expect("tip hash").to_string();
+    let gbt = jsonrpc(rpc_addr, "getblocktemplate", json!([{"rules": ["segwit"]}])).await;
+    let lp = gbt["result"]["longpollid"]
+        .as_str()
+        .expect("longpollid")
+        .to_string();
+    let t0 = Instant::now();
+    let stale = jsonrpc(
+        rpc_addr,
+        "getblocktemplate",
+        json!([{"rules": ["segwit"], "longpollid": "not-this-id"}]),
+    )
+    .await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(1_000),
+        "stale longpollid must return immediately: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(stale["result"]["longpollid"], lp, "{stale}");
+
+    let wait_new =
+        tokio::spawn(async move { jsonrpc(rpc_addr, "waitfornewblock", json!([15_000])).await });
+    let wait_height = tokio::spawn(async move {
+        jsonrpc(rpc_addr, "waitforblockheight", json!([want_height, 15_000])).await
+    });
+    let lp_owned = lp.clone();
+    let wait_gbt = tokio::spawn(async move {
+        jsonrpc(
+            rpc_addr,
+            "getblocktemplate",
+            json!([{"rules": ["segwit"], "longpollid": lp_owned}]),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    TipWaiters {
+        wait_new,
+        wait_height,
+        wait_gbt,
+        start_hash,
+    }
+}
+
+impl TipWaiters {
+    async fn assert_woke_on_new_tip(self, new_hash: &str, new_height: u64) {
+        assert_ne!(self.start_hash, new_hash);
+        let waited = tokio::time::timeout(Duration::from_secs(10), self.wait_new)
+            .await
+            .expect("waitfornewblock timed out")
+            .expect("waitfornewblock join");
+        assert_eq!(waited["result"]["hash"], new_hash, "{waited}");
+        assert_eq!(waited["result"]["height"], new_height, "{waited}");
+        let h = tokio::time::timeout(Duration::from_secs(10), self.wait_height)
+            .await
+            .expect("waitforblockheight timed out")
+            .expect("waitforblockheight join");
+        assert_eq!(h["result"]["hash"], new_hash, "{h}");
+        assert_eq!(h["result"]["height"], new_height, "{h}");
+        let gbt = tokio::time::timeout(Duration::from_secs(10), self.wait_gbt)
+            .await
+            .expect("gbt longpoll timed out")
+            .expect("gbt longpoll join");
+        let lp = gbt["result"]["longpollid"].as_str().unwrap_or("");
+        assert!(
+            lp.starts_with(new_hash),
+            "current longpollid must wake on generate: {gbt}"
+        );
+    }
+}
+
+async fn esplora_json_array(esplora_addr: SocketAddr, path: &str) -> (u16, String, Vec<Value>) {
+    let (st, body) = http_get(esplora_addr, path).await;
+    let list = serde_json::from_str(&body).unwrap_or_default();
+    (st, body, list)
+}
+
+/// B12: `/blocks` 10 newest; `/blocks/:start` at 0 and at tip.
+async fn pin_esplora_blocks_summaries(esplora_addr: SocketAddr, tip_height: u64, tip_hash: &str) {
+    let (st, body, list) = esplora_json_array(esplora_addr, "/blocks").await;
+    assert_eq!(st, 200, "GET /blocks: {body}");
+    assert_eq!(list.len(), 10, "10 newest: {body}");
+    assert_eq!(list[0]["height"], tip_height, "{body}");
+    assert_eq!(list[9]["height"], tip_height - 9, "{body}");
+
+    let (st, body, from_zero) = esplora_json_array(esplora_addr, "/blocks/0").await;
+    assert_eq!(st, 200, "GET /blocks/0: {body}");
+    assert_eq!(from_zero.len(), 1, "{body}");
+    assert_eq!(from_zero[0]["height"], 0, "{body}");
+
+    let (st, body, from_tip) =
+        esplora_json_array(esplora_addr, &format!("/blocks/{tip_height}")).await;
+    assert_eq!(st, 200, "GET /blocks/{{tip}}: {body}");
+    assert_eq!(from_tip.len(), 10, "{body}");
+    assert_eq!(from_tip[0]["height"], tip_height, "{body}");
+    assert_eq!(from_tip[0]["id"], tip_hash, "{body}");
+}
+
+/// B12: `/block/:hash/txs/:start` last page shorter than 25; unknown hash 404.
+async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n_tx: usize) {
+    let (st, body, page0) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/0")).await;
+    assert_eq!(st, 200, "GET /txs/0: {body}");
+    assert_eq!(page0.len(), 25, "first page is 25: {body}");
+
+    let (st, body, last) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/25")).await;
+    assert_eq!(st, 200, "GET /txs/25: {body}");
+    assert_eq!(
+        last.len(),
+        n_tx.saturating_sub(25),
+        "last page shorter than 25: {body}"
+    );
+    assert!(last.len() < 25 && !last.is_empty(), "last page: {body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/1")).await;
+    assert_eq!(st, 400, "start not multiple of 25: {body}");
+    let (st, body) = http_get(esplora_addr, &format!("/block/{}/txs/0", "00".repeat(32))).await;
+    assert_eq!(st, 404, "unknown block txs: {body}");
+}
+
+/// B13: one live `want: blocks` + `track-tx` on this `run_p2p` process.
+async fn spawn_esplora_ws_want_blocks_and_track_tx(
+    esplora_addr: SocketAddr,
+    track_txid: String,
+) -> tokio::task::JoinHandle<(bool, bool)> {
+    tokio::spawn(async move {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        let url = format!("ws://{esplora_addr}/v1/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("esplora ws upgrade");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into()))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(
+            format!(r#"{{"track-tx":"{track_txid}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+        let mut saw = (false, false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !(saw.0 && saw.1) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(Ok(WsMsg::Text(t)))) = tokio::time::timeout(left, ws.next()).await else {
+                break;
+            };
+            let v: Value = serde_json::from_str(t.as_str()).unwrap_or(json!(null));
+            saw.0 |= v["block"]["height"] == 106;
+            saw.1 |= v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true;
+        }
+        saw
+    })
+}
+
 fn encode_tx(tx: &Transaction) -> String {
     let mut raw = Vec::new();
     tx.consensus_encode(&mut raw).unwrap();
@@ -769,6 +978,14 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let fees: Value = serde_json::from_str(&body).unwrap();
     assert!(fees.get("1").is_some(), "{fees}");
 
+    let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
+    let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();
+    pin_waitforblockheight_timeout_zero_behind(rpc_addr, 105, &tip_hash).await;
+    pin_getblock_hash_oob_unknown_and_raw(rpc_addr, 105, &tip_hash).await;
+    let waiters = spawn_wait_and_gbt_longpoll(rpc_addr, 106).await;
+    let ws = spawn_esplora_ws_want_blocks_and_track_tx(esplora_addr, pkg_parent_txid.clone()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert_eq!(
         mined["result"].as_array().map(|a| a.len()),
@@ -780,11 +997,38 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let empty = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     assert_eq!(empty["result"], json!([]), "{empty}");
     let tip = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
+    let new_hash = tip["result"].as_str().expect("new tip");
+    waiters.assert_woke_on_new_tip(new_hash, 106).await;
+    let (saw_block, saw_tx) = tokio::time::timeout(Duration::from_secs(10), ws)
+        .await
+        .expect("esplora ws timed out")
+        .expect("esplora ws join");
+    assert!(saw_block, "ws want:blocks must push the generate tip");
+    assert!(
+        saw_tx,
+        "ws track-tx must confirm {pkg_parent_txid} on generate"
+    );
     let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
     assert!(
         txs.len() >= 30,
         "coinbase + RBF + esplora + packages: {blk}"
+    );
+    pin_esplora_blocks_summaries(esplora_addr, 106, new_hash).await;
+    pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
+    assert!(
+        txs[0]["vin"][0].get("txid").is_some(),
+        "verbosity 2 coinbase vin: {blk}"
+    );
+    assert!(
+        txs[0]["vout"][0].get("value").is_some(),
+        "verbosity 2 coinbase vout: {blk}"
+    );
+    assert!(
+        txs.iter()
+            .skip(1)
+            .any(|t| t["vin"][0].get("txid").is_some()),
+        "verbosity 2 spend vin: {blk}"
     );
     for tid in [
         &high_txid,

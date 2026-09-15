@@ -4675,7 +4675,12 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
             n_block <= MAX_SERVE_BLOCKS,
             "queued {n_block} blocks over cap {MAX_SERVE_BLOCKS}"
         );
+        assert_eq!(hashes.len(), 20);
         assert_eq!(n_block, MAX_SERVE_BLOCKS);
+        assert!(
+            n_block < hashes.len(),
+            "17th getdata hash must not queue a 17th body"
+        );
         assert_eq!(sess.serve_inflight.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
         let _ = std::fs::remove_dir_all(dir);
     });

@@ -18,6 +18,57 @@ before 1.0).
 
 ### Added
 
+- **Genesis+1 IBD + empty headers EOF vs lag:** `two_node_header_and_block_sync`
+  is genesis+1 (8-block dual-seeder stays `ibd_two_peers`). Empty `headers`
+  with lag keeps header sync; drained most-work path latches `headers_done`.
+  Inflight-16 is B7.
+
+- **Serve window 16 vs 17:** inbound `getdata` of 20 witness blocks serves
+  `MAX_SERVE_BLOCKS` (16); the 17th is not queued
+  (`getdata_skips_reconstruct_when_serve_inflight_at_cap`). Compact live pad
+  stays 2-tx / merkle-fail / orphan. Catch-up window guts stay.
+
+- **Feeler silence + inbound eviction rank:** `p2p_feeler_completes_and_closes`
+  still completes VERSION then closes; `run_feeler_timed` on a silent socket
+  is `Timeout`. `p2p_inbound_full_rejects_extra` still refuses the extra
+  follow at `max_inbound=1`; `select_inbound_eviction` 21-cand ranking picks
+  an unprotected slow peer. Inbound/outbound/plain silence and noban guts stay.
+
+- **Same-process body-queue residue:** `serve_after_restart_via_reconstruct`
+  restart RAM queue is empty. Planted leftover then
+  `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads,
+  keeps above-tip wire, unknown height stays queued. `has_block` /
+  known-archived keep and tip+1 gap `missing` stay crate guts.
+
+- **CLI unknown conf key + `--peertimeout=1`:** `node_cli_and_surface_smoke`
+  `--conf` with `unknown_key=1` still `--smoke`s. Conf `minrelaytxfee=-1`
+  and `network=nope` fail start. `--peertimeout=1` smokes; `0` still
+  InitError. Conf parse guts stay.
+
+- **Mempool leftover `slots.tmp`:** `analog_milestone_and_mempool_persist`
+  plants leftover `slots.tmp` after a clean flush; `MempoolHub` open
+  finishes the rename and live count matches. Truncated `tx.body` vs
+  slots refuses (not a silent empty pool). Compact crash guts stay.
+
+- **RPC exact `maxfeerate` / `maxburnamount` + scantxoutset arms:**
+  `sendrawtransaction` at default 0.10 BTC/kvB accepts; one sat over is
+  `max-fee-exceeded`; `maxfeerate=0` still admits the huge-fee tx.
+  `maxburnamount` equal to the OP_RETURN sat accepts; amount−1 rejects.
+  `scantxoutset` `abort` / `status` / empty scanobjects / unknown action.
+
+- **Process Esplora `/blocks` paging + one WS:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  `GET /blocks` is 10 newest; `/blocks/0` is genesis-only; `/blocks/:tip`
+  starts at the tip. `/block/:hash/txs/25` last page is shorter than 25;
+  unknown hash is 404. Same process: WS `want: blocks` and `track-tx`
+  confirm on the pad `generate`. Caps 64 vs 65 stay crate tests.
+
+- **Process wait/longpoll + getblock edges:** `esplora_broadcast_visible_in_rpc_and_electrum`
+  `waitforblockheight` timeout=0 while behind returns the live tip;
+  `waitfornewblock` / `waitforblockheight` and GBT current `longpollid`
+  wake on the pad `generate` (stale id stays immediate). `getblockhash`
+  tip ok / tip+1 is `-8`; unknown `getblock` is `-5`; verbosity 0 is hex
+  and 2 has vin/vout. Wait-on-stop units stay.
+
 - **Connect-path H4/H6 and BIP68 time:** `header_and_spending_boundaries`
   accepts a matching height-1 checkpoint, rejects a mismatch, and
   `validate_header` of a too-easy compact against mainnet `pow_limit` is

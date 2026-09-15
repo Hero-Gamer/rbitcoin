@@ -1,6 +1,6 @@
 //! Multi-node P2P integration tests (all default `cargo test` + coverage).
 //!
-//! Single-hop IBD (8 blocks), cold reconstruct serve (10 blocks), dead-peer
+//! Single-hop IBD (genesis+1), cold reconstruct serve (10 blocks), dead-peer
 //! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
 //! fill, product `run_p2p --blocksonly --connect`. Hard wall timeouts; hang-free on
 //! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
@@ -10,7 +10,10 @@
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
-use rbitcoin_net::{IbdConfig, P2PNode};
+use rbitcoin_net::{
+    rehydrate_block_queue_residue, run_feeler_timed, select_inbound_eviction, IbdConfig,
+    InboundEvictCandidate, NetError, P2PNode,
+};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
@@ -195,7 +198,7 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: serde_json::Value) -> s
         .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}"))
 }
 
-/// Two nodes, seed has 8 blocks, peer syncs tip (tier A — default suite).
+/// Two nodes, seed has genesis+1, peer IBD-syncs the short path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
     let fut = async {
@@ -204,19 +207,19 @@ async fn two_node_header_and_block_sync() {
         let peer_dir = TempDir::new().unwrap();
 
         let seed = start_node(&seed_dir).await;
-        seed_chain(&seed, 8).await;
-        assert_eq!(seed.cache.tip_height(), Some(8));
-        assert_eq!(seed.query.tip_height(), Some(Height(8)));
+        seed_chain(&seed, 1).await;
+        assert_eq!(seed.cache.tip_height(), Some(1));
+        assert_eq!(seed.query.tip_height(), Some(Height(1)));
 
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
-        assert!(n >= 8, "downloaded {n}");
-        peer.wait_height(8, Duration::from_secs(5))
+        assert!(n >= 1, "downloaded {n}");
+        peer.wait_height(1, Duration::from_secs(5))
             .await
             .expect("tip");
 
         // IBD confirm writes Class C tip; RAM BlockCache may stay cold.
-        assert_eq!(peer.query.tip_height(), Some(Height(8)));
+        assert_eq!(peer.query.tip_height(), Some(Height(1)));
         assert_eq!(peer.hub.tip_hash().unwrap(), seed.hub.tip_hash().unwrap());
         let write = peer.query.confirm_stats().last_write_phases();
         assert!(
@@ -1140,6 +1143,67 @@ fn attach_relay_mempool(node: &P2PNode, dir: &TempDir) {
 }
 
 /// Outbound feeler: VERSION completes, then the session closes (no live follow).
+async fn pin_feeler_handshake_timeout_after_silence() {
+    use bitcoin::p2p::Magic;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, peer) = listener.accept().await.unwrap();
+    let _silent = server;
+    match run_feeler_timed(
+        Duration::from_millis(50),
+        client,
+        Magic::REGTEST,
+        addr,
+        peer,
+        0,
+        "/rbitcoin:test/",
+    )
+    .await
+    {
+        Err(NetError::Timeout) => {}
+        Err(e) => panic!("feeler silence must Timeout, got {e}"),
+        Ok(()) => panic!("feeler succeeded on a silent peer"),
+    }
+}
+
+fn pin_select_node_to_evict_ranking() {
+    fn cand(
+        id: u64,
+        connected_at: u64,
+        min_ping: Option<f64>,
+        last_block: u64,
+        last_tx: u64,
+    ) -> InboundEvictCandidate {
+        InboundEvictCandidate {
+            id,
+            connected_at,
+            min_ping,
+            last_block,
+            last_tx,
+            netgroup: 1,
+            noban: false,
+        }
+    }
+    let mut cands = Vec::new();
+    for i in 0..4 {
+        cands.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
+    }
+    for i in 4..9 {
+        cands.push(cand(i, 200 + i, Some(0.5), 0, 0));
+    }
+    for i in 9..13 {
+        cands.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
+    }
+    for i in 13..21 {
+        cands.push(cand(i, 400 + i, Some(0.01), 0, 0));
+    }
+    let victim = select_inbound_eviction(cands).expect("one unprotected slow");
+    assert!((4..9).contains(&victim), "victim={victim}");
+}
+
 #[tokio::test]
 async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
@@ -1189,6 +1253,7 @@ async fn p2p_feeler_completes_and_closes() {
             "feeler must not leave a completed inbound on the dummy: {:?}",
             dummy.peers.snapshot()
         );
+        pin_feeler_handshake_timeout_after_silence().await;
 
         seed.shutdown().await;
         dummy.shutdown().await;
@@ -1203,6 +1268,7 @@ async fn p2p_feeler_completes_and_closes() {
 async fn p2p_inbound_full_rejects_extra() {
     let fut = async {
         let _live = live_p2p_lock().await;
+        pin_select_node_to_evict_ranking();
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
@@ -1295,6 +1361,7 @@ async fn serve_after_restart_via_reconstruct() {
             "restarted seeder must not rely on warm RAM cache"
         );
         assert_eq!(seed.query.tip_height(), Some(Height(10)));
+        pin_restart_empty_and_same_process_bq_residue(&seed);
 
         let peer = start_node(&peer_dir).await;
         let n = sync_ibd(&peer, seed.local_addr).await;
@@ -1337,6 +1404,56 @@ async fn serve_after_restart_via_reconstruct() {
     tokio::time::timeout(wall, fut)
         .await
         .unwrap_or_else(|_| panic!("serve_after_restart_via_reconstruct wall timeout ({wall:?})"));
+}
+
+fn pin_restart_empty_and_same_process_bq_residue(seed: &P2PNode) {
+    assert_eq!(
+        seed.query.block_queue_count(),
+        0,
+        "restart RAM body queue is empty"
+    );
+    let tip = seed.hub.tip_height().expect("seed tip");
+    let below = tip.saturating_sub(1);
+    let below_hash = seed
+        .query
+        .header_at_height(Height(below))
+        .unwrap()
+        .expect("below-tip header")
+        .1
+        .hash;
+    seed.query
+        .block_queue_offer(below, below_hash, 0, b"stale")
+        .unwrap();
+    seed.query
+        .block_queue_offer(tip + 1, [0xAB; 32], 0, b"")
+        .unwrap();
+    seed.query
+        .block_queue_offer(tip + 2, [0xCD; 32], 0, b"wire")
+        .unwrap();
+    seed.query
+        .block_queue_offer(u32::MAX, [0x11; 32], 0, b"unk")
+        .unwrap();
+
+    let n = rehydrate_block_queue_residue(&seed.hub).expect("same-process rehydrate");
+    assert_eq!(n, 1, "only above-tip wire is ready");
+    assert!(
+        !seed.query.block_queue_has_height(below),
+        "drop at/below tip"
+    );
+    assert!(
+        !seed.query.block_queue_has_height(tip + 1),
+        "empty payload skip"
+    );
+    assert!(
+        seed.query.block_queue_has_height(tip + 2),
+        "keep above-tip wire"
+    );
+    assert!(
+        seed.query.block_queue_has_height(u32::MAX),
+        "unknown height stays queued"
+    );
+    let _ = seed.query.block_queue_dequeue_height(tip + 2);
+    let _ = seed.query.block_queue_dequeue_height(u32::MAX);
 }
 
 /// Mid-node serve after IBD: leaf syncs from mid, not the original seeder.

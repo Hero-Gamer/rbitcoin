@@ -109,7 +109,7 @@ const MAX_PENDING_HEADERS: usize = 8_000;
 const MAX_PENDING_BLOCKS: usize = 128;
 /// Max reconstructed full bodies queued on one session writer, and the
 /// matching catch-up `getdata` window (extra hashes stick in `requested`).
-pub(crate) const MAX_SERVE_BLOCKS: usize = 16;
+pub const MAX_SERVE_BLOCKS: usize = 16;
 /// Drop inflight `getdata` hashes that the peer never sent so catch-up can
 /// ask again. `sync_blocks` is 60s; 120s headers poll is too late.
 pub(crate) const BLOCK_GETDATA_TIMEOUT: Duration = Duration::from_secs(10);
@@ -647,7 +647,8 @@ pub async fn run_feeler(
     .await
 }
 
-pub(crate) async fn run_feeler_timed(
+/// Feeler handshake with an explicit timeout (production uses [`HANDSHAKE_TIMEOUT`]).
+pub async fn run_feeler_timed(
     limit: Duration,
     stream: TcpStream,
     magic: Magic,
