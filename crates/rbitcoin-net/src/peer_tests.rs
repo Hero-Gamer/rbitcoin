@@ -7022,3 +7022,28 @@ fn prefillcompact_announce_and_getdata_follow_knob() {
         let _ = std::fs::remove_dir_all(dir);
     });
 }
+
+#[test]
+fn on_tx_announce_none_lagged_closed_are_ok() {
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("tx-ann-empty");
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let follow = PeerFollowState::new();
+    assert!(on_tx_announce(&hub, &out_tx, &follow, None, None).is_ok());
+    assert!(on_tx_announce(
+        &hub,
+        &out_tx,
+        &follow,
+        None,
+        Some(Err(broadcast::error::RecvError::Lagged(1))),
+    )
+    .is_ok());
+    assert!(on_tx_announce(
+        &hub,
+        &out_tx,
+        &follow,
+        None,
+        Some(Err(broadcast::error::RecvError::Closed)),
+    )
+    .is_ok());
+    let _ = std::fs::remove_dir_all(dir);
+}

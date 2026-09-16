@@ -852,19 +852,7 @@ where
     let req = match crate::tweaks::parse_req(params_v) {
         Ok(r) => r,
         Err(e) => {
-            rbitcoin_log::api_call(
-                "electrum",
-                &peer.to_string(),
-                "blockchain.tweaks.subscribe",
-                &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
-                0,
-                Some(&e),
-            );
-            write_line(
-                writer,
-                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
-            )
-            .await?;
+            tweaks_sub_err(writer, peer, &id, params_v, 0, &e).await?;
             return Ok(());
         }
     };
@@ -872,72 +860,32 @@ where
     let last = crate::tweaks::last_height(req.start, req.count, tip);
     let t0 = Instant::now();
     let Some(last) = last else {
-        let first = match crate::tweaks::height_map_json(
-            query,
-            chain,
-            req.start,
-            !req.historical,
-            min_dust,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                rbitcoin_log::api_call(
-                    "electrum",
-                    &peer.to_string(),
-                    "blockchain.tweaks.subscribe",
-                    &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
-                    t0.elapsed().as_millis() as u64,
-                    Some(&e),
-                );
-                write_line(
-                    writer,
-                    &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let wall_ms = t0.elapsed().as_millis() as u64;
-        meter_dispatch_wall(t0.elapsed().as_micros() as u64);
-        rbitcoin_log::api_call(
-            "electrum",
-            &peer.to_string(),
-            "blockchain.tweaks.subscribe",
-            &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
-            wall_ms,
-            None,
-        );
-        write_rpc_result(writer, &id, &first).await?;
-        write_line(writer, &crate::tweaks::done_notify()).await?;
-        return Ok(());
+        return serve_tweaks_empty_last(
+            writer, query, chain, peer, &id, params_v, req, t0, min_dust,
+        )
+        .await;
     };
     let limits = crate::tweaks::subscribe_serve_limits(req.historical);
-    let wave_fut = {
-        let q = Arc::clone(query);
-        let c = Arc::clone(chain);
-        let start_h = req.start;
-        async move {
-            tokio::task::spawn_blocking(move || {
-                crate::tweaks::first_subscribe_wave(&q, &c, start_h, last, limits, min_dust)
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()))
-        }
+    let q = Arc::clone(query);
+    let c = Arc::clone(chain);
+    let start_h = req.start;
+    let wave_fut = async move {
+        tokio::task::spawn_blocking(move || {
+            crate::tweaks::first_subscribe_wave(&q, &c, start_h, last, limits, min_dust)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
     };
     let wave = match wave_fut.await {
         Ok(v) => v,
         Err(e) => {
-            rbitcoin_log::api_call(
-                "electrum",
-                &peer.to_string(),
-                "blockchain.tweaks.subscribe",
-                &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
-                t0.elapsed().as_millis() as u64,
-                Some(&e),
-            );
-            write_line(
+            tweaks_sub_err(
                 writer,
-                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+                peer,
+                &id,
+                params_v,
+                t0.elapsed().as_millis() as u64,
+                &e,
             )
             .await?;
             return Ok(());
@@ -945,6 +893,47 @@ where
     };
     let wall_ms = t0.elapsed().as_millis() as u64;
     meter_dispatch_wall(t0.elapsed().as_micros() as u64);
+    tweaks_sub_ok_log(peer, params_v, wall_ms);
+    write_rpc_result(writer, &id, &wave.result_json).await?;
+    write_raw_lines(writer, &wave.rest_notifies).await?;
+    let mut next = req.start.saturating_add(wave.consumed.max(1));
+    let limits = crate::tweaks::subscribe_serve_limits(req.historical);
+    let more = next <= last;
+    if more && !crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
+        serve_tweaks_follow_waves(
+            reader, writer, query, chain, peer, last, limits, min_dust, idle, max_line, chunk, t0,
+            &mut next,
+        )
+        .await?;
+    }
+    write_line(writer, &crate::tweaks::done_notify()).await?;
+    Ok(())
+}
+
+async fn tweaks_sub_err<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    peer: &SocketAddr,
+    id: &Value,
+    params_v: &Value,
+    wall_ms: u64,
+    e: &str,
+) -> Result<(), std::io::Error> {
+    rbitcoin_log::api_call(
+        "electrum",
+        &peer.to_string(),
+        "blockchain.tweaks.subscribe",
+        &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+        wall_ms,
+        Some(e),
+    );
+    write_line(
+        writer,
+        &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+    )
+    .await
+}
+
+fn tweaks_sub_ok_log(peer: &SocketAddr, params_v: &Value, wall_ms: u64) {
     rbitcoin_log::api_call(
         "electrum",
         &peer.to_string(),
@@ -953,95 +942,160 @@ where
         wall_ms,
         None,
     );
-    write_rpc_result(writer, &id, &wave.result_json).await?;
-    write_raw_lines(writer, &wave.rest_notifies).await?;
+}
 
-    // Remaining heights after wave 0. Pre-taproot empty waves (no store), else
-    // budgeted thin load then per-height notifies. Hole → one height.
-    // `server.ping` must not drop the in-flight wave.
-    // Cake electrs caps count at 1000 then done; we seal at a wave boundary
-    // after `chunk` wall so Cake resubscribes. Wave 0 always completed above.
-    let mut next = req.start.saturating_add(wave.consumed.max(1));
-    let limits = crate::tweaks::subscribe_serve_limits(req.historical);
-    let more = next <= last;
-    if more && !crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
-        let spawn_wave = |batch_start: u32| {
-            let q = Arc::clone(query);
-            let c = Arc::clone(chain);
-            let lim = limits;
-            let last_h = last;
-            tokio::task::spawn_blocking(move || {
-                crate::tweaks::remaining_notify_lines(&q, &c, batch_start, last_h, lim, min_dust)
-            })
+#[allow(clippy::too_many_arguments)]
+async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    peer: &SocketAddr,
+    id: &Value,
+    params_v: &Value,
+    req: crate::tweaks::TweakReq,
+    t0: Instant,
+    min_dust: u64,
+) -> Result<(), std::io::Error> {
+    let first =
+        match crate::tweaks::height_map_json(query, chain, req.start, !req.historical, min_dust) {
+            Ok(v) => v,
+            Err(e) => {
+                tweaks_sub_err(
+                    writer,
+                    peer,
+                    id,
+                    params_v,
+                    t0.elapsed().as_millis() as u64,
+                    &e,
+                )
+                .await?;
+                return Ok(());
+            }
         };
-        let mut batch_start = next;
-        let mut handle = spawn_wave(batch_start);
-        loop {
-            let batch = loop {
-                tokio::select! {
-                    biased;
-                    line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
-                        match line {
-                            Ok(Ok(Some(l))) => {
-                                if !l.trim().is_empty() {
-                                    if let Ok(req) = serde_json::from_str::<Value>(&l) {
-                                        let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
-                                        if req.get("method").and_then(|m| m.as_str()) == Some("server.ping")
-                                        {
-                                            write_line(
-                                                writer,
-                                                &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                            Ok(Ok(None)) => return Ok(()),
-                            Ok(Err(e)) => return Err(e),
-                            Err(_) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "idle timeout",
-                                ));
+    let wall_ms = t0.elapsed().as_millis() as u64;
+    meter_dispatch_wall(t0.elapsed().as_micros() as u64);
+    tweaks_sub_ok_log(peer, params_v, wall_ms);
+    write_rpc_result(writer, id, &first).await?;
+    write_line(writer, &crate::tweaks::done_notify()).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_tweaks_follow_waves<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    peer: &SocketAddr,
+    last: u32,
+    limits: rbitcoin_query::ThinTweakRangeLimits,
+    min_dust: u64,
+    idle: Duration,
+    max_line: usize,
+    chunk: Duration,
+    t0: Instant,
+    next: &mut u32,
+) -> Result<(), std::io::Error>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let spawn_wave = |batch_start: u32| {
+        let q = Arc::clone(query);
+        let c = Arc::clone(chain);
+        let lim = limits;
+        let last_h = last;
+        tokio::task::spawn_blocking(move || {
+            crate::tweaks::remaining_notify_lines(&q, &c, batch_start, last_h, lim, min_dust)
+        })
+    };
+    let mut batch_start = *next;
+    let mut handle = spawn_wave(batch_start);
+    loop {
+        let batch = loop {
+            match tweaks_wait_wave_or_ping(reader, writer, idle, max_line, &mut handle).await? {
+                TweaksWait::Wave(map) => break map,
+                TweaksWait::Continue => continue,
+                TweaksWait::Eof => return Ok(()),
+            }
+        };
+        let batch = match batch {
+            Ok(v) => v,
+            Err(e) => {
+                rbitcoin_log::api_call(
+                    "electrum",
+                    &peer.to_string(),
+                    "blockchain.tweaks.subscribe",
+                    &format!("[{batch_start},batch]"),
+                    0,
+                    Some(&e),
+                );
+                break;
+            }
+        };
+        let n = batch.consumed.max(1);
+        *next = batch_start.saturating_add(n);
+        let more = *next <= last;
+        if more && !crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
+            handle = spawn_wave(*next);
+        }
+        write_raw_lines(writer, &batch.lines).await?;
+        if !more || crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
+            break;
+        }
+        batch_start = *next;
+    }
+    Ok(())
+}
+
+enum TweaksWait {
+    Wave(Result<crate::tweaks::NotifyWave, String>),
+    Continue,
+    Eof,
+}
+
+async fn tweaks_wait_wave_or_ping<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle: Duration,
+    max_line: usize,
+    handle: &mut tokio::task::JoinHandle<Result<crate::tweaks::NotifyWave, String>>,
+) -> Result<TweaksWait, std::io::Error>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
+            match line {
+                Ok(Ok(Some(l))) => {
+                    if !l.trim().is_empty() {
+                        if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                            let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
+                            if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
+                                write_line(
+                                    writer,
+                                    &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
+                                )
+                                .await?;
                             }
                         }
                     }
-                    map = &mut handle => {
-                        break map.unwrap_or_else(|e| Err(e.to_string()));
-                    }
+                    Ok(TweaksWait::Continue)
                 }
-            };
-            let batch = match batch {
-                Ok(v) => v,
-                Err(e) => {
-                    rbitcoin_log::api_call(
-                        "electrum",
-                        &peer.to_string(),
-                        "blockchain.tweaks.subscribe",
-                        &format!("[{batch_start},batch]"),
-                        0,
-                        Some(&e),
-                    );
-                    break;
-                }
-            };
-            let n = batch.consumed.max(1);
-            next = batch_start.saturating_add(n);
-            let more = next <= last;
-            if more && !crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
-                handle = spawn_wave(next);
+                Ok(Ok(None)) => Ok(TweaksWait::Eof),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "idle timeout",
+                )),
             }
-            write_raw_lines(writer, &batch.lines).await?;
-            if !more || crate::tweaks::seal_subscribe_chunk(t0.elapsed(), chunk, more) {
-                break;
-            }
-            batch_start = next;
+        }
+        map = &mut *handle => {
+            Ok(TweaksWait::Wave(map.unwrap_or_else(|e| Err(e.to_string()))))
         }
     }
-    write_line(writer, &crate::tweaks::done_notify()).await?;
-    Ok(())
 }
 
 async fn write_line<W: AsyncWrite + Unpin>(

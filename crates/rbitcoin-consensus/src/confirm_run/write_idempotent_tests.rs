@@ -421,6 +421,15 @@ fn drive_script_waves_start_fail_keeps_meta_and_continues() {
     assert_eq!(&*oks, &[20], "later batch still written");
 }
 
+/// `should_stop` at loop top must not block on recv.
+#[test]
+fn drive_script_waves_should_stop_skips_recv() {
+    use super::scripts::drive_script_waves_with;
+    use std::sync::mpsc;
+    let (_tx, rx) = mpsc::sync_channel::<(super::LoadedBatch, u64)>(1);
+    drive_script_waves_with(&rx, |_, _| {}, |_, _| true, |_, _, _| true, || true);
+}
+
 /// Drained job vecs must drop capacity before write handoff.
 #[test]
 fn script_jobs_shrink_after_take() {

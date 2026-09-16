@@ -36,6 +36,13 @@ before 1.0).
   `stamp_external_parents` already bound body+spent. `fill_missing_n` counts
   actual loc batches, not empty walks.
 
+- **CRAP chew (P2P/IBD/scripts/tweaks):** drop allowlist entries for
+  `on_block`, `on_blocktxn`, `on_tx_announce`, `need_any_valid_body_download`,
+  `plant_valid_tip_child`, `rehydrate_class_a_into_body_queue`,
+  `drive_script_waves_with`, and `serve_tweaks_subscribe` after extracts
+  (block/cmpct accept, announce fee-gate, IBD need/plant/rehydrate, script
+  wave start/drain, tweaks subscribe waves).
+
 - **CRAP chew (confirm/chain/peer):** drop allowlist entries for
   `handle_peer_frame`, `ChainHub::accept_branch_inner`,
   `Query::resume_work_path_after_tip_excluding`, `assemble_block_prevouts`,

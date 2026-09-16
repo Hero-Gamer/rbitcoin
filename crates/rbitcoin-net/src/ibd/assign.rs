@@ -33,6 +33,7 @@ use super::{
     TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS,
 };
 use crate::chain::ChainHub;
+use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
@@ -53,7 +54,6 @@ pub(crate) fn download_gate_closed(st: &IbdWorkState, hub: &ChainHub) -> bool {
 }
 
 fn need_any_valid_body_download(st: &IbdWorkState, hub: &ChainHub) -> bool {
-    use bitcoin::hashes::Hash as _;
     let tip = hub.tip_height().unwrap_or(0);
     let path_lo = if hub.tip_height().is_none() {
         0u32
@@ -63,30 +63,51 @@ fn need_any_valid_body_download(st: &IbdWorkState, hub: &ChainHub) -> bool {
     let occupant_dead = st
         .height_to_hash
         .get(&path_lo)
-        .is_some_and(|h| st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(h));
-    for (&h, &ht) in &st.hash_height {
-        if ht != path_lo {
-            continue;
-        }
-        if st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(&h) {
-            continue;
-        }
-        if hub.has_block(&h)
-            || st.body.is_known_archived(&h)
-            || hub.query.block_queue_has_hash(&h.to_byte_array())
-        {
-            continue;
-        }
+        .is_some_and(|h| need_body_dead(st, h));
+    if need_path_lo_alt(st, hub, path_lo) {
         return true;
     }
     if occupant_dead {
         return false;
     }
+    if need_contig_ahead(st, hub, path_lo) {
+        return true;
+    }
+    need_reorg_getdata(st, hub)
+}
+
+fn need_body_dead(st: &IbdWorkState, h: &BlockHash) -> bool {
+    st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(h)
+}
+
+fn need_body_in_hand(st: &IbdWorkState, hub: &ChainHub, h: &BlockHash) -> bool {
+    hub.has_block(h)
+        || st.body.is_known_archived(h)
+        || hub.query.block_queue_has_hash(&h.to_byte_array())
+}
+
+fn need_path_lo_alt(st: &IbdWorkState, hub: &ChainHub, path_lo: u32) -> bool {
+    for (&h, &ht) in &st.hash_height {
+        if ht != path_lo {
+            continue;
+        }
+        if need_body_dead(st, &h) {
+            continue;
+        }
+        if need_body_in_hand(st, hub, &h) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn need_contig_ahead(st: &IbdWorkState, hub: &ChainHub, path_lo: u32) -> bool {
     for ht in path_lo..=path_lo.saturating_add(CONTIG_DENSIFY_AHEAD) {
         let Some(&h) = st.height_to_hash.get(&ht) else {
             break;
         };
-        if st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(&h) {
+        if need_body_dead(st, &h) {
             continue;
         }
         if hub.has_block(&h) {
@@ -97,8 +118,12 @@ fn need_any_valid_body_download(st: &IbdWorkState, hub: &ChainHub) -> bool {
         }
         return true;
     }
+    false
+}
+
+fn need_reorg_getdata(st: &IbdWorkState, hub: &ChainHub) -> bool {
     for h in st.reorg.need_getdata() {
-        if st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(&h) {
+        if need_body_dead(st, &h) {
             continue;
         }
         if hub.has_block(&h) || hub.query.block_queue_has_hash(&h.to_byte_array()) {
@@ -1145,6 +1170,27 @@ mod tests {
         assert!(Query::lookup_taken_covers(4, Some(5)));
         assert!(!Query::lookup_taken_covers(6, Some(5)));
         assert!(Query::lookup_taken_covers(0, Some(0)));
+    }
+
+    #[test]
+    fn need_any_valid_body_download_empty_and_missing_tip_child() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        assert!(
+            !need_any_valid_body_download(&st, &hub),
+            "genesis-only path has no body download"
+        );
+        let want = h(0x21);
+        let ht = hub.tip_height().unwrap_or(0).saturating_add(1);
+        st.record_height(want, ht);
+        st.height_to_hash.insert(ht, want);
+        st.body.mark_missing(want);
+        assert!(
+            need_any_valid_body_download(&st, &hub),
+            "missing tip+1 must keep download open"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

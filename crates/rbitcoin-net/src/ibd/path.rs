@@ -134,9 +134,17 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
 
 /// If tip+1 is missing or invalid, plant a known valid sibling/child of tip.
 pub(crate) fn plant_valid_tip_child(st: &mut IbdWorkState, hub: &ChainHub) {
-    let Some(tip_hash) = hub.tip_hash() else {
+    let Some((child, expect, tip_hash)) = plant_find_valid_child(st, hub) else {
         return;
     };
+    plant_extend_from_child(st, hub, child, expect, tip_hash);
+}
+
+fn plant_find_valid_child(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+) -> Option<(BlockHash, u32, BlockHash)> {
+    let tip_hash = hub.tip_hash()?;
     let tip_h = hub.tip_height().unwrap_or(0);
     let expect = if hub.tip_height().is_none() {
         0u32
@@ -145,10 +153,9 @@ pub(crate) fn plant_valid_tip_child(st: &mut IbdWorkState, hub: &ChainHub) {
     };
     if let Some(&cur) = st.height_to_hash.get(&expect) {
         if !st.reorg.invalid.contains(cur.to_byte_array()) && !st.body.is_rejected(&cur) {
-            return;
+            return None;
         }
     }
-    let mut child: Option<BlockHash> = None;
     for (&h, &ht) in &st.hash_height {
         if ht != expect {
             continue;
@@ -162,12 +169,18 @@ pub(crate) fn plant_valid_tip_child(st: &mut IbdWorkState, hub: &ChainHub) {
         if prev != tip_hash {
             continue;
         }
-        child = Some(h);
-        break;
+        return Some((h, expect, tip_hash));
     }
-    let Some(child) = child else {
-        return;
-    };
+    None
+}
+
+fn plant_extend_from_child(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    child: BlockHash,
+    expect: u32,
+    tip_hash: BlockHash,
+) {
     let tip = hub.tip_height().zip(hub.tip_hash());
     let mut prev = tip_hash;
     let mut cur = child;
@@ -304,6 +317,16 @@ mod tests {
         // Empty everything → empty tips.
         let empty = IbdWorkState::new(Vec::new(), None, None);
         assert!(work_path_tips(&empty).is_empty());
+    }
+
+    #[test]
+    fn plant_valid_tip_child_no_tip_is_noop() {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("plant-none");
+        let mut st = IbdWorkState::new(Vec::new(), None, None);
+        super::plant_valid_tip_child(&mut st, &hub);
+        assert!(st.ordered.is_empty());
+        assert!(st.height_to_hash.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

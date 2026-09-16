@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 /// In-flight waves the stage thread will publish while steal is empty.
 /// Matches `scriptq` cap so load→scripts retain stays bounded.
@@ -135,80 +136,136 @@ pub fn drive_script_waves_with(
     set_script_publisher(Some(thread::current()));
     let _clear = ClearPublisher;
     let mut inflight: VecDeque<Inflight> = VecDeque::new();
-    fn drop_tail(inflight: &mut VecDeque<Inflight>) -> Vec<ScriptsBatchMeta> {
-        let mut dropped = Vec::with_capacity(inflight.len());
-        while let Some(rest) = inflight.pop_front() {
-            dropped.push(rest.meta.clone());
-            let _ = rest.finish();
-        }
-        dropped
-    }
     loop {
         if should_stop() {
             break;
         }
-        while inflight.front().is_some_and(Inflight::is_complete) {
-            let front = inflight.pop_front().expect("front");
-            let meta_err = front.meta.clone();
-            match front.finish() {
-                Ok((ok, meta)) => {
-                    if !on_ok(ok, meta) {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let dropped = drop_tail(&mut inflight);
-                    if !on_err(e, meta_err, &dropped) {
-                        return;
-                    }
-                }
-            }
+        if drive_drain_complete(&mut inflight, &mut on_ok, &mut on_err) {
+            return;
         }
-        if !fg_has_unclaimed() && inflight.len() < SCRIPT_WAVES_MAX {
-            let t_recv = Instant::now();
-            match mat_rx.try_recv() {
-                Ok((batch, mat_ns)) => {
-                    on_take(&batch, t_recv.elapsed());
-                    match Inflight::start(batch, mat_ns) {
-                        Ok(f) => inflight.push_back(f),
-                        Err((e, meta)) => {
-                            if !on_err(e, meta, &[]) {
-                                return;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if inflight.is_empty() {
-                        break;
-                    }
-                }
-            }
+        match drive_try_start(&mut inflight, mat_rx, &mut on_take, &mut on_err) {
+            DriveStart::Continue => continue,
+            DriveStart::Abort => return,
+            DriveStart::Stop => break,
+            DriveStart::Idle => {}
         }
         if inflight.is_empty() {
-            let t_recv = Instant::now();
-            match mat_rx.recv() {
-                Ok((batch, mat_ns)) => {
-                    on_take(&batch, t_recv.elapsed());
-                    match Inflight::start(batch, mat_ns) {
-                        Ok(f) => inflight.push_back(f),
-                        Err((e, meta)) => {
-                            if !on_err(e, meta, &[]) {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(_) => break,
+            match drive_blocking_start(&mut inflight, mat_rx, &mut on_take, &mut on_err) {
+                DriveStart::Continue => continue,
+                DriveStart::Abort | DriveStart::Stop | DriveStart::Idle => break,
             }
-            continue;
         }
         if help_steal() {
             continue;
         }
         thread::park_timeout(Duration::from_millis(1));
+    }
+}
+
+enum DriveStart {
+    Continue,
+    Idle,
+    Stop,
+    Abort,
+}
+
+fn drop_inflight_tail(inflight: &mut VecDeque<Inflight>) -> Vec<ScriptsBatchMeta> {
+    let mut dropped = Vec::with_capacity(inflight.len());
+    while let Some(rest) = inflight.pop_front() {
+        dropped.push(rest.meta.clone());
+        let _ = rest.finish();
+    }
+    dropped
+}
+
+fn drive_drain_complete(
+    inflight: &mut VecDeque<Inflight>,
+    on_ok: &mut impl FnMut(ConfirmScriptOutcome, ScriptsBatchMeta) -> bool,
+    on_err: &mut impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
+) -> bool {
+    while inflight.front().is_some_and(Inflight::is_complete) {
+        let front = inflight.pop_front().expect("front");
+        let meta_err = front.meta.clone();
+        match front.finish() {
+            Ok((ok, meta)) => {
+                if !on_ok(ok, meta) {
+                    return true;
+                }
+            }
+            Err(e) => {
+                let dropped = drop_inflight_tail(inflight);
+                if !on_err(e, meta_err, &dropped) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn drive_try_start(
+    inflight: &mut VecDeque<Inflight>,
+    mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
+    on_take: &mut impl FnMut(&LoadedBatch, Duration),
+    on_err: &mut impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
+) -> DriveStart {
+    if fg_has_unclaimed() || inflight.len() >= SCRIPT_WAVES_MAX {
+        return DriveStart::Idle;
+    }
+    let t_recv = Instant::now();
+    match mat_rx.try_recv() {
+        Ok((batch, mat_ns)) => {
+            on_take(&batch, t_recv.elapsed());
+            match Inflight::start(batch, mat_ns) {
+                Ok(f) => {
+                    inflight.push_back(f);
+                    DriveStart::Continue
+                }
+                Err((e, meta)) => {
+                    if on_err(e, meta, &[]) {
+                        DriveStart::Continue
+                    } else {
+                        DriveStart::Abort
+                    }
+                }
+            }
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => DriveStart::Idle,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            if inflight.is_empty() {
+                DriveStart::Stop
+            } else {
+                DriveStart::Idle
+            }
+        }
+    }
+}
+
+fn drive_blocking_start(
+    inflight: &mut VecDeque<Inflight>,
+    mat_rx: &std::sync::mpsc::Receiver<(LoadedBatch, u64)>,
+    on_take: &mut impl FnMut(&LoadedBatch, Duration),
+    on_err: &mut impl FnMut(ConsensusError, ScriptsBatchMeta, &[ScriptsBatchMeta]) -> bool,
+) -> DriveStart {
+    let t_recv = Instant::now();
+    match mat_rx.recv() {
+        Ok((batch, mat_ns)) => {
+            on_take(&batch, t_recv.elapsed());
+            match Inflight::start(batch, mat_ns) {
+                Ok(f) => {
+                    inflight.push_back(f);
+                    DriveStart::Continue
+                }
+                Err((e, meta)) => {
+                    if on_err(e, meta, &[]) {
+                        DriveStart::Continue
+                    } else {
+                        DriveStart::Stop
+                    }
+                }
+            }
+        }
+        Err(_) => DriveStart::Stop,
     }
 }
 
