@@ -40,6 +40,96 @@ pub(super) fn write_batch_vs_tip(
     }
 }
 
+fn finish_already_committed_write(
+    query: &Query,
+    batch: &ScriptOkBatch,
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    let items: Vec<(u32, [u8; 32])> = batch
+        .prepared
+        .iter()
+        .map(|p| (p.height.0, p.hash))
+        .collect();
+    finish_post_commit_hashes(query, &items)?;
+    if let Some(h) = items.iter().map(|(h, _)| *h).max() {
+        query.prune_write_create_loc(h);
+    }
+    Ok(Vec::new())
+}
+
+struct ArchivePlanNs {
+    pins: FkMap<rbitcoin_query::CreatePin>,
+    class_a_ns: u64,
+    ensure_ns: u64,
+    plan_take_ns: u64,
+    create_map_ns: u64,
+}
+
+fn apply_archive_plan(
+    query: &Query,
+    batch: &mut ScriptOkBatch,
+) -> Result<ArchivePlanNs, ConsensusError> {
+    let mut ns = ArchivePlanNs {
+        pins: FkMap::default(),
+        class_a_ns: 0,
+        ensure_ns: 0,
+        plan_take_ns: 0,
+        create_map_ns: 0,
+    };
+    let Some(mut plan) = batch.archive_plan.take() else {
+        return Ok(ns);
+    };
+    if plan.is_empty() {
+        return Ok(ns);
+    }
+    let blocks: Vec<&Block> = batch.wire_blocks.iter().map(|b| b.as_ref()).collect();
+    plan.fill_packed_ins_from_blocks(&blocks)
+        .map_err(ConsensusError::from)?;
+    let t_take = Instant::now();
+    let planned_fks = plan.planned_fks.clone();
+    let packed_pins: Vec<rbitcoin_query::CreatePin> =
+        if plan.batch_pin.len() == plan.planned_fks.len() {
+            std::mem::take(&mut plan.batch_pin)
+        } else {
+            plan.packed
+                .iter()
+                .map(|(pin, _)| std::sync::Arc::clone(pin))
+                .collect()
+        };
+    ns.plan_take_ns = t_take.elapsed().as_nanos() as u64;
+    let t_ca = Instant::now();
+    let (committed, loc) = query
+        .archive_commit_plan_defer_head(plan)
+        .map_err(ConsensusError::from)?;
+    ns.class_a_ns = t_ca.elapsed().as_nanos() as u64;
+    if !committed {
+        return Ok(ns);
+    }
+    let pack_hi = batch.prepared.last().map(|p| p.height.0).unwrap_or(0);
+    query.note_write_create_loc(&planned_fks, &loc, pack_hi);
+    if query.index_mode().is_tip() {
+        let t_map = Instant::now();
+        ns.pins.reserve(planned_fks.len());
+        for (fk, pin) in planned_fks.iter().zip(packed_pins.iter()) {
+            ns.pins.insert(*fk, std::sync::Arc::clone(pin));
+        }
+        ns.create_map_ns = t_map.elapsed().as_nanos() as u64;
+    }
+    let t_ens = Instant::now();
+    fill_planned_create_layout_after_commit(
+        query,
+        &mut batch.batch_parents,
+        &planned_fks,
+        &loc,
+        &packed_pins,
+        &batch.prepared,
+    )?;
+    ns.ensure_ns = t_ens.elapsed().as_nanos() as u64;
+    if let Some(last) = batch.prepared.last() {
+        query.set_class_a_hi(Some(last.height.0));
+    }
+    Ok(ns)
+}
+
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
 /// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
 ///
@@ -57,18 +147,7 @@ pub fn confirm_write_phase(
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     let tip = query.tip_height().map(|h| h.0);
     match write_batch_vs_tip(tip, batch.prepared.iter().map(|p| p.height.0)) {
-        WriteBatchVsTip::AllOld => {
-            let items: Vec<(u32, [u8; 32])> = batch
-                .prepared
-                .iter()
-                .map(|p| (p.height.0, p.hash))
-                .collect();
-            finish_post_commit_hashes(query, &items)?;
-            if let Some(h) = items.iter().map(|(h, _)| *h).max() {
-                query.prune_write_create_loc(h);
-            }
-            return Ok(Vec::new());
-        }
+        WriteBatchVsTip::AllOld => return finish_already_committed_write(query, &batch),
         WriteBatchVsTip::SpansTip => {
             return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
                 "invariant: write batch spans tip",
@@ -79,65 +158,13 @@ pub fn confirm_write_phase(
 
     let t_wall = Instant::now();
 
-    // Keep create pins for SH collect (Class C) — same Arcs as layout fill; avoid
-    // re-preading Class A bodies under RES=0 when residency is empty.
-    let mut write_create_pins: FkMap<rbitcoin_query::CreatePin> = FkMap::default();
-    let mut class_a_ns = 0u64;
-    let mut ensure_ns = 0u64;
-    let mut plan_take_ns = 0u64;
-    let mut create_map_ns = 0u64;
-    if let Some(mut plan) = batch.archive_plan.take() {
-        if !plan.is_empty() {
-            let blocks: Vec<&Block> = batch.wire_blocks.iter().map(|b| b.as_ref()).collect();
-            plan.fill_packed_ins_from_blocks(&blocks)
-                .map_err(ConsensusError::from)?;
-            let t_take = Instant::now();
-            let planned_fks = plan.planned_fks.clone();
-            let packed_pins: Vec<rbitcoin_query::CreatePin> =
-                if plan.batch_pin.len() == plan.planned_fks.len() {
-                    std::mem::take(&mut plan.batch_pin)
-                } else {
-                    plan.packed
-                        .iter()
-                        .map(|(pin, _)| std::sync::Arc::clone(pin))
-                        .collect()
-                };
-            plan_take_ns = t_take.elapsed().as_nanos() as u64;
-            let t_ca = Instant::now();
-            let (committed, loc) = query
-                .archive_commit_plan_defer_head(plan)
-                .map_err(ConsensusError::from)?;
-            class_a_ns = t_ca.elapsed().as_nanos() as u64;
-            // Layout from append RAM. Idempotent skip (Class A already present)
-            // must already have lookup stamps — missing abs is Corrupt.
-            // Direct SH collect is a no-op — skip the FkMap.
-            if committed {
-                let pack_hi = batch.prepared.last().map(|p| p.height.0).unwrap_or(0);
-                query.note_write_create_loc(&planned_fks, &loc, pack_hi);
-                if query.index_mode().is_tip() {
-                    let t_map = Instant::now();
-                    write_create_pins.reserve(planned_fks.len());
-                    for (fk, pin) in planned_fks.iter().zip(packed_pins.iter()) {
-                        write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
-                    }
-                    create_map_ns = t_map.elapsed().as_nanos() as u64;
-                }
-                let t_ens = Instant::now();
-                fill_planned_create_layout_after_commit(
-                    query,
-                    &mut batch.batch_parents,
-                    &planned_fks,
-                    &loc,
-                    &packed_pins,
-                    &batch.prepared,
-                )?;
-                ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
-                if let Some(last) = batch.prepared.last() {
-                    query.set_class_a_hi(Some(last.height.0));
-                }
-            }
-        }
-    }
+    let ArchivePlanNs {
+        pins: write_create_pins,
+        class_a_ns,
+        mut ensure_ns,
+        plan_take_ns,
+        create_map_ns,
+    } = apply_archive_plan(query, &mut batch)?;
     {
         let t_ens = Instant::now();
         ensure_spend_abs_layouts(&batch.batch_parents, &batch.prepared)?;

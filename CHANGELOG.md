@@ -52,6 +52,14 @@ before 1.0).
   keep the faded mid rate instead of Esplora `1.0` (insufficient sentinel).
   Empty pool is still `-1` / `1.0`.
 
+- **CRAP chew (WS/RPC/script):** drop allowlist entries for
+  `cheap_submit_tx_reject`, `getnodeaddresses`, `handle_client_msg`,
+  `parse_client_msg`, `backfill_sp_tweaks_cancellable`, `checksig_legacy`,
+  `confirm_write_phase`, `BinaryFuse8::try_from_keys`, and `run_all_script_rows`
+  (exclude `core_vectors.rs` — `#![cfg(test)]` fixture runner). Coverage pins
+  plus extracts (`parse_*_track`, CHECKSIG encodings, already-committed write,
+  archive-plan commit, fuse8 geometry/peel).
+
 - **CRAP chew (next 8):** drop allowlist entries for `TxTable::backfill_head_from`,
   `scripthash_index_data_present`, `Store::revalidate_tip_window_n`,
   `Query::load_thin_tweaks_range`, `op_checkmultisig`,

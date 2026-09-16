@@ -38,97 +38,115 @@ pub(crate) enum ClientMsg {
     Noop,
 }
 
-pub(crate) fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
-    let v: Value = serde_json::from_str(text).map_err(|e| format!("invalid json: {e}"))?;
-    let obj = v
-        .as_object()
-        .ok_or_else(|| "client message must be a JSON object".to_string())?;
+fn json_str_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    if let Some(action) = obj.get("action").and_then(|a| a.as_str()) {
-        if action == "want" {
-            let data = obj
-                .get("data")
-                .and_then(|d| d.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            return Ok(ClientMsg::Want(data));
-        }
+fn parse_want_action(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg> {
+    let action = obj.get("action").and_then(|a| a.as_str())?;
+    if action != "want" {
+        return None;
     }
+    let data = obj.get("data").map(json_str_list).unwrap_or_default();
+    Some(ClientMsg::Want(data))
+}
 
+fn parse_address_track(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg> {
     if let Some(v) = obj.get("track-address") {
         if v.is_null() || v.as_bool() == Some(false) {
-            return Ok(ClientMsg::StopTrackAddresses);
+            return Some(ClientMsg::StopTrackAddresses);
         }
         if let Some(s) = v.as_str() {
             if s.is_empty() {
-                return Ok(ClientMsg::StopTrackAddresses);
+                return Some(ClientMsg::StopTrackAddresses);
             }
-            return Ok(ClientMsg::TrackAddress(s.to_string()));
+            return Some(ClientMsg::TrackAddress(s.to_string()));
         }
     }
     if let Some(v) = obj.get("track-addresses") {
         if v.is_null() || (v.as_array().is_some_and(|a| a.is_empty())) {
-            return Ok(ClientMsg::StopTrackAddresses);
+            return Some(ClientMsg::StopTrackAddresses);
         }
         if let Some(arr) = v.as_array() {
             let addrs: Vec<String> = arr
                 .iter()
                 .filter_map(|x| x.as_str().map(|s| s.to_string()))
                 .collect();
-            return Ok(ClientMsg::TrackAddresses(addrs));
+            return Some(ClientMsg::TrackAddresses(addrs));
         }
     }
     if let Some(v) = obj.get("stop-track-address") {
         if v.as_bool() == Some(true) || v.is_null() {
-            return Ok(ClientMsg::StopTrackAddresses);
+            return Some(ClientMsg::StopTrackAddresses);
         }
         if let Some(s) = v.as_str() {
-            return Ok(ClientMsg::StopTrackAddress(Some(s.to_string())));
+            return Some(ClientMsg::StopTrackAddress(Some(s.to_string())));
         }
     }
     if obj.get("stop-track-addresses").is_some() {
-        return Ok(ClientMsg::StopTrackAddresses);
+        return Some(ClientMsg::StopTrackAddresses);
     }
+    None
+}
 
+fn parse_tx_track(obj: &serde_json::Map<String, Value>) -> Option<ClientMsg> {
     if let Some(v) = obj.get("track-tx") {
         if v.is_null() || v.as_bool() == Some(false) {
-            return Ok(ClientMsg::StopTrackTxs);
+            return Some(ClientMsg::StopTrackTxs);
         }
         if let Some(s) = v.as_str() {
             if s.is_empty() {
-                return Ok(ClientMsg::StopTrackTxs);
+                return Some(ClientMsg::StopTrackTxs);
             }
-            return Ok(ClientMsg::TrackTx(s.to_string()));
+            return Some(ClientMsg::TrackTx(s.to_string()));
         }
     }
     if let Some(v) = obj.get("track-txs") {
         if v.is_null() || (v.as_array().is_some_and(|a| a.is_empty())) {
-            return Ok(ClientMsg::StopTrackTxs);
+            return Some(ClientMsg::StopTrackTxs);
         }
         if let Some(arr) = v.as_array() {
             let ids: Vec<String> = arr
                 .iter()
                 .filter_map(|x| x.as_str().map(|s| s.to_string()))
                 .collect();
-            return Ok(ClientMsg::TrackTxs(ids));
+            return Some(ClientMsg::TrackTxs(ids));
         }
     }
     if let Some(v) = obj.get("stop-track-tx") {
         if v.as_bool() == Some(true) || v.is_null() {
-            return Ok(ClientMsg::StopTrackTxs);
+            return Some(ClientMsg::StopTrackTxs);
         }
         if let Some(s) = v.as_str() {
-            return Ok(ClientMsg::StopTrackTx(Some(s.to_string())));
+            return Some(ClientMsg::StopTrackTx(Some(s.to_string())));
         }
     }
     if obj.get("stop-track-txs").is_some() {
-        return Ok(ClientMsg::StopTrackTxs);
+        return Some(ClientMsg::StopTrackTxs);
     }
+    None
+}
 
+pub(crate) fn parse_client_msg(text: &str) -> Result<ClientMsg, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("invalid json: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "client message must be a JSON object".to_string())?;
+    if let Some(m) = parse_want_action(obj) {
+        return Ok(m);
+    }
+    if let Some(m) = parse_address_track(obj) {
+        return Ok(m);
+    }
+    if let Some(m) = parse_tx_track(obj) {
+        return Ok(m);
+    }
     Ok(ClientMsg::Noop)
 }
 
@@ -719,6 +737,43 @@ mod tests {
         );
         assert_eq!(
             parse_client_msg(r#"{"stop-track-address":1}"#).unwrap(),
+            ClientMsg::Noop
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"action":"want"}"#).unwrap(),
+            ClientMsg::Want(vec![])
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-addresses":null}"#).unwrap(),
+            ClientMsg::StopTrackAddresses
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-addresses":[]}"#).unwrap(),
+            ClientMsg::StopTrackAddresses
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"stop-track-address":"bcrt1qtest"}"#).unwrap(),
+            ClientMsg::StopTrackAddress(Some("bcrt1qtest".into()))
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"stop-track-address":true}"#).unwrap(),
+            ClientMsg::StopTrackAddresses
+        );
+        let id = "ab".repeat(32);
+        assert_eq!(
+            parse_client_msg(&format!(r#"{{"stop-track-tx":"{id}"}}"#)).unwrap(),
+            ClientMsg::StopTrackTx(Some(id))
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-tx":""}"#).unwrap(),
+            ClientMsg::StopTrackTxs
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"track-txs":null}"#).unwrap(),
+            ClientMsg::StopTrackTxs
+        );
+        assert_eq!(
+            parse_client_msg(r#"{"action":"ping"}"#).unwrap(),
             ClientMsg::Noop
         );
     }

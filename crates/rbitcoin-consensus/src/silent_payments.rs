@@ -211,20 +211,30 @@ pub fn backfill_sp_tweaks_cancellable(
                 flush(&mut pending, &mut wrote)?;
             }
             h = h.saturating_add(1);
-            if last_log.elapsed() >= std::time::Duration::from_secs(10) {
-                last_log = std::time::Instant::now();
-                let next = h;
-                let remain = snapshot.saturating_sub(next.saturating_sub(1));
-                let secs = t0.elapsed().as_secs_f64().max(1e-3);
-                let rate = wrote as f64 / secs;
-                rbitcoin_log::info!(
-                    "{}",
-                    format_sptweaks_progress(next, snapshot, rate, remain, t0.elapsed())
-                );
-            }
+            maybe_log_sptweaks_backfill(&mut last_log, t0, h, snapshot, wrote);
         }
         flush(&mut pending, &mut wrote)?;
     }
+}
+
+fn maybe_log_sptweaks_backfill(
+    last_log: &mut std::time::Instant,
+    t0: std::time::Instant,
+    h: u32,
+    snapshot: u32,
+    wrote: u32,
+) {
+    if last_log.elapsed() < std::time::Duration::from_secs(10) {
+        return;
+    }
+    *last_log = std::time::Instant::now();
+    let remain = snapshot.saturating_sub(h.saturating_sub(1));
+    let secs = t0.elapsed().as_secs_f64().max(1e-3);
+    let rate = wrote as f64 / secs;
+    rbitcoin_log::info!(
+        "{}",
+        format_sptweaks_progress(h, snapshot, rate, remain, t0.elapsed())
+    );
 }
 
 pub(crate) fn format_sptweaks_progress(
@@ -1113,6 +1123,36 @@ mod tests {
             1
         );
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_log_sptweaks_backfill_emits_after_ten_secs() {
+        let t0 = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(11))
+            .expect("clock");
+        let mut last = t0;
+        maybe_log_sptweaks_backfill(&mut last, t0, 3, 10, 2);
+        assert!(last > t0);
+        let before = last;
+        maybe_log_sptweaks_backfill(&mut last, t0, 4, 10, 2);
+        assert_eq!(last, before);
+    }
+
+    #[test]
+    fn backfill_no_tip_and_already_caught_up() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
+
+        q.enter_direct_index_mode().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 1);
+        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
+        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
