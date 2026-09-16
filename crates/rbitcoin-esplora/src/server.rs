@@ -1488,17 +1488,6 @@ mod tests {
         let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(fees.get("1").is_some());
 
-        let (st, body) = http_get(addr, "/fees/recommended").await;
-        assert_eq!(st, 200, "{body}");
-        let rec: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(rec.get("fastestFee").is_some(), "{body}");
-        assert!(rec.get("halfHourFee").is_some(), "{body}");
-        assert!(rec.get("hourFee").is_some(), "{body}");
-        assert!(rec.get("economyFee").is_some(), "{body}");
-        assert!(rec.get("minimumFee").is_some(), "{body}");
-        let (st, body) = http_get(addr, "/v1/fees/recommended").await;
-        assert_eq!(st, 200, "{body}");
-
         // POST /tx without hub
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let req = "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab";

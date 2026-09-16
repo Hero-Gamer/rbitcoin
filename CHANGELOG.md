@@ -25,6 +25,12 @@ before 1.0).
 
 ### Changed
 
+- **Catalog journeys own yesterday's operator pins:** Electrum **1.6**
+  outpoint / silent-payments TCP, `broadcast_package` success, live
+  `getpeerinfo` clock/sync fields, and Esplora `/fees/recommended` sit on
+  existing catalog pads. Dispatch/TCP twins of those contracts are gone.
+  Mock-clock / connecting / header-only `getpeerinfo` guts stay.
+
 - **Coverage 91% LCOV floor + CRAP fail-above 30:** drop the never-falls
   LCOV ratchet (llvm-cov hit counts jitter). Floor is unrounded
   `LH*100 >= LF*91`. After LCOV, `cargo crap --fail-above --threshold 30`

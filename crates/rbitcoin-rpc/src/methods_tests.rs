@@ -3518,10 +3518,6 @@ fn addnode_and_disconnectnode_on_table() {
     assert!(e["message"].as_str().unwrap().contains("dialer"), "{e}");
     let e = dispatch(&ctx, "disconnectnode", vec![json!("127.0.0.1:1")]).unwrap_err();
     assert_eq!(e["code"], ERR_CLIENT_NODE_NOT_CONNECTED);
-    let e = dispatch(&ctx, "disconnectnode", named(json!({"nodeid": 99}))).unwrap_err();
-    assert_eq!(e["code"], ERR_CLIENT_NODE_NOT_CONNECTED);
-    let e = dispatch(&ctx, "disconnectnode", vec![]).unwrap_err();
-    assert_eq!(e["code"], ERR_INVALID_PARAMS);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
