@@ -1,10 +1,11 @@
-//! Cookie / user-pass JSON-RPC client for the documented node subset.
+//! Datadir socket / bearer-token JSON-RPC client for the documented node subset.
 
+use rbitcoin_primitives::Network;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -12,27 +13,25 @@ fn usage() -> String {
     format!(
         "rbitcoin-cli {} — usage: rbitcoin-cli [OPTIONS] <COMMAND> [PARAMS...]\n\
          \n\
-         Options (names match bitcoin-cli):\n\
-           --datadir PATH        cookie at PATH/.cookie (same as rbitcoin-node --datadir)\n\
-           --rpcconnect HOST     JSON-RPC host (default 127.0.0.1)\n\
-           --rpcport PORT        JSON-RPC port (default 8332)\n\
-           --rpcuser USER        with --rpcpassword (else cookie)\n\
-           --rpcpassword PASS    with --rpcuser (else cookie)\n\
-           -h, --help            this message\n\
-           -V, --version         print version\n\
+         Options:\n\
+           --datadir PATH         node datadir (default ./datadir); unix socket PATH/rpc.sock\n\
+           --network NET          mainnet|testnet|signet|regtest (default TCP port)\n\
+           --rpc-url URL          HTTP JSON-RPC (default http://127.0.0.1:<network port>)\n\
+           --rpc-token-file PATH  Bearer token (default PATH/rpc.token from --datadir)\n\
+           -h, --help             this message\n\
+           -V, --version          print version\n\
          \n\
-         Auth: --rpcuser/--rpcpassword, or the cookie written when the node\n\
-         listens (`{{datadir}}/.cookie`). Plain HTTP, same as the node.",
+         Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
+         from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
         env!("CARGO_PKG_VERSION")
     )
 }
 
 struct CliConfig {
-    datadir: Option<PathBuf>,
-    rpcconnect: String,
-    rpcport: u16,
-    rpcuser: Option<String>,
-    rpcpassword: Option<String>,
+    datadir: PathBuf,
+    network: Network,
+    rpc_url: Option<String>,
+    token_file: Option<PathBuf>,
     command: Option<String>,
     params: Vec<String>,
 }
@@ -40,11 +39,10 @@ struct CliConfig {
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
-            datadir: None,
-            rpcconnect: "127.0.0.1".into(),
-            rpcport: 8332,
-            rpcuser: None,
-            rpcpassword: None,
+            datadir: PathBuf::from(".").join("datadir"),
+            network: Network::Mainnet,
+            rpc_url: None,
+            token_file: None,
             command: None,
             params: Vec::new(),
         }
@@ -97,15 +95,13 @@ fn parse_args(args: &[OsString]) -> Result<Action, String> {
                 None => take_value(args, &mut i, &format!("--{name}"))?,
             };
             match name {
-                "datadir" => cfg.datadir = Some(PathBuf::from(val)),
-                "rpcconnect" => cfg.rpcconnect = val,
-                "rpcport" => {
-                    cfg.rpcport = val
-                        .parse()
-                        .map_err(|_| format!("invalid --rpcport {val}"))?;
+                "datadir" => cfg.datadir = PathBuf::from(val),
+                "network" => {
+                    cfg.network =
+                        Network::parse(&val).map_err(|e| format!("invalid --network: {e}"))?;
                 }
-                "rpcuser" => cfg.rpcuser = Some(val),
-                "rpcpassword" => cfg.rpcpassword = Some(val),
+                "rpc-url" => cfg.rpc_url = Some(val),
+                "rpc-token-file" => cfg.token_file = Some(PathBuf::from(val)),
                 other => return Err(format!("unknown argument `--{other}`")),
             }
             i += 1;
@@ -121,43 +117,52 @@ fn parse_args(args: &[OsString]) -> Result<Action, String> {
     Ok(Action::Call(cfg))
 }
 
-fn resolve_auth(cfg: &CliConfig) -> Result<(String, String), String> {
-    match (&cfg.rpcuser, &cfg.rpcpassword) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Ok((u.clone(), p.clone())),
-        (Some(_), None) | (None, Some(_)) => {
-            Err("--rpcuser and --rpcpassword must both be set".into())
-        }
-        (Some(_), Some(_)) => Err("--rpcuser and --rpcpassword must be non-empty".into()),
-        (None, None) => {
-            let dir = cfg
-                .datadir
-                .as_ref()
-                .ok_or("need --datadir (cookie) or --rpcuser/--rpcpassword")?;
-            let path = dir.join(".cookie");
-            let line = std::fs::read_to_string(&path)
-                .map_err(|e| format!("read cookie {}: {e}", path.display()))?;
-            let (u, p) = line
-                .trim()
-                .split_once(':')
-                .ok_or("cookie file: expected user:password")?;
-            if u.is_empty() || p.is_empty() {
-                return Err("cookie file: expected user:password".into());
-            }
-            Ok((u.to_string(), p.to_string()))
-        }
+fn socket_path(cfg: &CliConfig) -> PathBuf {
+    cfg.datadir.join("rpc.sock")
+}
+
+fn token_path(cfg: &CliConfig) -> PathBuf {
+    cfg.token_file
+        .clone()
+        .unwrap_or_else(|| cfg.datadir.join("rpc.token"))
+}
+
+fn parse_http_url(url: &str) -> Result<(String, u16), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--rpc-url needs host:port (got {url})"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("invalid --rpc-url port in {url}"))?;
+    if host.is_empty() {
+        return Err(format!("invalid --rpc-url host in {url}"));
     }
+    Ok((host.to_string(), port))
+}
+
+fn read_token(path: &Path) -> Result<String, String> {
+    let line =
+        std::fs::read_to_string(path).map_err(|e| format!("read token {}: {e}", path.display()))?;
+    let t = line.trim();
+    if t.is_empty() {
+        return Err(format!("token file {}: empty", path.display()));
+    }
+    Ok(t.to_string())
 }
 
 fn param_value(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-/// POST one JSON-RPC method; returns the `result` value or an error message.
-pub fn rpc_call(
+fn rpc_http(
+    mut stream: impl Read + Write,
     host: &str,
     port: u16,
-    user: &str,
-    password: &str,
+    auth: Option<&str>,
     method: &str,
     params: &[Value],
 ) -> Result<Value, String> {
@@ -168,28 +173,26 @@ pub fn rpc_call(
         "params": params,
     });
     let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
-    use base64::Engine;
-    let tok = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+    let auth_h = match auth {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
     let req = format!(
         "POST / HTTP/1.1\r\n\
          Host: {host}:{port}\r\n\
-         Authorization: Basic {tok}\r\n\
+         {auth_h}\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
          \r\n",
         body.len()
     );
-    let mut stream =
-        TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
     let mut wire = req.into_bytes();
     wire.extend_from_slice(&body);
     stream.write_all(&wire).map_err(|e| format!("write: {e}"))?;
     let (status, resp_body) = read_http(&mut stream)?;
     if status == 401 {
-        return Err("RPC unauthorized (check cookie or --rpcuser/--rpcpassword)".into());
+        return Err("RPC unauthorized (check rpc.token or --rpc-token-file)".into());
     }
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status}: {resp_body}"));
@@ -206,7 +209,16 @@ pub fn rpc_call(
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
 
-fn read_http(stream: &mut TcpStream) -> Result<(u16, String), String> {
+fn connect_unix(path: &Path) -> Result<socket2::Socket, String> {
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+        .map_err(|e| format!("unix socket: {e}"))?;
+    let addr = socket2::SockAddr::unix(path).map_err(|e| format!("unix addr: {e}"))?;
+    sock.connect(&addr)
+        .map_err(|e| format!("connect {}: {e}", path.display()))?;
+    Ok(sock)
+}
+
+fn read_http(stream: &mut impl Read) -> Result<(u16, String), String> {
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
@@ -237,9 +249,23 @@ fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     if cmd == "help" {
         return Ok(usage());
     }
-    let (user, pass) = resolve_auth(cfg)?;
     let params: Vec<Value> = cfg.params.iter().map(|p| param_value(p)).collect();
-    let result = rpc_call(&cfg.rpcconnect, cfg.rpcport, &user, &pass, cmd, &params)?;
+    let sock = socket_path(cfg);
+    let result = if cfg.rpc_url.is_none() && sock.exists() {
+        let stream = connect_unix(&sock)?;
+        rpc_http(stream, "localhost", 0, None, cmd, &params)?
+    } else {
+        let (host, port) = match cfg.rpc_url.as_deref() {
+            Some(u) => parse_http_url(u)?,
+            None => ("127.0.0.1".into(), cfg.network.default_rpc_port()),
+        };
+        let stream = TcpStream::connect((host.as_str(), port))
+            .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+        let token = read_token(&token_path(cfg))?;
+        rpc_http(stream, &host, port, Some(&token), cmd, &params)?
+    };
     Ok(format_result(&result))
 }
 
@@ -302,11 +328,10 @@ mod tests {
         p
     }
 
-    /// Minimal JSON-RPC server: 401 without Basic; 200 + `result` when user:pass match.
-    fn spawn_rpc_mock(user: &str, pass: &str, result_json: &str) -> (u16, thread::JoinHandle<()>) {
+    fn spawn_rpc_mock(token: &str, result_json: &str) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let expect = format!("{user}:{pass}");
+        let expect = format!("Bearer {token}");
         let result = result_json.to_string();
         let h = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
@@ -321,14 +346,10 @@ mod tests {
             }
             let req = String::from_utf8_lossy(&raw);
             let authorized = req.lines().any(|line| {
-                let line = line.trim();
-                let Some(rest) = line
-                    .strip_prefix("Authorization: Basic ")
-                    .or_else(|| line.strip_prefix("authorization: Basic "))
-                else {
-                    return false;
-                };
-                decode_basic(rest).as_deref() == Some(expect.as_str())
+                line.trim()
+                    .strip_prefix("Authorization:")
+                    .map(|r| r.trim().eq_ignore_ascii_case(&expect))
+                    .unwrap_or(false)
             });
             let body = if authorized {
                 format!("{{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":{result},\"error\":null}}\n")
@@ -342,18 +363,10 @@ mod tests {
                 );
                 s.write_all(resp.as_bytes()).unwrap();
             } else {
-                s.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"jsonrpc\"\r\nContent-Length: 13\r\nConnection: close\r\n\r\nUnauthorized\n").unwrap();
+                s.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"jsonrpc\"\r\nContent-Length: 13\r\nConnection: close\r\n\r\nUnauthorized\n").unwrap();
             }
         });
         (port, h)
-    }
-
-    fn decode_basic(b64: &str) -> Option<String> {
-        use base64::Engine;
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .ok()?;
-        String::from_utf8(raw).ok()
     }
 
     #[test]
@@ -373,14 +386,13 @@ mod tests {
     #[test]
     fn equals_form_datadir_is_accepted() {
         let dir = tmp_datadir();
-        std::fs::write(dir.join(".cookie"), "__cookie__:s3cret").unwrap();
-        let (port, h) = spawn_rpc_mock("__cookie__", "s3cret", "0");
+        std::fs::write(dir.join("rpc.token"), "s3cret").unwrap();
+        let (port, h) = spawn_rpc_mock("s3cret", "0");
         let flag = format!("--datadir={}", dir.display());
         let code = cli_main([
             "rbitcoin-cli",
             flag.as_str(),
-            "--rpcconnect=127.0.0.1",
-            &format!("--rpcport={port}"),
+            &format!("--rpc-url=http://127.0.0.1:{port}"),
             "getblockcount",
         ]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -393,18 +405,17 @@ mod tests {
         let u = usage();
         for needle in [
             "--datadir PATH",
-            "--rpcconnect HOST",
-            "--rpcport PORT",
-            "--rpcuser USER",
-            "--rpcpassword PASS",
+            "--network NET",
+            "--rpc-url URL",
+            "--rpc-token-file PATH",
             "-h, --help",
             "-V, --version",
         ] {
             assert!(u.contains(needle), "usage must list {needle}");
         }
         assert!(
-            u.contains("--rpcpassword PASS") && u.contains("with --rpcuser"),
-            "rpcpassword must have a description"
+            !u.contains("--rpcuser") && !u.contains("--rpcport") && !u.contains("--rpcconnect"),
+            "dropped Core names must not be advertised: {u}"
         );
         assert!(
             u.contains("-V, --version") && u.contains("print version"),
@@ -413,57 +424,99 @@ mod tests {
     }
 
     #[test]
-    fn getblockcount_cookie_against_mock() {
+    fn getblockcount_token_against_mock() {
         let dir = tmp_datadir();
-        std::fs::write(dir.join(".cookie"), "__cookie__:s3cret").unwrap();
-        let (port, h) = spawn_rpc_mock("__cookie__", "s3cret", "0");
+        std::fs::write(dir.join("rpc.token"), "s3cret").unwrap();
+        let (port, h) = spawn_rpc_mock("s3cret", "0");
         let code = cli_main([
             "rbitcoin-cli",
             "--datadir",
             dir.to_str().unwrap(),
-            "--rpcconnect",
-            "127.0.0.1",
-            "--rpcport",
-            &port.to_string(),
+            "--rpc-url",
+            &format!("http://127.0.0.1:{port}"),
             "getblockcount",
         ]);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             exit_ok(code),
-            "cookie getblockcount must succeed against a live RPC mock, got {code:?}"
+            "token getblockcount must succeed against a live RPC mock, got {code:?}"
         );
         let _ = h.join();
     }
 
     #[test]
-    fn getblockcount_userpass_against_mock() {
-        let (port, h) = spawn_rpc_mock("alice", "pw", "0");
-        let code = cli_main([
-            "rbitcoin-cli",
-            "--rpcuser",
-            "alice",
-            "--rpcpassword",
-            "pw",
-            "--rpcport",
-            &port.to_string(),
-            "getblockcount",
-        ]);
-        assert!(
-            exit_ok(code),
-            "user/pass getblockcount must succeed against a live RPC mock, got {code:?}"
-        );
-        let _ = h.join();
+    fn dropped_core_names_are_unknown() {
+        for flag in [
+            "--rpcuser=u",
+            "--rpcpassword=p",
+            "--rpcport=1",
+            "--rpcconnect=h",
+            "-rpcport",
+        ] {
+            let code = cli_main(["rbitcoin-cli", flag, "getblockcount"]);
+            assert!(!exit_ok(code), "{flag} must be unknown");
+        }
     }
 
     #[test]
     fn missing_auth_is_unauthorized() {
-        let (port, _h) = spawn_rpc_mock("alice", "pw", "0");
+        let (port, _h) = spawn_rpc_mock("alice", "0");
+        let dir = tmp_datadir();
         let code = cli_main([
             "rbitcoin-cli",
-            "--rpcport",
-            &port.to_string(),
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--rpc-url",
+            &format!("http://127.0.0.1:{port}"),
             "getblockcount",
         ]);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(!exit_ok(code));
+    }
+
+    #[test]
+    fn default_rpc_port_follows_network() {
+        assert_eq!(Network::Mainnet.default_rpc_port(), 8332);
+        assert_eq!(Network::Regtest.default_rpc_port(), 18443);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_needs_no_token() {
+        use std::os::unix::net::UnixListener;
+        let dir = tmp_datadir();
+        let sock = dir.join("rpc.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let h = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&tmp[..n]);
+            }
+            let body =
+                "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":7,\"error\":null}\n".to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        });
+        let code = cli_main([
+            "rbitcoin-cli",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            exit_ok(code),
+            "unix getblockcount must succeed, got {code:?}"
+        );
+        let _ = h.join();
     }
 }
