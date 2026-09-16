@@ -37,45 +37,7 @@ where
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
-                eprintln!(
-                    "rbitcoin-node {} — usage:\n\
-  rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
-    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
-    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] \\\n\
-    [--milestone HEIGHT] \\\n\
-    [--max-outbound N] [--max-inbound N] \\\n\
-    [--mempool-size-mb N] \\\n\
-    [--testactivationheight name@height] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
-    [--blocks-only] [--prefillcompact[=0|1]] [--minrelaytxfee BTC] \\\n\
-    [--limitclustercount N] [--limitclustersize KVB] [--peer-timeout SECS] \\\n\
-    [--externalip IP] \\\n\
-    [--min-chain-work HEX] [--max-tip-age SECS] \\\n\
-    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] [--ua-comment STR] \\\n\
-    [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
-Networks: mainnet|testnet|signet|regtest\n\
-Custom Signet: --signet-challenge HEX [--signet-block-time SECONDS].\n\
-Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
-API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
-Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {{datadir}}/ip_asn.dat.\n\
-Milestone: skip script/sig checks at/below HEIGHT.\n\
-  Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
-Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
-Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
-  --trusted / --always-relay / --relay are inbound permission knobs (not Core -whitelist).\n\
-Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
-  --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
-  --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
-Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  --sptweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
-RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
-Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
-  Default (flag omitted): hot and cold files both live under --datadir.\n\
-Conf: --conf FILE (key=value; CLI overrides conf). See OPERATOR.md and docs/rpc.md.\n\
-Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
-IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\
-  Relay / RPC initialblockdownload after catch-up: --min-chain-work + --max-tip-age (24h).",
-                    env!("CARGO_PKG_VERSION")
-                );
+                eprintln!("{}", operator_usage());
                 return Ok(OperatorArgs::Help);
             }
             "--version" | "-V" => {
@@ -288,6 +250,51 @@ where
     }
 }
 
+fn operator_usage() -> String {
+    format!(
+        "rbitcoin-node {} — usage:\n\
+  rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
+    [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
+    [--listen ADDR] [--connect ADDR]... [--seed-node HOST]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
+    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] [--rpc-work-queue N] \\\n\
+    [--milestone HEIGHT] \\\n\
+    [--max-outbound N] [--max-inbound N] \\\n\
+    [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
+    [--test-activation-height name@HEIGHT] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
+    [--blocks-only] [--prefill-compact[=0|1]] [--min-relay-tx-fee BTC] \\\n\
+    [--limit-cluster-count N] [--limit-cluster-size KVB] [--peer-timeout SECS] \\\n\
+    [--external-ip IP] [--ua-comment STR] \\\n\
+    [--min-chain-work HEX] [--max-tip-age SECS] [--mock-time UNIX] \\\n\
+    [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
+    [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
+    [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
+Networks: mainnet|testnet|signet|regtest.\n\
+Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
+Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
+API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
+Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {{datadir}}/ip_asn.dat.\n\
+Milestone: skip script/sig checks at/below HEIGHT.\n\
+  Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
+Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
+Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
+  --trusted / --always-relay / --relay are inbound permission knobs (not Core -whitelist).\n\
+Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+  --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
+  --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
+Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
+  --sptweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
+RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
+Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
+  Default (flag omitted): hot and cold files both live under --datadir.\n\
+Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
+Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
+IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\
+  Relay / RPC initialblockdownload after catch-up: --min-chain-work + --max-tip-age (24h).",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn take_arg(args: &[OsString], i: &mut usize, flag: &str) -> Result<String, ExitCode> {
     *i += 1;
     if *i >= args.len() {
@@ -454,15 +461,84 @@ mod tests {
     }
 
     #[test]
+    fn help_advertises_kebab_not_concatenated_core_names() {
+        let h = operator_usage();
+        for flag in [
+            "--prefill-compact",
+            "--limit-cluster-count",
+            "--limit-cluster-size",
+            "--min-relay-tx-fee",
+            "--mempool-expiry",
+            "--external-ip",
+            "--seed-node",
+            "--mock-time",
+            "--block-version",
+            "--block-min-tx-fee",
+            "--alert-notify",
+            "--startup-notify",
+            "--test-activation-height",
+            "--rpc-work-queue",
+            "--peer-timeout",
+            "--blocks-only",
+            "--ua-comment",
+            "--min-chain-work",
+            "--max-tip-age",
+            "--signet-block-time",
+            "--rpcuser",
+            "--rpcpassword",
+        ] {
+            assert!(h.contains(flag), "help must list {flag}");
+        }
+        for concat in [
+            "--prefillcompact",
+            "--limitclustercount",
+            "--limitclustersize",
+            "--minrelaytxfee",
+            "--mempoolexpiry",
+            "--externalip",
+            "--seednode",
+            "--mocktime",
+            "--blockversion",
+            "--blockmintxfee",
+            "--alertnotify",
+            "--startupnotify",
+            "--testactivationheight",
+            "--rpcworkqueue",
+        ] {
+            assert!(!h.contains(concat), "help must not advertise {concat}");
+        }
+        assert!(
+            h.contains("Networks: mainnet|testnet|signet|regtest."),
+            "network list must end with a period"
+        );
+        assert!(
+            h.contains("[--signet-block-time SECS]"),
+            "duration placeholder must be SECS"
+        );
+    }
+
+    #[test]
+    fn kebab_seed_node_and_min_relay_tx_fee_parse() {
+        let seeds = ready_config(["rbitcoin-node", "--seed-node", "127.0.0.1:8333"]);
+        assert_eq!(seeds.listen.seednodes, vec!["127.0.0.1:8333".to_string()]);
+        let fee = ready_config(["rbitcoin-node", "--min-relay-tx-fee", "0.00001000"]);
+        assert_eq!(fee.mempool.min_relay_fee_btc.as_deref(), Some("0.00001000"));
+        let compact = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
+        assert!(!compact.prefill_compact);
+    }
+
+    #[test]
     fn prefillcompact_omitted_is_on_zero_disables() {
         let omitted = ready_config(["rbitcoin-node"]);
         assert!(omitted.prefill_compact);
-        let off = ready_config(["rbitcoin-node", "--prefillcompact=0"]);
+        let off = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
         assert!(!off.prefill_compact);
-        let on = ready_config(["rbitcoin-node", "--prefillcompact"]);
+        let on = ready_config(["rbitcoin-node", "--prefill-compact"]);
         assert!(on.prefill_compact);
-        let on_eq = ready_config(["rbitcoin-node", "--prefillcompact=1"]);
+        let on_eq = ready_config(["rbitcoin-node", "--prefill-compact=1"]);
         assert!(on_eq.prefill_compact);
+        let alias = ready_config(["rbitcoin-node", "--prefillcompact=0"]);
+        assert!(!alias.prefill_compact);
     }
 
     #[test]
@@ -595,10 +671,10 @@ mod tests {
             "regtest",
             "--datadir",
             dir.to_str().unwrap(),
-            "--testactivationheight=csv@102",
-            "--testactivationheight=dersig@50",
+            "--test-activation-height=csv@102",
+            "--test-activation-height=dersig@50",
             "--trusted",
-            "--limitclustercount=10",
+            "--limit-cluster-count=10",
             "--min-chain-work=0x65",
             "--no-seeds",
             "--log-level",

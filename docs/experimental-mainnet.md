@@ -106,7 +106,7 @@ compact until `blocktxn` overlays the holes (apply does not re-query
 mempool). Full `getdata` MSG_WITNESS_BLOCK remains the fallback when the
 header merkle fails or `blocktxn` does not complete the holes. We serve `getblocktxn` and
 `MSG_CMPCT_BLOCK` getdata from store/cache. Outbound extra prefill (10 KiB
-cap) is on; `--prefillcompact=0` is coinbase-only. Generate / submit / full-block
+cap) is on; `--prefill-compact=0` is coinbase-only. Generate / submit / full-block
 NewPoWValid pack txs that were not in the live mempool without delaying
 forward. A PoW-valid header that
 extends our tip is announced as `cmpctblock` to other HB peers **before**

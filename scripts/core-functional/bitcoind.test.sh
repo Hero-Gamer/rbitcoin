@@ -137,17 +137,17 @@ OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -maxtipage=3600 -blockmintxfee=0.00000001 -externalip=42.42.42.42 \
   -proxy=127.0.0.1:1 -deprecatedrpc=startingheight \
   2>/dev/null)" || OUTX=""
-if printf '%s' "$OUTX" | grep -q -- "--testactivationheight=csv@102" \
+if printf '%s' "$OUTX" | grep -q -- "--test-activation-height=csv@102" \
   && printf '%s' "$OUTX" | grep -q -- "--trusted" \
-  && printf '%s' "$OUTX" | grep -q -- "--limitclustercount=10" \
+  && printf '%s' "$OUTX" | grep -q -- "--limit-cluster-count=10" \
   && ! printf '%s' "$OUTX" | grep -q -- "permitbaremultisig" \
   && printf '%s' "$OUTX" | grep -q -- "--max-inbound=1" \
   && printf '%s' "$OUTX" | grep -q -- "--min-chain-work=0x65" \
-  && printf '%s' "$OUTX" | grep -q -- "--blockversion=1337" \
-  && printf '%s' "$OUTX" | grep -q -- "--mocktime=1296688602" \
+  && printf '%s' "$OUTX" | grep -q -- "--block-version=1337" \
+  && printf '%s' "$OUTX" | grep -q -- "--mock-time=1296688602" \
   && printf '%s' "$OUTX" | grep -q -- "--max-tip-age=3600" \
-  && printf '%s' "$OUTX" | grep -q -- "--blockmintxfee=0.00000001" \
-  && printf '%s' "$OUTX" | grep -q -- "--externalip=42.42.42.42" \
+  && printf '%s' "$OUTX" | grep -q -- "--block-min-tx-fee=0.00000001" \
+  && printf '%s' "$OUTX" | grep -q -- "--external-ip=42.42.42.42" \
   && ! printf '%s' "$OUTX" | grep -q -- "--whitelist" \
   && ! printf '%s' "$OUTX" | grep -q -- "--maxconnections" \
   && ! printf '%s' "$OUTX" | grep -q -- "limitancestor" \

@@ -54,7 +54,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Mempool structure | Cluster graph + chunks | Cluster mempool (same lineage) |
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
-| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve. Fill is live mempool + orphanage + `extra_compact` (cap 100). Outbound extra prefill is **on** unless `--prefillcompact=0` (10 KiB cap, extra-pool last; generate / submit / NewPoWValid pack txs not in the live mempool without delaying forward) | v1/v2 high-bandwidth + `extra_txn` cache (`-blockreconstructionextratxn`); Core #35558 prefill still unmerged |
+| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve. Fill is live mempool + orphanage + `extra_compact` (cap 100). Outbound extra prefill is **on** unless `--prefill-compact=0` (10 KiB cap, extra-pool last; generate / submit / NewPoWValid pack txs not in the live mempool without delaying forward) | v1/v2 high-bandwidth + `extra_txn` cache (`-blockreconstructionextratxn`); Core #35558 prefill still unmerged |
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | GetAddr | Core `MAX_ADDR_TO_SEND` / `MAX_PCT_ADDR_TO_SEND` (**1000** / **23%**), 24h per-bind cache. Named copies in `rbitcoin-net` — do not “improve” without a named reason to diverge. `MAX_ADDR_MAN` (8192) is **our** HashMap DoS cap and must stay above `1000/0.23` | Core new/tried buckets (~80k); same 1000 / 23% |
 | Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
@@ -62,7 +62,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
-| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpcworkqueue` is HTTP occupancy (503 when full); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpc-work-queue` is HTTP occupancy (503 when full); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
 | GetData serve | Reconstruct/serve **16** (`MAX_SERVE_BLOCKS`) hashes per inbound message; leftover hashes in that `getdata` are dropped (RAM cap) | Core `ProcessGetData` can keep serving leftover hashes |
 | Inbound eviction victim | After Core-shaped protect (netgroup / recent block / recent tx / min-ping), disconnect the **longest-connected** remaining inbound | Core `SelectNodeToEvict` youngest in the oldest netgroup |
 | `--sptweaks-dust` | Serve-time floor default **1000** sat (omit P2TR outs `value <=` floor). **546** matches Cake electrs. Not Cake/Electrum protocol | n/a (Electrum tweaks are not Core) |
@@ -89,7 +89,7 @@ Inbound `cmpctblock` may prefill any well-formed indexes (BIP152). We always
 log reconstruct fill sources and `fetched=` `blocktxn` bytes, and outbound
 `cmpct announce … prefill=N/bytes` when we send `cmpctblock` (tip announce or
 `MSG_CMPCT_BLOCK` getdata). **Sending** extra prefills (beyond coinbase) is on
-unless `--prefillcompact=0`. A pending compact owns the first-pass slot
+unless `--prefill-compact=0`. A pending compact owns the first-pass slot
 bodies (mempool / extra / orphan hits). `blocktxn` overlays only the missing
 indexes; apply does not re-walk a live short-id map.
 

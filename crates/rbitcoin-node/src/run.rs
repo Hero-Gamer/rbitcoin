@@ -239,7 +239,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         match parse_btc_to_sat(s) {
             Ok(sat) => node.hub.set_block_min_tx_fee_sat_kvb(sat),
             Err(e) => {
-                return Err(NodeError::Config(format!("bad --blockmintxfee {s}: {e}")));
+                return Err(NodeError::Config(format!(
+                    "bad --block-min-tx-fee {s}: {e}"
+                )));
             }
         }
     }
@@ -253,7 +255,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let min_relay_sat = match config.mempool.min_relay_fee_btc.as_deref() {
         Some(s) => Some(
             parse_btc_to_sat(s)
-                .map_err(|e| NodeError::Config(format!("bad --minrelaytxfee {s}: {e}")))?,
+                .map_err(|e| NodeError::Config(format!("bad --min-relay-tx-fee {s}: {e}")))?,
         ),
         None => None,
     };
@@ -636,8 +638,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(cmd) = config.startup_notify.as_deref() {
         match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
             Ok(st) if st.success() => {}
-            Ok(st) => warn!("startupnotify exited {st}: {cmd}"),
-            Err(e) => warn!("startupnotify failed: {e}: {cmd}"),
+            Ok(st) => warn!("startup-notify exited {st}: {cmd}"),
+            Err(e) => warn!("startup-notify failed: {e}: {cmd}"),
         }
     }
 

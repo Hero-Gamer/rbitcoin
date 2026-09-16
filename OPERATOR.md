@@ -342,9 +342,12 @@ sections below and [`COMPAT.md`](./COMPAT.md).
 
 ## CLI (operator-first)
 
-Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` is kebab-only
-(no Core aliases). Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
-`-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
+Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` flags are
+kebab-case (`--max-inbound`). Conf keys are snake_case (`max_inbound=`).
+`--rpcuser` / `--rpcpassword` match bitcoin-cli and Core `bitcoin.conf`.
+Concatenated Core spellings still apply as aliases. Core names
+(`-maxconnections`, `-whitelist`, `-blocksonly`, `-minimumchainwork`, …) are
+translated by the functional `bitcoind` shim only
 ([`docs/core-functional.md`](docs/core-functional.md)).
 
 Clean smoke:
@@ -356,10 +359,10 @@ Clean smoke:
 | Flag | Conf | Default |
 |------|------|---------|
 | `--datadir PATH` | `datadir=` | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
-| `--datadir-cold PATH` | `datadir-cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
+| `--datadir-cold PATH` | `datadir_cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
 | `--network NET` | `network=` | `mainnet` |
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
-| `--signet-block-time SECONDS` | `signet_block_time=` | 600; requires a custom challenge |
+| `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
 | `--listen ADDR` | `listen=` | bind later default port |
 | `--connect ADDR` | `connect=` (repeatable) | seeds |
 | `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
@@ -371,40 +374,40 @@ Clean smoke:
 | `--api-log PATH` | `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
 | `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `no_seeds=` | seeds on |
-| `--shindex` | `shindex=1` | **off** — Class B scripthash (required for Electrum/Esplora) |
-| `--max-sh-creates N` | `max_sh_creates` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
-| `--sptweaks` | `sptweaks=1` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
+| `--shindex` | `shindex=` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
+| `--sptweaks` | `sptweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sptweaks-dust SATS` | `sptweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen ADDR` | `electrum_listen=` | disabled (**requires** `--shindex`) |
 | `--esplora-listen ADDR` | `esplora_listen=` | disabled (Esplora REST; **requires** `--shindex`) |
-| `--esplora-block-template` | `esplora_block_template=1` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
-| `--rpc-listen ADDR` | `rpc_listen` | disabled — Core-class JSON-RPC subset |
-| `--rpcuser` / `--rpcpassword` | `rpcuser`/`rpcpassword` | unset — else cookie `{datadir}/.cookie` |
-| `--rpcworkqueue N` | `rpcworkqueue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
-| `--minrelaytxfee BTC` | `minrelaytxfee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
-| `--mempoolexpiry HOURS` | `mempoolexpiry=` | unset — hub default; min 1 |
+| `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
+| `--rpc-listen ADDR` | `rpc_listen=` | disabled — Core-class JSON-RPC subset |
+| `--rpcuser` / `--rpcpassword` | `rpcuser=` / `rpcpassword=` | unset — else cookie `{datadir}/.cookie` |
+| `--rpc-work-queue N` | `rpc_work_queue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
+| `--min-relay-tx-fee BTC` | `min_relay_tx_fee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
+| `--mempool-expiry HOURS` | `mempool_expiry=` | unset — hub default; min 1 |
 | `--blocks-only` | `blocks_only=` | off |
-| `--prefillcompact[=0\|1]` | `prefillcompact=` | **on** — extra BIP152 compact prefills (10 KiB cap); `=0` disables |
+| `--prefill-compact[=0\|1]` | `prefill_compact=` | **on** — extra BIP152 compact prefills (10 KiB cap); `=0` disables |
 | `--persist-mempool[=0\|1]` | `persist_mempool=` | on |
 | `--trusted` | `trusted=` | off — inbound is not evicted/banned |
 | `--always-relay` | `always_relay=` | off — always announce inbound txs |
 | `--relay` | `relay=` | off — permit tx relay to inbound while `--blocks-only` |
-| `--limitclustercount N` | `limitclustercount=` | unset — hub default |
-| `--limitclustersize KVB` | `limitclustersize=` | unset — hub default |
+| `--limit-cluster-count N` | `limit_cluster_count=` | unset — hub default |
+| `--limit-cluster-size KVB` | `limit_cluster_size=` | unset — hub default |
 | `--peer-timeout SECS` | `peer_timeout=` | unset — net default; `0` is InitError |
-| `--externalip IP` | `externalip=` | empty — `getnetworkinfo.localaddresses` |
-| `--seednode HOST` | `seednode=` | extra seeds (repeatable) |
-| `--mocktime UNIX` | `mocktime=` | unset — wall clock; `0` allowed |
+| `--external-ip IP` | `external_ip=` | empty — `getnetworkinfo.localaddresses` |
+| `--seed-node HOST` | `seed_node=` | extra seeds (repeatable) |
+| `--mock-time UNIX` | `mock_time=` | unset — wall clock; `0` allowed |
 | `--max-tip-age SECS` | `max_tip_age=` | unset — hub relay-inhibited age (default 24h) |
-| `--blockversion N` | `blockversion=` | unset — generate/template version overlay |
-| `--blockmintxfee BTC` | `blockmintxfee=` | unset — template min tx fee; garbage/negatives fail start |
-| `--alertnotify CMD` | `alertnotify=` | unset — `%s` = warning; fires once |
-| `--startupnotify CMD` | `startupnotify=` | unset |
-| `--testactivationheight name@H` | `testactivationheight=` | empty — buried deployment overlay |
+| `--block-version N` | `block_version=` | unset — generate/template version overlay |
+| `--block-min-tx-fee BTC` | `block_min_tx_fee=` | unset — template min tx fee; garbage/negatives fail start |
+| `--alert-notify CMD` | `alert_notify=` | unset — `%s` = warning; fires once |
+| `--startup-notify CMD` | `startup_notify=` | unset |
+| `--test-activation-height name@HEIGHT` | `test_activation_height=` | empty — buried deployment overlay |
 | `--min-chain-work HEX` | `min_chain_work=` | unset — densify/relay work floor |
 | `--ua-comment STR` | `ua_comment=` | empty — BIP14 subversion |
 | `--max-run-secs N` | `max_run_secs=` | unset — process exit after N seconds |
-| `--inhibit-suspend` | | off |
+| `--inhibit-suspend` | `inhibit_suspend=` | off |
 
 Conf file: simple `key=value` lines (`#` comments). CLI overrides conf. Example:
 
@@ -756,7 +759,7 @@ Do **not** wipe `store/` for mempool slot/full errors.
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
 - **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool/orphan/`extra_compact` short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
-  Outbound extra prefill (beyond coinbase) is **on** unless `--prefillcompact=0`.
+  Outbound extra prefill (beyond coinbase) is **on** unless `--prefill-compact=0`.
   Generate / `submitblock` / full-block NewPoWValid pack txs that were not in the
   live mempool (`try_read` only; skip packing if the mempool lock is busy).
 - **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
@@ -783,7 +786,7 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 `GET /block-template` on the Esplora listen (same JSON as RPC
 `getblocktemplate` template mode). Default **off** (404).
 
-`--max-sh-creates N` (conf `max_sh_creates`) is **0** by default (full join). When
+`--max-sh-creates N` (conf `max_sh_creates=`) is **0** by default (full join). When
 `N > 0`, Electrum and Esplora refuse a scripthash with more than N creates
 before Class A expand: Esplora **503** / Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates`.

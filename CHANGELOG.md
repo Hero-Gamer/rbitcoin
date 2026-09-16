@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **Operator CLI kebab + conf snake_case:** leftover concatenated Core spellings
+  (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are advertised as
+  kebab (`--prefill-compact`, `--min-relay-tx-fee`, `--rpc-work-queue`). Conf
+  keys are snake_case with `=` (`max_inbound=`). Concatenated aliases still
+  apply. `--rpcuser` / `--rpcpassword` match bitcoin-cli. Help notes end with
+  a period; duration placeholders are `SECS`.
+
 - **Fee estimates bias for inclusion confidence:** N=1 inverts at 99%
   (80% of the next block, 2× admit-EMA, confirm-memory p90 clip). Confidence
   fades linearly to 90% at N=6 and holds (95% fill, 1× EMA, p90 of per-block
