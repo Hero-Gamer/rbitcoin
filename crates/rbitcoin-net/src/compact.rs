@@ -744,6 +744,65 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_oob_prefill_is_fail() {
+        let oob = HeaderAndShortIds {
+            header: dummy_header(),
+            nonce: 0,
+            short_ids: vec![],
+            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction {
+                idx: 1,
+                tx: coinbase(),
+            }],
+        };
+        assert!(matches!(
+            reconstruct(&oob, &empty_avail(), 2),
+            Reconstruct::Fail
+        ));
+    }
+
+    #[test]
+    fn apply_rejects_oob_filled_slot_duplicate_and_leftover_hole() {
+        let b1 = spend(1);
+        let b2 = spend(2);
+        let block = sealed_block(vec![coinbase(), b1.clone(), b2.clone()]);
+        let hsi = HeaderAndShortIds::from_block(&block, 3, 2, &[]).unwrap();
+        let txn1 = BlockTransactions {
+            block_hash: block.block_hash(),
+            transactions: vec![b1.clone()],
+        };
+        let oob = CmpctPartial {
+            slots: vec![Some(coinbase()), None, None],
+            missing: vec![9],
+        };
+        assert!(apply_block_transactions(&hsi, &oob, &txn1)
+            .unwrap_err()
+            .is_empty());
+        let already = CmpctPartial {
+            slots: vec![Some(coinbase()), Some(b1.clone()), None],
+            missing: vec![1],
+        };
+        assert!(apply_block_transactions(&hsi, &already, &txn1)
+            .unwrap_err()
+            .is_empty());
+        let dup = CmpctPartial {
+            slots: vec![Some(coinbase()), Some(b1.clone()), None],
+            missing: vec![2],
+        };
+        assert_eq!(
+            apply_block_transactions(&hsi, &dup, &txn1).unwrap_err(),
+            vec![2]
+        );
+        let hole = CmpctPartial {
+            slots: vec![Some(coinbase()), None, None],
+            missing: vec![1],
+        };
+        assert_eq!(
+            apply_block_transactions(&hsi, &hole, &txn1).unwrap_err(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn version1_txid_shortids_fill() {
         let b1 = spend(7);
         let block = sealed_block(vec![coinbase(), b1.clone()]);
