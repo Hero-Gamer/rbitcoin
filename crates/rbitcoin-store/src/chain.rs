@@ -142,25 +142,6 @@ pub struct StrongTxTable {
     last_flush_bytes: std::sync::atomic::AtomicU64,
 }
 
-fn count_ones_in_bytes(v: &[u8], start_bit: u64, end_bit: u64) -> u64 {
-    let mut ones = 0u64;
-    let mut bit = start_bit;
-    while bit < end_bit {
-        let bi = (bit / 8) as usize;
-        let b = v[bi];
-        if b == 0 {
-            bit = (bit + 8) & !7;
-            continue;
-        }
-        let off = (bit % 8) as u32;
-        if (b >> off) & 1 != 0 {
-            ones += 1;
-        }
-        bit += 1;
-    }
-    ones
-}
-
 impl StrongTxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
@@ -446,18 +427,28 @@ impl StrongTxTable {
         if end_bit <= start_bit {
             return Ok(0);
         }
+        let mut ones = 0u64;
         let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
         if let Some(ref v) = *guard {
-            return Ok(count_ones_in_bytes(v, start_bit, end_bit));
+            let mut bit = start_bit;
+            while bit < end_bit {
+                let bi = (bit / 8) as usize;
+                let b = v[bi];
+                if b == 0 {
+                    bit = (bit + 8) & !7;
+                    continue;
+                }
+                let off = (bit % 8) as u32;
+                if (b >> off) & 1 != 0 {
+                    ones += 1;
+                }
+                bit += 1;
+            }
+            return Ok(ones);
         }
         drop(guard);
-        self.count_ones_from_file(start_bit, end_bit)
-    }
-
-    fn count_ones_from_file(&self, start_bit: u64, end_bit: u64) -> Result<u64, StoreError> {
         const CHUNK: usize = 8192;
         let mut buf = vec![0u8; CHUNK];
-        let mut ones = 0u64;
         let mut bit = start_bit;
         while bit < end_bit {
             let byte_off = bit / 8;

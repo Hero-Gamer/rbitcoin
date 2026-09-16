@@ -22,6 +22,7 @@ allow = [
   "SegmentedTxHead::probe_candidates_batch_wave",
   "Store::check_confirmed_height",
   "Store::open_layout",
+  "StrongTxTable::count_ones_bits",
   "StrongTxTable::set_bits_range",
   "TxTable::open_inwit",
   "TxTable::put_spend_batch_by_abs_meta",
