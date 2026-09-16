@@ -10,8 +10,8 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    blend_sat_kvb, enforce_monotone_desc, fine_candidate_rates, flow_for_depth,
-    frontier_feerate_from_chunks, historical_far_sat_kvb, min_rate_for_capacity, percentile_sat,
+    blend_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
+    historical_far_sat_kvb, hold_defined_then_monotone, min_rate_for_capacity, percentile_sat,
     weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
     Chunk, Coin, FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
@@ -1676,20 +1676,17 @@ impl MempoolHub {
             }
             ordered.push((depth, rate.map(|r| r.max(min_r))));
         }
-        let mut filled: Vec<u64> = ordered.iter().filter_map(|(_, r)| *r).collect();
-        enforce_monotone_desc(&mut filled);
-        let mut fi = 0usize;
+        let mut held: Vec<Option<u64>> = ordered.iter().map(|(_, r)| *r).collect();
+        hold_defined_then_monotone(&mut held);
         let mut by_depth = HashMap::with_capacity(ordered.len());
-        for (depth, raw) in ordered {
-            match raw {
-                None => {
-                    by_depth.insert(depth, -1.0);
-                }
-                Some(_) => {
-                    by_depth.insert(depth, (filled[fi] as f64) / 100_000_000.0);
-                    fi += 1;
-                }
-            }
+        for ((depth, _), rate) in ordered.iter().zip(held) {
+            by_depth.insert(
+                *depth,
+                match rate {
+                    None => -1.0,
+                    Some(r) => r as f64 / 100_000_000.0,
+                },
+            );
         }
 
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
@@ -2912,16 +2909,12 @@ mod tests {
             let e5 = hub.estimate_fee_btc_per_kb(5);
             let e144 = hub.estimate_fee_btc_per_kb(144);
             assert!(
-                e1 >= 0.0 && e5 >= 0.0,
-                "near under-full live stock: e1={e1} e5={e5}"
+                e1 >= 0.0 && e5 >= 0.0 && e144 >= 0.0,
+                "live stock defines near and holds far: e1={e1} e5={e5} e144={e144}"
             );
             assert!(
-                e144 < 0.0,
-                "far without block history is insufficient, got {e144}"
-            );
-            assert!(
-                e1 >= e5,
-                "N=1 99% confidence must not undercut N=5, e1={e1} e5={e5}"
+                e1 >= e5 && e5 >= e144,
+                "must not bounce up at far (Esplora 1.0 sentinel): e1={e1} e5={e5} e144={e144}"
             );
             let spent = hub.spent_outpoints();
             assert!(spent.contains(&op0));
