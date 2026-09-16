@@ -41,7 +41,7 @@ before 1.0).
   `validate_block_structure_with_pres`, `read_proc_rss`,
   `StrongTxTable::count_ones_bits`, and `getblock` after coverage pins and
   small extracts (`HeightPlan`, checkmultisig match loop, block tx layout,
-  `/proc` RSS parsers).
+  `/proc` RSS parsers, RAM vs file bit-count, `getblock` unknown-hash).
 
 - **CRAP chew (10 easiest):** drop allowlist entries for `stamp_external_parents`,
   `gbt_proposal_connect`, `gbt_chain_txout`, `header_head_occupied`,

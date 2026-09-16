@@ -242,43 +242,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
     {
         Some(h) => h,
-        None => {
-            let typed = BlockHash::from_byte_array(hash);
-            if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
-                if verbosity == 0 {
-                    let mut raw = Vec::new();
-                    block
-                        .consensus_encode(&mut raw)
-                        .map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
-                    return Ok(json!(hex_encode(raw)));
-                }
-                let txids: Vec<String> = block
-                    .txdata
-                    .iter()
-                    .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
-                    .collect();
-                return Ok(json!({
-                    "hash": hash_hex_display(&hash),
-                    "confirmations": -1,
-                    "version": block.header.version.to_consensus(),
-                    "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
-                    "time": block.header.time,
-                    "nonce": block.header.nonce,
-                    "bits": format!("{:08x}", block.header.bits.to_consensus()),
-                    "nTx": block.txdata.len(),
-                    "tx": txids,
-                }));
-            }
-            let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
-                || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
-            if header_only {
-                return Err(rpc_error(
-                    ERR_MISC,
-                    "Block not available (not fully downloaded)",
-                ));
-            }
-            return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"));
-        }
+        None => return getblock_unknown_hash(ctx, hash, verbosity),
     };
     let prev = if height.0 > 0 {
         ctx.query
@@ -358,6 +322,44 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         obj["tx"] = json!(txs);
     }
     Ok(obj)
+}
+
+fn getblock_unknown_hash(ctx: &RpcContext, hash: [u8; 32], verbosity: u32) -> Result<Value, Value> {
+    let typed = BlockHash::from_byte_array(hash);
+    if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
+        if verbosity == 0 {
+            let mut raw = Vec::new();
+            block
+                .consensus_encode(&mut raw)
+                .map_err(|_| rpc_error(ERR_MISC, "block encode"))?;
+            return Ok(json!(hex_encode(raw)));
+        }
+        let txids: Vec<String> = block
+            .txdata
+            .iter()
+            .map(|tx| hash_hex_display(&tx.compute_txid().to_byte_array()))
+            .collect();
+        return Ok(json!({
+            "hash": hash_hex_display(&hash),
+            "confirmations": -1,
+            "version": block.header.version.to_consensus(),
+            "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
+            "time": block.header.time,
+            "nonce": block.header.nonce,
+            "bits": format!("{:08x}", block.header.bits.to_consensus()),
+            "nTx": block.txdata.len(),
+            "tx": txids,
+        }));
+    }
+    let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
+        || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
+    if header_only {
+        return Err(rpc_error(
+            ERR_MISC,
+            "Block not available (not fully downloaded)",
+        ));
+    }
+    Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
 }
 
 pub(crate) fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
