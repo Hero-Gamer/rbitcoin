@@ -1247,6 +1247,7 @@ impl PeerHub {
     }
 
     /// BIP152: at most two inbound `getblocktxn` plus one outbound for a hash.
+    /// Same-peer retry while that hash is already pending does not take a slot.
     pub fn try_cmpct_fill_slot(&self, hash: BlockHash, inbound: bool) -> bool {
         let mut g = self.cmpct_fills.lock().unwrap_or_else(|e| e.into_inner());
         let (n_in, has_out) = g.entry(hash).or_insert((0, false));

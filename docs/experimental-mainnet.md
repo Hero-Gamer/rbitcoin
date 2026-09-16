@@ -101,9 +101,10 @@ Heap caps: [`docs/ibd-memory.md`](./ibd-memory.md) (tip-follow / P2P serve).
 **Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2.
 Incoming `cmpctblock` is reconstructed from the live mempool, orphanage, and
 `extra_compact` ring ([`COMPAT.md`](../COMPAT.md)); missing txs use
-`getblocktxn` / `blocktxn`. The first-pass slot bodies stay on the pending
-compact until `blocktxn` overlays the holes (apply does not re-query
-mempool). Full `getdata` MSG_WITNESS_BLOCK remains the fallback when the
+`getblocktxn` / `blocktxn`. A second compact from the same peer while that
+hash is already pending does not take another fill slot. The first-pass slot
+bodies stay on the pending compact until `blocktxn` overlays the holes (apply
+does not re-query mempool). Full `getdata` MSG_WITNESS_BLOCK remains the fallback when the
 header merkle fails or `blocktxn` does not complete the holes. We serve `getblocktxn` and
 `MSG_CMPCT_BLOCK` getdata from store/cache. Outbound extra prefill (10 KiB
 cap) is on; `--prefill-compact=0` is coinbase-only. Generate / submit / full-block
