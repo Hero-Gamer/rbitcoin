@@ -21,7 +21,7 @@ assert_ok() {
   fi
 }
 
-out="$(CRAP_DRY_RUN=1 "$RUN")"
+out="$(CRAP_DRY_RUN=1 CRAP_BASELINE=/no/such/crap_baseline.json "$RUN")"
 assert_ok "dry-run uses cargo crap --workspace" \
   grep -q "cargo crap --workspace" <<<"$out"
 assert_ok "dry-run reads coverage/lcov.info" \
@@ -55,6 +55,14 @@ assert_ok "gated dry-run still has no --fail-above" \
   bash -c '! grep -q -- "--fail-above" <<<"$1"' _ "$gated"
 assert_ok "dry-run does not invoke llvm-cov" \
   bash -c '! grep -q llvm-cov <<<"$1"' _ "$out"
+
+if [[ -f "$ROOT/crap_baseline.json" ]]; then
+  committed="$(CRAP_DRY_RUN=1 "$RUN")"
+  assert_ok "committed crap_baseline.json enables --fail-regression" \
+    grep -q -- "--fail-regression" <<<"$committed"
+  assert_ok "committed baseline path is crap_baseline.json" \
+    grep -q "crap_baseline.json" <<<"$committed"
+fi
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "coverage-crap.test.sh: $PASS passed, $FAIL failed"
