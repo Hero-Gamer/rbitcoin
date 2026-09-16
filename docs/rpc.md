@@ -13,49 +13,42 @@ subset** (table below); the functional harness proxy still intercepts those
 names for Core dialect scripts (`rpc_decodescript.py`, `rpc_validateaddress.py`).
 `getblocktemplate` / `getmininginfo` are a miner-backend (no stratum, no BIP9
 testdummy). `scantxoutset` supports `raw(script)` via the scripthash
-index (when `--shindex`) or Class A txout + spent. Prefer **Electrum /
-Esplora** (with `--shindex`) for address/script history.
+index (when `--sh-index`) or Class A txout + spent. Prefer **Electrum /
+Esplora** (with `--sh-index`) for address/script history.
 
 ## Operator knobs
 
 | Knob | Default | Meaning |
 |------|---------|---------|
-| `--rpc-listen ADDR` / conf `rpc_listen=` | **off** | Bind HTTP JSON-RPC |
-| `--rpcuser` / `--rpcpassword` | unset | HTTP Basic credentials |
-| Cookie | **on** when listen set and no user/pass | `{datadir}/.cookie` as `user:password` |
-| `--shindex` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
+| `--rpc` / conf `rpc=` | **off** | Unix JSON-RPC `{datadir}/rpc.sock` (mode 0600; filesystem auth) |
+| `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
+| `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
+| `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
 | `--rpc-work-queue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
 
-TLS is external (reverse proxy). Non-loopback binds still use cookie or user/pass
-(always authenticated).
+TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
+always Bearer-authenticated (harness-only Basic is password == token).
 
-### curl example (cookie)
+### curl example (TCP Bearer)
 
 ```bash
-# After node start with --rpc-listen 127.0.0.1:8332
-USERPASS=$(cat datadir/.cookie)
-curl --user "$USERPASS" --data-binary \
+# After node start with --rpc-listen (default 127.0.0.1:8332 on mainnet)
+TOKEN=$(cat datadir/rpc.token)
+curl -H "Authorization: Bearer $TOKEN" --data-binary \
   '{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}' \
-  -H 'content-type: application/json' http://127.0.0.1:8332/
-```
-
-### curl example (user/pass)
-
-```bash
-rbitcoin-node --rpc-listen 127.0.0.1:8332 --rpcuser u --rpcpassword p ...
-curl --user u:p --data-binary \
-  '{"jsonrpc":"1.0","id":"1","method":"getblockchaininfo","params":[]}' \
   -H 'content-type: application/json' http://127.0.0.1:8332/
 ```
 
 ### rbitcoin-cli
 
-Same datadir cookie, or `--rpcuser` / `--rpcpassword`. Default
-`127.0.0.1:8332`. Prints the JSON-RPC `result` (strings unquoted).
+`--datadir` (default `./datadir`) prefers `{datadir}/rpc.sock`. TCP uses
+`--rpc-url` (default `http://127.0.0.1:<network port>`) and Bearer from
+`{datadir}/rpc.token` or `--rpc-token-file`. Prints the JSON-RPC `result`
+(strings unquoted).
 
 ```bash
 rbitcoin-cli --datadir datadir getblockcount
-rbitcoin-cli --rpcuser u --rpcpassword p --rpcport 8332 getblockchaininfo
+rbitcoin-cli --network regtest --rpc-url http://127.0.0.1:18443 getblockchaininfo
 ```
 
 ## shindex matrix
@@ -125,7 +118,7 @@ still wait for durable SH when shindex is on.
 | `combinerawtransaction` / `createrawtransaction` / `signrawtransactionwithkey` / `createmultisig` / `deriveaddresses` | Not implemented (harness proxy only) |
 | Decode Core dialect | Node `decodescript` omits wrap/`desc`; `validateaddress` omits `error_locations`; `decoderawtransaction` asm is rust-bitcoin. Official scripts stay on the proxy. |
 | Full `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate. `raw()` Class A walk is the MiniWallet subset only. |
-| Address history via Core method names | Use Electrum/Esplora with `--shindex` |
+| Address history via Core method names | Use Electrum/Esplora with `--sh-index` |
 | Exact Core JSON field-for-field | Best-effort |
 | Multi-user `rpcauth` / method whitelist | Future |
 
@@ -133,9 +126,9 @@ still wait for durable SH when shindex is on.
 
 | Now | Future (not v1) |
 |-----|-----------------|
-| Cookie under datadir | `rpcauth=` multi-user |
-| `--rpcuser` / `--rpcpassword` | `rpcwhitelist` |
-| Always Basic auth when listen set | `rpcallowip` / unix socket |
+| `{datadir}/rpc.sock` (filesystem) | TLS in-process / mTLS |
+| `{datadir}/rpc.token` Bearer on TCP | multi-user tokens |
+| Harness `.cookie` + Basic password==token | `rpcallowip` |
 
 ## Related
 

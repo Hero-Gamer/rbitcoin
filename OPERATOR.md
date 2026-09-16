@@ -314,15 +314,15 @@ Electrum and Esplora **require `--sh-index`**. JSON-RPC is only there so
   --network regtest \
   --no-seeds \
   --sh-index \
-  --rpc-listen 127.0.0.1:18443 \
-  --electrum-listen 127.0.0.1:50001 \
-  --esplora-listen 127.0.0.1:3000
+  --rpc \
+  --electrum-listen \
+  --esplora-listen
 ```
 
-In another terminal (cookie at `/tmp/rb-hour/.cookie`):
+In another terminal:
 
 ```bash
-./target/release/rbitcoin-cli --datadir /tmp/rb-hour --rpcport 18443 \
+./target/release/rbitcoin-cli --datadir /tmp/rb-hour --network regtest \
   generatetodescriptor 1 'raw(51)'
 
 python3 - <<'PY'
@@ -344,7 +344,8 @@ sections below and [`COMPAT.md`](./COMPAT.md).
 
 Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` flags are
 kebab-case (`--max-inbound`). Conf keys are snake_case (`max_inbound=`).
-`--rpcuser` / `--rpcpassword` match bitcoin-cli and Core `bitcoin.conf`.
+RPC auth is a unix socket (`--rpc`) or Bearer `{datadir}/rpc.token` (TCP).
+There is no `--rpcuser` / `--rpcpassword`.
 Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
 `-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
 ([`docs/core-functional.md`](docs/core-functional.md)).
@@ -377,11 +378,12 @@ Clean smoke:
 | `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
-| `--electrum-listen ADDR` | `electrum_listen=` | disabled (**requires** `--sh-index`) |
-| `--esplora-listen ADDR` | `esplora_listen=` | disabled (Esplora REST; **requires** `--sh-index`) |
+| `--electrum-listen [ADDR]` | `electrum_listen=` | disabled (**requires** `--sh-index`); omit ADDR → `127.0.0.1:50001` |
+| `--esplora-listen [ADDR]` | `esplora_listen=` | disabled (Esplora REST; **requires** `--sh-index`); omit ADDR → `127.0.0.1:3000` |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
-| `--rpc-listen ADDR` | `rpc_listen=` | disabled — Core-class JSON-RPC subset |
-| `--rpcuser` / `--rpcpassword` | `rpcuser=` / `rpcpassword=` | unset — else cookie `{datadir}/.cookie` |
+| `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
+| `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
+| `--rpc-token-file PATH` | `rpc_token_file=` | `{datadir}/rpc.token` (CSPRNG hex; TCP Bearer) |
 | `--rpc-work-queue N` | `rpc_work_queue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
 | `--min-relay-tx-fee BTC` | `min_relay_tx_fee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempool-expiry HOURS` | `mempool_expiry=` | unset — hub default; min 1 |
@@ -416,7 +418,7 @@ max_inbound=64
 mempool_size_mb=100
 ```
 
-`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `.cookie`).
+`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
 rarely-read Class A **inwit** stem (`inwit.body` + `inwit.loc`, ~486 GiB + loc
 on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
@@ -1060,18 +1062,20 @@ Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 
 ## Core-class JSON-RPC
 
-Optional HTTP JSON-RPC subset (default **off**). Auth: cookie file under
-`{datadir}/.cookie` or `--rpcuser`/`--rpcpassword`. Does **not** require
-`--sh-index` (chain/mempool/rawtx by id only). See [`docs/rpc.md`](./docs/rpc.md)
-and [`COMPAT.md`](./COMPAT.md).
+Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
+`{datadir}/rpc.sock` (filesystem auth, no HTTP header). `--rpc-listen`
+adds TCP on `127.0.0.1:<network port>` when ADDR is omitted (mainnet 8332,
+testnet 18332, signet 38332, regtest 18443). TCP auth is
+`Authorization: Bearer` from `{datadir}/rpc.token` (0600). See
+[`docs/rpc.md`](./docs/rpc.md) and [`COMPAT.md`](./COMPAT.md).
 
 ```bash
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
-  --rpc-listen 127.0.0.1:8332 \
+  --rpc \
   --log-level info
-# same datadir cookie:
+# local socket:
 rbitcoin-cli --datadir ./datadir-mainnet getblockcount
 ```
 
