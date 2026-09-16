@@ -25,6 +25,11 @@ before 1.0).
 
 ### Changed
 
+- **CRAP fail-regression (Q-55):** after the LCOV gate, `coverage-crap.sh`
+  runs `cargo crap --fail-regression` against committed
+  `crap_baseline.json` (refresh from the `crap-report` coverage artifact).
+  Still no `--fail-above 30`. [`TESTING.md`](TESTING.md).
+
 - **Compact `blocktxn` apply owns first-pass slots:** pending compact keeps
   mempool/extra/orphan hits from the initial short-id walk. `blocktxn`
   overlays only the missing indexes and does not re-query the live map, so a
