@@ -61,12 +61,63 @@ impl Query {
             .get_list(header_fk)?
             .ok_or(StoreError::Corrupt("confirm without archived body"))?;
 
-        let out = self.confirm_blocks_run(&[ConfirmPrepared {
+        let prepared = ConfirmPrepared {
             height,
             header_fk,
             tx_fks,
-        }])?;
+        };
+        let out = self.confirm_blocks_run(std::slice::from_ref(&prepared))?;
+        self.annotate_spends_for_confirmed(std::slice::from_ref(&prepared))?;
         Ok(out[0])
+    }
+
+    /// Class C-only abs-meta annotate. Wire confirm uses `post_commit` instead;
+    /// do not call from [`Self::confirm_blocks_run_with_create_pins`].
+    fn annotate_spends_for_confirmed(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
+        if !self.spend_index_enabled() {
+            return Ok(());
+        }
+        let mut abs_edges: Vec<(u64, Fk, u32, Fk, u32)> = Vec::new();
+        for item in items {
+            for &spend_fk in &item.tx_fks {
+                let (_tx, ins, _outs) = self.store.get_tx_full(spend_fk)?;
+                for (vin, inp) in ins.into_iter().enumerate() {
+                    if inp.is_coinbase() {
+                        continue;
+                    }
+                    let create_fk = if inp.create_fk.is_null() {
+                        self.store
+                            .get_fk_by_txid_tip(&inp.prev_txid)?
+                            .unwrap_or(Fk::NULL)
+                    } else {
+                        inp.create_fk
+                    };
+                    if create_fk.is_null() {
+                        continue;
+                    }
+                    let (off, len) = self.store.tx_spent_range(create_fk)?;
+                    let abs = rbitcoin_store::spent_abs(off, inp.prev_index);
+                    if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+                        > off.saturating_add(len)
+                    {
+                        return Err(StoreError::Corrupt(
+                            "invariant: confirm_block spend slot OOB",
+                        ));
+                    }
+                    abs_edges.push((abs, create_fk, inp.prev_index, spend_fk, vin as u32));
+                }
+            }
+        }
+        if abs_edges.is_empty() {
+            return Ok(());
+        }
+        let cold = self.store.put_spend_batch_by_abs_meta(&abs_edges)?;
+        if !cold.is_empty() {
+            return Err(StoreError::Corrupt(
+                "invariant: confirm_block spend annotate abs cold",
+            ));
+        }
+        Ok(())
     }
 
     /// Confirm a contiguous tip-extension run of already-archived bodies.
@@ -88,8 +139,10 @@ impl Query {
     /// # Spend annotations
     ///
     /// When `spend_index` is on, durable spend annotations land on create outputs
-    /// (schema v5+). Under Direct IBD, **confirm** batch-writes those annotations
-    /// after Class C (not archive). Tip mode assumes they are already complete.
+    /// (schema v5+). Wire confirm (`post_commit`) writes them after Class C.
+    /// [`Self::confirm_block`] does the same abs-meta annotate for the Query
+    /// Class C-only path. [`Self::confirm_blocks_run`] itself does not annotate
+    /// (the wire write stage would double-walk).
     pub fn confirm_blocks_run(&self, items: &[ConfirmPrepared]) -> Result<Vec<Fk>, QueryError> {
         self.confirm_blocks_run_with_create_pins(items, None)
     }

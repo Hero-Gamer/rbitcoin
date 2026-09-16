@@ -709,9 +709,10 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
     }
 }
 
-/// Simulate kill -9 mid Class C: strong_tx + point edges written for
-/// tip+1 but `confirmed[]` not advanced. Re-confirm must not false-positive
-/// PrevoutSpent (tip is the Class C commit point).
+/// Simulate kill -9 mid Class C: `strong_tx` written for tip+1 but
+/// `confirmed[]` not advanced. Class A does not write spend point edges
+/// (confirm `post_commit` annotates after tip). Re-confirm must not
+/// false-positive PrevoutSpent (tip is the Class C commit point).
 #[test]
 fn confirm_survives_partial_class_c_without_tip_advance() {
     use rbitcoin_consensus::{
@@ -758,23 +759,19 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     let tx_fks = q.store().header_txs.get_list(header_fk).unwrap().unwrap();
     assert!(tx_fks.len() >= 2, "coinbase + spend");
 
-    // --- Partial Class C (confirm_blocks_run writes strong before tip) ---
-    // Archive already wrote point edges (spend_index on); the kill-9 window is
-    // strong bits without confirmed[] advance — old spenders() treated that as spent.
     let first = tx_fks[0];
     q.store()
         .strong_tx
         .set_strong_range(first, tx_fks.len() as u32, header_fk)
         .unwrap();
-    // Tip intentionally NOT advanced (fence still at old tip).
     assert_eq!(q.tip_height(), Some(tip_before));
     assert!(
         q.store().strong_tx.is_strong(tx_fks[1]).unwrap(),
         "sim: spending tx marked strong without tip"
     );
     assert!(
-        !q.spenders_raw(cb1.as_byte_array(), 0).unwrap().is_empty(),
-        "archive point edge present"
+        q.spenders_raw(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "Class A does not write spend point edges"
     );
     // Best-chain spenders must ignore strong-above-tip.
     assert!(

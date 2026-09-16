@@ -240,7 +240,6 @@ pub struct ArchiveWritePlan {
     pub per_header_sw: Vec<(u32, u32)>,
     /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
     pub edges: crate::SpendEdges,
-    pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
     /// External parent identity stamped at lookup (`txid` + optional body/spent/pin).
@@ -267,7 +266,6 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             per_header_sw: Vec::new(),
             edges: crate::SpendEdges::default(),
-            spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parents: crate::U64Map::default(),
             external_parent_vouts: crate::U64Map::default(),
@@ -423,7 +421,7 @@ impl ArchiveWritePlan {
     /// Freeze plan for write batch: drop pin-staging maps and `batch_creates`.
     ///
     /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
-    /// / headers / spends / `batch_pin`). In-flight still binds from `batch_pin`.
+    /// / headers / `batch_pin`). In-flight still binds from `batch_pin`.
     /// Prep must call this (or [`Self::clear_external_parent_outs`]) before
     /// enqueue to scripts/write so batch-merge never mutates growing stamp maps.
     pub fn freeze_after_pin(&mut self) {
@@ -501,8 +499,6 @@ impl ArchiveWritePlan {
         self.per_header_ranges = new_ranges;
         self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
-        self.spends
-            .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
         self.batch_creates
             .retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
         // body_est is an upper bound; leave as-is (overestimate is safe for reserve).
@@ -531,7 +527,6 @@ impl ArchiveWritePlan {
         self.per_header_ranges.append(&mut other.per_header_ranges);
         self.per_header_sw.append(&mut other.per_header_sw);
         self.edges.extend(other.edges);
-        self.spends.append(&mut other.spends);
         self.batch_creates.append(&mut other.batch_creates);
         self.batch_pin.append(&mut other.batch_pin);
         self.index_tx |= other.index_tx;
@@ -822,8 +817,6 @@ impl Query {
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::time::Instant;
 
-        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        let archive_spends = self.writes_archive_spends();
         let index_tx = self.tx_index_enabled();
 
         let t_collect = Instant::now();
@@ -840,7 +833,7 @@ impl Query {
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
-        let mut external_parents = ext.idents;
+        let external_parents = ext.idents;
         self.confirm_stats().note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
@@ -859,14 +852,6 @@ impl Query {
         let mut external_parent_vouts: crate::U64Map<Vec<u32>> = crate::U64Map::default();
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
-        let mut batch_create_ids: crate::U64Set =
-            crate::U64Set::with_capacity_and_hasher(batch_map.len(), Default::default());
-        for fk in batch_map.values() {
-            if let Some(id) = fk.get() {
-                batch_create_ids.insert(id);
-            }
-        }
-        let mut prestamp_parents = false;
         for row in work {
             let PlanRow {
                 tx_fk,
@@ -917,16 +902,6 @@ impl Query {
                             .or_default()
                             .push(inp.prev_index);
                     }
-                    if !batch_create_ids.contains(&pid)
-                        && !external_parents.contains_key(&pid)
-                        && inp.prev_txid != [0u8; 32]
-                    {
-                        external_parents.insert(pid, crate::ParentIdent::new(inp.prev_txid));
-                        prestamp_parents = true;
-                    }
-                }
-                if archive_spends {
-                    spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                 }
                 if inp.prev_index == u32::MAX {
                     tx_edges.push(crate::SpendEdge {
@@ -968,14 +943,6 @@ impl Query {
             vouts.sort_unstable();
             vouts.dedup();
         }
-        if prestamp_parents && skeleton.is_none() {
-            crate::fill_missing_parent_ranges(
-                &self.store,
-                in_flight,
-                &mut external_parents,
-                self.confirm_stats(),
-            )?;
-        }
 
         let t_finish = Instant::now();
         let batch_creates: Vec<([u8; 32], Fk)> = packed
@@ -1007,7 +974,6 @@ impl Query {
             per_header_ranges,
             per_header_sw: Vec::new(),
             edges,
-            spends,
             batch_creates,
             external_parents,
             external_parent_vouts,
@@ -1017,7 +983,7 @@ impl Query {
         })
     }
 
-    /// **Writer / write path:** durable Class A put (body / head / spends / htxs).
+    /// **Writer / write path:** durable Class A put (body / head / htxs).
     ///
     /// **Idempotent:** headers that already have `header_txs` body are stripped
     /// (partial prior commit after structural/tip fail). If every header is
@@ -1093,12 +1059,6 @@ impl Query {
         let head_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        if !plan.spends.is_empty() {
-            self.store.put_spend_batch(&plan.spends)?;
-        }
-        let spend_ns = t.elapsed().as_nanos() as u64;
-
-        let t = Instant::now();
         if !plan.per_header_ranges.is_empty() {
             self.store
                 .header_txs
@@ -1126,7 +1086,7 @@ impl Query {
             reserve_ns,
             body_ns,
             head_ns,
-            spend_ns,
+            0,
             htxs_ns,
             n_blocks.max(1),
         );
@@ -1970,8 +1930,8 @@ mod tests {
             );
             assert_eq!(
                 q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed),
-                1,
-                "stamp_external fill_missing is enough when packed adds no new fks"
+                0,
+                "stamp_external already bound loc; finish must not fill_missing"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2790,7 +2750,6 @@ mod tests {
             (dummy_pin(3), Vec::new()),
         ];
         plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
-        plan.spends = vec![([0u8; 32], 0, Fk(1), 0), ([0u8; 32], 0, Fk(3), 0)];
         // Header 10 already has body; 20 needs body.
         let keep = plan
             .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))
@@ -2799,8 +2758,6 @@ mod tests {
         assert_eq!(plan.per_header_ranges, vec![(Fk(20), Fk(3), 1)]);
         assert_eq!(plan.planned_fks, vec![Fk(3)]);
         assert_eq!(plan.packed.len(), 1);
-        assert_eq!(plan.spends.len(), 1);
-        assert_eq!(plan.spends[0].2, Fk(3));
     }
 
     /// retain_headers edges: empty ranges, all have body, no-op full keep, null fks.

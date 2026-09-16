@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 /// | Mode | Durable `tx.head` | Durable spends | SH |
 /// |------|-------------------|----------------|-----|
 /// | [`Direct`](IndexMode::Direct) | archive live | confirm batch after Class C | Class A collect → unsorted shards → seal at tip |
-/// | [`Tip`](IndexMode::Tip) | live | archive + connect | durable write-through after bulk |
+/// | [`Tip`](IndexMode::Tip) | live | confirm batch after Class C | durable write-through after bulk |
 ///
 /// Open defaults to [`Tip`] until the node calls [`Query::enter_direct_index_mode`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,11 +30,6 @@ impl IndexMode {
     }
     pub fn is_tip(self) -> bool {
         matches!(self, Self::Tip)
-    }
-
-    /// Archive writes spend annotations in Tip when `--spendindex` is on.
-    pub fn writes_archive_spends(self, spend_index: bool) -> bool {
-        spend_index && self.is_tip()
     }
 
     /// Confirm enqueues SH write-behind in Tip when `--shindex` is on.
@@ -70,13 +65,6 @@ impl Query {
     #[inline]
     pub fn sh_index_enabled(&self) -> bool {
         self.sh_index_enabled.load(Ordering::SeqCst)
-    }
-
-    /// Archive spend writes: Tip + spend index on.
-    #[inline]
-    pub fn writes_archive_spends(&self) -> bool {
-        self.index_mode()
-            .writes_archive_spends(self.spend_index_enabled())
     }
 
     /// Confirm SH write-behind enqueue: Tip + shindex on.
@@ -410,27 +398,15 @@ mod tests {
     #[test]
     fn query_index_products_follow_mode_and_flags() {
         let (dir, q) = crate::testutil::tiny_query_labeled("q-index-products");
-        q.set_spend_index(true);
         q.set_sh_index_enabled(true);
-        assert!(
-            q.writes_archive_spends(),
-            "open default is Tip; spendindex on must write archive spends"
-        );
         assert!(
             q.enqueues_sh_writebehind(),
             "open default is Tip; shindex on must enqueue SH write-behind"
         );
-        q.set_spend_index(false);
         q.set_sh_index_enabled(false);
-        assert!(!q.writes_archive_spends());
         assert!(!q.enqueues_sh_writebehind());
-        q.set_spend_index(true);
         q.set_sh_index_enabled(true);
         q.enter_direct_index_mode().unwrap();
-        assert!(
-            !q.writes_archive_spends(),
-            "Direct must not write archive spends even with spendindex on"
-        );
         assert!(
             !q.enqueues_sh_writebehind(),
             "Direct must not enqueue SH write-behind even with shindex on"

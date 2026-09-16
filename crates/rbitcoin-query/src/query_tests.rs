@@ -2215,9 +2215,6 @@ fn index_mode_helpers_and_batch_helpers() {
     assert!(IndexMode::Direct.is_direct());
     assert!(!IndexMode::Direct.is_tip());
     assert!(IndexMode::Tip.is_tip());
-    assert!(!IndexMode::Direct.writes_archive_spends(true));
-    assert!(IndexMode::Tip.writes_archive_spends(true));
-    assert!(!IndexMode::Tip.writes_archive_spends(false));
     assert!(!IndexMode::Direct.enqueues_sh_writebehind(true));
     assert!(IndexMode::Tip.enqueues_sh_writebehind(true));
     assert!(!IndexMode::Tip.enqueues_sh_writebehind(false));
