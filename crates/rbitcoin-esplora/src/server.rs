@@ -205,6 +205,8 @@ fn path_never_pins(path: &str) -> bool {
         ["mempool"]
             | ["mempool", _]
             | ["fee-estimates"]
+            | ["fees", "recommended"]
+            | ["v1", "fees", "recommended"]
             | ["tx"]
             | ["txs", "package"]
             | ["address", _, "txs", "mempool"]
@@ -483,6 +485,8 @@ pub async fn run_esplora(
         .route("/mempool/txids", get(handlers::mempool_txids))
         .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
+        .route("/fees/recommended", get(handlers::fees_recommended))
+        .route("/v1/fees/recommended", get(handlers::fees_recommended))
         .fallback(fallback_404)
         // Outer → inner: concurrency → body → timeout → meter → chain-view stamp.
         .layer(middleware::from_fn_with_state(
@@ -1483,6 +1487,17 @@ mod tests {
         assert_eq!(st, 200, "{body}");
         let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(fees.get("1").is_some());
+
+        let (st, body) = http_get(addr, "/fees/recommended").await;
+        assert_eq!(st, 200, "{body}");
+        let rec: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(rec.get("fastestFee").is_some(), "{body}");
+        assert!(rec.get("halfHourFee").is_some(), "{body}");
+        assert!(rec.get("hourFee").is_some(), "{body}");
+        assert!(rec.get("economyFee").is_some(), "{body}");
+        assert!(rec.get("minimumFee").is_some(), "{body}");
+        let (st, body) = http_get(addr, "/v1/fees/recommended").await;
+        assert_eq!(st, 200, "{body}");
 
         // POST /tx without hub
         let mut stream = TcpStream::connect(addr).await.unwrap();

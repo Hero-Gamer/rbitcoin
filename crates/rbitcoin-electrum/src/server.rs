@@ -22,8 +22,8 @@ use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 const PROTOCOL_MIN: &str = "1.4";
-const PROTOCOL_MAX: &str = "1.4.2";
-// Dialect version: trailing `asof:<blockhash>`. Not a dotted-int; `protocol_max` stays 1.4.2.
+const PROTOCOL_MAX: &str = "1.6";
+// Dialect version: trailing `asof:<blockhash>`. Not a dotted-int; `protocol_max` stays 1.6.
 const PROTOCOL_ASOF: &str = "1.4.2-asof";
 /// First `server.version` element. Cake Wallet `getNodeIsElectrs()` requires
 /// this string (lowercased) to contain `electrs` before it will probe
@@ -341,6 +341,8 @@ struct ElectrumConn {
     header_sub: bool,
     sh_subs: HashSet<[u8; 32]>,
     sh_join: Option<ShJoinSlot>,
+    outpoint_subs: HashSet<([u8; 32], u32)>,
+    sp_sub: Option<crate::silent_scan::SpSub>,
 }
 
 impl ElectrumConn {
@@ -350,6 +352,8 @@ impl ElectrumConn {
             header_sub: false,
             sh_subs: HashSet::new(),
             sh_join: None,
+            outpoint_subs: HashSet::new(),
+            sp_sub: None,
         }
     }
 }
@@ -402,6 +406,25 @@ where
                                 "params": [{ "hex": t.header_hex, "height": t.height }]
                             });
                             write_line(&mut writer, &msg).await?;
+                        }
+                        if !conn.outpoint_subs.is_empty() {
+                            emit_outpoint_notes(
+                                &mut writer,
+                                &query,
+                                mempool.as_deref(),
+                                &conn.outpoint_subs,
+                            )
+                            .await?;
+                        }
+                        if let Some(sub) = conn.sp_sub.as_ref() {
+                            emit_sp_tip(
+                                &mut writer,
+                                &query,
+                                &params,
+                                sub,
+                                t.height,
+                            )
+                            .await?;
                         }
                         if !conn.sh_subs.is_empty() {
                             let heights = if t.reorg_from_height.is_some() {
@@ -535,6 +558,19 @@ where
                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                 let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                 let params_v = req.get("params").cloned().unwrap_or(json!([]));
+                if method == "blockchain.silentpayments.subscribe" {
+                    serve_sp_subscribe(
+                        &mut writer,
+                        &query,
+                        &params,
+                        &peer,
+                        id,
+                        &params_v,
+                        &mut conn,
+                    )
+                    .await?;
+                    continue;
+                }
                 if method == "blockchain.tweaks.subscribe" {
                     serve_tweaks_subscribe(
                         &mut reader,
@@ -576,6 +612,8 @@ where
                         header_sub: conn.header_sub,
                         sh_subs: conn.sh_subs.clone(),
                         sh_join: conn.sh_join.take(),
+                        outpoint_subs: conn.outpoint_subs.clone(),
+                        sp_sub: conn.sp_sub.clone(),
                     };
                     let stamp = method_stamps_chain_tip(&method_owned);
                     match tokio::task::spawn_blocking(move || {
@@ -680,6 +718,102 @@ where
 /// Tweaks stream: JSON-RPC result = first height, then one notify per
 /// following height, then `{"message":"done"}`. Honor `count` through tip.
 /// Answer `server.ping` while computing.
+async fn serve_sp_subscribe<W>(
+    writer: &mut W,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    peer: &SocketAddr,
+    id: Value,
+    params_v: &Value,
+    conn: &mut ElectrumConn,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let tip = query.tip_height().map(|h| h.0);
+    let sub = match crate::silent_scan::parse_sub(params_v, chain.network, tip) {
+        Ok(s) => s,
+        Err(e) => {
+            write_line(
+                writer,
+                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let result = crate::silent_scan::subscribe_result(&sub);
+    rbitcoin_log::api_call(
+        "electrum",
+        &peer.to_string(),
+        "blockchain.silentpayments.subscribe",
+        &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+        0,
+        None,
+    );
+    write_line(writer, &rpc_result(&id, &result, None)).await?;
+    let last = tip.unwrap_or(sub.start);
+    let hits =
+        crate::silent_scan::scan_hits(query, chain, &sub, sub.start, last).unwrap_or_default();
+    let note = json!({
+        "jsonrpc": "2.0",
+        "method": "blockchain.silentpayments.subscribe",
+        "params": {
+            "subscription": result,
+            "progress": 1.0,
+            "history": hits,
+        }
+    });
+    write_line(writer, &note).await?;
+    conn.sp_sub = Some(sub);
+    Ok(())
+}
+
+async fn emit_sp_tip<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    query: &Query,
+    chain: &ChainParams,
+    sub: &crate::silent_scan::SpSub,
+    height: u32,
+) -> Result<(), std::io::Error> {
+    let hits = crate::silent_scan::scan_hits(query, chain, sub, height, height).unwrap_or_default();
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let note = json!({
+        "jsonrpc": "2.0",
+        "method": "blockchain.silentpayments.subscribe",
+        "params": {
+            "subscription": crate::silent_scan::subscribe_result(sub),
+            "progress": 1.0,
+            "history": hits,
+        }
+    });
+    write_line(writer, &note).await
+}
+
+async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    subs: &HashSet<([u8; 32], u32)>,
+) -> Result<(), std::io::Error> {
+    for &(txid, vout) in subs {
+        let params = json!([txid_hex(&txid), vout]);
+        let Ok(status) = outpoint_status(query, mempool, &params) else {
+            continue;
+        };
+        let note = json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.outpoint.subscribe",
+            "params": [txid_hex(&txid), vout, status],
+        });
+        write_line(writer, &note).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // matches handle_client call-site
 async fn serve_tweaks_subscribe<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1150,6 +1284,8 @@ fn dispatch(
         header_sub: *header_sub,
         sh_subs: std::mem::take(sh_subs),
         sh_join: None,
+        outpoint_subs: HashSet::new(),
+        sp_sub: None,
     };
     let r = dispatch_with_join(method, params, query, config, chain, mempool, &mut conn);
     *header_sub = conn.header_sub;
@@ -1257,18 +1393,19 @@ fn dispatch_pinned(
         "blockchain.block.headers" => {
             let start = param_u32(params, 0)?;
             let count = param_u32(params, 1)?.min(2016);
-            let mut hexes = String::new();
-            let mut n = 0u32;
+            let mut hexes = Vec::new();
             for h in start..start.saturating_add(count) {
                 match query.wire_header_at_height(Height(h)) {
-                    Ok(hdr) => {
-                        hexes.push_str(&header_hex(&hdr));
-                        n += 1;
-                    }
+                    Ok(hdr) => hexes.push(header_hex(&hdr)),
                     Err(_) => break,
                 }
             }
-            Ok(json!({"count": n, "hex": hexes, "max": 2016}))
+            let n = hexes.len() as u32;
+            if protocol_ge_1_6(&protocol) {
+                Ok(json!({"count": n, "headers": hexes, "max": 2016}))
+            } else {
+                Ok(json!({"count": n, "hex": hexes.concat(), "max": 2016}))
+            }
         }
         "blockchain.scripthash.get_history" => {
             let (params, asof) = if pinned.is_some() {
@@ -1517,6 +1654,85 @@ fn dispatch_pinned(
             let _ = chain.network;
             Ok(json!(format!("{}", r.txid)))
         }
+        "blockchain.transaction.broadcast_package" => {
+            let arr = params
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
+            let verbose = params
+                .as_array()
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut txs = Vec::with_capacity(arr.len());
+            let mut total_hex = 0usize;
+            for h in arr {
+                let raw_hex = h
+                    .as_str()
+                    .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
+                total_hex = total_hex.saturating_add(raw_hex.len());
+                if total_hex > config.max_broadcast_hex {
+                    return Err("package hex too large".into());
+                }
+                let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
+                if raw.len() > 4_000_000 {
+                    return Err("transaction too large".into());
+                }
+                let tx: bitcoin::Transaction =
+                    bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
+                txs.push(tx);
+            }
+            let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
+            let accepted = mp
+                .accept_package(&txs)
+                .map_err(|e| format!("broadcast_package reject: {e}"))?;
+            if verbose {
+                let mut tx_results = serde_json::Map::new();
+                for r in &accepted {
+                    tx_results.insert(
+                        r.txid.to_string(),
+                        json!({"txid": r.txid.to_string(), "allowed": true}),
+                    );
+                }
+                Ok(json!({
+                    "package_msg": "success",
+                    "tx-results": tx_results,
+                }))
+            } else {
+                Ok(json!("success"))
+            }
+        }
+        "mempool.get_info" => {
+            let min = MempoolHub::relay_fee_btc_per_kb();
+            let unbroadcast = mempool.map(|m| m.unbroadcast_count()).unwrap_or(0);
+            Ok(json!({
+                "minrelaytxfee": min,
+                "mempoolminfee": min,
+                "incrementalrelayfee": min,
+                "unbroadcastcount": unbroadcast,
+            }))
+        }
+        "blockchain.outpoint.get_status" => outpoint_status(query, mempool, params),
+        "blockchain.outpoint.subscribe" => {
+            let (txid, vout) = param_outpoint(params)?;
+            conn.outpoint_subs.insert((txid, vout));
+            outpoint_status(query, mempool, params)
+        }
+        "blockchain.outpoint.unsubscribe" => {
+            let (txid, vout) = param_outpoint(params)?;
+            Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
+        }
+        "blockchain.silentpayments.subscribe" => {
+            let tip = query.tip_height().map(|h| h.0);
+            let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+            Ok(crate::silent_scan::subscribe_result(&sub))
+        }
+        "blockchain.silentpayments.unsubscribe" => {
+            let tip = query.tip_height().map(|h| h.0);
+            let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+            Ok(json!(sub.address))
+        }
         "blockchain.transaction.id_from_pos" => {
             let height = param_u32(params, 0)?;
             let tx_pos = param_u32(params, 1)? as usize;
@@ -1622,6 +1838,59 @@ fn protocol_tuple(s: &str) -> Option<Vec<u32>> {
         return None;
     }
     s.split('.').map(|p| p.parse().ok()).collect()
+}
+
+fn protocol_ge_1_6(protocol: &str) -> bool {
+    match protocol_tuple(protocol) {
+        Some(v) => v.first() == Some(&1) && v.get(1).copied().unwrap_or(0) >= 6,
+        None => false,
+    }
+}
+
+fn param_outpoint(params: &Value) -> Result<([u8; 32], u32), String> {
+    let txid = param_txid(params, 0)?;
+    let vout = param_u32(params, 1)?;
+    Ok((txid, vout))
+}
+
+fn outpoint_status(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    params: &Value,
+) -> Result<Value, String> {
+    let (txid, vout) = param_outpoint(params)?;
+    if query
+        .is_outpoint_spent(&txid, vout)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(json!({
+            "txid": txid_hex(&txid),
+            "vout": vout,
+            "spent": true,
+            "height": query.tip_height().map(|h| h.0).unwrap_or(0),
+        }));
+    }
+    if let Some(mp) = mempool {
+        use bitcoin::hashes::Hash;
+        let op = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid),
+            vout,
+        };
+        if let Some(spend) = mp.spending_txid(&op) {
+            return Ok(json!({
+                "txid": txid_hex(&txid),
+                "vout": vout,
+                "spent": true,
+                "height": 0,
+                "spending_txid": format!("{spend}"),
+            }));
+        }
+    }
+    Ok(json!({
+        "txid": txid_hex(&txid),
+        "vout": vout,
+        "spent": false,
+    }))
 }
 
 fn protocol_string(parts: &[u32]) -> String {

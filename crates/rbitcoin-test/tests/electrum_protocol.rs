@@ -316,7 +316,7 @@ async fn electrum_server_version_history_balance() {
 
     let v = rpc(&mut stream, 4, "server.features", json!([])).await;
     assert!(v["result"]["genesis_hash"].as_str().is_some());
-    assert_eq!(v["result"]["protocol_max"].as_str(), Some("1.4.2"));
+    assert_eq!(v["result"]["protocol_max"].as_str(), Some("1.6"));
     assert_eq!(v["result"]["silent_payments"], json!([0]));
     assert_eq!(v["result"]["tweaks"], json!(true));
     assert_eq!(v["result"]["asof"], json!(true));

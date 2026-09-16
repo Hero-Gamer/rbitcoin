@@ -2,12 +2,14 @@
 //!
 //! libsecp256k1 has a `silentpayments` C module; rust-secp256k1 0.29 (bitcoin
 //! 0.32) does not bind it. This module uses `PublicKey::combine_keys` +
-//! `mul_tweak` plus script extract. We never take a scan private key.
+//! `mul_tweak` plus script extract. Tweak *index* never stores a scan key.
+//! Frigate `blockchain.silentpayments.subscribe` may pass a scan private key
+//! in RAM for the session only.
 
 use bitcoin::hashes::{hash160, sha256, Hash, HashEngine};
 use bitcoin::key::{Parity, XOnlyPublicKey};
 use bitcoin::script::{Instruction, Script};
-use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1};
+use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, Transaction, TxOut, Witness};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -431,6 +433,37 @@ fn input_hash_mul_a(tx: &Transaction, a: &PublicKey) -> Option<[u8; 33]> {
     Some(tweaked.serialize())
 }
 
+/// BIP-352 `P_k = B_spend + t_k·G` for tweak `A` and integer `k`.
+pub fn taproot_matches_scan(
+    tweak_compressed: &[u8; 33],
+    output_xonly: &[u8; 32],
+    scan_sk: &SecretKey,
+    spend_pk: &PublicKey,
+    k: u32,
+) -> bool {
+    let Ok(a) = PublicKey::from_slice(tweak_compressed) else {
+        return false;
+    };
+    let Ok(scan_scalar) = Scalar::from_be_bytes(scan_sk.secret_bytes()) else {
+        return false;
+    };
+    let Ok(shared) = a.mul_tweak(secp(), &scan_scalar) else {
+        return false;
+    };
+    let mut payload = [0u8; 37];
+    payload[..33].copy_from_slice(&shared.serialize());
+    payload[33..].copy_from_slice(&k.to_be_bytes());
+    let t = tagged_hash(b"BIP0352/SharedSecret", &payload);
+    let Ok(tk) = SecretKey::from_slice(&t) else {
+        return false;
+    };
+    let tg = PublicKey::from_secret_key(secp(), &tk);
+    let Ok(p) = PublicKey::combine_keys(&[spend_pk, &tg]) else {
+        return false;
+    };
+    p.x_only_public_key().0.serialize() == *output_xonly
+}
+
 fn tagged_hash(tag: &[u8], payload: &[u8]) -> [u8; 32] {
     let tagh = sha256::Hash::hash(tag);
     let mut eng = sha256::Hash::engine();
@@ -632,6 +665,7 @@ mod tests {
     use bitcoin::consensus::encode::deserialize;
     use bitcoin::hashes::Hash;
     use bitcoin::script::ScriptBuf;
+    use bitcoin::secp256k1::SecretKey;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, Sequence, TxIn};
     use rbitcoin_query::testutil::FixtureChain;
@@ -639,6 +673,14 @@ mod tests {
     use rbitcoin_store::{HeaderRecord, TxRecord};
     use serde_json::Value;
     use std::str::FromStr;
+    #[test]
+    fn taproot_matches_scan_rejects_invalid_tweak() {
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(secp(), &sk);
+        assert!(!taproot_matches_scan(&[0u8; 33], &[0u8; 32], &sk, &pk, 0));
+        assert!(!taproot_matches_scan(&[2u8; 33], &[0u8; 32], &sk, &pk, 7));
+    }
+
     fn hex_bytes(s: &str) -> Vec<u8> {
         rbitcoin_primitives::hex_decode(s).expect("hex")
     }
@@ -765,6 +807,40 @@ mod tests {
                             got.map(|g| rbitcoin_primitives::hex_encode(g.tweak))
                         );
                         n += 1;
+                    }
+                }
+                let unlabeled = given["labels"]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true);
+                if unlabeled {
+                    if let Some(scan_hex) = given["key_material"]["scan_priv_key"].as_str() {
+                        if let Some(tweak_hex) = expected["tweak"].as_str() {
+                            let scan = SecretKey::from_slice(&hex_bytes(scan_hex)).unwrap();
+                            let spend_sk = SecretKey::from_slice(&hex_bytes(
+                                given["key_material"]["spend_priv_key"].as_str().unwrap(),
+                            ))
+                            .unwrap();
+                            let spend_pk = PublicKey::from_secret_key(secp(), &spend_sk);
+                            let mut tw = [0u8; 33];
+                            tw.copy_from_slice(&hex_bytes(tweak_hex));
+                            if let Some(outs) = expected["outputs"].as_array() {
+                                for o in outs {
+                                    let Some(pk) = o["pub_key"].as_str() else {
+                                        continue;
+                                    };
+                                    let mut x = [0u8; 32];
+                                    x.copy_from_slice(&hex_bytes(pk));
+                                    assert!(
+                                        (0u32..8).any(|k| {
+                                            taproot_matches_scan(&tw, &x, &scan, &spend_pk, k)
+                                        }),
+                                        "scan miss {comment}"
+                                    );
+                                    n += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }

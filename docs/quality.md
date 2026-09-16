@@ -25,7 +25,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | Rank | ID | Item | Done looks like |
 |-----:|----|------|-----------------|
 | 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation. **71 run / 196 skip** (20 `rpc-missing`, 18 `core-log`, 68 `no-wallet`). COMPAT leftovers are `rpc-dialect`, not `rpc-missing`. Next `run`: `p2p_permissions`. `mempool_accept` stays skip (`policy-libre`). Unlabeled PRs stay cargo-only. Owner: [`core-functional.md`](./core-functional.md). |
-| 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Packages today are RPC `submitpackage` / Esplora `POST /txs/package` only. Then Electrum 1.6 then 1.7 (`protocol_max` bump in the same work) — [`COMPAT.md`](../COMPAT.md). |
+| 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Local packages: RPC `submitpackage`, Esplora `POST /txs/package`, Electrum 1.6 `broadcast_package`. `protocol_max` is **1.6**; 1.7 `scriptpubkey.*` still missing. |
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
 | 5 | **Q-54** | ast-grep named-cap rules | One rule per easy-to-delete cap from [`ibd-memory.md`](./ibd-memory.md): `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each has `lint/ast-grep/fixtures/{good,bad}/`. Today **four** structural rules, **zero** cap rules. |
@@ -33,7 +33,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 7 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
-**R-11+**. Next unused Q-id is **Q-63**.
+**R-11+**. Next unused Q-id is **Q-66**.
 
 Close work by **moving the Open row into CHANGELOG** in the same edit as
 the landing change (do not grow a Completed museum here). New item: insert
@@ -68,6 +68,17 @@ at an explicit rank with **Q-63+**.
 Coverage theater (chasing 100% lines), rewriting secp/rust-bitcoin/tokio
 “to reduce deps”, Core-complete RPC, and explorer-search APIs are also
 not Open.
+
+### Parked (not now; promote to Open with a rank to revisit)
+
+Wallet-backing extras from the 2026-09 node survey. Not Won't-fix forever —
+just not the current product. COMPAT/OPERATOR stay the shipped contract.
+
+| ID | Item | Why parked | Reopen when |
+|----|------|------------|-------------|
+| **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
+| **Q-64** | GBT longpoll / `waitNext` (then Sv2 template provider) | Opt-in `getblocktemplate` + Esplora `/block-template` with 15 s cache is the mining extra. No stratum/pool. | DATUM / Bitaxe / mkpool users need push templates; IPC mining interface is the Core shape. |
+| **Q-65** | BIP157/158 compact block filters (`peerblockfilters` / `getblockfilter`) | Electrum + Esplora (exact scripthash) is the wallet path. P2P filter short IDs stay decode-reject (`COMPAT.md`). | Neutrino / LDK-node on *this* node without handing every address to Electrum. |
 
 ---
 

@@ -1104,6 +1104,41 @@ pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     spawn_join(move || fee_estimates_sync(&st)).await
 }
 
+pub async fn fees_recommended(State(st): State<AppState>) -> Response {
+    spawn_join(move || fees_recommended_sync(&st)).await
+}
+
+fn sat_vb_for_target(pairs: &[(u32, f64)], target: u32) -> u32 {
+    pairs
+        .iter()
+        .find(|(t, _)| *t == target)
+        .map(|(_, btc_kb)| {
+            let sat_vb = if *btc_kb < 0.0 {
+                1.0
+            } else {
+                *btc_kb * 100_000.0
+            };
+            sat_vb.round().max(1.0) as u32
+        })
+        .unwrap_or(1)
+}
+
+fn fees_recommended_sync(st: &AppState) -> Response {
+    let pairs: Vec<(u32, f64)> = st
+        .mempool
+        .as_ref()
+        .map(|m| m.fee_estimates_btc_per_kb())
+        .unwrap_or_default();
+    Json(json!({
+        "fastestFee": sat_vb_for_target(&pairs, 1),
+        "halfHourFee": sat_vb_for_target(&pairs, 3),
+        "hourFee": sat_vb_for_target(&pairs, 6),
+        "economyFee": sat_vb_for_target(&pairs, 144),
+        "minimumFee": 1,
+    }))
+    .into_response()
+}
+
 fn fee_estimates_sync(st: &AppState) -> Response {
     let mut obj = serde_json::Map::new();
     let pairs: Vec<(u32, f64)> = st
@@ -1322,7 +1357,7 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
 
 #[cfg(test)]
 mod pure_helper_tests {
-    use super::{block_summary_json, outspend_json, resolve_address_sh};
+    use super::{block_summary_json, outspend_json, resolve_address_sh, sat_vb_for_target};
     use bitcoin::Network;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::testutil::FixtureChain;
@@ -1369,6 +1404,14 @@ mod pure_helper_tests {
         };
         let _ = q.connect_block(Height(0), &header, &[ta]).unwrap();
         hash
+    }
+
+    #[test]
+    fn sat_vb_for_target_negative_positive_and_missing() {
+        assert_eq!(sat_vb_for_target(&[], 1), 1);
+        assert_eq!(sat_vb_for_target(&[(1, -1.0)], 1), 1);
+        assert_eq!(sat_vb_for_target(&[(1, 0.00002)], 1), 2);
+        assert_eq!(sat_vb_for_target(&[(6, 0.00005)], 1), 1);
     }
 
     #[test]
