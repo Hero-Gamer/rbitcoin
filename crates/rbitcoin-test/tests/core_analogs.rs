@@ -199,6 +199,10 @@ fn pin_restart_catchup_then_tip_purge(
             w.arch_write_spend_ns, 0,
             "Class A must not put_spend_batch; spentness is post_commit abs-meta"
         );
+        assert_eq!(
+            w.fill_missing_n, 0,
+            "lookup stamp already bound parent loc; finish must not fill_missing"
+        );
         let same_coin = chain.blocks[2].txdata[0].compute_txid();
         let parent_coin = chain.blocks[4].txdata[0].compute_txid();
         assert!(

@@ -1953,8 +1953,8 @@ mod tests {
             );
             assert_eq!(
                 q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed),
-                1,
-                "stamp_external fill_missing is enough when packed adds no new fks"
+                0,
+                "stamp_external already bound loc; finish must not fill_missing"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
