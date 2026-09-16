@@ -1622,7 +1622,7 @@ fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
 const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
 
 /// One-line 18/19→20 index refuse (`Store::open` + tests).
-const SCHEMA20_INDEX_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)";
+const SCHEMA20_INDEX_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)";
 
 /// Occupied schema ≤21 Class A (spent slot layout / no vin pack).
 const SCHEMA22_CLASS_A_REFUSE: &str =

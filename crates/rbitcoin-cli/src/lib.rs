@@ -64,37 +64,57 @@ fn take_value(args: &[OsString], i: &mut usize, flag: &str) -> Result<String, St
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn flag_name_and_eq(raw: &str) -> Option<(&str, Option<&str>)> {
+    let rest = raw.strip_prefix("--")?;
+    match rest.split_once('=') {
+        Some((name, val)) => Some((name, Some(val))),
+        None => Some((rest, None)),
+    }
+}
+
 fn parse_args(args: &[OsString]) -> Result<Action, String> {
     let mut cfg = CliConfig::default();
     let mut i = 1usize;
     while i < args.len() {
         let a = args[i].to_string_lossy();
-        match a.as_ref() {
-            "--help" | "-h" => return Ok(Action::Help),
-            "--version" | "-V" => return Ok(Action::Version),
-            "--datadir" | "-datadir" => {
-                cfg.datadir = Some(PathBuf::from(take_value(args, &mut i, "--datadir")?));
+        if a == "--help" || a == "-h" {
+            return Ok(Action::Help);
+        }
+        if a == "--version" || a == "-V" {
+            return Ok(Action::Version);
+        }
+        if a.starts_with('-') && !a.starts_with("--") {
+            return Err(format!("unknown argument `{a}`"));
+        }
+        if let Some((name, eq)) = flag_name_and_eq(a.as_ref()) {
+            let val = match eq {
+                Some(v) => {
+                    if v.is_empty() {
+                        return Err(format!("--{name} requires a value"));
+                    }
+                    v.to_string()
+                }
+                None => take_value(args, &mut i, &format!("--{name}"))?,
+            };
+            match name {
+                "datadir" => cfg.datadir = Some(PathBuf::from(val)),
+                "rpcconnect" => cfg.rpcconnect = val,
+                "rpcport" => {
+                    cfg.rpcport = val
+                        .parse()
+                        .map_err(|_| format!("invalid --rpcport {val}"))?;
+                }
+                "rpcuser" => cfg.rpcuser = Some(val),
+                "rpcpassword" => cfg.rpcpassword = Some(val),
+                other => return Err(format!("unknown argument `--{other}`")),
             }
-            "--rpcconnect" | "-rpcconnect" => {
-                cfg.rpcconnect = take_value(args, &mut i, "--rpcconnect")?;
-            }
-            "--rpcport" | "-rpcport" => {
-                let v = take_value(args, &mut i, "--rpcport")?;
-                cfg.rpcport = v.parse().map_err(|_| format!("invalid --rpcport {v}"))?;
-            }
-            "--rpcuser" | "-rpcuser" => {
-                cfg.rpcuser = Some(take_value(args, &mut i, "--rpcuser")?);
-            }
-            "--rpcpassword" | "-rpcpassword" => {
-                cfg.rpcpassword = Some(take_value(args, &mut i, "--rpcpassword")?);
-            }
-            flag if flag.starts_with('-') => {
-                return Err(format!("unknown argument `{flag}`"));
-            }
-            _ if cfg.command.is_none() => {
-                cfg.command = Some(a.into_owned());
-            }
-            _ => cfg.params.push(a.into_owned()),
+            i += 1;
+            continue;
+        }
+        if cfg.command.is_none() {
+            cfg.command = Some(a.into_owned());
+        } else {
+            cfg.params.push(a.into_owned());
         }
         i += 1;
     }
@@ -348,6 +368,24 @@ mod tests {
         assert!(exit_ok(cli_main(["rbitcoin-cli", "--help"])));
         assert!(exit_ok(cli_main(["rbitcoin-cli", "-V"])));
         assert!(exit_ok(cli_main(["rbitcoin-cli", "help"])));
+    }
+
+    #[test]
+    fn equals_form_datadir_is_accepted() {
+        let dir = tmp_datadir();
+        std::fs::write(dir.join(".cookie"), "__cookie__:s3cret").unwrap();
+        let (port, h) = spawn_rpc_mock("__cookie__", "s3cret", "0");
+        let flag = format!("--datadir={}", dir.display());
+        let code = cli_main([
+            "rbitcoin-cli",
+            flag.as_str(),
+            "--rpcconnect=127.0.0.1",
+            &format!("--rpcport={port}"),
+            "getblockcount",
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(exit_ok(code), "--foo=bar form must parse, got {code:?}");
+        let _ = h.join();
     }
 
     #[test]

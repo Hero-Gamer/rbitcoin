@@ -310,7 +310,7 @@ struct OvfL1 {
 }
 
 const SH_L1_FROZEN_WARN: &str =
-    "scripthash ovf L1 MPHF is frozen; wipe store/scripthash* and rematerialize (--shindex)";
+    "scripthash ovf L1 MPHF is frozen; wipe store/scripthash* and rematerialize (--sh-index)";
 
 /// How `scripthash.body` is oriented on disk (schema 17 variant).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,7 +342,7 @@ fn sh_body_layout_wipe_msg() -> String {
 }
 
 /// Leftover single-file `scripthash.body` (schema 17 Shared).
-pub const INDEX_REFUSE_SHARED_SH_BODY: &str = "index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)";
+pub const INDEX_REFUSE_SHARED_SH_BODY: &str = "index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)";
 
 /// Detect directory SH body. File (Shared) leftovers refuse.
 pub fn detect_sh_body_layout(dir: &Path) -> Result<ShBodyLayout, StoreError> {
@@ -504,7 +504,7 @@ fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
 fn leftover_oa_wipe_msg() -> String {
     "scripthash leftover live OA index; wipe store/scripthash* (head, body, ovf, \
      runs, include_hwm, cold_progress, main_sealed, oa_stub) and rematerialize \
-     (--shindex rebuilds on start)"
+     (--sh-index rebuilds on start)"
         .into()
 }
 

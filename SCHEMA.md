@@ -17,7 +17,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
 `spent.off` and leftover `*.idx`. A 23 binary refuses 24 `meta`. Occupied schema
 18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
 dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 24; `tx.head` rebuilds
-from Class A; SH rematerializes with `--shindex`. An 19 binary refuses 20+
+from Class A; SH rematerializes with `--sh-index`. An 19 binary refuses 20+
 `meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
 Class A is **refused**. Empty 17 indexes rewrite `meta` to 24.
 
@@ -57,7 +57,7 @@ head rebuild cannot trip the refuse). Occupied 17 Class A with creates is the
 schema-22 Class A refuse (not an index wipe).  
 **18/19→22 open:** Occupied Class A with creates is the schema-22 Class A refuse.
 If Class A is empty and `tx.head` occupancy or any `scripthash*` data exists:
-`schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)`.
+`schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)`.
 Empty 18/19 indexes rewrite `meta` to 24 **before** `ScriptHashTable::open` /
 `TxTable::open`. `meta=22` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
 **18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
@@ -65,11 +65,11 @@ A **20** binary refuses leftover pack8 Paged (mode 10).
 **Schema-20 leftover index layouts (empty Class A, occupied `meta=20`):** fuse8 **v1**, flat `tx.head.meta`, flat `*.idx.meta`, Shared file `scripthash.body`, and pack8 **Paged** (mode 10) **refuse** (no always-probe, no rename, no Shared read). Occupied 20 Class A with creates is the schema-22 Class A refuse. Errors:
 
 ```text
-index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)
+index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)
 index refuses flat tx.head.meta; wipe store/tx.head then restart (Class A kept; tx.head rebuilds)
 index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNNN segments) then restart (Class A kept)
-index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
-index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
+index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
+index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
 **21→22 open:** occupied Class A with creates:
 `schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.

@@ -143,7 +143,7 @@ impl ShHeadValue {
 }
 
 /// Leftover pack8 mode 10 (schema-18 Paged megakey).
-pub const INDEX_REFUSE_PAGED_SH: &str = "index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)";
+pub const INDEX_REFUSE_PAGED_SH: &str = "index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)";
 
 const SH8_MODE_SHIFT: u32 = 62;
 const SH8_OFF_MASK: u64 = (1u64 << 40) - 1;

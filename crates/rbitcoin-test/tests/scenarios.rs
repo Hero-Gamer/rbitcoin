@@ -291,7 +291,7 @@ fn node_cli_and_surface_smoke() {
         "127.0.0.1:0",
         "--connect",
         "127.0.0.1:1",
-        "--shindex",
+        "--sh-index",
         "--electrum-listen",
         "127.0.0.1:0",
         "--inhibit-suspend",

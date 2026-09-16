@@ -393,13 +393,13 @@ impl NodeConfig {
         }
         if self.listen.electrum.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "electrum-listen requires shindex=1 (--shindex); Electrum history needs Class B scripthash"
+                "electrum-listen requires sh_index=1 (--sh-index); Electrum history needs Class B scripthash"
                     .into(),
             ));
         }
         if self.listen.esplora.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "esplora-listen requires shindex=1 (--shindex); Esplora history needs Class B scripthash"
+                "esplora-listen requires sh_index=1 (--sh-index); Esplora history needs Class B scripthash"
                     .into(),
             ));
         }
@@ -592,18 +592,18 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?,
                 );
             }
-            "shindex" => {
+            "sh_index" => {
                 self.shindex = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf shindex: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
             }
-            "sptweaks" => {
+            "sp_tweaks" => {
                 self.sptweaks = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf sptweaks: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sp_tweaks: {e}")))?;
             }
-            "sptweaks_dust" => {
+            "sp_tweaks_dust" => {
                 self.sptweaks_dust = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf sptweaks_dust: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sp_tweaks_dust: {e}")))?;
             }
             "max_sh_creates" => {
                 self.max_sh_creates = val
@@ -946,6 +946,27 @@ mod tests {
             ConfApply::Unknown(k) => assert_eq!(k, "maxshcreates"),
             other => panic!("{other:?}"),
         }
+        match c.apply_kv("shindex", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "shindex"),
+            other => panic!("{other:?}"),
+        }
+        match c.apply_kv("sptweaks", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "sptweaks"),
+            other => panic!("{other:?}"),
+        }
+        match c.apply_kv("sptweaks_dust", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "sptweaks_dust"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.apply_kv("sh_index", "1").unwrap(), ConfApply::Applied);
+        assert!(c.shindex);
+        assert_eq!(c.apply_kv("sp_tweaks", "1").unwrap(), ConfApply::Applied);
+        assert!(c.sptweaks);
+        assert_eq!(
+            c.apply_kv("sp_tweaks_dust", "546").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.sptweaks_dust, 546);
         assert_eq!(c.max_sh_creates, 100);
         let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
         assert!(
@@ -1383,8 +1404,8 @@ mod tests {
         cfg.shindex = false;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("shindex"),
-            "expected shindex requirement, got {err}"
+            err.contains("sh_index") || err.contains("--sh-index"),
+            "expected sh-index requirement, got {err}"
         );
     }
 
@@ -1394,7 +1415,10 @@ mod tests {
         cfg.listen.esplora = Some("127.0.0.1:3000".parse().unwrap());
         cfg.shindex = false;
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("shindex"), "got {err}");
+        assert!(
+            err.contains("sh_index") || err.contains("--sh-index"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1409,7 +1433,7 @@ mod tests {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("sp.conf");
-        std::fs::write(&conf, "sptweaks=1\n").unwrap();
+        std::fs::write(&conf, "sp_tweaks=1\n").unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert!(cfg.sptweaks);
@@ -1425,20 +1449,20 @@ mod tests {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("dust.conf");
-        std::fs::write(&conf, "sptweaks_dust=546\n").unwrap();
+        std::fs::write(&conf, "sp_tweaks_dust=546\n").unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert_eq!(cfg.sptweaks_dust, 546);
         let conf0 = dir.join("dust0.conf");
-        std::fs::write(&conf0, "sptweaks_dust=0\n").unwrap();
+        std::fs::write(&conf0, "sp_tweaks_dust=0\n").unwrap();
         let mut cfg0 = NodeConfig::default().with_datadir(dir.join("d0"));
         cfg0.merge_conf_file(&conf0).unwrap();
         assert_eq!(cfg0.sptweaks_dust, 0);
         let bad = dir.join("dust-bad.conf");
-        std::fs::write(&bad, "sptweaks_dust=nope\n").unwrap();
+        std::fs::write(&bad, "sp_tweaks_dust=nope\n").unwrap();
         let mut cfg_bad = NodeConfig::default().with_datadir(dir.join("db"));
         let err = cfg_bad.merge_conf_file(&bad).unwrap_err().to_string();
-        assert!(err.contains("sptweaks_dust"), "{err}");
+        assert!(err.contains("sp_tweaks_dust"), "{err}");
     }
 
     #[test]
@@ -1458,7 +1482,7 @@ mod tests {
             &conf,
             "listen=127.0.0.1:18444\n\
              connect=127.0.0.1:18445\n\
-             shindex=1\n\
+             sh_index=1\n\
              electrum_listen=127.0.0.1:50001\n\
              esplora_listen=127.0.0.1:3000\n\
              rpc_listen=127.0.0.1:8332\n\

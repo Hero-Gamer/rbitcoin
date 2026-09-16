@@ -26,7 +26,7 @@ pub const VERSION_V1: u32 = 1;
 pub const VERSION_V2: u32 = 2;
 
 /// One-line operator refuse for leftover fuse8 v1.
-pub const INDEX_REFUSE_FUSE8_V1: &str = "index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)";
+pub const INDEX_REFUSE_FUSE8_V1: &str = "index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)";
 
 /// Result of opening a sealed fuse file.
 #[derive(Clone, Debug)]

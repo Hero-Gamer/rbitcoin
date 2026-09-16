@@ -521,7 +521,7 @@ def translate(
         "--listen",
         f"127.0.0.1:{p2pport}",
         "--no-seeds",
-        "--shindex",
+        "--sh-index",
         "--esplora-listen",
         f"127.0.0.1:{esplora_port(int(rpcport))}",
     ]

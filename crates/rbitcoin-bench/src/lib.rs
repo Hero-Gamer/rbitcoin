@@ -149,70 +149,106 @@ fn take(args: &[OsString], i: &mut usize, flag: &str) -> Result<String, String> 
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn flag_name_and_eq(raw: &str) -> Option<(&str, Option<&str>)> {
+    let rest = raw.strip_prefix("--")?;
+    match rest.split_once('=') {
+        Some((name, val)) => Some((name, Some(val))),
+        None => Some((rest, None)),
+    }
+}
+
 fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
     let mut cfg = Cfg::default();
     let mut i = 1usize;
     while i < args.len() {
         let a = args[i].to_string_lossy();
-        match a.as_ref() {
-            "--help" | "-h" => return Err(usage()),
-            "--version" | "-V" => {
-                return Err(format!("rbitcoin-bench {}", env!("CARGO_PKG_VERSION")));
-            }
-            "--targets" => cfg.targets = Some(PathBuf::from(take(args, &mut i, "--targets")?)),
-            "--corpus" => cfg.corpus = Some(take(args, &mut i, "--corpus")?),
-            "--electrum" => cfg.electrum = Some(take(args, &mut i, "--electrum")?),
-            "--esplora" => cfg.esplora = Some(take(args, &mut i, "--esplora")?),
-            "--suite" => cfg.suite = Suite::parse(&take(args, &mut i, "--suite")?)?,
-            "--warmup" => {
-                cfg.warmup = take(args, &mut i, "--warmup")?
-                    .parse()
-                    .map_err(|_| "bad --warmup".to_string())?;
-            }
-            "--passes" => {
-                cfg.passes = take(args, &mut i, "--passes")?
-                    .parse()
-                    .map_err(|_| "bad --passes".to_string())?;
-            }
-            "--batch" => {
-                cfg.batch = take(args, &mut i, "--batch")?
-                    .parse()
-                    .map_err(|_| "bad --batch".to_string())?;
-            }
-            "--timeout-secs" => {
-                let n: u64 = take(args, &mut i, "--timeout-secs")?
-                    .parse()
-                    .map_err(|_| "bad --timeout-secs".to_string())?;
-                cfg.timeout = Duration::from_secs(n.max(1));
-            }
-            "--fetch-txs" => cfg.fetch_txs = true,
-            "--out" => cfg.out = Some(PathBuf::from(take(args, &mut i, "--out")?)),
-            "--clients" => {
-                cfg.clients_flag = true;
-                cfg.clients = take(args, &mut i, "--clients")?
-                    .parse()
-                    .map_err(|_| "bad --clients".to_string())?;
-            }
-            "--wallet-keys" => {
-                cfg.wallet_keys = Some(
-                    take(args, &mut i, "--wallet-keys")?
-                        .parse()
-                        .map_err(|_| "bad --wallet-keys".to_string())?,
-                );
-            }
-            "--max-txs" => {
-                cfg.max_txs = take(args, &mut i, "--max-txs")?
-                    .parse()
-                    .map_err(|_| "bad --max-txs".to_string())?;
-            }
-            "--max-utxos" => {
-                cfg.max_utxos = take(args, &mut i, "--max-utxos")?
-                    .parse()
-                    .map_err(|_| "bad --max-utxos".to_string())?;
-            }
-            other => return Err(format!("unknown argument `{other}`")),
+        if a == "--help" || a == "-h" {
+            return Err(usage());
         }
-        i += 1;
+        if a == "--version" || a == "-V" {
+            return Err(format!("rbitcoin-bench {}", env!("CARGO_PKG_VERSION")));
+        }
+        if a.starts_with('-') && !a.starts_with("--") {
+            return Err(format!("unknown argument `{a}`"));
+        }
+        if let Some((name, eq)) = flag_name_and_eq(a.as_ref()) {
+            let take_val = |i: &mut usize| -> Result<String, String> {
+                match eq {
+                    Some(v) => {
+                        if v.is_empty() {
+                            Err(format!("--{name} requires a value"))
+                        } else {
+                            Ok(v.to_string())
+                        }
+                    }
+                    None => take(args, i, &format!("--{name}")),
+                }
+            };
+            match name {
+                "fetch-txs" => {
+                    if let Some(v) = eq {
+                        if v != "1" && v != "true" {
+                            return Err("bad --fetch-txs".into());
+                        }
+                    }
+                    cfg.fetch_txs = true;
+                }
+                "targets" => cfg.targets = Some(PathBuf::from(take_val(&mut i)?)),
+                "corpus" => cfg.corpus = Some(take_val(&mut i)?),
+                "electrum" => cfg.electrum = Some(take_val(&mut i)?),
+                "esplora" => cfg.esplora = Some(take_val(&mut i)?),
+                "suite" => cfg.suite = Suite::parse(&take_val(&mut i)?)?,
+                "warmup" => {
+                    cfg.warmup = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --warmup".to_string())?;
+                }
+                "passes" => {
+                    cfg.passes = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --passes".to_string())?;
+                }
+                "batch" => {
+                    cfg.batch = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --batch".to_string())?;
+                }
+                "timeout-secs" => {
+                    let n: u64 = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --timeout-secs".to_string())?;
+                    cfg.timeout = Duration::from_secs(n.max(1));
+                }
+                "out" => cfg.out = Some(PathBuf::from(take_val(&mut i)?)),
+                "clients" => {
+                    cfg.clients_flag = true;
+                    cfg.clients = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --clients".to_string())?;
+                }
+                "wallet-keys" => {
+                    cfg.wallet_keys = Some(
+                        take_val(&mut i)?
+                            .parse()
+                            .map_err(|_| "bad --wallet-keys".to_string())?,
+                    );
+                }
+                "max-txs" => {
+                    cfg.max_txs = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --max-txs".to_string())?;
+                }
+                "max-utxos" => {
+                    cfg.max_utxos = take_val(&mut i)?
+                        .parse()
+                        .map_err(|_| "bad --max-utxos".to_string())?;
+                }
+                unk => return Err(format!("unknown argument `--{unk}`")),
+            }
+            i += 1;
+            continue;
+        }
+        return Err(format!("unknown argument `{a}`"));
     }
     Ok(cfg)
 }
@@ -473,6 +509,20 @@ mod tests {
         let c = parse_args(&args).unwrap();
         assert_eq!(c.corpus.as_deref(), Some("hot"));
         assert!(c.targets.is_none());
+    }
+
+    #[test]
+    fn equals_form_timeout_and_electrum() {
+        let args = vec![
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--timeout-secs=30"),
+            OsString::from("--electrum=127.0.0.1:50001"),
+            OsString::from("--suite=casa"),
+        ];
+        let c = parse_args(&args).unwrap();
+        assert_eq!(c.timeout, Duration::from_secs(30));
+        assert_eq!(c.electrum.as_deref(), Some("127.0.0.1:50001"));
+        assert_eq!(c.suite, Suite::Casa);
     }
 
     #[test]
