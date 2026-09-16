@@ -481,8 +481,8 @@ impl NodeConfig {
     /// Load a simple `key=value` conf (`#` comments). Hyphens and underscores match.
     ///
     /// Operator keys are snake_case (`max_inbound=`). Hyphens match underscores.
-    /// `rpcuser` / `rpcpassword` match Core bitcoin.conf. Concatenated Core
-    /// spellings remain aliases. Core CLI names stay on the functional shim only.
+    /// `rpcuser` / `rpcpassword` match Core bitcoin.conf. Core CLI names stay
+    /// on the functional shim only.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -535,7 +535,7 @@ impl NodeConfig {
         let key_l = key.to_ascii_lowercase().replace('-', "_");
         match key_l.as_str() {
             "datadir" => self.datadir.path = PathBuf::from(val),
-            "datadir_cold" | "datadircold" => {
+            "datadir_cold" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
                         "conf datadir_cold requires a path".into(),
@@ -575,18 +575,18 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
                 );
             }
-            "seednode" | "seed_node" => {
+            "seed_node" => {
                 if !val.is_empty() {
                     self.listen.seednodes.push(val.to_string());
                 }
             }
-            "electrum_listen" | "electrumlisten" => {
+            "electrum_listen" => {
                 self.listen.electrum = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf electrum_listen: {e}")))?,
                 );
             }
-            "esplora_listen" | "esploralisten" => {
+            "esplora_listen" => {
                 self.listen.esplora = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?,
@@ -600,30 +600,30 @@ impl NodeConfig {
                 self.sptweaks = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf sptweaks: {e}")))?;
             }
-            "sptweaks_dust" | "sptweaksdust" => {
+            "sptweaks_dust" => {
                 self.sptweaks_dust = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf sptweaks_dust: {e}")))?;
             }
-            "max_sh_creates" | "maxshcreates" => {
+            "max_sh_creates" => {
                 self.max_sh_creates = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf max_sh_creates: {e}")))?;
             }
-            "esplora_block_template" | "esplorablocktemplate" => {
+            "esplora_block_template" => {
                 self.esplora_block_template = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
             }
-            "rpc_listen" | "rpclisten" => {
+            "rpc_listen" => {
                 self.rpc.listen = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf rpc_listen: {e}")))?,
                 );
             }
-            "rpcuser" | "rpc_user" => self.rpc.user = Some(val.to_string()),
-            "rpcpassword" | "rpc_password" => self.rpc.password = Some(val.to_string()),
+            "rpcuser" => self.rpc.user = Some(val.to_string()),
+            "rpcpassword" => self.rpc.password = Some(val.to_string()),
             "ua_comment" => self.uacomments.push(val.to_string()),
-            "testactivationheight" | "test_activation_height" => {
+            "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
                     .map_err(|e| NodeError::Config(format!("conf test_activation_height: {e}")))?;
                 self.test_activation_heights
@@ -649,11 +649,11 @@ impl NodeConfig {
                 self.mempool.blocksonly = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf blocks_only: {e}")))?;
             }
-            "prefillcompact" | "prefill_compact" => {
+            "prefill_compact" => {
                 self.prefill_compact = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf prefill_compact: {e}")))?;
             }
-            "minrelaytxfee" | "min_relay_txfee" | "min_relay_tx_fee" => {
+            "min_relay_tx_fee" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
                         "conf min_relay_tx_fee requires a value".into(),
@@ -663,31 +663,31 @@ impl NodeConfig {
                     .map_err(|e| NodeError::Config(format!("conf min_relay_tx_fee: {e}")))?;
                 self.mempool.min_relay_fee_btc = Some(val.to_string());
             }
-            "mempoolexpiry" | "mempool_expiry" => {
+            "mempool_expiry" => {
                 let h: u64 = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf mempool_expiry: {e}")))?;
                 self.mempool.expiry_hours = Some(h.max(1));
             }
-            "startupnotify" | "startup_notify" => {
+            "startup_notify" => {
                 if !val.is_empty() {
                     self.startup_notify = Some(val.to_string());
                 }
             }
 
-            "limitclustercount" | "limit_cluster_count" => {
+            "limit_cluster_count" => {
                 self.mempool.limit_cluster_count =
                     Some(val.parse().map_err(|e| {
                         NodeError::Config(format!("conf limit_cluster_count: {e}"))
                     })?);
             }
-            "limitclustersize" | "limit_cluster_size" => {
+            "limit_cluster_size" => {
                 self.mempool.limit_cluster_size_kvb = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf limit_cluster_size: {e}")))?,
                 );
             }
-            "externalip" | "external_ip" => {
+            "external_ip" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
                         "conf external_ip requires an address".into(),
@@ -755,7 +755,7 @@ impl NodeConfig {
                 }
                 self.conf_log_level = Some(val.to_string());
             }
-            "api_log" | "apilog" => {
+            "api_log" => {
                 if val.is_empty() {
                     return Err(NodeError::Config("conf api_log requires a path".into()));
                 }
@@ -767,7 +767,7 @@ impl NodeConfig {
                 }
                 self.asmap = Some(PathBuf::from(val));
             }
-            "rpcworkqueue" | "rpc_work_queue" => {
+            "rpc_work_queue" => {
                 let n: usize = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf rpc_work_queue: {e}")))?;
@@ -776,17 +776,17 @@ impl NodeConfig {
                 }
                 self.rpc.work_queue = Some(n);
             }
-            "max_run_secs" | "maxrunsecs" => {
+            "max_run_secs" => {
                 self.max_run_secs = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf max_run_secs: {e}")))?,
                 );
             }
-            "inhibit_suspend" | "inhibitsuspend" => {
+            "inhibit_suspend" => {
                 self.inhibit_suspend = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf inhibit_suspend: {e}")))?;
             }
-            "mocktime" | "mock_time" => {
+            "mock_time" => {
                 let n: i64 = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf mock_time: {e}")))?;
@@ -804,13 +804,13 @@ impl NodeConfig {
                 }
                 self.max_tip_age_secs = Some(n as u64);
             }
-            "blockversion" | "block_version" => {
+            "block_version" => {
                 self.block_version = Some(
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf block_version: {e}")))?,
                 );
             }
-            "blockmintxfee" | "block_min_tx_fee" => {
+            "block_min_tx_fee" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
                         "conf block_min_tx_fee requires a value".into(),
@@ -820,7 +820,7 @@ impl NodeConfig {
                     .map_err(|e| NodeError::Config(format!("conf block_min_tx_fee: {e}")))?;
                 self.block_min_tx_fee_btc = Some(val.to_string());
             }
-            "alertnotify" | "alert_notify" => {
+            "alert_notify" => {
                 if !val.is_empty() {
                     self.alert_notify = Some(val.to_string());
                 }
@@ -942,8 +942,11 @@ mod tests {
             ConfApply::Applied
         );
         assert_eq!(c.max_sh_creates, 100);
-        assert_eq!(c.apply_kv("maxshcreates", "7").unwrap(), ConfApply::Applied);
-        assert_eq!(c.max_sh_creates, 7);
+        match c.apply_kv("maxshcreates", "7").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "maxshcreates"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(c.max_sh_creates, 100);
         let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
         assert!(
             format!("{bad}").contains("max_sh_creates"),
@@ -954,55 +957,59 @@ mod tests {
             ConfApply::Applied
         );
         assert!(c.esplora_block_template);
-        assert_eq!(
-            c.apply_kv("esplorablocktemplate", "0").unwrap(),
-            ConfApply::Applied
-        );
-        assert!(!c.esplora_block_template);
+        match c.apply_kv("esplorablocktemplate", "0").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "esplorablocktemplate"),
+            other => panic!("{other:?}"),
+        }
+        assert!(c.esplora_block_template);
     }
 
     #[test]
     fn minrelaytxfee_garbage_and_negative_are_config_errors() {
         let mut c = NodeConfig::default();
-        let bad = c.apply_kv("minrelaytxfee", "nope").unwrap_err();
+        let bad = c.apply_kv("min_relay_tx_fee", "nope").unwrap_err();
         assert!(
             format!("{bad}").contains("min_relay_tx_fee"),
             "garbage must name the knob: {bad}"
         );
-        let neg = c.apply_kv("minrelaytxfee", "-0.0001").unwrap_err();
+        let neg = c.apply_kv("min_relay_tx_fee", "-0.0001").unwrap_err();
         assert!(
             format!("{neg}").contains("min_relay_tx_fee"),
             "negative must name the knob: {neg}"
         );
         assert_eq!(
-            c.apply_kv("minrelaytxfee", "0").unwrap(),
+            c.apply_kv("min_relay_tx_fee", "0").unwrap(),
             ConfApply::Applied
         );
         assert_eq!(
-            c.apply_kv("minrelaytxfee", "0.00000001").unwrap(),
+            c.apply_kv("min_relay_tx_fee", "0.00000001").unwrap(),
             ConfApply::Applied
         );
+        match c.apply_kv("minrelaytxfee", "0").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "minrelaytxfee"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn prefillcompact_cli_conf_default_on() {
         let mut c = NodeConfig::default();
         assert!(c.prefill_compact);
-        assert_eq!(
-            c.apply_kv("prefillcompact", "0").unwrap(),
-            ConfApply::Applied
-        );
-        assert!(!c.prefill_compact);
-        assert_eq!(
-            c.apply_kv("prefillcompact", "1").unwrap(),
-            ConfApply::Applied
-        );
+        match c.apply_kv("prefillcompact", "0").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "prefillcompact"),
+            other => panic!("{other:?}"),
+        }
         assert!(c.prefill_compact);
         assert_eq!(
             c.apply_kv("prefill_compact", "0").unwrap(),
             ConfApply::Applied
         );
         assert!(!c.prefill_compact);
+        assert_eq!(
+            c.apply_kv("prefill_compact", "1").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(c.prefill_compact);
     }
 
     #[test]

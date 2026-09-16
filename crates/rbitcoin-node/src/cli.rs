@@ -105,7 +105,7 @@ where
             config.listen.connect.clear();
             saw_connect = true;
         }
-        if key == "seednode" && !saw_seednode {
+        if key == "seed_node" && !saw_seednode {
             config.listen.seednodes.clear();
             saw_seednode = true;
         }
@@ -323,14 +323,11 @@ fn is_bool_key(key: &str) -> bool {
         "shindex"
             | "sptweaks"
             | "esplora_block_template"
-            | "esplorablocktemplate"
             | "blocks_only"
-            | "prefillcompact"
             | "prefill_compact"
             | "persist_mempool"
             | "no_seeds"
             | "inhibit_suspend"
-            | "inhibitsuspend"
             | "trusted"
             | "always_relay"
             | "relay"
@@ -537,8 +534,6 @@ mod tests {
         assert!(on.prefill_compact);
         let on_eq = ready_config(["rbitcoin-node", "--prefill-compact=1"]);
         assert!(on_eq.prefill_compact);
-        let alias = ready_config(["rbitcoin-node", "--prefillcompact=0"]);
-        assert!(!alias.prefill_compact);
     }
 
     #[test]
@@ -879,6 +874,30 @@ mod tests {
             "--maxtipage=3600",
             "--uacomment=x",
             "--peertimeout=1",
+            "--prefillcompact=0",
+            "--limitclustercount=10",
+            "--limitclustersize=10",
+            "--minrelaytxfee=0.0001",
+            "--mempoolexpiry=1",
+            "--externalip=1.2.3.4",
+            "--seednode=127.0.0.1:1",
+            "--mocktime=1",
+            "--blockversion=1",
+            "--blockmintxfee=0.00000001",
+            "--alertnotify=echo",
+            "--startupnotify=echo",
+            "--testactivationheight=csv@102",
+            "--rpcworkqueue=1",
+            "--datadircold=/tmp/x",
+            "--electrumlisten=127.0.0.1:1",
+            "--esploralisten=127.0.0.1:1",
+            "--maxshcreates=1",
+            "--esplorablocktemplate=1",
+            "--apilog=/tmp/x",
+            "--maxrunsecs=1",
+            "--inhibitsuspend=1",
+            "--rpclisten=127.0.0.1:1",
+            "--rpc-user=u",
         ] {
             assert_exit(cli_main(["rbitcoin-node", flag]), ExitCode::from(2));
         }
