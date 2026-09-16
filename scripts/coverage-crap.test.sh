@@ -22,8 +22,12 @@ assert_ok() {
 }
 
 out="$(CRAP_DRY_RUN=1 "$RUN")"
-assert_ok "dry-run uses cargo crap --workspace" \
-  grep -q "cargo crap --workspace" <<<"$out"
+assert_ok "dry-run selects production -p crates" \
+  grep -q -- "-p rbitcoin-net" <<<"$out" && grep -q -- "-p rbitcoin-store" <<<"$out"
+assert_ok "dry-run does not analyze rbitcoin-bench" \
+  bash -c '! grep -q -- "-p rbitcoin-bench" <<<"$1"' _ "$out"
+assert_ok "dry-run does not use --workspace" \
+  bash -c '! grep -q -- "--workspace" <<<"$1"' _ "$out"
 assert_ok "dry-run reads coverage/lcov.info" \
   grep -q -- "--lcov " <<<"$out" && grep -q "coverage/lcov.info" <<<"$out"
 assert_ok "dry-run prints --summary" \

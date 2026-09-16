@@ -9,10 +9,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LCOV="${1:-$ROOT/coverage/lcov.info}"
 OUT="${2:-$ROOT/coverage/crap.json}"
+# -p not --workspace: workspace walks are crate-relative, so a
+# **/rbitcoin-bench/** exclude never matches src/*.rs inside that crate.
+# Skip rbitcoin-bench (optional host A/B) and rbitcoin-test.
+PACKAGES=(
+  rbitcoin-primitives
+  rbitcoin-log
+  rbitcoin-store
+  rbitcoin-query
+  rbitcoin-consensus
+  rbitcoin-mempool
+  rbitcoin-net
+  rbitcoin-rpc
+  rbitcoin-electrum
+  rbitcoin-esplora
+  rbitcoin-cli
+  rbitcoin-node
+)
+CRAP_P=()
+for p in "${PACKAGES[@]}"; do
+  CRAP_P+=(-p "$p")
+done
 
-SUMMARY=(cargo crap --workspace --lcov "$LCOV" --summary)
-JSON=(cargo crap --workspace --lcov "$LCOV" --format json --sort file --output "$OUT")
-GATE=(cargo crap --workspace --lcov "$LCOV" --fail-above --threshold 30 --summary)
+SUMMARY=(cargo crap "${CRAP_P[@]}" --lcov "$LCOV" --summary)
+JSON=(cargo crap "${CRAP_P[@]}" --lcov "$LCOV" --format json --sort file --output "$OUT")
+GATE=(cargo crap "${CRAP_P[@]}" --lcov "$LCOV" --fail-above --threshold 30 --summary)
 
 if [[ "${CRAP_DRY_RUN:-}" == "1" ]]; then
   echo "${SUMMARY[*]}"
