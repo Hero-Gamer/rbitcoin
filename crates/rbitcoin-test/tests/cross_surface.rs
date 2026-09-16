@@ -1014,6 +1014,21 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(st, 200, "GET /fee-estimates: {body}");
     let fees: Value = serde_json::from_str(&body).unwrap();
     assert!(fees.get("1").is_some(), "{fees}");
+    let (st, body) = http_get(esplora_addr, "/fees/recommended").await;
+    assert_eq!(st, 200, "GET /fees/recommended: {body}");
+    let rec: Value = serde_json::from_str(&body).unwrap();
+    for key in [
+        "fastestFee",
+        "halfHourFee",
+        "hourFee",
+        "economyFee",
+        "minimumFee",
+    ] {
+        let n = rec[key].as_u64().unwrap_or(0);
+        assert!(n >= 1, "{key} sat/vB: {body}");
+    }
+    let (st, body) = http_get(esplora_addr, "/v1/fees/recommended").await;
+    assert_eq!(st, 200, "GET /v1/fees/recommended: {body}");
 
     let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();

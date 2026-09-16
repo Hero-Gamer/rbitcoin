@@ -2336,12 +2336,38 @@ async fn node_run_p2p_short() {
             );
             let addr = rows[0]["addr"].as_str().expect("addr").to_string();
             assert_eq!(addr, seed_addr.to_string(), "{peers}");
+            assert!(
+                rows[0]["startingheight"].as_i64().unwrap() >= 0,
+                "handshake-complete startingheight must not be connecting dummy -1: {peers}"
+            );
+            assert!(
+                rows[0]["timeoffset"].as_i64().is_some(),
+                "peer timeoffset: {peers}"
+            );
+            assert!(
+                rows[0]["synced_headers"].as_i64().is_some(),
+                "synced_headers: {peers}"
+            );
+            assert!(
+                rows[0]["synced_blocks"].as_i64().is_some(),
+                "synced_blocks: {peers}"
+            );
+            assert!(
+                rows[0]["servicesnames"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "servicesnames: {peers}"
+            );
 
             let n = jsonrpc(rpc_addr, "getconnectioncount", json!([])).await;
             assert_eq!(n["result"], 1, "{n}");
             let net = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await;
             assert_eq!(net["result"]["connections"], 1, "{net}");
             assert_eq!(net["result"]["connections_out"], 1, "{net}");
+            assert!(
+                net["result"]["timeoffset"].as_i64().is_some(),
+                "getnetworkinfo.timeoffset: {net}"
+            );
             let totals = jsonrpc(rpc_addr, "getnettotals", json!([])).await;
             assert!(
                 totals["result"]["totalbytesrecv"].as_u64().unwrap_or(0) > 0,
@@ -2364,6 +2390,14 @@ async fn node_run_p2p_short() {
                     .unwrap_or("")
                     .contains("cannot create inbound"),
                 "{inbound}"
+            );
+
+            let miss_id = jsonrpc(rpc_addr, "disconnectnode", json!({"nodeid": 99})).await;
+            assert!(miss_id["error"].is_object(), "unknown nodeid: {miss_id}");
+            let miss_empty = jsonrpc(rpc_addr, "disconnectnode", json!([])).await;
+            assert!(
+                miss_empty["error"].is_object(),
+                "empty disconnectnode: {miss_empty}"
             );
 
             let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;

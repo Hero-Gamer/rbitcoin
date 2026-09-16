@@ -175,6 +175,8 @@ mod tests {
         assert!(sub.address.starts_with("sp1"), "{}", sub.address);
         let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3)).unwrap();
         assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
+        let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3)).unwrap();
+        assert!(t4.address.starts_with("tsp"), "{}", t4.address);
         let ts = match parse_sub(
             &json!([scan, spend, 600_000_000]),
             Network::Regtest,

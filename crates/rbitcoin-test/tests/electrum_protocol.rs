@@ -24,6 +24,85 @@ async fn read_line_timeout(reader: &mut BufReader<&mut TcpStream>, buf: &mut Str
         .unwrap_or_else(|e| panic!("electrum {label}: read_line io: {e}"));
 }
 
+const SP_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+const SP_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+
+async fn pin_wallet_protocol_1_6(stream: &mut TcpStream) {
+    let ver = rpc(stream, 40, "server.version", json!(["test", "1.6"])).await;
+    assert_eq!(ver["result"][1].as_str(), Some("1.6"), "{ver}");
+    let info = rpc(stream, 41, "mempool.get_info", json!([])).await;
+    assert!(
+        info["result"]["minrelaytxfee"].as_f64().unwrap() > 0.0,
+        "{info}"
+    );
+    assert_eq!(info["result"]["unbroadcastcount"], 0);
+    let zero = format!("{:064}", 0);
+    let st = rpc(
+        stream,
+        42,
+        "blockchain.outpoint.get_status",
+        json!([zero.clone(), 0]),
+    )
+    .await;
+    assert_eq!(st["result"]["spent"], false, "{st}");
+    let sub = rpc(
+        stream,
+        43,
+        "blockchain.outpoint.subscribe",
+        json!([zero.clone(), 0]),
+    )
+    .await;
+    assert_eq!(sub["result"]["spent"], false, "{sub}");
+    let un = rpc(
+        stream,
+        44,
+        "blockchain.outpoint.unsubscribe",
+        json!([zero, 0]),
+    )
+    .await;
+    assert_eq!(un["result"], json!(true), "{un}");
+    let sp = rpc(
+        stream,
+        45,
+        "blockchain.silentpayments.subscribe",
+        json!([SP_SCAN, SP_SPEND, 0]),
+    )
+    .await;
+    assert_eq!(sp["result"]["start_height"], 0, "{sp}");
+    assert!(
+        sp["result"]["address"].as_str().unwrap().contains("sp"),
+        "{sp}"
+    );
+    let note = read_notify(stream, "silentpayments history").await;
+    assert_eq!(
+        note["method"].as_str(),
+        Some("blockchain.silentpayments.subscribe"),
+        "{note}"
+    );
+    assert!(note["params"]["history"].as_array().is_some(), "{note}");
+    let unsp = rpc(
+        stream,
+        46,
+        "blockchain.silentpayments.unsubscribe",
+        json!([SP_SCAN, SP_SPEND, 0]),
+    )
+    .await;
+    assert!(unsp["result"].as_str().unwrap().contains("sp"), "{unsp}");
+    let bad = rpc(
+        stream,
+        47,
+        "blockchain.silentpayments.subscribe",
+        json!(["00", "02"]),
+    )
+    .await;
+    assert!(bad.get("error").is_some(), "{bad}");
+    let hdrs = rpc(stream, 48, "blockchain.block.headers", json!([0, 1])).await;
+    assert!(
+        hdrs["result"]["headers"].as_array().is_some(),
+        "1.6 headers is a list: {hdrs}"
+    );
+}
+
 async fn rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {
     let req = json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
     let mut line = serde_json::to_string(&req).unwrap();
@@ -331,6 +410,8 @@ async fn electrum_server_version_history_balance() {
     assert!(v["result"]["count"].as_u64().unwrap() >= 1);
     assert!(!v["result"]["hex"].as_str().unwrap().is_empty());
 
+    pin_wallet_protocol_1_6(&mut stream).await;
+
     let sh_hex = electrum_scripthash_hex(&[0x51]);
     let v = rpc(
         &mut stream,
@@ -591,6 +672,14 @@ async fn electrum_server_version_history_balance() {
     )
     .await;
     assert!(v.get("error").is_some());
+    let v = rpc(
+        &mut stream,
+        21,
+        "blockchain.transaction.broadcast_package",
+        json!([["00"]]),
+    )
+    .await;
+    assert!(v.get("error").is_some(), "{v}");
 
     // Bad params.
     let v = rpc(&mut stream, 20, "blockchain.block.header", json!(["x"])).await;
@@ -764,9 +853,15 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     let sh = electrum_scripthash_hex(spk.as_bytes());
     let (tip_tx, _) = broadcast::channel(4);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, Arc::clone(&q_arc), params, tip_tx, Some(mp))
-        .await
-        .expect("electrum listen");
+    let handle = run_electrum(
+        cfg,
+        Arc::clone(&q_arc),
+        params,
+        tip_tx,
+        Some(Arc::clone(&mp)),
+    )
+    .await
+    .expect("electrum listen");
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let want = rbitcoin_primitives::display_hash_hex(&parent.compute_txid().to_byte_array());
     let bal = rpc(
@@ -852,6 +947,45 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         tx_msg.contains("broadcast reject"),
         "consensus-invalid broadcast with hub: {bad_tx}"
     );
+
+    mp.set_relay_enabled(true);
+    let cb2 = q_arc.reconstruct_block_at_height(Height(2)).unwrap().txdata[0].compute_txid();
+    let pkg = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb2, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let pkg_hex = bitcoin::consensus::encode::serialize_hex(&pkg);
+    let packed = rpc(
+        &mut stream,
+        6,
+        "blockchain.transaction.broadcast_package",
+        json!([[pkg_hex], true]),
+    )
+    .await;
+    assert_eq!(
+        packed["result"]["package_msg"].as_str(),
+        Some("success"),
+        "{packed}"
+    );
+    let cb = rbitcoin_primitives::display_hash_hex(&cb2.to_byte_array());
+    let spent = rpc(
+        &mut stream,
+        7,
+        "blockchain.outpoint.get_status",
+        json!([cb, 0]),
+    )
+    .await;
+    assert_eq!(spent["result"]["spent"], true, "{spent}");
 
     handle.shutdown().await;
 }
