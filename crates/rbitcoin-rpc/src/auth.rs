@@ -1,93 +1,94 @@
-//! Core-inspired RPC auth: cookie file and/or user/password HTTP Basic.
+//! RPC auth: datadir token file (Bearer) and harness-only Basic password match.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Credentials accepted by the RPC server (user + password).
+/// Bearer token accepted by the RPC server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcAuth {
-    pub user: String,
-    pub password: String,
+    pub token: String,
 }
 
 impl RpcAuth {
-    pub fn new(user: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(token: impl Into<String>) -> Self {
         Self {
-            user: user.into(),
-            password: password.into(),
+            token: token.into(),
         }
     }
 
-    /// Encode as `user:password` (cookie file body / Basic raw).
-    pub fn cookie_line(&self) -> String {
-        format!("{}:{}", self.user, self.password)
+    pub fn matches_token(&self, token: &str) -> bool {
+        self.token == token
     }
 
-    /// Parse `user:password` from a cookie file line.
-    pub fn from_cookie_line(line: &str) -> Option<Self> {
-        let line = line.trim();
-        let (user, password) = line.split_once(':')?;
-        if user.is_empty() || password.is_empty() {
-            return None;
-        }
-        Some(Self {
-            user: user.to_string(),
-            password: password.to_string(),
-        })
-    }
-
-    /// Constant-time-ish equality for Basic auth compare.
-    pub fn matches(&self, user: &str, password: &str) -> bool {
-        // Avoid short-circuit on length alone for password; still not full CT.
-        user == self.user && password == self.password
+    /// Core TestNode cookie line (`__cookie__:<token>`). Not an operator file.
+    pub fn harness_cookie_line(&self) -> String {
+        format!("__cookie__:{}", self.token)
     }
 }
 
-/// Resolve auth for a listen bind: explicit user/pass, else generate cookie under datadir.
+pub fn default_token_path(datadir: &Path) -> PathBuf {
+    datadir.join("rpc.token")
+}
+
+pub fn default_socket_path(datadir: &Path) -> PathBuf {
+    datadir.join("rpc.sock")
+}
+
+/// Read an existing token or write a new CSPRNG token (mode 0600).
 pub fn resolve_rpc_auth(
     datadir: &Path,
-    rpc_user: Option<&str>,
-    rpc_password: Option<&str>,
-    cookie_path: Option<&Path>,
-) -> Result<(RpcAuth, Option<PathBuf>), String> {
-    match (rpc_user, rpc_password) {
-        (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => Ok((RpcAuth::new(u, p), None)),
-        (Some(_), None) | (None, Some(_)) => {
-            Err("rpcuser and rpcpassword must both be set (or both unset for cookie auth)".into())
-        }
-        (Some(u), Some(p)) if u.is_empty() || p.is_empty() => {
-            Err("rpcuser and rpcpassword must be non-empty".into())
-        }
-        _ => {
-            let path = cookie_path
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| datadir.join(".cookie"));
-            let auth = write_cookie_file(&path)?;
-            Ok((auth, Some(path)))
-        }
+    token_path: Option<&Path>,
+) -> Result<(RpcAuth, PathBuf), String> {
+    let path = token_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| default_token_path(datadir));
+    if path.is_file() {
+        let auth = read_token_file(&path)?;
+        return Ok((auth, path));
     }
+    let auth = write_token_file(&path)?;
+    Ok((auth, path))
 }
 
-/// Write a new random cookie to `path` (mode 0600 when supported). Returns credentials.
-pub fn write_cookie_file(path: &Path) -> Result<RpcAuth, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("cookie parent: {e}"))?;
+pub fn read_token_file(path: &Path) -> Result<RpcAuth, String> {
+    let line =
+        fs::read_to_string(path).map_err(|e| format!("read token {}: {e}", path.display()))?;
+    let token = line.trim();
+    if token.is_empty() {
+        return Err(format!("token file {}: empty", path.display()));
     }
-    let auth = RpcAuth::new("__cookie__", random_cookie_password());
-    let mut f = fs::File::create(path).map_err(|e| format!("cookie create: {e}"))?;
+    Ok(RpcAuth::new(token))
+}
+
+pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
+    }
+    let auth = RpcAuth::new(random_token());
+    let mut f = fs::File::create(path).map_err(|e| format!("token create: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
-    f.write_all(auth.cookie_line().as_bytes())
-        .map_err(|e| format!("cookie write: {e}"))?;
-    f.sync_all().map_err(|e| format!("cookie sync: {e}"))?;
+    f.write_all(auth.token.as_bytes())
+        .map_err(|e| format!("token write: {e}"))?;
+    f.sync_all().map_err(|e| format!("token sync: {e}"))?;
     Ok(auth)
 }
 
-/// Parse HTTP `Authorization: Basic …` header value.
+/// Parse `Authorization: Bearer …`.
+pub fn parse_bearer_auth(header: &str) -> Option<&str> {
+    let header = header.trim();
+    header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Parse HTTP `Authorization: Basic …` (harness cookie). Password is the token.
 pub fn parse_basic_auth(header: &str) -> Option<(String, String)> {
     let header = header.trim();
     let rest = header
@@ -102,11 +103,9 @@ pub fn parse_basic_auth(header: &str) -> Option<(String, String)> {
     Some((u.to_string(), p.to_string()))
 }
 
-/// 32-byte CSPRNG password as lowercase hex (64 chars). Same entropy class as
-/// `store.secret` — not `DefaultHasher(time, pid)`.
-fn random_cookie_password() -> String {
+fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("CSPRNG for RPC cookie");
+    getrandom::fill(&mut bytes).expect("CSPRNG for RPC token");
     let mut out = String::with_capacity(64);
     for b in bytes {
         use std::fmt::Write;
@@ -129,104 +128,79 @@ mod tests {
     }
 
     #[test]
-    fn cookie_roundtrip() {
+    fn token_roundtrip() {
         let dir = tmp();
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(".cookie");
-        let a = write_cookie_file(&path).unwrap();
-        let line = fs::read_to_string(&path).unwrap();
-        let b = RpcAuth::from_cookie_line(&line).unwrap();
+        let path = dir.join("rpc.token");
+        let a = write_token_file(&path).unwrap();
+        let b = read_token_file(&path).unwrap();
         assert_eq!(a, b);
-        assert_eq!(a.user, "__cookie__");
-        assert!(!a.password.is_empty());
+        assert_eq!(a.token.len(), 64);
+        assert!(a
+            .token
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Cookie password must be 32 bytes of CSPRNG entropy as lowercase hex
-    /// (not DefaultHasher(time,pid) — that was only 32 hex chars and guessable).
     #[test]
-    fn cookie_password_is_csprng_hex() {
+    fn resolve_reuses_existing_token() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rpc.token");
+        fs::write(&path, "fixed-token\n").unwrap();
+        let (a, p) = resolve_rpc_auth(&dir, None).unwrap();
+        assert_eq!(a.token, "fixed-token");
+        assert_eq!(p, path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_is_csprng_hex() {
         let dir = tmp();
         fs::create_dir_all(&dir).unwrap();
         let mut seen = std::collections::HashSet::new();
         for i in 0..32 {
-            let path = dir.join(format!(".cookie-{i}"));
-            let a = write_cookie_file(&path).unwrap();
-            assert_eq!(
-                a.password.len(),
-                64,
-                "expected 32-byte CSPRNG as 64 hex chars, got len={}",
-                a.password.len()
-            );
-            assert!(
-                a.password.chars().all(|c| c.is_ascii_hexdigit()),
-                "password must be hex: {}",
-                a.password
-            );
-            assert!(
-                a.password.chars().all(|c| !c.is_ascii_uppercase()),
-                "password must be lowercase hex"
-            );
-            assert!(
-                seen.insert(a.password.clone()),
-                "duplicate cookie password (not CSPRNG?): {}",
-                a.password
-            );
+            let path = dir.join(format!("rpc.token-{i}"));
+            let a = write_token_file(&path).unwrap();
+            assert_eq!(a.token.len(), 64);
+            assert!(seen.insert(a.token.clone()));
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_user_pass() {
-        let dir = tmp();
-        let (a, cookie) = resolve_rpc_auth(&dir, Some("u"), Some("p"), None).unwrap();
-        assert_eq!(a.user, "u");
-        assert_eq!(a.password, "p");
-        assert!(cookie.is_none());
-    }
-
-    #[test]
-    fn resolve_cookie_when_no_user() {
-        let dir = tmp();
-        fs::create_dir_all(&dir).unwrap();
-        let (a, cookie) = resolve_rpc_auth(&dir, None, None, None).unwrap();
-        assert_eq!(a.user, "__cookie__");
-        let path = cookie.unwrap();
-        assert!(path.exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn partial_user_pass_errors() {
-        let dir = tmp();
-        assert!(resolve_rpc_auth(&dir, Some("u"), None, None).is_err());
-        assert!(resolve_rpc_auth(&dir, None, Some("p"), None).is_err());
-        assert!(resolve_rpc_auth(&dir, Some(""), Some("p"), None).is_err());
-        assert!(resolve_rpc_auth(&dir, Some("u"), Some(""), None).is_err());
-    }
-
-    #[test]
-    fn basic_auth_parse() {
+    fn bearer_and_basic_parse() {
         use base64::Engine;
+        assert_eq!(parse_bearer_auth("Bearer abc"), Some("abc"));
+        assert_eq!(parse_bearer_auth("bearer xyz"), Some("xyz"));
+        assert!(parse_bearer_auth("Bearer ").is_none());
+        assert!(parse_bearer_auth("Basic abc").is_none());
         let tok = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
         let (u, p) = parse_basic_auth(&format!("Basic {tok}")).unwrap();
         assert_eq!(u, "alice");
         assert_eq!(p, "s3cret");
-        let (u, p) = parse_basic_auth(&format!("basic {tok}")).unwrap();
-        assert_eq!(u, "alice");
-        assert_eq!(p, "s3cret");
-        assert!(parse_basic_auth("Bearer x").is_none());
-        assert!(parse_basic_auth("Basic !!!").is_none());
-        assert!(parse_basic_auth("Basic ").is_none());
-        let nocolon = base64::engine::general_purpose::STANDARD.encode("nocolon");
-        assert!(parse_basic_auth(&format!("Basic {nocolon}")).is_none());
-        assert!(RpcAuth::from_cookie_line("").is_none());
-        assert!(RpcAuth::from_cookie_line("nocolon").is_none());
-        assert!(RpcAuth::from_cookie_line(":pass").is_none());
-        assert!(RpcAuth::from_cookie_line("user:").is_none());
-        let a = RpcAuth::new("u", "p");
-        assert!(a.matches("u", "p"));
-        assert!(!a.matches("u", "wrong"));
-        assert!(!a.matches("x", "p"));
+        let a = RpcAuth::new("s3cret");
+        assert!(a.matches_token("s3cret"));
+        assert!(!a.matches_token("nope"));
+        assert_eq!(a.harness_cookie_line(), "__cookie__:s3cret");
+        assert_eq!(
+            default_socket_path(Path::new("/d")),
+            PathBuf::from("/d/rpc.sock")
+        );
+        assert_eq!(
+            default_token_path(Path::new("/d")),
+            PathBuf::from("/d/rpc.token")
+        );
+    }
+
+    #[test]
+    fn empty_token_file_errors() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rpc.token");
+        fs::write(&path, "  \n").unwrap();
+        assert!(read_token_file(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
