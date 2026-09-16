@@ -25,6 +25,18 @@ before 1.0).
 
 ### Changed
 
+- **`getpeerinfo` / `getnetworkinfo` clock and sync fields are session state:**
+  per-peer `timeoffset` is VERSION time minus connect time (`0` before
+  handshake). `synced_headers` is the height of the peer's advertised best
+  block when we know it, else `-1`; `synced_blocks` is that height only when
+  the hash is on our best chain. `getnetworkinfo.timeoffset` is the median of
+  outbound handshake-complete offsets (`0` if none). Connecting rows report
+  `startingheight` `-1`.
+
+- **`syncwithvalidationinterfacequeue` is not a node method:** `-32601`
+  Method not found (no wallet/index callback queue). The functional proxy
+  still returns `null` so Core `sync_mempools` keeps working.
+
 - **CRAP fail-regression (Q-55):** after the LCOV gate, `coverage-crap.sh`
   runs `cargo crap --fail-regression` against committed
   `crap_baseline.json` (refresh from the `crap-report` coverage artifact).
