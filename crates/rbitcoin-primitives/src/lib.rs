@@ -56,7 +56,11 @@ pub fn rbitcoin_subversion(
     Ok(s)
 }
 
-/// File magic for store tables: ASCII `RBT1`.
+/// Default Electrum TCP port (electrs convention) when `--electrum-listen` omits ADDR.
+pub const DEFAULT_ELECTRUM_PORT: u16 = 50001;
+/// Default Esplora HTTP port when `--esplora-listen` omits ADDR.
+pub const DEFAULT_ESPLORA_PORT: u16 = 3000;
+
 pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
@@ -195,6 +199,26 @@ impl Network {
             }),
         }
     }
+
+    /// Core-matching P2P listen port.
+    pub fn default_p2p_port(self) -> u16 {
+        match self {
+            Network::Mainnet => 8333,
+            Network::Testnet => 18333,
+            Network::Signet => 38333,
+            Network::Regtest => 18444,
+        }
+    }
+
+    /// Core-matching JSON-RPC TCP port.
+    pub fn default_rpc_port(self) -> u16 {
+        match self {
+            Network::Mainnet => 8332,
+            Network::Testnet => 18332,
+            Network::Signet => 38332,
+            Network::Regtest => 18443,
+        }
+    }
 }
 
 impl fmt::Display for Network {
@@ -305,6 +329,16 @@ mod tests {
         let err = Network::parse("bogus").unwrap_err();
         assert_eq!(format!("{err}"), "unknown network `bogus`");
         let _ = &err as &dyn std::error::Error;
+        assert_eq!(Network::Mainnet.default_p2p_port(), 8333);
+        assert_eq!(Network::Mainnet.default_rpc_port(), 8332);
+        assert_eq!(Network::Testnet.default_p2p_port(), 18333);
+        assert_eq!(Network::Testnet.default_rpc_port(), 18332);
+        assert_eq!(Network::Signet.default_p2p_port(), 38333);
+        assert_eq!(Network::Signet.default_rpc_port(), 38332);
+        assert_eq!(Network::Regtest.default_p2p_port(), 18444);
+        assert_eq!(Network::Regtest.default_rpc_port(), 18443);
+        assert_eq!(DEFAULT_ELECTRUM_PORT, 50001);
+        assert_eq!(DEFAULT_ESPLORA_PORT, 3000);
     }
 
     #[test]
