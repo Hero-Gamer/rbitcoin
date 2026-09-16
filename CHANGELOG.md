@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **CRAP chew (confirm/chain/peer):** drop allowlist entries for
+  `handle_peer_frame`, `ChainHub::accept_branch_inner`,
+  `Query::resume_work_path_after_tip_excluding`, `assemble_block_prevouts`,
+  `structural_validate_spends`, and `on_cmpctblock` after extracts (peer
+  decode vs sync match, branch precheck/connect, resume index/walk,
+  assemble non-cb inputs, structural meta/pending/BIP68, compact reconstruct).
+
 - **CRAP chew (RPC/CLI/store/lookup):** drop allowlist entries for `method_help`,
   `operator_config_from_args`, `apply_peer_event`,
   `ScriptHashTable::apply_head_upserts`, `Store::open_layout`, and
