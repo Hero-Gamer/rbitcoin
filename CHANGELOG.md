@@ -25,6 +25,11 @@ before 1.0).
 
 ### Changed
 
+- **No concatenated `rbitcoin-node` aliases:** kebab CLI / snake_case conf only
+  (`--prefill-compact` / `prefill_compact=`). Concatenated Core spellings
+  (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are unknown.
+  `--rpcuser` / `--rpcpassword` stay. The functional shim still maps Core names.
+
 - **Fee estimates hold the last defined rate into far depths:** when the
   pool is thinner than N blocks and block-p10 history is empty, 144/504/1008
   keep the faded mid rate instead of Esplora `1.0` (insufficient sentinel).

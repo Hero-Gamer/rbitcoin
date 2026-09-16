@@ -345,9 +345,8 @@ sections below and [`COMPAT.md`](./COMPAT.md).
 Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` flags are
 kebab-case (`--max-inbound`). Conf keys are snake_case (`max_inbound=`).
 `--rpcuser` / `--rpcpassword` match bitcoin-cli and Core `bitcoin.conf`.
-Concatenated Core spellings still apply as aliases. Core names
-(`-maxconnections`, `-whitelist`, `-blocksonly`, `-minimumchainwork`, …) are
-translated by the functional `bitcoind` shim only
+Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
+`-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
 ([`docs/core-functional.md`](docs/core-functional.md)).
 
 Clean smoke:
