@@ -212,12 +212,22 @@ jobs:
       - name: coverage (line gate)
         env:
           COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # rust-cache of target/cov can leave stale llvm-cov counters (scripts-only
+          # PRs then fail never-falls ~20–30 hits under master on the same LF).
+          COVERAGE_CLEAN: "1"
         run: ./scripts/coverage.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-badge
           path: coverage/badge.json
           if-no-files-found: error
+          retention-days: 5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: crap-report
+          path: coverage/crap.json
+          if-no-files-found: ignore
           retention-days: 5
 
   # Not a required check. Write token only on green master coverage.

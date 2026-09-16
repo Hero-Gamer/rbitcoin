@@ -29,8 +29,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
 | 5 | **Q-54** | ast-grep named-cap rules | One rule per easy-to-delete cap from [`ibd-memory.md`](./ibd-memory.md): `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each has `lint/ast-grep/fixtures/{good,bad}/`. Today **four** structural rules, **zero** cap rules. |
-| 6 | **Q-55** | CRAP `--fail-regression` | Commit `crap_baseline.json` from a green coverage artifact; PRs fail if a function’s CRAP rises. Still no `--fail-above 30` (at ≥90% coverage CRAP equals CC and would force **R-10** peels). Clippy: [`code-shape.md`](./code-shape.md). |
-| 7 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
+| 6 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-66**.
@@ -62,7 +61,7 @@ at an explicit rank with **Q-63+**.
 | **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD is body-queue → lookup → load |
 | **—** | `rbitcoin-bench` in default-members / musl / required CI | Optional host A/B. Not a packaging or coverage gate |
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Primitives only |
-| **—** | `cargo crap --fail-above --threshold 30` | CRAP equals CC at ≥90% lines. Use **Q-55** regression |
+| **—** | `cargo crap --fail-above --threshold 30` | CRAP equals CC at ≥90% lines. Coverage uses `--fail-regression` vs `crap_baseline.json` |
 | **—** | ast-grep as a second clippy | Structural RSS/task-leak *shapes* only |
 
 Coverage theater (chasing 100% lines), rewriting secp/rust-bitcoin/tokio
