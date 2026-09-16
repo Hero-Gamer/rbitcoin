@@ -3753,8 +3753,8 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
     let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
     // Mempool present but empty live → Some(missing) not None.
     let missing = match try_reconstruct_cmpct(&hub, &hsi, 2) {
-        Some(CmpctReconstruct::Missing(m)) => m,
-        other => panic!("expected missing, got {other:?}"),
+        Some(CmpctReconstruct::NeedTxn(p, _)) => p.missing().to_vec(),
+        other => panic!("expected NeedTxn, got {other:?}"),
     };
     assert_eq!(missing, vec![1]); // spend short-id missing
     let mp = hub.mempool().unwrap();
