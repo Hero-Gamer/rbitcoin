@@ -131,6 +131,7 @@ where
     }
     config.smoke = smoke;
     config.absorb_inbound_env();
+    config.resolve_listen_defaults();
     Ok(OperatorArgs::Ready {
         config,
         log_level_cli,
@@ -257,7 +258,7 @@ fn operator_usage() -> String {
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
     [--listen ADDR] [--connect ADDR]... [--seed-node HOST]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
-    [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] [--rpc-work-queue N] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
@@ -284,7 +285,7 @@ Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora; both r
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
-RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
+RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
 Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
@@ -331,7 +332,12 @@ fn is_bool_key(key: &str) -> bool {
             | "trusted"
             | "always_relay"
             | "relay"
+            | "rpc"
     )
+}
+
+fn is_optional_addr_key(key: &str) -> bool {
+    matches!(key, "rpc_listen" | "electrum_listen" | "esplora_listen")
 }
 
 fn looks_like_flag(s: &str) -> bool {
@@ -368,6 +374,19 @@ fn parse_cli_flag(
     } else if is_bool_key(&key) {
         *i += 1;
         "1".to_string()
+    } else if is_optional_addr_key(&key) {
+        *i += 1;
+        if *i >= args.len() {
+            String::new()
+        } else {
+            let next = args[*i].to_string_lossy().into_owned();
+            if looks_like_flag(&next) {
+                String::new()
+            } else {
+                *i += 1;
+                next
+            }
+        }
     } else {
         *i += 1;
         if *i >= args.len() {
@@ -482,8 +501,9 @@ mod tests {
             "--sh-index",
             "--sp-tweaks",
             "--sp-tweaks-dust",
-            "--rpcuser",
-            "--rpcpassword",
+            "--rpc",
+            "--rpc-listen",
+            "--rpc-token-file",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
@@ -546,6 +566,17 @@ mod tests {
         assert_eq!(fee.mempool.min_relay_fee_btc.as_deref(), Some("0.00001000"));
         let compact = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
         assert!(!compact.prefill_compact);
+        let rpc = ready_config(["rbitcoin-node", "--network", "regtest", "--rpc-listen"]);
+        assert!(rpc.rpc.socket);
+        assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
+        assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
+        let sock = ready_config(["rbitcoin-node", "--rpc"]);
+        assert!(sock.rpc.socket);
+        assert!(sock.rpc.listen.is_none());
+        let el = ready_config(["rbitcoin-node", "--sh-index", "--electrum-listen"]);
+        assert_eq!(el.listen.electrum.unwrap().port(), 50001);
+        let es = ready_config(["rbitcoin-node", "--sh-index", "--esplora-listen"]);
+        assert_eq!(es.listen.esplora.unwrap().port(), 3000);
     }
 
     #[test]
@@ -922,6 +953,8 @@ mod tests {
             "--inhibitsuspend=1",
             "--rpclisten=127.0.0.1:1",
             "--rpc-user=u",
+            "--rpcuser=u",
+            "--rpcpassword=p",
             "--shindex",
             "--sptweaks",
             "-shindex",
