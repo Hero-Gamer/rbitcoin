@@ -1953,6 +1953,37 @@ async fn electrum_tweaks_subscribe_streams_then_done() {
     assert_eq!(done["method"], "blockchain.tweaks.subscribe");
     assert_eq!(done["params"][0]["message"], "done");
 
+    let past = json!({
+        "jsonrpc":"2.0","id":"past",
+        "method":"blockchain.tweaks.subscribe",
+        "params":[99, 1, false]
+    });
+    let mut past_line = serde_json::to_string(&past).unwrap();
+    past_line.push('\n');
+    reader
+        .get_mut()
+        .write_all(past_line.as_bytes())
+        .await
+        .unwrap();
+    read_line_timeout(&mut reader, &mut resp, "tweaks past result").await;
+    let past_result: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(past_result["id"], "past");
+    let past_map = past_result["result"].as_object().expect("past map");
+    assert_eq!(
+        past_map.len(),
+        1,
+        "start past tip is one empty height: {past_map:?}"
+    );
+    assert_eq!(
+        past_map["99"].as_object().map(|o| o.len()),
+        Some(0),
+        "{past_map:?}"
+    );
+    read_line_timeout(&mut reader, &mut resp, "tweaks past done").await;
+    let past_done: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(past_done["method"], "blockchain.tweaks.subscribe");
+    assert_eq!(past_done["params"][0]["message"], "done");
+
     drop(reader);
 
     handle.shutdown().await;

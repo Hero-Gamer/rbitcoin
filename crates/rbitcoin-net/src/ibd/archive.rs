@@ -151,7 +151,7 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
     confirm_feed: &super::confirm::ConfirmFeed,
     max: usize,
 ) -> Result<usize, String> {
-    use rbitcoin_log::{info, warn};
+    use rbitcoin_log::info;
 
     if max == 0 {
         return Ok(0);
@@ -171,109 +171,25 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
         if n >= max {
             break;
         }
-        let Some(&hash) = st.height_to_hash.get(&ht) else {
-            break;
-        };
-        if hub.has_block(&hash) {
-            // Confirmed-set contains this hash. If that is tip+1 while tip is
-            // still lower, confirmed[] stole the tip+1 row (mainnet stall:
-            // conf[mid]=tip+1 → has_block true → never rehydrate/offer tip+1).
-            if ht == path_lo && hub.tip_height().is_some() {
-                warn!(
-                    "ibd: tip+1={ht} {hash} is in confirmed-set while tip={} — \
-                     confirmed[] likely maps an earlier height to tip+1; \
-                     restart after tip revalidate / open repair (or fresh datadir)",
-                    hub.tip_height().unwrap_or(0)
-                );
+        match rehydrate_one_height(hub, st, confirm_feed, ht)? {
+            RehydrateOne::Offered { bytes: b } => {
+                bytes = bytes.saturating_add(b);
+                h_min = h_min.min(ht);
+                h_max = h_max.max(ht);
+                n = n.saturating_add(1);
             }
-            break;
-        }
-        if st.body.is_rejected(&hash) {
-            break;
-        }
-        if hub.query.block_queue_has_height(ht) {
-            st.body.mark_pending(hash);
-            confirm_feed.note(ht, hash);
-            n = n.saturating_add(1);
-            h_min = h_min.min(ht);
-            h_max = h_max.max(ht);
-            continue;
-        }
-        if st.body.is_pending(&hash) {
-            st.body.mark_missing(hash);
-        }
-        let has_class_a = st.body.is_known_archived(&hash)
-            || hub
-                .query
-                .is_block_archived(&hash.to_byte_array())
-                .unwrap_or(false);
-        if !has_class_a {
-            break;
-        }
-
-        let block = match hub.query.reconstruct_archived_block(&hash.to_byte_array()) {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                warn!(
-                    "ibd: Class A rehydrate h={ht}: header_txs missing after archive flag — re-getdata"
-                );
-                st.body.mark_missing(hash);
-                failed = failed.saturating_add(1);
-                break;
+            RehydrateOne::Queued => {
+                h_min = h_min.min(ht);
+                h_max = h_max.max(ht);
+                n = n.saturating_add(1);
             }
-            Err(e) => {
-                warn!("ibd: Class A rehydrate reconstruct h={ht} {hash}: {e} — re-getdata");
-                st.body.mark_missing(hash);
-                failed = failed.saturating_add(1);
-                break;
-            }
-        };
-
-        // Corrupt Class A (wrong txs linked to header) — do not feed confirm.
-        // Clear association so densify re-getdatas; never permanent-blacklist.
-        let merkle_ok = block
-            .compute_merkle_root()
-            .is_some_and(|mr| mr == block.header.merkle_root);
-        if !merkle_ok || block.block_hash() != hash {
-            warn!(
-                "ibd: Class A rehydrate h={ht} {hash}: reconstructed body fails header check \
-                 (merkle/hash) — clear Class A and re-getdata"
-            );
-            let _ = hub.query.clear_archived_body(hash.as_byte_array());
-            st.body.demote_known(hash);
-            st.body.mark_missing(hash);
-            failed = failed.saturating_add(1);
-            break;
-        }
-
-        let mut payload = Vec::new();
-        if block.consensus_encode(&mut payload).is_err() {
-            warn!("ibd: Class A rehydrate encode h={ht} {hash} failed — re-getdata");
-            st.body.mark_missing(hash);
-            failed = failed.saturating_add(1);
-            break;
-        }
-        let header_fk = st.header_fks.get(&hash).copied().unwrap_or(Fk::NULL);
-        match hub
-            .query
-            .block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload)
-        {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("ibd: Class A rehydrate offer h={ht}: {e} — re-getdata");
-                st.body.mark_missing(hash);
-                failed = failed.saturating_add(1);
+            RehydrateOne::Stop { failed: f } => {
+                if f {
+                    failed = failed.saturating_add(1);
+                }
                 break;
             }
         }
-        st.body.mark_pending(hash);
-        // Keep known_archived for densify skip of far Class A; pending is claim-ready.
-        confirm_feed.note(ht, hash);
-        st.max_ready_height = st.max_ready_height.max(ht);
-        bytes = bytes.saturating_add(payload.len() as u64);
-        h_min = h_min.min(ht);
-        h_max = h_max.max(ht);
-        n = n.saturating_add(1);
     }
 
     if n > 0 || failed > 0 {
@@ -285,6 +201,118 @@ pub(crate) fn rehydrate_class_a_into_body_queue(
         );
     }
     Ok(n)
+}
+
+enum RehydrateOne {
+    Offered { bytes: u64 },
+    Queued,
+    Stop { failed: bool },
+}
+
+fn rehydrate_one_height(
+    hub: &ChainHub,
+    st: &mut super::state::IbdWorkState,
+    confirm_feed: &super::confirm::ConfirmFeed,
+    ht: u32,
+) -> Result<RehydrateOne, String> {
+    use rbitcoin_log::warn;
+    let Some(&hash) = st.height_to_hash.get(&ht) else {
+        return Ok(RehydrateOne::Stop { failed: false });
+    };
+    let path_lo = match hub.tip_height() {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
+    if hub.has_block(&hash) {
+        if ht == path_lo && hub.tip_height().is_some() {
+            warn!(
+                "ibd: tip+1={ht} {hash} is in confirmed-set while tip={} — \
+                 confirmed[] likely maps an earlier height to tip+1; \
+                 restart after tip revalidate / open repair (or fresh datadir)",
+                hub.tip_height().unwrap_or(0)
+            );
+        }
+        return Ok(RehydrateOne::Stop { failed: false });
+    }
+    if st.body.is_rejected(&hash) {
+        return Ok(RehydrateOne::Stop { failed: false });
+    }
+    if hub.query.block_queue_has_height(ht) {
+        st.body.mark_pending(hash);
+        confirm_feed.note(ht, hash);
+        return Ok(RehydrateOne::Queued);
+    }
+    if st.body.is_pending(&hash) {
+        st.body.mark_missing(hash);
+    }
+    let has_class_a = st.body.is_known_archived(&hash)
+        || hub
+            .query
+            .is_block_archived(&hash.to_byte_array())
+            .unwrap_or(false);
+    if !has_class_a {
+        return Ok(RehydrateOne::Stop { failed: false });
+    }
+    rehydrate_offer_class_a(hub, st, confirm_feed, ht, hash)
+}
+
+fn rehydrate_offer_class_a(
+    hub: &ChainHub,
+    st: &mut super::state::IbdWorkState,
+    confirm_feed: &super::confirm::ConfirmFeed,
+    ht: u32,
+    hash: BlockHash,
+) -> Result<RehydrateOne, String> {
+    use rbitcoin_log::warn;
+    let block = match hub.query.reconstruct_archived_block(&hash.to_byte_array()) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            warn!(
+                "ibd: Class A rehydrate h={ht}: header_txs missing after archive flag — re-getdata"
+            );
+            st.body.mark_missing(hash);
+            return Ok(RehydrateOne::Stop { failed: true });
+        }
+        Err(e) => {
+            warn!("ibd: Class A rehydrate reconstruct h={ht} {hash}: {e} — re-getdata");
+            st.body.mark_missing(hash);
+            return Ok(RehydrateOne::Stop { failed: true });
+        }
+    };
+    let merkle_ok = block
+        .compute_merkle_root()
+        .is_some_and(|mr| mr == block.header.merkle_root);
+    if !merkle_ok || block.block_hash() != hash {
+        warn!(
+            "ibd: Class A rehydrate h={ht} {hash}: reconstructed body fails header check \
+             (merkle/hash) — clear Class A and re-getdata"
+        );
+        let _ = hub.query.clear_archived_body(hash.as_byte_array());
+        st.body.demote_known(hash);
+        st.body.mark_missing(hash);
+        return Ok(RehydrateOne::Stop { failed: true });
+    }
+    let mut payload = Vec::new();
+    if block.consensus_encode(&mut payload).is_err() {
+        warn!("ibd: Class A rehydrate encode h={ht} {hash} failed — re-getdata");
+        st.body.mark_missing(hash);
+        return Ok(RehydrateOne::Stop { failed: true });
+    }
+    let header_fk = st.header_fks.get(&hash).copied().unwrap_or(Fk::NULL);
+    if let Err(e) = hub
+        .query
+        .block_queue_offer(ht, hash.to_byte_array(), header_fk.0, &payload)
+    {
+        warn!("ibd: Class A rehydrate offer h={ht}: {e} — re-getdata");
+        st.body.mark_missing(hash);
+        return Ok(RehydrateOne::Stop { failed: true });
+    }
+    st.body.mark_pending(hash);
+    confirm_feed.note(ht, hash);
+    st.max_ready_height = st.max_ready_height.max(ht);
+    Ok(RehydrateOne::Offered {
+        bytes: payload.len() as u64,
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +378,18 @@ mod class_a_rehydrate_tests {
             }
         }
         block
+    }
+
+    #[test]
+    fn class_a_rehydrate_max_zero_is_zero() {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("ca-max0");
+        let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        let feed = ConfirmFeed::new();
+        assert_eq!(
+            rehydrate_class_a_into_body_queue(&hub, &mut st, &feed, 0).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
