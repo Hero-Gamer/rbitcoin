@@ -3767,6 +3767,64 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         fill.list_live
     );
 
+    use bitcoin::bip152::BlockTransactions;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
+    use bitcoin::Network;
+    use tokio::runtime::Builder;
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            payload,
+        }
+    }
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+                compact_block: hsi,
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let gbt = match out_rx.try_recv().expect("getblocktxn").expect_msg() {
+            NetworkMessage::GetBlockTxn(g) => g,
+            other => panic!("expected getblocktxn, got {other:?}"),
+        };
+        assert_eq!(gbt.txs_request.indexes, vec![1]);
+        handle_peer_frame(
+            frame_for(NetworkMessage::BlockTxn(BlockTxn {
+                transactions: BlockTransactions {
+                    block_hash: block.block_hash(),
+                    transactions: vec![spend],
+                },
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            follow.pending_cmpct.is_empty(),
+            "blocktxn apply must consume the pending compact"
+        );
+    });
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
