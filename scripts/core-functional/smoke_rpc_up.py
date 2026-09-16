@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Start the bitcoind shim like TestNode and assert cookie + getblockcount==0.
 
-Needs a built rbitcoin-node (RBITCOIN_NODE). Not invoked by default cargo test.
+The node writes `{datadir}/rpc.token`; the shim mirrors `__cookie__:<token>`
+to `{datadir}/.cookie` for BitcoinTestFramework. Needs a built rbitcoin-node
+(RBITCOIN_NODE). Not invoked by default cargo test.
 """
 
 from __future__ import annotations

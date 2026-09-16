@@ -3,7 +3,8 @@
 
 Maps Core TestNode argv + bitcoin.conf onto kebab rbitcoin-node flags
 (no Core aliases on the node). `-datadir=DIR` becomes `--datadir DIR/regtest`
-so the cookie lands at `DIR/regtest/.cookie` (what BitcoinTestFramework tails).
+so the harness cookie lands at `DIR/regtest/.cookie` (mirrored from the
+node's `{datadir}/rpc.token` as `__cookie__:<token>`).
 
 Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
 `rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
@@ -19,6 +20,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from map_debuglog import apply_line, load_rules, map_error_stderr
@@ -678,15 +680,44 @@ def main(argv: list[str] | None = None) -> int:
     pump.start()
 
     cookie_path = node_dir / ".cookie"
+    token_path = node_dir / "rpc.token"
     node_url = f"http://127.0.0.1:{node_rpc_port(public_rpc)}"
+
+    def _mirror_cookie() -> None:
+        last = None
+        while child.poll() is None:
+            try:
+                tok = token_path.read_text().strip()
+            except OSError:
+                tok = ""
+            if tok and tok != last:
+                line = f"__cookie__:{tok}\n"
+                try:
+                    cookie_path.write_text(line)
+                    cookie_path.chmod(0o600)
+                except OSError:
+                    pass
+                last = tok
+            time.sleep(0.05)
+
+    mirror = threading.Thread(target=_mirror_cookie, daemon=True)
+    mirror.start()
 
     def _cookie() -> str | None:
         try:
             text = cookie_path.read_text()
         except OSError:
-            return None
+            text = ""
         line = text.strip()
-        return line or None
+        if line:
+            return line
+        try:
+            tok = token_path.read_text().strip()
+        except OSError:
+            return None
+        if not tok:
+            return None
+        return f"__cookie__:{tok}"
 
     proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
     register_utility(proxy)

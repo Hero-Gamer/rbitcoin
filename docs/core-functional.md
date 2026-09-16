@@ -36,9 +36,12 @@ mempool and inbound block-sync scripts). `--dry-run` prints the command and writ
 never calls this.
 
 `scripts/core-functional/bitcoind` is the TestNode binary: `-datadir=DIR`
-→ `--datadir DIR/regtest` (cookie + `bitcoind.pid` under `DIR/regtest`),
+→ `--datadir DIR/regtest` (`bitcoind.pid` under `DIR/regtest`),
 `-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
-127.0.0.1, `--no-seeds`. Node stdio goes to `regtest/debug.log`; only
+127.0.0.1, `--no-seeds`. The node writes `{datadir}/rpc.token` (Bearer);
+the shim mirrors `__cookie__:<token>` to `{datadir}/.cookie` so Core
+TestNode cookie + HTTP Basic still work (TCP accepts Basic iff the
+password equals the token). Node stdio goes to `regtest/debug.log`; only
 `Error:` lines (UA / init) are copied to the shim stderr so TestNode’s
 clean-stop check matches Core. Unknown Core flags fail parse. The shim maps
 Core names onto kebab `rbitcoin-node` flags (`-maxconnections` → `--max-inbound`
@@ -48,7 +51,7 @@ those Core aliases.
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
-# live cookie + getblockcount==0 (needs a built node):
+# live cookie (mirrored from rpc.token) + getblockcount==0 (needs a built node):
 cargo build -p rbitcoin-node
 RBITCOIN_NODE=target/dev/debug/rbitcoin-node \
   python3 scripts/core-functional/smoke_rpc_up.py
