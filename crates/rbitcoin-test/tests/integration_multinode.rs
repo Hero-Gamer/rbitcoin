@@ -660,10 +660,11 @@ fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
     h
 }
 
-/// Mature-pad follow: HB coinbase compact, 2-tx compact → getblocktxn + connect,
-/// unique short-id fill that fails header merkle → getdata (not BLOCK_FAILED),
-/// honest full block connects, then orphan child GetData + parent accept
-/// (INV of parked child is AlreadyHave).
+/// Mature-pad follow: HB coinbase compact, 2-tx compact → getblocktxn, same-peer
+/// compact retry while pending, then blocktxn connect; unique short-id fill
+/// that fails header merkle → getdata (not BLOCK_FAILED), honest full block
+/// connects, then orphan child GetData + parent accept (INV of parked child
+/// is AlreadyHave).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_compact_hb_getblocktxn_and_orphan() {
     use bitcoin::bip152::{HeaderAndShortIds, ShortId};
@@ -725,6 +726,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         let with_extra = mine_regtest_block(tip, tip_time + 600, pad_h + 2, vec![extra]);
         assert_eq!(with_extra.txdata.len(), 2, "coinbase + extra");
         let h_extra = with_extra.block_hash();
+        let hsi_extra = HeaderAndShortIds::from_block(&with_extra, 0xdead_beef, 2, &[]).unwrap();
         seed.ingest_block(pad_h + 2, with_extra).unwrap();
         wait_ms_until(
             5_000,
@@ -739,6 +741,25 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
                      (seed={:?} peer={:?})",
                     seed.peers.snapshot(),
                     peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        wait_ms_until(
+            3_000,
+            || {
+                seed.peers.live_peers().into_iter().any(|p| {
+                    p.inbound
+                        && p.handshake_complete()
+                        && p.queue_msg(NetworkMessage::CmpctBlock(CmpctBlock {
+                            compact_block: hsi_extra.clone(),
+                        }))
+                })
+            },
+            || {
+                format!(
+                    "seed inbound writer must take same-peer compact retry (seed={:?})",
+                    seed.peers.snapshot()
                 )
             },
         )

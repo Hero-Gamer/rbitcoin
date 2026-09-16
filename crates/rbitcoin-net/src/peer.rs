@@ -3139,9 +3139,11 @@ fn on_cmpct_need_txn(
     partial: crate::compact::CmpctPartial,
     fill: Option<Box<crate::compact::CmpctFillSets>>,
 ) -> Result<(), NetError> {
+    if follow.pending_cmpct.contains_key(&hash) {
+        return Ok(());
+    }
     let missing_n = partial.missing().len();
-    if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT && !follow.pending_cmpct.contains_key(&hash)
-    {
+    if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
         follow.ban_score = follow.ban_score.saturating_add(10);
         log_cmpct_getdata(hash, missing_n);
         return queue_out(

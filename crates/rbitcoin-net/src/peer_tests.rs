@@ -2380,6 +2380,137 @@ fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
 }
 
 #[test]
+fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
+        Witness,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        use bitcoin::p2p::message::RawNetworkMessage;
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        let payload = full[24..].to_vec();
+        FramedMessage {
+            magic,
+            command,
+            payload,
+        }
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-same-peer");
+        hub.ensure_genesis().unwrap();
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        assert!(hub.attach_mempool(mp).is_ok());
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![1]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: hub.tip_hash().unwrap(),
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spend],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
+        let hash = block.block_hash();
+        let peers = crate::peers::PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18446);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let session = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        let frame = frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: hsi,
+        }));
+        handle_peer_frame(frame.clone(), &hub, &out_tx, &mut follow, Some(&session))
+            .await
+            .unwrap();
+        match out_rx.try_recv().expect("first getblocktxn").expect_msg() {
+            NetworkMessage::GetBlockTxn(_) => {}
+            other => panic!("expected getblocktxn, got {other:?}"),
+        }
+        handle_peer_frame(frame, &hub, &out_tx, &mut follow, Some(&session))
+            .await
+            .unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "same-peer compact while pending must not getblocktxn again"
+        );
+        assert!(
+            follow.pending_cmpct.contains_key(&hash),
+            "first NeedTxn pending must stay"
+        );
+        assert!(
+            peers.try_cmpct_fill_slot(hash, true),
+            "same-peer retry must not consume the second inbound fill slot"
+        );
+        assert!(!peers.try_cmpct_fill_slot(hash, true));
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
+#[test]
 fn handle_peer_frame_control_and_inv_paths() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;

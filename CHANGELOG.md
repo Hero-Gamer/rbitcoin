@@ -25,6 +25,10 @@ before 1.0).
 
 ### Changed
 
+- **Same-peer compact retry:** a second `cmpctblock` for a hash already in
+  `pending_cmpct` does not take another BIP152 fill slot or send a second
+  `getblocktxn`. Two inbound peers can still fill the same hash.
+
 - **Class A does not annotate spends:** Tip used to `put_spend_batch` (per-vin
   `tx.head` + spent RMW) and then confirm `post_commit` annotated the same
   slots. Direct already skipped that. Both modes now share the confirm abs-meta
