@@ -2997,6 +2997,47 @@ fn resume_work_path_prefers_most_work_over_body() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `exclude` must omit the winner first hop so resume falls back to the loser.
+#[test]
+fn resume_work_path_excluding_omits_winner() {
+    let (dir, q) = temp_query("resume-exclude-winner");
+    let (g, tg) = coinbase_block(0, Fk::NULL, None);
+    let gfk = q.put_header(&g).unwrap();
+    let _ = q.commit_class_a_only(&g, &[tg]).unwrap();
+    let (lose, tl) = coinbase_block(1, gfk, Some(g.hash));
+    let _ = q.put_header(&lose).unwrap();
+    let _ = q.commit_class_a_only(&lose, &[tl]).unwrap();
+    let mut w1 = coinbase_block(11, gfk, Some(g.hash)).0;
+    if w1.hash == lose.hash {
+        w1.nonce = w1.nonce.wrapping_add(7);
+        w1.hash = rbitcoin_store::block_header_hash(
+            w1.version,
+            &g.hash,
+            &w1.merkle_root,
+            w1.timestamp,
+            w1.bits,
+            w1.nonce,
+        );
+    }
+    let w1fk = q.put_header(&w1).unwrap();
+    let (w2, _) = coinbase_block(12, w1fk, Some(w1.hash));
+    let _ = q.put_header(&w2).unwrap();
+
+    let path = q
+        .resume_work_path_after_tip_excluding(g.hash, 0, 8, &[w1.hash])
+        .unwrap();
+    assert!(!path.is_empty(), "resume must pick a remaining child");
+    assert_eq!(
+        path[0].hash,
+        lose.hash,
+        "exclude winner hop; path={:?}",
+        path.iter()
+            .map(|e| (e.hash, e.has_body))
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Two heavier sibling forks under grandparent: pick the strictly heavier.
 #[test]
 fn resume_from_loser_child_picks_heavier_of_two_forks() {

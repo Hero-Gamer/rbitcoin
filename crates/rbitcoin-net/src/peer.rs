@@ -18,7 +18,7 @@ use crate::v2::{
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
-use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
@@ -2071,7 +2071,50 @@ async fn handle_peer_frame(
         }
         Err(e) => return Err(e),
     };
+    handle_decoded_peer_msg(msg, hub, out_tx, follow, session).await
+}
+
+async fn handle_decoded_peer_msg(
+    msg: RawNetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
     match msg.payload() {
+        NetworkMessage::GetData(inv) => serve_getdata(hub, out_tx, follow, session, inv).await?,
+        NetworkMessage::Block(block) => on_block(hub, out_tx, follow, session, block).await?,
+        NetworkMessage::CmpctBlock(cb) => on_cmpctblock(hub, out_tx, follow, session, cb).await?,
+        NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
+            on_blocktxn(hub, out_tx, follow, session, bt).await?
+        }
+        NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, tx).await?,
+        other => handle_peer_sync_msg(other, hub, out_tx, follow, session)?,
+    }
+    Ok(())
+}
+
+fn handle_peer_sync_msg(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    if handle_peer_control_msg(payload, hub, out_tx, follow, session)? {
+        return Ok(());
+    }
+    handle_peer_inventory_msg(payload, hub, out_tx, follow, session)
+}
+
+fn handle_peer_control_msg(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<bool, NetError> {
+    match payload {
         NetworkMessage::Version(_) => on_redundant_version(session),
         NetworkMessage::Verack => on_redundant_verack(session),
         NetworkMessage::Ping(n) => on_ping(hub, out_tx, follow, session, *n)?,
@@ -2081,28 +2124,39 @@ async fn handle_peer_frame(
         NetworkMessage::SendCmpct(sc) => on_sendcmpct(follow, session, sc),
         NetworkMessage::WtxidRelay => on_wtxid_relay(follow, session),
         NetworkMessage::SendAddrV2 => on_sendaddrv2(follow, session),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn handle_peer_inventory_msg(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    match payload {
         NetworkMessage::Addr(list) => on_addr_list(follow, session, list.len())?,
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
         NetworkMessage::GetHeaders(gh) => on_getheaders(hub, out_tx, follow, session, gh)?,
         NetworkMessage::GetBlocks(gb) => on_getblocks(hub, out_tx, follow, session, gb)?,
-        NetworkMessage::GetData(inv) => serve_getdata(hub, out_tx, follow, session, inv).await?,
         NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
             on_getblocktxn(hub, out_tx, follow, session, txs_request)?
         }
         NetworkMessage::Inv(items) => on_inv(hub, out_tx, follow, session, items)?,
         NetworkMessage::Headers(headers) => on_headers(hub, out_tx, follow, session, headers)?,
-        NetworkMessage::Block(block) => on_block(hub, out_tx, follow, session, block).await?,
-        NetworkMessage::CmpctBlock(cb) => on_cmpctblock(hub, out_tx, follow, session, cb).await?,
-        NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
-            on_blocktxn(hub, out_tx, follow, session, bt).await?
-        }
-        NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, tx).await?,
         NetworkMessage::MemPool
         | NetworkMessage::FilterLoad(_)
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
-        NetworkMessage::Unknown { .. } => {}
+        NetworkMessage::Unknown { .. }
+        | NetworkMessage::GetData(_)
+        | NetworkMessage::Block(_)
+        | NetworkMessage::CmpctBlock(_)
+        | NetworkMessage::BlockTxn(_)
+        | NetworkMessage::Tx(_) => {}
         _ => {}
     }
     Ok(())
@@ -2791,191 +2845,257 @@ async fn on_cmpctblock(
 ) -> Result<(), NetError> {
     let hsi = cb.compact_block.clone();
     let hash = hsi.header.block_hash();
+    if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
+        return Ok(());
+    }
+    if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
+        && !hub.knows_header(&hsi.header.prev_blockhash)
+    {
+        let _ = queue_getheaders(out_tx, hub, session, true, None);
+    }
+    follow.pending_headers.entry(hash).or_insert(hsi.header);
+    if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
+        return Ok(());
+    }
+    on_cmpctblock_queue_ancestors(hub, out_tx, follow, hash)?;
+    if compact_header_low_work(hub, &hsi.header) {
+        let id = session.map(|s| s.id).unwrap_or(0);
+        rbitcoin_log::info!("Ignoring low-work compact block from peer {id}");
+        return Ok(());
+    }
+    if on_cmpctblock_weaker_unsolicited(hub, out_tx, follow, session, &hsi, hash)? {
+        return Ok(());
+    }
+    if hub.has_block(&hash) {
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        return Ok(());
+    }
+    on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash).await
+}
+
+fn on_cmpctblock_reject_early(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hsi: &HeaderAndShortIds,
+    hash: BlockHash,
+) -> Result<bool, NetError> {
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
         rbitcoin_log::info!("previous compact block reconstruction attempt failed");
         punish_disconnect(&mut follow.ban_score, session);
-        return Ok(());
+        return Ok(true);
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
         s.note_best_known(hash);
         s.note_last_block();
     }
-    if !crate::compact::prefilled_indexes_ok(&hsi) {
+    if !crate::compact::prefilled_indexes_ok(hsi) {
         rbitcoin_log::info!("invalid index in cmpctblock message");
         punish_disconnect(&mut follow.ban_score, session);
-        return Ok(());
+        return Ok(true);
     }
     if let Some(mp) = hub.mempool() {
         mp.try_note_extra_compact_txs(hsi.prefilled_txs.iter().map(|p| &p.tx));
     }
-    // Child of a cached-invalid block: Core `BLOCK_INVALID_PREV`.
-    // Same-hash cached invalid via compact stays connected
-    // (`p2p_compactblocks` `test_invalid_tx_in_compactblock`).
     if hub.is_block_invalid(&hsi.header.prev_blockhash) {
         punish_disconnect(&mut follow.ban_score, session);
-        return Ok(());
+        return Ok(true);
     }
     if hub.is_block_invalid(&hash) {
-        return Ok(());
+        return Ok(true);
     }
-    if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
-        && !hub.knows_header(&hsi.header.prev_blockhash)
+    Ok(false)
+}
+
+fn on_cmpctblock_queue_ancestors(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    hash: BlockHash,
+) -> Result<(), NetError> {
+    let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies(
+        hub,
+        &follow.pending_headers,
+        hash,
+        &follow.pending_blocks,
+        &follow.requested_blocks,
+    )
+    .into_iter()
+    .filter(|h| *h != hash)
+    .collect();
+    ancestors.truncate(MAX_SERVE_BLOCKS.saturating_sub(follow.requested_blocks.len()));
+    queue_block_getdata(
+        hub,
+        out_tx,
+        &mut follow.requested_blocks,
+        &ancestors,
+        getdata_use_compact(hub, follow.cmpct_version),
+    )
+}
+
+fn on_cmpctblock_weaker_unsolicited(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hsi: &HeaderAndShortIds,
+    hash: BlockHash,
+) -> Result<bool, NetError> {
+    if hub.tip_hash() != Some(hsi.header.prev_blockhash)
+        && hub.tip_hash() != Some(hash)
+        && !follow.requested_blocks.contains(&hash)
+        && hub.unrequested_weaker_than_tip(&hsi.header)
     {
-        // Better-work compact of a long fork announces only the
-        // tip (`mempool_reorg` 20-block submitblock). Ask for the
-        // header path before reconstruct.
-        let _ = queue_getheaders(out_tx, hub, session, true, None);
-    }
-    follow.pending_headers.entry(hash).or_insert(hsi.header);
-    if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
-        // Below -minimumchainwork: keep header, do not reconstruct/accept.
-    } else {
-        let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies(
-            hub,
-            &follow.pending_headers,
-            hash,
-            &follow.pending_blocks,
-            &follow.requested_blocks,
-        )
-        .into_iter()
-        .filter(|h| *h != hash)
-        .collect();
-        ancestors.truncate(MAX_SERVE_BLOCKS.saturating_sub(follow.requested_blocks.len()));
-        queue_block_getdata(
-            hub,
-            out_tx,
-            &mut follow.requested_blocks,
-            &ancestors,
-            getdata_use_compact(hub, follow.cmpct_version),
-        )?;
-        if compact_header_low_work(hub, &hsi.header) {
-            let id = session.map(|s| s.id).unwrap_or(0);
-            rbitcoin_log::info!("Ignoring low-work compact block from peer {id}");
-        } else if hub.tip_hash() != Some(hsi.header.prev_blockhash)
-            && hub.tip_hash() != Some(hash)
-            && !follow.requested_blocks.contains(&hash)
-            && hub.unrequested_weaker_than_tip(&hsi.header)
-        {
-            // Unsolicited weaker compact that does not extend our tip:
-            // header-only (fingerprint / stale). A better-work fork
-            // must reconstruct (`p2p_sendheaders` mine_reorg).
-            let prev = hsi.header.prev_blockhash;
-            if hub.knows_header(&prev) || follow.pending_headers.contains_key(&prev) {
-                let _ = hub.ensure_header(&hsi.header);
-            } else {
-                let _ = queue_getheaders(out_tx, hub, session, false, None);
-            }
-        } else if hub.has_block(&hash) {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        let prev = hsi.header.prev_blockhash;
+        if hub.knows_header(&prev) || follow.pending_headers.contains_key(&prev) {
+            let _ = hub.ensure_header(&hsi.header);
         } else {
-            match try_reconstruct_cmpct(hub, &hsi, 2) {
-                Some(CmpctReconstruct::Block(block, fill)) => {
-                    log_cmpct_filled(hub, &hsi, &block, &[], fill.as_deref());
-                    follow.requested_blocks.remove(&hash);
-                    drop_pending_cmpct(follow, session, hash);
-                    relay_new_pow_valid_block(hub, &block, session);
-                    match hub.accept_received_block_async(block.clone()).await {
-                        Ok(AcceptOutcome::Accepted { .. }) => {
-                            hub.forget_asked_block(&hash);
-                            maybe_select_hb_if_relay(hub, session);
-                        }
-                        Err(e) if net_error_needs_parent(&e) => {
-                            hub.forget_asked_block(&hash);
-                            follow.pending_blocks.insert(hash, block);
-                            maybe_select_hb_if_relay(hub, session);
-                        }
-                        Ok(_) => {
-                            hub.forget_asked_block(&hash);
-                        }
-                        _ => {
-                            if !hub.knows_header(&hsi.header.prev_blockhash) {
-                                let _ = queue_getheaders(out_tx, hub, session, true, None);
-                            }
-                        }
-                    }
-                    drain_pending(
-                        hub,
-                        out_tx,
-                        &mut follow.pending_blocks,
-                        &mut follow.pending_headers,
-                        &mut follow.requested_blocks,
-                        getdata_use_compact(hub, follow.cmpct_version),
-                        session,
-                    )
-                    .await?;
-                }
-                Some(CmpctReconstruct::GetData) => {
-                    log_cmpct_getdata(hash, 0);
-                    if let Some(s) = session {
-                        s.note_failed_cmpct(hash);
-                    }
-                    queue_out(
-                        out_tx,
-                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                    )?;
-                }
-                Some(CmpctReconstruct::NeedTxn(partial, fill)) => {
-                    let missing_n = partial.missing().len();
-                    if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT
-                        && !follow.pending_cmpct.contains_key(&hash)
-                    {
-                        follow.ban_score = follow.ban_score.saturating_add(10);
-                        log_cmpct_getdata(hash, missing_n);
-                        queue_out(
-                            out_tx,
-                            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                        )?;
-                    } else {
-                        let may_fill = session.is_none_or(|s| s.try_cmpct_fill(hash));
-                        if !may_fill {
-                            // Parallel inbound slot already taken
-                            // (`p2p_compactblocks` :929).
-                        } else {
-                            let missing = partial.missing().to_vec();
-                            follow.pending_cmpct.insert(
-                                hash,
-                                PendingCmpct {
-                                    hsi: hsi.clone(),
-                                    partial,
-                                    fill: fill.map(|b| *b),
-                                },
-                            );
-                            if let Some(s) = session {
-                                let h = hub
-                                    .query
-                                    .height_of_hash(&hsi.header.prev_blockhash.to_byte_array())
-                                    .ok()
-                                    .flatten()
-                                    .map(|ht| ht.0.saturating_add(1))
-                                    .unwrap_or_else(|| {
-                                        hub.tip_height().unwrap_or(0).saturating_add(1)
-                                    });
-                                s.note_block_inflight(h);
-                            }
-                            queue_out(
-                                out_tx,
-                                NetworkMessage::GetBlockTxn(GetBlockTxn {
-                                    txs_request: crate::compact::missing_request(hash, &missing),
-                                }),
-                            )?;
-                            rbitcoin_log::debug!(
-                                "cmpct reconstruct {hash} missing={} awaiting blocktxn",
-                                missing_n
-                            );
-                        }
-                    }
-                }
-                None => {
-                    log_cmpct_getdata(hash, 0);
-                    queue_out(
-                        out_tx,
-                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                    )?;
-                }
+            let _ = queue_getheaders(out_tx, hub, session, false, None);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn on_cmpctblock_reconstruct(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hsi: &HeaderAndShortIds,
+    hash: BlockHash,
+) -> Result<(), NetError> {
+    match try_reconstruct_cmpct(hub, hsi, 2) {
+        Some(CmpctReconstruct::Block(block, fill)) => {
+            on_cmpct_got_block(hub, out_tx, follow, session, hsi, hash, block, fill).await
+        }
+        Some(CmpctReconstruct::GetData) => on_cmpct_need_getdata(out_tx, session, hash),
+        Some(CmpctReconstruct::NeedTxn(partial, fill)) => {
+            on_cmpct_need_txn(hub, out_tx, follow, session, hsi, hash, partial, fill)
+        }
+        None => {
+            log_cmpct_getdata(hash, 0);
+            queue_out(
+                out_tx,
+                NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn on_cmpct_got_block(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hsi: &HeaderAndShortIds,
+    hash: BlockHash,
+    block: Block,
+    fill: Option<Box<crate::compact::CmpctFillSets>>,
+) -> Result<(), NetError> {
+    log_cmpct_filled(hub, hsi, &block, &[], fill.as_deref());
+    follow.requested_blocks.remove(&hash);
+    drop_pending_cmpct(follow, session, hash);
+    relay_new_pow_valid_block(hub, &block, session);
+    match hub.accept_received_block_async(block.clone()).await {
+        Ok(AcceptOutcome::Accepted { .. }) => {
+            hub.forget_asked_block(&hash);
+            maybe_select_hb_if_relay(hub, session);
+        }
+        Err(e) if net_error_needs_parent(&e) => {
+            hub.forget_asked_block(&hash);
+            follow.pending_blocks.insert(hash, block);
+            maybe_select_hb_if_relay(hub, session);
+        }
+        Ok(_) => {
+            hub.forget_asked_block(&hash);
+        }
+        _ => {
+            if !hub.knows_header(&hsi.header.prev_blockhash) {
+                let _ = queue_getheaders(out_tx, hub, session, true, None);
             }
         }
     }
+    drain_pending(
+        hub,
+        out_tx,
+        &mut follow.pending_blocks,
+        &mut follow.pending_headers,
+        &mut follow.requested_blocks,
+        getdata_use_compact(hub, follow.cmpct_version),
+        session,
+    )
+    .await
+}
+
+fn on_cmpct_need_getdata(
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) -> Result<(), NetError> {
+    log_cmpct_getdata(hash, 0);
+    if let Some(s) = session {
+        s.note_failed_cmpct(hash);
+    }
+    queue_out(
+        out_tx,
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_cmpct_need_txn(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hsi: &HeaderAndShortIds,
+    hash: BlockHash,
+    partial: crate::compact::CmpctPartial,
+    fill: Option<Box<crate::compact::CmpctFillSets>>,
+) -> Result<(), NetError> {
+    let missing_n = partial.missing().len();
+    if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT && !follow.pending_cmpct.contains_key(&hash)
+    {
+        follow.ban_score = follow.ban_score.saturating_add(10);
+        log_cmpct_getdata(hash, missing_n);
+        return queue_out(
+            out_tx,
+            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+        );
+    }
+    let may_fill = session.is_none_or(|s| s.try_cmpct_fill(hash));
+    if !may_fill {
+        return Ok(());
+    }
+    let missing = partial.missing().to_vec();
+    follow.pending_cmpct.insert(
+        hash,
+        PendingCmpct {
+            hsi: hsi.clone(),
+            partial,
+            fill: fill.map(|b| *b),
+        },
+    );
+    if let Some(s) = session {
+        let h = hub
+            .query
+            .height_of_hash(&hsi.header.prev_blockhash.to_byte_array())
+            .ok()
+            .flatten()
+            .map(|ht| ht.0.saturating_add(1))
+            .unwrap_or_else(|| hub.tip_height().unwrap_or(0).saturating_add(1));
+        s.note_block_inflight(h);
+    }
+    queue_out(
+        out_tx,
+        NetworkMessage::GetBlockTxn(GetBlockTxn {
+            txs_request: crate::compact::missing_request(hash, &missing),
+        }),
+    )?;
+    rbitcoin_log::debug!("cmpct reconstruct {hash} missing={missing_n} awaiting blocktxn");
     Ok(())
 }
 

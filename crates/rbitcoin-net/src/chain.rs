@@ -2019,6 +2019,39 @@ impl ChainHub {
 
     fn accept_branch_inner(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
         let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.accept_branch_precheck(blocks)?;
+        if let Some(out) = self.accept_branch_genesis_fill(blocks)? {
+            return Ok(out);
+        }
+        let fork_height = self.accept_branch_fork_height(blocks)?;
+        if let Some(out) = self.accept_branch_weaker(blocks, fork_height)? {
+            return Ok(out);
+        }
+        let old_path = self.accept_branch_collect_old(fork_height)?;
+        self.accept_branch_disconnect(fork_height)?;
+        let base = fork_height.map(|h| h + 1).unwrap_or(0);
+        self.accept_branch_connect(blocks, fork_height, base, &old_path)?;
+        self.announce_reorg_len.store(0, Ordering::Relaxed);
+        let height = base + (blocks.len() as u32) - 1;
+        {
+            let mut held = self.held_bodies.write().unwrap();
+            for b in blocks {
+                held.remove(&b.block_hash());
+            }
+        }
+        {
+            let mut forks = self.fork_tips.write().unwrap();
+            if let Some(old) = old_path.last() {
+                forks.insert(old.block_hash());
+            }
+            for b in blocks {
+                forks.remove(&b.block_hash());
+            }
+        }
+        Ok(AcceptOutcome::Accepted { height })
+    }
+
+    fn accept_branch_precheck(&self, blocks: &[Block]) -> Result<(), NetError> {
         if blocks.is_empty() {
             return Err(NetError::Protocol("empty branch"));
         }
@@ -2033,42 +2066,60 @@ impl ChainHub {
                 return Err(NetError::Protocol("branch not linked"));
             }
         }
+        Ok(())
+    }
+
+    fn accept_branch_genesis_fill(
+        &self,
+        blocks: &[Block],
+    ) -> Result<Option<AcceptOutcome>, NetError> {
+        if blocks[0].header.prev_blockhash.to_byte_array() != [0u8; 32] {
+            return Ok(None);
+        }
+        if self.tip_height().is_some() {
+            return Ok(None);
+        }
+        for (i, b) in blocks.iter().enumerate() {
+            self.connect_at(i as u32, Arc::new(b.clone()))?;
+        }
+        let h = (blocks.len() - 1) as u32;
+        Ok(Some(AcceptOutcome::Accepted { height: h }))
+    }
+
+    fn accept_branch_fork_height(&self, blocks: &[Block]) -> Result<Option<u32>, NetError> {
         let fork_prev = blocks[0].header.prev_blockhash;
-        let fork_h = if fork_prev.to_byte_array() == [0u8; 32] {
-            if self.tip_height().is_none() {
-                for (i, b) in blocks.iter().enumerate() {
-                    self.connect_at(i as u32, Arc::new(b.clone()))?;
-                }
-                let h = (blocks.len() - 1) as u32;
-                return Ok(AcceptOutcome::Accepted { height: h });
-            }
-            None
-        } else {
-            Some(
-                self.query
-                    .height_of_hash(&fork_prev.to_byte_array())
-                    .map_err(|e| NetError::Consensus(e.to_string()))?
-                    .ok_or(NetError::Protocol("branch parent not on chain"))?,
-            )
-        };
+        if fork_prev.to_byte_array() == [0u8; 32] {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.query
+                .height_of_hash(&fork_prev.to_byte_array())
+                .map_err(|e| NetError::Consensus(e.to_string()))?
+                .ok_or(NetError::Protocol("branch parent not on chain"))?
+                .0,
+        ))
+    }
 
-        let fork_height = fork_h.map(|h| h.0);
-
+    fn accept_branch_weaker(
+        &self,
+        blocks: &[Block],
+        fork_height: Option<u32>,
+    ) -> Result<Option<AcceptOutcome>, NetError> {
         let new_work = sum_work(blocks.iter().map(|b| b.header.work()));
-
         let our_work = self.work_from_fork_to_tip(fork_height)?;
-
         let branch_tip = blocks.last().map(Block::block_hash);
         let precious = *self.precious.read().unwrap() == branch_tip;
-        // Precious may break an equal-work tie. It must not activate less work.
         let equal_work = !work_better(new_work, our_work) && !work_better(our_work, new_work);
         if self.tip_height().is_some()
             && !work_better(new_work, our_work)
             && !(precious && equal_work)
         {
-            return Ok(AcceptOutcome::IgnoredWeaker);
+            return Ok(Some(AcceptOutcome::IgnoredWeaker));
         }
+        Ok(None)
+    }
 
+    fn accept_branch_collect_old(&self, fork_height: Option<u32>) -> Result<Vec<Block>, NetError> {
         let tip_h = self.tip_height().unwrap_or(0);
         let mut old_path: Vec<Block> = Vec::new();
         if let Some(fh) = fork_height {
@@ -2081,9 +2132,10 @@ impl ChainHub {
                 }
             }
         }
+        Ok(old_path)
+    }
 
-        // Once-confirmed losers stay in Class A (`reconstruct_archived_block`).
-        // Do not copy `old_path` into the held-body map (that is a block index).
+    fn accept_branch_disconnect(&self, fork_height: Option<u32>) -> Result<(), NetError> {
         if let Some(fh) = fork_height {
             self.disconnect_to(fh)?;
         } else {
@@ -2098,14 +2150,21 @@ impl ChainHub {
             self.cache.clear();
             self.confirmed.write().unwrap().clear();
         }
+        Ok(())
+    }
 
-        let base = fork_height.map(|h| h + 1).unwrap_or(0);
+    fn accept_branch_connect(
+        &self,
+        blocks: &[Block],
+        fork_height: Option<u32>,
+        base: u32,
+        old_path: &[Block],
+    ) -> Result<(), NetError> {
         self.announce_reorg_len
             .store(blocks.len() as u32, Ordering::Relaxed);
         for (i, b) in blocks.iter().enumerate() {
             if let Err(e) = self.connect_at(base + i as u32, Arc::new(b.clone())) {
                 self.announce_reorg_len.store(0, Ordering::Relaxed);
-                // Mid-branch connect fail: restore pre-attempt tip (not leave LCA).
                 if let Some(fh) = fork_height {
                     if let Err(disc) = self.disconnect_to(fh) {
                         return Err(NetError::Consensus(format!(
@@ -2126,24 +2185,7 @@ impl ChainHub {
                 });
             }
         }
-        self.announce_reorg_len.store(0, Ordering::Relaxed);
-        let height = base + (blocks.len() as u32) - 1;
-        {
-            let mut held = self.held_bodies.write().unwrap();
-            for b in blocks {
-                held.remove(&b.block_hash());
-            }
-        }
-        {
-            let mut forks = self.fork_tips.write().unwrap();
-            if let Some(old) = old_path.last() {
-                forks.insert(old.block_hash());
-            }
-            for b in blocks {
-                forks.remove(&b.block_hash());
-            }
-        }
-        Ok(AcceptOutcome::Accepted { height })
+        Ok(())
     }
 
     /// Disconnect the best chain down to `keep_height` (inclusive). Losing
