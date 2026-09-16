@@ -330,66 +330,14 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         let meta_ver = check_meta(&path)?;
-        if meta_ver <= 23 {
-            HeaderTable::rewrite_v23_body(&path)?;
-        }
-        unlink_leftover_spent_off(&path)?;
-        if class_a_has_creates(&path) && txout_meta_lacks_layout17(&path) {
-            return Err(StoreError::Corrupt(
-                "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
-            ));
-        }
-        if (15..22).contains(&meta_ver) && class_a_has_creates(&path) {
-            return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
-        }
-        if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
-            if crate::segmented_head::SegmentedTxHead::disk_occupied(&path)
-                || scripthash_index_data_present(&path)
-            {
-                return Err(StoreError::Corrupt(SCHEMA20_INDEX_REFUSE));
-            }
-            rewrite_meta_current(&path)?;
-        }
-        let leftover_epoch = path.join("archive_epoch");
-        if leftover_epoch.exists() {
-            eprintln!(
-                "store: dropping leftover archive_epoch (unread dual-path leftover; schema 17 does not keep it)"
-            );
-            let _ = std::fs::remove_file(&leftover_epoch);
-        }
-        let leftover_wire = path.join("wire");
-        if leftover_wire.exists() {
-            eprintln!("store: dropping leftover store/wire (unused; body queue is RAM-only)");
-            let _ = std::fs::remove_dir_all(&leftover_wire);
-            let _ = std::fs::remove_file(&leftover_wire);
-        }
-        if crate::sp_tweaks::SpTweaksTable::discard_legacy_files(&path) {
-            eprintln!(
-                "store: dropping leftover sp_tweaks.idx/body files \
-                 (schema 17 uses segmented dirs; --sptweaks backfill regenerates)"
-            );
-        }
+        open_layout_refuse_old(&path, meta_ver)?;
+        drop_unread_store_leftovers(&path);
         let scripthash = if path.join("scripthash.body").exists() {
             ScriptHashTable::open_with_scale(&path, layout.head_scale)?
         } else {
             ScriptHashTable::create_with_scale(&path, layout.head_scale)?
         };
-        // Schema 13/14→current: empty Class A + empty SH may rewrite meta. Packed
-        // tx.body with creates, or a materialized SH index, is refused.
-        if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION >= 15 {
-            if scripthash.has_durable_index() {
-                return Err(StoreError::Corrupt(
-                    "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
-                ));
-            }
-            if class_a_has_creates(&path) {
-                return Err(StoreError::Corrupt(
-                    "schema 16 refuses packed Class A with creates; wipe datadir and redo IBD",
-                ));
-            }
-            rewrite_meta_current(&path)?;
-        }
-        // header_txs v2: (first, count) arrays (upgrade path if missing).
+        open_layout_rewrite_pre15(&path, meta_ver, &scripthash)?;
         let header_txs = if path.join("header_txs_first.body").exists() {
             HeaderTxsTable::open(&path)?
         } else {
@@ -397,30 +345,9 @@ impl Store {
         };
         let confirmed = ConfirmedTable::open(&path)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
-        // Schema 15 leftover: height is O(blocks) in the fence. Drop the 4 B/tx file.
-        let leftover_h = path.join("tx_height.body");
-        if leftover_h.exists() {
-            eprintln!(
-                "store: dropping leftover tx_height.body (schema 16 uses a RAM fence from header_txs)"
-            );
-            let _ = std::fs::remove_file(&leftover_h);
-        }
+        drop_leftover_tx_height(&path);
         crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
-        if meta_ver == 15 && SCHEMA_VERSION >= 16 {
-            rewrite_meta_current(&path)?;
-        }
-        if meta_ver == 16 && SCHEMA_VERSION >= 17 {
-            rewrite_meta_current(&path)?;
-        }
-        if meta_ver == 17 {
-            if schema17_index_data_present(&path) {
-                return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
-            }
-            rewrite_meta_current(&path)?;
-        }
-        if meta_ver < SCHEMA_VERSION {
-            rewrite_meta_current(&path)?;
-        }
+        open_layout_rewrite_current(&path, meta_ver)?;
         let inwit_dir = resolve_inwit_dir(&layout)?;
         let txs = TxTable::open_inwit(&path, &inwit_dir, layout.open_opts())?;
         if layout.is_split() {
@@ -1618,6 +1545,102 @@ fn unlink_leftover_spent_off(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
+    if meta_ver <= 23 {
+        HeaderTable::rewrite_v23_body(path)?;
+    }
+    unlink_leftover_spent_off(path)?;
+    if class_a_has_creates(path) && txout_meta_lacks_layout17(path) {
+        return Err(StoreError::Corrupt(
+            "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
+        ));
+    }
+    if (15..22).contains(&meta_ver) && class_a_has_creates(path) {
+        return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
+    }
+    if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
+        if crate::segmented_head::SegmentedTxHead::disk_occupied(path)
+            || scripthash_index_data_present(path)
+        {
+            return Err(StoreError::Corrupt(SCHEMA20_INDEX_REFUSE));
+        }
+        rewrite_meta_current(path)?;
+    }
+    Ok(())
+}
+
+fn drop_unread_store_leftovers(path: &Path) {
+    let leftover_epoch = path.join("archive_epoch");
+    if leftover_epoch.exists() {
+        eprintln!(
+            "store: dropping leftover archive_epoch (unread dual-path leftover; schema 17 does not keep it)"
+        );
+        let _ = std::fs::remove_file(&leftover_epoch);
+    }
+    let leftover_wire = path.join("wire");
+    if leftover_wire.exists() {
+        eprintln!("store: dropping leftover store/wire (unused; body queue is RAM-only)");
+        let _ = std::fs::remove_dir_all(&leftover_wire);
+        let _ = std::fs::remove_file(&leftover_wire);
+    }
+    if crate::sp_tweaks::SpTweaksTable::discard_legacy_files(path) {
+        eprintln!(
+            "store: dropping leftover sp_tweaks.idx/body files \
+             (schema 17 uses segmented dirs; --sptweaks backfill regenerates)"
+        );
+    }
+}
+
+fn open_layout_rewrite_pre15(
+    path: &Path,
+    meta_ver: u16,
+    scripthash: &ScriptHashTable,
+) -> Result<(), StoreError> {
+    if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION >= 15 {
+        if scripthash.has_durable_index() {
+            return Err(StoreError::Corrupt(
+                "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
+            ));
+        }
+        if class_a_has_creates(path) {
+            return Err(StoreError::Corrupt(
+                "schema 16 refuses packed Class A with creates; wipe datadir and redo IBD",
+            ));
+        }
+        rewrite_meta_current(path)?;
+    }
+    Ok(())
+}
+
+fn drop_leftover_tx_height(path: &Path) {
+    let leftover_h = path.join("tx_height.body");
+    if leftover_h.exists() {
+        eprintln!(
+            "store: dropping leftover tx_height.body (schema 16 uses a RAM fence from header_txs)"
+        );
+        let _ = std::fs::remove_file(&leftover_h);
+    }
+}
+
+fn open_layout_rewrite_current(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
+    if meta_ver == 15 && SCHEMA_VERSION >= 16 {
+        rewrite_meta_current(path)?;
+    }
+    if meta_ver == 16 && SCHEMA_VERSION >= 17 {
+        rewrite_meta_current(path)?;
+    }
+    if meta_ver == 17 {
+        if schema17_index_data_present(path) {
+            return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
+        }
+        rewrite_meta_current(path)?;
+    }
+    if meta_ver < SCHEMA_VERSION {
+        rewrite_meta_current(path)?;
+    }
+    Ok(())
+}
+
 /// One-line 17→18 index refuse (`Store::open` + tests).
 const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
 
@@ -2010,6 +2033,14 @@ mod tests {
             Store::open_tiny(dir.join("missing")),
             Err(StoreError::NotDirectory(_))
         ));
+        {
+            let file = dir.join("open-file-not-dir");
+            std::fs::write(&file, b"x").unwrap();
+            assert!(matches!(
+                Store::open_tiny(&file),
+                Err(StoreError::NotDirectory(_))
+            ));
+        }
 
         let s = Store::create_tiny(&dir).unwrap();
         assert_eq!(s.path(), dir.as_path());

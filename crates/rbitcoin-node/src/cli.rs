@@ -27,6 +27,38 @@ where
     T: Into<OsString>,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    match parse_operator_flags(&args)? {
+        OperatorFlagEnd::Help => Ok(OperatorArgs::Help),
+        OperatorFlagEnd::Version => Ok(OperatorArgs::Version),
+        OperatorFlagEnd::Flags(parsed) => {
+            let mut config = NodeConfig::default();
+            if let Some(ref cp) = parsed.conf_path {
+                if let Err(e) = config.merge_conf_file(cp) {
+                    eprintln!("error: {e}");
+                    return Err(ExitCode::from(2));
+                }
+                config.conf_path = Some(cp.clone());
+            }
+            apply_operator_kvs(&mut config, parsed.kvs)?;
+            finish_operator_config(config, parsed.smoke, parsed.log_level_cli)
+        }
+    }
+}
+
+enum OperatorFlagEnd {
+    Help,
+    Version,
+    Flags(ParsedOperatorFlags),
+}
+
+struct ParsedOperatorFlags {
+    smoke: bool,
+    conf_path: Option<PathBuf>,
+    log_level_cli: Option<Option<Level>>,
+    kvs: Vec<(String, String)>,
+}
+
+fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> {
     let mut i = 1usize;
     let mut smoke = false;
     let mut conf_path: Option<PathBuf> = None;
@@ -38,17 +70,17 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!("{}", operator_usage());
-                return Ok(OperatorArgs::Help);
+                return Ok(OperatorFlagEnd::Help);
             }
             "--version" | "-V" => {
                 eprintln!("rbitcoin-node {}", env!("CARGO_PKG_VERSION"));
-                return Ok(OperatorArgs::Version);
+                return Ok(OperatorFlagEnd::Version);
             }
             "--smoke" => {
                 smoke = true;
                 i += 1;
             }
-            "--conf" => match take_arg(&args, &mut i, "--conf") {
+            "--conf" => match take_arg(args, &mut i, "--conf") {
                 Ok(v) => conf_path = Some(PathBuf::from(v)),
                 Err(c) => return Err(c),
             },
@@ -61,7 +93,7 @@ where
                 conf_path = Some(PathBuf::from(v));
                 i += 1;
             }
-            "--log-level" => match take_arg(&args, &mut i, "--log-level") {
+            "--log-level" => match take_arg(args, &mut i, "--log-level") {
                 Ok(raw) => match parse_log_level(&raw) {
                     Ok(v) => log_level_cli = Some(v),
                     Err(c) => return Err(c),
@@ -75,23 +107,22 @@ where
                 }
                 i += 1;
             }
-            other => match parse_cli_flag(&args, &mut i, other) {
+            other => match parse_cli_flag(args, &mut i, other) {
                 Ok(Some(kv)) => kvs.push(kv),
                 Ok(None) => {}
                 Err(c) => return Err(c),
             },
         }
     }
+    Ok(OperatorFlagEnd::Flags(ParsedOperatorFlags {
+        smoke,
+        conf_path,
+        log_level_cli,
+        kvs,
+    }))
+}
 
-    let mut config = NodeConfig::default();
-    if let Some(ref cp) = conf_path {
-        if let Err(e) = config.merge_conf_file(cp) {
-            eprintln!("error: {e}");
-            return Err(ExitCode::from(2));
-        }
-        config.conf_path = Some(cp.clone());
-    }
-
+fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Result<(), ExitCode> {
     let mut saw_listen = false;
     let mut saw_connect = false;
     let mut saw_seednode = false;
@@ -118,7 +149,14 @@ where
             Err(e) => return Err(cli_apply_err(e)),
         }
     }
+    Ok(())
+}
 
+fn finish_operator_config(
+    mut config: NodeConfig,
+    smoke: bool,
+    log_level_cli: Option<Option<Level>>,
+) -> Result<OperatorArgs, ExitCode> {
     if let Err(e) =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
     {
@@ -628,6 +666,26 @@ mod tests {
 
         assert!(operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]).is_err());
 
+        assert!(
+            matches!(
+                operator_config_from_args(["rbitcoin-node", "-V"]),
+                Ok(OperatorArgs::Version)
+            ),
+            "-V must assemble Version before run"
+        );
+        assert!(
+            operator_config_from_args(["rbitcoin-node", "--conf="]).is_err(),
+            "empty --conf= must fail"
+        );
+        match operator_config_from_args(["rbitcoin-node", "--log-level=off"]) {
+            Ok(OperatorArgs::Ready {
+                log_level_cli: Some(None),
+                ..
+            }) => {}
+            other => panic!("--log-level=off must be Ready with log off, got {other:?}"),
+        }
+        assert!(operator_config_from_args(["rbitcoin-node", "--log-level"]).is_err());
+
         let dir = tmp_datadir();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("m.conf");
@@ -636,6 +694,9 @@ mod tests {
         assert_eq!(from_conf.network, Network::Mainnet);
         assert_eq!(from_conf.milestone_height, 0);
         assert_eq!(from_conf.milestone(), Milestone::NONE);
+        let eq = format!("--conf={}", conf.to_str().unwrap());
+        let from_eq = ready_config(["rbitcoin-node", eq.as_str()]);
+        assert_eq!(from_eq.milestone_height, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

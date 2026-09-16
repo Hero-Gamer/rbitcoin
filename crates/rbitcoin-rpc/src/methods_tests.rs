@@ -146,6 +146,58 @@ fn getnetworkhashps_help_labels_dummy_work() {
 }
 
 #[test]
+fn method_help_named_arms_and_unknown() {
+    for m in [
+        "estimatesmartfee",
+        "estimaterawfee",
+        "getblockchaininfo",
+        "getblockstats",
+        "generatetoaddress",
+        "generateblock",
+        "generate",
+        "mockscheduler",
+        "generatetodescriptor",
+        "scantxoutset",
+        "decoderawtransaction",
+        "decodescript",
+        "validateaddress",
+        "gettxout",
+        "sendrawtransaction",
+        "getchaintips",
+        "getdeploymentinfo",
+        "getblocktemplate",
+        "getmininginfo",
+        "getnetworkhashps",
+        "prioritisetransaction",
+        "getprioritisedtransactions",
+        "submitblock",
+        "submitheader",
+        "getpeerinfo",
+        "help",
+        "echo",
+        "ping",
+        "getblock",
+        "getrawmempool",
+        "setmocktime",
+        "preciousblock",
+    ] {
+        let h = super::method_help(m);
+        assert!(
+            h.starts_with(m),
+            "help for listed method {m} must start with the name: {h}"
+        );
+        assert!(
+            !h.starts_with("unknown method"),
+            "listed method {m} must not be unknown: {h}"
+        );
+    }
+    assert_eq!(
+        super::method_help("not-a-method"),
+        "unknown method not-a-method"
+    );
+}
+
+#[test]
 fn getmempoolinfo_permitbaremultisig_is_always_true() {
     let (ctx, dir) = ctx_empty();
     let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();

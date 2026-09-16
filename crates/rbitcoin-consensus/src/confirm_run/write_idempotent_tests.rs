@@ -2381,6 +2381,33 @@ fn store_start_states_lookup_load_confirm() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+#[test]
+fn wire_lookup_empty_and_noncontiguous() {
+    use super::confirm_wire_lookup_stamp;
+    use crate::error::ConsensusError;
+    use crate::milestone::Milestone;
+    use crate::params::{genesis_block, ChainParams};
+    use rbitcoin_primitives::Height;
+    use std::sync::Arc;
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &[], None) {
+        Err(ConsensusError::BadBlock("empty confirm batch")) => {}
+        Ok(_) => panic!("empty lookup must refuse"),
+        Err(e) => panic!("empty lookup must refuse, got {e}"),
+    }
+    let g = genesis_block(&params);
+    let a = (Height(0), Arc::new(g.clone()), None);
+    let b = (Height(2), Arc::new(g), None);
+    match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &[a, b], None) {
+        Err(ConsensusError::BadBlock("confirm run not contiguous")) => {}
+        Ok(_) => panic!("gap lookup must refuse"),
+        Err(e) => panic!("gap lookup must refuse, got {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Load miss: spend edges without pin denserels must hard-fail (no cold tier).
 /// Pin-covered parent without denserels/abs fails structural (no body-range cold).
 #[test]
