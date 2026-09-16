@@ -31,6 +31,13 @@ before 1.0).
   p10s). Same Electrum/Esplora numbers.
   [`docs/mempool-fee-estimation.md`](docs/mempool-fee-estimation.md).
 
+- **Electrum `silentpayments.unsubscribe` drops the session scan:** a later
+  tip no longer walks that scan key (mismatch address leaves it). Catalog
+  journeys pin outpoint tip notify, confirmed vs mempool spent JSON, package
+  success, SP start clamped to tip, live `startingheight` at the seeder tip
+  with `synced_*` still `-1` until a header hash is known, and `/fee-estimates`
+  depths.
+
 - **Catalog journeys own yesterday's operator pins:** Electrum **1.6**
   outpoint / silent-payments TCP, `broadcast_package` success, live
   `getpeerinfo` clock/sync fields, and Esplora `/fees/recommended` sit on

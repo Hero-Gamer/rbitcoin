@@ -362,6 +362,12 @@ mod tests {
         assert!((r1 as i64 - 5_000).abs() < 50, "{r1}");
         assert!((r144 as i64 - 2_000).abs() < 50, "{r144}");
         assert!(r1 > r144);
+        assert_eq!(blend_sat_kvb(Some(9_000), None, 6), Some(9_000));
+        assert_eq!(blend_sat_kvb(None, Some(3_000), 6), Some(3_000));
+        assert_eq!(blend_sat_kvb(None, None, 6), None);
+        let mid = blend_sat_kvb(Some(10_000), Some(0), 6).unwrap();
+        assert!(mid > 0 && mid < 10_000, "{mid}");
+        assert!((blend_weight(0) - blend_weight(1)).abs() < 1e-12);
     }
 
     #[test]
@@ -370,8 +376,17 @@ mod tests {
         v[11] = 8_000;
         let far = historical_far_sat_kvb(&v, 144).unwrap();
         assert!(far >= 1_000);
+        let cold: Vec<u64> = (1..=11).map(|i| i * 1_000).collect();
+        let warm: Vec<u64> = (1..=12).map(|i| i * 1_000).collect();
+        let cold_p = historical_far_sat_kvb(&cold, 144).unwrap();
+        let warm_p = historical_far_sat_kvb(&warm, 144).unwrap();
+        assert!(
+            warm_p > cold_p,
+            "12 samples use p85, 11 use median: warm={warm_p} cold={cold_p}"
+        );
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 0), Some(1));
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 100), Some(5));
+        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 255), Some(5));
         assert!(historical_far_sat_kvb(&[], 144).is_none());
         assert_eq!(historical_far_sat_kvb(&[1_000, 2_000], 144), Some(1_000));
     }

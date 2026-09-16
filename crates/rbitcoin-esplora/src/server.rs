@@ -1232,6 +1232,8 @@ mod tests {
         assert!(path_never_pins("/mempool"));
         assert!(path_never_pins("/mempool/txids"));
         assert!(path_never_pins("/fee-estimates"));
+        assert!(path_never_pins("/fees/recommended"));
+        assert!(path_never_pins("/v1/fees/recommended"));
         assert!(path_never_pins("/tx"));
         assert!(!path_never_pins("/tx/ab"));
         assert!(parse_asof_param(&AsOfQuery { asof: None })
@@ -1486,7 +1488,11 @@ mod tests {
         let (st, body) = http_get(addr, "/fee-estimates").await;
         assert_eq!(st, 200, "{body}");
         let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(fees.get("1").is_some());
+        for t in [
+            "1", "2", "3", "4", "5", "6", "10", "20", "144", "504", "1008",
+        ] {
+            assert_eq!(fees[t].as_f64(), Some(1.0), "{t}: {body}");
+        }
 
         // POST /tx without hub
         let mut stream = TcpStream::connect(addr).await.unwrap();

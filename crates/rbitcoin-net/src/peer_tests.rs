@@ -3785,13 +3785,75 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
             payload,
         }
     }
+    let hsi_ok = hsi.clone();
+    let hsi_fail = hsi.clone();
+    let spend_ok = spend.clone();
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let mut follow = PeerFollowState::new();
         handle_peer_frame(
             frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
-                compact_block: hsi,
+                compact_block: hsi_fail,
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = out_rx.try_recv().expect("getblocktxn");
+        handle_peer_frame(
+            frame_for(NetworkMessage::BlockTxn(BlockTxn {
+                transactions: BlockTransactions {
+                    block_hash: block.block_hash(),
+                    transactions: vec![],
+                },
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(follow.ban_score >= 10, "solicited bad blocktxn bans");
+        let gd = match out_rx.try_recv().expect("getdata").expect_msg() {
+            NetworkMessage::GetData(inv) => inv,
+            other => panic!("expected getdata, got {other:?}"),
+        };
+        assert!(
+            matches!(gd.first(), Some(Inventory::WitnessBlock(_))),
+            "bad blocktxn falls back to full block: {gd:?}"
+        );
+        let ban_after_fail = follow.ban_score;
+        handle_peer_frame(
+            frame_for(NetworkMessage::BlockTxn(BlockTxn {
+                transactions: BlockTransactions {
+                    block_hash: block.block_hash(),
+                    transactions: vec![],
+                },
+            })),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            follow.ban_score,
+            ban_after_fail + 5,
+            "late blocktxn after fail is mild"
+        );
+    });
+    rt.block_on(async {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
+                compact_block: hsi_ok,
             })),
             &hub,
             &out_tx,
@@ -3809,7 +3871,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
             frame_for(NetworkMessage::BlockTxn(BlockTxn {
                 transactions: BlockTransactions {
                     block_hash: block.block_hash(),
-                    transactions: vec![spend],
+                    transactions: vec![spend_ok],
                 },
             })),
             &hub,

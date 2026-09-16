@@ -2344,13 +2344,20 @@ async fn node_run_p2p_short() {
                 rows[0]["timeoffset"].as_i64().is_some(),
                 "peer timeoffset: {peers}"
             );
-            assert!(
-                rows[0]["synced_headers"].as_i64().is_some(),
-                "synced_headers: {peers}"
+            assert_eq!(
+                rows[0]["startingheight"].as_i64(),
+                Some(3),
+                "VERSION start_height is the seeder tip: {peers}"
             );
-            assert!(
-                rows[0]["synced_blocks"].as_i64().is_some(),
-                "synced_blocks: {peers}"
+            assert_eq!(
+                rows[0]["synced_headers"].as_i64(),
+                Some(-1),
+                "empty getheaders at tip does not set best_known: {peers}"
+            );
+            assert_eq!(
+                rows[0]["synced_blocks"].as_i64(),
+                Some(-1),
+                "synced_blocks follows best_known, not startingheight: {peers}"
             );
             assert!(
                 rows[0]["servicesnames"]
