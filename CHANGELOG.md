@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **Electrum verbose `transaction.get` matches electrs timestamps:** confirmed
+  verbose objects include `time`/`blocktime`/`confirmations`/`blockhash` plus
+  `vin`/`vout`/`size`/`version`/`locktime`/`hash`. Mempool verbose is
+  `confirmations: 0` with no block stamp. `id_from_pos` third arg `merkle=true`
+  returns `{tx_hash, merkle}`. Cake was dating confirmed txs as today because
+  `{hex,txid}` is a non-empty map without `time`.
+
 - **Rust-style CLI, default RPC ports, and token auth:** operator flags are
   two-dash kebab (`--rpc-listen`, `--rpc-url`); short flags are `-h`/`-V` only.
   `--shindex` / `--sptweaks` are `--sh-index` / `--sp-tweaks`. JSON-RPC is

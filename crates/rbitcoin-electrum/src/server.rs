@@ -1606,13 +1606,7 @@ fn dispatch_pinned(
                 if confirmed_ok {
                     let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                     if verbose {
-                        return Ok(verbose_tx_json(
-                            query,
-                            &raw,
-                            &txid,
-                            Some(fk),
-                            chain.network,
-                        ));
+                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk), chain.network));
                     }
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
@@ -1624,13 +1618,7 @@ fn dispatch_pinned(
                     if let Some(tx) = mp.get_tx(&tid) {
                         let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(verbose_tx_json(
-                                query,
-                                &raw,
-                                &txid,
-                                None,
-                                chain.network,
-                            ));
+                            return Ok(verbose_tx_json(query, &raw, &txid, None, chain.network));
                         }
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
@@ -1755,18 +1743,7 @@ fn dispatch_pinned(
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
         }
-        "blockchain.transaction.id_from_pos" => {
-            let height = param_u32(params, 0)?;
-            let tx_pos = param_u32(params, 1)? as usize;
-            let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
-                if matches!(e, StoreError::NotFound) {
-                    "pos out of range".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            Ok(json!(txid_hex(&txid)))
-        }
+        "blockchain.transaction.id_from_pos" => id_from_pos(query, params),
         "blockchain.estimatefee" => {
             let target = param_u32(params, 0).unwrap_or(2);
             let fee = mempool
@@ -2062,6 +2039,34 @@ fn param_txid(params: &Value, idx: usize) -> Result<[u8; 32], String> {
 
 fn txid_hex(txid: &[u8; 32]) -> String {
     hash_hex_rev(txid)
+}
+
+fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
+    let height = param_u32(params, 0)?;
+    let tx_pos = param_u32(params, 1)? as usize;
+    let want_merkle = params
+        .as_array()
+        .and_then(|a| a.get(2))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
+        if matches!(e, StoreError::NotFound) {
+            "pos out of range".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    if !want_merkle {
+        return Ok(json!(txid_hex(&txid)));
+    }
+    let proof = query
+        .merkle_proof(Height(height), &txid)
+        .map_err(|e| e.to_string())?;
+    let merkle: Vec<String> = proof.merkle.iter().map(hash_hex_rev).collect();
+    Ok(json!({
+        "tx_hash": txid_hex(&txid),
+        "merkle": merkle,
+    }))
 }
 
 /// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
