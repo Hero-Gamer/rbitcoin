@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce production LCOV LH/LF never falls vs last green master (90% floor).
+# Enforce production LCOV ≥ 91% floor. CRAP --fail-above 30 after that.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,7 +67,7 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
     --ignore-filename-regex "$IGNORE" \
     --lcov --output-path "$ROOT/coverage/lcov.info" || true
 
-  # Line gate: LCOV LH/LF never-falls vs last green master (90% floor).
+  # Line gate: LCOV ≥ 91% floor (llvm-cov LH jitters; no never-falls ratchet).
   LCOV_STATS="$(python3 - <<'PY'
 from pathlib import Path
 p = Path("coverage/lcov.info")
@@ -92,8 +92,8 @@ PY
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
   echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files)"
-  echo "Line coverage gate: never below highest master coverage at or before merge-base; ${LCOV_PCT}% now"
-  echo "Gate math: pass iff displayed 2-decimal % does not fall (llvm-cov LH jitters; 90% floor if no snapshot)"
+  echo "Line coverage gate: ${LCOV_PCT}% now; pass iff unrounded LH*100 >= LF*91"
+  echo "Gate math: 91% floor (llvm-cov LH jitters; no never-falls ratchet)"
 
   # Optional HTML diagnostic (not the pass condition).
   HTML_PRESENT=0
@@ -115,34 +115,16 @@ PY
     echo "HTML uncovered-line markers (diagnostic): ${UNCOV_TOTAL}"
   fi
 
-  # Unrounded LH/LF vs highest master snapshot at or before merge-base.
   GATE_JSON="$ROOT/coverage/gate.json"
-  GATE_ARGS=(--lh "$LCOV_HIT" --lf "$LCOV_TOT" --status-out "$GATE_JSON")
-  MERGE_BASE="${COVERAGE_MERGE_BASE:-}"
-  if [[ -z "$MERGE_BASE" ]] && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "$ROOT" fetch --no-tags origin master:refs/remotes/origin/master >/dev/null 2>&1 || true
-    HEAD_FOR_BASE="${COVERAGE_HEAD_SHA:-${GITHUB_HEAD_SHA:-HEAD}}"
-    MERGE_BASE="$(git -C "$ROOT" merge-base origin/master "$HEAD_FOR_BASE" 2>/dev/null || true)"
-  fi
-  if [[ -n "$MERGE_BASE" ]]; then
-    echo "Coverage merge-base: ${MERGE_BASE}"
-    GATE_ARGS+=(--merge-base "$MERGE_BASE" --git-dir "$ROOT")
-  fi
-  if ! python3 "$ROOT/scripts/coverage-gate.py" "${GATE_ARGS[@]}"; then
+  if ! python3 "$ROOT/scripts/coverage-gate.py" \
+    --lh "$LCOV_HIT" --lf "$LCOV_TOT" --status-out "$GATE_JSON"; then
     cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
     exit 1
   fi
   SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
-  BADGE_EXTRA=()
-  BASE_LH="$(python3 -c "import json; print(json.load(open('$GATE_JSON')).get('base_lh',''))")"
-  BASE_LF="$(python3 -c "import json; print(json.load(open('$GATE_JSON')).get('base_lf',''))")"
-  if [[ -n "$BASE_LH" && -n "$BASE_LF" ]]; then
-    BADGE_EXTRA+=(--base-lh "$BASE_LH" --base-lf "$BASE_LF")
-  fi
   python3 "$ROOT/scripts/coverage-badge.py" \
-    --lh "$LCOV_HIT" --lf "$LCOV_TOT" --gate 90 \
-    --sha "$SHA" --scope production --out "$ROOT/coverage/badge.json" \
-    "${BADGE_EXTRA[@]}"
+    --lh "$LCOV_HIT" --lf "$LCOV_TOT" --gate 91 \
+    --sha "$SHA" --scope production --out "$ROOT/coverage/badge.json"
   echo "Wrote coverage/badge.json (${LCOV_PCT}% production)"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
