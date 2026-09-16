@@ -32,9 +32,9 @@ impl IndexMode {
         matches!(self, Self::Tip)
     }
 
-    /// Archive writes spend annotations in Tip when `--spendindex` is on.
-    pub fn writes_archive_spends(self, spend_index: bool) -> bool {
-        spend_index && self.is_tip()
+    /// Class A never writes spend annotations (confirm `post_commit` does).
+    pub fn writes_archive_spends(self, _spend_index: bool) -> bool {
+        false
     }
 
     /// Confirm enqueues SH write-behind in Tip when `--shindex` is on.
@@ -72,7 +72,7 @@ impl Query {
         self.sh_index_enabled.load(Ordering::SeqCst)
     }
 
-    /// Archive spend writes: Tip + spend index on.
+    /// Archive spend writes: never (confirm `post_commit` annotates).
     #[inline]
     pub fn writes_archive_spends(&self) -> bool {
         self.index_mode()

@@ -822,8 +822,6 @@ impl Query {
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::time::Instant;
 
-        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        let archive_spends = self.writes_archive_spends();
         let index_tx = self.tx_index_enabled();
 
         let t_collect = Instant::now();
@@ -925,9 +923,6 @@ impl Query {
                         prestamp_parents = true;
                     }
                 }
-                if archive_spends {
-                    spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
-                }
                 if inp.prev_index == u32::MAX {
                     tx_edges.push(crate::SpendEdge {
                         prev_txid: [0u8; 32],
@@ -1007,7 +1002,7 @@ impl Query {
             per_header_ranges,
             per_header_sw: Vec::new(),
             edges,
-            spends,
+            spends: Vec::new(),
             batch_creates,
             external_parents,
             external_parent_vouts,
@@ -1017,7 +1012,7 @@ impl Query {
         })
     }
 
-    /// **Writer / write path:** durable Class A put (body / head / spends / htxs).
+    /// **Writer / write path:** durable Class A put (body / head / htxs).
     ///
     /// **Idempotent:** headers that already have `header_txs` body are stripped
     /// (partial prior commit after structural/tip fail). If every header is
@@ -1093,12 +1088,6 @@ impl Query {
         let head_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        if !plan.spends.is_empty() {
-            self.store.put_spend_batch(&plan.spends)?;
-        }
-        let spend_ns = t.elapsed().as_nanos() as u64;
-
-        let t = Instant::now();
         if !plan.per_header_ranges.is_empty() {
             self.store
                 .header_txs
@@ -1126,7 +1115,7 @@ impl Query {
             reserve_ns,
             body_ns,
             head_ns,
-            spend_ns,
+            0,
             htxs_ns,
             n_blocks.max(1),
         );
