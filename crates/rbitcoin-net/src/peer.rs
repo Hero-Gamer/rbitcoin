@@ -2101,6 +2101,19 @@ fn handle_peer_sync_msg(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    if handle_peer_control_msg(payload, hub, out_tx, follow, session)? {
+        return Ok(());
+    }
+    handle_peer_inventory_msg(payload, hub, out_tx, follow, session)
+}
+
+fn handle_peer_control_msg(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<bool, NetError> {
     match payload {
         NetworkMessage::Version(_) => on_redundant_version(session),
         NetworkMessage::Verack => on_redundant_verack(session),
@@ -2111,6 +2124,19 @@ fn handle_peer_sync_msg(
         NetworkMessage::SendCmpct(sc) => on_sendcmpct(follow, session, sc),
         NetworkMessage::WtxidRelay => on_wtxid_relay(follow, session),
         NetworkMessage::SendAddrV2 => on_sendaddrv2(follow, session),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn handle_peer_inventory_msg(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    match payload {
         NetworkMessage::Addr(list) => on_addr_list(follow, session, list.len())?,
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
         NetworkMessage::GetHeaders(gh) => on_getheaders(hub, out_tx, follow, session, gh)?,
@@ -2125,8 +2151,8 @@ fn handle_peer_sync_msg(
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
-        NetworkMessage::Unknown { .. } => {}
-        NetworkMessage::GetData(_)
+        NetworkMessage::Unknown { .. }
+        | NetworkMessage::GetData(_)
         | NetworkMessage::Block(_)
         | NetworkMessage::CmpctBlock(_)
         | NetworkMessage::BlockTxn(_)
