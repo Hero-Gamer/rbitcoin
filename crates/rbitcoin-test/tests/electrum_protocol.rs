@@ -609,6 +609,14 @@ async fn electrum_server_version_history_balance() {
     )
     .await;
     assert!(v["result"]["hex"].as_str().is_some());
+    let time = v["result"]["time"].as_u64().expect("verbose time");
+    assert_eq!(v["result"]["blocktime"].as_u64(), Some(time));
+    assert!(v["result"]["confirmations"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        v["result"]["blockhash"].as_str().unwrap().len(),
+        64,
+        "{v}"
+    );
 
     let v = rpc(
         &mut stream,

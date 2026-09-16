@@ -1606,10 +1606,7 @@ fn dispatch_pinned(
                 if confirmed_ok {
                     let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                     if verbose {
-                        return Ok(json!({
-                            "hex": rbitcoin_primitives::hex_encode(&raw),
-                            "txid": txid_hex(&txid)
-                        }));
+                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk)));
                     }
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
@@ -1621,10 +1618,7 @@ fn dispatch_pinned(
                     if let Some(tx) = mp.get_tx(&tid) {
                         let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(json!({
-                                "hex": rbitcoin_primitives::hex_encode(&raw),
-                                "txid": txid_hex(&txid)
-                            }));
+                            return Ok(verbose_tx_json(query, &raw, &txid, None));
                         }
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
@@ -2056,6 +2050,33 @@ fn param_txid(params: &Value, idx: usize) -> Result<[u8; 32], String> {
 
 fn txid_hex(txid: &[u8; 32]) -> String {
     hash_hex_rev(txid)
+}
+
+/// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
+/// stamp); None = mempool (`confirmations: 0`, no block fields).
+fn verbose_tx_json(query: &Query, raw: &[u8], txid: &[u8; 32], fk: Option<Fk>) -> Value {
+    let mut obj = json!({
+        "hex": rbitcoin_primitives::hex_encode(raw),
+        "txid": txid_hex(txid),
+    });
+    match fk {
+        Some(fk) => {
+            if let Ok(Some(h)) = query.store().tx_height_get(fk) {
+                if let Ok(hdr) = query.wire_header_at_height(Height(h)) {
+                    let ts = hdr.time;
+                    obj["time"] = json!(ts);
+                    obj["blocktime"] = json!(ts);
+                    obj["blockhash"] = json!(hash_hex_rev(&hdr.block_hash().to_byte_array()));
+                    let tip = query.tip_height().map(|t| t.0).unwrap_or(h);
+                    obj["confirmations"] = json!(tip.saturating_sub(h).saturating_add(1));
+                }
+            }
+        }
+        None => {
+            obj["confirmations"] = json!(0);
+        }
+    }
+    obj
 }
 
 fn hash_hex_rev(h: &[u8; 32]) -> String {

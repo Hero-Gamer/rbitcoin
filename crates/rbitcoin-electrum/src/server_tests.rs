@@ -1102,6 +1102,17 @@ fn dispatch_on_connected_chain() {
     )
     .unwrap();
     assert!(verbose.get("hex").is_some());
+    assert_eq!(verbose["time"], 1);
+    assert_eq!(verbose["blocktime"], 1);
+    assert!(verbose["confirmations"].as_u64().unwrap() >= 1);
+    let want_bh = q
+        .wire_header_at_height(rbitcoin_primitives::Height(0))
+        .unwrap()
+        .block_hash();
+    assert_eq!(
+        verbose["blockhash"].as_str().unwrap(),
+        want_bh.to_string()
+    );
 
     let merkle = dispatch(
         "blockchain.transaction.get_merkle",
@@ -2554,6 +2565,12 @@ fn dispatch_live_mempool_surfaces() {
     );
     // Either confirmed path or mempool — must succeed for live parent.
     assert!(got.is_ok(), "{got:?}");
+    let got = got.unwrap();
+    if got.get("blockhash").is_none() {
+        assert_eq!(got["confirmations"], 0);
+        assert!(got.get("time").is_none());
+        assert!(got.get("blocktime").is_none());
+    }
 
     // Broadcast a second spend of coinbase[1]
     let second = Transaction {
