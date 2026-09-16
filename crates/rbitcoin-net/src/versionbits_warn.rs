@@ -122,4 +122,52 @@ mod tests {
         assert!(!signals_unknown(&v, 26));
         assert!(!signals_unknown(&(VERSIONBITS_TOP_BITS as i32), 27));
     }
+
+    #[test]
+    fn bit_is_active_needs_two_periods_then_threshold() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_store::HeaderRecord;
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-active");
+        assert!(!bit_is_active(&q, 0, 4, 2, 27));
+        assert!(!bit_is_active(&q, 4, 4, 2, 27));
+
+        let signal = (VERSIONBITS_TOP_BITS | (1 << 27)) as i32;
+        let mut prev_fk = Fk::NULL;
+        let mut prev_hash = [0u8; 32];
+        for h in 0u32..=8 {
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&h.to_le_bytes());
+            let version = if h == 0 || h >= 4 { 1 } else { signal };
+            let timestamp = h + 1;
+            let bits = 0x207fffff;
+            let nonce = h;
+            let hash = if h == 0 {
+                merkle
+            } else {
+                rbitcoin_store::block_header_hash(
+                    version, &prev_hash, &merkle, timestamp, bits, nonce,
+                )
+            };
+            let rec = HeaderRecord {
+                prev_fk,
+                version,
+                timestamp,
+                bits,
+                nonce,
+                merkle_root: merkle,
+                hash,
+                size: 0,
+                weight: 0,
+            };
+            prev_fk = q.put_header(&rec).unwrap();
+            q.store().confirmed.set(Height(h), prev_fk).unwrap();
+            prev_hash = hash;
+        }
+        q.store().rebuild_height_fence().unwrap();
+        assert!(bit_is_active(&q, 8, 4, 2, 27));
+        assert!(!bit_is_active(&q, 8, 4, 2, 26));
+        assert!(!bit_is_active(&q, 8, 4, 4, 27));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1182,6 +1182,138 @@ fn blocksonly_sendraw_invs_unbroadcast_to_inbound() {
     });
 }
 
+#[test]
+fn force_announce_txid_skips_then_invs_full_relay() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_primitives::Height;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("force-ann");
+    hub.ensure_genesis().unwrap();
+    let missing = bitcoin::Txid::from_byte_array([0x11; 32]);
+    crate::force_announce_txid(&hub, &crate::peers::PeerHub::new(), missing);
+
+    hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .expect("pad");
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .compute_txid();
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_9999_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    hub.mempool().unwrap().accept_tx(&tx).expect("accept");
+    let tid = tx.compute_txid();
+    let w = tx.compute_wtxid();
+    crate::force_announce_txid(&hub, &crate::peers::PeerHub::new(), missing);
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+
+    let block_relay = crate::peers::PeerHub::new();
+    block_relay.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        crate::peers::PeerConnType::BlockRelay,
+    );
+    crate::force_announce_txid(&hub, &block_relay, tid);
+
+    let no_writer = crate::peers::PeerHub::new();
+    no_writer.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    crate::force_announce_txid(&hub, &no_writer, tid);
+
+    let (skip_tx, mut skip_rx) = mpsc::unbounded_channel();
+    let already = crate::peers::PeerHub::new();
+    let sess = already.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    sess.attach_out(skip_tx);
+    sess.note_announced_wtx(w);
+    crate::force_announce_txid(&hub, &already, tid);
+    assert!(
+        skip_rx.try_recv().is_err(),
+        "already-announced must skip INV"
+    );
+
+    let (fee_tx, mut fee_rx) = mpsc::unbounded_channel();
+    let fee_hub = crate::peers::PeerHub::new();
+    let fee_sess = fee_hub.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    fee_sess.attach_out(fee_tx);
+    fee_sess.note_minfeefilter_sat_kvb(u64::MAX);
+    crate::force_announce_txid(&hub, &fee_hub, tid);
+    assert!(fee_rx.try_recv().is_err(), "minfeefilter must skip INV");
+
+    let (ok_tx, mut ok_rx) = mpsc::unbounded_channel();
+    let ok_hub = crate::peers::PeerHub::new();
+    let ok_sess = ok_hub.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    ok_sess.attach_out(ok_tx);
+    crate::force_announce_txid(&hub, &ok_hub, tid);
+    match ok_rx.try_recv().expect("full-relay INV").expect_msg() {
+        NetworkMessage::Inv(v) => {
+            assert_eq!(v, vec![Inventory::WTx(w)]);
+        }
+        other => panic!("expected WTx inv, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// When relay is on, unbroadcast must not skip the inbound 30s INV gate
 /// (`mempool_reorg.py:71`).
 #[test]
