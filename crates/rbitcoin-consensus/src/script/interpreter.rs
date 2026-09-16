@@ -1285,31 +1285,7 @@ fn checksig_legacy(
     if sig.is_empty() {
         return Ok(false);
     }
-    // Core: DERSIG | LOW_S | STRICTENC all require IsValidSignatureEncoding.
-    let need_der = ctx.bip66_active || ctx.low_s || ctx.strictenc;
-    if need_der && !crypto::is_valid_signature_encoding(sig) {
-        return Err(ConsensusError::Script("SIG_DER".into()));
-    }
-    if ctx.low_s {
-        // Parse lax after encoding check; high-S is a separate hard fail.
-        if let Ok((ecdsa, _)) = crypto::parse_der_sig(sig, false) {
-            if !crypto::is_low_der_s(&ecdsa) {
-                return Err(ConsensusError::Script("SIG_HIGH_S".into()));
-            }
-        }
-    }
-    if ctx.strictenc && !crypto::is_defined_hashtype(sig) {
-        return Err(ConsensusError::Script("SIG_HASHTYPE".into()));
-    }
-    if ctx.strictenc && !crypto::is_compressed_or_uncompressed_pubkey(pubkey) {
-        return Err(ConsensusError::Script("PUBKEYTYPE".into()));
-    }
-    if ctx.witness_pubkeytype
-        && ctx.sig_version == SigVersion::WitnessV0
-        && !crypto::is_compressed_pubkey(pubkey)
-    {
-        return Err(ConsensusError::Script("WITNESS_PUBKEYTYPE".into()));
-    }
+    checksig_legacy_encodings(sig, pubkey, ctx)?;
 
     let (ecdsa_sig, sighash_ty) = match crypto::parse_der_sig(sig, false) {
         Ok(x) => x,
@@ -1361,6 +1337,37 @@ fn checksig_legacy(
         return Err(ConsensusError::Script("NULLFAIL".into()));
     }
     Ok(ok)
+}
+
+fn checksig_legacy_encodings(
+    sig: &[u8],
+    pubkey: &[u8],
+    ctx: &EvalContext<'_>,
+) -> Result<(), ConsensusError> {
+    let need_der = ctx.bip66_active || ctx.low_s || ctx.strictenc;
+    if need_der && !crypto::is_valid_signature_encoding(sig) {
+        return Err(ConsensusError::Script("SIG_DER".into()));
+    }
+    if ctx.low_s {
+        if let Ok((ecdsa, _)) = crypto::parse_der_sig(sig, false) {
+            if !crypto::is_low_der_s(&ecdsa) {
+                return Err(ConsensusError::Script("SIG_HIGH_S".into()));
+            }
+        }
+    }
+    if ctx.strictenc && !crypto::is_defined_hashtype(sig) {
+        return Err(ConsensusError::Script("SIG_HASHTYPE".into()));
+    }
+    if ctx.strictenc && !crypto::is_compressed_or_uncompressed_pubkey(pubkey) {
+        return Err(ConsensusError::Script("PUBKEYTYPE".into()));
+    }
+    if ctx.witness_pubkeytype
+        && ctx.sig_version == SigVersion::WitnessV0
+        && !crypto::is_compressed_pubkey(pubkey)
+    {
+        return Err(ConsensusError::Script("WITNESS_PUBKEYTYPE".into()));
+    }
+    Ok(())
 }
 
 /// BIP340 Schnorr verify for a 32-byte x-only pubkey in tapscript (leaf sighash).

@@ -93,32 +93,121 @@ const fn mod3(x: u8) -> u8 {
     }
 }
 
+struct Fuse8Geom {
+    segment_length: u32,
+    segment_length_mask: u32,
+    segment_count_length: u32,
+    fp_array_len: usize,
+    block_bits: u32,
+}
+
+fn fuse8_geom(size: usize) -> Fuse8Geom {
+    const ARITY: u32 = 3;
+    let segment_length: u32 = segment_length(ARITY, size as u32).min(262_144);
+    let segment_length_mask: u32 = segment_length - 1;
+    let factor = size_factor(ARITY, size as u32);
+    let capacity: u32 = if size > 1 {
+        (size as f64 * factor).round() as u32
+    } else {
+        0
+    };
+    let init_segment_count = capacity.saturating_add(segment_length - 1) / segment_length;
+    let array_len = init_segment_count * segment_length;
+    let proposed = array_len.saturating_add(segment_length - 1) / segment_length;
+    let segment_count = if proposed < ARITY {
+        1
+    } else {
+        proposed - (ARITY - 1)
+    };
+    let fp_array_len = ((segment_count + ARITY - 1) * segment_length) as usize;
+    let segment_count_length = segment_count * segment_length;
+    let mut block_bits = 1u32;
+    while (1u32 << block_bits) < segment_count {
+        block_bits += 1;
+    }
+    Fuse8Geom {
+        segment_length,
+        segment_length_mask,
+        segment_count_length,
+        fp_array_len,
+        block_bits,
+    }
+}
+
+struct Fuse8Peel<'a> {
+    alone: &'a mut [u32],
+    t2count: &'a mut [u8],
+    t2hash: &'a mut [u64],
+    reverse_h: &'a mut [u8],
+    reverse_order: &'a mut [u64],
+    h012: &'a mut [u32; 6],
+    capacity: usize,
+    geom: &'a Fuse8Geom,
+}
+
+fn fuse8_peel_stack(p: &mut Fuse8Peel<'_>) -> usize {
+    let mut qsize = 0usize;
+    for i in 0..p.capacity {
+        p.alone[qsize] = i as u32;
+        if (p.t2count[i] >> 2) == 1 {
+            qsize += 1;
+        }
+    }
+    let mut stack_size = 0usize;
+    while qsize > 0 {
+        qsize -= 1;
+        let index = p.alone[qsize] as usize;
+        if (p.t2count[index] >> 2) != 1 {
+            continue;
+        }
+        let hash = p.t2hash[index];
+        let found: u8 = p.t2count[index] & 3;
+        p.reverse_h[stack_size] = found;
+        p.reverse_order[stack_size] = hash;
+        stack_size += 1;
+
+        let (index1, index2, index3) = hash_of_hash(
+            hash,
+            p.geom.segment_length,
+            p.geom.segment_length_mask,
+            p.geom.segment_count_length,
+        );
+        p.h012[1] = index2;
+        p.h012[2] = index3;
+        p.h012[3] = index1;
+        p.h012[4] = p.h012[1];
+
+        let other_index1 = p.h012[(found + 1) as usize] as usize;
+        p.alone[qsize] = other_index1 as u32;
+        if (p.t2count[other_index1] >> 2) == 2 {
+            qsize += 1;
+        }
+        p.t2count[other_index1] = p.t2count[other_index1].wrapping_sub(4);
+        p.t2count[other_index1] ^= mod3(found + 1);
+        p.t2hash[other_index1] ^= hash;
+
+        let other_index2 = p.h012[(found + 2) as usize] as usize;
+        p.alone[qsize] = other_index2 as u32;
+        if (p.t2count[other_index2] >> 2) == 2 {
+            qsize += 1;
+        }
+        p.t2count[other_index2] = p.t2count[other_index2].wrapping_sub(4);
+        p.t2count[other_index2] ^= mod3(found + 2);
+        p.t2hash[other_index2] ^= hash;
+    }
+    stack_size
+}
+
 impl BinaryFuse8 {
     /// Build from distinct keys. Fails on construction timeout (usually dups).
     pub fn try_from_keys(keys: &[u64]) -> Result<Self, &'static str> {
-        let arity = 3u32;
         let size = keys.len();
-        let segment_length: u32 = segment_length(arity, size as u32).min(262_144);
-        let segment_length_mask: u32 = segment_length - 1;
-        let size_factor = size_factor(arity, size as u32);
-        let capacity: u32 = if size > 1 {
-            (size as f64 * size_factor).round() as u32
-        } else {
-            0
-        };
-        let init_segment_count = capacity.saturating_add(segment_length - 1) / segment_length;
-        let (fp_array_len, segment_count) = {
-            let array_len = init_segment_count * segment_length;
-            let proposed = array_len.saturating_add(segment_length - 1) / segment_length;
-            let segment_count = if proposed < arity {
-                1
-            } else {
-                proposed - (arity - 1)
-            };
-            let array_len = (segment_count + arity - 1) * segment_length;
-            (array_len as usize, segment_count)
-        };
-        let segment_count_length = segment_count * segment_length;
+        let geom = fuse8_geom(size);
+        let segment_length = geom.segment_length;
+        let segment_length_mask = geom.segment_length_mask;
+        let segment_count_length = geom.segment_count_length;
+        let fp_array_len = geom.fp_array_len;
+        let block_bits = geom.block_bits;
 
         let mut fingerprints = vec![0u8; fp_array_len].into_boxed_slice();
         let mut rng = 1u64;
@@ -133,10 +222,6 @@ impl BinaryFuse8 {
             reverse_order[size] = 1;
         }
 
-        let mut block_bits = 1u32;
-        while (1u32 << block_bits) < segment_count {
-            block_bits += 1;
-        }
         let start_pos_len: usize = 1 << block_bits;
         let mut start_pos = vec![0usize; start_pos_len];
         let mut h012 = [0u32; 6];
@@ -208,54 +293,16 @@ impl BinaryFuse8 {
                 continue;
             }
 
-            let mut qsize = 0usize;
-            for i in 0..capacity {
-                alone[qsize] = i as u32;
-                if (t2count[i] >> 2) == 1 {
-                    qsize += 1;
-                }
-            }
-            let mut stack_size = 0usize;
-            while qsize > 0 {
-                qsize -= 1;
-                let index = alone[qsize] as usize;
-                if (t2count[index] >> 2) == 1 {
-                    let hash = t2hash[index];
-                    let found: u8 = t2count[index] & 3;
-                    reverse_h[stack_size] = found;
-                    reverse_order[stack_size] = hash;
-                    stack_size += 1;
-
-                    let (index1, index2, index3) = hash_of_hash(
-                        hash,
-                        segment_length,
-                        segment_length_mask,
-                        segment_count_length,
-                    );
-                    h012[1] = index2;
-                    h012[2] = index3;
-                    h012[3] = index1;
-                    h012[4] = h012[1];
-
-                    let other_index1 = h012[(found + 1) as usize] as usize;
-                    alone[qsize] = other_index1 as u32;
-                    if (t2count[other_index1] >> 2) == 2 {
-                        qsize += 1;
-                    }
-                    t2count[other_index1] = t2count[other_index1].wrapping_sub(4);
-                    t2count[other_index1] ^= mod3(found + 1);
-                    t2hash[other_index1] ^= hash;
-
-                    let other_index2 = h012[(found + 2) as usize] as usize;
-                    alone[qsize] = other_index2 as u32;
-                    if (t2count[other_index2] >> 2) == 2 {
-                        qsize += 1;
-                    }
-                    t2count[other_index2] = t2count[other_index2].wrapping_sub(4);
-                    t2count[other_index2] ^= mod3(found + 2);
-                    t2hash[other_index2] ^= hash;
-                }
-            }
+            let stack_size = fuse8_peel_stack(&mut Fuse8Peel {
+                alone: &mut alone,
+                t2count: &mut t2count,
+                t2hash: &mut t2hash,
+                reverse_h: &mut reverse_h,
+                reverse_order: &mut reverse_order,
+                h012: &mut h012,
+                capacity,
+                geom: &geom,
+            });
 
             if stack_size + duplicates == size {
                 ultimate_size = stack_size;
@@ -355,5 +402,13 @@ mod tests {
     fn empty_keys_constructs_via_caller_dummy_only() {
         // size==0 geometry: empty reverse_order / zero stack still builds.
         assert!(BinaryFuse8::try_from_keys(&[]).is_ok());
+        let g0 = fuse8_geom(0);
+        assert_eq!(g0.segment_length, 4);
+        assert_eq!(g0.segment_length_mask, 3);
+        let g1 = fuse8_geom(1);
+        assert!(g1.fp_array_len > 0);
+        let g50 = fuse8_geom(50);
+        assert!(g50.fp_array_len > g1.fp_array_len);
+        assert!(g50.block_bits >= 1);
     }
 }

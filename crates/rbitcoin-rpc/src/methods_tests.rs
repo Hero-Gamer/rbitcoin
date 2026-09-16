@@ -2627,6 +2627,108 @@ fn submitblock_good_and_bad_merkle() {
 }
 
 #[test]
+fn submitblock_cheap_tx_rejects() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let (_, script) = p2wpkh_regtest();
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time + 1;
+
+    let mut empty = mine_regtest_paying(prev, time, 1, script.clone(), vec![]);
+    empty.txdata.clear();
+    let r = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&empty)))],
+    )
+    .unwrap();
+    assert_eq!(r, json!("bad-blk-length"));
+
+    let mut no_cb = mine_regtest_paying(prev, time + 1, 2, script.clone(), vec![]);
+    no_cb.txdata[0].input[0].previous_output = OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 0,
+    };
+    let r = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&no_cb)))],
+    )
+    .unwrap();
+    assert_eq!(r, json!("bad-cb-missing"));
+
+    let mut dup = mine_regtest_paying(prev, time + 2, 3, script.clone(), vec![]);
+    let cb = dup.txdata[0].clone();
+    dup.txdata.push(cb);
+    let r = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&dup)))],
+    )
+    .unwrap();
+    assert_eq!(r, json!("bad-txns-duplicate"));
+
+    let mut below = mine_regtest_paying(prev, time + 3, 4, script.clone(), vec![]);
+    let cb_txid = below.txdata[0].compute_txid();
+    below.txdata.push(Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb_txid,
+                vout: 0,
+            },
+            script_sig: Default::default(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(u64::MAX),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    });
+    let r = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&below)))],
+    )
+    .unwrap();
+    assert_eq!(r, json!("bad-txns-in-belowout"));
+
+    let mut miss = mine_regtest_paying(prev, time + 4, 5, script, vec![]);
+    miss.txdata.push(Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0x22; 32]),
+                vout: 0,
+            },
+            script_sig: Default::default(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        }],
+    });
+    let r = dispatch(
+        &ctx,
+        "submitblock",
+        vec![json!(rbitcoin_primitives::hex_encode(serialize(&miss)))],
+    )
+    .unwrap();
+    assert_eq!(r, json!("bad-txns-inputs-missingorspent"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn invalidate_reconsider_tip() {
     use bitcoin::consensus::encode::serialize;
     use rbitcoin_consensus::mine_regtest_paying;
@@ -3776,6 +3878,54 @@ fn addpeeraddress_updates_addrman_without_rewriting_peers_file() {
     assert_eq!(am.lock().unwrap().len(), 2);
     assert!(!peers_path.exists());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getnodeaddresses_empty_named_filter_and_count() {
+    use rbitcoin_net::AddrMan;
+    use std::sync::Mutex;
+
+    let (ctx, dir) = ctx_empty();
+    assert_eq!(
+        dispatch(&ctx, "getnodeaddresses", vec![]).unwrap(),
+        json!([])
+    );
+    let bad_net = dispatch(&ctx, "getnodeaddresses", vec![json!(1), json!("notanet")]).unwrap_err();
+    assert_eq!(bad_net["code"], ERR_INVALID_PARAMETER);
+    let neg = dispatch(&ctx, "getnodeaddresses", vec![json!(-1)]).unwrap_err();
+    assert_eq!(neg["code"], ERR_INVALID_PARAMETER);
+    let not_int = dispatch(&ctx, "getnodeaddresses", vec![json!("x")]).unwrap_err();
+    assert_eq!(not_int["code"], ERR_INVALID_PARAMS);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (mut ctx, dir) = ctx_empty();
+    let am = Arc::new(Mutex::new(AddrMan::new()));
+    ctx.addrman = Some(Arc::clone(&am));
+    dispatch(
+        &ctx,
+        "addpeeraddress",
+        vec![json!("128.1.2.3"), json!(8333)],
+    )
+    .unwrap();
+    dispatch(&ctx, "addpeeraddress", vec![json!("::1"), json!(8333)]).unwrap();
+    let none = dispatch(&ctx, "getnodeaddresses", vec![]).unwrap();
+    assert_eq!(none.as_array().unwrap().len(), 1);
+    let all = dispatch(&ctx, "getnodeaddresses", vec![json!(0)]).unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    let v4 = dispatch(&ctx, "getnodeaddresses", vec![json!(10), json!("ipv4")]).unwrap();
+    assert_eq!(v4.as_array().unwrap().len(), 1);
+    assert_eq!(v4[0]["network"], "ipv4");
+    let v6 = dispatch(
+        &ctx,
+        "getnodeaddresses",
+        named(json!({"count": 0, "network": "ipv6"})),
+    )
+    .unwrap();
+    assert_eq!(v6.as_array().unwrap().len(), 1);
+    assert_eq!(v6[0]["network"], "ipv6");
+    let onion = dispatch(&ctx, "getnodeaddresses", vec![json!(0), json!("onion")]).unwrap();
+    assert_eq!(onion.as_array().unwrap().len(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

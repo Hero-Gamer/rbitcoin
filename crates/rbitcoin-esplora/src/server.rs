@@ -1784,6 +1784,62 @@ mod tests {
         assert_eq!(v["block"]["height"], 1);
         assert!(v["block"]["id"].as_str().unwrap().len() == 64);
 
+        ws.send(WsMsg::Text(r#"{"foo":1}"#.into())).await.unwrap();
+        ws.send(WsMsg::Text(r#"{"stop-track-addresses":true}"#.into()))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(r#"{"track-address":"not-an-address"}"#.into()))
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timeout waiting invalid-address error")
+            .expect("ws closed")
+            .expect("ws err");
+        let err_text = match err {
+            WsMsg::Text(t) => t.as_str().to_owned(),
+            other => panic!("expected error text, got {other:?}"),
+        };
+        assert!(
+            err_text.contains("invalid address"),
+            "invalid address error: {err_text}"
+        );
+        let id = "ab".repeat(32);
+        ws.send(WsMsg::Text(
+            (format!(r#"{{"stop-track-tx":"{id}"}}"#)).into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(WsMsg::Text(
+            r#"{"stop-track-address":"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz8z5y2"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{id}"}}"#).into()))
+            .await
+            .unwrap();
+        ws.send(WsMsg::Text(
+            r#"{"track-addresses":["not-an-address"]}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let err2 = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timeout waiting track-addresses error")
+            .expect("ws closed")
+            .expect("ws err");
+        let err2_text = match err2 {
+            WsMsg::Text(t) => t.as_str().to_owned(),
+            other => panic!("expected error text, got {other:?}"),
+        };
+        assert!(
+            err2_text.contains("invalid address"),
+            "track-addresses error: {err2_text}"
+        );
+
         // REST still OK with WS open.
         let (st, body) = http_get(addr, "/blocks/tip/height").await;
         assert_eq!(st, 200, "{body}");
