@@ -37,6 +37,15 @@ before 1.0).
   returns `{tx_hash, merkle}`. Cake was dating confirmed txs as today because
   `{hex,txid}` is a non-empty map without `time`.
 
+- **CRAP chew (getdata/store/asmap):** drop allowlist entries for
+  `serve_getdata`, `Store::check_confirmed_height`, `assemble_run`,
+  `Query::join_spends_wave`, `ScriptHashTable::unlink_create`,
+  `SegmentedTxHead::probe_candidates_batch_wave`,
+  `ChainHub::reconsider_block_inner`, and `sanity_check_bits` after coverage
+  pins and extracts (getdata block/compact/wtx, header-tx range, assemble
+  MTP/bits, spend-join fks, unlink home write, probe unsealed/sealed waves,
+  asmap opcode helpers, invalidated-path take).
+
 - **Rust-style CLI, default RPC ports, and token auth:** operator flags are
   two-dash kebab (`--rpc-listen`, `--rpc-url`); short flags are `-h`/`-V` only.
   `--shindex` / `--sptweaks` are `--sh-index` / `--sp-tweaks`. JSON-RPC is
