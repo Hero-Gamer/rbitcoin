@@ -28,7 +28,8 @@ before 1.0).
 - **Class A does not annotate spends:** Tip used to `put_spend_batch` (per-vin
   `tx.head` + spent RMW) and then confirm `post_commit` annotated the same
   slots. Direct already skipped that. Both modes now share the confirm abs-meta
-  path only (`arch_write_spend_ns == 0`).
+  path only (`arch_write_spend_ns == 0`). `Query::confirm_block` (fixture
+  `connect_block`) annotates after Class C the same way.
 
 - **Wire plan trusts lookup parent loc:** `finish_archive_plan` no longer
   inserts `ParentIdent::new` / `fill_missing_parent_ranges` after

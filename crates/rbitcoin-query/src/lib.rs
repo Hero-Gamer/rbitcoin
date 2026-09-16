@@ -584,11 +584,11 @@ impl Query {
         &self.confirm_parents
     }
 
-    /// Enable/disable durable spend-annotation writes on archive **and** confirm
+    /// Enable/disable durable spend-annotation writes on confirm
     /// (schema v5 create-out annotations; default on).
     ///
-    /// Direct IBD keeps this **on** (confirm batch after Class C). Tip mode
-    /// assumes annotations are already complete — no automatic backfill.
+    /// Direct IBD and Tip both annotate after Class C (`post_commit` on the wire
+    /// path; [`Query::confirm_block`] on the Query Class C-only path).
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
