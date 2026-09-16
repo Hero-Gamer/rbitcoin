@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **Tip-mode mempool purge after catch-up drops conflicts and persists DEAD:**
+  leftover txs whose inputs were spent by a different confirmed txid are
+  evicted at `set_relay_enabled(true)`, and slot deaths are written even when
+  compact does not fire. Same-txid confirmed leftovers still drop; a child of
+  a now-confirmed parent stays. `analog_milestone_and_mempool_persist` pins
+  restart → catch-up → relay-on.
+
 - **Mempool block strip no longer dumps `tx.body`:** DEAD marks persist
   slots+meta once (`persist_if_dirty`) instead of rewriting the whole sidecar
   every 32 deaths. That was `mp_strip=` 5–8s on a ~70k pool (thousands of

@@ -3,13 +3,16 @@
 //! Unmodified Core scripts that touch LevelDB / `blocks/` / assumevalid logs
 //! cannot `run`. These scenarios keep the behavior we still want:
 //!
-//! 1. `--milestone` skip-below / check-above + mempool persist + missing
-//!    prevout still fails when scripts are skipped (`feature_assumevalid.py`,
+//! 1. `--milestone` skip-below / check-above + mempool persist + leftover
+//!    pool through catch-up then tip-mode purge, then missing prevout still
+//!    fails when scripts are skipped (`feature_assumevalid.py`,
 //!    `mempool_persist.py`)
 //! 2. Reconstruct height 1 after wiping `tx.head/` (`feature_reindex*.py`)
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{
+    Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+};
 use rbitcoin_consensus::{
     accept_and_connect_block, grind_regtest_pow, ChainParams, ConsensusError, Milestone,
 };
@@ -17,12 +20,16 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-use rbitcoin_test::{assert_reconstruct_eq, build_mature_regtest_with_spend, TestDatadir};
+use rbitcoin_test::{
+    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,
+    TestDatadir,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// One mature pad: mempool persist, then `--milestone` skip-below / check-above,
-/// then missing prevout still fails under a high milestone (scripts skipped).
+/// One mature pad: mempool persist, restart leftover through catch-up then
+/// tip-mode purge, then `--milestone` skip-below / check-above, then missing
+/// prevout still fails under a high milestone (scripts skipped).
 ///
 /// Core `feature_assumevalid.py` + `mempool_persist.py`.
 #[test]
@@ -56,15 +63,15 @@ fn analog_milestone_and_mempool_persist() {
     );
     assert_eq!(hub2.live_count(), 1);
     drop(hub2);
+    let (tip, tip_time, h) =
+        pin_restart_catchup_then_tip_purge(&mp_dir, &q_arc, &params, &chain, &want);
     pin_leftover_slots_tmp_and_truncated_body(&mp_dir, &q_arc, &want);
 
     let q = q_arc.as_ref();
     let mut bad = spend_anyone_can_spend(spend_txid, 0, Amount::from_sat(47_0000_0000));
     bad.input[0].script_sig = ScriptBuf::from_bytes(vec![0x6a]);
 
-    let tip = chain.tip_hash();
-    let tip_time = chain.blocks.last().unwrap().header.time;
-    let h = chain.spend_height + 1;
+    let catchup_tip = h - 1;
     let bad_block = mine_regtest_block(tip, tip_time + 600, h, vec![bad]);
 
     let ms_skip = Milestone { height: h };
@@ -79,7 +86,7 @@ fn analog_milestone_and_mempool_persist() {
         msg.contains("script") || msg.contains("opcode") || msg.contains("return"),
         "expected script failure above milestone, got: {err}"
     );
-    assert_eq!(q.tip_height(), Some(Height(chain.spend_height)));
+    assert_eq!(q.tip_height(), Some(Height(catchup_tip)));
 
     accept_and_connect_block(q, &params, Height(h), &bad_block, ms_skip)
         .expect("invalid script below milestone must be skipped");
@@ -121,6 +128,123 @@ fn analog_milestone_and_mempool_persist() {
         ),
         "expected missing-prevout class under milestone, got: {err}"
     );
+}
+
+/// Restart with a leftover pool, connect catch-up (relay off), then tip-mode
+/// `set_relay_enabled(true)`: same-txid confirmed gone, input-conflict gone,
+/// child of a now-confirmed parent kept, DEAD marks durable without `flush`.
+fn pin_restart_catchup_then_tip_purge(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    params: &ChainParams,
+    chain: &MatureRegtestChain,
+    leftover: &bitcoin::Txid,
+) -> (BlockHash, u32, u32) {
+    let (pad_tip, pad_time) = pad_empty_from(
+        q.as_ref(),
+        params,
+        chain.tip_hash(),
+        chain.blocks.last().unwrap().header.time,
+        chain.spend_height + 1,
+        chain.spend_height + 5,
+    );
+    let spend_cb = |h: usize, sats: u64| {
+        spend_anyone_can_spend(
+            chain.blocks[h].txdata[0].compute_txid(),
+            0,
+            Amount::from_sat(sats),
+        )
+    };
+    let same = spend_cb(2, 49_0000_0000);
+    let loser = spend_cb(3, 48_0000_0000);
+    let winner = spend_cb(3, 47_0000_0000);
+    let parent = spend_cb(4, 49_0000_0000);
+    let child = spend_anyone_can_spend(parent.compute_txid(), 0, Amount::from_sat(48_0000_0000));
+    let extras = [
+        spend_cb(5, 49_0000_0000),
+        spend_cb(6, 49_0000_0000),
+        spend_cb(7, 49_0000_0000),
+    ];
+    let same_id = same.compute_txid();
+    let loser_id = loser.compute_txid();
+    let parent_id = parent.compute_txid();
+    let child_id = child.compute_txid();
+    let extra_ids: Vec<_> = extras.iter().map(|t| t.compute_txid()).collect();
+    assert_ne!(loser_id, winner.compute_txid());
+
+    let h = chain.spend_height + 6;
+    let blk = mine_regtest_block(
+        pad_tip,
+        pad_time + 600,
+        h,
+        vec![same.clone(), winner, parent.clone()],
+    );
+    {
+        let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
+        hub.set_relay_enabled(true);
+        hub.accept_tx(&same).expect("accept same-txid leftover");
+        hub.accept_tx(&loser).expect("accept conflict loser");
+        hub.accept_tx(&parent).expect("accept parent");
+        hub.accept_tx(&child).expect("accept child of parent");
+        for tx in &extras {
+            hub.accept_tx(tx).expect("accept ballast leftover");
+        }
+        hub.flush().expect("persist leftover pool");
+        hub.set_relay_enabled(false);
+        accept_and_connect_block(q.as_ref(), params, Height(h), &blk, Milestone::NONE)
+            .expect("catch-up connect");
+        assert!(
+            hub.contains(&same_id) && hub.contains(&loser_id) && hub.contains(&parent_id),
+            "relay off must leave confirmed and conflicted txs in the leftover pool"
+        );
+        assert!(hub.contains(&child_id) && hub.contains(leftover));
+    }
+
+    {
+        let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
+        assert!(
+            hub.contains(&same_id) && hub.contains(&loser_id) && hub.contains(&parent_id),
+            "reopen after catch-up must load leftover txs before tip-mode purge"
+        );
+        hub.set_relay_enabled(true);
+        assert!(
+            !hub.contains(&same_id),
+            "same-txid confirmed leftover must drop at relay-on"
+        );
+        assert!(
+            !hub.contains(&loser_id),
+            "input-conflict leftover must drop at relay-on"
+        );
+        assert!(
+            !hub.contains(&parent_id),
+            "confirmed parent leftover must drop at relay-on"
+        );
+        assert!(
+            hub.contains(&child_id),
+            "child of a now-confirmed parent must stay"
+        );
+        assert!(hub.contains(leftover), "unrelated leftover must stay");
+        for id in &extra_ids {
+            assert!(hub.contains(id), "ballast leftover must stay (no compact)");
+        }
+    }
+
+    {
+        let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
+        assert!(
+            !hub.contains(&same_id) && !hub.contains(&loser_id) && !hub.contains(&parent_id),
+            "purge DEAD marks must survive drop without flush"
+        );
+        assert!(hub.contains(&child_id) && hub.contains(leftover));
+        hub.set_relay_enabled(true);
+        let mut strip = extra_ids;
+        strip.push(child_id);
+        assert_eq!(hub.remove_for_block(&strip), strip.len());
+        hub.flush()
+            .expect("restore singleton leftover for slots.tmp pin");
+    }
+
+    (blk.block_hash(), blk.header.time, h + 1)
 }
 
 fn pin_leftover_slots_tmp_and_truncated_body(mp_dir: &Path, q: &Arc<Query>, want: &bitcoin::Txid) {
