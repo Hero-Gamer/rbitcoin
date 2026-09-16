@@ -12,7 +12,6 @@ use rbitcoin_log::info;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
-use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -158,53 +157,54 @@ pub async fn run_rpc(
         );
     }
 
-    let mut socket_path_out = None;
-    if let Some(ref sock) = config.socket_path {
-        #[cfg(unix)]
-        {
-            if let Some(parent) = sock.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
-            }
-            let _ = fs::remove_file(sock);
-            let listener = tokio::net::UnixListener::bind(sock)
-                .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(sock, fs::Permissions::from_mode(0o600));
-            }
-            socket_path_out = Some(sock.clone());
-            let state = AppState {
-                ctx: Arc::clone(&ctx),
-                auth: auth.clone(),
-                work_queue,
-                require_auth: false,
-            };
-            let app = Router::new().route("/", post(rpc_post)).with_state(state);
-            let shutdown_w = Arc::clone(&shutdown);
-            tasks.push(tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        while !shutdown_w.load(Ordering::SeqCst) {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
-                    })
-                    .await
-                    .ok();
-            }));
-            info!("rpc: unix JSON-RPC on {}", sock.display());
+    #[cfg(unix)]
+    let socket_path_out = if let Some(ref sock) = config.socket_path {
+        if let Some(parent) = sock.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
         }
-        #[cfg(not(unix))]
+        let _ = std::fs::remove_file(sock);
+        let listener = tokio::net::UnixListener::bind(sock)
+            .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
         {
-            let _ = sock;
-            if config.listen.is_none() {
-                return Err(
-                    "rpc unix socket needs AF_UNIX; this Windows build has no tokio UnixListener — use --rpc-listen"
-                        .into(),
-                );
-            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
+        }
+        let state = AppState {
+            ctx: Arc::clone(&ctx),
+            auth: auth.clone(),
+            work_queue,
+            require_auth: false,
+        };
+        let app = Router::new().route("/", post(rpc_post)).with_state(state);
+        let shutdown_w = Arc::clone(&shutdown);
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !shutdown_w.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .ok();
+        }));
+        info!("rpc: unix JSON-RPC on {}", sock.display());
+        Some(sock.clone())
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let socket_path_out = {
+        if config.socket_path.is_some() && config.listen.is_none() {
+            return Err(
+                "rpc unix socket needs AF_UNIX; this Windows build has no tokio UnixListener — use --rpc-listen"
+                    .into(),
+            );
+        }
+        if config.socket_path.is_some() {
             info!("rpc: unix socket skipped (no AF_UNIX listener in this build)");
         }
-    }
+        None
+    };
     let _ = ctx;
 
     Ok(RpcHandle {
@@ -981,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_bearer_and_harness_basic_password() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-token").expect("temp dir");
-        fs::write(dir.path().join("rpc.token"), "pass").unwrap();
+        std::fs::write(dir.path().join("rpc.token"), "pass").unwrap();
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
