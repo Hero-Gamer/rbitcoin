@@ -413,8 +413,8 @@ mod tests {
         q.set_spend_index(true);
         q.set_sh_index_enabled(true);
         assert!(
-            q.writes_archive_spends(),
-            "open default is Tip; spendindex on must write archive spends"
+            !q.writes_archive_spends(),
+            "open default is Tip; Class A must not write archive spends (confirm post_commit does)"
         );
         assert!(
             q.enqueues_sh_writebehind(),

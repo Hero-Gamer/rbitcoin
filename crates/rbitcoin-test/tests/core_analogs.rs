@@ -191,8 +191,24 @@ fn pin_restart_catchup_then_tip_purge(
         }
         hub.flush().expect("persist leftover pool");
         hub.set_relay_enabled(false);
+        let _ = q.confirm_stats().take_window();
         accept_and_connect_block(q.as_ref(), params, Height(h), &blk, Milestone::NONE)
             .expect("catch-up connect");
+        let w = q.confirm_stats().take_window();
+        assert_eq!(
+            w.arch_write_spend_ns, 0,
+            "Class A must not put_spend_batch; spentness is post_commit abs-meta"
+        );
+        let same_coin = chain.blocks[2].txdata[0].compute_txid();
+        let parent_coin = chain.blocks[4].txdata[0].compute_txid();
+        assert!(
+            q.is_outpoint_spent(same_coin.as_byte_array(), 0).unwrap(),
+            "same-txid leftover parent coin must be confirmed-spent after connect"
+        );
+        assert!(
+            q.is_outpoint_spent(parent_coin.as_byte_array(), 0).unwrap(),
+            "confirmed parent leftover coin must be confirmed-spent after connect"
+        );
         assert!(
             hub.contains(&same_id) && hub.contains(&loser_id) && hub.contains(&parent_id),
             "relay off must leave confirmed and conflicted txs in the leftover pool"
