@@ -255,7 +255,7 @@ impl ShWriteBehind {
 /// Domain query facade used by higher layers (consensus, net, RPC).
 pub struct Query {
     store: Store,
-    /// When false, archive **and** confirm skip durable Class B point (spend) writes.
+    /// When false, confirm skips durable spend-annotation writes.
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts.
     tx_index: std::sync::atomic::AtomicBool,
