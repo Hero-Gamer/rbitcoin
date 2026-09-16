@@ -38,6 +38,7 @@ use crate::suite::{
 };
 use crate::targets::{load_corpus, load_targets};
 use crate::wallets::pack_wallets;
+use rbitcoin_primitives::{DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,10 +62,9 @@ fn usage() -> String {
          Usage:\n\
            cargo run -p rbitcoin-bench --features cli --release -- [OPTIONS]\n\
          \n\
-         Required:\n\
-           --electrum HOST:PORT   Electrum TCP (e.g. 127.0.0.1:50001)\n\
-           --esplora http://HOST:PORT\n\
-                                  Esplora REST (e.g. http://127.0.0.1:3000)\n\
+         Required (one):\n\
+           --electrum [HOST:PORT] Electrum TCP (default 127.0.0.1:50001)\n\
+           --esplora [URL]        Esplora REST (default http://127.0.0.1:3000)\n\
          \n\
          Targets (default: embedded corpus matching --suite):\n\
            --corpus casa|sparrow|hot  packed-in keys (see corpora/)\n\
@@ -149,6 +149,33 @@ fn take(args: &[OsString], i: &mut usize, flag: &str) -> Result<String, String> 
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn optional_endpoint(
+    args: &[OsString],
+    i: &mut usize,
+    eq: Option<&str>,
+    name: &str,
+    default: &str,
+) -> Result<String, String> {
+    match eq {
+        Some(v) if !v.is_empty() => Ok(v.to_string()),
+        Some(_) => Ok(default.to_string()),
+        None => {
+            let next = i.checked_add(1).and_then(|n| args.get(n));
+            match next {
+                None => Ok(default.to_string()),
+                Some(s) => {
+                    let s = s.to_string_lossy();
+                    if s.starts_with('-') {
+                        Ok(default.to_string())
+                    } else {
+                        take(args, i, &format!("--{name}"))
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn flag_name_and_eq(raw: &str) -> Option<(&str, Option<&str>)> {
     let rest = raw.strip_prefix("--")?;
     match rest.split_once('=') {
@@ -195,8 +222,24 @@ fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
                 }
                 "targets" => cfg.targets = Some(PathBuf::from(take_val(&mut i)?)),
                 "corpus" => cfg.corpus = Some(take_val(&mut i)?),
-                "electrum" => cfg.electrum = Some(take_val(&mut i)?),
-                "esplora" => cfg.esplora = Some(take_val(&mut i)?),
+                "electrum" => {
+                    cfg.electrum = Some(optional_endpoint(
+                        args,
+                        &mut i,
+                        eq,
+                        name,
+                        &format!("127.0.0.1:{DEFAULT_ELECTRUM_PORT}"),
+                    )?);
+                }
+                "esplora" => {
+                    cfg.esplora = Some(optional_endpoint(
+                        args,
+                        &mut i,
+                        eq,
+                        name,
+                        &format!("http://127.0.0.1:{DEFAULT_ESPLORA_PORT}"),
+                    )?);
+                }
                 "suite" => cfg.suite = Suite::parse(&take_val(&mut i)?)?,
                 "warmup" => {
                     cfg.warmup = take_val(&mut i)?
@@ -559,9 +602,34 @@ mod tests {
         assert!(u.contains("this message"), "{u}");
         assert!(u.contains("print version"), "{u}");
         assert!(
-            u.contains("--esplora http://HOST:PORT") && u.contains("Esplora REST"),
+            u.contains("--esplora [URL]") && u.contains("Esplora REST"),
             "{u}"
         );
+        assert!(u.contains("--electrum [HOST:PORT]"), "{u}");
+    }
+
+    #[test]
+    fn omitted_electrum_esplora_host_uses_local_defaults() {
+        let e = parse_args(&[
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--electrum"),
+        ])
+        .unwrap();
+        assert_eq!(e.electrum.as_deref(), Some("127.0.0.1:50001"));
+        let s = parse_args(&[
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--esplora"),
+            OsString::from("--suite"),
+            OsString::from("casa"),
+        ])
+        .unwrap();
+        assert_eq!(s.esplora.as_deref(), Some("http://127.0.0.1:3000"));
+        let eq = parse_args(&[
+            OsString::from("rbitcoin-bench"),
+            OsString::from("--electrum="),
+        ])
+        .unwrap();
+        assert_eq!(eq.electrum.as_deref(), Some("127.0.0.1:50001"));
     }
 
     #[test]
