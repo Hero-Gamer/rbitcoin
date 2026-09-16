@@ -851,16 +851,18 @@ impl MempoolHub {
     /// Enable/disable peer tx inv/accept (false during IBD catch-up).
     ///
     /// **False → true:** bulk-strip txs that are already confirmed-strong on the
-    /// best chain. Per-block [`Self::remove_for_block`] is skipped while relay is
-    /// off so catch-up is not paced by a large durable mempool (mainnet: 40k+
-    /// live after offline). One purge at tip-mode entry is enough before relay.
+    /// best chain, and live txs whose inputs are confirmed-spent by a different
+    /// txid (catch-up conflicts). Per-block [`Self::remove_for_block`] is skipped
+    /// while relay is off so catch-up is not paced by a large durable mempool
+    /// (mainnet: 40k+ live after offline). One purge at tip-mode entry is enough
+    /// before relay.
     pub fn set_relay_enabled(&self, on: bool) {
         let was = self.relay_enabled.swap(on, Ordering::SeqCst);
         if on && !was {
             let n = self.purge_confirmed_on_chain();
             if n > 0 {
                 rbitcoin_log::info!(
-                    "mempool: purged {n} confirmed tx(s) at tip-mode entry (deferred during IBD)"
+                    "mempool: purged {n} leftover tx(s) at tip-mode entry (deferred during IBD)"
                 );
             }
         }
@@ -1027,10 +1029,12 @@ impl MempoolHub {
         log.range(..=(now, u64::MAX)).next_back().map(|(k, _)| *k)
     }
 
-    /// Drop every live mempool entry whose create is confirmed-strong on tip.
+    /// Drop live mempool entries that are confirmed-strong on tip, then live
+    /// txs whose inputs are confirmed-spent by a different txid.
     ///
-    /// Used once when enabling relay after catch-up. Compacts durable slots if
-    /// DEAD dominates. Returns how many txs removed.
+    /// Used once when enabling relay after catch-up. Same-txid hits keep
+    /// in-mempool descendants; conflicts drop the loser tree. Persists DEAD
+    /// marks even when compact does not fire. Returns how many txs removed.
     pub fn purge_confirmed_on_chain(&self) -> usize {
         let live: Vec<Txid> = {
             let g = self.lock_read();
@@ -1050,27 +1054,42 @@ impl MempoolHub {
                 to_drop.push(*tid);
             }
         }
-        if to_drop.is_empty() {
-            return 0;
-        }
+        let utxo = self.utxo_provider();
         let mut g = self.lock_write();
-        let mut n = 0usize;
+        let mut gone = Vec::new();
         for tid in &to_drop {
             if g.graph.contains(tid) && g.remove_txid(tid).is_ok() {
-                n += 1;
+                gone.push(*tid);
             }
         }
-        if n > 0 {
-            let _ = g.maybe_compact();
-            self.mark_fee_dirty();
+        let remain: Vec<Txid> = g.graph.iter().map(|(t, _)| *t).collect();
+        let mut spent = Vec::new();
+        for tid in remain {
+            let Some(tx) = g.get_tx(&tid).cloned() else {
+                continue;
+            };
+            for inp in &tx.input {
+                if g.graph.contains(&inp.previous_output.txid) {
+                    continue;
+                }
+                if matches!(
+                    utxo.chain_prevout(&inp.previous_output),
+                    ChainPrevout::KnownUnavailable
+                ) {
+                    spent.push(inp.previous_output);
+                }
+            }
         }
+        gone.extend(g.evict_conflicts_with(&spent));
+        if gone.is_empty() {
+            return 0;
+        }
+        let _ = g.maybe_compact();
+        let _ = g.persist_if_dirty();
+        self.mark_fee_dirty();
         drop(g);
-        if n > 0 {
-            for tid in &to_drop {
-                self.unindex_txid(tid);
-            }
-        }
-        n
+        self.unindex_evicted(&gone);
+        gone.len()
     }
 
     pub fn subscribe_announces(&self) -> broadcast::Receiver<MempoolAnnounce> {
