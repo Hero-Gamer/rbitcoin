@@ -203,6 +203,19 @@ CORE_TO_NODE = {
     "peertimeout": "peer-timeout",
     "minimumchainwork": "min-chain-work",
     "maxtipage": "max-tip-age",
+    "testactivationheight": "test-activation-height",
+    "minrelaytxfee": "min-relay-tx-fee",
+    "mempoolexpiry": "mempool-expiry",
+    "startupnotify": "startup-notify",
+    "alertnotify": "alert-notify",
+    "limitclustercount": "limit-cluster-count",
+    "limitclustersize": "limit-cluster-size",
+    "externalip": "external-ip",
+    "seednode": "seed-node",
+    "mocktime": "mock-time",
+    "blockversion": "block-version",
+    "blockmintxfee": "block-min-tx-fee",
+    "rpcworkqueue": "rpc-work-queue",
 }
 
 

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
 /// Startup abort when the store tip is more than [`MAX_FUTURE_BLOCK_TIME`] ahead.
-pub const FUTURE_BLOCK_DB_MSG: &str = "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mocktime). Wipe the datadir and redo IBD only if you are sure the clock is correct.";
+pub const FUTURE_BLOCK_DB_MSG: &str = "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mock-time). Wipe the datadir and redo IBD only if you are sure the clock is correct.";
 
 pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
     u64::from(tip_time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME)

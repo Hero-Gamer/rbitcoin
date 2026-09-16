@@ -70,7 +70,7 @@ run "getdata wtx TRACE maps to Core needle" \
   "received getdata for: wtx aabbccdd peer"
 
 run "future tip maps to Core InitError needle" \
-  "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mocktime). Wipe the datadir and redo IBD only if you are sure the clock is correct." \
+  "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mock-time). Wipe the datadir and redo IBD only if you are sure the clock is correct." \
   "The block database contains a block which appears to be from the future."
 
 run "parked orphan DEBUG maps to Core was-not-accepted needle" \

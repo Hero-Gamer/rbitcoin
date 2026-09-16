@@ -64,6 +64,7 @@ fn usage() -> String {
          Required:\n\
            --electrum HOST:PORT   Electrum TCP (e.g. 127.0.0.1:50001)\n\
            --esplora http://HOST:PORT\n\
+                                  Esplora REST (e.g. http://127.0.0.1:3000)\n\
          \n\
          Targets (default: embedded corpus matching --suite):\n\
            --corpus casa|sparrow|hot  packed-in keys (see corpora/)\n\
@@ -84,8 +85,8 @@ fn usage() -> String {
            --fetch-txs                sparrow: also blockchain.transaction.get\n\
            --timeout-secs N           per request (default 30)\n\
            --out FILE                 CSV: casa/hot per-key; clients per-connection\n\
-           -h, --help\n\
-           -V, --version\n\
+           -h, --help                 this message\n\
+           -V, --version              print version\n\
          \n\
          Casa: sequential balance/history/utxo; throw away warmup; median of passes.\n\
          Sparrow: subscribe all (load) then get_history all (refresh), batch 50.\n\
@@ -209,7 +210,7 @@ fn parse_args(args: &[OsString]) -> Result<Cfg, String> {
                     .parse()
                     .map_err(|_| "bad --max-utxos".to_string())?;
             }
-            other => return Err(format!("unknown argument {other}")),
+            other => return Err(format!("unknown argument `{other}`")),
         }
         i += 1;
     }
@@ -498,6 +499,19 @@ mod tests {
     fn cli_help_exits_ok() {
         let code = cli_main([OsString::from("rbitcoin-bench"), OsString::from("-h")]);
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn usage_describes_help_version_and_esplora() {
+        let u = usage();
+        assert!(u.contains("-h, --help"), "{u}");
+        assert!(u.contains("-V, --version"), "{u}");
+        assert!(u.contains("this message"), "{u}");
+        assert!(u.contains("print version"), "{u}");
+        assert!(
+            u.contains("--esplora http://HOST:PORT") && u.contains("Esplora REST"),
+            "{u}"
+        );
     }
 
     #[test]

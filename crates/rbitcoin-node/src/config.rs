@@ -188,11 +188,11 @@ pub struct NodeConfig {
     pub conf_log_level: Option<String>,
     /// Optional JSONL API call log (`--api-log` / `api_log=`).
     pub api_log: Option<PathBuf>,
-    /// Core `-asmap` path. `None` = try `{datadir}/ip_asn.dat` if present.
+    /// `--asmap` path. `None` = try `{datadir}/ip_asn.dat` if present.
     pub asmap: Option<PathBuf>,
     /// `--ua-comment` fragments (BIP14 parens in subversion).
     pub uacomments: Vec<String>,
-    /// Core `-testactivationheight=name@height` (regtest).
+    /// `--test-activation-height=name@height` (regtest).
     pub test_activation_heights: Vec<(String, u32)>,
     /// Do not evict/ban inbound (`--trusted`; Core functional `-whitelist=noban`).
     pub trusted: bool,
@@ -200,21 +200,21 @@ pub struct NodeConfig {
     pub always_relay: bool,
     /// Permit tx relay to inbound while `--blocks-only` (`--relay`; Core `relay`).
     pub relay: bool,
-    /// Core `-startupnotify` shell command (run once after start).
+    /// `--startup-notify` shell command (run once after start).
     pub startup_notify: Option<String>,
-    /// Core `-alertnotify` shell command (`%s` = warning text).
+    /// `--alert-notify` shell command (`%s` = warning text).
     pub alert_notify: Option<String>,
     /// `--min-chain-work` (32-byte BE work). `None` = no extra densify/relay floor.
     pub minimum_chain_work: Option<[u8; 32]>,
-    /// Core `-mocktime` at start (`None` = wall clock).
+    /// `--mock-time` at start (`None` = wall clock).
     pub mock_time: Option<i64>,
     /// `--max-tip-age` seconds (`None` = 24h default on ChainHub).
     pub max_tip_age_secs: Option<u64>,
-    /// Core `-blockversion` GBT override (`None` = default).
+    /// `--block-version` GBT override (`None` = default).
     pub block_version: Option<i32>,
-    /// Core `-blockmintxfee` as BTC/kvB text (`None` = default 1 sat/kvB).
+    /// `--block-min-tx-fee` as BTC/kvB text (`None` = default 1 sat/kvB).
     pub block_min_tx_fee_btc: Option<String>,
-    /// BIP152 extra compact-block prefill (default **on**; `--prefillcompact=0` disables).
+    /// BIP152 extra compact-block prefill (default **on**; `--prefill-compact=0` disables).
     pub prefill_compact: bool,
 }
 
@@ -348,7 +348,7 @@ impl NodeConfig {
             params
                 .apply_test_activation_height(name, *height)
                 .map_err(|e| {
-                    NodeError::Config(format!("testactivationheight {name}@{height}: {e}"))
+                    NodeError::Config(format!("test_activation_height {name}@{height}: {e}"))
                 })?;
         }
         Ok(params)
@@ -369,10 +369,10 @@ impl NodeConfig {
             }
         }
         if self.listen.max_outbound == 0 {
-            return Err(NodeError::Config("max_outbound must be >= 1".into()));
+            return Err(NodeError::Config("max-outbound must be >= 1".into()));
         }
         if self.listen.max_inbound == 0 {
-            return Err(NodeError::Config("max_inbound must be >= 1".into()));
+            return Err(NodeError::Config("max-inbound must be >= 1".into()));
         }
         if (self.signet_challenge.is_some() || self.signet_block_time.is_some())
             && self.network != Network::Signet
@@ -393,13 +393,13 @@ impl NodeConfig {
         }
         if self.listen.electrum.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "electrum_listen requires shindex=1 (--shindex); Electrum history needs Class B scripthash"
+                "electrum-listen requires shindex=1 (--shindex); Electrum history needs Class B scripthash"
                     .into(),
             ));
         }
         if self.listen.esplora.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "esplora_listen requires shindex=1 (--shindex); Esplora history needs Class B scripthash"
+                "esplora-listen requires shindex=1 (--shindex); Esplora history needs Class B scripthash"
                     .into(),
             ));
         }
@@ -480,13 +480,9 @@ impl NodeConfig {
 
     /// Load a simple `key=value` conf (`#` comments). Hyphens and underscores match.
     ///
-    /// Operator keys: `datadir`, `datadir_cold`, `network`, `listen`, `connect` (repeatable),
-    /// `milestone`, `max_outbound`, `max_inbound`, `mempool_size_mb`,
-    /// `log_level`, `api_log`, `asmap`, `electrum_listen`, `esplora_listen`,
-    /// `shindex`, `sptweaks`, `sptweaks_dust`, `rpc_listen`, `rpcuser`, `rpcpassword`,
-    /// `no_seeds`, `signet_challenge`, `signet_block_time`, `min_chain_work`,
-    /// `max_tip_age`, `blocks_only`, `persist_mempool`, `trusted`, `always_relay`,
-    /// `relay`, `ua_comment`, `peer_timeout`. Core names are the functional shim only.
+    /// Operator keys are snake_case (`max_inbound=`). Hyphens match underscores.
+    /// `rpcuser` / `rpcpassword` match Core bitcoin.conf. Concatenated Core
+    /// spellings remain aliases. Core CLI names stay on the functional shim only.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -542,7 +538,7 @@ impl NodeConfig {
             "datadir_cold" | "datadircold" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
-                        "conf datadir-cold requires a path".into(),
+                        "conf datadir_cold requires a path".into(),
                     ));
                 }
                 self.datadir.cold = Some(PathBuf::from(val));
@@ -554,13 +550,13 @@ impl NodeConfig {
             "signet_challenge" => {
                 self.signet_challenge = Some(
                     parse_signet_challenge(val)
-                        .map_err(|e| NodeError::Config(format!("conf signet-challenge: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf signet_challenge: {e}")))?,
                 );
             }
             "signet_block_time" => {
                 self.signet_block_time = Some(
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf signet-block-time: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf signet_block_time: {e}")))?,
                 );
             }
             "listen" => {
@@ -579,7 +575,7 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
                 );
             }
-            "seednode" => {
+            "seednode" | "seed_node" => {
                 if !val.is_empty() {
                     self.listen.seednodes.push(val.to_string());
                 }
@@ -629,13 +625,13 @@ impl NodeConfig {
             "ua_comment" => self.uacomments.push(val.to_string()),
             "testactivationheight" | "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
-                    .map_err(|e| NodeError::Config(format!("conf testactivationheight: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf test_activation_height: {e}")))?;
                 self.test_activation_heights
                     .push((name.to_string(), height));
             }
             "persist_mempool" => {
                 self.mempool.persist = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf persist-mempool: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf persist_mempool: {e}")))?;
             }
             "trusted" => {
                 self.trusted = parse_conf_bool(val)
@@ -643,7 +639,7 @@ impl NodeConfig {
             }
             "always_relay" => {
                 self.always_relay = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf always-relay: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf always_relay: {e}")))?;
             }
             "relay" => {
                 self.relay = parse_conf_bool(val)
@@ -651,26 +647,26 @@ impl NodeConfig {
             }
             "blocks_only" => {
                 self.mempool.blocksonly = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf blocks-only: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf blocks_only: {e}")))?;
             }
             "prefillcompact" | "prefill_compact" => {
                 self.prefill_compact = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf prefillcompact: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf prefill_compact: {e}")))?;
             }
-            "minrelaytxfee" | "min_relay_txfee" => {
+            "minrelaytxfee" | "min_relay_txfee" | "min_relay_tx_fee" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
-                        "conf minrelaytxfee requires a value".into(),
+                        "conf min_relay_tx_fee requires a value".into(),
                     ));
                 }
                 parse_btc_to_sat(val)
-                    .map_err(|e| NodeError::Config(format!("conf minrelaytxfee: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf min_relay_tx_fee: {e}")))?;
                 self.mempool.min_relay_fee_btc = Some(val.to_string());
             }
             "mempoolexpiry" | "mempool_expiry" => {
                 let h: u64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf mempoolexpiry: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf mempool_expiry: {e}")))?;
                 self.mempool.expiry_hours = Some(h.max(1));
             }
             "startupnotify" | "startup_notify" => {
@@ -680,32 +676,32 @@ impl NodeConfig {
             }
 
             "limitclustercount" | "limit_cluster_count" => {
-                self.mempool.limit_cluster_count = Some(
-                    val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf limitclustercount: {e}")))?,
-                );
+                self.mempool.limit_cluster_count =
+                    Some(val.parse().map_err(|e| {
+                        NodeError::Config(format!("conf limit_cluster_count: {e}"))
+                    })?);
             }
             "limitclustersize" | "limit_cluster_size" => {
                 self.mempool.limit_cluster_size_kvb = Some(
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf limitclustersize: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf limit_cluster_size: {e}")))?,
                 );
             }
             "externalip" | "external_ip" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
-                        "conf externalip requires an address".into(),
+                        "conf external_ip requires an address".into(),
                     ));
                 }
                 let ip: std::net::IpAddr = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf externalip: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
                 self.listen.external_ips.push(ip);
             }
             "peer_timeout" => {
                 let n: u64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf peer-timeout: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf peer_timeout: {e}")))?;
                 if n == 0 {
                     return Err(NodeError::Config(
                         "peer-timeout must be a positive integer.".into(),
@@ -726,18 +722,18 @@ impl NodeConfig {
             "max_outbound" => {
                 let n: u32 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf max-outbound: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max_outbound: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config("conf max-outbound must be >= 1".into()));
+                    return Err(NodeError::Config("conf max_outbound must be >= 1".into()));
                 }
                 self.listen.max_outbound = n;
             }
             "max_inbound" => {
                 let n: u32 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf max-inbound: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max_inbound: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config("conf max-inbound must be >= 1".into()));
+                    return Err(NodeError::Config("conf max_inbound must be >= 1".into()));
                 }
                 self.listen.max_inbound = n;
                 self.listen.max_inbound_explicit = true;
@@ -774,9 +770,9 @@ impl NodeConfig {
             "rpcworkqueue" | "rpc_work_queue" => {
                 let n: usize = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf rpcworkqueue: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf rpc_work_queue: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config("conf rpcworkqueue must be >= 1".into()));
+                    return Err(NodeError::Config("conf rpc_work_queue must be >= 1".into()));
                 }
                 self.rpc.work_queue = Some(n);
             }
@@ -793,35 +789,35 @@ impl NodeConfig {
             "mocktime" | "mock_time" => {
                 let n: i64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf mocktime: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf mock_time: {e}")))?;
                 if n < 0 {
-                    return Err(NodeError::Config("conf mocktime must be >= 0".into()));
+                    return Err(NodeError::Config("conf mock_time must be >= 0".into()));
                 }
                 self.mock_time = Some(n);
             }
             "max_tip_age" => {
                 let n: i64 = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf max-tip-age: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf max_tip_age: {e}")))?;
                 if n < 0 {
-                    return Err(NodeError::Config("conf max-tip-age must be >= 0".into()));
+                    return Err(NodeError::Config("conf max_tip_age must be >= 0".into()));
                 }
                 self.max_tip_age_secs = Some(n as u64);
             }
             "blockversion" | "block_version" => {
                 self.block_version = Some(
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf blockversion: {e}")))?,
+                        .map_err(|e| NodeError::Config(format!("conf block_version: {e}")))?,
                 );
             }
             "blockmintxfee" | "block_min_tx_fee" => {
                 if val.is_empty() {
                     return Err(NodeError::Config(
-                        "conf blockmintxfee requires a value".into(),
+                        "conf block_min_tx_fee requires a value".into(),
                     ));
                 }
                 parse_btc_to_sat(val)
-                    .map_err(|e| NodeError::Config(format!("conf blockmintxfee: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf block_min_tx_fee: {e}")))?;
                 self.block_min_tx_fee_btc = Some(val.to_string());
             }
             "alertnotify" | "alert_notify" => {
@@ -970,12 +966,12 @@ mod tests {
         let mut c = NodeConfig::default();
         let bad = c.apply_kv("minrelaytxfee", "nope").unwrap_err();
         assert!(
-            format!("{bad}").contains("minrelaytxfee"),
+            format!("{bad}").contains("min_relay_tx_fee"),
             "garbage must name the knob: {bad}"
         );
         let neg = c.apply_kv("minrelaytxfee", "-0.0001").unwrap_err();
         assert!(
-            format!("{neg}").contains("minrelaytxfee"),
+            format!("{neg}").contains("min_relay_tx_fee"),
             "negative must name the knob: {neg}"
         );
         assert_eq!(

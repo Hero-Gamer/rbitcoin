@@ -20,11 +20,11 @@ Esplora** (with `--shindex`) for address/script history.
 
 | Knob | Default | Meaning |
 |------|---------|---------|
-| `--rpc-listen ADDR` / conf `rpc_listen` | **off** | Bind HTTP JSON-RPC |
+| `--rpc-listen ADDR` / conf `rpc_listen=` | **off** | Bind HTTP JSON-RPC |
 | `--rpcuser` / `--rpcpassword` | unset | HTTP Basic credentials |
 | Cookie | **on** when listen set and no user/pass | `{datadir}/.cookie` as `user:password` |
 | `--shindex` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
-| `--rpcworkqueue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
+| `--rpc-work-queue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
 
 TLS is external (reverse proxy). Non-loopback binds still use cookie or user/pass
 (always authenticated).
@@ -80,7 +80,7 @@ still wait for durable SH when shindex is on.
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. |
 | `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. We do not have Core `blk*.dat`, so `rpc_getblockstats.py`'s rename-file needle stays skip. |
 | `getdifficulty` | From tip bits |
-| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `timeoffset` is VERSION clock minus connect time (`0` before handshake). `synced_headers` is the height of that peer's advertised best block when we know it, else `-1`. `synced_blocks` is that height when the hash is on our best chain, else `-1`. `getnetworkinfo.timeoffset` is the median of outbound handshake-complete offsets (`0` if none). `mapped_as` is present when `--asmap` / `{datadir}/ip_asn.dat` mapped the peer (Core field; omitted without a map or ASN 0). `version` is rbitcoin semver as a Core integer (`major*10000+minor*100+patch`: `0.1.0` → `100`, `0.5.0` → `500`, `0.6.0` → `600`, `0.6.99` → `699`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2`. `localaddresses` lists `-externalip` (`score` = Core `LOCAL_MANUAL`) |
+| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `timeoffset` is VERSION clock minus connect time (`0` before handshake). `synced_headers` is the height of that peer's advertised best block when we know it, else `-1`. `synced_blocks` is that height when the hash is on our best chain, else `-1`. `getnetworkinfo.timeoffset` is the median of outbound handshake-complete offsets (`0` if none). `mapped_as` is present when `--asmap` / `{datadir}/ip_asn.dat` mapped the peer (Core field; omitted without a map or ASN 0). `version` is rbitcoin semver as a Core integer (`major*10000+minor*100+patch`: `0.1.0` → `100`, `0.5.0` → `500`, `0.6.0` → `600`, `0.6.99` → `699`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2`. `localaddresses` lists `--external-ip` (`score` = Core `LOCAL_MANUAL`) |
 | `getnettotals` | All networks. Raw TCP `totalbytesrecv` / `totalbytessent` on live sessions. `uploadtarget` is a Core-shaped stub (`target` 0). |
 | `ping` | All networks. Queues a ping on each live session (`null`). |
 | `addpeeraddress` | Hidden Core name. Inserts `{address,port}` into addrman RAM (does not rewrite `peers` per call). |
@@ -108,7 +108,7 @@ still wait for durable SH when shindex is on.
 | `gettxout` | All networks. Connected Class A + mempool. Default `include_mempool=true` returns `null` for a confirmed out spent by a live mempool tx. `include_mempool=false` still returns the confirmed coin. A leftover still live in the hub (IBD / `-blocksonly`) uses the connected path, not `confirmations: 0`. A disconnected archive row is `null` (not tip+1 confirmations). |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
 | `getchaintips` | All networks. Active + archive `valid-fork` + held `valid-headers` + header-only (`submitheader` / P2P headers). Invalid body after a known header marks that branch `invalid`. |
-| `getdeploymentinfo` | All networks. Buried deployments from `ChainParams` including `-testactivationheight`. `active` follows Core `DeploymentActiveAfter` (true for the *next* block). No BIP9 / testdummy. |
+| `getdeploymentinfo` | All networks. Buried deployments from `ChainParams` including `--test-activation-height`. `active` follows Core `DeploymentActiveAfter` (true for the *next* block). No BIP9 / testdummy. |
 | `submitheader` | All networks. Same `ChainHub::ensure_header` as P2P `headers`. Hex may be an 80-byte header or a full block. |
 | `waitforblock` / `waitforblockheight` / `waitfornewblock` | All networks. Poll tip (milliseconds timeout). |
 | `setmocktime` | **Regtest only.** `0` = wall clock. Generate timestamps and future-header checks use `NodeClock` (not a process `time()` hook). |

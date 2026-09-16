@@ -12,14 +12,14 @@ fn usage() -> String {
     format!(
         "rbitcoin-cli {} — usage: rbitcoin-cli [OPTIONS] <COMMAND> [PARAMS...]\n\
          \n\
-         Options:\n\
-           --datadir DIR         cookie at DIR/.cookie (same as rbitcoin-node --datadir)\n\
-           --rpcconnect HOST     default 127.0.0.1\n\
-           --rpcport PORT        default 8332\n\
+         Options (names match bitcoin-cli):\n\
+           --datadir PATH        cookie at PATH/.cookie (same as rbitcoin-node --datadir)\n\
+           --rpcconnect HOST     JSON-RPC host (default 127.0.0.1)\n\
+           --rpcport PORT        JSON-RPC port (default 8332)\n\
            --rpcuser USER        with --rpcpassword (else cookie)\n\
-           --rpcpassword PASS\n\
+           --rpcpassword PASS    with --rpcuser (else cookie)\n\
            -h, --help            this message\n\
-           -V, --version\n\
+           -V, --version         print version\n\
          \n\
          Auth: --rpcuser/--rpcpassword, or the cookie written when the node\n\
          listens (`{{datadir}}/.cookie`). Plain HTTP, same as the node.",
@@ -89,7 +89,7 @@ fn parse_args(args: &[OsString]) -> Result<Action, String> {
                 cfg.rpcpassword = Some(take_value(args, &mut i, "--rpcpassword")?);
             }
             flag if flag.starts_with('-') => {
-                return Err(format!("unknown option {flag}"));
+                return Err(format!("unknown argument `{flag}`"));
             }
             _ if cfg.command.is_none() => {
                 cfg.command = Some(a.into_owned());
@@ -348,6 +348,30 @@ mod tests {
         assert!(exit_ok(cli_main(["rbitcoin-cli", "--help"])));
         assert!(exit_ok(cli_main(["rbitcoin-cli", "-V"])));
         assert!(exit_ok(cli_main(["rbitcoin-cli", "help"])));
+    }
+
+    #[test]
+    fn usage_describes_every_option() {
+        let u = usage();
+        for needle in [
+            "--datadir PATH",
+            "--rpcconnect HOST",
+            "--rpcport PORT",
+            "--rpcuser USER",
+            "--rpcpassword PASS",
+            "-h, --help",
+            "-V, --version",
+        ] {
+            assert!(u.contains(needle), "usage must list {needle}");
+        }
+        assert!(
+            u.contains("--rpcpassword PASS") && u.contains("with --rpcuser"),
+            "rpcpassword must have a description"
+        );
+        assert!(
+            u.contains("-V, --version") && u.contains("print version"),
+            "version must have a description"
+        );
     }
 
     #[test]
