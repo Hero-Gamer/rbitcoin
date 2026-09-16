@@ -678,54 +678,58 @@ pub struct ProcRss {
 pub fn read_proc_rss() -> ProcRss {
     let mut out = ProcRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                out.rss_kb = parse_kb_field(rest);
-            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
-                out.hwm_kb = parse_kb_field(rest);
-            } else if let Some(rest) = line.strip_prefix("RssAnon:") {
-                out.anon_kb = parse_kb_field(rest);
-            } else if let Some(rest) = line.strip_prefix("RssFile:") {
-                out.file_kb = parse_kb_field(rest);
-            } else if let Some(rest) = line.strip_prefix("RssShmem:") {
-                // Shmem is neither classic anon nor file-backed table mmap; fold
-                // into file for operator "not heap" view if present.
-                let sh = parse_kb_field(rest);
-                if sh > 0 {
-                    out.file_kb = out.file_kb.saturating_add(sh);
-                }
-            }
-        }
+        fill_rss_from_status(&mut out, &s);
     }
     if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("Rss:") {
-                if out.rss_kb == 0 {
-                    out.rss_kb = parse_kb_field(rest);
-                }
-            } else if let Some(rest) = line.strip_prefix("Anonymous:") {
-                // Rollup name when status RssAnon missing.
-                if out.anon_kb == 0 {
-                    out.anon_kb = parse_kb_field(rest);
-                }
-            } else if let Some(rest) = line.strip_prefix("RssAnon:") {
-                if out.anon_kb == 0 {
-                    out.anon_kb = parse_kb_field(rest);
-                }
-            } else if let Some(rest) = line.strip_prefix("RssFile:") {
-                if out.file_kb == 0 {
-                    out.file_kb = parse_kb_field(rest);
-                }
-            } else if let Some(rest) = line.strip_prefix("Locked:") {
-                out.locked_kb = parse_kb_field(rest);
-            }
-        }
-        // If we have RSS + anon but no file split, residual is file-backed.
-        if out.file_kb == 0 && out.rss_kb > 0 && out.anon_kb > 0 && out.anon_kb <= out.rss_kb {
-            out.file_kb = out.rss_kb.saturating_sub(out.anon_kb);
-        }
+        fill_rss_from_smaps_rollup(&mut out, &s);
     }
     out
+}
+
+fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            out.rss_kb = parse_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            out.hwm_kb = parse_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("RssAnon:") {
+            out.anon_kb = parse_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("RssFile:") {
+            out.file_kb = parse_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("RssShmem:") {
+            let sh = parse_kb_field(rest);
+            if sh > 0 {
+                out.file_kb = out.file_kb.saturating_add(sh);
+            }
+        }
+    }
+}
+
+fn fill_rss_from_smaps_rollup(out: &mut ProcRss, s: &str) {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Rss:") {
+            if out.rss_kb == 0 {
+                out.rss_kb = parse_kb_field(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("Anonymous:") {
+            if out.anon_kb == 0 {
+                out.anon_kb = parse_kb_field(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("RssAnon:") {
+            if out.anon_kb == 0 {
+                out.anon_kb = parse_kb_field(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("RssFile:") {
+            if out.file_kb == 0 {
+                out.file_kb = parse_kb_field(rest);
+            }
+        } else if let Some(rest) = line.strip_prefix("Locked:") {
+            out.locked_kb = parse_kb_field(rest);
+        }
+    }
+    if out.file_kb == 0 && out.rss_kb > 0 && out.anon_kb > 0 && out.anon_kb <= out.rss_kb {
+        out.file_kb = out.rss_kb.saturating_sub(out.anon_kb);
+    }
 }
 
 fn parse_kb_field(rest: &str) -> u64 {
@@ -2510,6 +2514,35 @@ mod tests {
         assert!(!line.contains("shadow"), "{line}");
         assert!(!line.contains("contig parked="), "{line}");
         assert!(!line.contains("residency creates="), "{line}");
+    }
+
+    #[test]
+    fn fill_rss_from_status_and_smaps_edges() {
+        let mut r = ProcRss::default();
+        fill_rss_from_status(
+            &mut r,
+            "Name:\trbitcoin\nVmRSS:\t  1024 kB\nVmHWM:\t  2048 kB\nRssAnon:\t512 kB\nRssFile:\t256 kB\nRssShmem:\t128 kB\n",
+        );
+        assert_eq!(r.rss_kb, 1024);
+        assert_eq!(r.hwm_kb, 2048);
+        assert_eq!(r.anon_kb, 512);
+        assert_eq!(r.file_kb, 384);
+
+        let mut r = ProcRss::default();
+        fill_rss_from_smaps_rollup(
+            &mut r,
+            "Rss:\t  800 kB\nAnonymous:\t  300 kB\nRssAnon:\t  1 kB\nRssFile:\t  2 kB\nLocked:\t  16 kB\n",
+        );
+        assert_eq!(r.rss_kb, 800);
+        assert_eq!(r.anon_kb, 300);
+        assert_eq!(r.file_kb, 2);
+        assert_eq!(r.locked_kb, 16);
+
+        let mut r = ProcRss::default();
+        fill_rss_from_smaps_rollup(&mut r, "Rss:\t  900 kB\nAnonymous:\t  400 kB\n");
+        assert_eq!(r.rss_kb, 900);
+        assert_eq!(r.anon_kb, 400);
+        assert_eq!(r.file_kb, 500);
     }
 
     #[test]

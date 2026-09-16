@@ -1081,6 +1081,28 @@ fn op_checkmultisig(
     };
     let script_override = script_code_owned.as_deref();
 
+    let f_success = checkmultisig_pairs(&sigs, &pubkeys, ctx, script_override)?;
+
+    if !f_success && ctx.nullfail && sigs.iter().any(|s| !s.is_empty()) {
+        return Err(ConsensusError::Script("NULLFAIL".into()));
+    }
+
+    if verify {
+        if !f_success {
+            return Err(ConsensusError::Script("CHECKMULTISIGVERIFY".into()));
+        }
+    } else {
+        push(stack, alt_len, bool_encode(f_success))?;
+    }
+    Ok(())
+}
+
+fn checkmultisig_pairs(
+    sigs: &[Vec<u8>],
+    pubkeys: &[Vec<u8>],
+    ctx: &EvalContext<'_>,
+    script_override: Option<&[u8]>,
+) -> Result<bool, ConsensusError> {
     // Core: start at last-pushed sig/key (index 0 after pop-order storage).
     // Advance key always; advance sig only on match. Encoding checks run only
     // for pairs actually tried (early exit skips unused invalid encodings).
@@ -1101,19 +1123,7 @@ fn op_checkmultisig(
             f_success = false;
         }
     }
-
-    if !f_success && ctx.nullfail && sigs.iter().any(|s| !s.is_empty()) {
-        return Err(ConsensusError::Script("NULLFAIL".into()));
-    }
-
-    if verify {
-        if !f_success {
-            return Err(ConsensusError::Script("CHECKMULTISIGVERIFY".into()));
-        }
-    } else {
-        push(stack, alt_len, bool_encode(f_success))?;
-    }
-    Ok(())
+    Ok(f_success)
 }
 
 /// Remove every occurrence of a data-push of `data` from `script`.

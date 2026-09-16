@@ -35,6 +35,15 @@ before 1.0).
   keep the faded mid rate instead of Esplora `1.0` (insufficient sentinel).
   Empty pool is still `-1` / `1.0`.
 
+- **CRAP chew (next 8):** drop allowlist entries for `TxTable::backfill_head_from`,
+  `scripthash_index_data_present`, `Store::revalidate_tip_window_n`,
+  `Query::load_thin_tweaks_range`, `op_checkmultisig`,
+  `validate_block_structure_with_pres`, `read_proc_rss`, and `getblock`
+  after coverage pins and small extracts (`HeightPlan`, checkmultisig match
+  loop, block tx layout, `/proc` RSS parsers, `getblock` unknown-hash).
+  `StrongTxTable::count_ones_bits` stays allowlisted (file-backed walk is
+  unused while the bit image stays L2).
+
 - **CRAP chew (10 easiest):** drop allowlist entries for `stamp_external_parents`,
   `gbt_proposal_connect`, `gbt_chain_txout`, `header_head_occupied`,
   `ConfirmStats::miss_on_from_code`, `ConfirmRejectClass::from_net`,

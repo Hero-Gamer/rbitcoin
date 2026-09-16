@@ -4029,4 +4029,55 @@ mod tests {
         assert!(!hot.join("inwit.body").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn scripthash_index_data_present_runs_and_head_file() {
+        let dir = tmp();
+        assert!(!scripthash_index_data_present(&dir));
+        let runs = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        assert!(!scripthash_index_data_present(&dir));
+        std::fs::write(runs.join("seg"), b"x").unwrap();
+        assert!(scripthash_index_data_present(&dir));
+        std::fs::remove_dir_all(&runs).unwrap();
+        std::fs::write(dir.join("scripthash.head"), b"x").unwrap();
+        assert!(scripthash_index_data_present(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scripthash_index_data_present_head_dir_hwm_and_ingest_occ() {
+        let dir = tmp();
+        let head = dir.join("scripthash.head");
+        std::fs::create_dir_all(&head).unwrap();
+        std::fs::write(head.join("seg"), b"x").unwrap();
+        assert!(scripthash_index_data_present(&dir));
+        std::fs::remove_dir_all(&head).unwrap();
+
+        std::fs::write(dir.join("scripthash.include_hwm"), [0u8; 4]).unwrap();
+        assert!(!scripthash_index_data_present(&dir));
+        std::fs::write(dir.join("scripthash.include_hwm"), 0u64.to_le_bytes()).unwrap();
+        assert!(!scripthash_index_data_present(&dir));
+        std::fs::write(dir.join("scripthash.include_hwm"), 3u64.to_le_bytes()).unwrap();
+        assert!(scripthash_index_data_present(&dir));
+        std::fs::remove_file(dir.join("scripthash.include_hwm")).unwrap();
+
+        let ingest = dir.join("scripthash.ovf").join("ingest");
+        std::fs::create_dir_all(ingest.parent().unwrap()).unwrap();
+        let mut occ = ingest.into_os_string();
+        occ.push(".occ");
+        let occ = std::path::PathBuf::from(occ);
+        let mut buf = b"SHOCC001".to_vec();
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&occ, &buf).unwrap();
+        assert!(!scripthash_index_data_present(&dir));
+        buf.clear();
+        buf.extend_from_slice(b"SHOCC001");
+        buf.extend_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&occ, &buf).unwrap();
+        assert!(scripthash_index_data_present(&dir));
+        std::fs::write(&occ, b"NOMAGIC0").unwrap();
+        assert!(!scripthash_index_data_present(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

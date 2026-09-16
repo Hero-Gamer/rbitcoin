@@ -3692,3 +3692,21 @@ fn spent_range_uses_loc_not_txout_body() {
     assert_eq!(got, want);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn backfill_head_from_empty_and_unindexed() {
+    let dir = tempfile_dir("backfill-head");
+    let t = create_tiny(&dir);
+    assert_eq!(t.backfill_head_from(0).unwrap(), 0);
+    assert_eq!(t.backfill_head_from(1).unwrap(), 0);
+    let f1 = put_n_out(&t, 1, 1);
+    let n = t.count();
+    assert_eq!(t.backfill_head_from(n + 1).unwrap(), 0);
+    let first = f1.get().expect("indexed create fk");
+    let inserted = t.backfill_head_from(first).unwrap();
+    assert_eq!(inserted, 1);
+    let txid = t.body_txid(f1).unwrap();
+    let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
+    assert_eq!(batch[0].1.map(|(f, _)| f), Some(f1));
+    let _ = std::fs::remove_dir_all(&dir);
+}

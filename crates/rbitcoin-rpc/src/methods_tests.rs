@@ -1406,6 +1406,19 @@ fn getblock_verbosity_1_txids_skip_reconstruct() {
 }
 
 #[test]
+fn getblock_named_verbose_genesis_and_hex() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    let named = named(json!({"blockhash": genesis.clone(), "verbose": true}));
+    let v = dispatch(&ctx, "getblock", named).unwrap();
+    assert_eq!(v["previousblockhash"], "");
+    assert_eq!(v["tx"].as_array().unwrap().len(), 1);
+    let hex = dispatch(&ctx, "getblock", vec![genesis, json!(0)]).unwrap();
+    assert!(hex.as_str().unwrap().len() > 160);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn generateblock_submit_false_returns_hex_without_connecting() {
     let (ctx, dir, hub) = ctx_regtest_hub();
     let tip_before = hub.tip_height();

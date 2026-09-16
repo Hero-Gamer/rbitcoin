@@ -107,6 +107,59 @@ fn thin_join_txids_and_loc(
     }
 }
 
+struct HeightPlan {
+    height: Height,
+    first_id: u64,
+    elig: Vec<(u32, [u8; 33])>,
+}
+
+fn thin_tweak_height_plans(
+    store: &Store,
+    t: &SpTweaksTable,
+    start: Height,
+    limits: ThinTweakRangeLimits,
+) -> Result<Vec<HeightPlan>, QueryError> {
+    let mut meta: Vec<(Height, u64, u32)> = Vec::new();
+    for step in 0..limits.max_heights {
+        let h = Height(start.0.saturating_add(step));
+        let Some(header_fk) = store.confirmed.get(h)? else {
+            break;
+        };
+        let Some((first_fk, n_tx)) = store.header_txs.get_range(header_fk)? else {
+            break;
+        };
+        let Some(first_id) = first_fk.get() else {
+            return Err(StoreError::InvalidFk);
+        };
+        meta.push((h, first_id, n_tx));
+    }
+    if meta.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n_txs: Vec<u32> = meta.iter().map(|m| m.2).collect();
+    let Some(eligs) = t.get_eligible_range(meta[0].0, &n_txs)? else {
+        return Ok(Vec::new());
+    };
+    let mut plans = Vec::new();
+    let mut elig_total = 0usize;
+    for (i, elig) in eligs.into_iter().enumerate() {
+        let add = elig.len();
+        if !plans.is_empty()
+            && limits.max_eligible != usize::MAX
+            && elig_total.saturating_add(add) > limits.max_eligible
+        {
+            break;
+        }
+        elig_total = elig_total.saturating_add(add);
+        plans.push(HeightPlan {
+            height: meta[i].0,
+            first_id: meta[i].1,
+            elig,
+        });
+    }
+    Ok(plans)
+}
+
 impl Query {
     pub fn sptweaks_enabled(&self) -> bool {
         self.sptweaks_enabled.load(AtomicOrdering::Acquire)
@@ -258,60 +311,12 @@ impl Query {
         if limits.max_heights == 0 {
             return Ok(Vec::new());
         }
-        // Plan under lock: copy eligible tweaks + create fks only.
-        struct HeightPlan {
-            height: Height,
-            first_id: u64,
-            /// (tx_index_in_block, tweak)
-            elig: Vec<(u32, [u8; 33])>,
-        }
         let plans: Vec<HeightPlan> = {
             let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
             let Some(t) = g.as_ref() else {
                 return Ok(Vec::new());
             };
-            let mut meta: Vec<(Height, u64, u32)> = Vec::new();
-            for step in 0..limits.max_heights {
-                let h = Height(start.0.saturating_add(step));
-                let Some(header_fk) = self.store.confirmed.get(h)? else {
-                    break;
-                };
-                let Some((first_fk, n_tx)) = self.store.header_txs.get_range(header_fk)? else {
-                    break;
-                };
-                let Some(first_id) = first_fk.get() else {
-                    return Err(StoreError::InvalidFk);
-                };
-                meta.push((h, first_id, n_tx));
-            }
-            if meta.is_empty() {
-                Vec::new()
-            } else {
-                let n_txs: Vec<u32> = meta.iter().map(|m| m.2).collect();
-                match t.get_eligible_range(meta[0].0, &n_txs)? {
-                    None => Vec::new(),
-                    Some(eligs) => {
-                        let mut plans = Vec::new();
-                        let mut elig_total = 0usize;
-                        for (i, elig) in eligs.into_iter().enumerate() {
-                            let add = elig.len();
-                            if !plans.is_empty()
-                                && limits.max_eligible != usize::MAX
-                                && elig_total.saturating_add(add) > limits.max_eligible
-                            {
-                                break;
-                            }
-                            elig_total = elig_total.saturating_add(add);
-                            plans.push(HeightPlan {
-                                height: meta[i].0,
-                                first_id: meta[i].1,
-                                elig,
-                            });
-                        }
-                        plans
-                    }
-                }
-            }
+            thin_tweak_height_plans(&self.store, t, start, limits)?
         };
 
         if plans.is_empty() {

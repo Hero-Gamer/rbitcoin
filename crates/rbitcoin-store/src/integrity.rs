@@ -693,4 +693,44 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn revalidate_n_zero_and_empty_store() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert!(!r.tip_shrunk);
+        assert_eq!(r.tip_after, None);
+        assert!(s.confirmed.tip_height().is_none());
+
+        let rec = hdr(Fk::NULL, [0u8; 32], 0);
+        let fk = s.put_header(&rec).unwrap();
+        s.confirmed.set(Height(0), fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        let r = s.revalidate_tip_window_n(0).unwrap();
+        assert!(!r.tip_shrunk);
+        assert_eq!(r.tip_after, Some(0));
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tip_seal_hash_mismatch_drops_tip_block() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let g = hdr(Fk::NULL, [0u8; 32], 0);
+        let g_fk = s.put_header(&g).unwrap();
+        s.confirmed.set(Height(0), g_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        let mut seal = TipSeal::load(s.path())
+            .unwrap()
+            .expect("seal after tip barrier");
+        seal.tip_hash = [0xff; 32];
+        seal.store(s.path()).unwrap();
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert!(r.tip_shrunk, "seal hash mismatch must shrink: {r:?}");
+        assert!(s.confirmed.tip_height().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
