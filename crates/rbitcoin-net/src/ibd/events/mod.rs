@@ -323,165 +323,190 @@ pub(crate) fn apply_peer_event(
     confirm_feed: Option<&super::confirm::ConfirmFeed>,
 ) {
     match ev {
-        PeerEvent::Headers { peer, headers } => {
-            let batch_len = headers.len();
-            let added = on_headers_batch(st, hub, headers);
-            if added > 0 {
-                if super::reorg::consider_disconnected_heavier(st, hub).unwrap_or(false) {
-                    let _ = try_complete_awaiting_reorg(st, hub);
-                }
-                st.empty_header_streak = 0;
-                st.headers_done = false;
-                let live = st.ordered_set.len();
-                let need_ready_headroom = want_headers_beyond_soft_cap(
-                    live,
-                    st.body.known_len(),
-                    st.max_ordered_height.saturating_sub(st.max_ready_height),
-                    4096,
-                );
-                if batch_len >= MAX_HEADERS_RESULTS
-                    && live < MAX_ORDERED_HEADERS
-                    && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
-                {
-                    let tips = work_path_tips(st);
-                    let _ =
-                        request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
-                }
-            } else if batch_len == 0 {
-                on_empty_headers(st, hub);
-            } else {
-                on_known_headers_batch(st, hub, peer, batch_len);
-            }
-        }
+        PeerEvent::Headers { peer, headers } => apply_headers_event(st, hub, peer, headers),
         PeerEvent::BlockFramed {
             peer,
             hash,
             payload,
-        } => {
-            let wire_bytes = payload.len();
-            note_block_rx(&mut st.slots, peer, wire_bytes);
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-            // Class A `is_known_archived` is not claim-ready (needs BQ wire).
-            if st.body.is_rejected(&hash) || hub.has_block(&hash) {
-                return;
-            }
-            let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
-                fk
-            } else {
-                let header = match decode_block_header_prefix(&payload) {
-                    Some(h) => h,
-                    None => {
-                        st.body.mark_missing(hash);
-                        return;
-                    }
-                };
-                match hub.ensure_header_fk(&header) {
-                    Ok(fk) => {
-                        st.header_fks.insert(hash, fk);
-                        fk
-                    }
-                    Err(e) => {
-                        warn!("ibd: ensure_header {hash}: {e}");
-                        st.body.mark_missing(hash);
-                        return;
-                    }
-                }
-            };
-            let tip_h = hub.tip_height().unwrap_or(0);
-            let height = st.hash_height.get(&hash).copied();
-            let Some(height) = height else {
-                st.body.mark_missing(hash);
-                return;
-            };
-            let write_next = archive_write_next.load(Ordering::Relaxed);
-            let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
-            let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
-            if height > tip_hi && height > densify_hi {
-                st.body.mark_missing(hash);
-                return;
-            }
-            // Side-branch body at tip height (or any competing hash): hold by
-            // hash for most-work reorg. BQ is height first-wins and cannot store
-            // a same-height sibling of the confirmed tip.
-            let tip_hash = hub.tip_hash();
-            if height <= tip_h && tip_hash != Some(hash) {
-                if let Ok(block) = bitcoin::consensus::deserialize::<bitcoin::Block>(&payload) {
-                    st.reorg.hold_body(block);
-                    st.body.mark_pending(hash);
-                    if try_complete_awaiting_reorg(st, hub) {
-                        return;
-                    }
-                }
-            }
-            if super::progress::claim_ready(hub, &mut st.body, height, &hash) {
-                return;
-            }
-            let raw = hash.to_byte_array();
-            match hub
-                .query
-                .block_queue_offer(height, raw, header_fk.0, &payload)
-            {
-                Ok(_offer) => {
-                    let _ = try_complete_awaiting_reorg(st, hub);
-                }
-                Err(e) => {
-                    rbitcoin_log::warn!("ibd: body queue offer failed ({e}) h={height}");
-                    st.body.mark_missing(hash);
-                    return;
-                }
-            }
-            st.body.mark_pending(hash);
-            if let Some(feed) = confirm_feed {
-                feed.note(height, hash);
-            }
-        }
-        PeerEvent::BlockDecodeFailed { peer, hash } => {
-            note_block_progress(&mut st.slots, peer);
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-            if st.body.is_pending(&hash) {
-                st.body.mark_missing(hash);
-            }
-        }
-        PeerEvent::NotFound { peer, hashes } => {
-            note_block_progress(&mut st.slots, peer);
-            if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
-                for h in &hashes {
-                    s.in_flight.remove(h);
-                    let empty = st
-                        .inflight
-                        .get_mut(h)
-                        .map(|e| e.remove_peer(peer))
-                        .unwrap_or(false);
-                    if empty {
-                        st.inflight.remove(h);
-                    }
-                }
-            }
-        }
+        } => apply_block_framed(
+            st,
+            hub,
+            archive_write_next,
+            confirm_feed,
+            peer,
+            hash,
+            payload,
+        ),
+        PeerEvent::BlockDecodeFailed { peer, hash } => apply_block_decode_failed(st, peer, hash),
+        PeerEvent::NotFound { peer, hashes } => apply_notfound(st, peer, hashes),
         PeerEvent::Addrs { peer, addrs } => {
             inject_learned_addrs(peer_book, &addrs, local_addr, peer);
         }
-        PeerEvent::Dead { peer, reason } => {
-            warn!("ibd: peer[{peer}] dead: {reason}");
-            if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
-                note_dead_without_block_bytes(
-                    peer_book,
-                    &mut st.addr_cooldown,
-                    s.addr,
-                    s.first_data_ms,
-                    Instant::now(),
-                );
-                let lat = s.first_data_ms.saturating_sub(s.connected_ms);
-                peer_book.apply_ibd_dead_speed(
-                    s.addr,
-                    lat,
-                    s.rate.bps(),
-                    st.addr_cooldown.contains_key(&s.addr),
-                );
+        PeerEvent::Dead { peer, reason } => apply_peer_dead(st, peer_book, peer, reason),
+    }
+}
+
+fn apply_headers_event(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: Vec<bitcoin::block::Header>,
+) {
+    let batch_len = headers.len();
+    let added = on_headers_batch(st, hub, headers);
+    if added > 0 {
+        if super::reorg::consider_disconnected_heavier(st, hub).unwrap_or(false) {
+            let _ = try_complete_awaiting_reorg(st, hub);
+        }
+        st.empty_header_streak = 0;
+        st.headers_done = false;
+        let live = st.ordered_set.len();
+        let need_ready_headroom = want_headers_beyond_soft_cap(
+            live,
+            st.body.known_len(),
+            st.max_ordered_height.saturating_sub(st.max_ready_height),
+            4096,
+        );
+        if batch_len >= MAX_HEADERS_RESULTS
+            && live < MAX_ORDERED_HEADERS
+            && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
+        {
+            let tips = work_path_tips(st);
+            let _ = request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
+        }
+    } else if batch_len == 0 {
+        on_empty_headers(st, hub);
+    } else {
+        on_known_headers_batch(st, hub, peer, batch_len);
+    }
+}
+
+fn apply_block_framed(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    archive_write_next: &AtomicU32,
+    confirm_feed: Option<&super::confirm::ConfirmFeed>,
+    peer: usize,
+    hash: BlockHash,
+    payload: Vec<u8>,
+) {
+    let wire_bytes = payload.len();
+    note_block_rx(&mut st.slots, peer, wire_bytes);
+    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+    if st.body.is_rejected(&hash) || hub.has_block(&hash) {
+        return;
+    }
+    let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
+        fk
+    } else {
+        let header = match decode_block_header_prefix(&payload) {
+            Some(h) => h,
+            None => {
+                st.body.mark_missing(hash);
+                return;
             }
-            release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
+        };
+        match hub.ensure_header_fk(&header) {
+            Ok(fk) => {
+                st.header_fks.insert(hash, fk);
+                fk
+            }
+            Err(e) => {
+                warn!("ibd: ensure_header {hash}: {e}");
+                st.body.mark_missing(hash);
+                return;
+            }
+        }
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let Some(height) = st.hash_height.get(&hash).copied() else {
+        st.body.mark_missing(hash);
+        return;
+    };
+    let write_next = archive_write_next.load(Ordering::Relaxed);
+    let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
+    let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
+    if height > tip_hi && height > densify_hi {
+        st.body.mark_missing(hash);
+        return;
+    }
+    let tip_hash = hub.tip_hash();
+    if height <= tip_h && tip_hash != Some(hash) {
+        if let Ok(block) = bitcoin::consensus::deserialize::<bitcoin::Block>(&payload) {
+            st.reorg.hold_body(block);
+            st.body.mark_pending(hash);
+            if try_complete_awaiting_reorg(st, hub) {
+                return;
+            }
         }
     }
+    if super::progress::claim_ready(hub, &mut st.body, height, &hash) {
+        return;
+    }
+    let raw = hash.to_byte_array();
+    match hub
+        .query
+        .block_queue_offer(height, raw, header_fk.0, &payload)
+    {
+        Ok(_offer) => {
+            let _ = try_complete_awaiting_reorg(st, hub);
+        }
+        Err(e) => {
+            rbitcoin_log::warn!("ibd: body queue offer failed ({e}) h={height}");
+            st.body.mark_missing(hash);
+            return;
+        }
+    }
+    st.body.mark_pending(hash);
+    if let Some(feed) = confirm_feed {
+        feed.note(height, hash);
+    }
+}
+
+fn apply_block_decode_failed(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+    note_block_progress(&mut st.slots, peer);
+    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+    if st.body.is_pending(&hash) {
+        st.body.mark_missing(hash);
+    }
+}
+
+fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
+    note_block_progress(&mut st.slots, peer);
+    if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+        for h in &hashes {
+            s.in_flight.remove(h);
+            let empty = st
+                .inflight
+                .get_mut(h)
+                .map(|e| e.remove_peer(peer))
+                .unwrap_or(false);
+            if empty {
+                st.inflight.remove(h);
+            }
+        }
+    }
+}
+
+fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, reason: String) {
+    warn!("ibd: peer[{peer}] dead: {reason}");
+    if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
+        note_dead_without_block_bytes(
+            peer_book,
+            &mut st.addr_cooldown,
+            s.addr,
+            s.first_data_ms,
+            Instant::now(),
+        );
+        let lat = s.first_data_ms.saturating_sub(s.connected_ms);
+        peer_book.apply_ibd_dead_speed(
+            s.addr,
+            lat,
+            s.rate.bps(),
+            st.addr_cooldown.contains_key(&s.addr),
+        );
+    }
+    release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).

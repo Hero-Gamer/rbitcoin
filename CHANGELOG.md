@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **CRAP chew (RPC/CLI/store/lookup):** drop allowlist entries for `method_help`,
+  `operator_config_from_args`, `apply_peer_event`,
+  `ScriptHashTable::apply_head_upserts`, `Store::open_layout`, and
+  `wire_lookup_phase` after coverage pins and extracts (RPC help arms, conf/log
+  argv, peer-event match, SH home upserts, open-layout migrate/leftovers,
+  lookup contiguous/bind).
+
 - **Tip-mode mempool purge after catch-up drops conflicts and persists DEAD:**
   leftover txs whose inputs were spent by a different confirmed txid are
   evicted at `set_relay_enabled(true)`, and slot deaths are written even when

@@ -1092,10 +1092,13 @@ fn reopen_after_ingest_seal_and_unlink_homes() {
             t.key_home(&first_new).unwrap(),
             KeyHome::SealedOvf
         ));
+        put_create(&t, rec(first_new, 1999, 0));
+        assert_eq!(t.entries(&first_new).unwrap().len(), 2);
 
         t.unlink_create(&sh_main, Fk(1), 0).unwrap();
         assert!(t.entries(&sh_main).unwrap().is_empty());
         t.unlink_create(&first_new, Fk(1000), 0).unwrap();
+        t.unlink_create(&first_new, Fk(1999), 0).unwrap();
         assert!(t.entries(&first_new).unwrap().is_empty());
 
         t.flush().unwrap();

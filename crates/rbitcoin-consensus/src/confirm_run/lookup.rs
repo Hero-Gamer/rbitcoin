@@ -351,14 +351,7 @@ pub(super) fn wire_lookup_phase(
     blocks: &[WireBlockIn],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<LookupPhaseOut, ConsensusError> {
-    if blocks.is_empty() {
-        return Err(ConsensusError::BadBlock("empty confirm batch"));
-    }
-    for w in blocks.windows(2) {
-        if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
-            return Err(ConsensusError::BadBlock("confirm run not contiguous"));
-        }
-    }
+    lookup_require_contiguous(blocks)?;
 
     let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
     let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
@@ -452,87 +445,36 @@ pub(super) fn wire_lookup_phase(
         });
     }
 
-    let t_filter = Instant::now();
-    let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
-    let need_fks = query
-        .archive_filter_need_header_fks(&header_fks)
-        .map_err(ConsensusError::from)?;
-    confirm_archive_kind(header_fks.len(), need_fks.len())?;
-    let filter_ns = t_filter.elapsed().as_nanos() as u64;
-    let t_batch = Instant::now();
-    let plan = if need_fks.is_empty() {
-        for (i, m) in metas.iter_mut().enumerate() {
-            if let Some(list) = query
-                .store()
-                .header_txs
-                .get_list(m.header_fk)
-                .map_err(ConsensusError::from)?
-            {
-                m.tx_fks = list;
-            }
-            // Never rehash wire for lookup — index by batch position.
-            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
-            query.confirm_parent_cache().put_header_plan(
-                m.height.0,
-                m.header_fk,
-                m.header_rec.clone(),
-                m.tx_fks.clone(),
-                prev,
-            );
-        }
-        None
-    } else {
-        let mut need = Vec::with_capacity(need_fks.len());
-        for fk in &need_fks {
-            let i = metas
-                .iter()
-                .position(|m| m.header_fk == *fk)
-                .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: need-body header_fk not in batch",
-                )))?;
-            need.push((*fk, &wire_blocks[i], metas[i].txids.as_slice()));
-        }
-        let plan = match pipeline {
-            Some(p) => query
-                .archive_plan_batch_from_wire(
-                    &need,
-                    p.next_tx_start.max(1),
-                    p.in_flight,
-                    p.skeleton.as_ref(),
-                    p.skeleton.is_some().then_some(p.carried_need.as_slice()),
-                )
-                .map_err(ConsensusError::from)?,
-            None => query
-                .archive_plan_batch_from_wire(
-                    &need,
-                    query.tx_body_count().saturating_add(1).max(1),
-                    &rbitcoin_query::InFlight::new(),
-                    None,
-                    None,
-                )
-                .map_err(ConsensusError::from)?,
-        };
-        let by_header = create_fks_from_header_ranges(&plan.per_header_ranges);
-        for (i, m) in metas.iter_mut().enumerate() {
-            if let Some(id) = m.header_fk.get() {
-                if let Some(fks) = by_header.get(&id) {
-                    m.tx_fks = fks.clone();
-                }
-            }
-            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
-            query.confirm_parent_cache().put_header_plan(
-                m.height.0,
-                m.header_fk,
-                m.header_rec.clone(),
-                m.tx_fks.clone(),
-                prev,
-            );
-        }
-        Some(plan)
-    };
-    let batch_ns = t_batch.elapsed().as_nanos() as u64;
-    // plan_ns for HEAD_NS: filter + batch (legacy “lookup wall” without struct/prepare).
+    let (plan, filter_ns, batch_ns) =
+        lookup_bind_archive_plan(query, pipeline, &mut metas, &wire_blocks)?;
     let plan_ns = filter_ns.saturating_add(batch_ns);
+    lookup_note_stamp(
+        query, struct_ns, header_ns, prepare_ns, filter_ns, batch_ns, plan_ns,
+    );
+    Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+fn lookup_require_contiguous(blocks: &[WireBlockIn]) -> Result<(), ConsensusError> {
+    if blocks.is_empty() {
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
+    }
+    for w in blocks.windows(2) {
+        if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
+            return Err(ConsensusError::BadBlock("confirm run not contiguous"));
+        }
+    }
+    Ok(())
+}
+
+fn lookup_note_stamp(
+    query: &Query,
+    struct_ns: u64,
+    header_ns: u64,
+    prepare_ns: u64,
+    filter_ns: u64,
+    batch_ns: u64,
+    plan_ns: u64,
+) {
     query
         .confirm_stats()
         .note_stamp(struct_ns, prepare_ns, filter_ns, batch_ns);
@@ -548,7 +490,118 @@ pub(super) fn wire_lookup_phase(
     if plan_ns > 0 {
         rbitcoin_query::note_confirm(&query.confirm_stats().phase_prep_filter_plan_ns, plan_ns);
     }
-    Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+fn lookup_bind_have_body(
+    query: &Query,
+    metas: &mut [BodyMeta],
+    wire_blocks: &[Arc<Block>],
+) -> Result<(), ConsensusError> {
+    for (i, m) in metas.iter_mut().enumerate() {
+        if let Some(list) = query
+            .store()
+            .header_txs
+            .get_list(m.header_fk)
+            .map_err(ConsensusError::from)?
+        {
+            m.tx_fks = list;
+        }
+        let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
+        query.confirm_parent_cache().put_header_plan(
+            m.height.0,
+            m.header_fk,
+            m.header_rec.clone(),
+            m.tx_fks.clone(),
+            prev,
+        );
+    }
+    Ok(())
+}
+
+fn lookup_bind_need_body<'a>(
+    query: &Query,
+    pipeline: Option<&WireLoadPipeline>,
+    metas: &'a mut [BodyMeta],
+    wire_blocks: &'a [Arc<Block>],
+    need_fks: &[rbitcoin_primitives::Fk],
+) -> Result<rbitcoin_query::ArchiveWritePlan, ConsensusError> {
+    let mut need = Vec::with_capacity(need_fks.len());
+    for fk in need_fks {
+        let i = metas
+            .iter()
+            .position(|m| m.header_fk == *fk)
+            .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: need-body header_fk not in batch",
+            )))?;
+        need.push((*fk, &wire_blocks[i], metas[i].txids.as_slice()));
+    }
+    let plan = match pipeline {
+        Some(p) => query
+            .archive_plan_batch_from_wire(
+                &need,
+                p.next_tx_start.max(1),
+                p.in_flight,
+                p.skeleton.as_ref(),
+                p.skeleton.is_some().then_some(p.carried_need.as_slice()),
+            )
+            .map_err(ConsensusError::from)?,
+        None => query
+            .archive_plan_batch_from_wire(
+                &need,
+                query.tx_body_count().saturating_add(1).max(1),
+                &rbitcoin_query::InFlight::new(),
+                None,
+                None,
+            )
+            .map_err(ConsensusError::from)?,
+    };
+    let by_header = create_fks_from_header_ranges(&plan.per_header_ranges);
+    for (i, m) in metas.iter_mut().enumerate() {
+        if let Some(id) = m.header_fk.get() {
+            if let Some(fks) = by_header.get(&id) {
+                m.tx_fks = fks.clone();
+            }
+        }
+        let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
+        query.confirm_parent_cache().put_header_plan(
+            m.height.0,
+            m.header_fk,
+            m.header_rec.clone(),
+            m.tx_fks.clone(),
+            prev,
+        );
+    }
+    Ok(plan)
+}
+
+fn lookup_bind_archive_plan(
+    query: &Query,
+    pipeline: Option<&WireLoadPipeline>,
+    metas: &mut [BodyMeta],
+    wire_blocks: &[Arc<Block>],
+) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, u64, u64), ConsensusError> {
+    let t_filter = Instant::now();
+    let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
+    let need_fks = query
+        .archive_filter_need_header_fks(&header_fks)
+        .map_err(ConsensusError::from)?;
+    confirm_archive_kind(header_fks.len(), need_fks.len())?;
+    let filter_ns = t_filter.elapsed().as_nanos() as u64;
+    let t_batch = Instant::now();
+    let plan = if need_fks.is_empty() {
+        lookup_bind_have_body(query, metas, wire_blocks)?;
+        None
+    } else {
+        Some(lookup_bind_need_body(
+            query,
+            pipeline,
+            metas,
+            wire_blocks,
+            &need_fks,
+        )?)
+    };
+    let batch_ns = t_batch.elapsed().as_nanos() as u64;
+    Ok((plan, filter_ns, batch_ns))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

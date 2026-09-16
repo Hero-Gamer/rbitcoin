@@ -1618,59 +1618,99 @@ impl ScriptHashTable {
                 KeyHome::SealedOvf => {
                     sealed_ovf_ups.push((*key, val.clone()));
                 }
-                KeyHome::Main => {
-                    let hk = head_key_from_full(key);
-                    let si = self.shard_index(key);
-                    let updated = if let Some(slot) = self.sorted_main.get(si) {
-                        let g = slot.read().unwrap();
-                        match g.as_ref() {
-                            Some(h) => h.update_value(&hk, val)?,
-                            None => false,
-                        }
-                    } else {
-                        false
-                    };
-                    if updated {
-                        continue;
-                    }
-                    ingest_ups.push((*key, val.clone()));
-                }
+                KeyHome::Main => self.upsert_main_or_ingest(*key, val, &mut ingest_ups)?,
             }
         }
-
-        if !sealed_ovf_ups.is_empty() {
-            let mut missed: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-            {
-                let g = self.sealed_ovf.lock().unwrap();
-                for (key, val) in &sealed_ovf_ups {
-                    let hk = head_key_from_full(key);
-                    let mut hit = false;
-                    for h in g.iter().rev() {
-                        if h.update_value(&hk, val)? {
-                            hit = true;
-                            break;
-                        }
-                    }
-                    if !hit {
-                        missed.push((*key, val.clone()));
-                    }
-                }
-            }
-            for (key, val) in missed {
-                let hk = head_key_from_full(&key);
-                let mut hit = false;
-                if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
-                    hit = l1.head.update_value(&hk, &val)?;
-                }
-                if !hit {
-                    ingest_ups.push((key, val));
-                }
-            }
-        }
+        self.flush_sealed_ovf_upserts(sealed_ovf_ups, &mut ingest_ups)?;
         if !ingest_ups.is_empty() {
             self.ingest_insert_many(&ingest_ups)?;
         }
         Ok(())
+    }
+
+    fn upsert_main_or_ingest(
+        &self,
+        key: [u8; 32],
+        val: &ShHeadValue,
+        ingest_ups: &mut Vec<([u8; 32], ShHeadValue)>,
+    ) -> Result<(), StoreError> {
+        let hk = head_key_from_full(&key);
+        let si = self.shard_index(&key);
+        let updated = if let Some(slot) = self.sorted_main.get(si) {
+            let g = slot.read().unwrap();
+            match g.as_ref() {
+                Some(h) => h.update_value(&hk, val)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !updated {
+            ingest_ups.push((key, val.clone()));
+        }
+        Ok(())
+    }
+
+    fn flush_sealed_ovf_upserts(
+        &self,
+        sealed_ovf_ups: Vec<([u8; 32], ShHeadValue)>,
+        ingest_ups: &mut Vec<([u8; 32], ShHeadValue)>,
+    ) -> Result<(), StoreError> {
+        if sealed_ovf_ups.is_empty() {
+            return Ok(());
+        }
+        let missed = self.sealed_ovf_l0_misses(&sealed_ovf_ups)?;
+        self.sealed_miss_try_l1(missed, ingest_ups)
+    }
+
+    fn sealed_ovf_l0_misses(
+        &self,
+        sealed_ovf_ups: &[([u8; 32], ShHeadValue)],
+    ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
+        let mut missed: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+        let g = self.sealed_ovf.lock().unwrap();
+        for (key, val) in sealed_ovf_ups {
+            if !self.sealed_ovf_update_rev(&g, key, val)? {
+                missed.push((*key, val.clone()));
+            }
+        }
+        Ok(missed)
+    }
+
+    fn sealed_ovf_update_rev(
+        &self,
+        sealed: &[SortedHead],
+        key: &[u8; 32],
+        val: &ShHeadValue,
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        for h in sealed.iter().rev() {
+            if h.update_value(&hk, val)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn sealed_miss_try_l1(
+        &self,
+        missed: Vec<([u8; 32], ShHeadValue)>,
+        ingest_ups: &mut Vec<([u8; 32], ShHeadValue)>,
+    ) -> Result<(), StoreError> {
+        for (key, val) in missed {
+            if !self.ovf_l1_update(&key, &val)? {
+                ingest_ups.push((key, val));
+            }
+        }
+        Ok(())
+    }
+
+    fn ovf_l1_update(&self, key: &[u8; 32], val: &ShHeadValue) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            return l1.head.update_value(&hk, val);
+        }
+        Ok(false)
     }
 
     fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
