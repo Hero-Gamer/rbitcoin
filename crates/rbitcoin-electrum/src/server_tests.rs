@@ -1104,6 +1104,12 @@ fn dispatch_on_connected_chain() {
     assert!(verbose.get("hex").is_some());
     assert_eq!(verbose["time"], 1);
     assert_eq!(verbose["blocktime"], 1);
+    assert_eq!(verbose["version"], 1);
+    assert_eq!(verbose["locktime"], 0);
+    assert!(verbose["size"].as_u64().unwrap() > 0);
+    assert_eq!(verbose["hash"].as_str().unwrap().len(), 64);
+    assert!(verbose["vin"][0].get("coinbase").is_some());
+    assert_eq!(verbose["vout"][0]["n"], 0);
     assert!(verbose["confirmations"].as_u64().unwrap() >= 1);
     let want_bh = q
         .wire_header_at_height(rbitcoin_primitives::Height(0))

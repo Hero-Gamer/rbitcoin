@@ -1606,7 +1606,13 @@ fn dispatch_pinned(
                 if confirmed_ok {
                     let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                     if verbose {
-                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk)));
+                        return Ok(verbose_tx_json(
+                            query,
+                            &raw,
+                            &txid,
+                            Some(fk),
+                            chain.network,
+                        ));
                     }
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
@@ -1618,7 +1624,13 @@ fn dispatch_pinned(
                     if let Some(tx) = mp.get_tx(&tid) {
                         let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(verbose_tx_json(query, &raw, &txid, None));
+                            return Ok(verbose_tx_json(
+                                query,
+                                &raw,
+                                &txid,
+                                None,
+                                chain.network,
+                            ));
                         }
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
@@ -2054,11 +2066,31 @@ fn txid_hex(txid: &[u8; 32]) -> String {
 
 /// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
 /// stamp); None = mempool (`confirmations: 0`, no block fields).
-fn verbose_tx_json(query: &Query, raw: &[u8], txid: &[u8; 32], fk: Option<Fk>) -> Value {
+fn verbose_tx_json(
+    query: &Query,
+    raw: &[u8],
+    txid: &[u8; 32],
+    fk: Option<Fk>,
+    network: bitcoin::Network,
+) -> Value {
     let mut obj = json!({
         "hex": rbitcoin_primitives::hex_encode(raw),
         "txid": txid_hex(txid),
+        "size": raw.len(),
     });
+    if let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw) {
+        obj["version"] = json!(tx.version.0);
+        obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
+        obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));
+        obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
+        obj["vout"] = Value::Array(
+            tx.output
+                .iter()
+                .enumerate()
+                .map(|(n, o)| verbose_vout(n, o, network))
+                .collect(),
+        );
+    }
     match fk {
         Some(fk) => {
             if let Ok(Some(h)) = query.store().tx_height_get(fk) {
@@ -2077,6 +2109,51 @@ fn verbose_tx_json(query: &Query, raw: &[u8], txid: &[u8; 32], fk: Option<Fk>) -
         }
     }
     obj
+}
+
+fn verbose_vin(input: &bitcoin::TxIn) -> Value {
+    if input.previous_output.is_null() {
+        json!({
+            "coinbase": rbitcoin_primitives::hex_encode(input.script_sig.as_bytes()),
+            "sequence": input.sequence.0,
+        })
+    } else {
+        let mut v = json!({
+            "txid": input.previous_output.txid.to_string(),
+            "vout": input.previous_output.vout,
+            "scriptSig": {
+                "asm": input.script_sig.to_asm_string(),
+                "hex": rbitcoin_primitives::hex_encode(input.script_sig.as_bytes()),
+            },
+            "sequence": input.sequence.0,
+        });
+        if !input.witness.is_empty() {
+            v["txinwitness"] = Value::Array(
+                input
+                    .witness
+                    .iter()
+                    .map(|w| json!(rbitcoin_primitives::hex_encode(w)))
+                    .collect(),
+            );
+        }
+        v
+    }
+}
+
+fn verbose_vout(n: usize, out: &bitcoin::TxOut, network: bitcoin::Network) -> Value {
+    let mut spk = json!({
+        "asm": out.script_pubkey.to_asm_string(),
+        "hex": rbitcoin_primitives::hex_encode(out.script_pubkey.as_bytes()),
+    });
+    if let Ok(addr) = bitcoin::Address::from_script(&out.script_pubkey, network) {
+        spk["address"] = json!(addr.to_string());
+        spk["addresses"] = json!([addr.to_string()]);
+    }
+    json!({
+        "value": out.value.to_btc(),
+        "n": n,
+        "scriptPubKey": spk,
+    })
 }
 
 fn hash_hex_rev(h: &[u8; 32]) -> String {

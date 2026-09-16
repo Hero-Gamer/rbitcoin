@@ -609,6 +609,9 @@ async fn electrum_server_version_history_balance() {
     )
     .await;
     assert!(v["result"]["hex"].as_str().is_some());
+    assert!(v["result"]["vin"][0].get("coinbase").is_some());
+    assert_eq!(v["result"]["vout"][0]["n"], 0);
+    assert!(v["result"]["size"].as_u64().unwrap() > 0);
     let time = v["result"]["time"].as_u64().expect("verbose time");
     assert_eq!(v["result"]["blocktime"].as_u64(), Some(time));
     assert!(v["result"]["confirmations"].as_u64().unwrap() >= 1);
