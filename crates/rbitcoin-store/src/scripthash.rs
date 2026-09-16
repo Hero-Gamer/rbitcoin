@@ -2296,59 +2296,73 @@ impl ScriptHashTable {
         new_val: &ShHeadValue,
     ) -> Result<(), StoreError> {
         match home {
-            KeyHome::Main | KeyHome::Absent => {
-                let hk = head_key_from_full(scripthash);
-                let si = self.shard_index(scripthash);
-                let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
-                    let g = slot.read().unwrap();
-                    match g.as_ref() {
-                        Some(h) => h.update_value(&hk, new_val)?,
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                if !updated_sorted {
-                    let g = self.ingest.lock().unwrap();
-                    if new_val.is_empty() {
-                        g.clear_key(scripthash)?;
-                    } else {
-                        g.insert(scripthash, new_val)?;
-                    }
+            KeyHome::Main | KeyHome::Absent => self.unlink_write_main(scripthash, new_val),
+            KeyHome::Ingest => self.unlink_write_ingest(scripthash, new_val),
+            KeyHome::SealedOvf => self.unlink_write_sealed_ovf(scripthash, new_val),
+        }
+    }
+
+    fn unlink_write_ingest(
+        &self,
+        scripthash: &[u8; 32],
+        new_val: &ShHeadValue,
+    ) -> Result<(), StoreError> {
+        let g = self.ingest.lock().unwrap();
+        if new_val.is_empty() {
+            g.clear_key(scripthash)
+        } else {
+            g.insert(scripthash, new_val)
+        }
+    }
+
+    fn unlink_write_main(
+        &self,
+        scripthash: &[u8; 32],
+        new_val: &ShHeadValue,
+    ) -> Result<(), StoreError> {
+        let hk = head_key_from_full(scripthash);
+        let si = self.shard_index(scripthash);
+        let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
+            let g = slot.read().unwrap();
+            match g.as_ref() {
+                Some(h) => h.update_value(&hk, new_val)?,
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !updated_sorted {
+            self.unlink_write_ingest(scripthash, new_val)?;
+        }
+        Ok(())
+    }
+
+    fn unlink_write_sealed_ovf(
+        &self,
+        scripthash: &[u8; 32],
+        new_val: &ShHeadValue,
+    ) -> Result<(), StoreError> {
+        let hk = head_key_from_full(scripthash);
+        let g = self.sealed_ovf.lock().unwrap();
+        let mut hit = false;
+        for h in g.iter().rev() {
+            if h.update_value(&hk, new_val)? {
+                hit = true;
+                break;
+            }
+        }
+        drop(g);
+        if !hit {
+            if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+                if l1.head.update_value(&hk, new_val)? {
+                    hit = true;
                 }
             }
-            KeyHome::Ingest => {
-                let g = self.ingest.lock().unwrap();
-                if new_val.is_empty() {
-                    g.clear_key(scripthash)?;
-                } else {
-                    g.insert(scripthash, new_val)?;
-                }
-            }
-            KeyHome::SealedOvf => {
-                let hk = head_key_from_full(scripthash);
-                let g = self.sealed_ovf.lock().unwrap();
-                let mut hit = false;
-                for h in g.iter().rev() {
-                    if h.update_value(&hk, new_val)? {
-                        hit = true;
-                        break;
-                    }
-                }
-                drop(g);
-                if !hit {
-                    if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
-                        if l1.head.update_value(&hk, new_val)? {
-                            hit = true;
-                        }
-                    }
-                }
-                if !hit {
-                    return Err(StoreError::Corrupt(
-                        "scripthash: sealed ovf unlink missed home",
-                    ));
-                }
-            }
+        }
+        if !hit {
+            return Err(StoreError::Corrupt(
+                "scripthash: sealed ovf unlink missed home",
+            ));
         }
         Ok(())
     }
