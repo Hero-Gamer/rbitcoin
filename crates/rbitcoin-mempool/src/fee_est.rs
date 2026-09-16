@@ -10,9 +10,20 @@ pub const BLOCK_WEIGHT_WU: u64 = 4_000_000;
 /// Seconds per planned block (product clock; not wall time since last tip).
 pub const SECONDS_PER_BLOCK: u64 = 600;
 
-/// Safety margin: include when load ≤ this fraction of capacity (95%).
-pub const CAPACITY_SAFETY_NUM: u64 = 95;
-pub const CAPACITY_SAFETY_DEN: u64 = 100;
+/// Inclusion confidence at N=1 (10-minute default). Higher → higher sat/vB.
+pub const CONFIDENCE_NEAR: f64 = 0.99;
+/// Inclusion confidence at N≥6 (mid and far). Held flat from there.
+pub const CONFIDENCE_FAR: f64 = 0.90;
+/// First N where `c(N) = CONFIDENCE_FAR`.
+pub const CONFIDENCE_FADE_BLOCKS: u32 = 6;
+/// Fraction of `N×4e6` WU to fill at `CONFIDENCE_NEAR` (leave shock room).
+pub const FILL_AT_NEAR: f64 = 0.80;
+/// Fraction of `N×4e6` WU to fill at `CONFIDENCE_FAR` (today's 95% haircut).
+pub const FILL_AT_FAR: f64 = 0.95;
+/// Inflow EMA multiplier at `CONFIDENCE_NEAR`.
+pub const LAMBDA_AT_NEAR: f64 = 2.0;
+/// Inflow EMA multiplier at `CONFIDENCE_FAR`.
+pub const LAMBDA_AT_FAR: f64 = 1.0;
 
 /// Feerate bucket edges in sat/kvB (Libre min relay = 100). Last bucket is +∞.
 pub const FEE_BUCKET_EDGES_SAT_PER_KVB: &[u64] = &[
@@ -64,9 +75,39 @@ pub fn horizon_secs(n_blocks: u32) -> u64 {
     n.saturating_mul(SECONDS_PER_BLOCK)
 }
 
-/// Effective capacity after safety margin.
+/// Inclusion confidence `c(N)`: 0.99 at N=1, linear to 0.90 at N=6, then flat.
+fn inclusion_confidence(n_blocks: u32) -> f64 {
+    let n = n_blocks.max(1);
+    if n >= CONFIDENCE_FADE_BLOCKS {
+        return CONFIDENCE_FAR;
+    }
+    let t = f64::from(n - 1) / f64::from(CONFIDENCE_FADE_BLOCKS - 1);
+    CONFIDENCE_NEAR + t * (CONFIDENCE_FAR - CONFIDENCE_NEAR)
+}
+
+fn lerp_conf(c: f64, y_near: f64, y_far: f64) -> f64 {
+    let span = CONFIDENCE_NEAR - CONFIDENCE_FAR;
+    if span <= 0.0 {
+        return y_far;
+    }
+    let t = ((c - CONFIDENCE_FAR) / span).clamp(0.0, 1.0);
+    y_far + t * (y_near - y_far)
+}
+
+/// Block-fill fraction at confidence `c` (higher `c` → less of the block).
+fn fill_frac(c: f64) -> f64 {
+    lerp_conf(c, FILL_AT_NEAR, FILL_AT_FAR)
+}
+
+/// Inflow EMA multiplier at confidence `c` (higher `c` → more assumed λ).
+fn lambda_mult(c: f64) -> f64 {
+    lerp_conf(c, LAMBDA_AT_NEAR, LAMBDA_AT_FAR)
+}
+
+/// Effective capacity after the confidence fill fraction.
 pub fn effective_capacity_wu(n_blocks: u32) -> u64 {
-    capacity_wu(n_blocks).saturating_mul(CAPACITY_SAFETY_NUM) / CAPACITY_SAFETY_DEN
+    let fill = fill_frac(inclusion_confidence(n_blocks));
+    (capacity_wu(n_blocks) as f64 * fill).round() as u64
 }
 
 /// Projected weight arriving above rate R over horizon H.
@@ -115,13 +156,12 @@ where
 {
     let cap = effective_capacity_wu(n_blocks);
     let h = inflow_horizon_secs(n_blocks);
+    let lam = lambda_mult(inclusion_confidence(n_blocks));
     let mut best: Option<u64> = None;
     for &r in candidate_rates {
-        let load = stock_above(r).saturating_add(projected_inflow_wu_above(
-            inflow_wu_per_s_by_bucket,
-            r,
-            h,
-        ));
+        let inflow = projected_inflow_wu_above(inflow_wu_per_s_by_bucket, r, h);
+        let stressed = (inflow as f64 * lam).round() as u64;
+        let load = stock_above(r).saturating_add(stressed);
         if load <= cap {
             best = Some(match best {
                 Some(b) => b.min(r),
@@ -226,12 +266,16 @@ pub fn percentile_sat(mut v: Vec<u64>, pct: u8) -> Option<u64> {
     Some(v[i])
 }
 
-/// Far-horizon rate from per-block p10 samples (85th percentile, else median).
-pub fn historical_far_sat_kvb(block_p10s: &[u64]) -> Option<u64> {
+/// Per-block p10 ring → quantile `100·c(N)` (median if fewer than 12 samples).
+pub fn historical_far_sat_kvb(block_p10s: &[u64], n_blocks: u32) -> Option<u64> {
     if block_p10s.is_empty() {
         return None;
     }
-    let pct = if block_p10s.len() >= 12 { 85 } else { 50 };
+    let pct = if block_p10s.len() >= 12 {
+        (inclusion_confidence(n_blocks) * 100.0).round() as u8
+    } else {
+        50
+    };
     percentile_sat(block_p10s.to_vec(), pct)
 }
 
@@ -324,11 +368,62 @@ mod tests {
     fn historical_far_uses_high_percentile_when_warm() {
         let mut v = vec![1_000u64; 12];
         v[11] = 8_000;
-        let far = historical_far_sat_kvb(&v).unwrap();
+        let far = historical_far_sat_kvb(&v, 144).unwrap();
         assert!(far >= 1_000);
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 0), Some(1));
         assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 100), Some(5));
-        assert!(historical_far_sat_kvb(&[]).is_none());
+        assert!(historical_far_sat_kvb(&[], 144).is_none());
+        assert_eq!(historical_far_sat_kvb(&[1_000, 2_000], 144), Some(1_000));
+    }
+
+    #[test]
+    fn confidence_schedule_and_fill() {
+        assert!((inclusion_confidence(1) - 0.99).abs() < 1e-12);
+        assert!((inclusion_confidence(6) - 0.90).abs() < 1e-12);
+        assert!((inclusion_confidence(144) - 0.90).abs() < 1e-12);
+        assert!(inclusion_confidence(1) > inclusion_confidence(3));
+        assert!(inclusion_confidence(3) > inclusion_confidence(6));
+        assert!((fill_frac(0.99) - 0.80).abs() < 1e-12);
+        assert!((fill_frac(0.90) - 0.95).abs() < 1e-12);
+        assert!((lambda_mult(0.99) - 2.0).abs() < 1e-12);
+        assert!((lambda_mult(0.90) - 1.0).abs() < 1e-12);
+        assert_eq!(effective_capacity_wu(1), 3_200_000);
+        assert_eq!(
+            effective_capacity_wu(6),
+            (6.0_f64 * 4_000_000.0 * 0.95).round() as u64
+        );
+    }
+
+    #[test]
+    fn near_confidence_raises_rate_vs_far_fill() {
+        let stock = |r: u64| if r < 5_000 { 3_500_000 } else { 0 };
+        let inflow = vec![0u64; bucket_count()];
+        let rates = default_candidate_rates();
+        let r1 = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
+        let r6 = min_rate_for_capacity(stock, &inflow, 6, &rates).unwrap();
+        assert!(r1 >= 5_000, "N=1 80% fill cannot take 3.5e6 WU, got {r1}");
+        assert_eq!(r6, rates[0], "N=6 95% of 24e6 WU fits the cheap stock");
+        assert!(r1 > r6);
+    }
+
+    #[test]
+    fn near_lambda_stress_raises_rate() {
+        let stock = |_r: u64| 0u64;
+        let mut inflow = vec![0u64; bucket_count()];
+        inflow[bucket_index(1_000)] = 4_000;
+        let rates = default_candidate_rates();
+        let r1 = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
+        let r6 = min_rate_for_capacity(stock, &inflow, 6, &rates).unwrap();
+        assert!(r1 >= r6, "2× λ at N=1 must not undercut N=6, {r1} vs {r6}");
+    }
+
+    #[test]
+    fn hist_quantile_is_higher_at_n1_than_n144() {
+        let v: Vec<u64> = (0..20).map(|i| 1_000 + i * 100).collect();
+        let n1 = historical_far_sat_kvb(&v, 1).unwrap();
+        let n144 = historical_far_sat_kvb(&v, 144).unwrap();
+        assert!(n1 >= n144, "p99 vs p90: {n1} vs {n144}");
+        assert!(n144 >= 1_000);
     }
 
     #[test]

@@ -42,17 +42,19 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
 3. **Inflow EMA:** per feerate bucket, exponential moving average of admitted
    package/chunk weight per second (`FeeFlowMeter` on successful accept).
 4. **Include at R** when
-   `stock_above(R) + projected_inflow_above(R, min(N×600s, 600s)) ≤ 0.95 × N × 4e6`.
-   Inflow horizon is capped at ~4 admit half-lives so a 150 s EMA is not
-   stretched to a week.
+   `stock_above(R) + λ(c)·projected_inflow(R, min(N×600s, 600s)) ≤ fill(c) × N × 4e6`.
+   `c(N)` is 0.99 at N=1, linear to 0.90 at N=6, then flat. `fill(0.99)=0.80`,
+   `fill(0.90)=0.95`; `λ(0.99)=2`, `λ(0.90)=1`. Inflow horizon is capped at
+   ~4 admit half-lives so a 150 s EMA is not stretched to a week.
 5. **Frontier** is the marginal chunk at `N×4e6` WU. If the pool is thinner
    than N blocks, stock does **not** set a far rate (no last-chunk-as-far).
    Near depths (`w≥0.5`, N=1–5) with any live stock still answer min-relay
    (the next few blocks have room).
 6. **Far / blend:** `R = w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`.
-   `R_hist` is the 85th percentile (or median if <12 samples) of per-block
+   `R_hist` is the `100·c(N)` percentile (median if <12 samples) of per-block
    p10 confirmed package feerates. Then enforce `R(1) ≥ R(2) ≥ …`.
-7. **N=1** may additionally clip to the confirm-memory median. Long N does not.
+7. **N=1** may additionally clip to the confirm-memory **p90** (64-sample
+   ring; not max-of-64). Long N does not.
 
 **Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits),
 `R_flow` is frontier, or min-relay on an under-full **near** depth with live
@@ -65,7 +67,9 @@ stock. If `R_hist` is also empty, **far** APIs return “insufficient”
 |-----------|--------|
 | Block weight capacity | 4_000_000 WU |
 | Seconds per planned block | 600 |
-| Capacity safety margin | 95% |
+| Capacity fill at c=0.99 / 0.90 | 80% / 95% of N×4e6 |
+| Inflow λ multiplier at c=0.99 / 0.90 | 2.0 / 1.0 |
+| Inclusion confidence | 0.99 at N=1 → 0.90 at N≥6 |
 | Admit EMA half-life | ~150 s |
 | Inflow horizon cap | 600 s |
 | Blend N0 | 6 blocks |
@@ -75,8 +79,8 @@ stock. If `R_hist` is also empty, **far** APIs return “insufficient”
 
 ### Confirm-memory / block history
 
-Package feerates on `remove_for_block` fill a 64-sample ring (**N=1 clip**) and
-a per-block p10 ring (last 1008 blocks) for `R_hist`. Process-local.
+Package feerates on `remove_for_block` fill a 64-sample ring (**N=1 p90 clip**)
+and a per-block p10 ring (last 1008 blocks) for `R_hist`. Process-local.
 
 ### Histogram / relayfee
 

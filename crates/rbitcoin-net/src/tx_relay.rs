@@ -1653,10 +1653,10 @@ impl MempoolHub {
         let candidates = fine_candidate_rates();
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
-        let hist = self.historical_far_sat_kvb().or(confirm_floor);
 
         let mut ordered: Vec<(u32, Option<u64>)> = Vec::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
         for &depth in FEE_SNAPSHOT_DEPTHS {
+            let hist = self.historical_far_sat_kvb(depth).or(confirm_floor);
             let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
             let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
             let projected = inflow.as_ref().and_then(|inf| {
@@ -2637,9 +2637,9 @@ impl MempoolHub {
         if mem.is_empty() {
             return None;
         }
-        let mut v: Vec<u64> = mem.iter().copied().collect();
-        v.sort_unstable();
-        Some(v[v.len() / 2].max(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB))
+        let v: Vec<u64> = mem.iter().copied().collect();
+        percentile_sat(v, 90)
+            .map(|r| r.max(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB))
     }
 
     fn push_confirm_memory(&self, rate_sat_per_kvb: u64) {
@@ -2660,9 +2660,9 @@ impl MempoolHub {
         }
     }
 
-    fn historical_far_sat_kvb(&self) -> Option<u64> {
+    fn historical_far_sat_kvb(&self, n_blocks: u32) -> Option<u64> {
         let mut h = self.block_p10_history.lock().unwrap();
-        historical_far_sat_kvb(h.make_contiguous())
+        historical_far_sat_kvb(h.make_contiguous(), n_blocks)
     }
 }
 
@@ -2919,6 +2919,10 @@ mod tests {
                 e144 < 0.0,
                 "far without block history is insufficient, got {e144}"
             );
+            assert!(
+                e1 >= e5,
+                "N=1 99% confidence must not undercut N=5, e1={e1} e5={e5}"
+            );
             let spent = hub.spent_outpoints();
             assert!(spent.contains(&op0));
             let rows = hub.scripthash_mempool(&sh);
@@ -2928,6 +2932,13 @@ mod tests {
             assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
             assert!(hub.is_relay_servable(&wtxid, hub.current_relay_seq()));
             assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+            hub.mark_fee_dirty();
+            let e1b = hub.estimate_fee_btc_per_kb(1);
+            let e144b = hub.estimate_fee_btc_per_kb(144);
+            assert!(
+                e1b >= 0.0 && e144b >= 0.0 && e1b >= e144b,
+                "after confirm, N=1 must stay ≥ N=144: e1={e1b} e144={e144b}"
+            );
             assert!(
                 !hub.contains_wtxid(&wtxid),
                 "wtxid index must drop with the live entry"
@@ -4096,16 +4107,30 @@ mod tests {
         hub.push_block_p10(2_000);
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
-        let sat = |d: u32| {
-            bulk.iter()
+        let sat = |pairs: &[(u32, f64)], d: u32| {
+            pairs
+                .iter()
                 .find(|(k, _)| *k == d)
                 .map(|(_, v)| (*v * 100_000.0).round())
                 .unwrap()
         };
-        let s1 = sat(1);
-        let s144 = sat(144);
+        let s1 = sat(&bulk, 1);
+        let s144 = sat(&bulk, 144);
         assert!(s144 > 0.0, "144 must use history, not empty-pool -1");
         assert!(s144 <= s1 + 0.05, "monotone far={s144} near={s1}");
+        for i in 0..20u64 {
+            hub.push_block_p10(1_000 + i * 100);
+        }
+        hub.mark_fee_dirty();
+        let bulk = hub.fee_estimates_btc_per_kb();
+        let s1 = sat(&bulk, 1);
+        let s6 = sat(&bulk, 6);
+        let s144 = sat(&bulk, 144);
+        assert!(s1 > 0.0 && s6 > 0.0 && s144 > 0.0);
+        assert!(
+            s1 >= s6 && s6 >= s144,
+            "confidence fade monotone sat/vB n1={s1} n6={s6} n144={s144}"
+        );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
