@@ -1467,7 +1467,6 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         per_header_ranges: vec![],
         per_header_sw: vec![],
         edges: Default::default(),
-        spends: vec![],
         batch_creates: vec![],
         external_parents: Default::default(),
         external_parent_vouts: Default::default(),
@@ -1526,7 +1525,6 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         per_header_ranges: vec![],
         per_header_sw: vec![],
         edges: Default::default(),
-        spends: vec![],
         batch_creates: vec![],
         external_parents: idents,
         external_parent_vouts: Default::default(),
@@ -1867,7 +1865,6 @@ fn pin_sparse_need_high_vout_only() {
         per_header_ranges: vec![],
         per_header_sw: vec![],
         edges: Default::default(),
-        spends: vec![],
         batch_creates: vec![],
         external_parents: {
             let mut m = rbitcoin_query::U64Map::default();
@@ -2604,7 +2601,7 @@ fn one_shot_load_matches_stamp_then_load_from_plan() {
     let pb = from_plan.batch.archive_plan.as_ref().expect("plan B");
     assert_eq!(pa.planned_fks, pb.planned_fks);
     assert_eq!(pa.per_header_ranges, pb.per_header_ranges);
-    assert_eq!(pa.spends, pb.spends);
+    assert_eq!(pa.edges.len(), pb.edges.len());
     assert_eq!(pa.packed.len(), pb.packed.len());
     assert_eq!(pa.index_tx, pb.index_tx);
     let _ = std::fs::remove_dir_all(&path_a);

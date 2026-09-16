@@ -240,7 +240,6 @@ pub struct ArchiveWritePlan {
     pub per_header_sw: Vec<(u32, u32)>,
     /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
     pub edges: crate::SpendEdges,
-    pub spends: Vec<([u8; 32], u32, Fk, u32)>,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
     /// External parent identity stamped at lookup (`txid` + optional body/spent/pin).
@@ -267,7 +266,6 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             per_header_sw: Vec::new(),
             edges: crate::SpendEdges::default(),
-            spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parents: crate::U64Map::default(),
             external_parent_vouts: crate::U64Map::default(),
@@ -423,7 +421,7 @@ impl ArchiveWritePlan {
     /// Freeze plan for write batch: drop pin-staging maps and `batch_creates`.
     ///
     /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
-    /// / headers / spends / `batch_pin`). In-flight still binds from `batch_pin`.
+    /// / headers / `batch_pin`). In-flight still binds from `batch_pin`.
     /// Prep must call this (or [`Self::clear_external_parent_outs`]) before
     /// enqueue to scripts/write so batch-merge never mutates growing stamp maps.
     pub fn freeze_after_pin(&mut self) {
@@ -501,8 +499,6 @@ impl ArchiveWritePlan {
         self.per_header_ranges = new_ranges;
         self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
-        self.spends
-            .retain(|(_, _, spend_fk, _)| spend_fk.get().is_some_and(|id| keep_fks.contains(&id)));
         self.batch_creates
             .retain(|(_, fk)| fk.get().is_some_and(|id| keep_fks.contains(&id)));
         // body_est is an upper bound; leave as-is (overestimate is safe for reserve).
@@ -531,7 +527,6 @@ impl ArchiveWritePlan {
         self.per_header_ranges.append(&mut other.per_header_ranges);
         self.per_header_sw.append(&mut other.per_header_sw);
         self.edges.extend(other.edges);
-        self.spends.append(&mut other.spends);
         self.batch_creates.append(&mut other.batch_creates);
         self.batch_pin.append(&mut other.batch_pin);
         self.index_tx |= other.index_tx;
@@ -1002,7 +997,6 @@ impl Query {
             per_header_ranges,
             per_header_sw: Vec::new(),
             edges,
-            spends: Vec::new(),
             batch_creates,
             external_parents,
             external_parent_vouts,
@@ -2779,7 +2773,6 @@ mod tests {
             (dummy_pin(3), Vec::new()),
         ];
         plan.batch_pin = vec![dummy_pin(1), dummy_pin(2), dummy_pin(3)];
-        plan.spends = vec![([0u8; 32], 0, Fk(1), 0), ([0u8; 32], 0, Fk(3), 0)];
         // Header 10 already has body; 20 needs body.
         let keep = plan
             .retain_headers_needing_body(|hfk| Ok(hfk == Fk(10)))
@@ -2788,8 +2781,6 @@ mod tests {
         assert_eq!(plan.per_header_ranges, vec![(Fk(20), Fk(3), 1)]);
         assert_eq!(plan.planned_fks, vec![Fk(3)]);
         assert_eq!(plan.packed.len(), 1);
-        assert_eq!(plan.spends.len(), 1);
-        assert_eq!(plan.spends[0].2, Fk(3));
     }
 
     /// retain_headers edges: empty ranges, all have body, no-op full keep, null fks.

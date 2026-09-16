@@ -87,7 +87,7 @@ the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
 | Tip already-archived | `plan=None`: lookup still stamps parent pin material; load `txout` by range | Soft spentness recovery for zero pin identity is **not** OK |
 | Tip-ahead cascade | `fk mismatch` / `connect height not tip+1` after tip+1 fail | **Soft requeue** (not permanent blacklist) |
-| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Cold OOB/IO is hard Err. Annotate RMW is **`spent.body` only** (no `RWF_DONTCACHE`) | No ranged/by_create annotate tiers; no second spend walk; **no** `txout.body` annotate |
+| Spend annotate | Structural emits abs+meta jobs; `post_commit` `put_spend_batch_by_abs_meta` only (no pin `get_spender_abs`). Class A commit does not annotate. Cold OOB/IO is hard Err. Annotate RMW is **`spent.body` only** (no `RWF_DONTCACHE`) | No ranged/by_create annotate tiers; no second spend walk; **no** `txout.body` annotate; **no** Class A `put_spend_batch` |
 | Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
 | Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
 

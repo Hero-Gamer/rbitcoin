@@ -25,6 +25,11 @@ before 1.0).
 
 ### Changed
 
+- **Class A does not annotate spends:** Tip used to `put_spend_batch` (per-vin
+  `tx.head` + spent RMW) and then confirm `post_commit` annotated the same
+  slots. Direct already skipped that. Both modes now share the confirm abs-meta
+  path only (`arch_write_spend_ns == 0`).
+
 - **CRAP chew (confirm/chain/peer):** drop allowlist entries for
   `handle_peer_frame`, `ChainHub::accept_branch_inner`,
   `Query::resume_work_path_after_tip_excluding`, `assemble_block_prevouts`,
