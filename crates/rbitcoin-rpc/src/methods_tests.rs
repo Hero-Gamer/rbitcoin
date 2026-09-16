@@ -3426,6 +3426,71 @@ fn getnetworkinfo_timeoffset_median_of_outbound() {
 }
 
 #[test]
+fn getpeerinfo_timeoffset_when_peer_clock_behind() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    hub.register(
+        addr,
+        bind,
+        &test_version(1_699_999_940, 0),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    ctx.peers = Some(hub);
+    let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    assert_eq!(r.as_array().unwrap()[0]["timeoffset"], json!(-60));
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(net["timeoffset"], json!(-60));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getnetworkinfo_timeoffset_even_n_and_inbound_only() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    for (i, offset) in [10i64, 20].into_iter().enumerate() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19100 + i as u16);
+        hub.register(
+            addr,
+            bind,
+            &test_version(1_700_000_000 + offset, 0),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+    }
+    ctx.peers = Some(hub);
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(net["timeoffset"], json!(20), "even N uses upper middle");
+
+    let (mut ctx, dir2) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500),
+        bind,
+        &test_version(1_700_000_099, 0),
+        true,
+        PeerConnType::Inbound,
+    );
+    ctx.peers = Some(hub);
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(net["timeoffset"], json!(0), "inbound-only median is 0");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
 fn getpeerinfo_sent_pingwait_and_limited_services() {
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_network::VersionMessage;

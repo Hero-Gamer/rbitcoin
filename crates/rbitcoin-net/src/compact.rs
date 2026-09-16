@@ -800,6 +800,17 @@ mod tests {
             apply_block_transactions(&hsi, &hole, &txn1).unwrap_err(),
             vec![1]
         );
+        let empty_slots = CmpctPartial {
+            slots: vec![],
+            missing: vec![],
+        };
+        let empty_txn = BlockTransactions {
+            block_hash: block.block_hash(),
+            transactions: vec![],
+        };
+        assert!(apply_block_transactions(&hsi, &empty_slots, &empty_txn)
+            .unwrap_err()
+            .is_empty());
     }
 
     #[test]

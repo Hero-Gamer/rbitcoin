@@ -769,6 +769,24 @@ where
     Ok(())
 }
 
+fn silentpayments_unsubscribe(
+    conn: &mut ElectrumConn,
+    query: &Query,
+    chain: &ChainParams,
+    params: &Value,
+) -> Result<Value, String> {
+    let tip = query.tip_height().map(|h| h.0);
+    let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+    if conn
+        .sp_sub
+        .as_ref()
+        .is_some_and(|s| s.address == sub.address)
+    {
+        conn.sp_sub = None;
+    }
+    Ok(json!(sub.address))
+}
+
 async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     writer: &mut W,
     query: &Query,
@@ -1729,9 +1747,7 @@ fn dispatch_pinned(
             Ok(crate::silent_scan::subscribe_result(&sub))
         }
         "blockchain.silentpayments.unsubscribe" => {
-            let tip = query.tip_height().map(|h| h.0);
-            let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
-            Ok(json!(sub.address))
+            silentpayments_unsubscribe(conn, query, chain, params)
         }
         "blockchain.transaction.id_from_pos" => {
             let height = param_u32(params, 0)?;

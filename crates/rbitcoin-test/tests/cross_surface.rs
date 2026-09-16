@@ -1013,7 +1013,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_get(esplora_addr, "/fee-estimates").await;
     assert_eq!(st, 200, "GET /fee-estimates: {body}");
     let fees: Value = serde_json::from_str(&body).unwrap();
-    assert!(fees.get("1").is_some(), "{fees}");
+    for key in ["1", "5", "144", "504", "1008"] {
+        let v = fees[key].as_f64().unwrap_or(-1.0);
+        assert!(v > 0.0, "{key} sat/vB: {fees}");
+    }
+    let near = fees["1"].as_f64().unwrap();
+    let far = fees["144"].as_f64().unwrap();
+    assert!(near > 0.0 && far > 0.0, "near={near} far={far}: {fees}");
     let (st, body) = http_get(esplora_addr, "/fees/recommended").await;
     assert_eq!(st, 200, "GET /fees/recommended: {body}");
     let rec: Value = serde_json::from_str(&body).unwrap();

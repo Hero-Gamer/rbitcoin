@@ -2842,6 +2842,18 @@ fn broadcast_hex_cap_enforced() {
     )
     .unwrap_err();
     assert!(err.contains("too large"), "{err}");
+    let pkg_err = dispatch(
+        "blockchain.transaction.broadcast_package",
+        &json!([["aa".repeat(20)]]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(pkg_err.contains("too large"), "{pkg_err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3212,6 +3224,56 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
             "expected string",
         ),
         (
+            "blockchain.transaction.broadcast_package",
+            json!([]),
+            "expected array of hex txs",
+        ),
+        (
+            "blockchain.transaction.broadcast_package",
+            json!([1]),
+            "expected array of hex txs",
+        ),
+        (
+            "blockchain.transaction.broadcast_package",
+            json!([[1]]),
+            "tx must be hex",
+        ),
+        (
+            "blockchain.transaction.broadcast_package",
+            json!([["zz"]]),
+            "invalid hex digit",
+        ),
+        (
+            "blockchain.transaction.broadcast_package",
+            json!([["00"]]),
+            "IO error",
+        ),
+        (
+            "blockchain.outpoint.get_status",
+            json!([]),
+            "expected string",
+        ),
+        (
+            "blockchain.outpoint.subscribe",
+            json!([sh]),
+            "param 1 expected number",
+        ),
+        (
+            "blockchain.outpoint.unsubscribe",
+            json!([true, 0]),
+            "expected string",
+        ),
+        (
+            "blockchain.silentpayments.subscribe",
+            json!([]),
+            "expected string",
+        ),
+        (
+            "blockchain.silentpayments.unsubscribe",
+            json!([1, 2]),
+            "expected string",
+        ),
+        (
             "blockchain.transaction.id_from_pos",
             json!([]),
             "expected number",
@@ -3320,5 +3382,61 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
     )
     .unwrap();
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn silentpayments_unsubscribe_clears_session_scan() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+    let other_scan = "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+    let args = json!([scan, spend, 0]);
+    let other = json!([other_scan, spend, 0]);
+    let mut conn = ElectrumConn::new();
+    let none = dispatch_with_join(
+        "blockchain.silentpayments.unsubscribe",
+        &args,
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(none.as_str().unwrap().contains("sp"), "{none}");
+    assert!(conn.sp_sub.is_none());
+    conn.sp_sub =
+        Some(crate::silent_scan::parse_sub(&args, bitcoin::Network::Regtest, Some(0)).unwrap());
+    dispatch_with_join(
+        "blockchain.silentpayments.unsubscribe",
+        &other,
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(
+        conn.sp_sub.is_some(),
+        "mismatch address must leave the session scan"
+    );
+    dispatch_with_join(
+        "blockchain.silentpayments.unsubscribe",
+        &args,
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut conn,
+    )
+    .unwrap();
+    assert!(
+        conn.sp_sub.is_none(),
+        "unsubscribe must drop the session scan"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

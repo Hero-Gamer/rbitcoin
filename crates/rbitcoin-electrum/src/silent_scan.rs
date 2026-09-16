@@ -177,6 +177,17 @@ mod tests {
         assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
         let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3)).unwrap();
         assert!(t4.address.starts_with("tsp"), "{}", t4.address);
+        let tn = parse_sub(&json!([scan, spend]), Network::Testnet, Some(3)).unwrap();
+        assert!(tn.address.starts_with("tsp"), "{}", tn.address);
+        let no_tip = parse_sub(&json!([scan, spend, 50]), Network::Regtest, None).unwrap();
+        assert_eq!(no_tip.start, 50);
+        let null_start = parse_sub(&json!([scan, spend, null]), Network::Regtest, Some(3)).unwrap();
+        assert_eq!(null_start.start, 0);
+        let bad_spend = match parse_sub(&json!([scan, "02"]), Network::Regtest, Some(0)) {
+            Err(e) => e,
+            Ok(_) => panic!("spend"),
+        };
+        assert!(!bad_spend.is_empty(), "{bad_spend}");
         let ts = match parse_sub(
             &json!([scan, spend, 600_000_000]),
             Network::Regtest,
@@ -202,6 +213,8 @@ mod tests {
         .unwrap();
         assert_eq!(plain.start, 12);
         assert_eq!(plain.labels, vec![0, 2]);
+        let clamp = parse_sub(&json!([scan, spend, 100]), Network::Regtest, Some(3)).unwrap();
+        assert_eq!(clamp.start, 3);
         let bool_start = parse_sub(&json!([scan, spend, true]), Network::Regtest, Some(0)).unwrap();
         assert_eq!(bool_start.start, 0);
     }

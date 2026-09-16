@@ -4116,8 +4116,13 @@ mod tests {
         };
         let s1 = sat(&bulk, 1);
         let s144 = sat(&bulk, 144);
+        let s504 = sat(&bulk, 504);
+        let s1008 = sat(&bulk, 1008);
         assert!(s144 > 0.0, "144 must use history, not empty-pool -1");
+        assert!(s504 > 0.0, "504 must use history, not empty-pool -1");
+        assert!(s1008 > 0.0, "1008 must use history, not empty-pool -1");
         assert!(s144 <= s1 + 0.05, "monotone far={s144} near={s1}");
+        assert!(s504 <= s144 + 0.05, "monotone 504={s504} 144={s144}");
         for i in 0..20u64 {
             hub.push_block_p10(1_000 + i * 100);
         }
@@ -4130,6 +4135,28 @@ mod tests {
         assert!(
             s1 >= s6 && s6 >= s144,
             "confidence fade monotone sat/vB n1={s1} n6={s6} n144={s144}"
+        );
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        hub.push_block_p10(1);
+        hub.push_block_p10(1);
+        hub.mark_fee_dirty();
+        let bulk = hub.fee_estimates_btc_per_kb();
+        let v144 = bulk
+            .iter()
+            .find(|(k, _)| *k == 144)
+            .map(|(_, v)| *v)
+            .unwrap();
+        let min_btc = MempoolHub::relay_fee_btc_per_kb();
+        assert!(
+            v144 + 1e-12 >= min_btc,
+            "hist below min-relay must clamp: {v144} min={min_btc}"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
