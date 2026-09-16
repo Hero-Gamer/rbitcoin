@@ -25,6 +25,12 @@ before 1.0).
 
 ### Changed
 
+- **Fee estimates bias for inclusion confidence:** N=1 inverts at 99%
+  (80% of the next block, 2× admit-EMA, confirm-memory p90 clip). Confidence
+  fades linearly to 90% at N=6 and holds (95% fill, 1× EMA, p90 of per-block
+  p10s). Same Electrum/Esplora numbers.
+  [`docs/mempool-fee-estimation.md`](docs/mempool-fee-estimation.md).
+
 - **Catalog journeys own yesterday's operator pins:** Electrum **1.6**
   outpoint / silent-payments TCP, `broadcast_package` success, live
   `getpeerinfo` clock/sync fields, and Esplora `/fees/recommended` sit on
