@@ -25,6 +25,11 @@ before 1.0).
 
 ### Changed
 
+- **Mempool block strip no longer dumps `tx.body`:** DEAD marks persist
+  slots+meta once (`persist_if_dirty`) instead of rewriting the whole sidecar
+  every 32 deaths. That was `mp_strip=` 5–8s on a ~70k pool (thousands of
+  full-file writes per block). Admits still coalesce body writes at 32.
+
 - **Electrum verbose `transaction.get` matches electrs timestamps:** confirmed
   verbose objects include `time`/`blocktime`/`confirmations`/`blockhash` plus
   `vin`/`vout`/`size`/`version`/`locktime`/`hash`. Mempool verbose is

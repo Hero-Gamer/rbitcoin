@@ -57,9 +57,11 @@ pub struct MempoolMeta {
     pub live_count: u32,
 }
 
-/// Coalesce sidecar writes: flush RAM→disk after this many dirty ops (append/dead).
+/// Coalesce sidecar writes: flush RAM→disk after this many **body** ops (admits).
 ///
 /// Crash may lose fewer than this many admits since the last persist (relay re-fetch).
+/// DEAD marks do not trip this — they leave `tx.body` unchanged and persist via
+/// [`Mempool::persist_if_dirty`] / [`Mempool::flush`] (block strip writes slots once).
 /// Structural ops (slot grow, compact) and [`Mempool::flush`] always persist.
 pub const PERSIST_COALESCE_OPS: u32 = 32;
 
@@ -78,6 +80,9 @@ pub struct Mempool {
     live_count: u32,
     /// Append/mark_dead ops since last sidecar persist.
     dirty_ops: u32,
+    /// True when `tx.body` grew since last persist (admits). DEAD marks leave
+    /// body bytes unchanged and must not rewrite that file on the confirm path.
+    body_dirty: bool,
 }
 
 impl Mempool {
@@ -106,6 +111,7 @@ impl Mempool {
             slot_cap,
             live_count,
             dirty_ops: 0,
+            body_dirty: false,
         })
     }
 
@@ -142,7 +148,7 @@ impl Mempool {
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_all()?;
-        self.dirty_ops = 0;
+        self.clear_dirty();
         self.meta_file
             .sync_data()
             .map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
@@ -156,20 +162,32 @@ impl Mempool {
     }
 
     /// Best-effort sidecar write if dirty (no generation bump / no fsync).
+    ///
+    /// Admits rewrite body+slots. DEAD-only dirt writes slots+meta (confirm
+    /// strip of thousands of txs must not dump `tx.body` per coalesce batch).
     pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
         if self.dirty_ops == 0 {
             return Ok(());
         }
-        self.persist_all()?;
-        self.dirty_ops = 0;
+        if self.body_dirty {
+            self.persist_all()?;
+        } else {
+            self.persist_slots_and_meta()?;
+        }
+        self.clear_dirty();
         Ok(())
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty_ops = 0;
+        self.body_dirty = false;
     }
 
     fn note_dirty_op(&mut self) -> Result<(), MempoolError> {
         self.dirty_ops = self.dirty_ops.saturating_add(1);
-        if self.dirty_ops >= PERSIST_COALESCE_OPS {
+        if self.body_dirty && self.dirty_ops >= PERSIST_COALESCE_OPS {
             self.persist_all()?;
-            self.dirty_ops = 0;
+            self.clear_dirty();
         }
         Ok(())
     }
@@ -198,6 +216,7 @@ impl Mempool {
         let slot = self.alloc_slot()?;
         self.write_slot(slot, SLOT_LIVE, body_off, payload_len as u32, txid)?;
         self.live_count = self.live_count.saturating_add(1);
+        self.body_dirty = true;
         self.note_dirty_op()?;
         Ok(slot)
     }
@@ -219,7 +238,10 @@ impl Mempool {
         Ok(n)
     }
 
-    /// Mark slot DEAD and decrement live_count (rollback path).
+    /// Mark slot DEAD and decrement live_count (confirm / RBF / eviction).
+    ///
+    /// Does not rewrite `tx.body` or trip [`PERSIST_COALESCE_OPS`]. Caller
+    /// [`Self::persist_if_dirty`] writes slots+meta once (block strip).
     pub fn mark_slot_dead(&mut self, slot: u32) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
@@ -291,7 +313,7 @@ impl Mempool {
         self.slots = new_slots;
         self.live_count = next_slot;
         self.install_packed_images()?;
-        self.dirty_ops = 0;
+        self.clear_dirty();
         Ok((self.live_count, logical))
     }
 
@@ -366,7 +388,7 @@ impl Mempool {
         self.slots[8..12].copy_from_slice(&new_cap.to_le_bytes());
         self.slot_cap = new_cap;
         self.persist_all()?;
-        self.dirty_ops = 0;
+        self.clear_dirty();
         rbitcoin_log::info!(
             "mempool: grew slot table {old_cap} → {new_cap} (live={})",
             self.live_count
@@ -409,7 +431,6 @@ impl Mempool {
     /// old LIVE ranges stay a prefix of the new body. Packed compact must not
     /// use this order (see [`Self::install_packed_images`]).
     fn persist_all(&mut self) -> Result<(), MempoolError> {
-        let slots_path = self.dir.join("slots");
         let body_path = self.dir.join("tx.body");
 
         let logical = body_logical_len(&self.body)?;
@@ -423,6 +444,12 @@ impl Mempool {
             .write_all(&self.body[..logical])
             .map_err(|e| MempoolError::io(&body_path, e))?;
 
+        self.persist_slots_and_meta()
+    }
+
+    /// Slots + live_count only. DEAD marks do not change `tx.body`.
+    fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
+        let slots_path = self.dir.join("slots");
         let slots_need = self.slots.len() as u64;
         self.slots_file
             .set_len(slots_need)
@@ -433,7 +460,6 @@ impl Mempool {
         self.slots_file
             .write_all(&self.slots)
             .map_err(|e| MempoolError::io(&slots_path, e))?;
-
         self.persist_meta()
     }
 
@@ -750,6 +776,74 @@ mod tests {
             let mp = Mempool::open_or_create(&dir).unwrap();
             assert_eq!(mp.live_count(), PERSIST_COALESCE_OPS);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_dead_does_not_coalesce_persist() {
+        let dir = tmp_dir();
+        let n = PERSIST_COALESCE_OPS + 8;
+        let mut slots = Vec::with_capacity(n as usize);
+        {
+            let mut mp = Mempool::open_or_create(&dir).unwrap();
+            for i in 0..n {
+                let mut id = [0u8; 32];
+                id[0] = i as u8;
+                id[1] = (i >> 8) as u8;
+                let tid = Txid::from_byte_array(id);
+                slots.push(
+                    mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                        .unwrap(),
+                );
+            }
+            mp.flush().unwrap();
+            assert_eq!(mp.live_count(), n);
+            for slot in &slots {
+                mp.mark_slot_dead(*slot).unwrap();
+            }
+            assert_eq!(mp.live_count(), 0);
+        }
+        {
+            let mp = Mempool::open_or_create(&dir).unwrap();
+            assert_eq!(
+                mp.live_count(),
+                n,
+                "DEAD marks must not trip persist_all coalesce (body unchanged)"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_deaths_writes_slots_not_body() {
+        let dir = tmp_dir();
+        let n = PERSIST_COALESCE_OPS + 8;
+        let mut slots = Vec::with_capacity(n as usize);
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        for i in 0..n {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            id[1] = (i >> 8) as u8;
+            let tid = Txid::from_byte_array(id);
+            slots.push(
+                mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                    .unwrap(),
+            );
+        }
+        mp.flush().unwrap();
+        let body_before = fs::read(dir.join("tx.body")).unwrap();
+        for slot in &slots {
+            mp.mark_slot_dead(*slot).unwrap();
+        }
+        mp.persist_if_dirty().unwrap();
+        let body_after = fs::read(dir.join("tx.body")).unwrap();
+        assert_eq!(
+            body_before, body_after,
+            "DEAD persist must not rewrite mempool/tx.body"
+        );
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

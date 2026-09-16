@@ -10,8 +10,11 @@
 //! | `tx.body` | Unconfirmed payloads only: `fee(8)‖weight(8)‖raw_tx` per LIVE slot |
 //!
 //! **Commit model:** body complete → slot LIVE → RAM graph → no fsync per tx.
-//! [`ActiveMempool::flush`] bumps `G` and `sync_data`s sidecars. Kill loses at
-//! most the last unflushed batch; never claim incomplete bodies.
+//! Admits coalesce sidecar writes every 32 body ops. Confirm/RBF DEAD marks
+//! persist slots+meta once ([`ActiveMempool::persist_if_dirty`]) and do **not**
+//! rewrite `mempool/tx.body`. [`ActiveMempool::flush`] bumps `G` and `sync_data`s
+//! sidecars. Kill loses at most the last unflushed admit batch; never claim
+//! incomplete bodies.
 //!
 //! **Memory rule:** graph + body buffers stay proportional to the live set.
 //! Sidecars use process `Vec` + file write (no `memmap2`).
