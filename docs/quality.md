@@ -61,7 +61,7 @@ at an explicit rank with **Q-63+**.
 | **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD is body-queue → lookup → load |
 | **—** | `rbitcoin-bench` in default-members / musl / required CI | Optional host A/B. Not a packaging or coverage gate |
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Primitives only |
-| **—** | `cargo crap --fail-above --threshold 30` | CRAP equals CC at ≥90% lines. Coverage uses `--fail-regression` vs `crap_baseline.json` |
+| **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 91% |
 | **—** | ast-grep as a second clippy | Structural RSS/task-leak *shapes* only |
 
 Coverage theater (chasing 100% lines), rewriting secp/rust-bitcoin/tokio
@@ -108,9 +108,9 @@ checklist.
   (`live_p2p_lock`). Do not “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
-  functional. Coverage: production LCOV **never-falls** vs the highest
-  master snapshot at or before the PR merge-base (90% floor). Tests assert
-  shipped behavior, not repo text.
+  functional. Coverage: production LCOV **≥ 91%** floor; CRAP `--fail-above 30`
+  with `.cargo-crap.toml` allowlist. Tests assert shipped behavior, not repo
+  text.
 - **Operator honesty:** experimental 0.x; milestone skip is loud; CLI/conf
   share `apply_kv`; dummy RPC numbers labeled or gone; COMPAT matches
   shipped surface (including Esplora `/txs/summary` as a dialect).

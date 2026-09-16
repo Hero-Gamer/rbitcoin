@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **Coverage 91% LCOV floor + CRAP fail-above 30:** drop the never-falls
+  LCOV ratchet (llvm-cov hit counts jitter). Floor is unrounded
+  `LH*100 >= LF*91`. After LCOV, `cargo crap --fail-above --threshold 30`
+  with today's production CRAP>30 functions allowlisted in
+  `.cargo-crap.toml` (chew through later). No `--fail-regression`.
+  [`TESTING.md`](TESTING.md).
+
 - **`getpeerinfo` / `getnetworkinfo` clock and sync fields are session state:**
   per-peer `timeoffset` is VERSION time minus connect time (`0` before
   handshake). `synced_headers` is the height of the peer's advertised best
@@ -36,11 +43,6 @@ before 1.0).
 - **`syncwithvalidationinterfacequeue` is not a node method:** `-32601`
   Method not found (no wallet/index callback queue). The functional proxy
   still returns `null` so Core `sync_mempools` keeps working.
-
-- **CRAP fail-regression (Q-55):** after the LCOV gate, `coverage-crap.sh`
-  runs `cargo crap --fail-regression` against committed
-  `crap_baseline.json` (refresh from the `crap-report` coverage artifact).
-  Still no `--fail-above 30`. [`TESTING.md`](TESTING.md).
 
 - **Compact `blocktxn` apply owns first-pass slots:** pending compact keeps
   mempool/extra/orphan hits from the initial short-id walk. `blocktxn`

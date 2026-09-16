@@ -22,15 +22,7 @@ def badge_payload(
     pct = 100.0 * lh / lf
     message = f"{pct:.2f}%"
     floor_ok = lh * 100 >= lf * gate
-    if base_lh is not None and base_lf:
-        # Same 2-decimal compare as coverage-gate.passes_ratchet (llvm-cov jitter).
-        def hundredths(h: int, f: int) -> int:
-            return (10000 * h + f // 2) // f if f > 0 else 0
-
-        ratchet_ok = hundredths(lh, lf) >= hundredths(base_lh, base_lf)
-        color = "brightgreen" if floor_ok and ratchet_ok else "red"
-    else:
-        color = "brightgreen" if floor_ok else "red"
+    color = "brightgreen" if floor_ok else "red"
     out = {
         "schemaVersion": 1,
         "label": "coverage",
@@ -55,7 +47,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--lh", type=int, required=True)
     p.add_argument("--lf", type=int, required=True)
-    p.add_argument("--gate", type=int, default=90)
+    p.add_argument("--gate", type=int, default=91)
     p.add_argument("--sha", default="")
     p.add_argument("--scope", default="production")
     p.add_argument("--date", default="")

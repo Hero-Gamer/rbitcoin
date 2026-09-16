@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Contract: LCOV gate ignores test files (not substring "test"), runs default
-# workspace tests (Tier A IBD included), never-falls vs master, writes Shields
-# JSON. Does not run llvm-cov.
+# workspace tests (Tier A IBD included), 91% floor (no never-falls ratchet),
+# writes Shields JSON. Does not run llvm-cov.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -150,170 +150,29 @@ assert_gate_fail() {
   fi
 }
 
-base="$(mktemp)"
-python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 101175 --lf 110953 --gate 90 --sha b1510f783e3f --date 2026-09-15 --out "$base"
-base_jitter="$(mktemp)"
-python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 103271 --lf 113171 --gate 90 --sha 91ccb5f085f6 --date 2026-09-15 --out "$base_jitter"
-
-assert_gate_pass "equal ratio vs master baseline passes" \
-  --lh 101175 --lf 110953 --baseline "$base"
-assert_gate_pass "few-hit llvm-cov jitter still same 2-decimal percent" \
-  --lh 101174 --lf 110953 --baseline "$base"
-assert_gate_pass "production-scale 4-hit jitter (103267 vs 103271 / 113171) passes" \
-  --lh 103267 --lf 113171 --baseline "$base_jitter"
-assert_gate_fail "displayed 2-decimal percent drop still fails" \
-  --lh 101160 --lf 110953 --baseline "$base"
-assert_gate_fail "90.50% vs 91.19% master fails" \
-  --lh 905 --lf 1000 --baseline "$base"
-assert_gate_pass "higher ratio vs master passes" \
-  --lh 101586 --lf 111297 --baseline "$base"
-assert_gate_pass "same ratio on a larger tree passes" \
-  --lh 202350 --lf 221906 --baseline "$base"
-assert_gate_pass "file:// baseline URL works" \
-  --lh 101175 --lf 110953 --baseline "file://${base}"
-
-assert_gate_pass "floor-only 90.00% passes" --lh 90 --lf 100 --floor-only
-assert_gate_fail "floor-only 89.99% fails" --lh 8999 --lf 10000 --floor-only
-
-if GITHUB_ACTIONS=true python3 "$GATE" --lh 90 --lf 100 \
-  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null 2>&1; then
-  echo "not ok - CI fetch fail is an error (wanted fail)"
-  FAIL=$((FAIL + 1))
-else
-  echo "ok - CI fetch fail is an error"
-  PASS=$((PASS + 1))
-fi
-if env -u GITHUB_ACTIONS python3 "$GATE" --lh 90 --lf 100 \
-  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null; then
-  echo "ok - local fetch fail falls back to 90% floor (pass)"
-  PASS=$((PASS + 1))
-else
-  echo "not ok - local fetch fail falls back to 90% floor (pass)"
-  FAIL=$((FAIL + 1))
-fi
-if env -u GITHUB_ACTIONS python3 "$GATE" --lh 89 --lf 100 \
-  --baseline-url "http://127.0.0.1:1/coverage.json" >/dev/null 2>&1; then
-  echo "not ok - local fetch fail falls back to 90% floor (fail under)"
-  FAIL=$((FAIL + 1))
-else
-  echo "ok - local fetch fail falls back to 90% floor (fail under)"
-  PASS=$((PASS + 1))
-fi
+assert_gate_pass "91.00% floor passes" --lh 91 --lf 100
+assert_gate_fail "90.99% floor fails" --lh 9099 --lf 10000
+assert_gate_pass "production-scale 91.27% passes the 91% floor" \
+  --lh 104220 --lf 114185
+assert_gate_fail "90.00% fails the 91% floor" --lh 90 --lf 100
 
 st="$(mktemp)"
-python3 "$GATE" --lh 101586 --lf 111297 --baseline "$base" --status-out "$st" >/dev/null
+python3 "$GATE" --lh 104220 --lf 114185 --status-out "$st" >/dev/null
 python3 - "$st" <<'PY'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text())
 assert d["ok"] is True, d
-assert d["lh"] == 101586 and d["lf"] == 111297, d
-assert d["base_lh"] == 101175 and d["base_lf"] == 110953, d
-assert d["mode"] == "ratchet", d
+assert d["mode"] == "floor", d
+assert d["floor"] == 91, d
 PY
-assert_ok "status-out JSON names ratchet baseline" true
-rm -f "$st" "$base" "$base_jitter"
-
-# Merge-base ratchet: highest master snapshot at or before the fork point,
-# not whatever origin/master has published while the PR was open.
-gitrepo="$(mktemp -d)"
-git -C "$gitrepo" init -q
-git -C "$gitrepo" config user.email "gate@test"
-git -C "$gitrepo" config user.name "gate"
-echo a >"$gitrepo/f"
-git -C "$gitrepo" add f
-git -C "$gitrepo" commit -q -m A
-SHA_A="$(git -C "$gitrepo" rev-parse HEAD)"
-echo b >>"$gitrepo/f"
-git -C "$gitrepo" commit -q -am B
-SHA_B="$(git -C "$gitrepo" rev-parse HEAD)"
-echo c >>"$gitrepo/f"
-git -C "$gitrepo" commit -q -am C
-SHA_C="$(git -C "$gitrepo" rev-parse HEAD)"
-hist="$(mktemp)"
-python3 - "$hist" "$SHA_A" "$SHA_B" "$SHA_C" <<'PY'
-import json, sys
-from pathlib import Path
-path, a, b, c = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-rows = [
-    {"sha": a, "lh": 900, "lf": 1000, "date": "2026-09-01"},
-    {"sha": b, "lh": 910, "lf": 1000, "date": "2026-09-10"},
-    {"sha": c, "lh": 930, "lf": 1000, "date": "2026-09-15"},
-]
-Path(path).write_text("".join(json.dumps(r) + "\n" for r in rows))
-PY
-
-python3 - "$GATE" "$hist" "$gitrepo" "$SHA_B" "$SHA_C" <<'PY' || exit 1
-import importlib.util, json, sys
-from pathlib import Path
-gate_path, hist, gitrepo, sha_b, sha_c = sys.argv[1:6]
-spec = importlib.util.spec_from_file_location("coverage_gate", gate_path)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-entries = mod.parse_history(Path(hist).read_text())
-picked = mod.pick_baseline(entries, sha_b, gitrepo)
-assert picked is not None, "expected a baseline at B"
-assert picked["lh"] == 910 and picked["sha"] == sha_b, picked
-# C is after the fork; must not be the baseline for merge-base B.
-assert picked["lh"] != 930
-later = mod.pick_baseline(entries, sha_c, gitrepo)
-assert later["lh"] == 930, later
-print("ok - pick_baseline ignores post-fork master snapshots")
-PY
-assert_ok "pick_baseline ignores post-fork master snapshots" true
-
-python3 - "$GATE" "$hist" "$gitrepo" "$SHA_B" "$SHA_A" <<'PY' || exit 1
-import importlib.util, json, sys
-from pathlib import Path
-gate_path, hist, gitrepo, sha_b, sha_a = sys.argv[1:6]
-spec = importlib.util.spec_from_file_location("coverage_gate", gate_path)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-entries = mod.parse_history(Path(hist).read_text())
-# Peak before B is A=90% vs B=91% → B wins. Rewrite A higher:
-entries[0]["lh"] = 920
-picked = mod.pick_baseline(entries, sha_b, gitrepo)
-assert picked["lh"] == 920, picked
-print("ok - pick_baseline takes the highest ancestor ratio, not the newest")
-PY
-assert_ok "pick_baseline takes the highest ancestor ratio, not the newest" true
-
-tipbadge="$(mktemp)"
-python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 999 --lf 1000 --gate 90 --sha deadbeefdead --date 2026-09-15 --out "$tipbadge"
-assert_gate_pass "CLI merge-base B does not require beating C" \
-  --lh 910 --lf 1000 --history "$hist" --baseline "$tipbadge" \
-  --merge-base "$SHA_B" --git-dir "$gitrepo"
-assert_gate_fail "CLI merge-base B still fails a real drop vs B" \
-  --lh 909 --lf 1000 --history "$hist" --baseline "$tipbadge" \
-  --merge-base "$SHA_B" --git-dir "$gitrepo"
-assert_gate_fail "CLI merge-base C still requires beating C" \
-  --lh 920 --lf 1000 --history "$hist" --baseline "$tipbadge" \
-  --merge-base "$SHA_C" --git-dir "$gitrepo"
-rm -f "$tipbadge"
-
-rm -f "$hist"
-rm -rf "$gitrepo"
-
-tmp="$(mktemp)"
-python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 905 --lf 1000 --gate 90 --base-lh 101175 --base-lf 110953 \
-  --sha deadbeef --date 2026-09-15 --out "$tmp"
-python3 - "$tmp" <<'PY'
-import json, sys
-from pathlib import Path
-d = json.loads(Path(sys.argv[1]).read_text())
-assert d["color"] == "red", d
-assert d["base_lh"] == 101175, d
-assert d["base_lf"] == 110953, d
-PY
-assert_ok "badge is red when below master even if ≥90%" true
-rm -f "$tmp"
+assert_ok "status-out JSON names 91% floor" true
+rm -f "$st"
 
 assert_ok "coverage.sh calls coverage-gate.py" \
   grep -q "coverage-gate.py" "$COV"
+assert_ok "coverage.sh does not fetch merge-base for the gate" \
+  bash -c '! grep -q "Coverage merge-base" "$1"' _ "$COV"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "coverage.test.sh: $PASS passed, $FAIL failed"
