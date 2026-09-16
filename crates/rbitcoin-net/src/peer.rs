@@ -1188,39 +1188,78 @@ fn on_tx_announce_ok(
     let Some(mp) = hub.mempool() else {
         return Ok(());
     };
-    if let Some(s) = session {
-        let gated = s.inbound
-            && s.conn_type != crate::peers::PeerConnType::BlockRelay
-            && (s.relay || mp.is_unbroadcast(&txid))
-            && mp.relay_enabled()
-            && !s.peer_hub().is_some_and(|h| h.is_noban());
-        if gated && mp.try_contains(&txid) {
-            s.set_inv_to_send(s.inv_to_send().saturating_add(1));
-        }
-    }
-    if !tx_announce_peer_ok(session, mp, &txid) {
+    tx_announce_maybe_count(session, mp, &txid);
+    if !tx_announce_should_queue(session, mp, &txid) {
         return Ok(());
     }
-    if !mp.try_contains(&txid) || !(mp.relay_enabled() || mp.is_unbroadcast(&txid)) {
-        return Ok(());
-    }
-    if tx_announce_below_feefilter(session, mp, &txid) {
-        return Ok(());
-    }
-    let inv = if let Some(tx) = mp.try_get_tx(&txid) {
-        Inventory::WTx(tx.compute_wtxid())
-    } else {
-        Inventory::WitnessTransaction(txid)
-    };
-    if let Some(s) = session {
-        if let Inventory::WTx(w) = inv {
-            s.note_announced_wtx(w);
-            if let Some(seq) = mp.relay_seq_of(&w) {
-                s.note_tx_inv_seq(s.last_inv_sequence().max(seq.saturating_add(1)));
-            }
-        }
-    }
+    let inv = tx_announce_inv(mp, &txid);
+    tx_announce_note_wtx(session, mp, inv);
     queue_out(out_tx, NetworkMessage::Inv(vec![inv]))
+}
+
+fn tx_announce_maybe_count(
+    session: Option<&crate::peers::LivePeer>,
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if !tx_announce_inbound_gated(s, mp, txid) {
+        return;
+    }
+    if s.peer_hub().is_some_and(|h| h.is_noban()) {
+        return;
+    }
+    if mp.try_contains(txid) {
+        s.set_inv_to_send(s.inv_to_send().saturating_add(1));
+    }
+}
+
+fn tx_announce_inbound_gated(
+    s: &crate::peers::LivePeer,
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> bool {
+    s.inbound
+        && s.conn_type != crate::peers::PeerConnType::BlockRelay
+        && (s.relay || mp.is_unbroadcast(txid))
+        && mp.relay_enabled()
+}
+
+fn tx_announce_should_queue(
+    session: Option<&crate::peers::LivePeer>,
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> bool {
+    tx_announce_peer_ok(session, mp, txid)
+        && mp.try_contains(txid)
+        && (mp.relay_enabled() || mp.is_unbroadcast(txid))
+        && !tx_announce_below_feefilter(session, mp, txid)
+}
+
+fn tx_announce_inv(mp: &crate::tx_relay::MempoolHub, txid: &bitcoin::Txid) -> Inventory {
+    match mp.try_get_tx(txid) {
+        Some(tx) => Inventory::WTx(tx.compute_wtxid()),
+        None => Inventory::WitnessTransaction(*txid),
+    }
+}
+
+fn tx_announce_note_wtx(
+    session: Option<&crate::peers::LivePeer>,
+    mp: &crate::tx_relay::MempoolHub,
+    inv: Inventory,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    let Inventory::WTx(w) = inv else {
+        return;
+    };
+    s.note_announced_wtx(w);
+    if let Some(seq) = mp.relay_seq_of(&w) {
+        s.note_tx_inv_seq(s.last_inv_sequence().max(seq.saturating_add(1)));
+    }
 }
 
 fn tx_announce_peer_ok(

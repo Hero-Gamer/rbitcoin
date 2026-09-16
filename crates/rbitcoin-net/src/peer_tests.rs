@@ -7027,7 +7027,7 @@ fn prefillcompact_announce_and_getdata_follow_knob() {
 fn on_tx_announce_none_lagged_closed_are_ok() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("tx-ann-empty");
     let (out_tx, _rx) = mpsc::unbounded_channel();
-    let follow = PeerFollowState::new();
+    let mut follow = PeerFollowState::new();
     assert!(on_tx_announce(&hub, &out_tx, &follow, None, None).is_ok());
     assert!(on_tx_announce(
         &hub,
@@ -7045,5 +7045,25 @@ fn on_tx_announce_none_lagged_closed_are_ok() {
         Some(Err(broadcast::error::RecvError::Closed)),
     )
     .is_ok());
+
+    use bitcoin::hashes::Hash;
+    use bitcoin::Txid;
+    use std::sync::Arc;
+    let txid = Txid::from_byte_array([0x11; 32]);
+    let ann = crate::tx_relay::MempoolAnnounce {
+        txid,
+        replaced: Vec::new(),
+        replaced_scripthashes: Vec::new(),
+        scripthashes: Vec::new(),
+    };
+    assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann.clone()))).is_ok());
+
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann.clone()))).is_ok());
+
+    follow.from_this_peer.insert(txid, FROM_THIS_PEER_CAP);
+    assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann))).is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }

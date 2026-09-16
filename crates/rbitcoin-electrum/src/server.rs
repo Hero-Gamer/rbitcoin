@@ -972,12 +972,22 @@ async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
                 return Ok(());
             }
         };
+    serve_tweaks_empty_ok(writer, peer, id, params_v, t0, &first).await
+}
+
+async fn serve_tweaks_empty_ok<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    peer: &SocketAddr,
+    id: &Value,
+    params_v: &Value,
+    t0: Instant,
+    first: &str,
+) -> Result<(), std::io::Error> {
     let wall_ms = t0.elapsed().as_millis() as u64;
     meter_dispatch_wall(t0.elapsed().as_micros() as u64);
     tweaks_sub_ok_log(peer, params_v, wall_ms);
-    write_rpc_result(writer, id, &first).await?;
-    write_line(writer, &crate::tweaks::done_notify()).await?;
-    Ok(())
+    write_rpc_result(writer, id, first).await?;
+    write_line(writer, &crate::tweaks::done_notify()).await
 }
 
 #[allow(clippy::too_many_arguments)]

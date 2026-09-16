@@ -181,39 +181,62 @@ fn plant_extend_from_child(
     expect: u32,
     tip_hash: BlockHash,
 ) {
-    let tip = hub.tip_height().zip(hub.tip_hash());
     let mut prev = tip_hash;
     let mut cur = child;
     let mut ht = expect;
     for _ in 0..MAX_ORDERED_HEADERS {
-        if st.reorg.invalid.contains(cur.to_byte_array()) || st.body.is_rejected(&cur) {
+        if !plant_commit_header(st, hub, cur, ht, prev) {
             break;
         }
-        let on_path = st.try_set_path_slot(cur, ht, prev, tip);
-        st.max_ordered_height = st.max_ordered_height.max(ht);
-        if on_path && st.ordered_set.insert(cur) {
-            st.ordered.push_back(cur);
-        }
-        st.known_headers.insert(cur);
         prev = cur;
         ht = ht.saturating_add(1);
-        let next = st.height_to_hash.get(&ht).copied().or_else(|| {
-            st.hash_height
-                .iter()
-                .find(|(_, &hht)| hht == ht)
-                .map(|(h, _)| *h)
-        });
-        let Some(n) = next else {
-            break;
-        };
-        let Ok(Some(p)) = super::reorg::parent_hash_of(hub, n) else {
-            break;
-        };
-        if p != cur {
-            break;
+        match plant_next_connected(st, hub, cur, ht) {
+            Some(n) => cur = n,
+            None => break,
         }
-        cur = n;
     }
+}
+
+fn plant_commit_header(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    cur: BlockHash,
+    ht: u32,
+    prev: BlockHash,
+) -> bool {
+    if st.reorg.invalid.contains(cur.to_byte_array()) || st.body.is_rejected(&cur) {
+        return false;
+    }
+    let tip = hub.tip_height().zip(hub.tip_hash());
+    let on_path = st.try_set_path_slot(cur, ht, prev, tip);
+    st.max_ordered_height = st.max_ordered_height.max(ht);
+    if on_path && st.ordered_set.insert(cur) {
+        st.ordered.push_back(cur);
+    }
+    st.known_headers.insert(cur);
+    true
+}
+
+fn plant_hash_at_height(st: &IbdWorkState, ht: u32) -> Option<BlockHash> {
+    st.height_to_hash.get(&ht).copied().or_else(|| {
+        st.hash_height
+            .iter()
+            .find(|(_, &hht)| hht == ht)
+            .map(|(h, _)| *h)
+    })
+}
+
+fn plant_next_connected(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    parent: BlockHash,
+    ht: u32,
+) -> Option<BlockHash> {
+    let n = plant_hash_at_height(st, ht)?;
+    let Ok(Some(p)) = super::reorg::parent_hash_of(hub, n) else {
+        return None;
+    };
+    (p == parent).then_some(n)
 }
 
 /// Highest hashes on the download path (newest first) for getheaders locators.
@@ -326,6 +349,86 @@ mod tests {
         super::plant_valid_tip_child(&mut st, &hub);
         assert!(st.ordered.is_empty());
         assert!(st.height_to_hash.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plant_valid_tip_child_extends_connected_headers() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            Witness,
+        };
+
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("plant-ext");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: Version::from_consensus(4),
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let child = mine(gen, 1_300_000_600, 1);
+        let ext = mine(child.block_hash(), 1_300_001_200, 2);
+        hub.ensure_header(&child.header).unwrap();
+        hub.ensure_header(&ext.header).unwrap();
+
+        let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+        st.hash_height.insert(child.block_hash(), 1);
+        st.hash_height.insert(ext.block_hash(), 2);
+        super::plant_valid_tip_child(&mut st, &hub);
+        assert!(st.ordered_set.contains(&child.block_hash()));
+        assert!(st.ordered_set.contains(&ext.block_hash()));
+        assert_eq!(st.height_to_hash.get(&1), Some(&child.block_hash()));
+        assert_eq!(st.height_to_hash.get(&2), Some(&ext.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
