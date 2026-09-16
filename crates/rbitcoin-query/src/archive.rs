@@ -833,7 +833,7 @@ impl Query {
         let inflight_ns = ext.inflight_ns;
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
-        let mut external_parents = ext.idents;
+        let external_parents = ext.idents;
         self.confirm_stats().note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
@@ -852,14 +852,6 @@ impl Query {
         let mut external_parent_vouts: crate::U64Map<Vec<u32>> = crate::U64Map::default();
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
-        let mut batch_create_ids: crate::U64Set =
-            crate::U64Set::with_capacity_and_hasher(batch_map.len(), Default::default());
-        for fk in batch_map.values() {
-            if let Some(id) = fk.get() {
-                batch_create_ids.insert(id);
-            }
-        }
-        let mut prestamp_parents = false;
         for row in work {
             let PlanRow {
                 tx_fk,
@@ -910,13 +902,6 @@ impl Query {
                             .or_default()
                             .push(inp.prev_index);
                     }
-                    if !batch_create_ids.contains(&pid)
-                        && !external_parents.contains_key(&pid)
-                        && inp.prev_txid != [0u8; 32]
-                    {
-                        external_parents.insert(pid, crate::ParentIdent::new(inp.prev_txid));
-                        prestamp_parents = true;
-                    }
                 }
                 if inp.prev_index == u32::MAX {
                     tx_edges.push(crate::SpendEdge {
@@ -957,14 +942,6 @@ impl Query {
         for vouts in external_parent_vouts.values_mut() {
             vouts.sort_unstable();
             vouts.dedup();
-        }
-        if prestamp_parents && skeleton.is_none() {
-            crate::fill_missing_parent_ranges(
-                &self.store,
-                in_flight,
-                &mut external_parents,
-                self.confirm_stats(),
-            )?;
         }
 
         let t_finish = Instant::now();

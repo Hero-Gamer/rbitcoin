@@ -293,7 +293,6 @@ pub fn fill_missing_parent_ranges(
     idents: &mut U64Map<ParentIdent>,
     stats: &crate::ConfirmStats,
 ) -> Result<(), QueryError> {
-    stats.note_fill_missing();
     let mut need: Vec<Fk> = Vec::new();
     for (&id, ident) in idents.iter() {
         if in_flight.get_out(id).is_some() {
@@ -306,6 +305,7 @@ pub fn fill_missing_parent_ranges(
     if need.is_empty() {
         return Ok(());
     }
+    stats.note_fill_missing();
     let filled = store.tx_create_loc_range_batch(&need)?;
     for (fk, row) in need.into_iter().zip(filled) {
         let Some(id) = fk.get() else {
@@ -335,7 +335,6 @@ fn fill_inflight_spent_from_loc(
     idents: &mut U64Map<ParentIdent>,
     stats: &crate::ConfirmStats,
 ) -> Result<(), QueryError> {
-    stats.note_fill_missing();
     let mut need: Vec<Fk> = Vec::new();
     for (&id, ident) in idents.iter() {
         if ident.spent.is_some() {
@@ -348,6 +347,7 @@ fn fill_inflight_spent_from_loc(
     if need.is_empty() {
         return Ok(());
     }
+    stats.note_fill_missing();
     let filled = store.tx_create_loc_range_batch(&need)?;
     for (fk, row) in need.into_iter().zip(filled) {
         let Some(id) = fk.get() else {
