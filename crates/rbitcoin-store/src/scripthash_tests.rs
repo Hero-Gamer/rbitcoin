@@ -2389,3 +2389,19 @@ fn unsorted_materialize_appends_when_done_lags_and_no_shards() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn publish_sorted_shard_seals_dedup_and_grows_bump() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    t.publish_sorted_shard(0, &[], 0, t.alloc_bump()).unwrap();
+    let mut k_a = [0u8; crate::scripthash_layout::SH_HEAD_KEY_LEN];
+    k_a[0] = 0x10;
+    let mut k_b = [0u8; crate::scripthash_layout::SH_HEAD_KEY_LEN];
+    k_b[0] = 0x20;
+    let bump = t.alloc_bump().saturating_add(64);
+    t.publish_sorted_shard(0, &[(k_a, 8), (k_b, 16), (k_a, 24)], 2, bump)
+        .unwrap();
+    assert_eq!(t.alloc_bump(), bump);
+    let _ = std::fs::remove_dir_all(&dir);
+}

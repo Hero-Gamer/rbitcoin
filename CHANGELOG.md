@@ -35,6 +35,13 @@ before 1.0).
   keep the faded mid rate instead of Esplora `1.0` (insufficient sentinel).
   Empty pool is still `-1` / `1.0`.
 
+- **CRAP chew (10 easiest):** drop allowlist entries for `stamp_external_parents`,
+  `gbt_proposal_connect`, `gbt_chain_txout`, `header_head_occupied`,
+  `ConfirmStats::miss_on_from_code`, `ConfirmRejectClass::from_net`,
+  `prevout_from_block_or_query`, `force_announce_txid`,
+  `ScriptHashTable::publish_sorted_shard`, and `bit_is_active` after coverage
+  pins (and a stamp in-flight extract) put each ≤30.
+
 - **Operator CLI kebab + conf snake_case:** leftover concatenated Core spellings
   (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are advertised as
   kebab (`--prefill-compact`, `--min-relay-tx-fee`, `--rpc-work-queue`). Conf

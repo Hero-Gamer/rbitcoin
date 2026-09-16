@@ -980,6 +980,28 @@ mod tests {
     }
 
     #[test]
+    fn header_head_occupied_sums_base_and_gen() {
+        let dir = tmp();
+        assert_eq!(header_head_occupied(&dir).unwrap(), 0);
+        {
+            let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
+            h.insert(&[0x11; 32], Fk(1)).unwrap();
+            h.flush().unwrap();
+        }
+        assert_eq!(header_head_occupied(&dir).unwrap(), 1);
+        {
+            let g = HashHead::create_with_slots(dir.join("header.head.g1"), 64).unwrap();
+            g.insert(&[0x22; 32], Fk(2)).unwrap();
+            g.insert(&[0x33; 32], Fk(3)).unwrap();
+            g.flush().unwrap();
+        }
+        assert_eq!(header_head_occupied(&dir).unwrap(), 3);
+        std::fs::write(dir.join("header.head"), [0u8; 3]).unwrap();
+        assert!(header_head_occupied(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rewrite_v23_already_96_is_nop() {
         let dir = tmp();
         let t = HeaderTable::create_tiny(&dir).unwrap();

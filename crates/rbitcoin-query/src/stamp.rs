@@ -119,31 +119,13 @@ impl ExternalParentStamp {
     }
 }
 
-/// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
-///
-/// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
-/// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
-/// skeleton loc when TipOnly already has that create (later wave). Same-wave
-/// creates are omitted from the skeleton; those holes stay for write fill.
-/// In-flight identity that still lacks spent after that bind tries loc by fk
-/// (later-wave TipOnly miss / head lag); miss is OK. `skeleton = None` is
-/// plan=None / S0 leftover TipOnly. Same-batch identities are not inputs —
-/// callers skip them in `need` and keep them offline at pin.
-pub fn stamp_external_parents(
-    store: &Store,
-    need: &[[u8; 32]],
+fn stamp_inflight_hits<'a>(
+    stamp: &mut ExternalParentStamp,
+    need: &'a [[u8; 32]],
     in_flight: &InFlight,
     skeleton: Option<&BatchParentIds>,
-    stats: &crate::ConfirmStats,
-) -> Result<ExternalParentStamp, QueryError> {
-    let mut stamp = ExternalParentStamp {
-        resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
-        idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
-        ..ExternalParentStamp::default()
-    };
-
-    let t_inflight = Instant::now();
-    let mut still_need: Vec<&[u8; 32]> = Vec::new();
+    still_need: &mut Vec<&'a [u8; 32]>,
+) {
     for t in need {
         if *t == [0u8; 32] {
             continue;
@@ -171,6 +153,34 @@ pub fn stamp_external_parents(
             still_need.push(t);
         }
     }
+}
+
+/// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
+///
+/// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
+/// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
+/// skeleton loc when TipOnly already has that create (later wave). Same-wave
+/// creates are omitted from the skeleton; those holes stay for write fill.
+/// In-flight identity that still lacks spent after that bind tries loc by fk
+/// (later-wave TipOnly miss / head lag); miss is OK. `skeleton = None` is
+/// plan=None / S0 leftover TipOnly. Same-batch identities are not inputs —
+/// callers skip them in `need` and keep them offline at pin.
+pub fn stamp_external_parents(
+    store: &Store,
+    need: &[[u8; 32]],
+    in_flight: &InFlight,
+    skeleton: Option<&BatchParentIds>,
+    stats: &crate::ConfirmStats,
+) -> Result<ExternalParentStamp, QueryError> {
+    let mut stamp = ExternalParentStamp {
+        resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
+        idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
+        ..ExternalParentStamp::default()
+    };
+
+    let t_inflight = Instant::now();
+    let mut still_need: Vec<&[u8; 32]> = Vec::new();
+    stamp_inflight_hits(&mut stamp, need, in_flight, skeleton, &mut still_need);
     stamp.inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
     let t_pin_txid = Instant::now();
@@ -424,6 +434,17 @@ mod tests {
             stamp_external_parents(q.store(), &[txid], &inflight, None, q.confirm_stats()).unwrap();
         assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(42)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn null_txid_is_skipped() {
+        let (dir, q) = tmp_store();
+        let empty = InFlight::new();
+        let st = stamp_external_parents(q.store(), &[[0u8; 32]], &empty, None, q.confirm_stats())
+            .unwrap();
+        assert!(st.resolved.is_empty());
+        assert_eq!(st.head_need_n, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

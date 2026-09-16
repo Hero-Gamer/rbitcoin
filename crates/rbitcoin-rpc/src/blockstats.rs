@@ -365,7 +365,11 @@ fn parse_hash_or_height(v: &Value) -> Result<HashOrHeight, Value> {
     ))
 }
 
-fn prevout_from_block_or_query(ctx: &RpcContext, block: &Block, op: &OutPoint) -> Option<TxOut> {
+pub(crate) fn prevout_from_block_or_query(
+    ctx: &RpcContext,
+    block: &Block,
+    op: &OutPoint,
+) -> Option<TxOut> {
     for tx in &block.txdata {
         if tx.compute_txid() == op.txid {
             return tx.output.get(op.vout as usize).cloned();

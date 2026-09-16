@@ -1883,6 +1883,40 @@ fn write_session_fault_is_engine_fault_and_requeue_puts_ready() {
 }
 
 #[test]
+fn from_net_maps_wire_and_string_classes() {
+    use super::ConfirmRejectClass;
+    use crate::error::NetError;
+
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Cancelled),
+        ConfirmRejectClass::Cancelled
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Mutated("x".into())),
+        ConfirmRejectClass::SoftWire
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::BadPrev),
+        ConfirmRejectClass::SoftWire
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::ConnectFailed {
+            hash: [0u8; 32],
+            msg: "script verification failed".into(),
+        }),
+        ConfirmRejectClass::ConsensusInvalid
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Consensus("fk mismatch".into())),
+        ConfirmRejectClass::Cascade
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Timeout),
+        ConfirmRejectClass::Cascade
+    );
+}
+
+#[test]
 fn requeue_on_uring_recover_credits_then_skips_non_fault() {
     let (_d, q) = rbitcoin_query::testutil::tiny_query_labeled("requeue-uring");
     let feed = ConfirmFeed::new();

@@ -2338,6 +2338,145 @@ fn getblocktemplate_proposal_core_needles() {
 }
 
 #[test]
+fn gbt_proposal_connect_chain_spend_and_value_needles() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let blk1 = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
+    let cb_txid = Txid::from_byte_array(
+        parse_hash32_display(blk1["tx"][0]["txid"].as_str().unwrap()).unwrap(),
+    );
+    let cb_val =
+        (blk1["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+    let op = OutPoint {
+        txid: cb_txid,
+        vout: 0,
+    };
+    let chain_out = gbt_chain_txout(&ctx, &op).expect("mature coinbase is chain-spendable");
+    assert_eq!(chain_out.value.to_sat(), cb_val);
+    assert!(gbt_chain_txout(
+        &ctx,
+        &OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0
+        }
+    )
+    .is_none());
+
+    let tip_s = dispatch(&ctx, "getbestblockhash", vec![])
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let raw = hex_decode(
+        dispatch(&ctx, "getblock", vec![json!(tip_s), json!(0)])
+            .unwrap()
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mined: Block = deserialize(&raw).unwrap();
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_val - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut next = Block {
+        header: Header {
+            version: BlockVersion::from_consensus(0x2000_0000),
+            prev_blockhash: mined.block_hash(),
+            merkle_root: mined.header.merkle_root,
+            time: mined.header.time.saturating_add(1),
+            bits: mined.header.bits,
+            nonce: 0,
+        },
+        txdata: vec![mined.txdata[0].clone(), spend.clone()],
+    };
+    next.header.merkle_root = next.compute_merkle_root().unwrap();
+    gbt_proposal_connect(&ctx, &next, 102, next.header.time).unwrap();
+
+    let mut duplex = next.clone();
+    duplex.txdata.push(spend.clone());
+    assert_eq!(
+        gbt_proposal_connect(&ctx, &duplex, 102, duplex.header.time).unwrap_err(),
+        "bad-txns-inputs-missingorspent"
+    );
+
+    let mut fat = spend.clone();
+    fat.output[0].value = Amount::from_sat(cb_val + 1);
+    let mut below = next.clone();
+    below.txdata[1] = fat;
+    assert_eq!(
+        gbt_proposal_connect(&ctx, &below, 102, below.header.time).unwrap_err(),
+        "bad-txns-in-belowout"
+    );
+
+    let mut locked = spend.clone();
+    locked.lock_time = LockTime::from_height(200).unwrap();
+    locked.input[0].sequence = Sequence::ZERO;
+    let mut nonfinal = next.clone();
+    nonfinal.txdata[1] = locked;
+    assert_eq!(
+        gbt_proposal_connect(&ctx, &nonfinal, 102, nonfinal.header.time).unwrap_err(),
+        "bad-txns-nonfinal"
+    );
+
+    let (spent_hex, _) =
+        spend_generated_coinbase(&ctx, 1, cb_val - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(spent_hex)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    assert!(
+        gbt_chain_txout(&ctx, &op).is_none(),
+        "spent coinbase must drop out of gbt_chain_txout"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prevout_from_block_or_query_same_block_then_store() {
+    use bitcoin::OutPoint;
+
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let genesis = hub.query.reconstruct_block_at_height(Height(0)).unwrap();
+    let cb = &genesis.txdata[0];
+    let op = OutPoint {
+        txid: cb.compute_txid(),
+        vout: 0,
+    };
+    assert_eq!(
+        crate::blockstats::prevout_from_block_or_query(&ctx, &genesis, &op).as_ref(),
+        Some(&cb.output[0])
+    );
+    let h1 = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
+    assert_eq!(
+        crate::blockstats::prevout_from_block_or_query(&ctx, &h1, &op).as_ref(),
+        Some(&cb.output[0]),
+        "height-1 block must load genesis prevout from the store"
+    );
+    let miss = OutPoint {
+        txid: cb.compute_txid(),
+        vout: 99,
+    };
+    assert!(crate::blockstats::prevout_from_block_or_query(&ctx, &h1, &miss).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prioritisetransaction_dummy_and_deprioritise_skips_generate() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let e = dispatch(
