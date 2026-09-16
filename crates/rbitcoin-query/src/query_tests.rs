@@ -1847,6 +1847,22 @@ fn scripthash_join_includes_spend_and_keeps_sibling_utxo() {
 }
 
 #[test]
+fn scripthash_join_spend_index_off_marks_creates_unspent() {
+    let (dir, q) = temp_query("sh-join-spend-off");
+    let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+    let sh = script_hash(&[0x51]);
+    q.set_spend_index(false);
+    let view = q.pin_chain_view().unwrap().unwrap();
+    let joined = q
+        .sh_join(&sh, crate::scripthash::ShJoinNeed::LISTUNSPENT, None, &view)
+        .unwrap();
+    assert!(!joined.is_empty());
+    assert!(joined.iter().all(|r| !r.spent && r.spender_fks.is_empty()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scripthash_listunspent_identity_skips_spent_creates() {
     let (dir, q) = temp_query("sh-lu-id-spent");
     assert!(q.index_mode().is_tip());

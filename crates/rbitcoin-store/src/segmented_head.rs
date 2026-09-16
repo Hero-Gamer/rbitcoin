@@ -582,45 +582,65 @@ impl SegmentedTxHead {
         if segs.is_empty() {
             return Ok(out);
         }
-
-        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
-
-        let n_segs = segs.len();
-        // Unsealed OAs (insert tail + in-flight seal) are wave 1, newest first.
         if wave.includes_open() {
-            for seg in segs.iter().rev() {
-                if seg.sealed {
+            self.probe_unsealed_wave(mixed, active, ctx, &mut out)?;
+        }
+        self.probe_sealed_wave(mixed, wave, active, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    fn probe_unsealed_wave(
+        &self,
+        mixed: &[[u8; 32]],
+        active: Option<&[bool]>,
+        ctx: &mut crate::IoCtx<'_>,
+        out: &mut [Vec<Fk>],
+    ) -> Result<(), StoreError> {
+        let segs = self.segments_snapshot();
+        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
+        for seg in segs.iter().rev() {
+            if seg.sealed {
+                continue;
+            }
+            let Some(head) = seg.head.as_ref() else {
+                continue;
+            };
+            let mut pass_i: Vec<usize> = Vec::new();
+            let mut pass_keys: Vec<[u8; 32]> = Vec::new();
+            for (i, key) in mixed.iter().enumerate() {
+                if !key_on(i) {
                     continue;
                 }
-                let Some(head) = seg.head.as_ref() else {
-                    continue;
-                };
-                let mut pass_i: Vec<usize> = Vec::new();
-                let mut pass_keys: Vec<[u8; 32]> = Vec::new();
-                for (i, key) in mixed.iter().enumerate() {
-                    if !key_on(i) {
-                        continue;
-                    }
-                    pass_i.push(i);
-                    pass_keys.push(*key);
-                }
-                if pass_keys.is_empty() {
-                    continue;
-                }
-                let rel_lists = head.probe_fks_batch_ctx(&pass_keys, ctx)?;
-                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                    for r in rels.into_iter().rev() {
-                        if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
-                            out[orig_i].push(fk);
-                        }
+                pass_i.push(i);
+                pass_keys.push(*key);
+            }
+            if pass_keys.is_empty() {
+                continue;
+            }
+            let rel_lists = head.probe_fks_batch_ctx(&pass_keys, ctx)?;
+            for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                for r in rels.into_iter().rev() {
+                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                        out[orig_i].push(fk);
                     }
                 }
             }
         }
+        Ok(())
+    }
 
-        // Sealed newest → oldest. Unsealed OAs were handled above.
-        let sealed_range = (0..n_segs).rev();
-        for si in sealed_range {
+    fn probe_sealed_wave(
+        &self,
+        mixed: &[[u8; 32]],
+        wave: HeadProbeWave,
+        active: Option<&[bool]>,
+        ctx: &mut crate::IoCtx<'_>,
+        out: &mut [Vec<Fk>],
+    ) -> Result<(), StoreError> {
+        let segs = self.segments_snapshot();
+        let n_segs = segs.len();
+        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
+        for si in (0..n_segs).rev() {
             let seg = &segs[si];
             if !seg.sealed {
                 continue;
@@ -675,7 +695,7 @@ impl SegmentedTxHead {
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
@@ -1272,6 +1292,27 @@ mod tests {
         m[0..8].copy_from_slice(&i.to_le_bytes());
         m[8] = 0xA5;
         m
+    }
+
+    #[test]
+    fn probe_wave_empty_and_active_mask_len() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        assert!(h.probe_candidates_batch(&[]).unwrap().is_empty());
+        let err = h
+            .probe_candidates_batch_wave(
+                &[mixed(1)],
+                HeadProbeWave::All,
+                Some(&[true, false]),
+                &mut crate::IoCtx::none(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(m) if m.contains("probe active mask len")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

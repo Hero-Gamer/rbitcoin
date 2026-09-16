@@ -707,29 +707,10 @@ impl Query {
             abs_offs.push(spent_abs(*off, c.vout));
         }
         let metas = self.store.get_spender_meta_at_abs_batch(&abs_offs)?;
+        let per_out = self.join_spends_wave_fks(creates, &abs_at, &metas, view)?;
         let mut spender_fks = Vec::new();
-        let mut per_out: Vec<Vec<Fk>> = vec![Vec::new(); creates.len()];
-        for (i, c) in creates.iter().enumerate() {
-            let Some(mi) = abs_at[i] else {
-                continue;
-            };
-            let Some((field, flags, _vin)) = metas.get(mi).copied().flatten() else {
-                continue;
-            };
-            if field.is_null() {
-                continue;
-            }
-            if flags & output_flags::MULTI_SPENDER != 0 {
-                for fk in self.store.spenders_create(c.create_tx_fk, c.vout)? {
-                    if self.confirmed_strong_in(fk, view)? {
-                        per_out[i].push(fk);
-                        spender_fks.push(fk);
-                    }
-                }
-            } else if self.confirmed_strong_in(field, view)? {
-                per_out[i].push(field);
-                spender_fks.push(field);
-            }
+        for fks in &per_out {
+            spender_fks.extend_from_slice(fks);
         }
         let mut id_by_fk = HashMap::new();
         if need.spender_identity && !spender_fks.is_empty() {
@@ -773,6 +754,37 @@ impl Query {
             });
         }
         Ok(out)
+    }
+
+    fn join_spends_wave_fks(
+        &self,
+        creates: &[ScriptHashOutpoint],
+        abs_at: &[Option<usize>],
+        metas: &[Option<(Fk, u8, u32)>],
+        view: &ChainView,
+    ) -> Result<Vec<Vec<Fk>>, QueryError> {
+        let mut per_out: Vec<Vec<Fk>> = vec![Vec::new(); creates.len()];
+        for (i, c) in creates.iter().enumerate() {
+            let Some(mi) = abs_at[i] else {
+                continue;
+            };
+            let Some((field, flags, _vin)) = metas.get(mi).copied().flatten() else {
+                continue;
+            };
+            if field.is_null() {
+                continue;
+            }
+            if flags & output_flags::MULTI_SPENDER != 0 {
+                for fk in self.store.spenders_create(c.create_tx_fk, c.vout)? {
+                    if self.confirmed_strong_in(fk, view)? {
+                        per_out[i].push(fk);
+                    }
+                }
+            } else if self.confirmed_strong_in(field, view)? {
+                per_out[i].push(field);
+            }
+        }
+        Ok(per_out)
     }
 
     /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs.

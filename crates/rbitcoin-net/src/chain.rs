@@ -1814,34 +1814,7 @@ impl ChainHub {
         }
 
         self.invalidated.set.write().unwrap().remove(&hash);
-        let paths: Vec<Vec<BlockHash>> = {
-            let mut g = self.invalidated.paths.write().unwrap();
-            let mut taken = Vec::new();
-            let mut seeds = related.clone();
-            seeds.insert(hash);
-            loop {
-                let before = taken.len();
-                g.retain(|p| {
-                    let hit = p.iter().any(|h| seeds.contains(h))
-                        || p.first().is_some_and(|h| {
-                            self.prev_of(h).is_some_and(|prev| seeds.contains(&prev))
-                        });
-                    if hit {
-                        for h in p {
-                            seeds.insert(*h);
-                        }
-                        taken.push(p.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                if taken.len() == before {
-                    break;
-                }
-            }
-            taken
-        };
+        let paths = self.take_related_invalidated_paths(hash, &related);
         {
             let mut inv = self.invalidated.set.write().unwrap();
             for path in &paths {
@@ -1883,6 +1856,38 @@ impl ChainHub {
             }
         }
         Ok(())
+    }
+
+    fn take_related_invalidated_paths(
+        &self,
+        hash: BlockHash,
+        related: &HashSet<BlockHash>,
+    ) -> Vec<Vec<BlockHash>> {
+        let mut g = self.invalidated.paths.write().unwrap();
+        let mut taken = Vec::new();
+        let mut seeds = related.clone();
+        seeds.insert(hash);
+        loop {
+            let before = taken.len();
+            g.retain(|p| {
+                let hit = p.iter().any(|h| seeds.contains(h))
+                    || p.first()
+                        .is_some_and(|h| self.prev_of(h).is_some_and(|prev| seeds.contains(&prev)));
+                if hit {
+                    for h in p {
+                        seeds.insert(*h);
+                    }
+                    taken.push(p.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if taken.len() == before {
+                break;
+            }
+        }
+        taken
     }
 
     /// Prefer this hash among equal-work competing tips.
@@ -4092,6 +4097,19 @@ mod tests {
             hub.accept_block(orphan).unwrap_err(),
             NetError::UnknownParent
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconsider_unknown_hash_is_block_not_found() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let miss = BlockHash::from_byte_array([0xab; 32]);
+        let err = hub.reconsider_block(miss).unwrap_err();
+        assert!(
+            matches!(err, NetError::Consensus(ref s) if s.contains("Block not found")),
+            "{err:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

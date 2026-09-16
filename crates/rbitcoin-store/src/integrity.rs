@@ -12,7 +12,7 @@ use crate::error::StoreError;
 use crate::header_table::block_header_hash;
 use crate::store::Store;
 use bitcoin_hashes::{sha256, Hash, HashEngine};
-use rbitcoin_primitives::{schema_file_openable, Height, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -328,45 +328,57 @@ impl Store {
         }
 
         match self.header_txs.get_range(fk) {
-            Ok(None) => Ok(()), // no body — ok for structural tip (unarchived tip rare)
+            Ok(None) => Ok(()),
             Ok(Some((first, count))) => {
-                if count == 0 || first.is_null() {
-                    let _ = self.header_txs.clear_body(fk);
-                    report.bodies_cleared = report.bodies_cleared.saturating_add(1);
-                    return Err("header_txs empty association");
-                }
-                let last = first.0.saturating_add(u64::from(count)).saturating_sub(1);
-                if first.0 == 0 || last > tx_count {
-                    let _ = self.header_txs.clear_body(fk);
-                    report.bodies_cleared = report.bodies_cleared.saturating_add(1);
-                    return Err("header_txs range OOB");
-                }
-                let leaves = match self.txs.body_txid_range(first.0, last) {
-                    Ok(v) if v.len() == count as usize => v,
-                    Ok(_) => {
-                        let _ = self.header_txs.clear_body(fk);
-                        report.bodies_cleared = report.bodies_cleared.saturating_add(1);
-                        return Err("txid.body short for header_txs range");
-                    }
-                    Err(_) => {
-                        let _ = self.header_txs.clear_body(fk);
-                        report.bodies_cleared = report.bodies_cleared.saturating_add(1);
-                        return Err("txid.body read");
-                    }
-                };
-                let root = merkle_root_from_txids(&leaves);
-                if root != rec.merkle_root {
-                    let _ = self.header_txs.clear_body(fk);
-                    report.bodies_cleared = report.bodies_cleared.saturating_add(1);
-                    return Err("merkle root mismatch");
-                }
-                match self.strong_tx.all_strong_range(first, count) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err("strong bits missing in tip window"),
-                    Err(_) => Err("strong_tx read"),
-                }
+                self.check_header_tx_range(fk, first, count, tx_count, &rec.merkle_root, report)
             }
             Err(_) => Err("header_txs read"),
+        }
+    }
+
+    fn check_header_tx_range(
+        &self,
+        fk: Fk,
+        first: Fk,
+        count: u32,
+        tx_count: u64,
+        merkle_root: &[u8; 32],
+        report: &mut TipRevalidateReport,
+    ) -> Result<(), &'static str> {
+        if count == 0 || first.is_null() {
+            let _ = self.header_txs.clear_body(fk);
+            report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+            return Err("header_txs empty association");
+        }
+        let last = first.0.saturating_add(u64::from(count)).saturating_sub(1);
+        if first.0 == 0 || last > tx_count {
+            let _ = self.header_txs.clear_body(fk);
+            report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+            return Err("header_txs range OOB");
+        }
+        let leaves = match self.txs.body_txid_range(first.0, last) {
+            Ok(v) if v.len() == count as usize => v,
+            Ok(_) => {
+                let _ = self.header_txs.clear_body(fk);
+                report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+                return Err("txid.body short for header_txs range");
+            }
+            Err(_) => {
+                let _ = self.header_txs.clear_body(fk);
+                report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+                return Err("txid.body read");
+            }
+        };
+        let root = merkle_root_from_txids(&leaves);
+        if root != *merkle_root {
+            let _ = self.header_txs.clear_body(fk);
+            report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+            return Err("merkle root mismatch");
+        }
+        match self.strong_tx.all_strong_range(first, count) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("strong bits missing in tip window"),
+            Err(_) => Err("strong_tx read"),
         }
     }
 
@@ -712,6 +724,37 @@ mod tests {
         assert!(!r.tip_shrunk);
         assert_eq!(r.tip_after, Some(0));
         assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_nonzero_prev_fk_and_header_txs_oob_shrink() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let dummy = hdr(Fk::NULL, [0u8; 32], 9);
+        let dummy_fk = s.put_header(&dummy).unwrap();
+        let g = hdr(dummy_fk, dummy.hash, 0);
+        let g_fk = s.put_header(&g).unwrap();
+        s.confirmed.set(Height(0), g_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(r.first_bad_reason, Some("genesis prev_fk non-null"));
+        assert!(r.tip_shrunk);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let g = hdr(Fk::NULL, [0u8; 32], 0);
+        let g_fk = s.put_header(&g).unwrap();
+        s.confirmed.set(Height(0), g_fk).unwrap();
+        s.header_txs.put_range(g_fk, Fk(1_000_000), 1).unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        s.header_txs.flush().unwrap();
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(r.first_bad_reason, Some("header_txs range OOB"));
+        assert!(r.bodies_cleared >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

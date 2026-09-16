@@ -2304,72 +2304,10 @@ async fn serve_getdata(
     for item in inv.iter().take(MAX_INV_SIZE) {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
-                    continue;
-                }
-                if !hub.stale_relay_allowed(h) {
-                    continue;
-                }
-                let query = Arc::clone(&hub.query);
-                let cache = Arc::clone(&hub.cache);
-                let hash = *h;
-                let encoded = tokio::task::spawn_blocking(move || {
-                    let _g = crate::reactor::BlockingRegion::enter();
-                    encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)
-                })
-                .await
-                .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
-                if let Some(bytes) = encoded {
-                    let _ = try_queue_served_encoded(out_tx, inflight, bytes)?;
-                }
+                serve_getdata_full_block(hub, out_tx, inflight, h).await?;
             }
             Inventory::CompactBlock(h) => {
-                if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
-                    continue;
-                }
-                if let Some(block) = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)? {
-                    // Core `MAX_CMPCTBLOCK_DEPTH` (5): older tips get a
-                    // full `block` (`p2p_compactblocks` :689).
-                    const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
-                    let tip_h = hub.tip_height().unwrap_or(0);
-                    let block_h = hub
-                        .query
-                        .height_of_hash(&h.to_byte_array())
-                        .ok()
-                        .flatten()
-                        .map(|ht| ht.0)
-                        .unwrap_or(0);
-                    if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-                        let _ =
-                            try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
-                    } else {
-                        let ver = follow.cmpct_version.clamp(1, 2);
-                        let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
-                        if let Ok(hsi) =
-                            HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref)
-                        {
-                            rbitcoin_log::info!(
-                                "{}",
-                                crate::compact::cmpct_send_line(
-                                    block.block_hash(),
-                                    block.txdata.len(),
-                                    &hsi
-                                )
-                            );
-                            let _ = try_queue_served_block(
-                                out_tx,
-                                inflight,
-                                NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
-                            )?;
-                        } else {
-                            let _ = try_queue_served_block(
-                                out_tx,
-                                inflight,
-                                NetworkMessage::Block(block),
-                            )?;
-                        }
-                    }
-                }
+                serve_getdata_compact(hub, out_tx, follow, inflight, h)?;
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
@@ -2378,21 +2316,7 @@ async fn serve_getdata(
                 }
             }
             Inventory::WTx(wtxid) => {
-                if let Some(s) = session {
-                    rbitcoin_log::trace!("{}", received_getdata_wtx_log(wtxid, s.id));
-                }
-                let tx = hub.mempool().and_then(|mp| mp.try_get_tx_by_wtxid(wtxid));
-                if serve_mempool_getdata(hub, out_tx, session, tx)? {
-                    continue;
-                }
-                let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
-                if announced {
-                    if let Some(tx) = tx_from_tip_block(hub, wtxid) {
-                        queue_out(out_tx, NetworkMessage::Tx(tx))?;
-                        continue;
-                    }
-                }
-                notfound.push(*item);
+                serve_getdata_wtx(hub, out_tx, session, *item, wtxid, &mut notfound)?;
             }
             _ => {}
         }
@@ -2400,6 +2324,103 @@ async fn serve_getdata(
     if !notfound.is_empty() {
         queue_out(out_tx, NetworkMessage::NotFound(notfound))?;
     }
+    Ok(())
+}
+
+async fn serve_getdata_full_block(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    inflight: Option<&AtomicUsize>,
+    h: &bitcoin::BlockHash,
+) -> Result<(), NetError> {
+    if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
+        return Ok(());
+    }
+    if !hub.stale_relay_allowed(h) {
+        return Ok(());
+    }
+    let query = Arc::clone(&hub.query);
+    let cache = Arc::clone(&hub.cache);
+    let hash = *h;
+    let encoded = tokio::task::spawn_blocking(move || {
+        let _g = crate::reactor::BlockingRegion::enter();
+        encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)
+    })
+    .await
+    .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
+    if let Some(bytes) = encoded {
+        let _ = try_queue_served_encoded(out_tx, inflight, bytes)?;
+    }
+    Ok(())
+}
+
+fn serve_getdata_compact(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    inflight: Option<&AtomicUsize>,
+    h: &bitcoin::BlockHash,
+) -> Result<(), NetError> {
+    if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
+        return Ok(());
+    }
+    let Some(block) = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)? else {
+        return Ok(());
+    };
+    const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let block_h = hub
+        .query
+        .height_of_hash(&h.to_byte_array())
+        .ok()
+        .flatten()
+        .map(|ht| ht.0)
+        .unwrap_or(0);
+    if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
+        let _ = try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
+        return Ok(());
+    }
+    let ver = follow.cmpct_version.clamp(1, 2);
+    let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
+    if let Ok(hsi) = HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref) {
+        rbitcoin_log::info!(
+            "{}",
+            crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
+        );
+        let _ = try_queue_served_block(
+            out_tx,
+            inflight,
+            NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
+        )?;
+    } else {
+        let _ = try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
+    }
+    Ok(())
+}
+
+fn serve_getdata_wtx(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
+    item: Inventory,
+    wtxid: &bitcoin::Wtxid,
+    notfound: &mut Vec<Inventory>,
+) -> Result<(), NetError> {
+    if let Some(s) = session {
+        rbitcoin_log::trace!("{}", received_getdata_wtx_log(wtxid, s.id));
+    }
+    let tx = hub.mempool().and_then(|mp| mp.try_get_tx_by_wtxid(wtxid));
+    if serve_mempool_getdata(hub, out_tx, session, tx)? {
+        return Ok(());
+    }
+    let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
+    if announced {
+        if let Some(tx) = tx_from_tip_block(hub, wtxid) {
+            queue_out(out_tx, NetworkMessage::Tx(tx))?;
+            return Ok(());
+        }
+    }
+    notfound.push(item);
     Ok(())
 }
 

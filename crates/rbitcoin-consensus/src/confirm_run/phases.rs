@@ -3,6 +3,101 @@
 use super::*;
 use rbitcoin_query::FkMap;
 
+fn assemble_parent_mtp_and_bits(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    header: &bitcoin::block::Header,
+    block_hash: [u8; 32],
+) -> Result<(u32, Vec<u32>), ConsensusError> {
+    let prev_h = Height(height.0 - 1);
+    let start = prev_h.0.saturating_sub(10);
+    let prev_hash = header.prev_blockhash.to_byte_array();
+    let mut times = Vec::with_capacity(11);
+    let mut prev_bits_raw: Option<u32> = None;
+    let mut prev_time: Option<u32> = None;
+    for h in start..=prev_h.0 {
+        if let Some(plan) = query.confirm_parent_cache().get_header_plan(h) {
+            times.push(plan.header_rec.timestamp);
+            if h == prev_h.0 {
+                if plan.header_rec.hash != prev_hash {
+                    return Err(ConsensusError::BadPrev);
+                }
+                prev_bits_raw = Some(plan.header_rec.bits);
+                prev_time = Some(plan.header_rec.timestamp);
+            }
+        } else if let Some((_fk, rec)) = query
+            .header_at_height(Height(h))
+            .map_err(ConsensusError::from)?
+        {
+            times.push(rec.timestamp);
+            if h == prev_h.0 {
+                if rec.hash != prev_hash {
+                    return Err(ConsensusError::BadPrev);
+                }
+                prev_bits_raw = Some(rec.bits);
+                prev_time = Some(rec.timestamp);
+            }
+        } else {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "confirm: load incomplete (parent header plan missing above tip)",
+            )));
+        }
+    }
+    let mtp = median_time_past_times(&times);
+    if header.time <= mtp {
+        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+    }
+    check_header_version_and_future_time(params, height, header)?;
+    let (Some(prev_bits_raw), Some(prev_time)) = (prev_bits_raw, prev_time) else {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "confirm: load incomplete (parent header plan missing above tip)",
+        )));
+    };
+    if let Some(cp) = params.checkpoint_at(height) {
+        if cp.to_byte_array() != block_hash {
+            return Err(ConsensusError::BadHeader("checkpoint mismatch"));
+        }
+    }
+    let prev_bits = bitcoin::CompactTarget::from_consensus(prev_bits_raw);
+    let expected =
+        expected_bits_extending(query, params, height, prev_bits, prev_time, header.time)?;
+    if header.bits != expected {
+        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+    }
+    Ok((mtp, times))
+}
+
+fn assemble_chained_header(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    header: &bitcoin::block::Header,
+    block_hash: [u8; 32],
+    prev: &Prepared,
+    time_window: &[u32],
+) -> Result<u32, ConsensusError> {
+    if header.prev_blockhash.to_byte_array() != prev.hash {
+        return Err(ConsensusError::BadPrev);
+    }
+    let mtp = median_time_past_times(time_window);
+    if header.time <= mtp {
+        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+    }
+    check_header_version_and_future_time(params, height, header)?;
+    if let Some(cp) = params.checkpoint_at(height) {
+        if cp.to_byte_array() != block_hash {
+            return Err(ConsensusError::BadHeader("checkpoint mismatch"));
+        }
+    }
+    let expected =
+        expected_bits_extending(query, params, height, prev.bits, prev.time, header.time)?;
+    if header.bits != expected {
+        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+    }
+    Ok(mtp)
+}
+
 pub(super) fn assemble_run(
     query: &Query,
     params: &ChainParams,
@@ -29,110 +124,25 @@ pub(super) fn assemble_run(
         let prev_mtp: u32;
 
         if i == 0 {
-            // IBD pipelines load(N+1) ∥ scripts(N) ∥ write(N−1). Tip GC drops
-            // header plans for h ≤ tip when write advances tip. Assemble must
-            // not snapshot tip once: a concurrent tip_gc can drop plans while
-            // our tip read is still the pre-write value → false "plan missing
-            // above tip" (retryable load incomplete spam on restart / dense
-            // pipeline). Prefer plan when present; else **store** if confirmed.
             if height.0 >= 1 {
-                let prev_h = Height(height.0 - 1);
-                let start = prev_h.0.saturating_sub(10);
-                let prev_hash = block.header.prev_blockhash.to_byte_array();
-                let mut times = Vec::with_capacity(11);
-                let mut prev_bits_raw: Option<u32> = None;
-                let mut prev_time: Option<u32> = None;
-                for h in start..=prev_h.0 {
-                    if let Some(plan) = query.confirm_parent_cache().get_header_plan(h) {
-                        times.push(plan.header_rec.timestamp);
-                        if h == prev_h.0 {
-                            if plan.header_rec.hash != prev_hash {
-                                return Err(ConsensusError::BadPrev);
-                            }
-                            prev_bits_raw = Some(plan.header_rec.bits);
-                            prev_time = Some(plan.header_rec.timestamp);
-                        }
-                    } else if let Some((_fk, rec)) = query
-                        .header_at_height(Height(h))
-                        .map_err(ConsensusError::from)?
-                    {
-                        times.push(rec.timestamp);
-                        if h == prev_h.0 {
-                            if rec.hash != prev_hash {
-                                return Err(ConsensusError::BadPrev);
-                            }
-                            prev_bits_raw = Some(rec.bits);
-                            prev_time = Some(rec.timestamp);
-                        }
-                    } else {
-                        return Err(ConsensusError::Store(StoreError::Corrupt(
-                            "confirm: load incomplete (parent header plan missing above tip)",
-                        )));
-                    }
-                }
-                let mtp = median_time_past_times(&times);
-                if block.header.time <= mtp {
-                    return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
-                }
+                let (mtp, times) =
+                    assemble_parent_mtp_and_bits(query, params, height, &block.header, block_hash)?;
                 prev_mtp = mtp;
                 time_window = times;
-
-                // MTP + prev hash already checked. Do not call validate_header
-                // (second MTP walk + header rehash).
-                check_header_version_and_future_time(params, height, &block.header)?;
-                let (Some(prev_bits_raw), Some(prev_time)) = (prev_bits_raw, prev_time) else {
-                    return Err(ConsensusError::Store(StoreError::Corrupt(
-                        "confirm: load incomplete (parent header plan missing above tip)",
-                    )));
-                };
-                if let Some(cp) = params.checkpoint_at(height) {
-                    if cp.to_byte_array() != block_hash {
-                        return Err(ConsensusError::BadHeader("checkpoint mismatch"));
-                    }
-                }
-                let prev_bits = bitcoin::CompactTarget::from_consensus(prev_bits_raw);
-                let expected = expected_bits_extending(
-                    query,
-                    params,
-                    height,
-                    prev_bits,
-                    prev_time,
-                    block.header.time,
-                )?;
-                if block.header.bits != expected {
-                    return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
-                }
             } else {
                 prev_mtp = 0;
                 validate_header_hashed(query, params, height, &block.header, block_hash)?;
             }
         } else {
-            let prev = &prepared[i - 1];
-            if block.header.prev_blockhash.to_byte_array() != prev.hash {
-                return Err(ConsensusError::BadPrev);
-            }
-            let mtp = median_time_past_times(&time_window);
-            if block.header.time <= mtp {
-                return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
-            }
-            prev_mtp = mtp;
-            check_header_version_and_future_time(params, height, &block.header)?;
-            if let Some(cp) = params.checkpoint_at(height) {
-                if cp.to_byte_array() != block_hash {
-                    return Err(ConsensusError::BadHeader("checkpoint mismatch"));
-                }
-            }
-            let expected = expected_bits_extending(
+            prev_mtp = assemble_chained_header(
                 query,
                 params,
                 height,
-                prev.bits,
-                prev.time,
-                block.header.time,
+                &block.header,
+                block_hash,
+                &prepared[i - 1],
+                &time_window,
             )?;
-            if block.header.bits != expected {
-                return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
-            }
         }
 
         if block_has_witness_from_pres(&meta.pres) && !params.segwit_active_at(height.0) {

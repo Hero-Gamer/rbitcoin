@@ -2285,6 +2285,16 @@ impl ScriptHashTable {
         let new_val = self.rewrite_entries_for_key(body, &mut alloc, &val, &live)?;
         write_alloc_header(body, &alloc)?;
         drop(alloc);
+        self.unlink_write_home(scripthash, home, &new_val)?;
+        Ok(true)
+    }
+
+    fn unlink_write_home(
+        &self,
+        scripthash: &[u8; 32],
+        home: KeyHome,
+        new_val: &ShHeadValue,
+    ) -> Result<(), StoreError> {
         match home {
             KeyHome::Main | KeyHome::Absent => {
                 let hk = head_key_from_full(scripthash);
@@ -2292,7 +2302,7 @@ impl ScriptHashTable {
                 let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
                     let g = slot.read().unwrap();
                     match g.as_ref() {
-                        Some(h) => h.update_value(&hk, &new_val)?,
+                        Some(h) => h.update_value(&hk, new_val)?,
                         None => false,
                     }
                 } else {
@@ -2303,7 +2313,7 @@ impl ScriptHashTable {
                     if new_val.is_empty() {
                         g.clear_key(scripthash)?;
                     } else {
-                        g.insert(scripthash, &new_val)?;
+                        g.insert(scripthash, new_val)?;
                     }
                 }
             }
@@ -2312,7 +2322,7 @@ impl ScriptHashTable {
                 if new_val.is_empty() {
                     g.clear_key(scripthash)?;
                 } else {
-                    g.insert(scripthash, &new_val)?;
+                    g.insert(scripthash, new_val)?;
                 }
             }
             KeyHome::SealedOvf => {
@@ -2320,7 +2330,7 @@ impl ScriptHashTable {
                 let g = self.sealed_ovf.lock().unwrap();
                 let mut hit = false;
                 for h in g.iter().rev() {
-                    if h.update_value(&hk, &new_val)? {
+                    if h.update_value(&hk, new_val)? {
                         hit = true;
                         break;
                     }
@@ -2328,7 +2338,7 @@ impl ScriptHashTable {
                 drop(g);
                 if !hit {
                     if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
-                        if l1.head.update_value(&hk, &new_val)? {
+                        if l1.head.update_value(&hk, new_val)? {
                             hit = true;
                         }
                     }
@@ -2340,7 +2350,7 @@ impl ScriptHashTable {
                 }
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

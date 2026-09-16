@@ -233,6 +233,98 @@ pub fn sanity_check(asmap: &[u8]) -> bool {
     sanity_check_bits(asmap, 128)
 }
 
+fn sanity_return(
+    pos: &mut usize,
+    asmap: &[u8],
+    endpos: usize,
+    prevopcode: u32,
+    jumps: &mut Vec<(usize, i32)>,
+    bits: &mut i32,
+) -> Option<bool> {
+    if prevopcode == DEFAULT {
+        return Some(false);
+    }
+    let asn = decode_asn(pos, asmap);
+    if asn == INVALID {
+        return Some(false);
+    }
+    if jumps.is_empty() {
+        if endpos - *pos > 7 {
+            return Some(false);
+        }
+        while *pos != endpos {
+            match consume_bit_le(pos, asmap) {
+                Some(true) => return Some(false),
+                Some(false) => {}
+                None => return Some(false),
+            }
+        }
+        return Some(true);
+    }
+    let Some((target, restore)) = jumps.pop() else {
+        return Some(false);
+    };
+    if *pos != target {
+        return Some(false);
+    }
+    *bits = restore;
+    None
+}
+
+fn sanity_jump(
+    pos: &mut usize,
+    asmap: &[u8],
+    endpos: usize,
+    bits: &mut i32,
+    jumps: &mut Vec<(usize, i32)>,
+) -> bool {
+    let jump = decode_jump(pos, asmap);
+    if jump == INVALID {
+        return false;
+    }
+    if i64::from(jump) > (endpos - *pos) as i64 {
+        return false;
+    }
+    if *bits == 0 {
+        return false;
+    }
+    *bits -= 1;
+    let jump_offset = *pos + jump as usize;
+    if let Some(&(prev, _)) = jumps.last() {
+        if jump_offset >= prev {
+            return false;
+        }
+    }
+    jumps.push((jump_offset, *bits));
+    true
+}
+
+fn sanity_match(
+    pos: &mut usize,
+    asmap: &[u8],
+    prevopcode: u32,
+    had_incomplete_match: &mut bool,
+    bits: &mut i32,
+) -> bool {
+    let matchv = decode_match(pos, asmap);
+    if matchv == INVALID {
+        return false;
+    }
+    let matchlen = bit_width(matchv) as i32 - 1;
+    if prevopcode != MATCH {
+        *had_incomplete_match = false;
+    }
+    if matchlen < 8 && *had_incomplete_match {
+        return false;
+    }
+    *had_incomplete_match = matchlen < 8;
+    if *bits < matchlen {
+        return false;
+    }
+    *bits -= matchlen;
+    true
+}
+
 fn sanity_check_bits(asmap: &[u8], mut bits: i32) -> bool {
     let mut pos = 0usize;
     let endpos = asmap.len().saturating_mul(8);
@@ -247,71 +339,25 @@ fn sanity_check_bits(asmap: &[u8], mut bits: i32) -> bool {
 
         let opcode = decode_type(&mut pos, asmap);
         if opcode == RETURN {
-            if prevopcode == DEFAULT {
-                return false;
+            match sanity_return(&mut pos, asmap, endpos, prevopcode, &mut jumps, &mut bits) {
+                Some(done) => return done,
+                None => prevopcode = JUMP,
             }
-            let asn = decode_asn(&mut pos, asmap);
-            if asn == INVALID {
-                return false;
-            }
-            if jumps.is_empty() {
-                if endpos - pos > 7 {
-                    return false;
-                }
-                while pos != endpos {
-                    match consume_bit_le(&mut pos, asmap) {
-                        Some(true) => return false,
-                        Some(false) => {}
-                        None => return false,
-                    }
-                }
-                return true;
-            }
-            let Some((target, restore)) = jumps.pop() else {
-                return false;
-            };
-            if pos != target {
-                return false;
-            }
-            bits = restore;
-            prevopcode = JUMP;
         } else if opcode == JUMP {
-            let jump = decode_jump(&mut pos, asmap);
-            if jump == INVALID {
+            if !sanity_jump(&mut pos, asmap, endpos, &mut bits, &mut jumps) {
                 return false;
             }
-            if i64::from(jump) > (endpos - pos) as i64 {
-                return false;
-            }
-            if bits == 0 {
-                return false;
-            }
-            bits -= 1;
-            let jump_offset = pos + jump as usize;
-            if let Some(&(prev, _)) = jumps.last() {
-                if jump_offset >= prev {
-                    return false;
-                }
-            }
-            jumps.push((jump_offset, bits));
             prevopcode = JUMP;
         } else if opcode == MATCH {
-            let matchv = decode_match(&mut pos, asmap);
-            if matchv == INVALID {
+            if !sanity_match(
+                &mut pos,
+                asmap,
+                prevopcode,
+                &mut had_incomplete_match,
+                &mut bits,
+            ) {
                 return false;
             }
-            let matchlen = bit_width(matchv) as i32 - 1;
-            if prevopcode != MATCH {
-                had_incomplete_match = false;
-            }
-            if matchlen < 8 && had_incomplete_match {
-                return false;
-            }
-            had_incomplete_match = matchlen < 8;
-            if bits < matchlen {
-                return false;
-            }
-            bits -= matchlen;
             prevopcode = MATCH;
         } else if opcode == DEFAULT {
             if prevopcode == DEFAULT {
@@ -495,5 +541,19 @@ mod tests {
         ip16.copy_from_slice(ip);
         assert_eq!(m.interpret_ip16(&ip16), 1);
         assert_eq!(ip16, ip16_for_lookup(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 0))));
+    }
+
+    #[test]
+    fn sanity_check_bits_rejects_jump_at_zero_bits_and_double_default() {
+        assert!(!sanity_check_bits(&[], 128));
+        let mut bits = instr_jump(17);
+        bits.extend(instr_return(1));
+        assert!(!sanity_check_bits(&pack_le(&bits), 0));
+        let mut bits = instr_type(DEFAULT);
+        bits.extend(encode_bits(1, 1, &ASN_BIT_SIZES));
+        bits.extend(instr_type(DEFAULT));
+        bits.extend(encode_bits(1, 1, &ASN_BIT_SIZES));
+        bits.extend(instr_return(1));
+        assert!(AsMap::from_bytes(pack_le(&bits)).is_none());
     }
 }

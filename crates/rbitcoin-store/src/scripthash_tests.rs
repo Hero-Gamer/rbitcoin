@@ -322,6 +322,8 @@ fn scripthash_thin_roundtrip() {
     assert_eq!(t.entries(&sh).unwrap().len(), 2);
     assert!(t.unlink_create(&sh, Fk(4), 1).unwrap());
     assert_eq!(t.entries(&sh).unwrap().len(), 1);
+    assert!(!t.unlink_create(&[0u8; 32], Fk(1), 0).unwrap());
+    assert!(!t.unlink_create(&sh, Fk(99), 0).unwrap());
     assert!(t.unlink_create(&sh, Fk(3), 0).unwrap());
     assert!(t.entries(&sh).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
