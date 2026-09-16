@@ -10,7 +10,8 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    default_candidate_rates, frontier_feerate_from_chunks, min_rate_for_capacity,
+    blend_sat_kvb, enforce_monotone_desc, fine_candidate_rates, flow_for_depth,
+    frontier_feerate_from_chunks, historical_far_sat_kvb, min_rate_for_capacity, percentile_sat,
     weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
     Chunk, Coin, FeeFlowMeter, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
@@ -414,8 +415,10 @@ pub struct MempoolHub {
     recent: Mutex<std::collections::VecDeque<RecentAccept>>,
     /// Recently confirmed txid/wtxid for INV AlreadyHave.
     recent_confirmed: Mutex<RecentConfirmed>,
-    /// Recently confirmed package feerates (sat/kvB) for estimate floor.
+    /// Recently confirmed package feerates (sat/kvB) for N=1 sanity clip.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
+    /// Per-block p10 of confirmed package feerates (sat/kvB), newest last.
+    block_p10_history: Mutex<std::collections::VecDeque<u64>>,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
     fee_flow: Mutex<FeeFlowMeter>,
     /// Published fee table for Electrum/Esplora (refreshed dirty ∥ max-age, singleflight).
@@ -544,6 +547,7 @@ impl MempoolHub {
             )),
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
+            block_p10_history: Mutex::new(std::collections::VecDeque::with_capacity(1008)),
             fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             fee_snapshot: ArcSwap::from_pointee(FeeSnapshot::empty(Instant::now())),
             fee_dirty: AtomicBool::new(true),
@@ -1646,11 +1650,12 @@ impl MempoolHub {
             Ok(mut flow) if flow.is_warm(now) => Some(flow.admit_rates_wu_s(now)),
             _ => None,
         };
-        let candidates = default_candidate_rates();
+        let candidates = fine_candidate_rates();
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
+        let hist = self.historical_far_sat_kvb().or(confirm_floor);
 
-        let mut by_depth = HashMap::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
+        let mut ordered: Vec<(u32, Option<u64>)> = Vec::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
         for &depth in FEE_SNAPSHOT_DEPTHS {
             let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
             let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
@@ -1662,23 +1667,29 @@ impl MempoolHub {
                     &candidates,
                 )
             });
-            let mut rate = match (projected, frontier) {
-                (Some(p), Some(f)) => p.max(f),
-                (Some(p), None) => p,
-                (None, Some(f)) => f,
-                (None, None) => {
-                    let v = confirm_floor
-                        .map(|r| (r as f64) / 100_000_000.0)
-                        .unwrap_or(-1.0);
-                    by_depth.insert(depth, v);
-                    continue;
+            let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
+            let mut rate = blend_sat_kvb(flow, hist, depth);
+            if depth <= 1 {
+                if let (Some(r), Some(floor)) = (rate, confirm_floor) {
+                    rate = Some(r.max(floor));
                 }
-            };
-            rate = rate.max(min_r);
-            if let Some(floor) = confirm_floor {
-                rate = rate.max(floor);
             }
-            by_depth.insert(depth, (rate as f64) / 100_000_000.0);
+            ordered.push((depth, rate.map(|r| r.max(min_r))));
+        }
+        let mut filled: Vec<u64> = ordered.iter().filter_map(|(_, r)| *r).collect();
+        enforce_monotone_desc(&mut filled);
+        let mut fi = 0usize;
+        let mut by_depth = HashMap::with_capacity(ordered.len());
+        for (depth, raw) in ordered {
+            match raw {
+                None => {
+                    by_depth.insert(depth, -1.0);
+                }
+                Some(_) => {
+                    by_depth.insert(depth, (filled[fi] as f64) / 100_000_000.0);
+                    fi += 1;
+                }
+            }
         }
 
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
@@ -1851,11 +1862,16 @@ impl MempoolHub {
         let utxo = self.utxo_provider();
         let n = {
             let mut g = self.lock_write();
+            let mut block_rates = Vec::new();
             for tid in txids {
                 if let Some(e) = g.graph.get(tid) {
                     let rate = e.fee_rate_sat_per_kvb();
                     self.push_confirm_memory(rate);
+                    block_rates.push(rate);
                 }
+            }
+            if let Some(p10) = percentile_sat(block_rates, 10) {
+                self.push_block_p10(p10);
             }
             g.remove_live_txids(txids).unwrap_or(0)
         };
@@ -2634,6 +2650,20 @@ impl MempoolHub {
             mem.pop_front();
         }
     }
+
+    fn push_block_p10(&self, p10_sat_per_kvb: u64) {
+        const CAP: usize = 1008;
+        let mut h = self.block_p10_history.lock().unwrap();
+        h.push_back(p10_sat_per_kvb.max(1));
+        while h.len() > CAP {
+            h.pop_front();
+        }
+    }
+
+    fn historical_far_sat_kvb(&self) -> Option<u64> {
+        let mut h = self.block_p10_history.lock().unwrap();
+        historical_far_sat_kvb(h.make_contiguous())
+    }
 }
 
 /// One Electrum mempool history row.
@@ -2880,8 +2910,15 @@ mod tests {
             assert!(!hub.fee_histogram().is_empty());
             let e1 = hub.estimate_fee_btc_per_kb(1);
             let e5 = hub.estimate_fee_btc_per_kb(5);
-            let e20 = hub.estimate_fee_btc_per_kb(20);
-            assert!(e1 >= 0.0 && e5 >= 0.0 && e20 >= 0.0);
+            let e144 = hub.estimate_fee_btc_per_kb(144);
+            assert!(
+                e1 >= 0.0 && e5 >= 0.0,
+                "near under-full live stock: e1={e1} e5={e5}"
+            );
+            assert!(
+                e144 < 0.0,
+                "far without block history is insufficient, got {e144}"
+            );
             let spent = hub.spent_outpoints();
             assert!(spent.contains(&op0));
             let rows = hub.scripthash_mempool(&sh);
@@ -4044,6 +4081,31 @@ mod tests {
             hub.estimate_fee_btc_per_kb(6),
             hub.fee_estimates_btc_per_kb()[4].1
         );
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn far_horizon_follows_block_history_not_pool_tail() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        hub.push_block_p10(2_000);
+        hub.push_block_p10(2_000);
+        hub.mark_fee_dirty();
+        let bulk = hub.fee_estimates_btc_per_kb();
+        let sat = |d: u32| {
+            bulk.iter()
+                .find(|(k, _)| *k == d)
+                .map(|(_, v)| (*v * 100_000.0).round())
+                .unwrap()
+        };
+        let s1 = sat(1);
+        let s144 = sat(144);
+        assert!(s144 > 0.0, "144 must use history, not empty-pool -1");
+        assert!(s144 <= s1 + 0.05, "monotone far={s144} near={s1}");
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

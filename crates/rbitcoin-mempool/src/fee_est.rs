@@ -114,7 +114,7 @@ where
     F: Fn(u64) -> u64,
 {
     let cap = effective_capacity_wu(n_blocks);
-    let h = horizon_secs(n_blocks);
+    let h = inflow_horizon_secs(n_blocks);
     let mut best: Option<u64> = None;
     for &r in candidate_rates {
         let load = stock_above(r).saturating_add(projected_inflow_wu_above(
@@ -135,6 +135,113 @@ where
 /// Default candidate ladder: bucket edges.
 pub fn default_candidate_rates() -> Vec<u64> {
     FEE_BUCKET_EDGES_SAT_PER_KVB.to_vec()
+}
+
+/// 0.1 sat/vB steps through 10 sat/vB, then coarse high edges.
+pub fn fine_candidate_rates() -> Vec<u64> {
+    let mut v = Vec::with_capacity(120);
+    let mut r = MIN_CANDIDATE_SAT_PER_KVB;
+    while r <= 10_000 {
+        v.push(r);
+        r = r.saturating_add(100);
+    }
+    for &e in &[20_000u64, 50_000, 100_000] {
+        if v.last().copied().unwrap_or(0) < e {
+            v.push(e);
+        }
+    }
+    v
+}
+
+/// Trust admit-EMA at most this many seconds (≈ 4× 150s half-life).
+pub const INFLOW_HORIZON_CAP_SECS: u64 = 600;
+/// Blend length in blocks (~1 hour). `w(1)=1`, `w(6)≈0.43`, `w(144)≈0`.
+pub const BLEND_N0: f64 = 6.0;
+/// Under-full pool may still answer min-relay when `blend_weight ≥` this (N=1–5).
+pub const NEAR_BLEND_FLOOR: f64 = 0.5;
+const MIN_CANDIDATE_SAT_PER_KVB: u64 = 100;
+
+/// Horizon used for inflow projection (capped; not N×10 minutes for N=144).
+pub fn inflow_horizon_secs(n_blocks: u32) -> u64 {
+    horizon_secs(n_blocks).min(INFLOW_HORIZON_CAP_SECS)
+}
+
+/// Weight on the live flow estimate vs historical blocks.
+pub fn blend_weight(n_blocks: u32) -> f64 {
+    let n = f64::from(n_blocks.max(1));
+    (-(n - 1.0) / BLEND_N0).exp()
+}
+
+/// Combine projected inflow with the N-block frontier.
+///
+/// If the pool is thinner than N blocks, live stock does not set a far rate
+/// (`w < NEAR_BLEND_FLOOR`). Near depths with any live stock still answer
+/// min-relay (everything fits now).
+pub fn flow_for_depth(
+    projected: Option<u64>,
+    frontier: Option<u64>,
+    has_live_stock: bool,
+    n_blocks: u32,
+    min_relay: u64,
+) -> Option<u64> {
+    let mut flow = match (projected, frontier) {
+        (Some(p), Some(f)) => Some(p.max(f)),
+        (Some(p), None) => Some(p),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
+    if frontier.is_none() {
+        if blend_weight(n_blocks) >= NEAR_BLEND_FLOOR {
+            if flow.is_none() && has_live_stock {
+                flow = Some(min_relay);
+            }
+        } else {
+            flow = None;
+        }
+    }
+    flow
+}
+
+/// `w·flow + (1-w)·hist`. Missing side drops out.
+pub fn blend_sat_kvb(flow: Option<u64>, hist: Option<u64>, n_blocks: u32) -> Option<u64> {
+    match (flow, hist) {
+        (Some(f), Some(h)) => {
+            let w = blend_weight(n_blocks);
+            Some((w * f as f64 + (1.0 - w) * h as f64).round() as u64)
+        }
+        (Some(f), None) => Some(f),
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
+}
+
+/// `pct` in 0..=100. Empty → None.
+pub fn percentile_sat(mut v: Vec<u64>, pct: u8) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let pct = pct.min(100) as usize;
+    let i = (v.len() - 1).saturating_mul(pct) / 100;
+    Some(v[i])
+}
+
+/// Far-horizon rate from per-block p10 samples (85th percentile, else median).
+pub fn historical_far_sat_kvb(block_p10s: &[u64]) -> Option<u64> {
+    if block_p10s.is_empty() {
+        return None;
+    }
+    let pct = if block_p10s.len() >= 12 { 85 } else { 50 };
+    percentile_sat(block_p10s.to_vec(), pct)
+}
+
+/// Enforce R(1) ≥ R(2) ≥ … in place (depths already sorted ascending).
+pub fn enforce_monotone_desc(rates: &mut [u64]) {
+    for i in 1..rates.len() {
+        if rates[i] > rates[i - 1] {
+            rates[i] = rates[i - 1];
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +307,67 @@ mod tests {
         assert_eq!(bucket_index(150), 0);
         assert_eq!(bucket_index(200), 1);
         assert!(bucket_index(1_000_000) >= FEE_BUCKET_EDGES_SAT_PER_KVB.len() - 1);
+    }
+
+    #[test]
+    fn blend_is_flow_at_one_and_hist_at_far() {
+        assert!((blend_weight(1) - 1.0).abs() < 1e-9);
+        assert!(blend_weight(144) < 0.01);
+        let r1 = blend_sat_kvb(Some(5_000), Some(2_000), 1).unwrap();
+        let r144 = blend_sat_kvb(Some(5_000), Some(2_000), 144).unwrap();
+        assert!((r1 as i64 - 5_000).abs() < 50, "{r1}");
+        assert!((r144 as i64 - 2_000).abs() < 50, "{r144}");
+        assert!(r1 > r144);
+    }
+
+    #[test]
+    fn historical_far_uses_high_percentile_when_warm() {
+        let mut v = vec![1_000u64; 12];
+        v[11] = 8_000;
+        let far = historical_far_sat_kvb(&v).unwrap();
+        assert!(far >= 1_000);
+        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 0), Some(1));
+        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 100), Some(5));
+        assert!(historical_far_sat_kvb(&[]).is_none());
+    }
+
+    #[test]
+    fn monotone_desc_clips_rises() {
+        let mut r = [5_000u64, 6_000, 2_000, 3_000];
+        enforce_monotone_desc(&mut r);
+        assert_eq!(r, [5_000, 5_000, 2_000, 2_000]);
+    }
+
+    #[test]
+    fn inflow_horizon_is_capped() {
+        assert_eq!(inflow_horizon_secs(1), 600);
+        assert_eq!(inflow_horizon_secs(144), INFLOW_HORIZON_CAP_SECS);
+        assert!(fine_candidate_rates().len() > default_candidate_rates().len());
+        assert_eq!(fine_candidate_rates()[0], 100);
+    }
+
+    #[test]
+    fn underfull_live_stock_defines_near_not_far() {
+        assert!(blend_weight(5) >= NEAR_BLEND_FLOOR);
+        assert!(blend_weight(6) < NEAR_BLEND_FLOOR);
+        let min_r = 100u64;
+        assert_eq!(flow_for_depth(None, None, true, 1, min_r), Some(min_r));
+        assert_eq!(flow_for_depth(None, None, true, 5, min_r), Some(min_r));
+        assert_eq!(flow_for_depth(None, None, true, 6, min_r), None);
+        assert_eq!(flow_for_depth(None, None, true, 144, min_r), None);
+        assert_eq!(flow_for_depth(None, None, false, 1, min_r), None);
+        assert_eq!(
+            flow_for_depth(Some(5_000), None, true, 1, min_r),
+            Some(5_000)
+        );
+        assert_eq!(flow_for_depth(Some(5_000), None, true, 144, min_r), None);
+        assert_eq!(
+            flow_for_depth(Some(4_000), Some(3_000), true, 1, min_r),
+            Some(4_000)
+        );
+        assert_eq!(
+            flow_for_depth(None, Some(3_000), true, 144, min_r),
+            Some(3_000)
+        );
     }
 }
