@@ -5,7 +5,7 @@ One-off timing harness for `--api-log`. Talks to:
 
   Electrum TCP   127.0.0.1:50001
   Esplora HTTP   127.0.0.1:8080
-  Core RPC HTTP  127.0.0.1:8332   (cookie {datadir}/.cookie)
+  Core RPC HTTP  127.0.0.1:8332   (Bearer {datadir}/rpc.token)
 
 Discovers tip / a real txid / a scripthash from the node, then walks every
 supported method. Does **not** call RPC ``stop``. Broadcast / sendraw use
@@ -334,16 +334,12 @@ def run_esplora(r: Results, base: str, timeout: float) -> None:
 # ── RPC ───────────────────────────────────────────────────────────────────
 
 
-def load_cookie(datadir: str, user: str | None, password: str | None) -> tuple[str, str] | None:
-    if user is not None:
-        return user, password or ""
-    for name in (".cookie",):
-        p = os.path.join(datadir, name)
-        if os.path.isfile(p):
-            raw = open(p, encoding="utf-8").read().strip()
-            if ":" in raw:
-                u, pw = raw.split(":", 1)
-                return u, pw
+def load_rpc_token(datadir: str) -> str | None:
+    p = os.path.join(datadir, "rpc.token")
+    if os.path.isfile(p):
+        tok = open(p, encoding="utf-8").read().strip()
+        if tok:
+            return tok
     return None
 
 
@@ -352,12 +348,10 @@ def run_rpc(
     url: str,
     datadir: str,
     timeout: float,
-    user: str | None,
-    password: str | None,
 ) -> None:
-    auth = load_cookie(datadir, user, password)
-    if auth is None:
-        r.add("rpc", "(auth)", "skip", 0, f"no cookie in {datadir} and no --rpcuser")
+    token = load_rpc_token(datadir)
+    if token is None:
+        r.add("rpc", "(auth)", "skip", 0, f"no rpc.token in {datadir}")
         # Still try unauthenticated so a down/up bind is visible.
         code, _, wall = http_post(
             url,
@@ -368,10 +362,6 @@ def run_rpc(
         r.add("rpc", "getblockcount", str(code) if code else "down", wall, "no auth")
         return
 
-    import base64
-
-    token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
-
     def call(method: str, params: list[Any], note: str = "") -> Any:
         body = json.dumps({"jsonrpc": "1.0", "id": "bench", "method": method, "params": params})
         t0 = time.perf_counter()
@@ -381,7 +371,7 @@ def run_rpc(
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Basic {token}",
+                "Authorization": f"Bearer {token}",
             },
         )
         try:
@@ -456,8 +446,6 @@ def main() -> int:
     p.add_argument("--esplora", default=os.environ.get("ESPLORA", "http://127.0.0.1:8080"))
     p.add_argument("--rpc", default=os.environ.get("RPC", "http://127.0.0.1:8332"))
     p.add_argument("--datadir", default=os.environ.get("DATADIR", "./datadir-mainnet"))
-    p.add_argument("--rpcuser", default=os.environ.get("RPCUSER"))
-    p.add_argument("--rpcpassword", default=os.environ.get("RPCPASSWORD"))
     p.add_argument("--timeout", type=float, default=120.0, help="per-call socket timeout (s)")
     p.add_argument("--tweaks-count", type=int, default=1, help="Electrum tweaks count (server caps at 8)")
     p.add_argument("--skip-electrum", action="store_true")
@@ -477,7 +465,7 @@ def main() -> int:
         run_esplora(r, args.esplora, args.timeout)
     if not args.skip_rpc:
         print(f"# rpc {args.rpc}", flush=True)
-        run_rpc(r, args.rpc, args.datadir, args.timeout, args.rpcuser, args.rpcpassword)
+        run_rpc(r, args.rpc, args.datadir, args.timeout)
     r.summary()
     return 0
 

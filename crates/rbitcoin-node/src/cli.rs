@@ -131,6 +131,7 @@ where
     }
     config.smoke = smoke;
     config.absorb_inbound_env();
+    config.resolve_listen_defaults();
     Ok(OperatorArgs::Ready {
         config,
         log_level_cli,
@@ -256,8 +257,8 @@ fn operator_usage() -> String {
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
     [--listen ADDR] [--connect ADDR]... [--seed-node HOST]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
-    [--shindex] [--sptweaks] [--sptweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
-    [--rpc-listen ADDR] [--rpcuser USER] [--rpcpassword PASS] [--rpc-work-queue N] \\\n\
+    [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
@@ -279,12 +280,12 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
   --trusted / --always-relay / --relay are inbound permission knobs (not Core -whitelist).\n\
-Scripthash: --shindex (default off) builds Class B for Electrum/Esplora; both require it.\n\
+Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora; both require it.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
-Silent payments: --sptweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  --sptweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
-RPC: --rpc-listen ADDR (default off); cookie under datadir/.cookie or --rpcuser/--rpcpassword.\n\
+Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
+  --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
+RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
 Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
@@ -320,8 +321,8 @@ fn parse_log_level(raw: &str) -> Result<Option<Level>, ExitCode> {
 fn is_bool_key(key: &str) -> bool {
     matches!(
         key,
-        "shindex"
-            | "sptweaks"
+        "sh_index"
+            | "sp_tweaks"
             | "esplora_block_template"
             | "blocks_only"
             | "prefill_compact"
@@ -331,11 +332,16 @@ fn is_bool_key(key: &str) -> bool {
             | "trusted"
             | "always_relay"
             | "relay"
+            | "rpc"
     )
 }
 
+fn is_optional_addr_key(key: &str) -> bool {
+    matches!(key, "rpc_listen" | "electrum_listen" | "esplora_listen")
+}
+
 fn looks_like_flag(s: &str) -> bool {
-    s.starts_with("--") || matches!(s, "-h" | "-V" | "-shindex" | "-sptweaks")
+    s.starts_with("--") || matches!(s, "-h" | "-V")
 }
 
 fn parse_cli_flag(
@@ -345,8 +351,6 @@ fn parse_cli_flag(
 ) -> Result<Option<(String, String)>, ExitCode> {
     let rest = if let Some(r) = flag.strip_prefix("--") {
         r
-    } else if matches!(flag, "-shindex" | "-sptweaks") {
-        &flag[1..]
     } else {
         eprintln!("error: unknown argument `{flag}`");
         return Err(ExitCode::from(2));
@@ -370,6 +374,19 @@ fn parse_cli_flag(
     } else if is_bool_key(&key) {
         *i += 1;
         "1".to_string()
+    } else if is_optional_addr_key(&key) {
+        *i += 1;
+        if *i >= args.len() {
+            String::new()
+        } else {
+            let next = args[*i].to_string_lossy().into_owned();
+            if looks_like_flag(&next) {
+                String::new()
+            } else {
+                *i += 1;
+                next
+            }
+        }
     } else {
         *i += 1;
         if *i >= args.len() {
@@ -481,10 +498,20 @@ mod tests {
             "--min-chain-work",
             "--max-tip-age",
             "--signet-block-time",
-            "--rpcuser",
-            "--rpcpassword",
+            "--sh-index",
+            "--sp-tweaks",
+            "--sp-tweaks-dust",
+            "--rpc",
+            "--rpc-listen",
+            "--rpc-token-file",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
+        }
+        for concat in ["--shindex", "--sptweaks", "-shindex", "-sptweaks"] {
+            assert!(
+                !h.contains(concat),
+                "help must not advertise concatenated or one-dash long {concat}"
+            );
         }
         for concat in [
             "--prefillcompact",
@@ -515,6 +542,23 @@ mod tests {
     }
 
     #[test]
+    fn sh_index_and_sp_tweaks_are_kebab_not_concat() {
+        let on = ready_config(["rbitcoin-node", "--sh-index", "--sp-tweaks"]);
+        assert!(on.shindex);
+        assert!(on.sptweaks);
+        let eq = ready_config(["rbitcoin-node", "--sh-index=1", "--sp-tweaks-dust=546"]);
+        assert!(eq.shindex);
+        assert_eq!(eq.sptweaks_dust, 546);
+        assert_exit(cli_main(["rbitcoin-node", "--shindex"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "-shindex"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--sptweaks"]), ExitCode::from(2));
+        assert_exit(
+            cli_main(["rbitcoin-node", "--sptweaks-dust=1"]),
+            ExitCode::from(2),
+        );
+    }
+
+    #[test]
     fn kebab_seed_node_and_min_relay_tx_fee_parse() {
         let seeds = ready_config(["rbitcoin-node", "--seed-node", "127.0.0.1:8333"]);
         assert_eq!(seeds.listen.seednodes, vec!["127.0.0.1:8333".to_string()]);
@@ -522,6 +566,17 @@ mod tests {
         assert_eq!(fee.mempool.min_relay_fee_btc.as_deref(), Some("0.00001000"));
         let compact = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
         assert!(!compact.prefill_compact);
+        let rpc = ready_config(["rbitcoin-node", "--network", "regtest", "--rpc-listen"]);
+        assert!(rpc.rpc.socket);
+        assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
+        assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
+        let sock = ready_config(["rbitcoin-node", "--rpc"]);
+        assert!(sock.rpc.socket);
+        assert!(sock.rpc.listen.is_none());
+        let el = ready_config(["rbitcoin-node", "--sh-index", "--electrum-listen"]);
+        assert_eq!(el.listen.electrum.unwrap().port(), 50001);
+        let es = ready_config(["rbitcoin-node", "--sh-index", "--esplora-listen"]);
+        assert_eq!(es.listen.esplora.unwrap().port(), 3000);
     }
 
     #[test]
@@ -745,11 +800,11 @@ mod tests {
             ExitCode::from(2),
         );
         assert_exit(
-            cli_main(["rbitcoin-node", "--sptweaks-dust"]),
+            cli_main(["rbitcoin-node", "--sp-tweaks-dust"]),
             ExitCode::from(2),
         );
         assert_exit(
-            cli_main(["rbitcoin-node", "--sptweaks-dust", "nope"]),
+            cli_main(["rbitcoin-node", "--sp-tweaks-dust", "nope"]),
             ExitCode::from(2),
         );
         // Bad conf path / invalid conf log_level.
@@ -898,6 +953,13 @@ mod tests {
             "--inhibitsuspend=1",
             "--rpclisten=127.0.0.1:1",
             "--rpc-user=u",
+            "--rpcuser=u",
+            "--rpcpassword=p",
+            "--shindex",
+            "--sptweaks",
+            "-shindex",
+            "-sptweaks",
+            "-datadir=/tmp/x",
         ] {
             assert_exit(cli_main(["rbitcoin-node", flag]), ExitCode::from(2));
         }

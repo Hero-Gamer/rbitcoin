@@ -69,12 +69,12 @@ pub fn fixed_seed_hosts(network: Network) -> &'static [&'static str] {
 
 /// Default P2P port for a network.
 pub fn default_port(network: Network) -> u16 {
-    match network {
-        Network::Mainnet => 8333,
-        Network::Testnet => 18333,
-        Network::Signet => 38333,
-        Network::Regtest => 18444,
-    }
+    network.default_p2p_port()
+}
+
+/// Default JSON-RPC TCP port for a network (Core-matching).
+pub fn default_rpc_port(network: Network) -> u16 {
+    network.default_rpc_port()
 }
 
 /// Resolve fixed seed host strings to socket addresses (best-effort).
@@ -1215,6 +1215,10 @@ mod tests {
         assert_eq!(default_port(Network::Testnet), 18333);
         assert_eq!(default_port(Network::Signet), 38333);
         assert_eq!(default_port(Network::Regtest), 18444);
+        assert_eq!(default_rpc_port(Network::Mainnet), 8332);
+        assert_eq!(default_rpc_port(Network::Testnet), 18332);
+        assert_eq!(default_rpc_port(Network::Signet), 38332);
+        assert_eq!(default_rpc_port(Network::Regtest), 18443);
         assert!(!dns_seeds(Network::Mainnet).is_empty());
         assert!(!dns_seeds(Network::Testnet).is_empty());
         assert_eq!(dns_seeds(Network::Signet).len(), 1);

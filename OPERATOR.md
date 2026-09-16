@@ -305,7 +305,7 @@ One loop: mine a block, one Electrum RPC, one Esplora GET. This is **regtest**,
 not validated mainnet (default mainnet `--milestone` skips historical scripts).
 Signet/mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
-Electrum and Esplora **require `--shindex`**. JSON-RPC is only there so
+Electrum and Esplora **require `--sh-index`**. JSON-RPC is only there so
 `rbitcoin-cli` can mine.
 
 ```bash
@@ -313,16 +313,16 @@ Electrum and Esplora **require `--shindex`**. JSON-RPC is only there so
   --datadir /tmp/rb-hour \
   --network regtest \
   --no-seeds \
-  --shindex \
-  --rpc-listen 127.0.0.1:18443 \
-  --electrum-listen 127.0.0.1:50001 \
-  --esplora-listen 127.0.0.1:3000
+  --sh-index \
+  --rpc \
+  --electrum-listen \
+  --esplora-listen
 ```
 
-In another terminal (cookie at `/tmp/rb-hour/.cookie`):
+In another terminal:
 
 ```bash
-./target/release/rbitcoin-cli --datadir /tmp/rb-hour --rpcport 18443 \
+./target/release/rbitcoin-cli --datadir /tmp/rb-hour --network regtest \
   generatetodescriptor 1 'raw(51)'
 
 python3 - <<'PY'
@@ -344,7 +344,8 @@ sections below and [`COMPAT.md`](./COMPAT.md).
 
 Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` flags are
 kebab-case (`--max-inbound`). Conf keys are snake_case (`max_inbound=`).
-`--rpcuser` / `--rpcpassword` match bitcoin-cli and Core `bitcoin.conf`.
+RPC auth is a unix socket (`--rpc`) or Bearer `{datadir}/rpc.token` (TCP).
+There is no `--rpcuser` / `--rpcpassword`.
 Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
 `-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
 ([`docs/core-functional.md`](docs/core-functional.md)).
@@ -373,15 +374,16 @@ Clean smoke:
 | `--api-log PATH` | `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
 | `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `no_seeds=` | seeds on |
-| `--shindex` | `shindex=` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--sh-index` | `sh_index=` | **off** — Class B scripthash (required for Electrum/Esplora) |
 | `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
-| `--sptweaks` | `sptweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
-| `--sptweaks-dust SATS` | `sptweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
-| `--electrum-listen ADDR` | `electrum_listen=` | disabled (**requires** `--shindex`) |
-| `--esplora-listen ADDR` | `esplora_listen=` | disabled (Esplora REST; **requires** `--shindex`) |
+| `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
+| `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
+| `--electrum-listen [ADDR]` | `electrum_listen=` | disabled (**requires** `--sh-index`); omit ADDR → `127.0.0.1:50001` |
+| `--esplora-listen [ADDR]` | `esplora_listen=` | disabled (Esplora REST; **requires** `--sh-index`); omit ADDR → `127.0.0.1:3000` |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
-| `--rpc-listen ADDR` | `rpc_listen=` | disabled — Core-class JSON-RPC subset |
-| `--rpcuser` / `--rpcpassword` | `rpcuser=` / `rpcpassword=` | unset — else cookie `{datadir}/.cookie` |
+| `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
+| `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
+| `--rpc-token-file PATH` | `rpc_token_file=` | `{datadir}/rpc.token` (CSPRNG hex; TCP Bearer) |
 | `--rpc-work-queue N` | `rpc_work_queue=` | unset — unlimited in-flight HTTP RPC. When set, one POST is one slot (array batches still run); full permit is HTTP **503** `Work queue depth exceeded` |
 | `--min-relay-tx-fee BTC` | `min_relay_tx_fee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempool-expiry HOURS` | `mempool_expiry=` | unset — hub default; min 1 |
@@ -416,7 +418,7 @@ max_inbound=64
 mempool_size_mb=100
 ```
 
-`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `.cookie`).
+`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
 rarely-read Class A **inwit** stem (`inwit.body` + `inwit.loc`, ~486 GiB + loc
 on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
@@ -641,7 +643,7 @@ schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD
 When the 20 index refuse fires, the log line is:
 
 ```text
-schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)
+schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)
 ```
 
 A **schema-20** datadir can still refuse leftover **index** layouts (fuse8 v1,
@@ -649,11 +651,11 @@ flat `*.idx.meta`, Shared file `scripthash.body`, pack8 Paged mode 10). The
 line is one of:
 
 ```text
-index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --shindex)
+index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)
 index refuses flat tx.head.meta; wipe store/tx.head then restart (Class A kept; tx.head rebuilds)
 index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNNN segments) then restart (Class A kept)
-index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
-index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --shindex)
+index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
+index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```
 
 Copy-paste (node stopped with SIGTERM):
@@ -668,7 +670,7 @@ rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 
 Keep Class A (`txout` / `inwit` / `spent` + `create.loc` / `inwit.loc`, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
-`--shindex`, SH rematerializes. Do **not** `rm -rf store/`.
+`--sh-index`, SH rematerializes. Do **not** `rm -rf store/`.
 
 When the 17-index refuse fires, the log line is:
 
@@ -685,7 +687,7 @@ rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 
 Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
-`--shindex`, SH rematerializes from runs / Class A. Do **not** `rm -rf store/`.
+`--sh-index`, SH rematerializes from runs / Class A. Do **not** `rm -rf store/`.
 
 **Kill-9 / crash is not a schema upgrade.** Open follows
 [`docs/crash-recovery.md`](docs/crash-recovery.md) (tip-as-commit, Class C
@@ -768,7 +770,7 @@ Do **not** wipe `store/` for mempool slot/full errors.
   child-with-parents ancestor tree). No P2P package command (BIP331 is not in
   rust-bitcoin 0.32).
 
-## Scripthash index (`--shindex`)
+## Scripthash index (`--sh-index`)
 
 Class B **scripthash** reverse index is **optional** (default **off**), analogous
 in *operator spirit* to Core’s heavy reverse indexes — **not** the same as
@@ -777,9 +779,9 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | Mode | Behavior |
 |------|----------|
 | **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
-| **on** (`--shindex` / `shindex=1`) | Direct IBD SH runs + tip bulk materialize; Electrum/Esplora may start when SH is tip-ready. |
+| **on** (`--sh-index` / `sh_index=1`) | Direct IBD SH runs + tip bulk materialize; Electrum/Esplora may start when SH is tip-ready. |
 
-**Electrum or Esplora without `--shindex` fails at process start** (clear config error).
+**Electrum or Esplora without `--sh-index` fails at process start** (clear config error).
 
 `--esplora-block-template` (conf `esplora_block_template=1`) enables
 `GET /block-template` on the Esplora listen (same JSON as RPC
@@ -792,7 +794,7 @@ before Class A expand: Esplora **503** / Electrum JSON-RPC error
 
 Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 
-- **During IBD with shindex=1:** modest extra work (run stream); after IBD, bulk materialize is typically **tens of minutes to a few hours**.
+- **During IBD with sh_index=1:** modest extra work (run stream); after IBD, bulk materialize is typically **tens of minutes to a few hours**.
 - **Enable after tip already synced:** full recollect/materialize from Class A — **often multi-hour**; tip follow continues; Electrum waits until SH ready.
 - **Disable later:** tables are **left on disk** (no automatic purge). Re-enable may rematerialize.
 
@@ -802,7 +804,7 @@ Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` �
 
 Keep **`store/scripthash.unsorted/`** until all shards seal. SIGINT / SIGTERM
 mid-cold keeps every **sealed** `scripthash.head/NN`; restart with the same
-`--datadir --shindex` packs **unsealed** shards only (holes stay). Incomplete
+`--datadir --sh-index` packs **unsealed** shards only (holes stay). Incomplete
 collect (no `DONE`) restarts the Class A pass. `DONE` names the Class A
 `create_fk` scanned; restart appends new creates into unsorted files when no
 shards are sealed, or tail-appends onto the durable head after pack when any
@@ -819,13 +821,13 @@ to “start over” unless you intend a full Class A collect
 | `DONE` then more Class A, some/all shards sealed | Pack remaining unsealed files; Class A tail onto the durable head (Direct) or write-behind (Tip). |
 | Empty SH head + leftover catalog | Wipe leftover runs + SEAL, then Class A collect into unsorted shards. |
 | Durable SH head + leftover runs | Discard leftover runs (keep SEAL); write-behind fills HWM lag. |
-| Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--shindex`. |
+| Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. |
 
 Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH
 abort. Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`) must never redo
 multi-hour Class A work casually — [`docs/env-knobs.md`](docs/env-knobs.md).
 
-## Silent payment tweaks (`--sptweaks`)
+## Silent payment tweaks (`--sp-tweaks`)
 
 Optional **thin** BIP-352 index for Electrum `blockchain.tweaks.subscribe`
 (Cake Wallet, [kiss-bdk](https://github.com/kkdao/kiss-bdk); client-side
@@ -834,7 +836,7 @@ walk). Flag on = persist + serve-from-index. Stream shape and Sparrow/Frigate:
 [`COMPAT.md`](./COMPAT.md) (Electrum surface).
 
 **Not built during Direct IBD** (the write thread stays Class A + annotate).
-After catch-up, **SH materialize first** (if `--shindex`), then a background
+After catch-up, **SH materialize first** (if `--sh-index`), then a background
 walker fills `origin..=live tip` from Class A. Tip write-through only when
 `height == next_height`; if confirm is ahead, backfill owns the hole. Kill
 is safe: `next_height` is the last complete put; restart in Tip (or after
@@ -853,7 +855,7 @@ On disk (schema 17 dirs; leftover single files are unlinked on startup):
 sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
 **not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
 
-Serve-time **`--sptweaks-dust SATS`** (conf `sptweaks_dust=`) omits P2TR outs
+Serve-time **`--sp-tweaks-dust SATS`** (conf `sp_tweaks_dust=`) omits P2TR outs
 with `value <= SATS` and drops txs that then have none. Default **1000**.
 `0` serves every value. **`546` matches Cake electrs** `sp_min_dust`. This is
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
@@ -883,7 +885,7 @@ reverse proxy**, and rely on the node’s **app DoS limits** always being on. A
 loopback-only bind is convenient with a local proxy, but it is **not** the
 security model by itself.
 
-**Requires `--shindex`.** Without it the node refuses to start.
+**Requires `--sh-index`.** Without it the node refuses to start.
 
 `server.version[0]` is `rbitcoin-electrs <ver>` so Cake Wallet
 `getNodeIsElectrs()` will probe silent-payment tweaks. Other tweaks clients
@@ -896,8 +898,8 @@ scripthashes / txids; we do **not** aim to back block-explorer search UIs.
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
-  --shindex \
-  --sptweaks \
+  --sh-index \
+  --sp-tweaks \
   --electrum-listen 127.0.0.1:50001 \
   --log-level info
 ```
@@ -914,7 +916,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
-| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sptweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sptweaks-dust` (default 1000; 546 = Cake electrs): omit P2TR outs with `value <=` the floor. Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sp-tweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sp-tweaks-dust` (default 1000; 546 = Cake electrs): omit P2TR outs with `value <=` the floor. Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
 
 ### API request log
 
@@ -1039,7 +1041,7 @@ Blockstream-**compatible** **plain HTTP** API for **wallet clients and APIs**
 block-explorer backend. Same internet-facing model as Electrum: app DoS limits
 always on; terminate TLS at a reverse proxy.
 
-**Requires `--shindex`.** Without it the node refuses to start.
+**Requires `--sh-index`.** Without it the node refuses to start.
 
 **Explicit non-goals:** explorer search/`address-prefix`, Liquid,
 mempool.space-style catalogue UI APIs. Opt-in `GET /block-template` is GBT
@@ -1051,27 +1053,29 @@ Blockstream Esplora `API.md`); surface: [`COMPAT.md`](./COMPAT.md).
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
-  --shindex \
+  --sh-index \
   --esplora-listen 127.0.0.1:3000 \
   --log-level info
 ```
 
-Conf: `shindex=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
+Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 
 ## Core-class JSON-RPC
 
-Optional HTTP JSON-RPC subset (default **off**). Auth: cookie file under
-`{datadir}/.cookie` or `--rpcuser`/`--rpcpassword`. Does **not** require
-`--shindex` (chain/mempool/rawtx by id only). See [`docs/rpc.md`](./docs/rpc.md)
-and [`COMPAT.md`](./COMPAT.md).
+Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
+`{datadir}/rpc.sock` (filesystem auth, no HTTP header). `--rpc-listen`
+adds TCP on `127.0.0.1:<network port>` when ADDR is omitted (mainnet 8332,
+testnet 18332, signet 38332, regtest 18443). TCP auth is
+`Authorization: Bearer` from `{datadir}/rpc.token` (0600). See
+[`docs/rpc.md`](./docs/rpc.md) and [`COMPAT.md`](./COMPAT.md).
 
 ```bash
 ./target/release/rbitcoin-node \
   --datadir ./datadir-mainnet \
   --network mainnet \
-  --rpc-listen 127.0.0.1:8332 \
+  --rpc \
   --log-level info
-# same datadir cookie:
+# local socket:
 rbitcoin-cli --datadir ./datadir-mainnet getblockcount
 ```
 

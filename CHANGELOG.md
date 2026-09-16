@@ -25,10 +25,20 @@ before 1.0).
 
 ### Changed
 
+- **Rust-style CLI, default RPC ports, and token auth:** operator flags are
+  two-dash kebab (`--rpc-listen`, `--rpc-url`); short flags are `-h`/`-V` only.
+  `--shindex` / `--sptweaks` are `--sh-index` / `--sp-tweaks`. JSON-RPC is
+  `--rpc` (`{datadir}/rpc.sock`) and optional `--rpc-listen` (default
+  `127.0.0.1` and Core-matching 8332/18332/38332/18443). TCP auth is Bearer
+  `{datadir}/rpc.token`; `--rpcuser` / `--rpcpassword` / `.cookie` are gone.
+  `rbitcoin-cli` uses `--datadir` / `--network` / `--rpc-url` /
+  `--rpc-token-file`. The functional shim still writes Core `.cookie` from
+  the token. [`OPERATOR.md`](OPERATOR.md), [`docs/rpc.md`](docs/rpc.md).
+
 - **No concatenated `rbitcoin-node` aliases:** kebab CLI / snake_case conf only
   (`--prefill-compact` / `prefill_compact=`). Concatenated Core spellings
   (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are unknown.
-  `--rpcuser` / `--rpcpassword` stay. The functional shim still maps Core names.
+  The functional shim still maps Core names.
 
 - **Fee estimates hold the last defined rate into far depths:** when the
   pool is thinner than N blocks and block-p10 history is empty, 144/504/1008
@@ -55,7 +65,7 @@ before 1.0).
   (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are advertised as
   kebab (`--prefill-compact`, `--min-relay-tx-fee`, `--rpc-work-queue`). Conf
   keys are snake_case with `=` (`max_inbound=`). Concatenated aliases still
-  apply. `--rpcuser` / `--rpcpassword` match bitcoin-cli. Help notes end with
+  apply. Help notes end with
   a period; duration placeholders are `SECS`.
 
 - **Fee estimates bias for inclusion confidence:** N=1 inverts at 99%

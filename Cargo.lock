@@ -721,9 +721,10 @@ dependencies = [
 name = "rbitcoin-cli"
 version = "0.6.99"
 dependencies = [
- "base64 0.23.1",
  "mimalloc",
+ "rbitcoin-primitives",
  "serde_json",
+ "socket2",
 ]
 
 [[package]]

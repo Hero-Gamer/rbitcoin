@@ -579,59 +579,57 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .await;
 
     let mut rpc_handle: Option<RpcHandle> = None;
-    if let Some(addr) = config.rpc.listen {
-        if !shutdown.requested() {
-            let rcfg = RpcConfig {
-                listen: addr,
-                datadir: config.datadir.path.clone(),
-                network: config.network,
-                rpc_user: config.rpc.user.clone(),
-                rpc_password: config.rpc.password.clone(),
-                cookie_path: Some(config.rpc_cookie_path()),
-                work_queue: config.rpc.work_queue,
-                subversion: Some(
-                    rbitcoin_primitives::rbitcoin_subversion(
-                        env!("CARGO_PKG_VERSION"),
-                        &config.uacomments,
-                    )
-                    .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
-                ),
-                alert_notify: config.alert_notify.clone(),
-            };
-            let miner: Option<Arc<dyn RpcRegtest>> = if config.network == Network::Regtest {
-                Some(Arc::new(HubRegtest(Arc::clone(&node.hub))))
+    if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {
+        let rcfg = RpcConfig {
+            listen: config.rpc.listen,
+            socket_path: if config.rpc.socket {
+                Some(config.rpc_socket_path())
             } else {
                 None
-            };
-            match run_rpc(
-                rcfg,
-                Arc::clone(&node.hub.query),
-                Some(mempool.clone()),
-                miner,
-                Some(Arc::clone(&node.peers)),
-                Some(Arc::clone(&node.hub)),
-                Some(Arc::clone(&shared_peers)),
-            )
-            .await
-            {
-                Ok(h) => {
-                    h.initial_block_download
-                        .store(!tip_follow_ready || node.hub.in_ibd(), Ordering::SeqCst);
-                    h.connections
-                        .store(node.follow_live_count() as u64, Ordering::Relaxed);
-                    info!(
-                        "rpc: listening on {} (auth={})",
-                        h.local_addr,
-                        if config.rpc.user.is_some() {
-                            "rpcuser/rpcpassword"
-                        } else {
-                            "cookie"
-                        }
-                    );
-                    rpc_handle = Some(h);
-                }
-                Err(e) => warn!("rpc start warning: {e}"),
+            },
+            datadir: config.datadir.path.clone(),
+            network: config.network,
+            token_path: Some(config.rpc_token_path()),
+            work_queue: config.rpc.work_queue,
+            subversion: Some(
+                rbitcoin_primitives::rbitcoin_subversion(
+                    env!("CARGO_PKG_VERSION"),
+                    &config.uacomments,
+                )
+                .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION"))),
+            ),
+            alert_notify: config.alert_notify.clone(),
+        };
+        let miner: Option<Arc<dyn RpcRegtest>> = if config.network == Network::Regtest {
+            Some(Arc::new(HubRegtest(Arc::clone(&node.hub))))
+        } else {
+            None
+        };
+        match run_rpc(
+            rcfg,
+            Arc::clone(&node.hub.query),
+            Some(mempool.clone()),
+            miner,
+            Some(Arc::clone(&node.peers)),
+            Some(Arc::clone(&node.hub)),
+            Some(Arc::clone(&shared_peers)),
+        )
+        .await
+        {
+            Ok(h) => {
+                h.initial_block_download
+                    .store(!tip_follow_ready || node.hub.in_ibd(), Ordering::SeqCst);
+                h.connections
+                    .store(node.follow_live_count() as u64, Ordering::Relaxed);
+                info!(
+                    "rpc: listening tcp={:?} sock={:?} token={}",
+                    h.local_addr,
+                    h.socket_path,
+                    h.token_path.display()
+                );
+                rpc_handle = Some(h);
             }
+            Err(e) => warn!("rpc start warning: {e}"),
         }
     }
 

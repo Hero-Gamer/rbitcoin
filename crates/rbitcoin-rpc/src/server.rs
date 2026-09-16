@@ -1,6 +1,6 @@
-//! HTTP JSON-RPC server (axum) with Basic auth.
+//! HTTP JSON-RPC server (axum) with Bearer token auth on TCP; unix socket is filesystem-auth.
 
-use crate::auth::{parse_basic_auth, resolve_rpc_auth, RpcAuth};
+use crate::auth::{parse_basic_auth, parse_bearer_auth, resolve_rpc_auth, RpcAuth};
 use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -23,25 +23,27 @@ use tokio::task::JoinHandle;
 /// RPC listen configuration.
 #[derive(Clone, Debug)]
 pub struct RpcConfig {
-    pub listen: SocketAddr,
+    /// TCP bind. `None` = no TCP (unix socket only).
+    pub listen: Option<SocketAddr>,
+    /// Unix socket path. `None` = no socket.
+    pub socket_path: Option<PathBuf>,
     pub datadir: PathBuf,
     pub network: Network,
-    pub rpc_user: Option<String>,
-    pub rpc_password: Option<String>,
-    /// Override cookie path (default `{datadir}/.cookie`).
-    pub cookie_path: Option<PathBuf>,
+    /// Override token path (default `{datadir}/rpc.token`).
+    pub token_path: Option<PathBuf>,
     /// `getnetworkinfo.subversion`. Empty → `/rbitcoin:VERSION/`.
     pub subversion: Option<String>,
-    /// Core `-rpcworkqueue`. `None` = unlimited (tests / default).
+    /// HTTP occupancy cap. `None` = unlimited.
     pub work_queue: Option<usize>,
-    /// Core `-alertnotify` (`%s` = warning text).
+    /// `--alert-notify` (`%s` = warning text).
     pub alert_notify: Option<String>,
 }
 
 /// Live RPC server handle.
 pub struct RpcHandle {
-    pub local_addr: SocketAddr,
-    pub cookie_path: Option<PathBuf>,
+    pub local_addr: Option<SocketAddr>,
+    pub socket_path: Option<PathBuf>,
+    pub token_path: PathBuf,
     pub auth: RpcAuth,
     pub stop: Arc<AtomicBool>,
     pub connections: Arc<AtomicU64>,
@@ -50,14 +52,16 @@ pub struct RpcHandle {
     /// handlers before tearing down the RPC server (`feature_shutdown.py`).
     pub active: Arc<std::sync::Mutex<crate::methods::RpcActive>>,
     shutdown: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl RpcHandle {
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        self.task.abort();
-        let _ = self.task.await;
+        for task in self.tasks {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -66,9 +70,10 @@ struct AppState {
     ctx: Arc<RpcContext>,
     auth: RpcAuth,
     work_queue: Option<Arc<tokio::sync::Semaphore>>,
+    require_auth: bool,
 }
 
-/// Start Core-class JSON-RPC on `config.listen` (plain HTTP; TLS via reverse proxy).
+/// Start JSON-RPC on TCP and/or a unix socket (plain HTTP; TLS via reverse proxy).
 pub async fn run_rpc(
     config: RpcConfig,
     query: Arc<Query>,
@@ -78,15 +83,12 @@ pub async fn run_rpc(
     chain: Option<Arc<rbitcoin_net::ChainHub>>,
     addrman: Option<Arc<std::sync::Mutex<rbitcoin_net::AddrMan>>>,
 ) -> Result<RpcHandle, String> {
-    let (auth, cookie_path) = resolve_rpc_auth(
-        &config.datadir,
-        config.rpc_user.as_deref(),
-        config.rpc_password.as_deref(),
-        config.cookie_path.as_deref(),
-    )?;
-
-    if auth.password.is_empty() {
-        return Err("RPC auth password empty".into());
+    if config.listen.is_none() && config.socket_path.is_none() {
+        return Err("rpc: need --rpc (socket) or --rpc-listen (TCP)".into());
+    }
+    let (auth, token_path) = resolve_rpc_auth(&config.datadir, config.token_path.as_deref())?;
+    if auth.token.is_empty() {
+        return Err("RPC token empty".into());
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -115,68 +117,120 @@ pub async fn run_rpc(
         alert_fired: Arc::new(AtomicBool::new(false)),
     });
 
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .map_err(|e| format!("rpc bind {}: {e}", config.listen))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| format!("rpc local_addr: {e}"))?;
-
     let work_queue = config
         .work_queue
         .filter(|n| *n > 0)
         .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
-    let state = AppState {
-        ctx,
-        auth: auth.clone(),
-        work_queue,
-    };
-    let app = Router::new().route("/", post(rpc_post)).with_state(state);
-
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_w = Arc::clone(&shutdown);
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                while !shutdown_w.load(Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .ok();
-    });
+    let mut tasks = Vec::new();
+    let mut local_addr = None;
 
-    if let Some(ref p) = cookie_path {
+    if let Some(addr) = config.listen {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("rpc bind {addr}: {e}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("rpc local_addr: {e}"))?;
+        local_addr = Some(bound);
+        let state = AppState {
+            ctx: Arc::clone(&ctx),
+            auth: auth.clone(),
+            work_queue: work_queue.clone(),
+            require_auth: true,
+        };
+        let app = Router::new().route("/", post(rpc_post)).with_state(state);
+        let shutdown_w = Arc::clone(&shutdown);
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !shutdown_w.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .ok();
+        }));
         info!(
-            "rpc: HTTP JSON-RPC on {local_addr} (cookie auth {})",
-            p.display()
+            "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
+            token_path.display()
         );
-    } else {
-        info!("rpc: HTTP JSON-RPC on {local_addr} (rpcuser/rpcpassword auth)");
     }
+
+    #[cfg(unix)]
+    let socket_path_out = if let Some(ref sock) = config.socket_path {
+        if let Some(parent) = sock.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
+        }
+        let _ = std::fs::remove_file(sock);
+        let listener = tokio::net::UnixListener::bind(sock)
+            .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
+        }
+        let state = AppState {
+            ctx: Arc::clone(&ctx),
+            auth: auth.clone(),
+            work_queue,
+            require_auth: false,
+        };
+        let app = Router::new().route("/", post(rpc_post)).with_state(state);
+        let shutdown_w = Arc::clone(&shutdown);
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !shutdown_w.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .ok();
+        }));
+        info!("rpc: unix JSON-RPC on {}", sock.display());
+        Some(sock.clone())
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let socket_path_out = {
+        if config.socket_path.is_some() && config.listen.is_none() {
+            return Err(
+                "rpc unix socket needs AF_UNIX; this Windows build has no tokio UnixListener — use --rpc-listen"
+                    .into(),
+            );
+        }
+        if config.socket_path.is_some() {
+            info!("rpc: unix socket skipped (no AF_UNIX listener in this build)");
+        }
+        None
+    };
+    let _ = ctx;
 
     Ok(RpcHandle {
         local_addr,
-        cookie_path,
+        socket_path: socket_path_out,
+        token_path,
         auth,
         stop,
         connections,
         initial_block_download: ibd,
         active,
         shutdown,
-        task,
+        tasks,
     })
 }
 
 async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if !authorized(&state.auth, &headers) {
+    if state.require_auth && !authorized(&state.auth, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"jsonrpc\"")],
+            [(header::WWW_AUTHENTICATE, "Bearer realm=\"jsonrpc\"")],
             "Unauthorized\n",
         )
             .into_response();
     }
+
     let _permit = if let Some(sem) = state.work_queue.as_ref() {
         match sem.try_acquire() {
             Ok(p) => Some(p),
@@ -435,10 +489,13 @@ fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
     else {
         return false;
     };
-    let Some((u, p)) = parse_basic_auth(val) else {
-        return false;
-    };
-    auth.matches(&u, &p)
+    if let Some(tok) = parse_bearer_auth(val) {
+        return auth.matches_token(tok);
+    }
+    if let Some((_u, p)) = parse_basic_auth(val) {
+        return auth.matches_token(&p);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -446,10 +503,12 @@ mod tests {
     use super::*;
     use rbitcoin_primitives::Network;
 
-    fn basic_auth_header(auth: &RpcAuth) -> String {
-        use base64::Engine;
-        let tok = base64::engine::general_purpose::STANDARD.encode(auth.cookie_line());
-        format!("Basic {tok}")
+    fn auth_header(auth: &RpcAuth) -> String {
+        format!("Bearer {}", auth.token)
+    }
+
+    fn tcp_addr(handle: &RpcHandle) -> SocketAddr {
+        handle.local_addr.expect("tcp listen")
     }
 
     async fn post_rpc(
@@ -466,7 +525,7 @@ mod tests {
             "params": params,
         });
         let body_s = body.to_string();
-        let auth_h = basic_auth_header(auth);
+        let auth_h = auth_header(auth);
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_s}",
             body_s.len()
@@ -497,12 +556,11 @@ mod tests {
             MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
         mp.set_relay_enabled(true);
         let cfg = RpcConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
-            rpc_user: Some("testuser".into()),
-            rpc_password: Some("testpass".into()),
-            cookie_path: None,
+            token_path: None,
             subversion: None,
             work_queue: None,
 
@@ -514,7 +572,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
         let count = post_rpc(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             "getblockcount",
             serde_json::json!([]),
@@ -525,7 +583,7 @@ mod tests {
         assert_eq!(count["result"], 0);
 
         let help = post_rpc(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             "help",
             serde_json::json!([]),
@@ -537,7 +595,7 @@ mod tests {
         assert!(s.contains("getblockchaininfo"));
 
         let mem = post_rpc(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             "getmempoolinfo",
             serde_json::json!([]),
@@ -548,7 +606,7 @@ mod tests {
         assert_eq!(mem["result"]["size"], 0);
 
         let chain = post_rpc(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             "getblockchaininfo",
             serde_json::json!([]),
@@ -559,7 +617,7 @@ mod tests {
         assert_eq!(chain["result"]["chain"], "regtest");
 
         // 401 without auth
-        let mut stream = tokio::net::TcpStream::connect(handle.local_addr)
+        let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
             .await
             .unwrap();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -583,7 +641,7 @@ mod tests {
         body: &[u8],
     ) -> (u16, Option<serde_json::Value>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let auth_h = basic_auth_header(auth);
+        let auth_h = auth_header(auth);
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -617,12 +675,11 @@ mod tests {
             MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
         mp.set_relay_enabled(true);
         let cfg = RpcConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
-            rpc_user: Some("testuser".into()),
-            rpc_password: Some("testpass".into()),
-            cookie_path: None,
+            token_path: None,
             subversion: None,
             work_queue: None,
 
@@ -639,7 +696,7 @@ mod tests {
             {"jsonrpc":"2.0","id":4,"pizza":"sausage"}
         ]);
         let (st, body) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             batch.to_string().as_bytes(),
         )
@@ -654,7 +711,7 @@ mod tests {
         assert_eq!(arr[2]["error"]["message"], "Missing method");
 
         let (st, body) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             br#"{"jsonrpc":"2.0","method":"getblockcount"}"#,
         )
@@ -662,12 +719,12 @@ mod tests {
         assert_eq!(st, 204, "{body:?}");
         assert!(body.is_none());
 
-        let (st, body) = post_raw(handle.local_addr, &handle.auth, b"").await;
+        let (st, body) = post_raw(tcp_addr(&handle), &handle.auth, b"").await;
         assert_eq!(st, 500);
         assert_eq!(body.unwrap()["error"]["message"], "Parse error");
 
         let (st, body) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             br#"{"jsonrpc":2,"method":"getblockcount"}"#,
         )
@@ -679,7 +736,7 @@ mod tests {
         );
 
         let (st, _) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             br#"{"jsonrpc":"1.1","id":1,"method":"invalidmethod"}"#,
         )
@@ -697,12 +754,11 @@ mod tests {
         let mp =
             MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
         let cfg = RpcConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
-            rpc_user: Some("testuser".into()),
-            rpc_password: Some("testpass".into()),
-            cookie_path: None,
+            token_path: None,
             subversion: None,
             work_queue: Some(1),
 
@@ -713,7 +769,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let (st, body) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
         )
@@ -726,7 +782,7 @@ mod tests {
             {"jsonrpc":"1.0","id":2,"method":"getblockcount"}
         ]);
         let (st, body) = post_raw(
-            handle.local_addr,
+            tcp_addr(&handle),
             &handle.auth,
             batch.to_string().as_bytes(),
         )
@@ -744,7 +800,7 @@ mod tests {
         let mut hits = Vec::new();
         let mut set = tokio::task::JoinSet::new();
         for _ in 0..16 {
-            let addr = handle.local_addr;
+            let addr = tcp_addr(&handle);
             let auth = handle.auth.clone();
             set.spawn(async move {
                 post_raw(
@@ -778,12 +834,11 @@ mod tests {
         let mp =
             MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
         let cfg = RpcConfig {
-            listen: "127.0.0.1:0".parse().unwrap(),
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
-            rpc_user: Some("testuser".into()),
-            rpc_password: Some("testpass".into()),
-            cookie_path: None,
+            token_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -792,7 +847,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        let addr = handle.local_addr;
+        let addr = tcp_addr(&handle);
         let auth = &handle.auth;
 
         let (st, _) = http_verb(addr, "GET", "/", auth, b"").await;
@@ -897,7 +952,7 @@ mod tests {
         body: &[u8],
     ) -> (u16, Option<serde_json::Value>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let auth_h = basic_auth_header(auth);
+        let auth_h = auth_header(auth);
         let req = format!(
             "{verb} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -921,5 +976,111 @@ mod tests {
             Some(serde_json::from_str(json_body).unwrap_or(serde_json::json!(json_body)))
         };
         (status, parsed)
+    }
+
+    #[tokio::test]
+    async fn tcp_bearer_and_harness_basic_password() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-token").expect("temp dir");
+        std::fs::write(dir.path().join("rpc.token"), "pass").unwrap();
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let addr = tcp_addr(&handle);
+        let count = post_rpc(addr, &handle.auth, "getblockcount", serde_json::json!([]))
+            .await
+            .unwrap();
+        assert_eq!(count["result"], 0, "{count}");
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode("ignored:pass");
+        let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic {basic}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("\"result\":0") || text.contains("\"result\": 0"),
+            "{text}"
+        );
+        handle.shutdown().await;
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unix_socket_without_tcp_refuses_without_af_unix() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-sock-win").expect("temp dir");
+        let sock = dir.path().join("rpc.sock");
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: None,
+            socket_path: Some(sock),
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let err = run_rpc(cfg, q, None, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("rpc-listen") || err.contains("AF_UNIX"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_needs_no_http_auth() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-sock").expect("temp dir");
+        let sock = dir.path().join("rpc.sock");
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: None,
+            socket_path: Some(sock.clone()),
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(sock.exists(), "socket file");
+        let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("\"result\":0") || text.contains("\"result\": 0"),
+            "unix unauthenticated getblockcount: {text}"
+        );
+        handle.shutdown().await;
     }
 }

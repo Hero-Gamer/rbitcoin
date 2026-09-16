@@ -12,9 +12,11 @@ name = "rbitcoin-cli"
 path = "src/main.rs"
 
 [dependencies]
+rbitcoin-primitives = { workspace = true }
 mimalloc = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.23"
+socket2 = { version = "0.6", features = ["all"] }
+
 
 [lints]
 workspace = true

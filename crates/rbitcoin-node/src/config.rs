@@ -2,7 +2,7 @@ use crate::error::NodeError;
 use bitcoin::hex::FromHex;
 use bitcoin::ScriptBuf;
 use rbitcoin_consensus::{ChainParams, Milestone};
-use rbitcoin_primitives::Network;
+use rbitcoin_primitives::{Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT};
 use rbitcoin_store::HeadScale;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
     Ok(whole.saturating_mul(100_000_000).saturating_add(frac_n))
 }
 
-/// Process datadir (Class A store, cookie, debug.log, mempool).
+/// Process datadir (Class A store, rpc.token / rpc.sock, debug.log, mempool).
 ///
 /// Cold store is [`Self::cold`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,12 +130,17 @@ impl Default for MempoolOpts {
     }
 }
 
-/// JSON-RPC HTTP listen and auth.
+/// JSON-RPC listen and auth.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RpcOpts {
+    /// TCP bind. Filled from `--rpc-listen` (optional ADDR uses network default port).
     pub listen: Option<SocketAddr>,
-    pub user: Option<String>,
-    pub password: Option<String>,
+    /// `--rpc-listen` was set with no ADDR; resolve after `--network`.
+    pub listen_default: bool,
+    /// Unix socket at `{datadir}/rpc.sock` (`--rpc` or `--rpc-listen`).
+    pub socket: bool,
+    /// Override `{datadir}/rpc.token`.
+    pub token_file: Option<PathBuf>,
     pub work_queue: Option<usize>,
 }
 
@@ -393,27 +398,43 @@ impl NodeConfig {
         }
         if self.listen.electrum.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "electrum-listen requires shindex=1 (--shindex); Electrum history needs Class B scripthash"
+                "electrum-listen requires sh_index=1 (--sh-index); Electrum history needs Class B scripthash"
                     .into(),
             ));
         }
         if self.listen.esplora.is_some() && !self.shindex {
             return Err(NodeError::Config(
-                "esplora-listen requires shindex=1 (--shindex); Esplora history needs Class B scripthash"
+                "esplora-listen requires sh_index=1 (--sh-index); Esplora history needs Class B scripthash"
                     .into(),
-            ));
-        }
-        if self.rpc.listen.is_some() && (self.rpc.user.is_some() ^ self.rpc.password.is_some()) {
-            return Err(NodeError::Config(
-                "rpcuser and rpcpassword must both be set (or both unset for cookie auth)".into(),
             ));
         }
         Ok(())
     }
 
-    /// Path for Core-style RPC cookie (`{datadir}/.cookie`).
-    pub fn rpc_cookie_path(&self) -> PathBuf {
-        self.datadir.path().join(".cookie")
+    /// Fill `--rpc-listen` omitted ADDR from `--network`. Implies unix socket.
+    pub fn resolve_listen_defaults(&mut self) {
+        if self.rpc.listen_default && self.rpc.listen.is_none() {
+            self.rpc.listen = Some(SocketAddr::from((
+                [127, 0, 0, 1],
+                self.network.default_rpc_port(),
+            )));
+        }
+        if self.rpc.listen.is_some() {
+            self.rpc.socket = true;
+        }
+    }
+
+    /// `{datadir}/rpc.token`.
+    pub fn rpc_token_path(&self) -> PathBuf {
+        self.rpc
+            .token_file
+            .clone()
+            .unwrap_or_else(|| rbitcoin_rpc::default_token_path(self.datadir.path()))
+    }
+
+    /// `{datadir}/rpc.sock`.
+    pub fn rpc_socket_path(&self) -> PathBuf {
+        rbitcoin_rpc::default_socket_path(self.datadir.path())
     }
 
     /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
@@ -481,8 +502,7 @@ impl NodeConfig {
     /// Load a simple `key=value` conf (`#` comments). Hyphens and underscores match.
     ///
     /// Operator keys are snake_case (`max_inbound=`). Hyphens match underscores.
-    /// `rpcuser` / `rpcpassword` match Core bitcoin.conf. Core CLI names stay
-    /// on the functional shim only.
+    /// Core CLI names stay on the functional shim only.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -581,29 +601,33 @@ impl NodeConfig {
                 }
             }
             "electrum_listen" => {
-                self.listen.electrum = Some(
+                self.listen.electrum = Some(if val.is_empty() {
+                    SocketAddr::from(([127, 0, 0, 1], DEFAULT_ELECTRUM_PORT))
+                } else {
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf electrum_listen: {e}")))?,
-                );
+                        .map_err(|e| NodeError::Config(format!("conf electrum_listen: {e}")))?
+                });
             }
             "esplora_listen" => {
-                self.listen.esplora = Some(
+                self.listen.esplora = Some(if val.is_empty() {
+                    SocketAddr::from(([127, 0, 0, 1], DEFAULT_ESPLORA_PORT))
+                } else {
                     val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?,
-                );
+                        .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?
+                });
             }
-            "shindex" => {
+            "sh_index" => {
                 self.shindex = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf shindex: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
             }
-            "sptweaks" => {
+            "sp_tweaks" => {
                 self.sptweaks = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf sptweaks: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sp_tweaks: {e}")))?;
             }
-            "sptweaks_dust" => {
+            "sp_tweaks_dust" => {
                 self.sptweaks_dust = val
                     .parse()
-                    .map_err(|e| NodeError::Config(format!("conf sptweaks_dust: {e}")))?;
+                    .map_err(|e| NodeError::Config(format!("conf sp_tweaks_dust: {e}")))?;
             }
             "max_sh_creates" => {
                 self.max_sh_creates = val
@@ -614,14 +638,35 @@ impl NodeConfig {
                 self.esplora_block_template = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
             }
-            "rpc_listen" => {
-                self.rpc.listen = Some(
-                    val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf rpc_listen: {e}")))?,
-                );
+            "rpc" => {
+                self.rpc.socket = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf rpc: {e}")))?;
             }
-            "rpcuser" => self.rpc.user = Some(val.to_string()),
-            "rpcpassword" => self.rpc.password = Some(val.to_string()),
+            "rpc_listen" => {
+                self.rpc.socket = true;
+                if val.is_empty() {
+                    self.rpc.listen_default = true;
+                } else {
+                    self.rpc.listen = Some(
+                        val.parse()
+                            .map_err(|e| NodeError::Config(format!("conf rpc_listen: {e}")))?,
+                    );
+                }
+            }
+            "rpcuser" | "rpcpassword" => {
+                return Err(NodeError::Config(
+                    "rpcuser/rpcpassword removed; unix socket --rpc or Bearer {datadir}/rpc.token"
+                        .into(),
+                ));
+            }
+            "rpc_token_file" => {
+                if val.is_empty() {
+                    return Err(NodeError::Config(
+                        "conf rpc_token_file requires a path".into(),
+                    ));
+                }
+                self.rpc.token_file = Some(PathBuf::from(val));
+            }
             "ua_comment" => self.uacomments.push(val.to_string()),
             "test_activation_height" => {
                 let (name, height) = ChainParams::parse_test_activation_height(val)
@@ -933,6 +978,30 @@ mod tests {
     }
 
     #[test]
+    fn rpc_listen_and_dropped_user_apply_kv() {
+        let err = NodeConfig::default()
+            .apply_kv("rpcuser", "u")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rpc.token"), "{err}");
+        let err = NodeConfig::default()
+            .apply_kv("rpcpassword", "p")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rpc.token"), "{err}");
+        let mut rpc = NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        };
+        assert_eq!(rpc.apply_kv("rpc", "1").unwrap(), ConfApply::Applied);
+        assert!(rpc.rpc.socket);
+        assert_eq!(rpc.apply_kv("rpc_listen", "").unwrap(), ConfApply::Applied);
+        rpc.resolve_listen_defaults();
+        assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
+        assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
     fn max_sh_creates_and_esplora_block_template_apply_kv() {
         let mut c = NodeConfig::default();
         assert_eq!(c.max_sh_creates, 0);
@@ -946,6 +1015,15 @@ mod tests {
             ConfApply::Unknown(k) => assert_eq!(k, "maxshcreates"),
             other => panic!("{other:?}"),
         }
+        assert_eq!(c.apply_kv("sh_index", "1").unwrap(), ConfApply::Applied);
+        assert!(c.shindex);
+        assert_eq!(c.apply_kv("sp_tweaks", "1").unwrap(), ConfApply::Applied);
+        assert!(c.sptweaks);
+        assert_eq!(
+            c.apply_kv("sp_tweaks_dust", "546").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.sptweaks_dust, 546);
         assert_eq!(c.max_sh_creates, 100);
         let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
         assert!(
@@ -962,6 +1040,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(c.esplora_block_template);
+    }
+
+    #[test]
+    fn concatenated_index_conf_keys_are_unknown() {
+        let mut c = NodeConfig::default();
+        match c.apply_kv("shindex", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "shindex"),
+            other => panic!("{other:?}"),
+        }
+        match c.apply_kv("sptweaks", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "sptweaks"),
+            other => panic!("{other:?}"),
+        }
+        match c.apply_kv("sptweaks_dust", "1").unwrap() {
+            ConfApply::Unknown(k) => assert_eq!(k, "sptweaks_dust"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1383,8 +1478,8 @@ mod tests {
         cfg.shindex = false;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("shindex"),
-            "expected shindex requirement, got {err}"
+            err.contains("sh_index") || err.contains("--sh-index"),
+            "expected sh-index requirement, got {err}"
         );
     }
 
@@ -1394,7 +1489,10 @@ mod tests {
         cfg.listen.esplora = Some("127.0.0.1:3000".parse().unwrap());
         cfg.shindex = false;
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("shindex"), "got {err}");
+        assert!(
+            err.contains("sh_index") || err.contains("--sh-index"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1409,7 +1507,7 @@ mod tests {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("sp.conf");
-        std::fs::write(&conf, "sptweaks=1\n").unwrap();
+        std::fs::write(&conf, "sp_tweaks=1\n").unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert!(cfg.sptweaks);
@@ -1425,20 +1523,20 @@ mod tests {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("dust.conf");
-        std::fs::write(&conf, "sptweaks_dust=546\n").unwrap();
+        std::fs::write(&conf, "sp_tweaks_dust=546\n").unwrap();
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert_eq!(cfg.sptweaks_dust, 546);
         let conf0 = dir.join("dust0.conf");
-        std::fs::write(&conf0, "sptweaks_dust=0\n").unwrap();
+        std::fs::write(&conf0, "sp_tweaks_dust=0\n").unwrap();
         let mut cfg0 = NodeConfig::default().with_datadir(dir.join("d0"));
         cfg0.merge_conf_file(&conf0).unwrap();
         assert_eq!(cfg0.sptweaks_dust, 0);
         let bad = dir.join("dust-bad.conf");
-        std::fs::write(&bad, "sptweaks_dust=nope\n").unwrap();
+        std::fs::write(&bad, "sp_tweaks_dust=nope\n").unwrap();
         let mut cfg_bad = NodeConfig::default().with_datadir(dir.join("db"));
         let err = cfg_bad.merge_conf_file(&bad).unwrap_err().to_string();
-        assert!(err.contains("sptweaks_dust"), "{err}");
+        assert!(err.contains("sp_tweaks_dust"), "{err}");
     }
 
     #[test]
@@ -1458,7 +1556,7 @@ mod tests {
             &conf,
             "listen=127.0.0.1:18444\n\
              connect=127.0.0.1:18445\n\
-             shindex=1\n\
+             sh_index=1\n\
              electrum_listen=127.0.0.1:50001\n\
              esplora_listen=127.0.0.1:3000\n\
              rpc_listen=127.0.0.1:8332\n\
