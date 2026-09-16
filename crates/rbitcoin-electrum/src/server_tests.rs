@@ -961,6 +961,103 @@ async fn api_log_records_electrum_method() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn pin_verbose_and_id_from_pos(
+    q: &Query,
+    cfg: &ElectrumConfig,
+    params: &ChainParams,
+    txid_hex: &str,
+    header_sub: &mut bool,
+    sh_subs: &mut HashSet<[u8; 32]>,
+) {
+    let raw = dispatch(
+        "blockchain.transaction.get",
+        &json!([txid_hex]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert!(raw.as_str().unwrap().len() > 10);
+    let verbose = dispatch(
+        "blockchain.transaction.get",
+        &json!([txid_hex, true]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert!(verbose.get("hex").is_some());
+    assert_eq!(verbose["time"], 1);
+    assert_eq!(verbose["blocktime"], 1);
+    assert_eq!(verbose["version"], 1);
+    assert_eq!(verbose["locktime"], 0);
+    assert!(verbose["size"].as_u64().unwrap() > 0);
+    assert_eq!(verbose["hash"].as_str().unwrap().len(), 64);
+    assert!(verbose["vin"][0].get("coinbase").is_some());
+    assert_eq!(verbose["vout"][0]["n"], 0);
+    assert!(verbose["confirmations"].as_u64().unwrap() >= 1);
+    let want_bh = q
+        .wire_header_at_height(rbitcoin_primitives::Height(0))
+        .unwrap()
+        .block_hash();
+    assert_eq!(verbose["blockhash"].as_str().unwrap(), want_bh.to_string());
+    let merkle = dispatch(
+        "blockchain.transaction.get_merkle",
+        &json!([txid_hex, 0]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert_eq!(merkle["block_height"], 0);
+    let idpos = dispatch(
+        "blockchain.transaction.id_from_pos",
+        &json!([0, 0]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert_eq!(idpos.as_str().unwrap(), txid_hex);
+    let idpos_false = dispatch(
+        "blockchain.transaction.id_from_pos",
+        &json!([0, 0, false]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert_eq!(idpos_false.as_str().unwrap(), txid_hex);
+    let idpos_m = dispatch(
+        "blockchain.transaction.id_from_pos",
+        &json!([0, 0, true]),
+        q,
+        cfg,
+        params,
+        None,
+        header_sub,
+        sh_subs,
+    )
+    .unwrap();
+    assert_eq!(idpos_m["tx_hash"].as_str().unwrap(), txid_hex);
+    assert!(idpos_m["merkle"].as_array().is_some());
+}
+
 #[test]
 fn dispatch_on_connected_chain() {
     use rbitcoin_primitives::{Fk, Height};
@@ -1078,56 +1175,7 @@ fn dispatch_on_connected_chain() {
         r.reverse();
         rbitcoin_primitives::hex_encode(r)
     };
-    let raw = dispatch(
-        "blockchain.transaction.get",
-        &json!([txid_hex]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    assert!(raw.as_str().unwrap().len() > 10);
-    let verbose = dispatch(
-        "blockchain.transaction.get",
-        &json!([txid_hex, true]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    assert!(verbose.get("hex").is_some());
-
-    let merkle = dispatch(
-        "blockchain.transaction.get_merkle",
-        &json!([txid_hex, 0]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    assert_eq!(merkle["block_height"], 0);
-
-    let idpos = dispatch(
-        "blockchain.transaction.id_from_pos",
-        &json!([0, 0]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    assert_eq!(idpos.as_str().unwrap(), txid_hex);
+    pin_verbose_and_id_from_pos(&q, &cfg, &params, &txid_hex, &mut header_sub, &mut sh_subs);
 
     // Missing tx.
     let miss = [0xeeu8; 32];
@@ -2554,6 +2602,12 @@ fn dispatch_live_mempool_surfaces() {
     );
     // Either confirmed path or mempool — must succeed for live parent.
     assert!(got.is_ok(), "{got:?}");
+    let got = got.unwrap();
+    if got.get("blockhash").is_none() {
+        assert_eq!(got["confirmations"], 0);
+        assert!(got.get("time").is_none());
+        assert!(got.get("blocktime").is_none());
+    }
 
     // Broadcast a second spend of coinbase[1]
     let second = Transaction {

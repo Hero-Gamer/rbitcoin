@@ -591,6 +591,23 @@ async fn electrum_server_version_history_balance() {
     .await;
     let txid_hex = v["result"].as_str().expect("txid").to_string();
     assert_eq!(txid_hex.len(), 64);
+    let v = rpc(
+        &mut stream,
+        50,
+        "blockchain.transaction.id_from_pos",
+        json!([1, 0, false]),
+    )
+    .await;
+    assert_eq!(v["result"].as_str(), Some(txid_hex.as_str()));
+    let v = rpc(
+        &mut stream,
+        51,
+        "blockchain.transaction.id_from_pos",
+        json!([1, 0, true]),
+    )
+    .await;
+    assert_eq!(v["result"]["tx_hash"].as_str(), Some(txid_hex.as_str()));
+    assert!(v["result"]["merkle"].as_array().is_some(), "{v}");
 
     let v = rpc(
         &mut stream,
@@ -609,6 +626,13 @@ async fn electrum_server_version_history_balance() {
     )
     .await;
     assert!(v["result"]["hex"].as_str().is_some());
+    assert!(v["result"]["vin"][0].get("coinbase").is_some());
+    assert_eq!(v["result"]["vout"][0]["n"], 0);
+    assert!(v["result"]["size"].as_u64().unwrap() > 0);
+    let time = v["result"]["time"].as_u64().expect("verbose time");
+    assert_eq!(v["result"]["blocktime"].as_u64(), Some(time));
+    assert!(v["result"]["confirmations"].as_u64().unwrap() >= 1);
+    assert_eq!(v["result"]["blockhash"].as_str().unwrap().len(), 64, "{v}");
 
     let v = rpc(
         &mut stream,

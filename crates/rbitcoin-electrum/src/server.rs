@@ -1606,10 +1606,7 @@ fn dispatch_pinned(
                 if confirmed_ok {
                     let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
                     if verbose {
-                        return Ok(json!({
-                            "hex": rbitcoin_primitives::hex_encode(&raw),
-                            "txid": txid_hex(&txid)
-                        }));
+                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk), chain.network));
                     }
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
@@ -1621,10 +1618,7 @@ fn dispatch_pinned(
                     if let Some(tx) = mp.get_tx(&tid) {
                         let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(json!({
-                                "hex": rbitcoin_primitives::hex_encode(&raw),
-                                "txid": txid_hex(&txid)
-                            }));
+                            return Ok(verbose_tx_json(query, &raw, &txid, None, chain.network));
                         }
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
@@ -1749,18 +1743,7 @@ fn dispatch_pinned(
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
         }
-        "blockchain.transaction.id_from_pos" => {
-            let height = param_u32(params, 0)?;
-            let tx_pos = param_u32(params, 1)? as usize;
-            let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
-                if matches!(e, StoreError::NotFound) {
-                    "pos out of range".to_string()
-                } else {
-                    e.to_string()
-                }
-            })?;
-            Ok(json!(txid_hex(&txid)))
-        }
+        "blockchain.transaction.id_from_pos" => id_from_pos(query, params),
         "blockchain.estimatefee" => {
             let target = param_u32(params, 0).unwrap_or(2);
             let fee = mempool
@@ -2056,6 +2039,126 @@ fn param_txid(params: &Value, idx: usize) -> Result<[u8; 32], String> {
 
 fn txid_hex(txid: &[u8; 32]) -> String {
     hash_hex_rev(txid)
+}
+
+fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
+    let height = param_u32(params, 0)?;
+    let tx_pos = param_u32(params, 1)? as usize;
+    let want_merkle = params
+        .as_array()
+        .and_then(|a| a.get(2))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let txid = query.block_txid_at(Height(height), tx_pos).map_err(|e| {
+        if matches!(e, StoreError::NotFound) {
+            "pos out of range".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    if !want_merkle {
+        return Ok(json!(txid_hex(&txid)));
+    }
+    let proof = query
+        .merkle_proof(Height(height), &txid)
+        .map_err(|e| e.to_string())?;
+    let merkle: Vec<String> = proof.merkle.iter().map(hash_hex_rev).collect();
+    Ok(json!({
+        "tx_hash": txid_hex(&txid),
+        "merkle": merkle,
+    }))
+}
+
+/// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
+/// stamp); None = mempool (`confirmations: 0`, no block fields).
+fn verbose_tx_json(
+    query: &Query,
+    raw: &[u8],
+    txid: &[u8; 32],
+    fk: Option<Fk>,
+    network: bitcoin::Network,
+) -> Value {
+    let mut obj = json!({
+        "hex": rbitcoin_primitives::hex_encode(raw),
+        "txid": txid_hex(txid),
+        "size": raw.len(),
+    });
+    if let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw) {
+        obj["version"] = json!(tx.version.0);
+        obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
+        obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));
+        obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
+        obj["vout"] = Value::Array(
+            tx.output
+                .iter()
+                .enumerate()
+                .map(|(n, o)| verbose_vout(n, o, network))
+                .collect(),
+        );
+    }
+    match fk {
+        Some(fk) => {
+            if let Ok(Some(h)) = query.store().tx_height_get(fk) {
+                if let Ok(hdr) = query.wire_header_at_height(Height(h)) {
+                    let ts = hdr.time;
+                    obj["time"] = json!(ts);
+                    obj["blocktime"] = json!(ts);
+                    obj["blockhash"] = json!(hash_hex_rev(&hdr.block_hash().to_byte_array()));
+                    let tip = query.tip_height().map(|t| t.0).unwrap_or(h);
+                    obj["confirmations"] = json!(tip.saturating_sub(h).saturating_add(1));
+                }
+            }
+        }
+        None => {
+            obj["confirmations"] = json!(0);
+        }
+    }
+    obj
+}
+
+fn verbose_vin(input: &bitcoin::TxIn) -> Value {
+    if input.previous_output.is_null() {
+        json!({
+            "coinbase": rbitcoin_primitives::hex_encode(input.script_sig.as_bytes()),
+            "sequence": input.sequence.0,
+        })
+    } else {
+        let mut v = json!({
+            "txid": input.previous_output.txid.to_string(),
+            "vout": input.previous_output.vout,
+            "scriptSig": {
+                "asm": input.script_sig.to_asm_string(),
+                "hex": rbitcoin_primitives::hex_encode(input.script_sig.as_bytes()),
+            },
+            "sequence": input.sequence.0,
+        });
+        if !input.witness.is_empty() {
+            v["txinwitness"] = Value::Array(
+                input
+                    .witness
+                    .iter()
+                    .map(|w| json!(rbitcoin_primitives::hex_encode(w)))
+                    .collect(),
+            );
+        }
+        v
+    }
+}
+
+fn verbose_vout(n: usize, out: &bitcoin::TxOut, network: bitcoin::Network) -> Value {
+    let mut spk = json!({
+        "asm": out.script_pubkey.to_asm_string(),
+        "hex": rbitcoin_primitives::hex_encode(out.script_pubkey.as_bytes()),
+    });
+    if let Ok(addr) = bitcoin::Address::from_script(&out.script_pubkey, network) {
+        spk["address"] = json!(addr.to_string());
+        spk["addresses"] = json!([addr.to_string()]);
+    }
+    json!({
+        "value": out.value.to_btc(),
+        "n": n,
+        "scriptPubKey": spk,
+    })
 }
 
 fn hash_hex_rev(h: &[u8; 32]) -> String {
