@@ -148,7 +148,7 @@ async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-const RPC_BASIC: &str = "Basic dXNlcjpwYXNz";
+const RPC_BASIC: &str = "Basic dXNlcjpwYXNz"; // password `pass` == rpc.token
 
 fn ephemeral_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2304,8 +2304,7 @@ async fn node_run_p2p_short() {
         cfg.listen.esplora = Some(esplora_addr);
         cfg.shindex = true;
         cfg.rpc.listen = Some(rpc_addr);
-        cfg.rpc.user = Some("user".into());
-        cfg.rpc.password = Some("pass".into());
+        std::fs::write(node_dir.path().join("rpc.token"), "pass").unwrap();
         cfg.max_run_secs = Some(60);
         cfg.mempool.blocksonly = true;
         cfg.max_tip_age_secs = Some(u64::MAX);

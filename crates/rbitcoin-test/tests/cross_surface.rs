@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-/// HTTP Basic for `user:pass` (same pair NodeConfig uses below).
+/// HTTP Basic for `user:pass` (password must equal `{datadir}/rpc.token`).
 const RPC_BASIC: &str = "Basic dXNlcjpwYXNz";
 
 fn ephemeral_addr() -> SocketAddr {
@@ -483,8 +483,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(esplora_addr);
     cfg.rpc.listen = Some(rpc_addr);
-    cfg.rpc.user = Some("user".into());
-    cfg.rpc.password = Some("pass".into());
+    std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     cfg.max_run_secs = Some(90);
 
     let node = tokio::spawn(run_p2p(cfg));
