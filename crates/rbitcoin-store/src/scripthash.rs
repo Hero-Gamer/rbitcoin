@@ -1659,34 +1659,58 @@ impl ScriptHashTable {
         if sealed_ovf_ups.is_empty() {
             return Ok(());
         }
+        let missed = self.sealed_ovf_l0_misses(&sealed_ovf_ups)?;
+        self.sealed_miss_try_l1(missed, ingest_ups)
+    }
+
+    fn sealed_ovf_l0_misses(
+        &self,
+        sealed_ovf_ups: &[([u8; 32], ShHeadValue)],
+    ) -> Result<Vec<([u8; 32], ShHeadValue)>, StoreError> {
         let mut missed: Vec<([u8; 32], ShHeadValue)> = Vec::new();
-        {
-            let g = self.sealed_ovf.lock().unwrap();
-            for (key, val) in &sealed_ovf_ups {
-                let hk = head_key_from_full(key);
-                let mut hit = false;
-                for h in g.iter().rev() {
-                    if h.update_value(&hk, val)? {
-                        hit = true;
-                        break;
-                    }
-                }
-                if !hit {
-                    missed.push((*key, val.clone()));
-                }
+        let g = self.sealed_ovf.lock().unwrap();
+        for (key, val) in sealed_ovf_ups {
+            if !self.sealed_ovf_update_rev(&g, key, val)? {
+                missed.push((*key, val.clone()));
             }
         }
-        for (key, val) in missed {
-            let hk = head_key_from_full(&key);
-            let mut hit = false;
-            if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
-                hit = l1.head.update_value(&hk, &val)?;
+        Ok(missed)
+    }
+
+    fn sealed_ovf_update_rev(
+        &self,
+        sealed: &[SortedHead],
+        key: &[u8; 32],
+        val: &ShHeadValue,
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        for h in sealed.iter().rev() {
+            if h.update_value(&hk, val)? {
+                return Ok(true);
             }
-            if !hit {
+        }
+        Ok(false)
+    }
+
+    fn sealed_miss_try_l1(
+        &self,
+        missed: Vec<([u8; 32], ShHeadValue)>,
+        ingest_ups: &mut Vec<([u8; 32], ShHeadValue)>,
+    ) -> Result<(), StoreError> {
+        for (key, val) in missed {
+            if !self.ovf_l1_update(&key, &val)? {
                 ingest_ups.push((key, val));
             }
         }
         Ok(())
+    }
+
+    fn ovf_l1_update(&self, key: &[u8; 32], val: &ShHeadValue) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(key);
+        if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
+            return l1.head.update_value(&hk, val);
+        }
+        Ok(false)
     }
 
     fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
