@@ -2309,10 +2309,11 @@ impl ScriptHashTable {
     ) -> Result<(), StoreError> {
         let g = self.ingest.lock().unwrap();
         if new_val.is_empty() {
-            g.clear_key(scripthash)
+            g.clear_key(scripthash)?;
         } else {
-            g.insert(scripthash, new_val)
+            g.insert(scripthash, new_val)?;
         }
+        Ok(())
     }
 
     fn unlink_write_main(
