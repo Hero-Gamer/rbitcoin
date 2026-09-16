@@ -125,12 +125,7 @@ pub(crate) fn validate_block_structure_precomputed(
 /// Like [`validate_block_structure_precomputed`], reusing lookup-stashed pres
 /// when `pres` is `Some` (no second `from_tx`). Length must match `txdata`.
 /// Caller Arc is returned as-is (refcount only).
-pub fn validate_block_structure_with_pres(
-    block: &Block,
-    ctx: &ValidationContext<'_>,
-    pres: Option<Arc<[TxPrecompute]>>,
-    stats: Option<&rbitcoin_query::ConfirmStats>,
-) -> Result<Arc<[TxPrecompute]>, ConsensusError> {
+fn reject_bad_block_tx_layout(block: &Block) -> Result<(), ConsensusError> {
     if block.txdata.is_empty() {
         return Err(ConsensusError::BadBlock("no transactions"));
     }
@@ -142,6 +137,16 @@ pub fn validate_block_structure_with_pres(
             return Err(ConsensusError::BadBlock("coinbase not first"));
         }
     }
+    Ok(())
+}
+
+pub fn validate_block_structure_with_pres(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: Option<Arc<[TxPrecompute]>>,
+    stats: Option<&rbitcoin_query::ConfirmStats>,
+) -> Result<Arc<[TxPrecompute]>, ConsensusError> {
+    reject_bad_block_tx_layout(block)?;
 
     let n = block.txdata.len();
     let (pres, txid_ns) = if let Some(stashed) = pres {

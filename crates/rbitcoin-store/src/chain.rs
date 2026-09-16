@@ -622,6 +622,24 @@ mod strong_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn count_strong_in_fk_range_skips_zero_bytes() {
+        let dir = tmp();
+        let t = StrongTxTable::create(&dir).unwrap();
+        assert_eq!(t.count_strong_in_fk_range(0, 8).unwrap(), 0);
+        assert_eq!(t.count_strong_in_fk_range(5, 5).unwrap(), 0);
+        assert_eq!(t.count_strong_in_fk_range(100, 200).unwrap(), 0);
+        t.set_strong(Fk(1), Fk(1)).unwrap();
+        t.set_strong(Fk(16), Fk(1)).unwrap();
+        assert_eq!(t.count_strong_in_fk_range(1, 17).unwrap(), 2);
+        assert_eq!(t.count_strong_in_fk_range(2, 16).unwrap(), 0);
+        t.flush().unwrap();
+        drop(t);
+        let t = StrongTxTable::open(&dir).unwrap();
+        assert_eq!(t.count_strong_in_fk_range(1, 17).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `strong_tx` stays L2 even when the Class C array cap would demote it.
     #[test]
     fn strong_tx_always_l2_above_class_c_cap() {
