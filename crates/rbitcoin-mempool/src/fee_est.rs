@@ -288,6 +288,32 @@ pub fn enforce_monotone_desc(rates: &mut [u64]) {
     }
 }
 
+/// After the first defined depth, hold that rate through later holes, then
+/// monotone. Trailing insufficient (no hist, pool thinner than N) must not
+/// bounce above a cheaper mid estimate (Esplora maps -1 to 1.0 sat/vB).
+pub fn hold_defined_then_monotone(rates: &mut [Option<u64>]) {
+    let mut last = None;
+    for r in rates.iter_mut() {
+        match *r {
+            Some(v) => last = Some(v),
+            None => {
+                if let Some(v) = last {
+                    *r = Some(v);
+                }
+            }
+        }
+    }
+    let mut filled: Vec<u64> = rates.iter().copied().flatten().collect();
+    enforce_monotone_desc(&mut filled);
+    let mut i = 0;
+    for r in rates.iter_mut() {
+        if r.is_some() {
+            *r = Some(filled[i]);
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +465,19 @@ mod tests {
         let n144 = historical_far_sat_kvb(&v, 144).unwrap();
         assert!(n1 >= n144, "p99 vs p90: {n1} vs {n144}");
         assert!(n144 >= 1_000);
+    }
+
+    #[test]
+    fn hold_defined_then_monotone_fills_tail_holes() {
+        let mut r = [Some(5_000), Some(900), None, None];
+        hold_defined_then_monotone(&mut r);
+        assert_eq!(r, [Some(5_000), Some(900), Some(900), Some(900)]);
+        let mut empty = [None, None];
+        hold_defined_then_monotone(&mut empty);
+        assert_eq!(empty, [None, None]);
+        let mut mid = [None, Some(200), None];
+        hold_defined_then_monotone(&mut mid);
+        assert_eq!(mid, [None, Some(200), Some(200)]);
     }
 
     #[test]

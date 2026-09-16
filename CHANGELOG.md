@@ -25,6 +25,11 @@ before 1.0).
 
 ### Changed
 
+- **Fee estimates hold the last defined rate into far depths:** when the
+  pool is thinner than N blocks and block-p10 history is empty, 144/504/1008
+  keep the faded mid rate instead of Esplora `1.0` (insufficient sentinel).
+  Empty pool is still `-1` / `1.0`.
+
 - **Operator CLI kebab + conf snake_case:** leftover concatenated Core spellings
   (`--prefillcompact`, `--minrelaytxfee`, `--rpcworkqueue`, …) are advertised as
   kebab (`--prefill-compact`, `--min-relay-tx-fee`, `--rpc-work-queue`). Conf
