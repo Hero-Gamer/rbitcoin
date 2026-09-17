@@ -49,8 +49,6 @@ struct Segment {
     head: Option<Arc<AddressHead>>,
     pack: Option<Arc<TxHeadMphf>>,
     fuse: Option<SealedFuse8>,
-    /// Mixed fuse key + rel while open (for seal). Empty when sealed.
-    open_keys: Mutex<Vec<(u64, u32)>>,
 }
 
 pub(crate) struct SealPublish {
@@ -144,7 +142,6 @@ impl SegmentedTxHead {
                 head,
                 pack,
                 fuse,
-                open_keys: Mutex::new(Vec::new()),
             }));
         }
         let unsealed_nontail = segs
@@ -292,7 +289,7 @@ impl SegmentedTxHead {
             .sum()
     }
 
-    /// Open-segment fuse-key Vec heap (`count × 8`).
+    /// Open-segment fuse-key Vec heap. Always 0: seal collects from `txid.body`.
     pub fn open_keys_resident_bytes(&self) -> u64 {
         (self.open_keys_len() as u64).saturating_mul(12)
     }
@@ -356,7 +353,6 @@ impl SegmentedTxHead {
                 head: s.head.clone(),
                 pack: s.pack.clone(),
                 fuse: Some(fuse),
-                open_keys: Mutex::new(Vec::new()),
             });
             found = true;
             break;
@@ -370,21 +366,9 @@ impl SegmentedTxHead {
         Ok(())
     }
 
-    /// Number of fuse keys buffered for the open tail (diagnostics / tests).
+    /// Fuse keys are not retained on the open tail (diagnostics / tests).
     pub fn open_keys_len(&self) -> usize {
-        let segs = self.segments_snapshot();
-        let Some(last) = segs.last() else {
-            return 0;
-        };
-        if last.sealed {
-            return 0;
-        }
-        let n = last
-            .open_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        n
+        0
     }
 
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
@@ -398,8 +382,23 @@ impl SegmentedTxHead {
     ///
     /// Rolls when open count reaches `max_keys` (80% of slots). Publish drains
     /// on the next `insert_many`, [`Self::flush`], or `Drop` — not joined on
-    /// the roll that started it.
+    /// the roll that started it. Seal keys are collected at roll (see
+    /// [`Self::insert_many_with`]); they are not retained on the open tail.
+    #[cfg(test)]
     pub fn insert_many(&self, entries: &mut [([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many_with(entries, None)
+    }
+
+    /// Insert with an optional seal-key collector (Class A `txid.body` in production).
+    ///
+    /// `collect(first_fk, count)` must return `count` `(fuse_key, rel)` pairs.
+    /// When `None`, this call's inserted keys are used; a roll that needs keys
+    /// from a prior insert (no collector) is `Corrupt`.
+    pub(crate) fn insert_many_with(
+        &self,
+        entries: &mut [([u8; 32], Fk)],
+        collect: Option<&dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError>>,
+    ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -407,6 +406,7 @@ impl SegmentedTxHead {
 
         self.try_publish_seal_locked()?;
 
+        let mut pending: Vec<(u64, u32)> = Vec::new();
         let mut i = 0usize;
         while i < entries.len() {
             self.ensure_open_for(entries[i].1 .0)?;
@@ -419,7 +419,8 @@ impl SegmentedTxHead {
             }
             let count = last.count.load(Ordering::Relaxed);
             if count >= self.max_keys {
-                self.roll_tail_background_locked()?;
+                let pairs = self.seal_pairs_locked(collect, last.first_fk, count, &mut pending)?;
+                self.roll_tail_background_locked(pairs)?;
                 continue;
             }
             let room = self.max_keys - count;
@@ -427,7 +428,6 @@ impl SegmentedTxHead {
             let batch = &mut entries[i..i + take];
             let first_fk = last.first_fk;
 
-            let mut fuse_keys = Vec::with_capacity(batch.len());
             for (mixed, fk) in batch.iter_mut() {
                 if fk.0 < first_fk {
                     return Err(StoreError::Corrupt("tx.head insert fk before segment"));
@@ -437,25 +437,44 @@ impl SegmentedTxHead {
                     return Err(StoreError::Corrupt("tx.head relative fk overflow"));
                 }
                 *fk = Fk(rel);
-                fuse_keys.push((fuse_key_from_mixed(mixed), rel as u32));
+                if collect.is_none() {
+                    pending.push((fuse_key_from_mixed(mixed), rel as u32));
+                }
             }
             last.head
                 .as_ref()
                 .ok_or(StoreError::Corrupt("tx.head insert: open missing OA"))?
                 .insert_many_in_place(batch)?;
-            last.open_keys
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(fuse_keys);
             last.count.fetch_add(batch.len() as u64, Ordering::Relaxed);
             i += take;
 
-            if last.count.load(Ordering::Relaxed) >= self.max_keys {
-                self.roll_tail_background_locked()?;
+            let new_count = last.count.load(Ordering::Relaxed);
+            if new_count >= self.max_keys {
+                let pairs = self.seal_pairs_locked(collect, first_fk, new_count, &mut pending)?;
+                self.roll_tail_background_locked(pairs)?;
             }
         }
         self.persist_meta_locked()?;
         Ok(())
+    }
+
+    fn seal_pairs_locked(
+        &self,
+        collect: Option<&dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError>>,
+        first_fk: u64,
+        count: u64,
+        pending: &mut Vec<(u64, u32)>,
+    ) -> Result<Vec<(u64, u32)>, StoreError> {
+        if let Some(c) = collect {
+            pending.clear();
+            return c(first_fk, count);
+        }
+        if pending.len() as u64 != count {
+            return Err(StoreError::Corrupt(
+                "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
+            ));
+        }
+        Ok(std::mem::take(pending))
     }
 }
 
@@ -749,7 +768,6 @@ impl SegmentedTxHead {
             head: Some(Arc::new(head)),
             pack: None,
             fuse: None,
-            open_keys: Mutex::new(Vec::new()),
         });
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
@@ -834,7 +852,6 @@ impl SegmentedTxHead {
                 head: None,
                 pack: Some(Arc::new(p.pack)),
                 fuse: Some(p.fuse),
-                open_keys: Mutex::new(Vec::new()),
             });
             found = true;
             break;
@@ -853,7 +870,7 @@ impl SegmentedTxHead {
         Ok(())
     }
 
-    fn roll_tail_background_locked(&self) -> Result<(), StoreError> {
+    fn roll_tail_background_locked(&self, pairs: Vec<(u64, u32)>) -> Result<(), StoreError> {
         self.wait_seal_locked()?;
         let segs = self.segments_snapshot();
         let last = segs
@@ -866,24 +883,20 @@ impl SegmentedTxHead {
         if count == 0 {
             return Ok(());
         }
-        let mut pairs = last.open_keys.lock().unwrap_or_else(|e| e.into_inner());
-        let raw_n = pairs.len();
-        if raw_n as u64 != count {
+        if pairs.len() as u64 != count {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
             ));
         }
         let file_id = last.file_id;
         let first_fk = last.first_fk;
-        let taken = std::mem::take(&mut *pairs);
-        drop(pairs);
         if let Some(h) = last.head.as_ref() {
             h.flush()?;
         }
         let next_fk = first_fk.saturating_add(count);
         self.open_new_locked(next_fk)?;
         self.persist_meta_locked()?;
-        self.spawn_seal(file_id, first_fk, count, taken);
+        self.spawn_seal(file_id, first_fk, count, pairs);
         Ok(())
     }
 
@@ -896,7 +909,11 @@ impl SegmentedTxHead {
         });
     }
 
-    fn seal_file_sync_locked(&self, file_id: u32) -> Result<(), StoreError> {
+    fn seal_file_sync_locked(
+        &self,
+        file_id: u32,
+        pairs: Vec<(u64, u32)>,
+    ) -> Result<(), StoreError> {
         self.wait_seal_locked()?;
         let segs = self.segments_snapshot();
         let Some(seg) = segs.iter().find(|s| s.file_id == file_id) else {
@@ -909,7 +926,6 @@ impl SegmentedTxHead {
         if count == 0 {
             return Ok(());
         }
-        let mut pairs = seg.open_keys.lock().unwrap_or_else(|e| e.into_inner());
         if pairs.len() as u64 != count {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
@@ -918,65 +934,35 @@ impl SegmentedTxHead {
         if let Some(h) = seg.head.as_ref() {
             h.flush()?;
         }
-        let taken = std::mem::take(&mut *pairs);
-        drop(pairs);
-        let pubd = build_seal_publish(&self.dir, file_id, seg.first_fk, count, taken)?;
+        let pubd = build_seal_publish(&self.dir, file_id, seg.first_fk, count, pairs)?;
         self.apply_seal_publish_locked(pubd)
     }
 
-    /// Crash reopen: seal every unsealed non-tail (keys already rebuilt).
-    pub fn seal_unsealed_nontail(&self) -> Result<(), StoreError> {
+    /// Crash reopen: seal every unsealed non-tail (caller collected keys).
+    pub fn seal_file_sync(&self, file_id: u32, pairs: Vec<(u64, u32)>) -> Result<(), StoreError> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<u32> = {
-            let segs = self.segments_snapshot();
-            let n = segs.len();
-            segs.iter()
-                .enumerate()
-                .filter(|(i, s)| i + 1 != n && !s.sealed)
-                .map(|(_, s)| s.file_id)
-                .collect()
-        };
-        for id in ids {
-            self.seal_file_sync_locked(id)?;
-        }
-        Ok(())
+        self.seal_file_sync_locked(file_id, pairs)
+    }
+
+    /// Unsealed non-tail `(file_id, first_fk, count)` (in-flight seal after crash).
+    pub fn unsealed_nontail_ranges(&self) -> Vec<(u32, u64, u64)> {
+        let segs = self.segments_snapshot();
+        let n = segs.len();
+        segs.iter()
+            .enumerate()
+            .filter(|(i, s)| i + 1 != n && !s.sealed)
+            .map(|(_, s)| (s.file_id, s.first_fk, s.count.load(Ordering::Relaxed)))
+            .collect()
     }
 
     /// Unsealed segments `(file_id, first_fk, count)` (insert tail + in-flight seal).
+    #[cfg(test)]
     pub fn unsealed_ranges(&self) -> Vec<(u32, u64, u64)> {
         self.segments_snapshot()
             .iter()
             .filter(|s| !s.sealed)
             .map(|s| (s.file_id, s.first_fk, s.count.load(Ordering::Relaxed)))
             .collect()
-    }
-
-    pub fn replace_open_keys_for(&self, file_id: u32, keys: Vec<u64>) -> Result<(), StoreError> {
-        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let segs = self.segments_snapshot();
-        let Some(seg) = segs.iter().find(|s| s.file_id == file_id) else {
-            return Err(StoreError::Corrupt(
-                "tx.head replace_open_keys_for: missing",
-            ));
-        };
-        if seg.sealed {
-            return Err(StoreError::Corrupt(
-                "tx.head replace_open_keys_for: segment sealed",
-            ));
-        }
-        let count = seg.count.load(Ordering::Relaxed);
-        if keys.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head replace_open_keys_for: key count mismatch",
-            ));
-        }
-        let pairs: Vec<(u64, u32)> = keys
-            .into_iter()
-            .enumerate()
-            .map(|(i, k)| (k, (i as u32).saturating_add(1)))
-            .collect();
-        *seg.open_keys.lock().unwrap_or_else(|e| e.into_inner()) = pairs;
-        Ok(())
     }
 
     pub(crate) fn write_sealed_pairs(
@@ -1009,7 +995,6 @@ impl SegmentedTxHead {
                 head: None,
                 pack: Some(Arc::new(p.pack)),
                 fuse: Some(p.fuse),
-                open_keys: Mutex::new(Vec::new()),
             }));
         }
         {
@@ -1436,10 +1421,21 @@ mod tests {
         assert!(fuse_skip, "fuse miss must not pread g pages");
 
         let k = mixed(0xB1B0);
-        h.insert_many(&mut [(k, Fk(821))]).unwrap();
+        let collect = |first_fk: u64, count: u64| {
+            Ok((0..count)
+                .map(|i| {
+                    let fk = first_fk + i;
+                    let m = if fk == 821 { k } else { mixed(fk) };
+                    (fuse_key_from_mixed(&m), (i as u32) + 1)
+                })
+                .collect())
+        };
+        h.insert_many_with(&mut [(k, Fk(821))], Some(&collect))
+            .unwrap();
         let mut fill: Vec<_> = (822..1639).map(|i| (mixed(i), Fk(i))).collect();
-        h.insert_many(&mut fill).unwrap();
-        h.insert_many(&mut [(k, Fk(1639))]).unwrap();
+        h.insert_many_with(&mut fill, Some(&collect)).unwrap();
+        h.insert_many_with(&mut [(k, Fk(1639))], Some(&collect))
+            .unwrap();
         let cands = h.probe_candidates(&k).unwrap();
         assert_eq!(
             cands.first().copied(),
@@ -1537,17 +1533,7 @@ mod tests {
             h.install_sealed_fuse(0, fuse).unwrap();
             let p = h.fuse_path_for_file_id(0);
             assert!(p.to_string_lossy().contains("000000.fuse8"));
-            assert!(h.replace_open_keys_for(open_id, vec![1, 2, 3]).is_err());
-            let open_n = h
-                .segments_snapshot()
-                .last()
-                .map(|s| s.count.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(0);
-            if open_n > 0 {
-                let keys: Vec<u64> = (0..open_n).map(|i| i + 1).collect();
-                h.replace_open_keys_for(open_id, keys).unwrap();
-                assert_eq!(h.open_keys_len() as u64, open_n);
-            }
+            assert_eq!(h.open_keys_len(), 0);
             h.flush().unwrap();
         }
 
@@ -1569,11 +1555,8 @@ mod tests {
         let dir_roll = tmp();
         let layout_roll = HeadLayout::with_entry_bytes(8, 4).unwrap();
         let h_roll = SegmentedTxHead::create(&dir_roll, layout_roll).unwrap();
-        let mut batch1: Vec<_> = (0..203u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&mut batch1).unwrap();
-        assert_eq!(h_roll.segment_count(), 1);
-        let mut batch2: Vec<_> = (203..254u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-        h_roll.insert_many(&mut batch2).unwrap();
+        let mut fill: Vec<_> = (0..254u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h_roll.insert_many(&mut fill).unwrap();
         assert!(h_roll.segment_count() >= 2);
         h_roll.flush().unwrap();
         assert!(h_roll.sealed_segment_count() >= 1);
