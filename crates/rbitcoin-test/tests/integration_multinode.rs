@@ -695,6 +695,16 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         peer.wait_tip_hash(h_empty, Duration::from_secs(5))
             .await
             .expect("first tip via headers/inv");
+        assert!(
+            peer.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| !p.inbound && p.bip152_hb_to),
+            "HB sendcmpct(1) must be decided before the new tip is visible \
+             (peer={:?} seed={:?})",
+            peer.peers.snapshot(),
+            seed.peers.snapshot()
+        );
         wait_ms_until(
             3_000,
             || {
@@ -1997,7 +2007,7 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
 }
 
 /// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
-/// FIFO eviction at 320 stays `hold_body_caps_at_320_fifo`.
+/// FIFO eviction at the cap stays `hold_body_caps_fifo`.
 fn pin_held_sixteen_vs_seventeen(hub: &rbitcoin_net::ChainHub, parent: BlockHash, timestamp: u32) {
     use rbitcoin_net::AcceptOutcome;
 
@@ -2483,4 +2493,64 @@ async fn node_run_p2p_short() {
     tokio::time::timeout(wall, fut)
         .await
         .unwrap_or_else(|_| panic!("node_run_p2p_short wall timeout ({wall:?})"));
+}
+
+/// `feature_bip68_sequence` unconfirmed-inputs: 10× `setmocktime(+600)` plus
+/// generate must not ping-timeout a peer that pongs on localhost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mocktime_generate_keeps_ponging_peer() {
+    let fut = async {
+        let _live = live_p2p_lock().await;
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let a = start_node(&a_dir).await;
+        let mut b = start_node(&b_dir).await;
+        tokio::time::timeout(Duration::from_secs(5), b.follow_from(a.local_addr))
+            .await
+            .expect("follow")
+            .expect("handshake");
+        wait_ms_until(
+            3_000,
+            || !a.peers.snapshot().is_empty() && !b.peers.snapshot().is_empty(),
+            || {
+                format!(
+                    "connected a={:?} b={:?}",
+                    a.peers.snapshot(),
+                    b.peers.snapshot()
+                )
+            },
+        )
+        .await;
+
+        let t0 = a.peers.now_secs();
+        let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        for i in 1..=10u64 {
+            a.peers.set_mock_now(t0 + i * 600);
+            let hub = a.hub.clone();
+            let script = script.clone();
+            tokio::task::spawn_blocking(move || {
+                let _g = rbitcoin_net::BlockingRegion::enter();
+                hub.generate_to_script(1, script, vec![]).expect("generate");
+            })
+            .await
+            .expect("join");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !a.peers.snapshot().is_empty(),
+            "miner must keep the ponging peer after 6000s mocktime+generate: {:?}",
+            a.peers.snapshot()
+        );
+        assert!(
+            !b.peers.snapshot().is_empty(),
+            "follower must stay connected: {:?}",
+            b.peers.snapshot()
+        );
+        a.shutdown().await;
+        b.shutdown().await;
+    };
+    let wall = llvm_cov_wall(60, 180);
+    tokio::time::timeout(wall, fut)
+        .await
+        .unwrap_or_else(|_| panic!("mocktime_generate_keeps_ponging_peer wall timeout ({wall:?})"));
 }

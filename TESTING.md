@@ -292,7 +292,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Restart RAM body queue is empty. Same-process `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads, keeps above-tip wire, unknown height stays queued. `has_block` / known-archived keep and tip+1 gap `missing` stay `bq_rehydrate_residue_keep_drop_gap_and_unknown` |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
 | `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
-| `reorg_same_height_then_multi_block_branch` | P2P/chain (default) | Same-height rival then multi-block reorg to height 6; `getchaintips` `active` vs `valid-fork`; 16 vs 17 equal-work siblings park as `valid-headers` (product held cap 320 does not FIFO at 17); `precious_block` the loser; less work ignored; unknown hash `Block not found`. Held cap 320 FIFO stays `hold_body_caps_at_320_fifo` |
+| `reorg_same_height_then_multi_block_branch` | P2P/chain (default) | Same-height rival then multi-block reorg to height 6; `getchaintips` `active` vs `valid-fork`; 16 vs 17 equal-work siblings park as `valid-headers` (product held cap 320 does not FIFO at 17); `precious_block` the loser; less work ignored; unknown hash `Block not found`. Held cap FIFO stays `hold_body_caps_fifo` |
 | `three_node_relay_path` | P2P (**default**) | Leaf IBD-syncs from a mid node that already synced (hop serve) |
 | `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |
 | `tip_follow_after_ibd` | P2P (**default**) | After IBD, follow + one new tip via inv/headers |
@@ -472,7 +472,10 @@ newer Bitcoin Core release exists than the inventory pin. Label
 ([`docs/releases.md`](docs/releases.md)). It is **not** a required PR check,
 including on PRs that touch net or RPC (too slow). Unlabeled PRs keep the
 default cargo jobs. Default `cargo test` does **not** invoke Core’s Python
-suite.
+suite. A red labeled run is reproduced locally with
+`./scripts/core-functional/run.sh <failing.py>` until that script passes
+([`docs/core-functional.md`](docs/core-functional.md)); do not push-and-wait
+on that job as the inner loop.
 
 ```bash
 python3 scripts/core-functional/check_inventory.py
@@ -480,7 +483,7 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/sync-core-fixtures.test.sh
 ./scripts/core-functional/run.sh.test.sh
 ./scripts/core-functional/run.sh --list
-./scripts/core-functional/run.sh feature_help.py feature_uacomment.py
+./scripts/core-functional/run.sh feature_uacomment.py rpc_uptime.py
 ./scripts/core-functional/bitcoind.test.sh
 ./scripts/core-functional/create_cache.test.sh
 ./scripts/core-functional/check_core_release.test.sh
