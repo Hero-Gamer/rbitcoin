@@ -186,7 +186,7 @@ jobs:
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
 
-  # Line-coverage 91% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
+  # Line-coverage 92% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
   # Slow; waits for the fast gates so a red fmt/clippy/test does not start
   # this job. Required. Job+step timeouts so a hung llvm-cov test binary
   # cannot sit until the runner's 6h default.

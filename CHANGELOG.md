@@ -32,6 +32,9 @@ before 1.0).
 
 ### Changed
 
+- **Coverage LCOV floor 92%:** production `LH*100 >= LF*92` (was 91%). Master
+  has held ~92.0–92.2% since 2026-09-16. Still no never-falls ratchet.
+
 - **Catalog journeys absorb leftover twins:** mature confirm pins Class A then
   accept and `confirm_wire_run` double-spend; unified wire pins empty
   `confirm_wire_run`; Electrum TCP pins `id_from_pos` pos OOB and mempool

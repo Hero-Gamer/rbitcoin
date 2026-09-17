@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Contract: LCOV gate ignores test files (not substring "test"), runs default
-# workspace tests (Tier A IBD included), 91% floor (no never-falls ratchet),
+# workspace tests (Tier A IBD included), 92% floor (no never-falls ratchet),
 # writes Shields JSON. Does not run llvm-cov.
 set -euo pipefail
 
@@ -156,23 +156,23 @@ assert_gate_fail() {
   fi
 }
 
-assert_gate_pass "91.00% floor passes" --lh 91 --lf 100
-assert_gate_fail "90.99% floor fails" --lh 9099 --lf 10000
-assert_gate_pass "production-scale 91.27% passes the 91% floor" \
-  --lh 104220 --lf 114185
-assert_gate_fail "90.00% fails the 91% floor" --lh 90 --lf 100
+assert_gate_pass "92.00% floor passes" --lh 92 --lf 100
+assert_gate_fail "91.99% floor fails" --lh 9199 --lf 10000
+assert_gate_pass "production-scale 92.18% passes the 92% floor" \
+  --lh 110725 --lf 120122
+assert_gate_fail "91.00% fails the 92% floor" --lh 91 --lf 100
 
 st="$(mktemp)"
-python3 "$GATE" --lh 104220 --lf 114185 --status-out "$st" >/dev/null
+python3 "$GATE" --lh 110725 --lf 120122 --status-out "$st" >/dev/null
 python3 - "$st" <<'PY'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text())
 assert d["ok"] is True, d
 assert d["mode"] == "floor", d
-assert d["floor"] == 91, d
+assert d["floor"] == 92, d
 PY
-assert_ok "status-out JSON names 91% floor" true
+assert_ok "status-out JSON names 92% floor" true
 rm -f "$st"
 
 assert_ok "coverage.sh calls coverage-gate.py" \

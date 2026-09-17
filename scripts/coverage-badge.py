@@ -47,7 +47,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--lh", type=int, required=True)
     p.add_argument("--lf", type=int, required=True)
-    p.add_argument("--gate", type=int, default=91)
+    p.add_argument("--gate", type=int, default=92)
     p.add_argument("--sha", default="")
     p.add_argument("--scope", default="production")
     p.add_argument("--date", default="")
