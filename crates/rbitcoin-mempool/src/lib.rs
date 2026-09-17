@@ -10,12 +10,13 @@
 //! | `tx.body` | Packed live records (fee, weight, txid, wtxid, packed tx, vin aux) |
 //!
 //! **Commit model:** body tail complete → slot LIVE → RAM graph. No fsync per
-//! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); tip-follow
-//! drives that from the perf tick. Confirm/RBF DEAD of an already-durable slot
+//! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); that path
+//! appends the body tail and `pwrite`s only new LIVE slot records. Tip-follow
+//! drives it from the perf tick. Confirm/RBF DEAD of an already-durable slot
 //! is an immediate one-record `pwrite` (not a full slot dump).
-//! [`ActiveMempool::flush`] bumps `G` and `sync_data`s sidecars. Crash may lose
-//! ≤5 s of admits; never LIVE slots past durable `tx.body`. Leftover schema 1
-//! converts to packed on open (vin aux empty; SH reindex batch-fills).
+//! [`ActiveMempool::flush`] bumps `G`, rewrites slots, and `sync_data`s. Crash
+//! may lose ≤5 s of admits; never LIVE slots past durable `tx.body`. Leftover
+//! schema 1 converts to packed on open (vin aux empty; SH reindex batch-fills).
 //!
 //! Packed decode uses stored txid/wtxid (no SHA256d). Vin aux is hashed at
 //! admit from resolved prevouts. Compact copies packed payload ranges.

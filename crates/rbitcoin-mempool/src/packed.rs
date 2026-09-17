@@ -6,7 +6,6 @@
 //! admitted wire.
 
 use crate::error::MempoolError;
-use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, Wtxid};
 use rbitcoin_primitives::Fk;
@@ -49,7 +48,7 @@ pub fn encode_packed_live(
     if vins.len() != tx.input.len() && !vins.is_empty() {
         return Err(MempoolError::Corrupt("vin aux count"));
     }
-    let mut out = Vec::with_capacity(80 + serialize(tx).len());
+    let mut out = Vec::with_capacity(80 + tx.input.len() * 80 + tx.output.len() * 40);
     out.extend_from_slice(&fee_sat.to_le_bytes());
     out.extend_from_slice(&weight.to_le_bytes());
     out.extend_from_slice(txid.as_byte_array());
@@ -320,6 +319,7 @@ fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), MempoolError> {
 mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version;
 
     fn sample_tx(annex: bool) -> Transaction {

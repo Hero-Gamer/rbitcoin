@@ -429,7 +429,7 @@ impl ActiveMempool {
         self.store.persist_due()
     }
 
-    /// Time-based sidecar persist (5 s, no fsync). Body tail then slots.
+    /// Time-based sidecar persist (5 s, no fsync). Body tail then new LIVE slots.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
         self.store.persist_due()
     }

@@ -34,6 +34,8 @@ before 1.0).
   Class A instead of per-vin `get_txout` / `chain_prevout`. Leftover schema 1
   converts to packed on open (vin aux empty; SH reindex batch-fills). Packed
   size is not promised smaller than bitcoin serialize (vin aux adds bytes).
+  The 5 s path appends the body tail and `pwrite`s only new LIVE slot records
+  (full slot table still on flush/grow/compact).
 
 - **Same-peer compact retry:** a second `cmpctblock` for a hash already in
   `pending_cmpct` does not take another BIP152 fill slot or send a second

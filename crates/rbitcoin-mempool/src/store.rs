@@ -100,6 +100,8 @@ pub struct Mempool {
     last_persist_ms: u64,
     /// Last `tx.body` write start offset (tests: incremental tail).
     last_body_write_off: u64,
+    /// Bytes written to `slots` on the last persist (tests: incremental pwrite).
+    last_slot_write_bytes: u64,
 }
 
 impl Mempool {
@@ -135,6 +137,7 @@ impl Mempool {
             mock_now_ms: None,
             last_persist_ms: 0,
             last_body_write_off: 0,
+            last_slot_write_bytes: 0,
         };
         let body_schema = u16::from_le_bytes(mp.body[4..6].try_into().unwrap());
         if body_schema == 1 {
@@ -194,8 +197,9 @@ impl Mempool {
 
     /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
     ///
-    /// No fsync. Body tail first, then slots+meta. DEAD of durable slots is
-    /// [`Self::mark_slot_dead`], not this path.
+    /// No fsync. Body tail first, then `pwrite` of new LIVE slot records, then
+    /// meta. DEAD of durable slots is [`Self::mark_slot_dead`]. Flush / grow /
+    /// compact still rewrite the full slot table.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
         if !self.body_dirty {
             return Ok(());
@@ -203,7 +207,13 @@ impl Mempool {
         if self.now_ms().saturating_sub(self.last_persist_ms) < PERSIST_INTERVAL_MS {
             return Ok(());
         }
-        self.persist_body_then_slots()
+        let old_persisted = self.body_persisted_len;
+        self.persist_body_tail()?;
+        self.pwrite_live_slots_since(old_persisted)?;
+        self.persist_meta()?;
+        self.clear_dirty();
+        self.last_persist_ms = self.now_ms();
+        Ok(())
     }
 
     /// Best-effort alias of [`Self::persist_due`] (no generation bump / no fsync).
@@ -229,6 +239,10 @@ impl Mempool {
         self.last_body_write_off
     }
 
+    pub fn last_slot_write_bytes(&self) -> u64 {
+        self.last_slot_write_bytes
+    }
+
     fn clear_dirty(&mut self) {
         self.body_dirty = false;
     }
@@ -238,6 +252,44 @@ impl Mempool {
         self.persist_slots_and_meta()?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
+        Ok(())
+    }
+
+    /// `pwrite` LIVE rows whose payload starts at or past `old_persisted`.
+    ///
+    /// Adjacent new slots are one write. Does not rewrite the rest of the table.
+    fn pwrite_live_slots_since(&mut self, old_persisted: u64) -> Result<(), MempoolError> {
+        let path = self.dir.join("slots");
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            if body_off < old_persisted {
+                continue;
+            }
+            let rec_end = off + SLOT_REC;
+            if let Some((_, end)) = ranges.last_mut() {
+                if *end == off {
+                    *end = rec_end;
+                    continue;
+                }
+            }
+            ranges.push((off, rec_end));
+        }
+        let mut n = 0usize;
+        for (start, end) in ranges {
+            self.slots_file
+                .seek(SeekFrom::Start(start as u64))
+                .map_err(|e| MempoolError::io(&path, e))?;
+            self.slots_file
+                .write_all(&self.slots[start..end])
+                .map_err(|e| MempoolError::io(&path, e))?;
+            n += end - start;
+        }
+        self.last_slot_write_bytes = n as u64;
         Ok(())
     }
 
@@ -373,9 +425,8 @@ impl Mempool {
                 return Err(MempoolError::Corrupt("live slot body range"));
             }
             let start = body_off as usize;
-            let payload = self.body[start..start + body_len].to_vec();
             let new_off = new_body.len() as u64;
-            new_body.extend_from_slice(&payload);
+            new_body.extend_from_slice(&self.body[start..start + body_len]);
             let dst = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
             new_slots[dst] = SLOT_LIVE;
             new_slots[dst + 4..dst + 12].copy_from_slice(&new_off.to_le_bytes());
@@ -598,11 +649,15 @@ impl Mempool {
     fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
         let slots_path = self.dir.join("slots");
         if let Some(disk) = self.demoted_slots_image() {
+            let n = disk.len() as u64;
             self.write_slots_bytes(&slots_path, &disk)?;
+            self.last_slot_write_bytes = n;
         } else {
             let buf = std::mem::take(&mut self.slots);
+            let n = buf.len() as u64;
             let w = Self::write_slots_file(&mut self.slots_file, &slots_path, &buf);
             self.slots = buf;
+            self.last_slot_write_bytes = n;
             w?;
         }
         self.persist_meta()
@@ -1100,6 +1155,38 @@ mod tests {
             &body_after_second[BODY_HEADER..first_end as usize],
             &body_after_first[BODY_HEADER..],
             "first payload bytes must be unchanged"
+        );
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.load_live_txs().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_due_pwrites_only_new_live_slots() {
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let raw = tiny_tx();
+        let t1 = Txid::from_byte_array([0x01; 32]);
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, &[])
+            .unwrap();
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+        assert_eq!(
+            mp.last_slot_write_bytes(),
+            SLOT_REC as u64,
+            "first persist_due writes one LIVE record, not the full table"
+        );
+        let t2 = Txid::from_byte_array([0x02; 32]);
+        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 2, 400, &[])
+            .unwrap();
+        mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+        mp.persist_due().unwrap();
+        assert_eq!(
+            mp.last_slot_write_bytes(),
+            SLOT_REC as u64,
+            "second persist_due must not rewrite the first LIVE record"
         );
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
