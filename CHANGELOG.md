@@ -29,6 +29,11 @@ before 1.0).
   `pending_cmpct` does not take another BIP152 fill slot or send a second
   `getblocktxn`. Two inbound peers can still fill the same hash.
 
+- **Sealed-hot MPHF `g` stays in RAM:** `tx.head` ages `1..=3` unpack BDZ `g`
+  into process heap on open and after each seal (`mphf_g=`; ~0.5 GiB mainnet).
+  Age ≥4 and SH compact `g` stay FdOnly. Tip-follow lookup then does not
+  re-fault those hot pages after a quiet gap between blocks.
+
 - **Class A does not annotate spends:** Tip used to `put_spend_batch` (per-vin
   `tx.head` + spent RMW) and then confirm `post_commit` annotated the same
   slots. Direct already skipped that. Both modes now share the confirm abs-meta

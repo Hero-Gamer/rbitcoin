@@ -50,10 +50,12 @@ leaks.
 
 ## Tip-follow / P2P serve (process heap)
 
-Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
+Not page cache. Caps on **decoded `Block` objects**, live outbound sessions,
+and the sealed-hot `tx.head` `g` pin:
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
+| **Sealed-hot `tx.head` MPHF `g`** | Ages `1..=3` unpacked in process (~0.5 GiB mainnet); age ≥4 FdOnly | Open and each seal pin/evict. Same pin during IBD (pages already hot). |
 | **Hopeless advertised tip** | Connecting headers with `header_branch_vs_tip` **Less** and announced height **+ 288 < our tip** | `request_disconnect` (no ban). `noban` keeps the session. |
 | **`follow_live`** | ≤ `max_outbound` | Stale extra at cap **rotates** one random outbound full-relay (not `noban`) then dials a replacement. |
 | **GetData serve inflight** | **16** full `Block`/`CmpctBlock` per session writer | Writer saturating-decrements after send so unpaired compact tip announce cannot wrap to `usize::MAX`. Announce is not counted on this cap (a burst would starve reconstruct). Extra inv hashes in the same inbound `getdata` past 16 are dropped (not a Core `ProcessGetData` leftover queue). |
@@ -103,7 +105,7 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
 | `fuse8=` ≈ 9 bits × sealed Class A | In-RAM sealed membership filters — intentional; not a leak |
-| `mphf_g=` | Sealed BDZ `g` heap; **0** after FdOnly open (pages are `RssFile`) |
+| `mphf_g=` | Sealed-hot `tx.head` BDZ `g` heap (ages `1..=3`, unpacked); colder sealed ages and SH compact `g` stay **0** (FdOnly pages) |
 | `class_c_l2=` ≈ creates/8 | Strong-tx bit image under the Class C in-RAM cap |
 
 Host check / in-process:
@@ -129,7 +131,7 @@ grep 'tip: perf' mainnet.log
 | `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH catalog runs / tip heads |
-| `heap … iflight= wloc= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins (`iflight=`) + write loc packs (`wloc=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
+| `heap … iflight= wloc= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process heap: BQ + load-ahead CreatePins (`iflight=`) + write loc packs (`wloc=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + **sealed `tx.head` fuse8 fingerprints** + sealed-hot BDZ `g` heap (`mphf_g=`, ages `1..=3`) + open-segment fuse-key Vec + Class C L2 images; residual = anon − accounted |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 
@@ -148,8 +150,9 @@ intentional:
 | **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |
 
 Meters `fuse8=` / `mphf_g=` / `open_keys=` / `class_c_l2=` enter `accounted`.
-`mphf_g=` is **0** after open (FdOnly). Fuse stays the intentional ~1.6 GiB
-heap cost of segmented heads.
+`mphf_g=` is the unpacked sealed-hot `tx.head` `g` (ages `1..=3`; ~0.5 GiB
+mainnet). Colder ages and SH compact `g` stay FdOnly. Fuse stays the
+intentional ~1.6 GiB heap cost of every sealed segment.
 
 Grep:
 
