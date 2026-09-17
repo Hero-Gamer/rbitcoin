@@ -16,6 +16,7 @@ from rpc_proxy import (
     RpcProxy,
     core_btc_kvb_to_sat_vb,
     esplora_port,
+    node_authorization,
     node_rpc_port,
     rewrite_core_maxfeerate,
 )
@@ -52,6 +53,9 @@ assert node_rpc_port(60000) == 50000
 assert esplora_port(50000) == 30000
 assert 1 <= esplora_port(56000) <= 65535
 
+assert node_authorization("__cookie__:secret") == "Bearer secret"
+assert node_authorization("secret") == "Bearer secret"
+
 COOKIE = "__cookie__:secret"
 
 
@@ -61,7 +65,7 @@ class FakeNode(BaseHTTPRequestHandler):
 
     def do_POST(self):
         auth = self.headers.get("Authorization", "")
-        want = "Basic " + base64.b64encode(COOKIE.encode()).decode()
+        want = "Bearer secret"
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n)
         item = json.loads(raw.decode())

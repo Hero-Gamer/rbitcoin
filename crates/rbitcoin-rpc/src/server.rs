@@ -1,6 +1,6 @@
 //! HTTP JSON-RPC server (axum) with Bearer token auth on TCP; unix socket is filesystem-auth.
 
-use crate::auth::{parse_basic_auth, parse_bearer_auth, resolve_rpc_auth, RpcAuth};
+use crate::auth::{parse_bearer_auth, resolve_rpc_auth, RpcAuth};
 use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -492,9 +492,6 @@ fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
     if let Some(tok) = parse_bearer_auth(val) {
         return auth.matches_token(tok);
     }
-    if let Some((_u, p)) = parse_basic_auth(val) {
-        return auth.matches_token(&p);
-    }
     false
 }
 
@@ -979,7 +976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_bearer_and_harness_basic_password() {
+    async fn tcp_bearer_succeeds_and_basic_is_rejected() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-token").expect("temp dir");
         std::fs::write(dir.path().join("rpc.token"), "pass").unwrap();
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
@@ -1015,8 +1012,8 @@ mod tests {
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert!(
-            text.contains("\"result\":0") || text.contains("\"result\": 0"),
-            "{text}"
+            text.contains("401") || text.contains("Unauthorized"),
+            "Basic must not authorize TCP RPC, got {text}"
         );
         handle.shutdown().await;
     }

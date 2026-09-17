@@ -31,6 +31,13 @@ _CORE_MAXFEERATE_MSG = (
 )
 
 
+def node_authorization(cookie_line: str) -> str:
+    """Node TCP is Bearer. TestNode cookie is `__cookie__:<token>`."""
+    prefix = "__cookie__:"
+    token = cookie_line[len(prefix) :] if cookie_line.startswith(prefix) else cookie_line
+    return f"Bearer {token}"
+
+
 def core_btc_kvb_to_sat_vb(value: Any) -> int:
     """Core `maxfeerate` BTC/kvB → node sat/vB. `>= 1` is Core `-8`."""
     if value is None:
@@ -155,12 +162,11 @@ class RpcProxy:
 
     def forward_raw(self, raw: bytes) -> tuple[int, bytes]:
         cookie = self.cookie_line() or ""
-        tok = base64.b64encode(cookie.encode()).decode()
         req = urllib.request.Request(
             self.node_url,
             data=raw,
             headers={
-                "Authorization": f"Basic {tok}",
+                "Authorization": node_authorization(cookie),
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -220,13 +226,12 @@ class RpcProxy:
 
     def forward(self, item: dict[str, Any]) -> dict[str, Any]:
         cookie = self.cookie_line() or ""
-        tok = base64.b64encode(cookie.encode()).decode()
         body = json.dumps(item).encode()
         req = urllib.request.Request(
             self.node_url,
             data=body,
             headers={
-                "Authorization": f"Basic {tok}",
+                "Authorization": node_authorization(cookie),
                 "Content-Type": "application/json",
             },
             method="POST",

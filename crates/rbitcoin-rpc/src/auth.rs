@@ -1,4 +1,4 @@
-//! RPC auth: datadir token file (Bearer) and harness-only Basic password match.
+//! RPC auth: datadir token file (Bearer).
 
 use std::fs;
 use std::io::Write;
@@ -19,11 +19,6 @@ impl RpcAuth {
 
     pub fn matches_token(&self, token: &str) -> bool {
         self.token == token
-    }
-
-    /// Core TestNode cookie line (`__cookie__:<token>`). Not an operator file.
-    pub fn harness_cookie_line(&self) -> String {
-        format!("__cookie__:{}", self.token)
     }
 }
 
@@ -86,21 +81,6 @@ pub fn parse_bearer_auth(header: &str) -> Option<&str> {
         .or_else(|| header.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty())
-}
-
-/// Parse HTTP `Authorization: Basic …` (harness cookie). Password is the token.
-pub fn parse_basic_auth(header: &str) -> Option<(String, String)> {
-    let header = header.trim();
-    let rest = header
-        .strip_prefix("Basic ")
-        .or_else(|| header.strip_prefix("basic "))?;
-    use base64::Engine;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(rest.trim())
-        .ok()?;
-    let s = String::from_utf8(raw).ok()?;
-    let (u, p) = s.split_once(':')?;
-    Some((u.to_string(), p.to_string()))
 }
 
 fn random_token() -> String {
@@ -170,20 +150,14 @@ mod tests {
     }
 
     #[test]
-    fn bearer_and_basic_parse() {
-        use base64::Engine;
+    fn bearer_parse_and_token_paths() {
         assert_eq!(parse_bearer_auth("Bearer abc"), Some("abc"));
         assert_eq!(parse_bearer_auth("bearer xyz"), Some("xyz"));
         assert!(parse_bearer_auth("Bearer ").is_none());
         assert!(parse_bearer_auth("Basic abc").is_none());
-        let tok = base64::engine::general_purpose::STANDARD.encode("alice:s3cret");
-        let (u, p) = parse_basic_auth(&format!("Basic {tok}")).unwrap();
-        assert_eq!(u, "alice");
-        assert_eq!(p, "s3cret");
         let a = RpcAuth::new("s3cret");
         assert!(a.matches_token("s3cret"));
         assert!(!a.matches_token("nope"));
-        assert_eq!(a.harness_cookie_line(), "__cookie__:s3cret");
         assert_eq!(
             default_socket_path(Path::new("/d")),
             PathBuf::from("/d/rpc.sock")
