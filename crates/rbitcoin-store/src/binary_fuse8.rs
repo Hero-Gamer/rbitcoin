@@ -10,14 +10,58 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use crate::fuse_map::FuseMap;
+
+/// Fingerprint storage: heap while building, mapped after `open_file`.
+pub enum Fingerprints {
+    Heap(Box<[u8]>),
+    Map(FuseMap),
+}
+
+impl Fingerprints {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Heap(b) => b,
+            Self::Map(m) => m.fingerprints(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Heap(b) => b.len(),
+            Self::Map(_) => 0,
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Fingerprints {
+    type Output = u8;
+    fn index(&self, index: usize) -> &u8 {
+        &self.as_slice()[index]
+    }
+}
+
+impl std::fmt::Debug for Fingerprints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Heap(b) => f.debug_tuple("Heap").field(&b.len()).finish(),
+            Self::Map(m) => f.debug_tuple("Map").field(m).finish(),
+        }
+    }
+}
+
 /// Immutable binary-fuse membership filter over `u64` keys.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BinaryFuse8 {
     pub seed: u64,
     pub segment_length: u32,
     pub segment_length_mask: u32,
     pub segment_count_length: u32,
-    pub fingerprints: Box<[u8]>,
+    pub fingerprints: Fingerprints,
 }
 
 #[inline]
@@ -349,7 +393,7 @@ impl BinaryFuse8 {
             segment_length,
             segment_length_mask,
             segment_count_length,
-            fingerprints,
+            fingerprints: Fingerprints::Heap(fingerprints),
         })
     }
 
@@ -372,6 +416,10 @@ impl BinaryFuse8 {
     #[inline]
     pub fn len(&self) -> usize {
         self.fingerprints.len()
+    }
+
+    pub fn fingerprint_heap_bytes(&self) -> usize {
+        self.fingerprints.heap_bytes()
     }
 }
 

@@ -267,7 +267,7 @@ impl SegmentedTxHead {
             .map(|s| {
                 s.fuse
                     .as_ref()
-                    .map(|f| f.fingerprint_bytes() as u64)
+                    .map(|f| f.fingerprint_heap_bytes() as u64)
                     .unwrap_or(0)
             })
             .sum()
@@ -1522,14 +1522,16 @@ mod tests {
             h.flush().unwrap();
             assert!(h.sealed_segment_count() >= 1);
             let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
-            assert!(h.install_sealed_fuse(999_999, fuse.clone()).is_err());
+            assert!(h.install_sealed_fuse(999_999, fuse).is_err());
+            let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
             let open_id = h
                 .segments_snapshot()
                 .iter()
                 .find(|s| !s.sealed)
                 .map(|s| s.file_id)
                 .expect("open tail");
-            assert!(h.install_sealed_fuse(open_id, fuse.clone()).is_err());
+            assert!(h.install_sealed_fuse(open_id, fuse).is_err());
+            let fuse = SealedFuse8::build(&[1u64, 2, 3]).unwrap();
             h.install_sealed_fuse(0, fuse).unwrap();
             let p = h.fuse_path_for_file_id(0);
             assert!(p.to_string_lossy().contains("000000.fuse8"));
