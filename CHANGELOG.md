@@ -69,6 +69,15 @@ before 1.0).
   `submitpackage_child_fail_keeps_parent` stays a crate unit (LCOV; the live
   pad has no spare mature coinbase after generate).
 
+- **Crate connect spend rejects share one fixture:**
+  `header_and_spending_boundaries` remains the catalog pin for same-block
+  double spend, child-before-parent, `in < out`, subsidy+1, and immature
+  coinbase. Four remine `accept_and_connect_block` twins collapse into
+  `accept_rejects_connect_spend_rules` (one store; LCOV). The same-block
+  double-spend arm uses distinct txids (the #593 twin was two copies of
+  one tx and failed as `duplicate txid`). Store-less
+  `rejects_coinbase_excess_value_fast` stays next to `p1_block_subsidy_halvings`.
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep
