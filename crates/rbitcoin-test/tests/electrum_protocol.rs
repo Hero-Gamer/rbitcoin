@@ -608,6 +608,14 @@ async fn electrum_server_version_history_balance() {
     .await;
     assert_eq!(v["result"]["tx_hash"].as_str(), Some(txid_hex.as_str()));
     assert!(v["result"]["merkle"].as_array().is_some(), "{v}");
+    let v = rpc(
+        &mut stream,
+        52,
+        "blockchain.transaction.id_from_pos",
+        json!([1, 99]),
+    )
+    .await;
+    assert!(v.get("error").is_some(), "pos OOB: {v}");
 
     let v = rpc(
         &mut stream,
@@ -1179,6 +1187,20 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         Some("success"),
         "non-verbose package: {packed2}"
     );
+
+    let pkg_txid = rbitcoin_primitives::display_hash_hex(&pkg.compute_txid().to_byte_array());
+    let verbose = rpc(
+        &mut stream,
+        12,
+        "blockchain.transaction.get",
+        json!([pkg_txid, true]),
+    )
+    .await;
+    let got = &verbose["result"];
+    assert!(got.get("blockhash").is_none(), "mempool verbose: {verbose}");
+    assert_eq!(got["confirmations"], 0, "{verbose}");
+    assert!(got.get("time").is_none(), "{verbose}");
+    assert!(got.get("blocktime").is_none(), "{verbose}");
 
     handle.shutdown().await;
 }

@@ -340,6 +340,18 @@ fn node_cli_and_surface_smoke() {
     ])));
     pin_conf_unknown_key_and_peertimeout(&td);
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "a", "b"])));
+    for flag in [
+        "--rpcuser=u",
+        "--rpcpassword=p",
+        "--rpcport=1",
+        "--rpcconnect=h",
+        "-rpcport",
+    ] {
+        assert!(
+            !exit_success(cli_cli_main(["rbitcoin-cli", flag, "getblockcount"])),
+            "{flag} must be unknown"
+        );
+    }
 
     // Serialize process-wide env mutation (parallel `cargo test` races).
     static DROP_STORE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -935,66 +947,6 @@ fn resume_tx_head_resolves_external_prev() {
     }
 }
 
-/// After confirm, durable spentness is authority (body LRU may still hold outs).
-/// Structural rejects double-spend; no separate wave spent-filter map.
-#[test]
-fn confirm_structural_rejects_already_spent_prevout() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, ChainParams, Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let ms = Milestone::NONE;
-    let params = ChainParams::regtest();
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-
-    let last_pad = maturity + 1;
-    for h in 2..=last_pad {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
-
-    let spend_h = last_pad + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-
-    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
-
-    let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
-    let b_bad = mine_regtest_block(
-        b_spend.block_hash(),
-        b_spend.header.time + 600,
-        spend_h + 1,
-        vec![spend2],
-    );
-    commit_class_a_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
-    let err = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms)
-        .expect_err("double-spend must fail structural");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("spent") || msg.contains("PrevoutSpent") || msg.contains("prevout"),
-        "unexpected reject: {msg}"
-    );
-}
-
 /// Multi-block confirm batch that **creates** a non-coinbase parent and
 /// **spends** it in a later height of the same run. Runway reserves that
 /// parent (not in UTXO yet); readiness must not require the reserve to fill
@@ -1198,46 +1150,6 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     assert_eq!(q.tip_height(), Some(Height(next_h)));
 }
 
-/// Sequential confirm_wire_run + failed confirm must not poison spends.
-#[test]
-fn confirm_run_sequential_and_failed_no_spend_poison() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, commit_class_a_block, confirm_wire_run, ChainParams, Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let ms = Milestone { height: 0 };
-    let params = ChainParams::regtest();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-    let mut blocks = Vec::new();
-    for h in 1u32..=4 {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        commit_class_a_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-        blocks.push(b);
-    }
-
-    let run: Vec<_> = (1u32..=3)
-        .map(|h| (Height(h), blocks[(h - 1) as usize].clone()))
-        .collect();
-    confirm_wire_run(&q, &params, ms, &run).expect("sequential run");
-    assert_eq!(q.tip_height(), Some(Height(3)));
-
-    // Empty / non-contiguous confirm fails without advancing tip.
-    let bad = confirm_wire_run(&q, &params, ms, &[]);
-    assert!(bad.is_err());
-    confirm_wire_run(&q, &params, ms, &[(Height(4), blocks[3].clone())]).expect("confirm tip+1");
-    assert_eq!(q.tip_height(), Some(Height(4)));
-}
-
 // ─── Consensus + reconstruct: one mature mine, many assertions ──────────────
 
 /// Single mature-chain pad covers consensus + scripthash + reconstruct + reorg:
@@ -1251,6 +1163,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 #[test]
 fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_consensus::{commit_class_a_block, confirm_wire_run};
     use rbitcoin_net::local_service_flags;
     use rbitcoin_store::script_hash;
 
@@ -1405,6 +1318,28 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
                 || msg.contains("multi-spender")
                 || msg.contains("double")),
         "double-spend must reject, got {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
+
+    commit_class_a_block(&q, &params, Height(tip_h + 1), &b_bad, Milestone::NONE).unwrap();
+    let err = accept_and_connect_block(&q, &params, Height(tip_h + 1), &b_bad, Milestone::NONE)
+        .expect_err("Class A then accept double-spend must fail structural");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("spent") || msg.contains("PrevoutSpent") || msg.contains("prevout"),
+        "unexpected reject: {msg}"
+    );
+    let wire_err = confirm_wire_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[(Height(tip_h + 1), b_bad.clone())],
+    )
+    .expect_err("wire-path double-spend must fail");
+    let wire_msg = format!("{wire_err}").to_lowercase();
+    assert!(
+        wire_msg.contains("spent") || wire_msg.contains("double") || wire_msg.contains("bad"),
+        "wire double-spend: {wire_err}"
     );
     assert_eq!(q.tip_height(), Some(Height(tip_h)));
 
@@ -1973,6 +1908,11 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     let _ = confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]);
     assert_eq!(q.tip_height(), Some(Height(1)));
     assert_eq!(q.tx_body_count(), n_before);
+    assert!(
+        confirm_wire_run(&q, &params, ms, &[]).is_err(),
+        "empty confirm_wire_run must fail without advancing tip"
+    );
+    assert_eq!(q.tip_height(), Some(Height(1)));
     tip = b1.block_hash();
     tip_time = b1.header.time;
 
@@ -2320,49 +2260,4 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         panic!("write B after load-ahead must fill parent denserels from committed A (got {e})");
     });
     assert_eq!(q.tip_height(), Some(Height(hb)));
-}
-
-/// Structural double-spend still rejects on the wire path.
-#[test]
-fn unified_wire_pipeline_rejects_double_spend() {
-    use rbitcoin_consensus::{accept_and_connect_block, confirm_wire_run, ChainParams, Milestone};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-    q.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let ms = Milestone::NONE;
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-    (tip, tip_time) = pad_empty_from(&q, &params, tip, tip_time, 2, maturity);
-
-    let spend_h = maturity + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    // Wire path for the spend under test (pad was accept-only).
-    confirm_wire_run(&q, &params, ms, &[(Height(spend_h), b_spend.clone())]).unwrap();
-    tip = b_spend.block_hash();
-    tip_time = b_spend.header.time;
-    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
-
-    let spend2 = spend_anyone_can_spend(cb1, 0, Amount::from_sat(48_0000_0000));
-    let b_dup = mine_regtest_block(tip, tip_time + 600, spend_h + 1, vec![spend2]);
-    let err = confirm_wire_run(&q, &params, ms, &[(Height(spend_h + 1), b_dup)])
-        .expect_err("double spend");
-    let msg = format!("{err}").to_lowercase();
-    assert!(
-        msg.contains("spent") || msg.contains("double") || msg.contains("bad"),
-        "unexpected: {msg}"
-    );
-    assert_eq!(q.tip_height(), Some(Height(spend_h)));
 }

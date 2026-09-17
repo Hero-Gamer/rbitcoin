@@ -680,6 +680,35 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(child_row["height"], -1, "{child_row}");
     let child_fee = child_row["fee"].as_i64().expect("mempool child fee");
     assert!(child_fee > 0, "mempool child fee: {child_row}");
+    let child_utxo = electrum_rpc(
+        &mut el,
+        24,
+        "blockchain.scripthash.listunspent",
+        json!([child_sh.clone()]),
+    )
+    .await;
+    let utxo_row = child_utxo["result"]
+        .as_array()
+        .expect("child listunspent array")
+        .iter()
+        .find(|r| r["tx_hash"] == child_txid)
+        .unwrap_or_else(|| panic!("listunspent missing child {child_txid}: {child_utxo}"));
+    assert_eq!(utxo_row["height"], -1, "{utxo_row}");
+    let parent_utxo = electrum_rpc(
+        &mut el,
+        25,
+        "blockchain.scripthash.listunspent",
+        json!([sh]),
+    )
+    .await;
+    assert!(
+        parent_utxo["result"]
+            .as_array()
+            .expect("parent listunspent")
+            .iter()
+            .all(|r| r["tx_hash"] != txid_hex),
+        "child spend must drop the parent UTXO: {parent_utxo}"
+    );
 
     let child_mem = electrum_rpc(
         &mut el,
