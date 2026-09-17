@@ -1940,15 +1940,25 @@ pub(crate) fn spawn_confirm_engine(
                             continue;
                         }
                         let first_hash = wire_batch[0].1;
-                        load_fail_rewind_wave(
-                            &feed_load,
-                            &hub_load,
-                            &mut lookup_ahead,
-                            expect_h,
-                            wire_batch.iter().skip(1).filter_map(|(h, ha, w)| {
-                                (!hub_load.has_block(ha)).then_some((*h, *ha, w.block.as_ref()))
-                            }),
-                        );
+                        let class = ConfirmRejectClass::from_consensus(&e);
+                        if class == ConfirmRejectClass::EngineFault {
+                            reoffer_blocks_to_body_queue(
+                                &hub_load,
+                                wire_batch.iter().filter_map(|(h, ha, w)| {
+                                    (!hub_load.has_block(ha)).then_some((*h, *ha, w.block.as_ref()))
+                                }),
+                            );
+                        } else {
+                            load_fail_rewind_wave(
+                                &feed_load,
+                                &hub_load,
+                                &mut lookup_ahead,
+                                expect_h,
+                                wire_batch.iter().skip(1).filter_map(|(h, ha, w)| {
+                                    (!hub_load.has_block(ha)).then_some((*h, *ha, w.block.as_ref()))
+                                }),
+                            );
+                        }
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -1965,7 +1975,7 @@ pub(crate) fn spawn_confirm_engine(
                             &feed_load,
                             expect_h,
                             first_hash,
-                            ConfirmRejectClass::from_consensus(&e),
+                            class,
                             log_msg,
                             wire_batch.len(),
                         );
