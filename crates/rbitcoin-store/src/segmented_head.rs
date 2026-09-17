@@ -1524,12 +1524,20 @@ mod tests {
             assert!(h.sealed_segment_count() >= 1);
         }
         let oa = dir.join("tx.head").join("000000");
+        let mphf = dir.join("tx.head").join("000000.mphf");
         assert!(!oa.is_file());
+        assert!(mphf.is_file());
+        let mphf_before = std::fs::read(&mphf).unwrap();
         std::fs::write(&oa, b"leftover pre-unlink OA").unwrap();
         let h2 = SegmentedTxHead::open(&dir).unwrap();
         assert!(
             !oa.is_file(),
             "leftover sealed-segment OA must be discarded on open"
+        );
+        assert_eq!(
+            std::fs::read(&mphf).unwrap(),
+            mphf_before,
+            "mphf must be unchanged when discarding leftover OA"
         );
         let cands = h2.probe_candidates(&mixed(1)).unwrap();
         assert!(cands.iter().any(|f| f.0 == 1), "cands={cands:?}");
