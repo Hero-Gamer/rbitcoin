@@ -845,7 +845,7 @@ impl LivePeer {
         }
         problem.map(|p| {
             format!(
-                "pong peer={}: {p}, {expected:x} expected, {received:x} received, {} bytes",
+                "p2p: pong peer={}: {p}, {expected:x} expected, {received:x} received, {} bytes",
                 self.id,
                 payload.len()
             )
@@ -1675,7 +1675,7 @@ impl PeerHub {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, Arc::clone(&peer));
-        rbitcoin_log::debug!("Added connection peer={id}");
+        rbitcoin_log::debug!("p2p: Added connection peer={id}");
         peer
     }
 
@@ -2774,7 +2774,10 @@ mod tests {
         assert_eq!(hub.snapshot()[0].pingwait, Some(3.0));
 
         let short = p.on_pong(&[], hub.now_secs()).expect("short");
-        assert!(short.starts_with("pong peer=0: Short payload"), "{short}");
+        assert!(
+            short.starts_with("p2p: pong peer=0: Short payload"),
+            "{short}"
+        );
         assert!(p
             .on_pong(&0u64.to_le_bytes(), hub.now_secs())
             .unwrap()
@@ -2812,8 +2815,8 @@ mod tests {
         match to {
             PingAction::Timeout { elapsed_secs } => {
                 assert!((elapsed_secs - 1201.0).abs() < 0.01, "{elapsed_secs}");
-                let line = format!("ping timeout: {elapsed_secs:.6}s");
-                assert_eq!(line, "ping timeout: 1201.000000s");
+                let line = crate::peer::ping_timeout_log(elapsed_secs);
+                assert_eq!(line, "p2p: ping timeout: 1201.000000s");
             }
             other => panic!("{other:?}"),
         }

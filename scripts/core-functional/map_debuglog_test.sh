@@ -82,12 +82,12 @@ run "parked orphan DEBUG maps to Core was-not-accepted needle" \
   "was not accepted"
 
 run "CLI InitError maps peer-timeout to Core peertimeout" \
-  "Error: configuration error: peer-timeout must be a positive integer." \
+  "Error: peer-timeout must be a positive integer." \
   "Error: peertimeout must be a positive integer."
 
-run "CLI InitError drops configuration error prefix (minchainwork)" \
-  "Error: configuration error: Invalid minimum work specified (test), must be up to 64 hex digits" \
-  "Error: Invalid minimum work specified (test), must be up to 64 hex digits"
+run "CLI InitError minchainwork already Core-shaped" \
+  "Error: Invalid minimum work specified (test), must be up to 64 hex digits" \
+  ""
 
 run "datadir flock maps rbitcoin to Bitcoin Core" \
   "Error: Cannot obtain a lock on directory /tmp/dd. rbitcoin is probably already running." \
@@ -108,6 +108,10 @@ run "net-permission netmask maps to Core -whitelist" \
 run "net-permission-bind out maps to Core whitebind" \
   "Error: --net-permission-bind may only be used for incoming connections (\"out\" was passed)" \
   "whitebind may only be used for incoming connections"
+
+run "compact low-work maps to Core [net] needle" \
+  "2026-01-01T00:00:00Z INFO p2p: ignore low-work compact block from peer 0" \
+  "[net] Ignoring low-work compact block from peer 0"
 
 run "unmapped is empty" \
   "2026-01-01T00:00:00Z INFO something else" \

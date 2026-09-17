@@ -242,19 +242,21 @@ pub fn has_all_desirable_service_flags(offered: ServiceFlags, tip_depth_blocks: 
 }
 
 pub fn expected_services_disconnect_log(offered: u64, expected: u64) -> String {
-    format!("does not offer the expected services ({offered:08x} offered, {expected:08x} expected)")
+    format!(
+        "p2p: does not offer the expected services ({offered:08x} offered, {expected:08x} expected)"
+    )
 }
 
 pub fn feeler_connection_completed_log() -> &'static str {
-    "feeler connection completed"
+    "p2p: feeler connection completed"
 }
 
 pub fn connected_to_self_log(addr: impl std::fmt::Display) -> String {
-    format!("connected to self at {addr}, disconnecting")
+    format!("p2p: connected to self at {addr}, disconnecting")
 }
 
 pub fn version_handshake_timeout_log(peer: u64) -> String {
-    format!("version handshake timeout, disconnecting peer={peer}")
+    format!("p2p: version handshake timeout, disconnecting peer={peer}")
 }
 
 /// Max addresses in one ADDR / addrv2. Interop size — do not change without
@@ -267,19 +269,23 @@ pub const MAX_ADDR_TO_SEND: usize = 1000;
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
 pub fn sendaddrv2_after_verack_log(peer: u64) -> String {
-    format!("sendaddrv2 received after verack, disconnecting peer={peer}")
+    format!("p2p: sendaddrv2 received after verack, disconnecting peer={peer}")
 }
 
 pub fn addrv2_message_size_log(n: usize) -> String {
-    format!("addrv2 message size = {n}")
+    format!("p2p: addrv2 message size = {n}")
 }
 
 pub fn received_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("received: addrv2 ({nbytes} bytes) peer={peer}")
+    format!("p2p: received: addrv2 ({nbytes} bytes) peer={peer}")
 }
 
 pub fn sending_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("sending addrv2 ({nbytes} bytes) peer={peer}")
+    format!("p2p: sending addrv2 ({nbytes} bytes) peer={peer}")
+}
+
+pub fn ping_timeout_log(elapsed_secs: f64) -> String {
+    format!("p2p: ping timeout: {elapsed_secs:.6}s")
 }
 
 pub fn ping_prior_to_verack_log(peer: u64) -> String {
@@ -287,18 +293,18 @@ pub fn ping_prior_to_verack_log(peer: u64) -> String {
 }
 
 pub fn unsupported_before_verack_log(cmd: &str, peer: u64) -> String {
-    format!("Unsupported message \"{cmd}\" prior to verack from peer={peer}")
+    format!("p2p: Unsupported message \"{cmd}\" prior to verack from peer={peer}")
 }
 
 /// Disconnect peers advertising protocol version below this.
 pub const MIN_PEER_PROTO_VERSION: i32 = 31800;
 
 pub fn obsolete_version_log(version: i32, peer: u64) -> String {
-    format!("using obsolete version {version}, disconnecting peer={peer}")
+    format!("p2p: using obsolete version {version}, disconnecting peer={peer}")
 }
 
 pub fn advertising_address_log(addr_port: impl std::fmt::Display, peer: u64) -> String {
-    format!("Advertising address {addr_port} to peer={peer}")
+    format!("p2p: Advertising address {addr_port} to peer={peer}")
 }
 
 fn addrv2_from_sock(now: u32, sock: SocketAddr) -> AddrV2Message {
@@ -351,7 +357,7 @@ pub fn hidden_addr_from() -> Address {
 }
 
 pub fn non_version_before_handshake_log(cmd: &str, peer: u64) -> String {
-    format!("non-version message before version handshake. Message \"{cmd}\" from peer={peer}")
+    format!("p2p: non-version message before version handshake. Message \"{cmd}\" from peer={peer}")
 }
 
 /// Tip age in blocks: `(now - tip_time) / pow_target_spacing`.
@@ -1103,7 +1109,7 @@ async fn on_heartbeat(
             let _ = queue_out(out_tx, NetworkMessage::Ping(nonce));
         }
         Some(PingAction::Timeout { elapsed_secs }) => {
-            rbitcoin_log::info!("ping timeout: {elapsed_secs:.6}s");
+            rbitcoin_log::info!("{}", ping_timeout_log(elapsed_secs));
             s.request_disconnect();
         }
         None => {}
@@ -2044,13 +2050,13 @@ fn maybe_force_relay_recent_reject(
     }
     let id = session.map(|s| s.id).unwrap_or(0);
     if mp.try_contains(&txid) {
-        rbitcoin_log::info!("Force relaying tx {txid} (wtxid={wtxid}) from peer={id}");
+        rbitcoin_log::info!("p2p: Force relaying tx {txid} (wtxid={wtxid}) from peer={id}");
         if let Some(ph) = session.and_then(|s| s.peer_hub()) {
             force_announce_txid(hub, ph.as_ref(), txid);
         }
     } else {
         rbitcoin_log::info!(
-            "Not relaying non-mempool transaction {txid} (wtxid={wtxid}) from forcerelay peer={id}"
+            "p2p: Not relaying non-mempool transaction {txid} (wtxid={wtxid}) from forcerelay peer={id}"
         );
     }
 }
@@ -2066,7 +2072,7 @@ fn maybe_force_relay_duplicate(
     }
     let id = session.map(|s| s.id).unwrap_or(0);
     rbitcoin_log::info!(
-        "Force relaying tx {tid} (wtxid={}) from peer={id}",
+        "p2p: Force relaying tx {tid} (wtxid={}) from peer={id}",
         tx.compute_wtxid()
     );
     if let Some(ph) = session.and_then(|s| s.peer_hub()) {
@@ -2379,17 +2385,17 @@ fn handle_peer_inventory_msg(
 
 fn on_redundant_version(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("redundant version message from peer={}", s.id);
+        rbitcoin_log::info!("p2p: redundant version message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("redundant version message from peer");
+        rbitcoin_log::info!("p2p: redundant version message from peer");
     }
 }
 
 fn on_redundant_verack(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("ignoring redundant verack message from peer={}", s.id);
+        rbitcoin_log::info!("p2p: ignoring redundant verack message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("ignoring redundant verack message");
+        rbitcoin_log::info!("p2p: ignoring redundant verack message");
     }
 }
 
@@ -2722,7 +2728,7 @@ fn on_getblocktxn(
             }
         }
         if bad {
-            rbitcoin_log::info!("getblocktxn with out-of-bounds tx indices");
+            rbitcoin_log::info!("p2p: getblocktxn with out-of-bounds tx indices");
             // Out-of-range indexes: disconnect.
             follow.ban_score = follow.ban_score.saturating_add(BAN_SCORE_THRESHOLD);
             if let Some(s) = session {
@@ -2850,7 +2856,7 @@ fn on_inv(
     if let Some(hx) = tx_inv_hex {
         if reject_unsolicited_tx(hub, session) {
             rbitcoin_log::info!(
-                "transaction ({hx}) inv sent in violation of protocol, disconnecting peer"
+                "p2p: transaction ({hx}) inv sent in violation of protocol, disconnecting peer"
             );
             punish_disconnect(&mut follow.ban_score, session);
             return Ok(());
@@ -3129,7 +3135,7 @@ async fn on_cmpctblock(
     on_cmpctblock_queue_ancestors(hub, out_tx, follow, hash)?;
     if compact_header_low_work(hub, &hsi.header) && !follow.requested_blocks.contains(&hash) {
         let id = session.map(|s| s.id).unwrap_or(0);
-        rbitcoin_log::info!("Ignoring low-work compact block from peer {id}");
+        rbitcoin_log::info!("p2p: ignore low-work compact block from peer {id}");
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
     }
@@ -3154,7 +3160,7 @@ fn on_cmpctblock_reject_early(
     hash: BlockHash,
 ) -> Result<bool, NetError> {
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
-        rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+        rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(true);
     }
@@ -3164,7 +3170,7 @@ fn on_cmpctblock_reject_early(
         s.note_last_block();
     }
     if !crate::compact::prefilled_indexes_ok(hsi) {
-        rbitcoin_log::info!("invalid index in cmpctblock message");
+        rbitcoin_log::info!("p2p: invalid index in cmpctblock message");
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(true);
     }
@@ -3361,7 +3367,7 @@ async fn on_blocktxn(
         mp.try_note_extra_compact_txs(bt.transactions.iter());
     }
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
-        rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+        rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
@@ -3457,7 +3463,7 @@ fn on_blocktxn_apply_fail(
     pc: &PendingCmpct,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+    rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
     log_cmpct_getdata(hash, pc.partial.missing().len());
     if let Some(s) = session {
         s.note_failed_cmpct(hash);
@@ -3476,7 +3482,7 @@ fn on_blocktxn_unconnectable(
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    rbitcoin_log::info!("previous compact block reconstruction attempt failed");
+    rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
     if let Some(s) = session {
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
@@ -3546,7 +3552,9 @@ async fn on_tx(
     }
     if reject_unsolicited_tx(hub, session) {
         let id = session.map(|s| s.id).unwrap_or(0);
-        rbitcoin_log::info!("transaction sent in violation of protocol, disconnecting peer={id}");
+        rbitcoin_log::info!(
+            "p2p: transaction sent in violation of protocol, disconnecting peer={id}"
+        );
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
