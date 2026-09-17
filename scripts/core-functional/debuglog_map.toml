@@ -16,15 +16,15 @@ match = 'rbitcoin-node listening on (\S+)'
 emit = ['Bound to {1}']
 
 [[rule]]
-match = 'getblocktxn with out-of-bounds tx indices'
+match = 'p2p: getblocktxn with out-of-bounds tx indices'
 emit = ['getblocktxn with out-of-bounds tx indices']
 
 [[rule]]
-match = 'previous compact block reconstruction attempt failed'
+match = 'p2p: previous compact block reconstruction attempt failed'
 emit = ['previous compact block reconstruction attempt failed']
 
 [[rule]]
-match = 'Ignoring low-work compact block from peer (\d+)'
+match = 'p2p: ignore low-work compact block from peer (\d+)'
 emit = ['[net] Ignoring low-work compact block from peer {1}']
 
 [[rule]]
@@ -36,55 +36,55 @@ match = '([0-9a-f]{64}), bad-version\(0x([0-9a-f]{8})\)'
 emit = ['{1}, bad-version(0x{2})']
 
 [[rule]]
-match = 'pong peer=(\d+): (.+)'
+match = 'p2p: pong peer=(\d+): (.+)$'
 emit = ['pong peer={1}: {2}']
 
 [[rule]]
-match = 'ping timeout: ([0-9.]+)s'
+match = 'p2p: ping timeout: ([0-9.]+)s'
 emit = ['ping timeout: {1}s']
 
 [[rule]]
-match = 'Removed ([0-9a-f]{64}) from set of unbroadcast txns before confirmation that txn was sent out'
+match = 'p2p: Removed ([0-9a-f]{64}) from set of unbroadcast txns before confirmation that txn was sent out'
 emit = ['Removed {1} from set of unbroadcast txns before confirmation that txn was sent out']
 
 [[rule]]
-match = 'V2 transport error: invalid message type'
+match = 'p2p: V2 transport error: invalid message type'
 emit = ['V2 transport error: invalid message type']
 
 [[rule]]
-match = 'V2 transport error: packet too large \((\d+) bytes\)'
+match = 'p2p: V2 transport error: packet too large \((\d+) bytes\)'
 emit = ['V2 transport error: packet too large ({1} bytes)']
 
 [[rule]]
-match = 'redundant version message from peer(=.*)?'
+match = 'p2p: redundant version message from peer(=.*)?'
 emit = ['redundant version message from peer']
 
 [[rule]]
-match = 'V2 handshake timeout, disconnecting peer=(\d+)'
+match = 'p2p: V2 handshake timeout, disconnecting peer=(\d+)'
 emit = ['V2 handshake timeout, disconnecting peer={1}']
 
 [[rule]]
-match = 'V2 transport error: missing garbage terminator'
+match = 'p2p: V2 transport error: missing garbage terminator'
 emit = ['V2 transport error: missing garbage terminator']
 
 [[rule]]
-match = 'V2 transport error: packet decryption failure'
+match = 'p2p: V2 transport error: packet decryption failure'
 emit = ['V2 transport error: packet decryption failure']
 
 [[rule]]
-match = 'sendaddrv2 received after verack, disconnecting peer=(\d+)'
+match = 'p2p: sendaddrv2 received after verack, disconnecting peer=(\d+)'
 emit = ['sendaddrv2 received after verack, disconnecting peer={1}']
 
 [[rule]]
-match = 'addrv2 message size = (\d+)'
+match = 'p2p: addrv2 message size = (\d+)'
 emit = ['addrv2 message size = {1}']
 
 [[rule]]
-match = 'received: addrv2 \((\d+) bytes\) peer=(\d+)'
+match = 'p2p: received: addrv2 \((\d+) bytes\) peer=(\d+)'
 emit = ['received: addrv2 ({1} bytes) peer={2}']
 
 [[rule]]
-match = 'sending addrv2 \((\d+) bytes\) peer=(\d+)'
+match = 'p2p: sending addrv2 \((\d+) bytes\) peer=(\d+)'
 emit = ['sending addrv2 ({1} bytes) peer={2}']
 
 [[rule]]
@@ -132,19 +132,15 @@ match = 'txrelay: park '
 emit = ['was not accepted']
 
 [[rule]]
-match = 'Error: configuration error: peer-timeout must be a positive integer\.'
+match = 'Error: peer-timeout must be a positive integer\.'
 emit = ['Error: peertimeout must be a positive integer.']
 
 [[rule]]
-match = 'Error: configuration error: (?!peer-timeout must be a positive integer\.)(.+)$'
-emit = ['Error: {1}']
-
-[[rule]]
-match = 'transaction sent in violation of protocol, disconnecting peer=(\d+)'
+match = 'p2p: transaction sent in violation of protocol, disconnecting peer=(\d+)'
 emit = ['transaction sent in violation of protocol, disconnecting peer={1}']
 
 [[rule]]
-match = 'transaction \(([0-9a-f]+)\) inv sent in violation of protocol, disconnecting peer'
+match = 'p2p: transaction \(([0-9a-f]+)\) inv sent in violation of protocol, disconnecting peer'
 emit = ['transaction ({1}) inv sent in violation of protocol, disconnecting peer']
 
 [[rule]]
@@ -178,3 +174,31 @@ emit = ['Invalid netmask specified in -whitelist']
 [[rule]]
 match = '--net-permission-bind may only be used for incoming connections'
 emit = ['whitebind may only be used for incoming connections']
+
+[[rule]]
+match = 'p2p: Added connection peer=(\d+)'
+emit = ['Added connection peer={1}']
+
+[[rule]]
+match = 'p2p: Unsupported message "([^"]+)" prior to verack from peer=(\d+)'
+emit = ['Unsupported message "{1}" prior to verack from peer={2}']
+
+[[rule]]
+match = 'p2p: non-version message before version handshake. Message "([^"]+)" from peer=(\d+)'
+emit = ['non-version message before version handshake. Message "{1}" from peer={2}']
+
+[[rule]]
+match = 'p2p: version handshake timeout, disconnecting peer=(\d+)'
+emit = ['version handshake timeout, disconnecting peer={1}']
+
+[[rule]]
+match = 'p2p: Force relaying tx ([0-9a-f]+) \(wtxid=([0-9a-f]+)\) from peer=(\d+)'
+emit = ['Force relaying tx {1} (wtxid={2}) from peer={3}']
+
+[[rule]]
+match = 'p2p: Not relaying non-mempool transaction ([0-9a-f]+) \(wtxid=([0-9a-f]+)\) from forcerelay peer=(\d+)'
+emit = ['Not relaying non-mempool transaction {1} (wtxid={2}) from forcerelay peer={3}']
+
+[[rule]]
+match = 'p2p: using obsolete version (\d+), disconnecting peer=(\d+)'
+emit = ['using obsolete version {1}, disconnecting peer={2}']

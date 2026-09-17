@@ -191,18 +191,9 @@ impl RpcParams {
         self.pos.len()
     }
 
-    pub fn named(mut named: serde_json::Map<String, Value>) -> Self {
-        // AuthServiceProxy mixed call: `{args: [...], argN: ...}`.
-        let pos = match named.remove("args") {
-            Some(Value::Array(a)) => a,
-            Some(other) => {
-                named.insert("args".into(), other);
-                Vec::new()
-            }
-            None => Vec::new(),
-        };
+    pub fn named(named: serde_json::Map<String, Value>) -> Self {
         Self {
-            pos,
+            pos: Vec::new(),
             named: Some(named),
         }
     }
@@ -212,7 +203,7 @@ impl RpcParams {
             if let Some(v) = m.get(name) {
                 return Some(v);
             }
-            // Mixed object: named miss falls through to the peeled `args` array.
+            // Named miss falls through to positional (mixed JSON-RPC).
             if !self.pos.is_empty() {
                 return self.pos.get(index);
             }
@@ -484,15 +475,38 @@ const ECHO_NAMES: [&str; 10] = [
     "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
 ];
 
-/// Return params as a positional array (Core testing RPC).
+/// Return params as a positional array (operator testing RPC).
 ///
-/// Mixed AuthServiceProxy: `{args: [0, 1], arg3: 3}` → `[0, 1, null, 3]`.
+/// AuthServiceProxy mixed: `{args: [0, 1], arg3: 3}` → `[0, 1, null, 3]`.
 /// Named-only `arg9` sizes the array to 10 with null holes.
 pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&ECHO_NAMES)?;
+    const ECHO_ALLOWED: [&str; 11] = [
+        "args", "arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9",
+    ];
+    params.reject_unknown(&ECHO_ALLOWED)?;
+
+    let mut pos = params.pos.clone();
     if let Some(m) = &params.named {
+        if let Some(v) = m.get("args") {
+            let arr = v.as_array().ok_or_else(|| {
+                rpc_error(
+                    ERR_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type array",
+                        json_type_name(v)
+                    ),
+                )
+            })?;
+            if !pos.is_empty() {
+                return Err(rpc_error(
+                    ERR_INVALID_PARAMETER,
+                    "Parameter args specified twice both as positional and named argument",
+                ));
+            }
+            pos = arr.clone();
+        }
         for (i, name) in ECHO_NAMES.iter().enumerate() {
-            if m.contains_key(*name) && i < params.pos.len() {
+            if m.contains_key(*name) && i < pos.len() {
                 return Err(rpc_error(
                     ERR_INVALID_PARAMETER,
                     format!(
@@ -503,10 +517,10 @@ pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
         }
     }
 
-    let mut max_idx: Option<usize> = if params.pos.is_empty() {
+    let mut max_idx: Option<usize> = if pos.is_empty() {
         None
     } else {
-        Some(params.pos.len() - 1)
+        Some(pos.len() - 1)
     };
     if let Some(m) = &params.named {
         for (i, name) in ECHO_NAMES.iter().enumerate() {
@@ -519,7 +533,7 @@ pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
         return Ok(json!([]));
     };
     let mut out = vec![Value::Null; max + 1];
-    for (i, v) in params.pos.iter().enumerate() {
+    for (i, v) in pos.iter().enumerate() {
         out[i] = v.clone();
     }
     if let Some(m) = &params.named {

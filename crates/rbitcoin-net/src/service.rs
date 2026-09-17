@@ -300,17 +300,18 @@ impl P2PNode {
             p.request_disconnect();
         }
         let mut join = Vec::new();
-        for t in self.tasks.drain(..) {
-            t.abort();
-            join.push(t);
-        }
+        join.append(&mut self.tasks);
         if let Ok(mut g) = self.session_tasks.lock() {
-            for t in g.drain(..) {
-                t.abort();
-                join.push(t);
-            }
+            join.append(&mut *g);
         }
-        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+        let grace = tokio::time::Instant::now() + Duration::from_millis(750);
+        while tokio::time::Instant::now() < grace && join.iter().any(|t| !t.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for t in &join {
+            t.abort();
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(750), async {
             for t in join {
                 let _ = t.await;
             }
@@ -672,6 +673,51 @@ mod tests {
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "shutdown must not wait out a 30s session task"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_lets_short_session_task_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _live = live_p2p_lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-p2p-shutdown-grace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
+        let mut node = P2PNode::start(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+        )
+        .await
+        .unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let sleeper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        node.tasks.push(sleeper);
+        let t0 = std::time::Instant::now();
+        node.shutdown().await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "shutdown must not abort a session task that finishes within the grace window"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "shutdown must still bound wait"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -485,7 +485,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             let block = ctx
                 .query
                 .reconstruct_block_at_height(height)
-                .map_err(|_| rpc_error(ERR_MISC, "Block not found on disk"))?;
+                .map_err(|_| rpc_error(ERR_MISC, "block body not in store"))?;
             (height, block)
         }
         HashOrHeight::Hash(hash) => {
@@ -498,7 +498,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
                     let block = ctx
                         .query
                         .reconstruct_block_at_height(height)
-                        .map_err(|_| rpc_error(ERR_MISC, "Block not found on disk"))?;
+                        .map_err(|_| rpc_error(ERR_MISC, "block body not in store"))?;
                     (height, block)
                 }
                 None => {

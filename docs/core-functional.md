@@ -40,8 +40,9 @@ never calls this.
 `-rpcport`/`-port`/`bitcoin.conf` → `--rpc-listen` / `--listen` on
 127.0.0.1, `--no-seeds`. The node writes `{datadir}/rpc.token` (Bearer);
 the shim mirrors `__cookie__:<token>` to `{datadir}/.cookie` so Core
-TestNode cookie + HTTP Basic still work (TCP accepts Basic iff the
-password equals the token). Node stdio goes to `regtest/debug.log`; only
+TestNode cookie + HTTP Basic still work on the **proxy** public port. The
+proxy forwards `Authorization: Bearer` to the node (TCP is Bearer-only).
+Node stdio goes to `regtest/debug.log`; only
 `Error:` lines (UA / init) are copied to the shim stderr so TestNode’s
 clean-stop check matches Core. Unknown Core flags fail parse. The shim maps
 Core names onto kebab `rbitcoin-node` flags (`-maxconnections` → `--max-inbound`
@@ -49,7 +50,10 @@ as `N−11`, `-whitelist` → `--net-permission`, `-whitebind` → `--net-permis
 `-whitelistrelay` → `--net-permission-relay`, `-checkblocks` → `--check-blocks`,
 `-blocksonly` → `--blocks-only`,
 `-minimumchainwork` → `--min-chain-work`, …). The operator CLI does not accept
-those Core aliases.
+those Core aliases. The shim sets `RBITCOIN_RPC_WAIT_TIP_IDLE=1` on the child so
+`getblockcount` waits until the tip-accept lane is empty (`sync_blocks`).
+Production (unset) waits only for the accept that was running when the RPC
+arrived.
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh

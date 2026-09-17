@@ -2304,9 +2304,14 @@ impl ChainHub {
         self.accept_received_block_inner(block)
     }
 
-    /// Block until the current tip-accept job (including BIP152 HB select) finishes.
+    /// Wait until the current tip-accept job finishes (including BIP152 HB select).
+    ///
+    /// Default is bounded to that job: a queued follow-on accept may still be
+    /// in flight so wallet `getblockcount` cannot stall across a catch-up burst.
+    /// `RBITCOIN_RPC_WAIT_TIP_IDLE=1` waits until the lane is empty (Core
+    /// functional `sync_blocks`; not a production default).
     pub fn wait_tip_stable_for_rpc(&self) {
-        crate::tip_accept::wait_idle();
+        crate::tip_accept::wait_for_rpc();
     }
 
     fn held_body_height(&self, block: &Block) -> Option<u32> {

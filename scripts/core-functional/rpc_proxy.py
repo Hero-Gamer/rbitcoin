@@ -31,6 +31,13 @@ _CORE_MAXFEERATE_MSG = (
 )
 
 
+def node_authorization(cookie_line: str) -> str:
+    """Node TCP is Bearer. TestNode cookie is `__cookie__:<token>`."""
+    prefix = "__cookie__:"
+    token = cookie_line[len(prefix) :] if cookie_line.startswith(prefix) else cookie_line
+    return f"Bearer {token}"
+
+
 def core_btc_kvb_to_sat_vb(value: Any) -> int:
     """Core `maxfeerate` BTC/kvB → node sat/vB. `>= 1` is Core `-8`."""
     if value is None:
@@ -53,6 +60,43 @@ def core_btc_kvb_to_sat_vb(value: Any) -> int:
     if btc >= 1:
         raise RpcError(-8, _CORE_MAXFEERATE_MSG)
     return int(round(btc * 100_000))
+
+
+def named_param_index(method: str, key: str) -> int | None:
+    """Positional index for a Core named key on a forwarded method."""
+    if key == "maxfeerate":
+        return _MAXFEERATE_METHODS.get(method)
+    if key == "maxburnamount" and method in _MAXFEERATE_METHODS:
+        return 2
+    return None
+
+
+def peel_authproxy_args(item: dict[str, Any]) -> None:
+    """AuthServiceProxy mixed call → positional list the node will accept.
+
+    `submitpackage([...], maxfeerate=0)` arrives as `{args: [[...]], maxfeerate: 0}`.
+    The node rejects named `args` except on `echo` (which keeps this object).
+    """
+    params = item.get("params")
+    if not isinstance(params, dict) or "args" not in params:
+        return
+    args = params.get("args")
+    if not isinstance(args, list):
+        return
+    method = item.get("method") if isinstance(item.get("method"), str) else ""
+    named = {k: v for k, v in params.items() if k != "args"}
+    if not named:
+        item["params"] = list(args)
+        return
+    pos = list(args)
+    for k, v in named.items():
+        idx = named_param_index(method, k)
+        if idx is None:
+            return
+        while len(pos) <= idx:
+            pos.append(None)
+        pos[idx] = v
+    item["params"] = pos
 
 
 def rewrite_core_maxfeerate(item: dict[str, Any]) -> None:
@@ -133,9 +177,11 @@ class RpcProxy:
             if isinstance(payload, list):
                 for item in payload:
                     if isinstance(item, dict):
+                        peel_authproxy_args(item)
                         rewrite_core_maxfeerate(item)
                 return self.forward_raw(json.dumps(payload).encode())
             if isinstance(payload, dict):
+                peel_authproxy_args(payload)
                 rewrite_core_maxfeerate(payload)
                 method = payload.get("method")
                 if isinstance(method, str) and method in self._handlers:
@@ -155,12 +201,11 @@ class RpcProxy:
 
     def forward_raw(self, raw: bytes) -> tuple[int, bytes]:
         cookie = self.cookie_line() or ""
-        tok = base64.b64encode(cookie.encode()).decode()
         req = urllib.request.Request(
             self.node_url,
             data=raw,
             headers={
-                "Authorization": f"Basic {tok}",
+                "Authorization": node_authorization(cookie),
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -220,13 +265,12 @@ class RpcProxy:
 
     def forward(self, item: dict[str, Any]) -> dict[str, Any]:
         cookie = self.cookie_line() or ""
-        tok = base64.b64encode(cookie.encode()).decode()
         body = json.dumps(item).encode()
         req = urllib.request.Request(
             self.node_url,
             data=body,
             headers={
-                "Authorization": f"Basic {tok}",
+                "Authorization": node_authorization(cookie),
                 "Content-Type": "application/json",
             },
             method="POST",

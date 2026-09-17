@@ -62,15 +62,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedRead<R> {
 
 /// `p2p_v2_misbehaving.py` needles.
 pub fn v2_handshake_timeout_log(peer: u64) -> String {
-    format!("V2 handshake timeout, disconnecting peer={peer}")
+    format!("p2p: V2 handshake timeout, disconnecting peer={peer}")
 }
 
 pub fn v2_missing_garbage_terminator_log() -> &'static str {
-    "V2 transport error: missing garbage terminator"
+    "p2p: V2 transport error: missing garbage terminator"
 }
 
 pub fn v2_packet_decryption_failure_log() -> &'static str {
-    "V2 transport error: packet decryption failure"
+    "p2p: V2 transport error: packet decryption failure"
 }
 
 /// Raw TCP bytes observed after connect.
@@ -165,7 +165,7 @@ pub fn v2_other_recv_bytes(contents_len: usize) -> u64 {
 
 /// `p2p_invalid_messages.py` v2 needle for an oversized length prefix.
 pub fn v2_packet_too_large_log(n: usize) -> String {
-    format!("V2 transport error: packet too large ({n} bytes)")
+    format!("p2p: V2 transport error: packet too large ({n} bytes)")
 }
 
 /// Cancellation-safe BIP324 application read (length prefix, then body).
@@ -371,7 +371,7 @@ fn command_to_12(cmd: &str) -> [u8; 12] {
 
 /// `p2p_invalid_messages.py` v2 needle for an unknown short/long type.
 pub fn v2_invalid_message_type_log() -> &'static str {
-    "V2 transport error: invalid message type"
+    "p2p: V2 transport error: invalid message type"
 }
 
 fn command_from_12(cmd12: &[u8; 12]) -> Result<String, NetError> {
@@ -751,12 +751,12 @@ mod tests {
         assert!(short_id_for_command("verack").is_none());
         assert_eq!(
             v2_invalid_message_type_log(),
-            "V2 transport error: invalid message type"
+            "p2p: V2 transport error: invalid message type"
         );
         assert_eq!(MAX_V2_CONTENTS_LEN, 4_000_013);
         assert_eq!(
             v2_packet_too_large_log(4_000_014),
-            "V2 transport error: packet too large (4000014 bytes)"
+            "p2p: V2 transport error: packet too large (4000014 bytes)"
         );
         assert_eq!(V2_CIPHER_EXPANSION, 20);
         assert_eq!(v2_other_recv_bytes(3), 23);
@@ -765,15 +765,15 @@ mod tests {
         assert!(short_id_for_command("sendaddrv2").is_none());
         assert_eq!(
             v2_handshake_timeout_log(0),
-            "V2 handshake timeout, disconnecting peer=0"
+            "p2p: V2 handshake timeout, disconnecting peer=0"
         );
         assert_eq!(
             v2_missing_garbage_terminator_log(),
-            "V2 transport error: missing garbage terminator"
+            "p2p: V2 transport error: missing garbage terminator"
         );
         assert_eq!(
             v2_packet_decryption_failure_log(),
-            "V2 transport error: packet decryption failure"
+            "p2p: V2 transport error: packet decryption failure"
         );
         // Placeholder slots 29–36 stay empty (unknown short id → protocol error).
         for id in 29u8..=36 {

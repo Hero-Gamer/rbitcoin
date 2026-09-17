@@ -821,7 +821,7 @@ impl MempoolHub {
     /// before a peer getdata's it.
     pub fn unbroadcast_removed_log(txid: &Txid) -> String {
         format!(
-            "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
+            "p2p: Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
         )
     }
 
@@ -3782,7 +3782,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
+                "p2p: Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
             )
         );
     }

@@ -422,11 +422,11 @@ printf 'regtest=1\nport=+18444\n' >"$CONF_PORT/bitcoin.conf"
 assert_fail_msg "conf port +18444" "Error: Invalid port specified in -port: '+18444'" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$CONF_PORT" -regtest
 
-# InitError FULL_TEXT: production prints `Error: configuration error: …`;
-# the shim must emit Core's line (no extra prefix). Fake node, no cargo.
+# InitError FULL_TEXT: production prints `Error: …` (`NodeError::Init`).
+# the shim must emit Core's peertimeout needle. Fake node, no cargo.
 FAKE_INIT="$WORKDIR/rbitcoin-node-initerr"
 printf '%s\n' '#!/bin/sh' \
-  'echo "Error: configuration error: peer-timeout must be a positive integer."' \
+  'echo "Error: peer-timeout must be a positive integer."' \
   'exit 1' >"$FAKE_INIT"
 chmod +x "$FAKE_INIT"
 INIT_DD="$WORKDIR/initerr-peertimeout"
@@ -511,9 +511,29 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+ENV_DD="$WORKDIR/rpc-wait-idle"
+mkdir -p "$ENV_DD"
+printf 'regtest=1\n' >"$ENV_DD/bitcoin.conf"
+ENV_FAKE="$WORKDIR/env-node"
+ENV_OUT="$WORKDIR/child-env"
+cat >"$ENV_FAKE" <<EOF
+#!/bin/sh
+env | grep -F RBITCOIN_RPC_WAIT_TIP_IDLE >"$ENV_OUT" || true
+exit 0
+EOF
+chmod +x "$ENV_FAKE"
+RBITCOIN_NODE="$ENV_FAKE" "$SHIM" -datadir="$ENV_DD" -regtest -noserver >/dev/null 2>&1 || true
+if grep -q '^RBITCOIN_RPC_WAIT_TIP_IDLE=1$' "$ENV_OUT" 2>/dev/null; then
+  echo "ok - shim sets RBITCOIN_RPC_WAIT_TIP_IDLE on the node"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - shim sets RBITCOIN_RPC_WAIT_TIP_IDLE (got: $([[ -f $ENV_OUT ]] && cat "$ENV_OUT" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
 FAKE_MCW="$WORKDIR/rbitcoin-node-minchainwork"
 printf '%s\n' '#!/bin/sh' \
-  'echo "Error: configuration error: Invalid minimum work specified (test), must be up to 64 hex digits"' \
+  'echo "Error: Invalid minimum work specified (test), must be up to 64 hex digits"' \
   'exit 1' >"$FAKE_MCW"
 chmod +x "$FAKE_MCW"
 MCW_DD="$WORKDIR/initerr-minchainwork"

@@ -468,6 +468,10 @@ fn estimatesmartfee_core_param_gates() {
         vec![json!(1), json!("ECONOMICAL")],
     )
     .unwrap();
+    let raw = dispatch(&ctx, "estimaterawfee", vec![json!(1)]).unwrap();
+    assert!(raw.get("feerate").is_some(), "{raw}");
+    assert!(raw.get("short").is_none(), "{raw}");
+    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("unset")]).unwrap();
     let _ = dispatch(
         &ctx,
@@ -475,8 +479,6 @@ fn estimatesmartfee_core_param_gates() {
         vec![json!(1), json!("conservative")],
     )
     .unwrap();
-    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1)]).unwrap();
-    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -861,10 +863,10 @@ fn echo_positional_named_and_mixed_args() {
     .unwrap_err();
     assert_eq!(twice_null["code"], ERR_INVALID_PARAMETER);
 
-    // Mixed positional `args` must feed getblockhash(height).
+    // Mixed positional `args` is echo-only; other methods reject the named key.
     let gh = dispatch(&ctx, "getblockhash", named(json!({"args": [0]}))).unwrap_err();
-    assert_ne!(gh["message"].as_str().unwrap_or(""), "height required");
     assert_eq!(gh["code"], ERR_INVALID_PARAMETER);
+    assert_eq!(gh["message"], "Unknown named parameter args");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4589,11 +4591,18 @@ fn rpc_params_type_coercion_and_unknown_named() {
             .cloned()
             .unwrap(),
     );
-    assert_eq!(
-        mixed.get(0, "hexstring").and_then(|v| v.as_str()),
-        Some("from-args")
+    assert!(
+        mixed.get(0, "hexstring").is_none(),
+        "args peel is echo-only, not RpcParams::named"
     );
     assert_eq!(mixed.opt_bool(1, "verbose").unwrap(), Some(true));
+    assert_eq!(
+        mixed
+            .get(0, "args")
+            .and_then(|v| v.as_array())
+            .map(|a| a[0].as_str()),
+        Some(Some("from-args"))
+    );
 
     let args_not_array = RpcParams::named(
         json!({"args": "not-array", "blockhash": "aa"})

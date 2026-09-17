@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-/// HTTP Basic for `user:pass` (password must equal `{datadir}/rpc.token`).
-const RPC_BASIC: &str = "Basic dXNlcjpwYXNz";
+/// TCP RPC Bearer matching `{datadir}/rpc.token` written by the tests.
+const RPC_BEARER: &str = "Bearer pass";
 
 fn ephemeral_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -92,7 +92,7 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
 async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     let body = json!({"jsonrpc":"1.0","id":"test","method":method,"params":params}).to_string();
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BASIC}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BEARER}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let (_st, text) = http_exchange(addr, &req).await;

@@ -16,6 +16,8 @@ pub fn tip_too_far_in_future(tip_time: u32, now: u64) -> bool {
 #[derive(Debug)]
 pub enum NodeError {
     Config(String),
+    /// Operator InitError: exit 1, `Error:` prefix (Core functional mapping).
+    Init(String),
     /// Tip time is more than two hours ahead of the node clock.
     FutureTip,
     Network(ParseNetworkError),
@@ -32,6 +34,7 @@ impl fmt::Display for NodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NodeError::Config(s) => write!(f, "configuration error: {s}"),
+            NodeError::Init(s) => write!(f, "Error: {s}"),
             NodeError::FutureTip => write!(f, "{FUTURE_BLOCK_DB_MSG}"),
             NodeError::Network(e) => write!(f, "{e}"),
             NodeError::Datadir { path, source } => {
@@ -49,7 +52,10 @@ impl std::error::Error for NodeError {
             NodeError::Network(e) => Some(e),
             NodeError::Datadir { source, .. } => Some(source),
             NodeError::Store(e) => Some(e),
-            NodeError::Config(_) | NodeError::FutureTip | NodeError::Locked(_) => None,
+            NodeError::Config(_)
+            | NodeError::Init(_)
+            | NodeError::FutureTip
+            | NodeError::Locked(_) => None,
         }
     }
 }
@@ -79,6 +85,13 @@ mod tests {
         let cfg = NodeError::Config("bad".into());
         assert_eq!(format!("{cfg}"), "configuration error: bad");
         assert!(cfg.source().is_none());
+
+        let init = NodeError::Init("peer-timeout must be a positive integer.".into());
+        assert_eq!(
+            format!("{init}"),
+            "Error: peer-timeout must be a positive integer."
+        );
+        assert!(init.source().is_none());
 
         let fut = NodeError::FutureTip;
         assert_eq!(format!("{fut}"), FUTURE_BLOCK_DB_MSG);

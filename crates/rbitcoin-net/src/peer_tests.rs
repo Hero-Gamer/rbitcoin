@@ -3056,11 +3056,11 @@ fn sendaddrv2_after_verack_disconnects() {
 
     assert_eq!(
         crate::peer::sendaddrv2_after_verack_log(0),
-        "sendaddrv2 received after verack, disconnecting peer=0"
+        "p2p: sendaddrv2 received after verack, disconnecting peer=0"
     );
     assert_eq!(
         crate::peer::addrv2_message_size_log(1010),
-        "addrv2 message size = 1010"
+        "p2p: addrv2 message size = 1010"
     );
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
@@ -5115,11 +5115,11 @@ fn desirable_service_flags_match_core() {
 
     assert_eq!(
         expected_services_disconnect_log(0, full.to_u64()),
-        "does not offer the expected services (00000000 offered, 00000009 expected)"
+        "p2p: does not offer the expected services (00000000 offered, 00000009 expected)"
     );
     assert_eq!(
         expected_services_disconnect_log(limited_wit.to_u64(), full.to_u64()),
-        "does not offer the expected services (00000408 offered, 00000009 expected)"
+        "p2p: does not offer the expected services (00000408 offered, 00000009 expected)"
     );
 }
 
@@ -5138,15 +5138,15 @@ fn expect_services_from_conn_matches_core() {
 fn handshake_disconnect_log_needles() {
     assert_eq!(
         crate::peer::ping_prior_to_verack_log(0),
-        "Unsupported message \"ping\" prior to verack from peer=0"
+        "p2p: Unsupported message \"ping\" prior to verack from peer=0"
     );
     assert_eq!(
         crate::peer::non_version_before_handshake_log("ping", 1),
-        "non-version message before version handshake. Message \"ping\" from peer=1"
+        "p2p: non-version message before version handshake. Message \"ping\" from peer=1"
     );
     assert_eq!(
         crate::peer::obsolete_version_log(31799, 5),
-        "using obsolete version 31799, disconnecting peer=5"
+        "p2p: using obsolete version 31799, disconnecting peer=5"
     );
     assert_eq!(crate::peer::MIN_PEER_PROTO_VERSION, 31800);
     let hidden = crate::peer::hidden_addr_from();
@@ -5157,7 +5157,7 @@ fn handshake_disconnect_log_needles() {
     );
     assert_eq!(
         crate::peer::advertising_address_log("42.42.42.42:18445", 3),
-        "Advertising address 42.42.42.42:18445 to peer=3"
+        "p2p: Advertising address 42.42.42.42:18445 to peer=3"
     );
 }
 

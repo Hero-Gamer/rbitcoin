@@ -16,7 +16,9 @@ from rpc_proxy import (
     RpcProxy,
     core_btc_kvb_to_sat_vb,
     esplora_port,
+    node_authorization,
     node_rpc_port,
+    peel_authproxy_args,
     rewrite_core_maxfeerate,
 )
 
@@ -36,6 +38,32 @@ item = {
 rewrite_core_maxfeerate(item)
 assert item["params"][1] == 10_000, item
 
+# AuthServiceProxy mixed: peel `args` into a positional list (echo keeps the object).
+mixed = {
+    "method": "submitpackage",
+    "params": {"args": [["aa", "bb"]], "maxfeerate": 0},
+}
+peel_authproxy_args(mixed)
+assert mixed["params"] == [["aa", "bb"], 0], mixed
+rewrite_core_maxfeerate(mixed)
+assert mixed["params"] == [["aa", "bb"], 0], mixed
+echo_mixed = {
+    "method": "echo",
+    "params": {"args": [0, 1], "arg3": 3},
+}
+peel_authproxy_args(echo_mixed)
+assert echo_mixed["params"] == {"args": [0, 1], "arg3": 3}, echo_mixed
+args_only = {"method": "getblockhash", "params": {"args": [0]}}
+peel_authproxy_args(args_only)
+assert args_only["params"] == [0], args_only
+send_mixed = {
+    "method": "sendrawtransaction",
+    "params": {"args": ["dead"], "maxfeerate": 0.1},
+}
+peel_authproxy_args(send_mixed)
+rewrite_core_maxfeerate(send_mixed)
+assert send_mixed["params"] == ["dead", 10_000], send_mixed
+
 assert node_rpc_port(18443) == 28443
 assert esplora_port(18443) == 38443
 # Consecutive Core rpcports must not share node-RPC / Esplora binds.
@@ -52,6 +80,9 @@ assert node_rpc_port(60000) == 50000
 assert esplora_port(50000) == 30000
 assert 1 <= esplora_port(56000) <= 65535
 
+assert node_authorization("__cookie__:secret") == "Bearer secret"
+assert node_authorization("secret") == "Bearer secret"
+
 COOKIE = "__cookie__:secret"
 
 
@@ -61,7 +92,7 @@ class FakeNode(BaseHTTPRequestHandler):
 
     def do_POST(self):
         auth = self.headers.get("Authorization", "")
-        want = "Basic " + base64.b64encode(COOKIE.encode()).decode()
+        want = "Bearer secret"
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n)
         item = json.loads(raw.decode())

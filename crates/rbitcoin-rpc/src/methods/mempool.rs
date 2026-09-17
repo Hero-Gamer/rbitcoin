@@ -717,8 +717,7 @@ pub(crate) fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<V
     estimate_fee_result(ctx, conf_target)
 }
 
-/// Core `estimaterawfee` name; same 10-minute product as [`estimatesmartfee`].
-/// Core `estimaterawfee` name; same 10-minute product as [`estimatesmartfee`].
+/// Same 10-minute product as [`estimatesmartfee`] under the Core name.
 pub(crate) fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["conf_target", "threshold"])?;
     if params.get(0, "conf_target").is_none() {
@@ -739,19 +738,7 @@ pub(crate) fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             ));
         }
     }
-    // Core returns nested short/medium/long buckets; we expose the same
-    // single-horizon product under `short` for harness compatibility.
-    let base = estimate_fee_result(ctx, conf_target)?;
-    Ok(json!({
-        "short": {
-            "feerate": base.get("feerate").cloned().unwrap_or(json!(-1.0)),
-            "decay": 0.962,
-            "scale": 2,
-            "pass": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-            "fail": Value::Null,
-            "errors": base.get("errors").cloned().unwrap_or(Value::Null),
-        }
-    }))
+    estimate_fee_result(ctx, conf_target)
 }
 
 pub(crate) fn estimate_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
@@ -1173,7 +1160,7 @@ pub(crate) fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value
             "from": s.announcers,
         });
         if verbosity == 2 {
-            row["hex"] = json!(bitcoin::consensus::encode::serialize_hex(&s.tx));
+            row["hex"] = json!(serialize_hex(&s.tx));
         }
         out.push(row);
     }
