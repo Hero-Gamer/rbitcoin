@@ -146,10 +146,6 @@ impl TxHeadMphf {
         self.mphf.g_bytes_resident() as u64
     }
 
-    pub(crate) fn pin_g_resident(&mut self) -> Result<(), StoreError> {
-        self.mphf.load_g_resident()
-    }
-
     pub fn read_rels_batch(
         &self,
         slots: &[u32],
