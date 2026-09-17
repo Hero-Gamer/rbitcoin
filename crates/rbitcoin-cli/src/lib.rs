@@ -445,20 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn dropped_core_names_are_unknown() {
-        for flag in [
-            "--rpcuser=u",
-            "--rpcpassword=p",
-            "--rpcport=1",
-            "--rpcconnect=h",
-            "-rpcport",
-        ] {
-            let code = cli_main(["rbitcoin-cli", flag, "getblockcount"]);
-            assert!(!exit_ok(code), "{flag} must be unknown");
-        }
-    }
-
-    #[test]
     fn missing_auth_is_unauthorized() {
         let (port, _h) = spawn_rpc_mock("alice", "0");
         let dir = tmp_datadir();

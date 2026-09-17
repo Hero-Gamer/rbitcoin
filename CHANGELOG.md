@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **Catalog journeys absorb leftover twins:** mature confirm pins Class A then
+  accept and `confirm_wire_run` double-spend; unified wire pins empty
+  `confirm_wire_run`; Electrum TCP pins `id_from_pos` pos OOB and mempool
+  verbose `transaction.get`; cross-surface pins mempool-child `listunspent`
+  `height=-1`; CLI smoke refuses dropped Core `--rpcuser`/`--rpcport` names.
+  Dispatch/crate twins of those contracts are gone.
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep
