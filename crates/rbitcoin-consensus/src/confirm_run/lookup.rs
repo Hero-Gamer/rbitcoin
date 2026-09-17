@@ -362,6 +362,7 @@ pub(super) fn wire_lookup_phase(
         Some(t) => t.saturating_add(1),
     };
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
+    check_carried_header_lens(pipeline, blocks.len())?;
 
     let mut struct_ns = 0u64;
     let mut header_ns = 0u64;
@@ -380,28 +381,21 @@ pub(super) fn wire_lookup_phase(
         )?;
         let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
         struct_ns = struct_ns.saturating_add(t_struct.elapsed().as_nanos() as u64);
+        let carried = carried_header_at(pipeline, i);
         let t_header = Instant::now();
-        if i == 0 {
-            if height.0 != path_lo {
-                return Err(ConsensusError::BadPrev);
-            }
-            if path_lo == store_path_lo {
-                validate_header_hashed(query, params, *height, &block.header, hash)?;
-            } else {
-                let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
-                if block.header.prev_blockhash.to_byte_array() != expect_prev {
-                    return Err(ConsensusError::BadPrev);
-                }
-                pow_hash_meets_target(hash, block.header.bits, params.pow_limit)?;
-            }
-        } else {
-            // Prev wire hash already on metas[i-1] — no rehash.
-            let prev_hash = metas[i - 1].hash;
-            if block.header.prev_blockhash.to_byte_array() != prev_hash {
-                return Err(ConsensusError::BadPrev);
-            }
-            pow_hash_meets_target(hash, block.header.bits, params.pow_limit)?;
-        }
+        stamp_check_header_link(
+            query,
+            params,
+            pipeline,
+            i,
+            *height,
+            path_lo,
+            store_path_lo,
+            &block.header,
+            hash,
+            carried,
+            (i > 0).then(|| metas[i - 1].hash),
+        )?;
         header_ns = header_ns.saturating_add(t_header.elapsed().as_nanos() as u64);
 
         let t_prep = Instant::now();
@@ -421,17 +415,7 @@ pub(super) fn wire_lookup_phase(
         let header_rec = crate::header_to_record(prev_fk, &block.header, hash);
         prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
         let t_put = Instant::now();
-        let header_fk = if let Some((fk, _)) = query
-            .get_header_by_hash(&header_rec.hash)
-            .map_err(ConsensusError::from)?
-        {
-            fk
-        } else {
-            query
-                .store()
-                .put_header(&header_rec)
-                .map_err(ConsensusError::from)?
-        };
+        let header_fk = stamp_header_fk(query, &header_rec, carried.map(|(fk, _)| fk))?;
         header_ns = header_ns.saturating_add(t_put.elapsed().as_nanos() as u64);
         wire_blocks.push(block);
         metas.push(BodyMeta {
@@ -452,6 +436,117 @@ pub(super) fn wire_lookup_phase(
         query, struct_ns, header_ns, prepare_ns, filter_ns, batch_ns, plan_ns,
     );
     Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+fn check_carried_header_lens(
+    pipeline: Option<&WireLoadPipeline>,
+    n_blocks: usize,
+) -> Result<(), ConsensusError> {
+    let Some(p) = pipeline else {
+        return Ok(());
+    };
+    if (!p.carried_header_fks.is_empty() || !p.carried_header_hashes.is_empty())
+        && (p.carried_header_fks.len() != n_blocks || p.carried_header_hashes.len() != n_blocks)
+    {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: carried header length",
+        )));
+    }
+    Ok(())
+}
+
+fn carried_header_at(
+    pipeline: Option<&WireLoadPipeline>,
+    i: usize,
+) -> Option<(rbitcoin_primitives::Fk, [u8; 32])> {
+    pipeline.and_then(|p| {
+        let fk = p.carried_header_fks.get(i).copied()?;
+        if fk.is_null() {
+            return None;
+        }
+        Some((fk, p.carried_header_hashes[i]))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stamp_check_header_link(
+    query: &Query,
+    params: &ChainParams,
+    pipeline: Option<&WireLoadPipeline>,
+    i: usize,
+    height: Height,
+    path_lo: u32,
+    store_path_lo: u32,
+    header: &bitcoin::block::Header,
+    hash: [u8; 32],
+    carried: Option<(rbitcoin_primitives::Fk, [u8; 32])>,
+    prev_meta_hash: Option<[u8; 32]>,
+) -> Result<(), ConsensusError> {
+    if i == 0 && height.0 != path_lo {
+        return Err(ConsensusError::BadPrev);
+    }
+    let prev_bytes = header.prev_blockhash.to_byte_array();
+    if let Some((_, expect)) = carried {
+        if hash != expect {
+            return Err(ConsensusError::BadBlock("carried header hash mismatch"));
+        }
+        if i == 0 {
+            if path_lo != store_path_lo {
+                let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
+                if prev_bytes != expect_prev {
+                    return Err(ConsensusError::BadPrev);
+                }
+            }
+        } else if prev_bytes != prev_meta_hash.unwrap_or([0u8; 32]) {
+            return Err(ConsensusError::BadPrev);
+        }
+        return Ok(());
+    }
+    if i == 0 {
+        if path_lo == store_path_lo {
+            validate_header_hashed(query, params, height, header, hash)?;
+        } else {
+            let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
+            if prev_bytes != expect_prev {
+                return Err(ConsensusError::BadPrev);
+            }
+            pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+        }
+        return Ok(());
+    }
+    if prev_bytes != prev_meta_hash.unwrap_or([0u8; 32]) {
+        return Err(ConsensusError::BadPrev);
+    }
+    pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+    Ok(())
+}
+
+fn stamp_header_fk(
+    query: &Query,
+    header_rec: &rbitcoin_store::HeaderRecord,
+    carried: Option<rbitcoin_primitives::Fk>,
+) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
+    if let Some(fk) = carried {
+        match query.store().get_header(fk) {
+            Ok(rec) if rec.hash == header_rec.hash => {
+                rbitcoin_query::note_confirm(&query.confirm_stats().phase_prep_header_skip_n, 1);
+                return Ok(fk);
+            }
+            Ok(_) | Err(StoreError::NotFound) => {}
+            Err(e) => return Err(ConsensusError::from(e)),
+        }
+    }
+    if let Some((fk, _)) = query
+        .get_header_by_hash(&header_rec.hash)
+        .map_err(ConsensusError::from)?
+    {
+        Ok(fk)
+    } else {
+        query
+            .store()
+            .put_header(header_rec)
+            .map_err(ConsensusError::from)
+    }
 }
 
 fn lookup_require_contiguous(blocks: &[WireBlockIn]) -> Result<(), ConsensusError> {
@@ -819,6 +914,77 @@ mod tests {
             want.as_ptr(),
             "plan must not copy scriptPubKey"
         );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn stamp_skips_header_ensure_when_pipeline_carries_fk() {
+        use crate::accept_and_connect_block;
+        use crate::regtest_pad::mine_empty_regtest;
+        use std::sync::atomic::Ordering;
+
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let hash = b1.block_hash().to_byte_array();
+        let genesis_fk = q
+            .get_header_by_hash(&genesis.block_hash().to_byte_array())
+            .unwrap()
+            .unwrap()
+            .0;
+        let rec = crate::header_to_record(genesis_fk, &b1.header, hash);
+        let hfk = q.store().put_header(&rec).unwrap();
+        let n_headers = q.store().headers.count();
+        let inflight = rbitcoin_query::InFlight::new();
+        let pipe = WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: &inflight,
+            skeleton: None,
+            carried_need: Vec::new(),
+            carried_header_fks: vec![hfk],
+            carried_header_hashes: vec![hash],
+        };
+        let items = [(Height(1), Arc::new(b1), None)];
+        let _ = q
+            .confirm_stats()
+            .phase_prep_header_skip_n
+            .swap(0, Ordering::Relaxed);
+        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+            .expect("carried header stamp");
+        assert_eq!(
+            q.confirm_stats()
+                .phase_prep_header_skip_n
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(q.store().headers.count(), n_headers);
+        assert_eq!(stamped.metas[0].header_fk, hfk);
+        let plan = stamped.plan.as_ref().expect("plan");
+        assert_eq!(plan.per_header_ranges[0].0, hfk);
+        assert!(
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "wire planner packed ins stay empty"
+        );
+
+        let pipe_bad = WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: &inflight,
+            skeleton: None,
+            carried_need: Vec::new(),
+            carried_header_fks: vec![hfk],
+            carried_header_hashes: vec![[0x11; 32]],
+        };
+        match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe_bad)) {
+            Err(ConsensusError::BadBlock("carried header hash mismatch")) => {}
+            Err(e) => panic!("expected hash mismatch, got {e}"),
+            Ok(_) => panic!("expected hash mismatch, got Ok"),
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 

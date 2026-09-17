@@ -77,6 +77,8 @@ impl LoadAheadState {
         store_path_lo: u32,
         skeleton: Option<rbitcoin_query::BatchParentIds>,
         carried_need: Vec<[u8; 32]>,
+        carried_header_fks: Vec<rbitcoin_primitives::Fk>,
+        carried_header_hashes: Vec<[u8; 32]>,
     ) -> WireLoadPipeline<'_> {
         let parent_hash = if path_lo == store_path_lo {
             None
@@ -92,6 +94,8 @@ impl LoadAheadState {
             in_flight: &self.in_flight,
             skeleton,
             carried_need,
+            carried_header_fks,
+            carried_header_hashes,
         }
     }
 
@@ -1879,12 +1883,16 @@ pub(crate) fn spawn_confirm_engine(
                 }));
                 confirm_thr_stats::add_load_clone(&stats, t_clone.elapsed());
                 let mut carried_need = Vec::new();
-                for (_, _, w) in &wire_batch {
+                let mut carried_header_fks = Vec::with_capacity(wire_batch.len());
+                let mut carried_header_hashes = Vec::with_capacity(wire_batch.len());
+                for (_, ha, w) in &wire_batch {
                     for &(txid, _) in w.spend_keys.iter() {
                         if txid != [0u8; 32] {
                             carried_need.push(txid);
                         }
                     }
+                    carried_header_fks.push(rbitcoin_primitives::Fk(w.header_fk));
+                    carried_header_hashes.push(ha.to_byte_array());
                 }
                 let t_stamp = Instant::now();
                 let plan_res = {
@@ -1893,6 +1901,8 @@ pub(crate) fn spawn_confirm_engine(
                         store_path_lo,
                         parent_ids.clone(),
                         carried_need,
+                        carried_header_fks,
+                        carried_header_hashes,
                     );
                     rbitcoin_consensus::confirm_wire_lookup_stamp(
                         &hub_load.query,
@@ -1985,6 +1995,8 @@ pub(crate) fn spawn_confirm_engine(
                     expect_h,
                     store_path_lo,
                     parent_ids,
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                 );
                 let plan_ns = stamped.work_ns;

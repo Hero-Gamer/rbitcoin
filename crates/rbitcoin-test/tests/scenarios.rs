@@ -2230,6 +2230,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
             in_flight: &inflight,
             skeleton: None,
             carried_need: Vec::new(),
+            carried_header_fks: Vec::new(),
+            carried_header_hashes: Vec::new(),
         };
         confirm_wire_load_phase_pipelined(
             &q,
@@ -2290,6 +2292,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
             in_flight: &inflight,
             skeleton: None,
             carried_need: Vec::new(),
+            carried_header_fks: Vec::new(),
+            carried_header_hashes: Vec::new(),
         };
         confirm_wire_load_phase_pipelined(
             &q,
