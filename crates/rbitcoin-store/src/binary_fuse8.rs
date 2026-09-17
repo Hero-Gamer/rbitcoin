@@ -10,12 +10,12 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::fuse_map::FuseMap;
+use crate::readonly_map::ReadonlyMap;
 
 /// Fingerprint storage: heap while building, mapped after `open_file`.
 pub enum Fingerprints {
     Heap(Box<[u8]>),
-    Map(FuseMap),
+    Map(ReadonlyMap),
 }
 
 impl Fingerprints {

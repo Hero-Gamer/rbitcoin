@@ -18,7 +18,7 @@
 
 use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
 use crate::error::StoreError;
-use crate::fuse_map::FuseMap;
+use crate::readonly_map::ReadonlyMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -120,7 +120,7 @@ impl SealedFuse8 {
 
 /// Open a BF8R fuse file. v1 and unreadable v2 refuse (no always-probe).
 pub fn open_file(path: &Path) -> Result<FuseFileOpen, StoreError> {
-    let mut map = FuseMap::map_path(path)?;
+    let mut map = ReadonlyMap::map_path(path)?;
     let geo = {
         let bytes = map.as_file_bytes();
         if bytes.len() < 16 {
