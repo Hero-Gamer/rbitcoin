@@ -65,10 +65,9 @@ puts parent P on the load-batch skeleton, load stamp of a child spending P has
 **zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
 move `plan_batch` onto lookup.
 
-IBD stamp does not build `TxApply`. Packed ins are filled from the same plan
-edge walk (`archive_plan_batch_from_wire`); write `fill_packed_ins_from_blocks`
-is then a no-op. SpendEdges + CreatePin survive freeze. Write encodes Class A
-outs from `Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
+IBD stamp does not build `TxApply` / packed ins (`archive_plan_batch_from_wire`).
+SpendEdges + CreatePin survive freeze. Write encodes ins and Class A outs from
+`Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
 the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 
 | Stage | Allowed IO | Forbidden |

@@ -150,7 +150,6 @@ pub struct WireLoadPipeline<'a> {
     /// External prev_txids from the BQ input walk (IBD skeleton stamp; no second wire collect).
     pub carried_need: Vec<[u8; 32]>,
     /// BQ `header_fk` per block (empty = stamp ensure/put). Length matches `carried_header_hashes`.
-    /// Ensure skip requires the stored header at this fk to match the wire hash.
     pub carried_header_fks: Vec<rbitcoin_primitives::Fk>,
     /// BQ header hashes aligned with [`Self::carried_header_fks`].
     pub carried_header_hashes: Vec<[u8; 32]>,
