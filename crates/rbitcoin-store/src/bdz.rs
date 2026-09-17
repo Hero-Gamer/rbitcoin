@@ -136,6 +136,27 @@ impl BdzMphf {
         }
     }
 
+    /// Unpack packed `g` into process RAM. Idempotent; index then does not pread.
+    pub(crate) fn load_g_resident(&mut self) -> Result<(), StoreError> {
+        let GStore::Fd {
+            file,
+            path,
+            off,
+            n_bytes,
+            g_bits,
+            ..
+        } = &self.g
+        else {
+            return Ok(());
+        };
+        let mut buf = vec![0u8; *n_bytes as usize];
+        pread_exact(file, path, *off, &mut buf)?;
+        let g_bits = *g_bits;
+        let unpacked: Box<[u32]> = (0..self.m).map(|v| unpack_g_at(&buf, v, g_bits)).collect();
+        self.g = GStore::Ram(unpacked);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn vertices(&self, key: u64) -> [u32; 3] {
         if self.n <= 1 {
@@ -1558,6 +1579,43 @@ mod tests {
             pages.len() >= 2,
             "straddle vertex must include both page sides"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_g_resident_indexes_without_pread() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-bdz2-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = 1_200u32;
+        let modulus = 1u32 << 25;
+        let keys: Vec<u64> = (0..n as u64)
+            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(13))
+            .collect();
+        let values: Vec<u32> = (0..n).map(|i| i * 17 + 3).collect();
+        let ram = BdzMphf::build_assigned(&keys, &values, modulus).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_packed_to(&p).unwrap();
+        let mut fd = BdzMphf::read_packed_from(&p).unwrap();
+        assert_eq!(fd.g_bytes_resident(), 0);
+        fd.load_g_resident().unwrap();
+        assert!(fd.g_bytes_resident() > 0);
+        fd.load_g_resident().unwrap();
+        let _ = fd.take_g_page_preads();
+        for &k in &keys {
+            assert_eq!(ram.index(k).unwrap(), fd.index(k).unwrap());
+        }
+        assert_eq!(
+            ram.index(0xDEAD_BEEF_u64).unwrap(),
+            fd.index(0xDEAD_BEEF_u64).unwrap()
+        );
+        assert_eq!(fd.take_g_page_preads(), 0, "resident g must not pread");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
