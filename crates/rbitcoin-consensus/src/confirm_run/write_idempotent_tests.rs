@@ -2705,8 +2705,8 @@ fn store_start_states_lookup_load_confirm() {
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
         let plan = stamped.plan.as_ref().expect("plan");
         assert!(
-            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
-            "IBD stamp must not carry packed InputRecords to load/write"
+            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
+            "IBD stamp fills packed InputRecords so write fill is a no-op"
         );
         assert!(
             !plan.edges.is_empty(),

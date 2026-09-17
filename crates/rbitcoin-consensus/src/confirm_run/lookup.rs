@@ -895,9 +895,15 @@ mod tests {
         assert_eq!(stamped.metas[0].pres.len(), pres.len());
         assert_eq!(stamped.metas[0].pres[0].txid, pres[0].txid);
         let plan = stamped.plan.as_ref().expect("new body plans");
-        assert!(
-            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
-            "wire planner packed ins stay empty"
+        assert_eq!(plan.packed.len(), 1);
+        assert_eq!(
+            plan.packed[0].1.len(),
+            1,
+            "wire planner fills packed ins from stamp edges"
+        );
+        assert_eq!(
+            plan.packed[0].1[0].script_sig,
+            items[0].1.txdata[0].input[0].script_sig.to_bytes()
         );
         let want = items[0].1.txdata[0].output[0].script_pubkey.as_bytes();
         assert_eq!(
@@ -965,10 +971,6 @@ mod tests {
         assert_eq!(stamped.metas[0].header_fk, hfk);
         let plan = stamped.plan.as_ref().expect("plan");
         assert_eq!(plan.per_header_ranges[0].0, hfk);
-        assert!(
-            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
-            "wire planner packed ins stay empty"
-        );
 
         let pipe_bad = WireLoadPipeline {
             path_lo: 1,
