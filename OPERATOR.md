@@ -729,10 +729,12 @@ stderr. That is intentional Core-style `checkblocks=6` + crash/race healing —
 not a full reindex. Widespread mid-chain header graph poison still means a
 clean datadir.
 
-**Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A). If it
-is damaged or an old 4k-slot table was left wedged, stop the node and delete that
-directory — the next start recreates it empty and redownloads unconfirmed txs.
-Do **not** wipe `store/` for mempool slot/full errors.
+**Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A),
+schema **2**. Leftover schema **1** (pre-packed `fee‖weight‖bitcoin-serialize`)
+**refuses** open — stop the node and delete `{datadir}/mempool/` (Class A
+kept); the next start recreates it empty and redownloads unconfirmed txs. The
+same wipe applies if the sidecar is damaged or an old 4k-slot table was left
+wedged. Do **not** wipe `store/` for mempool slot/full/schema errors.
 
 ## P2P transport
 
