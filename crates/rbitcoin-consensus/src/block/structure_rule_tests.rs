@@ -2109,3 +2109,202 @@ fn pres_has_witness_matches_block_walk() {
         block_has_witness(&block)
     );
 }
+
+#[test]
+fn rejects_double_spend_same_block_fast() {
+    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("ds-fast");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let op = OutPoint {
+        txid: b1.txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let mk = |op| {
+        let _b = vec![0x51u8];
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(_b),
+            }],
+        }
+    };
+    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    b2.txdata.push(mk(op));
+    b2.txdata.push(mk(op));
+    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
+        .expect_err("must reject double spend in block");
+    let m = format!("{:?}", err).to_lowercase();
+    assert!(
+        m.contains("double") || m.contains("duplicate") || m.contains("spend"),
+        "got {}",
+        m
+    );
+}
+
+#[test]
+fn rejects_forward_spend_pj_ge_ti_fast() {
+    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("fwd-fast");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let mk_spk = || {
+        let v = vec![0x51u8];
+        ScriptBuf::from_bytes(v)
+    };
+    let tx_b = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: b1.txdata[0].compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: mk_spk(),
+        }],
+    };
+    let tx_b_id = tx_b.compute_txid();
+    let tx_a = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: tx_b_id,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: mk_spk(),
+        }],
+    };
+    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    b2.txdata.push(tx_a);
+    b2.txdata.push(tx_b);
+    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
+        .expect_err("must reject forward spend");
+    let m = format!("{:?}", err);
+    assert!(
+        m.contains("MissingPrevout") || m.contains("missing") || m.contains("prevout"),
+        "got {}",
+        m
+    );
+}
+
+#[test]
+fn rejects_coinbase_excess_value_fast() {
+    let mut cb = coinbase(1);
+    cb.output[0].value = Amount::from_sat(50_0000_0000 + 1);
+    let block = block_with(vec![cb]);
+    let err = super::check_coinbase_subsidy(&block, &ctx_h(1), 0).unwrap_err();
+    assert_bad_block(err, "coinbase excess value");
+}
+
+#[test]
+fn rejects_in_below_out_fast() {
+    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("in-below-out-fast");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let mk_spk = || {
+        let v = vec![0x51u8];
+        ScriptBuf::from_bytes(v)
+    };
+    let big = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: b1.txdata[0].compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 + 1),
+            script_pubkey: mk_spk(),
+        }],
+    };
+    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    b2.txdata.push(big);
+    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
+        .expect_err("must reject in < out");
+    assert!(format!("{:?}", err).contains("in < out"));
+}
+
+#[test]
+fn rejects_coinbase_maturity_durable_4_deep_fast() {
+    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("maturity-4-deep-fast");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let mut prev_hash = genesis.block_hash();
+    let mut prev_time = genesis.header.time;
+    let mut blocks = Vec::new();
+    for h in 1..=4 {
+        let b = mine_empty_regtest(prev_hash, prev_time + 600, h);
+        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
+        prev_hash = b.block_hash();
+        prev_time = b.header.time;
+        blocks.push(b);
+    }
+    let mk_spk = || {
+        let v = vec![0x51u8];
+        ScriptBuf::from_bytes(v)
+    };
+    let spend = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: blocks[0].txdata[0].compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: mk_spk(),
+        }],
+    };
+    let mut b5 = mine_empty_regtest(prev_hash, prev_time + 600, 5);
+    b5.txdata.push(spend);
+    prepare_regtest_candidate(&mut b5, prev_hash, prev_time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(5), &b5, Milestone::NONE)
+        .expect_err("must reject immature");
+    assert!(format!("{:?}", err).contains("immature"));
+}
