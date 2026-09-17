@@ -90,8 +90,6 @@ impl Wave {
             return None;
         }
         #[cfg(test)]
-        maybe_delay_claim();
-        #[cfg(test)]
         if STEAL_CLAIMS_ON.load(Ordering::Relaxed) {
             STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
         }
@@ -196,7 +194,12 @@ fn steal_from(snap: &[Arc<Wave>]) -> Option<(Arc<Wave>, Range<usize>)> {
 }
 
 fn steal_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
-    steal_from(&waves_snap().load())
+    let claimed = steal_from(&waves_snap().load());
+    #[cfg(test)]
+    if claimed.is_some() {
+        maybe_delay_claim();
+    }
+    claimed
 }
 
 fn steal_bg_chunk() -> Option<(Arc<Wave>, Range<usize>)> {
@@ -1171,5 +1174,20 @@ mod tests {
         arm.go();
         wave.join().expect("join").expect("wave ok");
         occupy.release();
+    }
+
+    #[test]
+    fn delay_claim_does_not_block_idle_wave() {
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        let arm = DelayClaimArm::arm();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let r = try_for_each_parallel_idle(&[1u32, 2], ok_u32);
+            let _ = tx.send(r);
+        });
+        let got = rx.recv_timeout(Duration::from_secs(2));
+        arm.go();
+        let r = got.expect("idle wave blocked on DELAY_CLAIM");
+        r.unwrap();
     }
 }
