@@ -926,7 +926,9 @@ analog = "official: dual-connect getconnectioncount + last_block/last_transactio
 
 [[test]]
 name = "rpc_orphans.py"
-status = "run"
+status = "skip"
+reason = "rpc-missing"
+analog = "official: orphan park + EraseForPeer; dump RPC is Core test API"
 
 [[test]]
 name = "rpc_packages.py"

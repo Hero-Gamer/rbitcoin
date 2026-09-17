@@ -108,7 +108,7 @@ fn help_and_getrpcinfo_list_every_dispatched_method() {
 }
 
 #[test]
-fn getorphantxs_is_hidden_and_lists_parked() {
+fn getorphantxs_is_not_a_node_rpc() {
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
@@ -119,28 +119,12 @@ fn getorphantxs_is_hidden_and_lists_parked() {
     let s = help_all.as_str().unwrap();
     assert!(
         !s.lines().any(|l| l == "getorphantxs"),
-        "getorphantxs must stay hidden from help()"
+        "getorphantxs must not appear in help()"
     );
     let one = dispatch(&ctx, "help", vec![json!("getorphantxs")]).unwrap();
-    let one_s = one.as_str().unwrap();
-    assert!(one_s.contains("getorphantxs"));
-    assert!(!one_s.contains("unknown command: getorphantxs"));
-
-    let empty = dispatch(&ctx, "getorphantxs", vec![]).unwrap();
-    assert_eq!(empty, json!([]));
-
-    let bool_err = dispatch(&ctx, "getorphantxs", vec![json!(true)]).unwrap_err();
-    assert_eq!(bool_err["code"], ERR_TYPE_ERROR);
-    assert!(bool_err["message"]
-        .as_str()
-        .unwrap()
-        .contains("Verbosity was boolean but only integer allowed"));
-    let bad = dispatch(&ctx, "getorphantxs", vec![json!(-1)]).unwrap_err();
-    assert_eq!(bad["code"], ERR_INVALID_PARAMETER);
-    assert!(bad["message"]
-        .as_str()
-        .unwrap()
-        .contains("Invalid verbosity value -1"));
+    assert!(one.as_str().unwrap().contains("unknown method"), "{one}");
+    let err = dispatch(&ctx, "getorphantxs", vec![]).unwrap_err();
+    assert_eq!(err["message"], "Method not found");
 
     let mp = ctx.mempool.as_ref().unwrap();
     let tx = Transaction {
@@ -165,15 +149,8 @@ fn getorphantxs_is_hidden_and_lists_parked() {
         matches!(err, rbitcoin_net::AcceptError::Orphaned { .. }),
         "{err}"
     );
-    let ids = dispatch(&ctx, "getorphantxs", vec![]).unwrap();
-    let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-    assert_eq!(ids, json!([txid]));
-    let v1 = dispatch(&ctx, "getorphantxs", vec![json!(1)]).unwrap();
-    assert_eq!(v1[0]["txid"], json!(txid));
-    assert_eq!(v1[0]["from"], json!([3]));
-    assert!(v1[0].get("hex").is_none());
-    let v2 = dispatch(&ctx, "getorphantxs", vec![json!(2)]).unwrap();
-    assert!(v2[0]["hex"].as_str().unwrap().len() > 20);
+    assert_eq!(mp.orphan_snapshot().len(), 1);
+    assert_eq!(mp.orphan_snapshot()[0].announcers, vec![3]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -243,7 +220,6 @@ fn method_help_named_arms_and_unknown() {
         "submitblock",
         "submitheader",
         "getpeerinfo",
-        "getorphantxs",
         "help",
         "echo",
         "ping",
@@ -468,6 +444,10 @@ fn estimatesmartfee_core_param_gates() {
         vec![json!(1), json!("ECONOMICAL")],
     )
     .unwrap();
+    let raw = dispatch(&ctx, "estimaterawfee", vec![json!(1)]).unwrap();
+    assert!(raw.get("feerate").is_some(), "{raw}");
+    assert!(raw.get("short").is_none(), "{raw}");
+    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     let _ = dispatch(&ctx, "estimatesmartfee", vec![json!(1), json!("unset")]).unwrap();
     let _ = dispatch(
         &ctx,
@@ -475,8 +455,6 @@ fn estimatesmartfee_core_param_gates() {
         vec![json!(1), json!("conservative")],
     )
     .unwrap();
-    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1)]).unwrap();
-    let _ = dispatch(&ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -861,10 +839,10 @@ fn echo_positional_named_and_mixed_args() {
     .unwrap_err();
     assert_eq!(twice_null["code"], ERR_INVALID_PARAMETER);
 
-    // Mixed positional `args` must feed getblockhash(height).
+    // Mixed positional `args` is echo-only; other methods reject the named key.
     let gh = dispatch(&ctx, "getblockhash", named(json!({"args": [0]}))).unwrap_err();
-    assert_ne!(gh["message"].as_str().unwrap_or(""), "height required");
     assert_eq!(gh["code"], ERR_INVALID_PARAMETER);
+    assert_eq!(gh["message"], "Unknown named parameter args");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4589,11 +4567,18 @@ fn rpc_params_type_coercion_and_unknown_named() {
             .cloned()
             .unwrap(),
     );
-    assert_eq!(
-        mixed.get(0, "hexstring").and_then(|v| v.as_str()),
-        Some("from-args")
+    assert!(
+        mixed.get(0, "hexstring").is_none(),
+        "args peel is echo-only, not RpcParams::named"
     );
     assert_eq!(mixed.opt_bool(1, "verbose").unwrap(), Some(true));
+    assert_eq!(
+        mixed
+            .get(0, "args")
+            .and_then(|v| v.as_array())
+            .map(|a| a[0].as_str()),
+        Some(Some("from-args"))
+    );
 
     let args_not_array = RpcParams::named(
         json!({"args": "not-array", "blockhash": "aa"})

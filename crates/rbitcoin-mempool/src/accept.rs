@@ -757,7 +757,7 @@ impl ActiveMempool {
         self.park_orphan_from(tx, missing, None)
     }
 
-    /// Park with a P2P announcer (`getorphantxs` `from`).
+    /// Park with a P2P announcer peer id.
     pub fn park_orphan_from(
         &mut self,
         tx: &Transaction,

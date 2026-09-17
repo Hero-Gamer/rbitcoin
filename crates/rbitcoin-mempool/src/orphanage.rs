@@ -26,11 +26,11 @@ struct OrphanEntry {
     weight: u64,
     /// Missing parent txids (prevout.txid not in mempool/chain at insert).
     missing: BTreeSet<Txid>,
-    /// Core `NodeId` announcers (`getorphantxs` `from`).
+    /// P2P peer ids that announced this orphan.
     announcers: BTreeSet<u64>,
 }
 
-/// One parked orphan for `getorphantxs`.
+/// One parked orphan (txid + announcer peer ids).
 #[derive(Debug, Clone)]
 pub struct OrphanSnapshot {
     pub tx: Transaction,

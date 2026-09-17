@@ -717,8 +717,7 @@ pub(crate) fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<V
     estimate_fee_result(ctx, conf_target)
 }
 
-/// Core `estimaterawfee` name; same 10-minute product as [`estimatesmartfee`].
-/// Core `estimaterawfee` name; same 10-minute product as [`estimatesmartfee`].
+/// Same 10-minute product as [`estimatesmartfee`] under the Core name.
 pub(crate) fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["conf_target", "threshold"])?;
     if params.get(0, "conf_target").is_none() {
@@ -739,19 +738,7 @@ pub(crate) fn estimaterawfee(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             ));
         }
     }
-    // Core returns nested short/medium/long buckets; we expose the same
-    // single-horizon product under `short` for harness compatibility.
-    let base = estimate_fee_result(ctx, conf_target)?;
-    Ok(json!({
-        "short": {
-            "feerate": base.get("feerate").cloned().unwrap_or(json!(-1.0)),
-            "decay": 0.962,
-            "scale": 2,
-            "pass": { "startrange": 0, "endrange": 0, "withintarget": 0, "totalconfirmed": 0, "inmempool": 0, "leftmempool": 0 },
-            "fail": Value::Null,
-            "errors": base.get("errors").cloned().unwrap_or(Value::Null),
-        }
-    }))
+    estimate_fee_result(ctx, conf_target)
 }
 
 pub(crate) fn estimate_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
@@ -1124,56 +1111,6 @@ pub(crate) fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Resu
             if let Some(sp) = mp.spending_txid(&op) {
                 row["spendingtxid"] = json!(hash_hex_display(&sp.to_byte_array()));
             }
-        }
-        out.push(row);
-    }
-    Ok(json!(out))
-}
-
-pub(crate) fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["verbosity"])?;
-    let verbosity = match params.get(0, "verbosity") {
-        None | Some(Value::Null) => 0i64,
-        Some(Value::Bool(_)) => {
-            return Err(rpc_error(
-                ERR_TYPE_ERROR,
-                "Verbosity was boolean but only integer allowed",
-            ));
-        }
-        Some(v) => json_i64(v)
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "verbosity must be an integer"))?,
-    };
-    if !(0..=2).contains(&verbosity) {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            format!("Invalid verbosity value {verbosity}"),
-        ));
-    }
-    let Some(mp) = ctx.mempool.as_ref() else {
-        return Ok(json!([]));
-    };
-    let snaps = mp.orphan_snapshot();
-    if verbosity == 0 {
-        let ids: Vec<String> = snaps
-            .iter()
-            .map(|s| hash_hex_display(&s.tx.compute_txid().to_byte_array()))
-            .collect();
-        return Ok(json!(ids));
-    }
-    let mut out = Vec::with_capacity(snaps.len());
-    for s in snaps {
-        let raw = bitcoin::consensus::encode::serialize(&s.tx);
-        let weight = s.tx.weight().to_wu();
-        let mut row = json!({
-            "txid": hash_hex_display(&s.tx.compute_txid().to_byte_array()),
-            "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
-            "bytes": raw.len(),
-            "vsize": s.tx.vsize(),
-            "weight": weight,
-            "from": s.announcers,
-        });
-        if verbosity == 2 {
-            row["hex"] = json!(bitcoin::consensus::encode::serialize_hex(&s.tx));
         }
         out.push(row);
     }
