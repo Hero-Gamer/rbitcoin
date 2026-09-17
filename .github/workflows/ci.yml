@@ -188,9 +188,11 @@ jobs:
 
   # Line-coverage 91% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
   # Slow; waits for the fast gates so a red fmt/clippy/test does not start
-  # this job. Required.
+  # this job. Required. Job+step timeouts so a hung llvm-cov test binary
+  # cannot sit until the runner's 6h default.
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, clippy, test]
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
@@ -212,6 +214,7 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.6.14,cargo-crap@0.4.3
       - name: coverage (line gate)
+        timeout-minutes: 15
         env:
           COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: ./scripts/coverage.sh

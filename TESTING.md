@@ -177,7 +177,11 @@ missing: `cargo install cargo-llvm-cov --locked`. On Nix, prefer
 
 **CI:** the `coverage` job installs a **prebuilt** `cargo-llvm-cov@0.6.14` via
 `taiki-e/install-action` pinned to a commit SHA (not a floating `v2` tag) —
-it does **not** `cargo install` from crates.io on every PR.
+it does **not** `cargo install` from crates.io on every PR. The job is
+`timeout-minutes: 20` (step 15; `coverage.sh` GNU `timeout` 12m around
+`llvm-cov test`, override `LLVM_COV_TEST_TIMEOUT`) so a hung instrumented
+binary cannot sit until the runner 6h default. Do not pass `--report-time`
+(stable rustc 1.95.0 rejects it).
 
 **Target dir:** the script sets `CARGO_TARGET_DIR` to **`target/cov`** (override
 with `CARGO_TARGET_DIR_COV`). Day-to-day `cargo test` / clippy use **`target/dev`**

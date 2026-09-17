@@ -55,10 +55,32 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
     fi
   fi
   mkdir -p "$ROOT/coverage"
-  cargo llvm-cov test --workspace --exclude rbitcoin-bench \
-    --ignore-filename-regex "$IGNORE" \
-    "${EXTRA[@]}" \
+  # Wall-clock cap: a hung instrumented test (P2P/confirm join) otherwise sits
+  # until the runner's 6h default. Override: LLVM_COV_TEST_TIMEOUT=20m.
+  LLVM_COV_TEST_TIMEOUT="${LLVM_COV_TEST_TIMEOUT:-12m}"
+  LLVM_COV_TEST=(
+    cargo llvm-cov test --workspace --exclude rbitcoin-bench
+    --ignore-filename-regex "$IGNORE"
+    "${EXTRA[@]}"
     --html --output-dir "$ROOT/coverage"
+  )
+  echo "coverage: llvm-cov test wall ${LLVM_COV_TEST_TIMEOUT}"
+  set +e
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after=30s "${LLVM_COV_TEST_TIMEOUT}" "${LLVM_COV_TEST[@]}"
+    llvm_cov_st=$?
+  else
+    "${LLVM_COV_TEST[@]}"
+    llvm_cov_st=$?
+  fi
+  set -e
+  if [[ "$llvm_cov_st" -eq 124 ]]; then
+    echo "FAIL: cargo llvm-cov test exceeded ${LLVM_COV_TEST_TIMEOUT} (hung test binary?)" >&2
+    exit 1
+  fi
+  if [[ "$llvm_cov_st" -ne 0 ]]; then
+    exit "$llvm_cov_st"
+  fi
 
   REPORT="$(cargo llvm-cov report --ignore-filename-regex "$IGNORE" 2>/dev/null || true)"
   echo "$REPORT"

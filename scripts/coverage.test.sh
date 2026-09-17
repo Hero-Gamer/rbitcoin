@@ -77,6 +77,12 @@ assert_ok "llvm-cov test has no --skip" \
   bash -c '! grep -E "llvm-cov test" -A12 "$1" | grep -q -- "--skip"' _ "$COV"
 assert_ok "llvm-cov excludes rbitcoin-bench" \
   bash -c 'grep -E "llvm-cov test" -A12 "$1" | grep -q -- "--exclude rbitcoin-bench"' _ "$COV"
+assert_ok "llvm-cov test is GNU-timeout wrapped" \
+  grep -q 'timeout --kill-after=30s' "$COV"
+assert_ok "llvm-cov test does not pass --report-time (stable rustc)" \
+  bash -c '! grep -E "report-time" "$1"' _ "$COV"
+assert_ok "ci coverage job has a wall timeout" \
+  bash -c 'awk "/^  coverage:/{p=1} p&&/timeout-minutes:/{print; exit}" "$1" | grep -q timeout-minutes' _ "$ROOT/.github/workflows/ci.yml"
 
 tmp="$(mktemp)"
 python3 "$ROOT/scripts/coverage-badge.py" \
