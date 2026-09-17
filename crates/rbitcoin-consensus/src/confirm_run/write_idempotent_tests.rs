@@ -2103,6 +2103,58 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+#[test]
+fn write_refuses_empty_packed_ins() {
+    use super::{
+        confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
+        confirm_write_phase, ScriptPreverified,
+    };
+    use crate::accept_and_connect_block;
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use crate::regtest_pad::mine_empty_regtest;
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::StoreError;
+    use std::sync::Arc;
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let items = [(Height(1), Arc::new(b1), None)];
+    let mut stamped =
+        confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None).expect("stamp");
+    {
+        let plan = stamped.plan.as_mut().expect("plan");
+        assert!(
+            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
+            "stamp fills packed ins"
+        );
+        for (_, ins) in plan.packed.iter_mut() {
+            ins.clear();
+        }
+    }
+    let mat = confirm_wire_load_from_plan(
+        &q,
+        &params,
+        Milestone::NONE,
+        stamped,
+        None,
+        &ScriptPreverified::new(),
+    )
+    .expect("load");
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+    match confirm_write_phase(&q, &params, Milestone::NONE, ok.batch) {
+        Err(crate::ConsensusError::Store(StoreError::Corrupt(msg))) => {
+            assert!(msg.contains("packed ins empty at write"), "got {msg}");
+        }
+        Err(e) => panic!("expected packed ins empty, got {e}"),
+        Ok(_) => panic!("write must not fill packed ins from wire"),
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// C1: pin reads plan.edges; packed ins may be empty.
 #[test]
 fn pin_plan_edges_without_packed_ins() {
@@ -2706,7 +2758,7 @@ fn store_start_states_lookup_load_confirm() {
         let plan = stamped.plan.as_ref().expect("plan");
         assert!(
             plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
-            "IBD stamp fills packed InputRecords so write fill is a no-op"
+            "IBD stamp fills packed InputRecords; write does not refill"
         );
         assert!(
             !plan.edges.is_empty(),

@@ -291,14 +291,16 @@ fn block_size_weight(block: &bitcoin::Block) -> Result<(u32, u32), StoreError> {
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
     /// Body-append rows: shared [`CreatePin`] (tx + outs) + inputs.
-    /// IBD wire planner fills ins from the stamp edge walk; write fill is a no-op.
+    /// IBD wire planner fills ins from the stamp edge walk. Empty ins at
+    /// commit is Corrupt (write does not refill from wire).
     /// Outs live once in the pin Arc (not duplicated alongside inputs).
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     /// BIP144 size + BIP141 weight per [`Self::per_header_ranges`] row.
     pub per_header_sw: Vec<(u32, u32)>,
-    /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins do not.
+    /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins
+    /// are the commit payload (filled at plan).
     pub edges: crate::SpendEdges,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
@@ -337,66 +339,6 @@ impl ArchiveWritePlan {
 
     pub fn is_empty(&self) -> bool {
         self.packed.is_empty()
-    }
-
-    /// Fill empty packed ins from wire txs + [`Self::edges`] (IBD write encode).
-    ///
-    /// No-op when every packed row already has ins. `blocks` must match
-    /// [`Self::per_header_ranges`] order and tx counts.
-    pub fn fill_packed_ins_from_blocks(
-        &mut self,
-        blocks: &[&bitcoin::Block],
-    ) -> Result<(), StoreError> {
-        if self.packed.is_empty() || self.packed.iter().all(|(_, ins)| !ins.is_empty()) {
-            return Ok(());
-        }
-        if blocks.len() != self.per_header_ranges.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: write encode prepared/wire length",
-            ));
-        }
-        let mut i = 0usize;
-        if self.per_header_sw.is_empty() {
-            self.per_header_sw = blocks
-                .iter()
-                .map(|b| block_size_weight(b))
-                .collect::<Result<Vec<_>, _>>()?;
-        }
-        for ((_, _, n), block) in self.per_header_ranges.iter().zip(blocks.iter()) {
-            if block.txdata.len() != *n as usize {
-                return Err(StoreError::Corrupt(
-                    "invariant: write encode tx_fks/txdata length",
-                ));
-            }
-            for tx in &block.txdata {
-                let fk = *self.planned_fks.get(i).ok_or(StoreError::Corrupt(
-                    "invariant: write encode packed shorter than planned_fks",
-                ))?;
-                let Some(id) = fk.get() else {
-                    return Err(StoreError::Corrupt(
-                        "invariant: write encode null planned fk",
-                    ));
-                };
-                let empty = [];
-                let eds = self.edges.get(&id).map(|v| v.as_slice()).unwrap_or(&empty);
-                let ins = input_records_from_wire(tx, fk, eds)?;
-                if i >= self.packed.len() {
-                    return Err(StoreError::Corrupt(
-                        "invariant: write encode packed shorter than planned_fks",
-                    ));
-                }
-                if self.packed[i].1.is_empty() {
-                    self.packed[i].1 = ins;
-                }
-                i += 1;
-            }
-        }
-        if i != self.packed.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: write encode packed/tx count mismatch",
-            ));
-        }
-        Ok(())
     }
 
     /// Wire `prev_txid` known for this create_fk at plan stamp (RAM only).
@@ -604,8 +546,6 @@ struct PlanRow {
     tx_fk: Fk,
     tx: TxRecord,
     ins: Vec<PlanIn>,
-    packed_ins: Vec<InputRecord>,
-    ins_est: u64,
     block: Arc<bitcoin::Block>,
     tx_index: u32,
 }
@@ -626,15 +566,8 @@ fn collect_plan_need_external(
         return need_external.into_iter().collect();
     }
     for row in work {
-        for (i, inp) in row.ins.iter().enumerate() {
+        for inp in row.ins.iter() {
             if inp.is_coinbase {
-                continue;
-            }
-            if row
-                .packed_ins
-                .get(i)
-                .is_some_and(|r| !r.create_fk.is_null())
-            {
                 continue;
             }
             if batch_map.contains_key(&inp.prev_txid) || inp.prev_txid == [0u8; 32] {
@@ -646,7 +579,7 @@ fn collect_plan_need_external(
     need_external.into_iter().collect()
 }
 
-/// Class A ins from wire + stamped spend edges (plan fill; write is then a no-op).
+/// Class A ins from wire + stamped spend edges (plan fill; write does not refill).
 pub fn input_records_from_wire(
     tx: &bitcoin::Transaction,
     spend_fk: Fk,
@@ -715,21 +648,6 @@ fn plan_in_from_txin(inp: &bitcoin::TxIn) -> PlanIn {
     }
 }
 
-fn wire_ins_est(tx: &bitcoin::Transaction) -> u64 {
-    tx.input
-        .iter()
-        .map(|inp| {
-            (1 + 8
-                + 9
-                + 4
-                + 9
-                + inp.script_sig.len()
-                + 9
-                + inp.witness.iter().map(|w| 9 + w.len()).sum::<usize>()) as u64
-        })
-        .sum()
-}
-
 fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
     TxRecord {
         txid,
@@ -743,7 +661,7 @@ fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
 }
 
 impl Query {
-    /// Class A plan + fill packed ins + commit from wire blocks. Does not set tip.
+    /// Class A plan + commit from wire blocks. Does not set tip.
     pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
         if items.is_empty() {
             return Ok(());
@@ -761,13 +679,11 @@ impl Query {
             return Ok(());
         }
         let start = self.store.txs.count().saturating_add(1);
-        let mut plan =
+        let plan =
             self.archive_plan_batch_from_wire(&need, start, &crate::InFlight::new(), None, None)?;
         if plan.is_empty() {
             return Ok(());
         }
-        let blocks: Vec<&bitcoin::Block> = need.iter().map(|(_, b, _)| b.as_ref()).collect();
-        plan.fill_packed_ins_from_blocks(&blocks)?;
         self.archive_commit_plan(plan)?;
         Ok(())
     }
@@ -789,7 +705,7 @@ impl Query {
     }
 
     /// IBD stamp: CreatePin + SpendEdges from wire txs. Packed ins filled from
-    /// the same edge walk (write `fill_packed_ins_from_blocks` is then a no-op).
+    /// the same edge walk. Empty ins at Class A commit is Corrupt.
     ///
     /// Does not build [`TxApply`]. `body_est` uses packed encoded lengths.
     /// Same txid in one block is Corrupt. Same txid across headers in the wave
@@ -845,8 +761,6 @@ impl Query {
                     tx_fk,
                     tx: rec,
                     ins,
-                    packed_ins: Vec::new(),
-                    ins_est: wire_ins_est(tx),
                     block: Arc::clone(block),
                     tx_index: tx_index as u32,
                 });
@@ -923,18 +837,12 @@ impl Query {
                 tx_fk,
                 tx,
                 ins,
-                mut packed_ins,
-                ins_est,
                 block,
                 tx_index,
             } = row;
             let mut tx_edges: Vec<crate::SpendEdge> = Vec::with_capacity(ins.len());
             for (i, inp) in ins.iter().enumerate() {
                 if inp.is_coinbase {
-                    if let Some(rec) = packed_ins.get_mut(i) {
-                        rec.create_fk = Fk::NULL;
-                        rec.prev_index = u32::MAX;
-                    }
                     tx_edges.push(crate::SpendEdge {
                         prev_txid: [0u8; 32],
                         vout: u32::MAX,
@@ -944,23 +852,17 @@ impl Query {
                     });
                     continue;
                 }
-                let mut create_fk = packed_ins.get(i).map(|r| r.create_fk).unwrap_or(Fk::NULL);
-                if create_fk.is_null() {
-                    if let Some(&cfk) = batch_map.get(&inp.prev_txid) {
-                        create_fk = cfk;
-                        batch_stamp = batch_stamp.saturating_add(1);
-                    } else if let Some(&cfk) = resolved.get(&inp.prev_txid) {
-                        create_fk = cfk;
-                        resolved_stamp = resolved_stamp.saturating_add(1);
-                    } else {
-                        return Err(StoreError::Corrupt(
-                            "archive: parent create_fk unresolved (contiguous batch required)",
-                        ));
-                    }
-                }
-                if let Some(rec) = packed_ins.get_mut(i) {
-                    rec.create_fk = create_fk;
-                }
+                let create_fk = if let Some(&cfk) = batch_map.get(&inp.prev_txid) {
+                    batch_stamp = batch_stamp.saturating_add(1);
+                    cfk
+                } else if let Some(&cfk) = resolved.get(&inp.prev_txid) {
+                    resolved_stamp = resolved_stamp.saturating_add(1);
+                    cfk
+                } else {
+                    return Err(StoreError::Corrupt(
+                        "archive: parent create_fk unresolved (contiguous batch required)",
+                    ));
+                };
                 if let Some(pid) = create_fk.get() {
                     if !ArchiveWritePlan::create_in_header_ranges(&per_header_ranges, tx_fk, pid) {
                         external_parent_vouts
@@ -987,22 +889,16 @@ impl Query {
                     });
                 }
             }
-            if packed_ins.is_empty() {
-                let tx = block
-                    .txdata
-                    .get(tx_index as usize)
-                    .ok_or(StoreError::Corrupt("invariant: plan tx_index"))?;
-                packed_ins = input_records_from_wire(tx, tx_fk, &tx_edges)?;
-            }
+            let tx_wire = block
+                .txdata
+                .get(tx_index as usize)
+                .ok_or(StoreError::Corrupt("invariant: plan tx_index"))?;
+            let packed_ins = input_records_from_wire(tx_wire, tx_fk, &tx_edges)?;
             if let Some(sid) = tx_fk.get() {
                 edges.insert(sid, tx_edges);
             }
             planned_fks.push(tx_fk);
-            let ins_bytes = if packed_ins.is_empty() {
-                ins_est
-            } else {
-                packed_ins.iter().map(|x| x.encoded_len() as u64).sum()
-            };
+            let ins_bytes: u64 = packed_ins.iter().map(|x| x.encoded_len() as u64).sum();
             let pin = CreatePinInner::wire(block, tx_index, tx);
             body_est = body_est
                 .saturating_add((1 + TxRecord::ENCODED_LEN) as u64)
@@ -1087,6 +983,9 @@ impl Query {
         }
         if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
             return Ok((false, Vec::new()));
+        }
+        if plan.packed.iter().any(|(_, ins)| ins.is_empty()) {
+            return Err(StoreError::Corrupt("invariant: packed ins empty at write"));
         }
         let t0 = Instant::now();
         let n_blocks = plan.per_header_ranges.len() as u64;
@@ -1272,15 +1171,13 @@ mod tests {
                 })
             })
             .collect();
-        let mut plan = q.archive_plan_batch_from_wire(
+        let plan = q.archive_plan_batch_from_wire(
             &refs,
             next,
             in_flight,
             skeleton,
             skeleton.is_some().then_some(carried.as_slice()),
         )?;
-        let blocks: Vec<&bitcoin::Block> = wires.iter().map(|(_, b, _)| b.as_ref()).collect();
-        plan.fill_packed_ins_from_blocks(&blocks)?;
         Ok(plan)
     }
 
@@ -1356,7 +1253,7 @@ mod tests {
         let hfk = q.commit_class_a_only(&header, &[ta]).unwrap();
         assert!(q.store().header_txs.has_body(hfk).unwrap());
         let (_tx, ins, _outs) = q.store().get_tx_full(Fk(1)).unwrap();
-        assert_eq!(ins.len(), 1, "write fill must persist packed ins");
+        assert_eq!(ins.len(), 1, "plan fill must persist packed ins");
         assert_eq!(ins[0].script_sig, sig);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2413,7 +2310,7 @@ mod tests {
         let child_ptr = child_spk.as_ptr();
         let parent_spk = parent_spk.to_vec();
         let child_spk = child_spk.to_vec();
-        let mut plan = q
+        let plan = q
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
                 1,
@@ -2446,19 +2343,6 @@ mod tests {
             child_ptr,
             "plan must not copy scriptPubKey"
         );
-        plan.fill_packed_ins_from_blocks(&[block.as_ref()])
-            .expect("write fill no-op");
-        assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
-        plan.packed[1].1.clear();
-        match plan.fill_packed_ins_from_blocks(&[]) {
-            Err(e) => {
-                let s = e.to_string();
-                assert!(s.contains("write encode prepared/wire length"), "{s}");
-            }
-            Ok(()) => panic!("empty blocks must not fill a non-empty plan"),
-        }
-        plan.fill_packed_ins_from_blocks(&[block.as_ref()])
-            .expect("write fill empty row");
         assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
         assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_pin.len(), 2);
@@ -2478,6 +2362,38 @@ mod tests {
             "body_est must count wire ins, got {}",
             plan.body_est
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_refuses_empty_packed_ins() {
+        use std::sync::Arc;
+        let (dir, q) = temp_query("commit-empty-packed-ins");
+        let (block, txids, _) = wire_parent_child_big_script_sig();
+        let block = Arc::new(block);
+        let mut plan = q
+            .archive_plan_batch_from_wire(
+                &[(Fk(1), &block, txids.as_slice())],
+                1,
+                &crate::InFlight::new(),
+                None,
+                None,
+            )
+            .expect("wire plan");
+        assert!(
+            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
+            "stamp must fill packed ins"
+        );
+        for (_, ins) in plan.packed.iter_mut() {
+            ins.clear();
+        }
+        match q.archive_commit_plan(plan) {
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("invariant: packed ins empty at write"), "{s}");
+            }
+            Ok(_) => panic!("commit must not encode empty packed ins"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

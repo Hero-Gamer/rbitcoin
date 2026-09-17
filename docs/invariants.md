@@ -49,7 +49,7 @@ wire / body-queue
   → load / pin (BatchParents outs by known txout range only;
             IO: txout.body — NEVER head / loc / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
-  → Class A commit (if ArchiveWritePlan present; encode ins from Arc<Block> + SpendEdges)
+  → Class A commit (if ArchiveWritePlan present; encode plan packed ins filled at stamp)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
@@ -66,8 +66,9 @@ puts parent P on the load-batch skeleton, load stamp of a child spending P has
 move `plan_batch` onto lookup.
 
 IBD stamp does not build `TxApply`. Packed ins are filled from the same plan
-edge walk (`archive_plan_batch_from_wire`); write `fill_packed_ins_from_blocks`
-is then a no-op. SpendEdges + CreatePin survive freeze. Write encodes Class A
+edge walk (`archive_plan_batch_from_wire`). Empty ins at Class A commit is
+`Corrupt("invariant: packed ins empty at write")` — write does not refill from
+wire. SpendEdges + CreatePin survive freeze. Write encodes Class A
 outs from `Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
 the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 

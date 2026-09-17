@@ -55,8 +55,8 @@ before 1.0).
 - **IBD stamp skips header ensure when BQ carries `header_fk`:** header-sync
   already stored the row. Load stamp uses the BQ fk/hash (store row must
   match); hash mismatch is `BadBlock`. `ibd: perf` `header_skip=`. Wire
-  planner fills packed ins from the stamp edge walk so write
-  `fill_packed_ins_from_blocks` is a no-op.
+  planner fills packed ins from the stamp edge walk. Empty ins at Class A
+  commit is `Corrupt` (write does not refill from wire).
 
 - **Confirm size/weight is a sequential `header.body` rewrite:** contiguous
   header-fk runs are one 96-byte-record write (`put_size_weight_run`), no
