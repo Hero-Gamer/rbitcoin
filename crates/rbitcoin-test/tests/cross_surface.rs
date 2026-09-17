@@ -299,7 +299,7 @@ async fn pin_esplora_block_txids_merkle_and_outspend(
     let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/merkle-proof")).await;
     assert_eq!(st, 200, "GET merkle-proof: {body}");
     let mp: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(mp["block_height"], 106, "{body}");
+    assert_eq!(mp["block_height"], 107, "{body}");
     assert_eq!(mp["pos"], 0, "{body}");
     assert!(mp.get("merkle").is_some(), "{body}");
 
@@ -338,7 +338,7 @@ async fn spawn_esplora_ws_want_blocks_and_track_tx(
                 break;
             };
             let v: Value = serde_json::from_str(t.as_str()).unwrap_or(json!(null));
-            saw.0 |= v["block"]["height"] == 106;
+            saw.0 |= v["block"]["height"] == 107;
             saw.1 |= v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true;
         }
         saw
@@ -493,20 +493,20 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
 
     let (st, height) = http_get(esplora_addr, "/blocks/tip/height").await;
     assert_eq!(st, 200, "esplora tip height: {height}");
-    assert_eq!(height, "105");
+    assert_eq!(height, "106");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
-    assert_eq!(count["result"], 105, "{count}");
+    assert_eq!(count["result"], 106, "{count}");
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], true, "{chain}");
     let mpinfo = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
     assert_eq!(mpinfo["result"]["relay_enabled"], false, "{mpinfo}");
     let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
-    assert_eq!(tips["result"][0]["height"], 105, "{tips}");
+    assert_eq!(tips["result"][0]["height"], 106, "{tips}");
     assert_eq!(tips["result"][0]["status"], "active", "{tips}");
     let cb_hex = coinbase_txid.to_string();
     let utxo = jsonrpc(rpc_addr, "gettxout", json!([cb_hex.clone(), 0])).await;
     assert_eq!(utxo["result"]["coinbase"], true, "{utxo}");
-    assert_eq!(utxo["result"]["confirmations"], 105, "{utxo}");
+    assert_eq!(utxo["result"]["confirmations"], 106, "{utxo}");
 
     let rpc_spk = ScriptBuf::from_bytes(vec![0x54]);
     let rpc_spend = acs_spend(rpc_cb, 50_0000_0000, 1_000, rpc_spk);
@@ -1039,9 +1039,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
 
     let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();
-    pin_waitforblockheight_timeout_zero_behind(rpc_addr, 105, &tip_hash).await;
-    pin_getblock_hash_oob_unknown_and_raw(rpc_addr, 105, &tip_hash).await;
-    let waiters = spawn_wait_and_gbt_longpoll(rpc_addr, 106).await;
+    pin_waitforblockheight_timeout_zero_behind(rpc_addr, 106, &tip_hash).await;
+    pin_getblock_hash_oob_unknown_and_raw(rpc_addr, 106, &tip_hash).await;
+    let waiters = spawn_wait_and_gbt_longpoll(rpc_addr, 107).await;
     let ws = spawn_esplora_ws_want_blocks_and_track_tx(esplora_addr, pkg_parent_txid.clone()).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1052,12 +1052,12 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{mined}"
     );
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
-    assert_eq!(count["result"], 106, "{count}");
+    assert_eq!(count["result"], 107, "{count}");
     let empty = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
     assert_eq!(empty["result"], json!([]), "{empty}");
     let tip = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let new_hash = tip["result"].as_str().expect("new tip");
-    waiters.assert_woke_on_new_tip(new_hash, 106).await;
+    waiters.assert_woke_on_new_tip(new_hash, 107).await;
     let (saw_block, saw_tx) = tokio::time::timeout(Duration::from_secs(10), ws)
         .await
         .expect("esplora ws timed out")
@@ -1073,7 +1073,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         txs.len() >= 30,
         "coinbase + RBF + esplora + packages: {blk}"
     );
-    pin_esplora_blocks_summaries(esplora_addr, 106, new_hash).await;
+    pin_esplora_blocks_summaries(esplora_addr, 107, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
     assert!(
         txs[0]["vin"][0].get("txid").is_some(),
