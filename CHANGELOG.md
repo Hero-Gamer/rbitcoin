@@ -251,6 +251,46 @@ before 1.0).
   Disconnect score in P2P logs (not banlist). Native serve/cmpct lines use
   `tx=` (not Hungarian `ntx=`).
 
+- **Core functional `run` is production-only:** skip scripts whose asserts
+  were only the bitcoind shim (`feature_help`, `feature_blocksdir`,
+  `feature_dirsymlinks`, `feature_filelock`, `tool_rpcauth`) or Core
+  decode/`validateaddress` dialect the node does not ship
+  (`rpc_decodescript`, `rpc_invalid_address_message`). Live proxy no longer
+  intercepts `decoderawtransaction` / `decodescript` / `validateaddress`.
+  `feature_filelock.py` stays skip (`harness`). Labeled `test_runner` prints
+  **72** jobs (**66** inventory `run`; Core expands transport twins and
+  `wallet_txn_*` flags; **201** skip).
+
+- **Core `-bind`/`-port` map to `--listen`:** bare `-port` binds `0.0.0.0`
+  plus onion `127.0.0.1:port+1`; TestNode `bind=127.0.0.1` stays loopback.
+  `Bound to` matches those sockets. `feature_port.py` is `run`.
+
+- **`--check-blocks N`:** store-open revalidate window (default 6;
+  `0` / negative = whole chain). Shim maps Core `-checkblocks`.
+
+- **Datadir exclusive lock:** `rbitcoin-node` flocks `{datadir}/.lock`.
+  Dummy Core `blocks/blk00000.dat` is shim-only (`rpc_getblockstats`
+  rename needle). No live-node `blocks/.lock` and no fake SQLite `-wallet`
+  InitError.
+
+- **Hidden `getorphantxs`:** verbosity 0/1/2, `from[]` announcer peer ids,
+  Core `EraseForPeer` on disconnect. Handshake/INV stay off the tokio
+  reactor write lock. `rpc_orphans.py` is `run`.
+
+- **CIDR / bind net permissions:** shim `-whitelist` / `-whitebind` → `--net-permission` /
+  `--net-permission-bind` (implicit flags, in/out, `--net-permission-relay` /
+  `--net-permission-force-relay`). Operator `--trusted` / `--always-relay` / `--relay`
+  stay global inbound knobs (not promoted from a CIDR/bind grant).
+  Headers-sync stall timeout uses session `noban` (CIDR or `--trusted`).
+  `getpeerinfo.permissions` is per-peer. 0-value
+  spendable outputs are `dust` (Libre still admits 1-sat). Forcerelay and
+  `--always-relay` recent-rejects skip ATMP on the second send (cleared on
+  tip connect; fee / cluster-limit rejects stay reconsiderable). IPv6 CIDR
+  grants (`noban@::1`, `2001:db8::/32`). Conf `net_permission_bind=`
+  listens (same sockets as `--listen`). Shim `-whitebind` is bind-only
+  (no synthesized CIDR `--net-permission`).
+  `p2p_permissions.py` is `run`.
+
 - **Coverage ratchet is merge-base, not tip of master:** PRs must not lower
   the **displayed 2-decimal** production LCOV percent vs the **highest**
   green-`master` snapshot whose SHA is an ancestor of
@@ -283,6 +323,36 @@ before 1.0).
   live tip so RPC/Esplora get `None`, not Corrupt.
 
 ### Fixed
+
+- **Unknown-parent compact asks for headers; unsolicited unknown-parent
+  block disconnects:** `cmpctblock` whose prev is missing keeps the header
+  in-session (`pending_headers`) and retries `getheaders` even if one is
+  already in flight (`p2p_sendheaders` `mine_reorg`, `feature_bip68_sequence`
+  catch-up) without storing garbage hashes. Reconstruct and hold the
+  body even when one-block work looks weaker than a tall tip. Catch-up
+  `getdata` uses witness bodies for hashes not on our validated tip
+  (compact is tip-relay); a requested compact is not ignored as
+  low-work. Held side-branch bodies stay capped at 320; in-flight
+  getdata hashes are not FIFO-evicted. An unsolicited
+  `block` with a missing prev is `AcceptBlock FAILED (prev-blk-not-found)`
+  and disconnects (`p2p_mutated_blocks`). A *requested* unknown-parent
+  body stays parked for drain and getheaders from our locator. HB
+  `sendcmpct` is written as soon as a peer is selected.
+  Completion-session drain-on-drop matches `UringSession` drop (no
+  process abort if the kernel has not harvested CQEs).
+
+- **Compact extra-pool is not compact prefills:** Core extra-compact holds
+  rejects/orphans/replacements. Prefills from a failed compact must not
+  complete a later `cmpctblock` of the same spends (`p2p_compactblocks`
+  `test_multiple_blocktxn_response`).
+
+- **IBD recently-confirmed ring:** `accept_block` only records wtxid AlreadyHave
+  when mempool relay is on, matching `note_confirmed_tip`. Txs confirmed
+  during IBD are requested again after tip-follow (`p2p_ibd_txrelay.py`).
+
+- **RPC `submitpackage` is sequential ATMP then package remainder:** a later
+  member fail keeps already admitted txs. Min-relay / missing-input remainders
+  are re-evaluated as a package (CPFP parent below min-relay + paying child).
 
 - **Package rollback restores RBF victims:** a later package member fail
   re-admits txs the accepted members had replaced.

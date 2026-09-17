@@ -85,18 +85,25 @@ impl HeldBodies {
         self.by_hash.get(&hash).map(|(_, s)| *s).unwrap_or(u64::MAX)
     }
 
-    fn insert(&mut self, block: Arc<Block>) {
+    fn insert(&mut self, block: Arc<Block>, keep: &HashSet<BlockHash>) {
         let hash = block.block_hash();
         if self.by_hash.contains_key(&hash) {
             return;
         }
         if self.by_hash.len() >= Self::CAP {
-            if let Some(k) = self
+            let victim = self
                 .by_hash
                 .iter()
+                .filter(|(h, _)| !keep.contains(*h))
                 .min_by_key(|(_, (_, s))| *s)
                 .map(|(h, _)| *h)
-            {
+                .or_else(|| {
+                    self.by_hash
+                        .iter()
+                        .min_by_key(|(_, (_, s))| *s)
+                        .map(|(h, _)| *h)
+                });
+            if let Some(k) = victim {
                 self.by_hash.remove(&k);
             }
         }
@@ -514,20 +521,56 @@ impl ChainHub {
         parent_h.saturating_add(1) > tip.saturating_add(HeldBodies::STALE_BELOW)
     }
 
-    /// Unrequested body whose header-path work is strictly below the tip.
-    pub fn unrequested_weaker_than_tip(&self, header: &Header) -> bool {
-        let Ok(tip) = self.chain_work() else {
-            return false;
-        };
-        crate::most_work::work_better(tip, self.work_with_header(header))
-    }
-
     /// True when connecting `header` would still be below `-minimumchainwork`.
     pub fn header_below_minwork(&self, header: &Header) -> bool {
         let Some(min) = self.min_chain_work_floor() else {
             return false;
         };
         self.work_with_header(header).to_be_bytes() < min
+    }
+
+    /// Core `GetAntiDoSWorkThreshold`: `max(tip_work - 144*tip_proof, minchainwork)`.
+    pub(crate) fn anti_dos_work_threshold(&self) -> Work {
+        let zero = Work::from_be_bytes([0u8; 32]);
+        let tip_work = self.chain_work().unwrap_or(zero);
+        let one = self.tip_header().map(|h| h.work()).unwrap_or(zero);
+        let mut window = zero;
+        for _ in 0..144 {
+            let next = window + one;
+            if next > tip_work {
+                window = tip_work;
+                break;
+            }
+            window = next;
+        }
+        let near = tip_work - window;
+        match self.min_chain_work_floor() {
+            Some(min) => {
+                let floor = Work::from_be_bytes(min);
+                if near > floor {
+                    near
+                } else {
+                    floor
+                }
+            }
+            None => near,
+        }
+    }
+
+    /// Compact/header whose claimed work is below the anti-DoS threshold.
+    /// Unknown prev is not low-work (Core sends getheaders instead).
+    pub(crate) fn header_below_anti_dos(&self, header: &Header) -> bool {
+        let prev = header.prev_blockhash;
+        if self
+            .query
+            .height_of_hash(&prev.to_byte_array())
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return false;
+        }
+        self.work_with_header(header) < self.anti_dos_work_threshold()
     }
 
     /// True when tip work meets `-minimumchainwork` (or the flag is unset).
@@ -1531,6 +1574,7 @@ impl ChainHub {
         need_meta: &[(u32, BlockHash)],
     ) -> Result<(), NetError> {
         if let Some(mp) = self.mempool() {
+            mp.clear_recent_rejects();
             if mp.relay_enabled() {
                 for &(_height, hash) in need_meta {
                     if let Ok(Some(block)) =
@@ -2256,6 +2300,15 @@ impl ChainHub {
         crate::tip_accept::run_on_tip_accept_async(|| self.accept_received_block_inner(block)).await
     }
 
+    pub(crate) fn accept_received_on_lane(&self, block: Block) -> Result<AcceptOutcome, NetError> {
+        self.accept_received_block_inner(block)
+    }
+
+    /// Block until the current tip-accept job (including BIP152 HB select) finishes.
+    pub fn wait_tip_stable_for_rpc(&self) {
+        crate::tip_accept::wait_idle();
+    }
+
     fn held_body_height(&self, block: &Block) -> Option<u32> {
         let prev = block.header.prev_blockhash;
         if prev.to_byte_array() == [0u8; 32] {
@@ -2315,7 +2368,8 @@ impl ChainHub {
                 }
             }
         }
-        self.held_bodies.write().unwrap().insert(block);
+        let keep = self.asked_blocks.read().unwrap().clone();
+        self.held_bodies.write().unwrap().insert(block, &keep);
     }
 
     /// Never-confirmed side-branch body in RAM. Once-confirmed disconnected
@@ -2509,7 +2563,10 @@ impl ChainHub {
         self.header_tips.write().unwrap().remove(&hash);
         let t_mp = std::time::Instant::now();
         if let Some(mp) = self.mempool() {
-            mp.note_recent_confirmed(&block.txdata);
+            mp.clear_recent_rejects();
+            if mp.relay_enabled() {
+                mp.note_recent_confirmed(&block.txdata);
+            }
             let ids = Self::strip_txids_from_pres(&pres);
             let spent: Vec<_> = block
                 .txdata
@@ -3224,25 +3281,49 @@ mod tests {
     }
 
     #[test]
-    fn hold_body_caps_at_320_fifo() {
+    fn hold_body_caps_fifo() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
-        let mut hashes = Vec::with_capacity(321);
+        let n = HeldBodies::CAP.saturating_add(1);
+        let mut hashes = Vec::with_capacity(n);
         let mut avoid = Vec::new();
-        for i in 0..321u32 {
+        for i in 0..n as u32 {
             let b = mine_distinct(gen, 1_300_000_000 + i, 1, &avoid);
             let h = b.block_hash();
             avoid.push(h);
             hashes.push(h);
             hub.hold_unconnected_body(b);
         }
-        assert_eq!(hub.held_body_count(), 320);
+        assert_eq!(hub.held_body_count(), HeldBodies::CAP);
         assert!(
             hub.held_body(&hashes[0]).is_none(),
-            "lowest-seq (first held) must be FIFO-evicted at cap 320"
+            "lowest-seq (first held) must be FIFO-evicted at cap"
         );
-        assert!(hub.held_body(&hashes[320]).is_some());
+        assert!(hub.held_body(&hashes[HeldBodies::CAP]).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hold_body_spares_asked_getdata_from_fifo() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let asked = mine_distinct(gen, 1_400_000_000, 1, &[]);
+        let asked_h = asked.block_hash();
+        hub.note_asked_block(asked_h);
+        hub.hold_unconnected_body(asked);
+        let mut avoid = vec![asked_h];
+        for i in 0..HeldBodies::CAP as u32 {
+            let b = mine_distinct(gen, 1_400_000_100 + i, 1, &avoid);
+            avoid.push(b.block_hash());
+            hub.hold_unconnected_body(b);
+        }
+        assert!(
+            hub.held_body(&asked_h).is_some(),
+            "in-flight getdata body must not FIFO-evict at cap"
+        );
+        assert_eq!(hub.held_body_count(), HeldBodies::CAP);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3482,6 +3563,28 @@ mod tests {
     }
 
     #[test]
+    fn ibd_accept_does_not_fill_recent_confirmed_wtxid() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mp = crate::tx_relay::MempoolHub::open(dir.path().join("mp"), Arc::clone(&hub.query))
+            .unwrap();
+        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+        assert!(hub.in_ibd(), "regtest genesis is older than 24h");
+        assert!(!mp.relay_enabled());
+        let gen = hub.tip_hash().unwrap();
+        let old = hub.clock.now_secs() as u32 - 2 * 24 * 3600;
+        let block = mine(gen, old, 1);
+        let wtxid = block.txdata[0].compute_wtxid();
+        hub.accept_block(block).unwrap();
+        assert!(hub.in_ibd());
+        assert!(
+            !mp.try_contains_wtxid(&wtxid),
+            "txs confirmed during IBD must not be in the recently-confirmed filter"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn feefilter_sat_kvb_is_min_relay_once_tip_is_fresh() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -3540,7 +3643,10 @@ mod tests {
         hub.accept_block(b2.clone()).unwrap();
         let fork = mine(gen, 1_300_000_200, 1);
         assert!(
-            hub.unrequested_weaker_than_tip(&fork.header),
+            crate::most_work::work_better(
+                hub.chain_work().unwrap(),
+                hub.work_with_header(&fork.header)
+            ),
             "genesis-fork at height 1 is weaker than tip 2"
         );
         let _ = std::fs::remove_dir_all(dir);

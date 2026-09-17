@@ -261,7 +261,7 @@ where
                 }
             }
             Err(e) => {
-                error!("{e}");
+                print_run_err(&e);
                 ExitCode::FAILURE
             }
         }
@@ -276,11 +276,7 @@ where
         let code = match rt.block_on(run_p2p(config)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                if matches!(e, crate::error::NodeError::FutureTip) {
-                    eprintln!("{e}");
-                } else {
-                    error!("{e}");
-                }
+                print_run_err(&e);
                 ExitCode::FAILURE
             }
         };
@@ -301,10 +297,11 @@ fn operator_usage() -> String {
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
     [--test-activation-height name@HEIGHT] [--persist-mempool[=0|1]] [--trusted] [--always-relay] [--relay] \\\n\
+    [--net-permission SPEC] [--net-permission-bind SPEC] [--net-permission-relay[=0|1]] [--net-permission-force-relay[=0|1]] \\\n\
     [--blocks-only] [--prefill-compact[=0|1]] [--min-relay-tx-fee BTC] \\\n\
     [--limit-cluster-count N] [--limit-cluster-size KVB] [--peer-timeout SECS] \\\n\
     [--external-ip IP] [--ua-comment STR] \\\n\
-    [--min-chain-work HEX] [--max-tip-age SECS] [--mock-time UNIX] \\\n\
+    [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
     [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
@@ -315,9 +312,12 @@ API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also
 Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {{datadir}}/ip_asn.dat.\n\
 Milestone: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
+Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
-  --trusted / --always-relay / --relay are inbound permission knobs (not Core -whitelist).\n\
+  --trusted / --always-relay / --relay are inbound permission knobs.\n\
+  --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
+  --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora; both require it.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
@@ -365,6 +365,8 @@ fn is_bool_key(key: &str) -> bool {
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"
+            | "net_permission_relay"
+            | "net_permission_force_relay"
             | "no_seeds"
             | "inhibit_suspend"
             | "trusted"
@@ -442,13 +444,31 @@ fn parse_cli_flag(
     Ok(Some((key, val)))
 }
 
+fn print_run_err(e: &crate::error::NodeError) {
+    match e {
+        crate::error::NodeError::FutureTip => eprintln!("{e}"),
+        crate::error::NodeError::Locked(_) => eprintln!("Error: {e}"),
+        _ => error!("{e}"),
+    }
+}
+
 fn cli_apply_err(e: crate::error::NodeError) -> ExitCode {
     let s = e.to_string();
     if s.contains("peer-timeout must be a positive integer")
         || s.contains("Invalid minimum work")
         || s.contains("must be hexadecimal")
+        || s.contains("Duplicate binding configuration")
+        || s.contains("Invalid P2P permission")
+        || s.contains("Only direction was set, no permissions")
+        || s.contains("Invalid netmask specified in")
+        || s.contains("Cannot resolve --net-permission-bind address")
+        || s.contains("Need to specify a port with --net-permission-bind")
     {
-        eprintln!("Error: {e}");
+        if s.contains("Duplicate binding configuration") {
+            eprintln!("Error: Duplicate binding configuration");
+        } else {
+            eprintln!("Error: {e}");
+        }
         ExitCode::from(1)
     } else {
         eprintln!("error: {e}");
@@ -535,6 +555,11 @@ mod tests {
             "--ua-comment",
             "--min-chain-work",
             "--max-tip-age",
+            "--check-blocks",
+            "--net-permission",
+            "--net-permission-bind",
+            "--net-permission-relay",
+            "--net-permission-force-relay",
             "--signet-block-time",
             "--sh-index",
             "--sp-tweaks",
@@ -566,6 +591,11 @@ mod tests {
             "--startupnotify",
             "--testactivationheight",
             "--rpcworkqueue",
+            "--checkblocks",
+            "--blocksdir",
+            "--blocks-dir",
+            "--whitelist-relay",
+            "--whitelist-forcerelay",
         ] {
             assert!(!h.contains(concat), "help must not advertise {concat}");
         }
@@ -615,6 +645,25 @@ mod tests {
         assert_eq!(el.listen.electrum.unwrap().port(), 50001);
         let es = ready_config(["rbitcoin-node", "--sh-index", "--esplora-listen"]);
         assert_eq!(es.listen.esplora.unwrap().port(), 3000);
+    }
+
+    #[test]
+    fn check_blocks_cli_parses_zero_and_negative() {
+        let omitted = ready_config(["rbitcoin-node"]);
+        assert_eq!(omitted.check_blocks, None);
+        assert_eq!(
+            omitted.check_blocks_window(),
+            rbitcoin_store::VERIFY_TIP_BLOCKS
+        );
+        let six = ready_config(["rbitcoin-node", "--check-blocks=6"]);
+        assert_eq!(six.check_blocks, Some(6));
+        assert_eq!(six.check_blocks_window(), 6);
+        let all = ready_config(["rbitcoin-node", "--check-blocks", "0"]);
+        assert_eq!(all.check_blocks, Some(0));
+        assert_eq!(all.check_blocks_window(), 0);
+        let neg = ready_config(["rbitcoin-node", "--check-blocks=-1"]);
+        assert_eq!(neg.check_blocks, Some(-1));
+        assert_eq!(neg.check_blocks_window(), 0);
     }
 
     #[test]
@@ -1016,6 +1065,11 @@ mod tests {
             "--rpc-user=u",
             "--rpcuser=u",
             "--rpcpassword=p",
+            "--checkblocks=6",
+            "--blocksdir=/tmp/x",
+            "--blocks-dir=/tmp/x",
+            "--whitelist-relay=0",
+            "--whitelist-forcerelay=1",
             "--shindex",
             "--sptweaks",
             "-shindex",

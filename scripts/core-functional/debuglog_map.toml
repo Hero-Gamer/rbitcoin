@@ -12,8 +12,8 @@ match = 'rpc: listening on 127\.0\.0\.1:(\d+)'
 emit = ['Bound to 127.0.0.1:{1}']
 
 [[rule]]
-match = 'rbitcoin-node listening on 127\.0\.0\.1:(\d+)'
-emit = ['Bound to 127.0.0.1:{1}']
+match = 'rbitcoin-node listening on (\S+)'
+emit = ['Bound to {1}']
 
 [[rule]]
 match = 'getblocktxn with out-of-bounds tx indices'
@@ -158,3 +158,23 @@ emit = ['UpdateTip: new best={1} height={2} version={3} tx={4} date={5} progress
 [[rule]]
 match = 'Store tip time is more than two hours ahead of the node clock'
 emit = ['The block database contains a block which appears to be from the future.']
+
+[[rule]]
+match = 'Cannot obtain a lock on directory (.+)\. rbitcoin is probably already running'
+emit = ['Error: Cannot obtain a lock on directory {1}. Bitcoin Core is probably already running.']
+
+[[rule]]
+match = 'Cannot resolve --net-permission-bind address'
+emit = ['Cannot resolve -whitebind address']
+
+[[rule]]
+match = 'Need to specify a port with --net-permission-bind'
+emit = ['Need to specify a port with -whitebind']
+
+[[rule]]
+match = 'Invalid netmask specified in --net-permission'
+emit = ['Invalid netmask specified in -whitelist']
+
+[[rule]]
+match = '--net-permission-bind may only be used for incoming connections'
+emit = ['whitebind may only be used for incoming connections']

@@ -1048,9 +1048,10 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
         }
     }
     if !to_admit.is_empty() {
-        match mp.accept_package(&to_admit) {
-            Ok(oks) => {
-                for (tx, ok) in to_admit.iter().zip(oks.iter()) {
+        let mut any_fail = false;
+        for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
+            match res {
+                Ok(ok) => {
                     mp.note_unbroadcast(ok.txid);
                     for old in &ok.replaced {
                         replaced.push(hash_hex_display(&old.to_byte_array()));
@@ -1064,24 +1065,24 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
                         }),
                     );
                 }
-            }
-            Err(e) => {
-                let reason = accept_reject_reason(&e);
-                for tx in &to_admit {
+                Err(e) => {
+                    any_fail = true;
                     tx_results.insert(
                         hash_hex_display(&tx.compute_wtxid().to_byte_array()),
                         json!({
                             "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
-                            "error": reason,
+                            "error": accept_reject_reason(&e),
                         }),
                     );
                 }
-                return Ok(json!({
-                    "package_msg": "transaction failed",
-                    "tx-results": tx_results,
-                    "replaced-transactions": replaced,
-                }));
             }
+        }
+        if any_fail {
+            return Ok(json!({
+                "package_msg": "transaction failed",
+                "tx-results": tx_results,
+                "replaced-transactions": replaced,
+            }));
         }
     }
     Ok(json!({
@@ -1123,6 +1124,56 @@ pub(crate) fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Resu
             if let Some(sp) = mp.spending_txid(&op) {
                 row["spendingtxid"] = json!(hash_hex_display(&sp.to_byte_array()));
             }
+        }
+        out.push(row);
+    }
+    Ok(json!(out))
+}
+
+pub(crate) fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["verbosity"])?;
+    let verbosity = match params.get(0, "verbosity") {
+        None | Some(Value::Null) => 0i64,
+        Some(Value::Bool(_)) => {
+            return Err(rpc_error(
+                ERR_TYPE_ERROR,
+                "Verbosity was boolean but only integer allowed",
+            ));
+        }
+        Some(v) => json_i64(v)
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "verbosity must be an integer"))?,
+    };
+    if !(0..=2).contains(&verbosity) {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Invalid verbosity value {verbosity}"),
+        ));
+    }
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return Ok(json!([]));
+    };
+    let snaps = mp.orphan_snapshot();
+    if verbosity == 0 {
+        let ids: Vec<String> = snaps
+            .iter()
+            .map(|s| hash_hex_display(&s.tx.compute_txid().to_byte_array()))
+            .collect();
+        return Ok(json!(ids));
+    }
+    let mut out = Vec::with_capacity(snaps.len());
+    for s in snaps {
+        let raw = bitcoin::consensus::encode::serialize(&s.tx);
+        let weight = s.tx.weight().to_wu();
+        let mut row = json!({
+            "txid": hash_hex_display(&s.tx.compute_txid().to_byte_array()),
+            "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
+            "bytes": raw.len(),
+            "vsize": s.tx.vsize(),
+            "weight": weight,
+            "from": s.announcers,
+        });
+        if verbosity == 2 {
+            row["hex"] = json!(bitcoin::consensus::encode::serialize_hex(&s.tx));
         }
         out.push(row);
     }

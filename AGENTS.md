@@ -137,6 +137,7 @@ Suite, budgets, coverage: [`TESTING.md`](TESTING.md).
 | **Each plan step / single-shot** | Targeted `cargo test -p <crate> …` (or slim scenario). `cargo fmt --all` if dirty. |
 | **Compile inner loop** | `cargo check -p <crate> --lib` (or that same `--lib` test filter). **Not** `cargo check --tests` / multi-crate `--tests` after every edit. `--tests` once per green slice. |
 | **Before push** | `cargo clippy --workspace --all-targets -- -D warnings` (same as CI `clippy`). Do not open a PR whose first clippy run is GitHub Actions. |
+| **Core functional CI red** | Reproduce with `./scripts/core-functional/run.sh <failing.py>` against a cargo-built `rbitcoin-node` (`RBITCOIN_NODE=…/rbitcoin-node`). Rebuild the node after each product change. Iterate that script locally until it passes. Do **not** push and wait on the labeled job as the inner loop. Owner: [`docs/core-functional.md`](docs/core-functional.md). |
 | **Not by default** | `cargo test --workspace`, `./scripts/coverage.sh`, `nix build .#rbitcoin-musl` |
 | **Exception** | User asked for a local full suite, or you cannot push and must prove gates offline |
 

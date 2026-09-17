@@ -26,6 +26,15 @@ struct OrphanEntry {
     weight: u64,
     /// Missing parent txids (prevout.txid not in mempool/chain at insert).
     missing: BTreeSet<Txid>,
+    /// Core `NodeId` announcers (`getorphantxs` `from`).
+    announcers: BTreeSet<u64>,
+}
+
+/// One parked orphan for `getorphantxs`.
+#[derive(Debug, Clone)]
+pub struct OrphanSnapshot {
+    pub tx: Transaction,
+    pub announcers: Vec<u64>,
 }
 
 /// Side pool of not-yet-acceptable txs waiting on parent(s).
@@ -86,13 +95,21 @@ impl Orphanage {
         self.by_txid.values().map(|e| &e.tx)
     }
 
-    /// Insert orphan waiting on `missing` parent txids. Returns true if newly stored.
-    pub fn insert(&mut self, tx: Transaction, missing: BTreeSet<Txid>) -> bool {
+    /// Insert (or add `from` as announcer if already parked).
+    pub fn insert_from(
+        &mut self,
+        tx: Transaction,
+        missing: BTreeSet<Txid>,
+        from: Option<u64>,
+    ) -> bool {
         if missing.is_empty() {
             return false;
         }
         let txid = tx.compute_txid();
         if self.by_txid.contains_key(&txid) {
+            if let Some(peer) = from {
+                self.add_announcer(&txid, peer);
+            }
             return false;
         }
         let wtxid = tx.compute_wtxid();
@@ -116,6 +133,10 @@ impl Orphanage {
         for p in &missing {
             self.by_parent.entry(*p).or_default().insert(txid);
         }
+        let mut announcers = BTreeSet::new();
+        if let Some(peer) = from {
+            announcers.insert(peer);
+        }
         self.by_wtxid.insert(wtxid, txid);
         self.by_txid.insert(
             txid,
@@ -124,6 +145,7 @@ impl Orphanage {
                 wtxid,
                 weight,
                 missing,
+                announcers,
             },
         );
         self.fifo.push_back(txid);
@@ -178,6 +200,66 @@ impl Orphanage {
                     }
                 }
                 out.push(e.tx);
+            }
+        }
+        out
+    }
+
+    pub fn announcers_of(&self, txid: &Txid) -> Vec<u64> {
+        self.by_txid
+            .get(txid)
+            .map(|e| e.announcers.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn has_announcer(&self, peer: u64) -> bool {
+        self.by_txid.values().any(|e| e.announcers.contains(&peer))
+    }
+
+    pub fn add_announcer(&mut self, txid: &Txid, peer: u64) -> bool {
+        let Some(e) = self.by_txid.get_mut(txid) else {
+            return false;
+        };
+        e.announcers.insert(peer)
+    }
+
+    pub fn add_announcer_wtxid(&mut self, wtxid: &Wtxid, peer: u64) -> bool {
+        let Some(txid) = self.by_wtxid.get(wtxid).copied() else {
+            return false;
+        };
+        self.add_announcer(&txid, peer)
+    }
+
+    /// Drop `peer` as announcer; erase orphans with no remaining announcers.
+    pub fn erase_for_peer(&mut self, peer: u64) {
+        let drop: Vec<Txid> = self
+            .by_txid
+            .iter_mut()
+            .filter_map(|(txid, e)| {
+                if !e.announcers.remove(&peer) {
+                    return None;
+                }
+                e.announcers.is_empty().then_some(*txid)
+            })
+            .collect();
+        for t in drop {
+            self.remove_txid(&t);
+        }
+        self.fifo.retain(|t| self.by_txid.contains_key(t));
+    }
+
+    pub fn snapshot(&self) -> Vec<OrphanSnapshot> {
+        let mut out = Vec::with_capacity(self.fifo.len());
+        let mut seen = HashSet::new();
+        for txid in &self.fifo {
+            if !seen.insert(*txid) {
+                continue;
+            }
+            if let Some(e) = self.by_txid.get(txid) {
+                out.push(OrphanSnapshot {
+                    tx: e.tx.clone(),
+                    announcers: e.announcers.iter().copied().collect(),
+                });
             }
         }
         out
@@ -247,7 +329,7 @@ mod tests {
         let mut miss = BTreeSet::new();
         miss.insert(p);
         let wtxid = tx.compute_wtxid();
-        assert!(o.insert(tx, miss));
+        assert!(o.insert_from(tx, miss, None));
         assert!(o.contains(&tid));
         assert!(o.contains_wtxid(&wtxid));
         assert_eq!(o.missing_of(&tid).map(|s| s.len()), Some(1));
@@ -266,7 +348,7 @@ mod tests {
             let tx = make_orphan(p, i + 1);
             let mut miss = BTreeSet::new();
             miss.insert(p);
-            o.insert(tx, miss);
+            o.insert_from(tx, miss, None);
         }
         assert!(o.len() <= 2);
         assert!(o.total_weight() <= DEFAULT_ORPHAN_MAX_WEIGHT);
@@ -289,12 +371,11 @@ mod tests {
         let p = txid_n(3);
         // Empty missing parents → refuse.
         let tx = make_orphan(p, 1);
-        assert!(!o.insert(tx.clone(), BTreeSet::new()));
+        assert!(!o.insert_from(tx.clone(), BTreeSet::new(), None));
         let mut miss = BTreeSet::new();
         miss.insert(p);
-        assert!(o.insert(tx.clone(), miss.clone()));
-        // Duplicate insert rejected.
-        assert!(!o.insert(tx.clone(), miss.clone()));
+        assert!(o.insert_from(tx.clone(), miss.clone(), None));
+        assert!(!o.insert_from(tx.clone(), miss.clone(), None));
         let tid = tx.compute_txid();
         o.remove_txid(&tid);
         assert!(!o.contains(&tid));
@@ -306,7 +387,7 @@ mod tests {
             let t = make_orphan(p, i + 1);
             let mut m = BTreeSet::new();
             m.insert(p);
-            o2.insert(t, m);
+            o2.insert_from(t, m, None);
         }
         assert!(o2.len() <= 3);
         // erase_for_block drops matching orphans.
@@ -314,8 +395,31 @@ mod tests {
         let tid3 = t3.compute_txid();
         let mut m = BTreeSet::new();
         m.insert(p);
-        o2.insert(t3, m);
+        o2.insert_from(t3, m, None);
         o2.erase_for_block(&[tid3]);
         assert!(!o2.contains(&tid3));
+    }
+
+    #[test]
+    fn announcers_and_erase_for_peer() {
+        let mut o = Orphanage::new();
+        let p = txid_n(4);
+        let tx = make_orphan(p, 7);
+        let tid = tx.compute_txid();
+        let wtxid = tx.compute_wtxid();
+        let mut miss = BTreeSet::new();
+        miss.insert(p);
+        assert!(o.insert_from(tx.clone(), miss, Some(3)));
+        assert!(o.has_announcer(3));
+        assert!(!o.has_announcer(9));
+        assert_eq!(o.announcers_of(&tid), vec![3]);
+        assert!(o.add_announcer_wtxid(&wtxid, 9));
+        assert_eq!(o.announcers_of(&tid), vec![3, 9]);
+        o.erase_for_peer(3);
+        assert_eq!(o.announcers_of(&tid), vec![9]);
+        assert!(o.contains(&tid));
+        o.erase_for_peer(9);
+        assert!(!o.contains(&tid));
+        assert!(o.is_empty());
     }
 }

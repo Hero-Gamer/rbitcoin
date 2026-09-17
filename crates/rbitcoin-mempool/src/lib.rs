@@ -57,6 +57,6 @@ pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,
     TxEntry, TxGraph,
 };
-pub use orphanage::Orphanage;
+pub use orphanage::{OrphanSnapshot, Orphanage};
 pub use packed::VinAux;
 pub use store::{Mempool, MempoolMeta};

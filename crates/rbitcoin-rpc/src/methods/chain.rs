@@ -7,12 +7,20 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+fn wait_chain_tip(ctx: &RpcContext) {
+    if let Some(c) = ctx.chain.as_ref() {
+        c.wait_tip_stable_for_rpc();
+    }
+}
+
 pub(crate) fn getblockcount(ctx: &RpcContext) -> Result<Value, Value> {
+    wait_chain_tip(ctx);
     let h = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     Ok(json!(h))
 }
 
 pub(crate) fn getbestblockhash(ctx: &RpcContext) -> Result<Value, Value> {
+    wait_chain_tip(ctx);
     let Some(tip) = ctx.query.tip_height() else {
         return Err(rpc_error(ERR_MISC, "no tip"));
     };

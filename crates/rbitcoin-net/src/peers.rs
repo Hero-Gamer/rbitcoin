@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 
 /// Session writer payload: application messages or pre-encoded v2 block bytes.
@@ -214,8 +214,7 @@ pub struct LivePeer {
     /// Shared with the TCP reader so split-header bytes count (`p2p_invalid_messages`).
     wire_recv: Mutex<Option<std::sync::Arc<AtomicU64>>>,
     wire_sent: Mutex<Option<std::sync::Arc<AtomicU64>>>,
-    /// Compact hashes whose first `blocktxn` reconstruct already failed
-    /// (`p2p_compactblocks` `test_multiple_blocktxn_response`).
+    /// Compact hashes whose first `blocktxn` reconstruct already failed.
     failed_cmpct: Mutex<HashSet<BlockHash>>,
     /// Heights of blocks we have requested from this peer and not yet received
     /// (`getpeerinfo.inflight`).
@@ -732,6 +731,41 @@ impl LivePeer {
         self.owner.upgrade()
     }
 
+    pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
+        self.owner
+            .upgrade()
+            .map(|h| h.permission_flags(self.addr, self.inbound, self.addrbind))
+            .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
+    }
+
+    pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
+        self.net_perm_flags().has(flag)
+    }
+
+    /// CIDR/bind table plus operator `--trusted`.
+    pub fn session_noban(&self) -> bool {
+        self.peer_hub().is_some_and(|h| h.is_noban())
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::NOBAN)
+    }
+
+    /// CIDR/bind table plus operator `--relay` / `--always-relay`.
+    pub fn session_relay_perm(&self) -> bool {
+        self.peer_hub().is_some_and(|h| h.is_relay_perm())
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::RELAY)
+    }
+
+    /// CIDR/bind table plus operator `--always-relay`.
+    pub fn session_forcerelay(&self) -> bool {
+        self.peer_hub().is_some_and(|h| h.is_forcerelay_perm())
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::FORCE_RELAY)
+    }
+
     pub fn set_inv_gen_floor(&self, floor: u64) {
         self.inv_gen_floor.store(floor, Ordering::Relaxed);
     }
@@ -879,18 +913,11 @@ impl LivePeer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            permissions: {
-                let mut p = Vec::new();
-                if let Some(h) = self.owner.upgrade() {
-                    if h.is_noban() {
-                        p.push("noban".into());
-                    }
-                    if h.is_relay_perm() {
-                        p.push("relay".into());
-                    }
-                }
-                p
-            },
+            permissions: self
+                .owner
+                .upgrade()
+                .map(|h| h.permission_strings(self.addr, self.inbound, self.addrbind))
+                .unwrap_or_default(),
             mapped_as: self.owner.upgrade().and_then(|h| {
                 h.asmap().and_then(|m| {
                     let asn = m.mapped_as(self.addr.ip());
@@ -1023,6 +1050,10 @@ pub struct PeerHub {
     /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
+    /// Tip-mode mempool for Core `EraseForPeer` on disconnect.
+    mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
+    /// Core `-whitelist` / `-whitebind` grants (`getpeerinfo.permissions`).
+    net_perms: Mutex<crate::net_permissions::NetPermTable>,
 }
 
 fn canonical_bind(addr: SocketAddr) -> SocketAddr {
@@ -1093,7 +1124,42 @@ impl PeerHub {
             external_ips: Mutex::new(Vec::new()),
             listen_port: AtomicU16::new(0),
             asmap: Mutex::new(None),
+            mempool: Mutex::new(None),
+            net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
         })
+    }
+
+    pub fn attach_mempool(&self, mp: &Arc<crate::tx_relay::MempoolHub>) {
+        *self.mempool.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(mp));
+    }
+
+    pub fn set_net_perms(&self, t: crate::net_permissions::NetPermTable) {
+        *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
+    }
+
+    pub fn permission_flags(
+        &self,
+        addr: SocketAddr,
+        inbound: bool,
+        bind: SocketAddr,
+    ) -> crate::net_permissions::NetPermissionFlags {
+        self.net_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flags_for(addr.ip(), inbound, bind)
+    }
+
+    pub fn permission_strings(
+        &self,
+        addr: SocketAddr,
+        inbound: bool,
+        bind: SocketAddr,
+    ) -> Vec<String> {
+        self.permission_flags(addr, inbound, bind)
+            .to_strings()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn set_asmap(&self, m: Option<Arc<crate::asmap::AsMap>>) {
@@ -1309,7 +1375,7 @@ impl PeerHub {
         self.forcerelay_perm.store(v, Ordering::Relaxed);
     }
 
-    /// Do not send `feefilter`.
+    /// Operator `--always-relay`: skip `feefilter` and force-rebroadcast.
     pub fn is_forcerelay_perm(&self) -> bool {
         self.forcerelay_perm.load(Ordering::Relaxed)
     }
@@ -1386,7 +1452,6 @@ impl PeerHub {
             .values()
             .filter(|p| Self::is_preferred_download(p))
             .count();
-        let noban_all = self.noban.load(Ordering::Relaxed);
         for p in g.values() {
             if !p.sync_started.load(Ordering::Relaxed) {
                 continue;
@@ -1399,12 +1464,10 @@ impl PeerHub {
             if n_preferred.saturating_sub(stalling_pref as usize) < 1 {
                 continue;
             }
-            if noban_all {
+            if p.session_noban() {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
                 p.sync_started.store(false, Ordering::Relaxed);
                 p.headers_sync_timeout.store(0, Ordering::Relaxed);
-                // In-flight getheaders timed out; allow a new one
-                // (`p2p_initial_headers_sync` noban recipient).
                 let _ = p.take_awaiting_headers();
                 self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
             } else {
@@ -1617,6 +1680,15 @@ impl PeerHub {
     }
 
     pub fn unregister(&self, id: u64) {
+        if let Some(mp) = self
+            .mempool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            mp.erase_orphans_for_peer(id);
+        }
         let removed = self
             .live
             .write()
@@ -1626,6 +1698,10 @@ impl PeerHub {
             p.release_all_cmpct();
             self.end_headers_sync(&p);
         }
+        self.hb_selected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|x| *x != id);
     }
 
     pub fn live_peers(&self) -> Vec<Arc<LivePeer>> {
@@ -1635,11 +1711,8 @@ impl PeerHub {
 
     /// Re-advertise BIP133 feefilter after IBD/minrelay change (skip block-relay / forcerelay).
     pub fn queue_feefilter_all(&self, sat_kvb: i64) {
-        if self.is_forcerelay_perm() {
-            return;
-        }
         for s in self.live_peers() {
-            if s.conn_type == PeerConnType::BlockRelay {
+            if s.conn_type == PeerConnType::BlockRelay || s.session_forcerelay() {
                 continue;
             }
             if let Some(tx) = s.writer() {
@@ -1730,7 +1803,9 @@ impl PeerHub {
         };
         let inbound = peer.inbound;
         let mut sel = self.hb_selected.lock().unwrap_or_else(|e| e.into_inner());
-        if sel.contains(&id) {
+        if let Some(pos) = sel.iter().position(|x| *x == id) {
+            sel.remove(pos);
+            sel.push(id);
             return;
         }
         if sel.len() >= 3 {
@@ -1754,15 +1829,35 @@ impl PeerHub {
                 let evicted = sel.remove(evict_at);
                 if let Some(p) = self.get(evicted) {
                     p.set_hb_to(false);
-                    p.pending_sendcmpct
-                        .store(PendingSendCmpct::Lb as u8, Ordering::Relaxed);
+                    if let Some(out) = p.writer() {
+                        let _ = out.send(PeerOut::Msg(NetworkMessage::SendCmpct(
+                            bitcoin::p2p::message_compact_blocks::SendCmpct {
+                                send_compact: false,
+                                version: 2,
+                            },
+                        )));
+                        p.pending_sendcmpct.store(0, Ordering::Relaxed);
+                    } else {
+                        p.pending_sendcmpct
+                            .store(PendingSendCmpct::Lb as u8, Ordering::Relaxed);
+                    }
                 }
             }
         }
         sel.push(id);
         peer.set_hb_to(true);
-        peer.pending_sendcmpct
-            .store(PendingSendCmpct::Hb as u8, Ordering::Relaxed);
+        if let Some(out) = peer.writer() {
+            let _ = out.send(PeerOut::Msg(NetworkMessage::SendCmpct(
+                bitcoin::p2p::message_compact_blocks::SendCmpct {
+                    send_compact: true,
+                    version: 2,
+                },
+            )));
+            peer.pending_sendcmpct.store(0, Ordering::Relaxed);
+        } else {
+            peer.pending_sendcmpct
+                .store(PendingSendCmpct::Hb as u8, Ordering::Relaxed);
+        }
     }
 
     pub fn addconnection(&self, addr: SocketAddr, typ: PeerConnType) -> Result<(), String> {
@@ -1840,7 +1935,6 @@ impl PeerHub {
 
     /// Disconnect one unprotected inbound when inbound slots are full.
     pub fn try_evict_inbound(&self) -> bool {
-        let noban = self.is_noban();
         let now = self.now_secs();
         let cands: Vec<crate::eviction::InboundEvictCandidate> = self
             .live_peers()
@@ -1855,7 +1949,7 @@ impl PeerHub {
                     last_block: p.last_block.load(Ordering::Relaxed),
                     last_tx: p.last_transaction.load(Ordering::Relaxed),
                     netgroup: crate::eviction::eviction_netgroup(p.addr),
-                    noban,
+                    noban: p.session_noban(),
                 }
             })
             .collect();
@@ -1964,6 +2058,192 @@ mod tests {
         assert_eq!(PendingSendCmpct::None as u8, 0);
         assert_eq!(PendingSendCmpct::Lb as u8, 1);
         assert_eq!(PendingSendCmpct::Hb as u8, 2);
+    }
+
+    #[test]
+    fn maybe_select_hb_writes_sendcmpct_when_writer_attached() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let p = hub.register(
+            a,
+            a,
+            &ver("/rbitcoin:0.1.0(testnode0)/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        p.attach_out(tx);
+        hub.maybe_select_hb(p.id);
+        assert!(p.hb_to.load(Ordering::Relaxed));
+        match rx.try_recv().expect("sendcmpct").expect_msg() {
+            NetworkMessage::SendCmpct(sc) => {
+                assert!(sc.send_compact);
+                assert_eq!(sc.version, 2);
+            }
+            other => panic!("expected sendcmpct HB, got {other:?}"),
+        }
+        assert_eq!(p.pending_sendcmpct.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn maybe_select_hb_pending_when_no_writer_and_evicts_fourth_inbound() {
+        let hub = PeerHub::new();
+        hub.maybe_select_hb(9_999);
+        let peers: Vec<_> = (18444u16..18447)
+            .map(|port| {
+                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                hub.register(
+                    a,
+                    a,
+                    &ver("/rbitcoin:0.1.0(testnode0)/"),
+                    true,
+                    PeerConnType::Inbound,
+                )
+            })
+            .collect();
+        for p in &peers {
+            hub.maybe_select_hb(p.id);
+            hub.maybe_select_hb(p.id);
+            assert!(p.hb_to.load(Ordering::Relaxed));
+            assert_eq!(
+                p.pending_sendcmpct.load(Ordering::Relaxed),
+                PendingSendCmpct::Hb as u8
+            );
+        }
+        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+        let fourth = hub.register(
+            fourth_addr,
+            fourth_addr,
+            &ver("/rbitcoin:0.1.0(testnode0)/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        hub.maybe_select_hb(fourth.id);
+        assert!(
+            !peers[0].hb_to.load(Ordering::Relaxed),
+            "oldest inbound must be evicted when a fourth inbound is selected"
+        );
+        assert_eq!(
+            peers[0].pending_sendcmpct.load(Ordering::Relaxed),
+            PendingSendCmpct::Lb as u8
+        );
+        assert!(peers[1].hb_to.load(Ordering::Relaxed));
+        assert!(peers[2].hb_to.load(Ordering::Relaxed));
+        assert!(fourth.hb_to.load(Ordering::Relaxed));
+        assert_eq!(
+            fourth.pending_sendcmpct.load(Ordering::Relaxed),
+            PendingSendCmpct::Hb as u8
+        );
+    }
+
+    #[test]
+    fn maybe_select_hb_inbound_keeps_lone_outbound() {
+        let hub = PeerHub::new();
+        let out_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let outbound = hub.register(
+            out_addr,
+            out_addr,
+            &ver("/rbitcoin:0.1.0(testnode0)/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        hub.maybe_select_hb(outbound.id);
+        let mut inbounds = Vec::new();
+        for port in 18445u16..18448 {
+            let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let p = hub.register(
+                a,
+                a,
+                &ver("/rbitcoin:0.1.0(testnode0)/"),
+                true,
+                PeerConnType::Inbound,
+            );
+            hub.maybe_select_hb(p.id);
+            inbounds.push(p);
+        }
+        assert!(outbound.hb_to.load(Ordering::Relaxed));
+        assert!(
+            !inbounds[0].hb_to.load(Ordering::Relaxed),
+            "lone outbound stays; first inbound is the eviction"
+        );
+        assert!(inbounds[1].hb_to.load(Ordering::Relaxed));
+        assert!(inbounds[2].hb_to.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn maybe_select_hb_lru_refresh_protects_recent_inbound() {
+        let hub = PeerHub::new();
+        let peers: Vec<_> = (18444u16..18447)
+            .map(|port| {
+                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                hub.register(
+                    a,
+                    a,
+                    &ver("/rbitcoin:0.1.0(testnode0)/"),
+                    true,
+                    PeerConnType::Inbound,
+                )
+            })
+            .collect();
+        for p in &peers {
+            hub.maybe_select_hb(p.id);
+        }
+        hub.maybe_select_hb(peers[0].id);
+        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+        let fourth = hub.register(
+            fourth_addr,
+            fourth_addr,
+            &ver("/rbitcoin:0.1.0(testnode0)/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        hub.maybe_select_hb(fourth.id);
+        assert!(
+            peers[0].hb_to.load(Ordering::Relaxed),
+            "re-selected inbound must stay HB (Core LRU)"
+        );
+        assert!(
+            !peers[1].hb_to.load(Ordering::Relaxed),
+            "oldest unre-selected inbound is evicted"
+        );
+        assert!(peers[2].hb_to.load(Ordering::Relaxed));
+        assert!(fourth.hb_to.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unregister_releases_hb_slot() {
+        let hub = PeerHub::new();
+        let peers: Vec<_> = (18444u16..18447)
+            .map(|port| {
+                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                hub.register(
+                    a,
+                    a,
+                    &ver("/rbitcoin:0.1.0(testnode0)/"),
+                    true,
+                    PeerConnType::Inbound,
+                )
+            })
+            .collect();
+        for p in &peers {
+            hub.maybe_select_hb(p.id);
+        }
+        hub.unregister(peers[1].id);
+        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+        let fourth = hub.register(
+            fourth_addr,
+            fourth_addr,
+            &ver("/rbitcoin:0.1.0(testnode0)/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        hub.maybe_select_hb(fourth.id);
+        assert!(
+            peers[0].hb_to.load(Ordering::Relaxed),
+            "live HB peer must not be evicted to fill a disconnect hole"
+        );
+        assert!(peers[2].hb_to.load(Ordering::Relaxed));
+        assert!(fourth.hb_to.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -2358,8 +2638,20 @@ mod tests {
 
     #[test]
     fn noban_headers_timeout_clears_awaiting_so_a_new_getheaders_can_send() {
+        pin_noban_headers_timeout_keep(true);
+        pin_noban_headers_timeout_keep(false);
+    }
+
+    fn pin_noban_headers_timeout_keep(via_cidr: bool) {
         let hub = PeerHub::new();
-        hub.set_noban(true);
+        if via_cidr {
+            let mut t = crate::NetPermTable::default();
+            t.whitelist
+                .push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
+            hub.set_net_perms(t);
+        } else {
+            hub.set_noban(true);
+        }
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
@@ -2370,6 +2662,10 @@ mod tests {
             false,
             PeerConnType::OutboundFullRelay,
         );
+        if via_cidr {
+            assert!(!hub.is_noban(), "CIDR noban must not set hub --trusted");
+            assert!(inbound.session_noban());
+        }
         let now = 1_700_000_000u64;
         let best = 1_231_006_505u64;
         assert!(hub.try_start_headers_sync(&inbound, now, best));
@@ -2378,8 +2674,12 @@ mod tests {
         let deadline = crate::chain::headers_download_timeout_secs(now, best);
         hub.set_mock_now(deadline + 1);
         assert!(
+            !inbound.stop.load(Ordering::SeqCst),
+            "noban stall must keep the TCP session (via_cidr={via_cidr})"
+        );
+        assert!(
             !inbound.is_sync_started(),
-            "noban timeout must end the stalling sync"
+            "noban timeout must end the stalling sync (via_cidr={via_cidr})"
         );
         assert!(
             !inbound.is_awaiting_headers(),
@@ -2388,6 +2688,65 @@ mod tests {
         assert!(
             hub.try_start_headers_sync(&inbound, deadline + 1, best),
             "after timeout another getheaders start must be allowed"
+        );
+    }
+
+    #[test]
+    fn snapshot_permissions_are_cidr_table_not_hub_noban() {
+        let hub = PeerHub::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+        hub.register(
+            a,
+            bind,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        hub.set_noban(true);
+        assert!(
+            hub.snapshot()[0].permissions.is_empty(),
+            "hub --trusted is a DoS bypass, not getpeerinfo.permissions"
+        );
+        let mut t = crate::NetPermTable::default();
+        t.whitelist
+            .push(crate::parse_whitelist("noban,out@127.0.0.1").unwrap());
+        hub.set_net_perms(t);
+        assert_eq!(hub.snapshot()[0].permissions, ["noban", "download"]);
+    }
+
+    #[test]
+    fn cidr_noban_is_per_peer_not_hub_wide() {
+        let hub = PeerHub::new();
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+        let local = hub.register(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
+            bind,
+            &ver("/rbitcoin:0.1.0/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        let other = hub.register(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 18444),
+            bind,
+            &ver("/rbitcoin:0.1.0/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        let mut t = crate::NetPermTable::default();
+        t.whitelist
+            .push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
+        hub.set_net_perms(t);
+        assert!(!hub.is_noban(), "a CIDR grant must not set hub --trusted");
+        assert!(local.session_noban());
+        assert!(
+            !other.session_noban(),
+            "non-matching inbound must not inherit CIDR noban"
+        );
+        hub.set_noban(true);
+        assert!(
+            other.session_noban(),
+            "operator --trusted still covers every session"
         );
     }
 

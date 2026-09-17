@@ -20,7 +20,7 @@ const HELP: &str = "getblockstats hash_or_height ( stats )";
 
 /// Core `CScript::IsUnspendable`: leading `OP_RETURN`, or over `MAX_SCRIPT_SIZE`.
 pub fn is_unspendable(script: &[u8]) -> bool {
-    script.first() == Some(&0x6a) || script.len() > 10_000
+    rbitcoin_consensus::policy::is_unspendable(script)
 }
 
 /// Consensus-serialized `CTxOut` size (value + compact script).
