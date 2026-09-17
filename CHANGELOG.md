@@ -53,6 +53,14 @@ before 1.0).
   info/summary/utxo/chain pages. Crate Esplora tests keep no-hub mempool/fees
   and reconstruct meters.
 
+- **Catalog journeys absorb Electrum dispatch / Esplora tip-404 leftovers:**
+  TCP `electrum_server_version_history_balance` pins `CARGO_PKG_VERSION`,
+  `protocol_min` / `asof_protocol` / `server_version`; crate TCP no-hub
+  covers Cake `tweaks.subscribe [0,1,false]`, `estimatefee` `-1.0`, and
+  empty histogram. Live `esplora_broadcast` pins `/block-height`,
+  `/block/:hash/header`, and `/tx` status/JSON (unknown OP_TRUE type).
+  Dispatch twins of those contracts are gone.
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep

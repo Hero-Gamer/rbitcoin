@@ -414,6 +414,69 @@ async fn pin_esplora_txid_raw_hex_merkleblock(
     assert_eq!(matches.len(), 1);
 }
 
+async fn pin_esplora_block_height_and_header(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    tip_height: u64,
+) {
+    let (st, body) = http_get(esplora_addr, &format!("/block-height/{tip_height}")).await;
+    assert_eq!(st, 200, "block-height: {body}");
+    assert_eq!(body.trim(), tip_hash, "{body}");
+    let (st, _) = http_get(esplora_addr, "/block-height/999").await;
+    assert_eq!(st, 404);
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/header")).await;
+    assert_eq!(st, 200, "header: {body}");
+    assert_eq!(body.trim().len(), 160, "{body}");
+    let miss = "ff".repeat(32);
+    let (st, _) = http_get(esplora_addr, &format!("/block/{miss}/header")).await;
+    assert_eq!(st, 404);
+}
+
+async fn pin_esplora_tx_status(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    cb_txid: &str,
+    tip_height: u64,
+) {
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/status")).await;
+    assert_eq!(st, 200, "tx status: {body}");
+    let stj: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(stj["confirmed"], true, "{body}");
+    assert_eq!(stj["block_height"], tip_height, "{body}");
+    assert_eq!(stj["block_hash"], tip_hash, "{body}");
+    assert!(stj.get("block_time").is_some(), "{body}");
+
+    let miss = "ff".repeat(32);
+    let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}/hex")).await;
+    assert_eq!(st, 404);
+    let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}/status")).await;
+    assert_eq!(st, 404);
+    let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}")).await;
+    assert_eq!(st, 404);
+}
+
+async fn pin_esplora_tx_json_unknown_coinbase(esplora_addr: SocketAddr, cb_txid: &str) {
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}")).await;
+    assert_eq!(st, 200, "tx json: {body}");
+    let full: Value = serde_json::from_str(&body).unwrap();
+    assert!(full.get("txid").is_some(), "{body}");
+    assert!(full.get("vin").is_some(), "{body}");
+    assert!(full.get("vout").is_some(), "{body}");
+    assert!(full.get("status").is_some(), "{body}");
+    assert_eq!(full["fee"], 0, "{body}");
+    let v0 = &full["vout"][0];
+    assert!(v0.get("scriptpubkey").is_some(), "{body}");
+    assert!(v0.get("scriptpubkey_asm").is_some(), "{body}");
+    assert_eq!(v0["scriptpubkey_type"], "unknown", "{body}");
+    assert!(
+        v0["scriptpubkey_asm"].as_str().unwrap().contains("OP_"),
+        "{body}"
+    );
+    assert_eq!(full["vin"][0]["is_coinbase"], true, "{body}");
+    assert!(full["vin"][0].get("scriptsig_asm").is_some(), "{body}");
+}
+
 async fn pin_esplora_scripthash_pages(esplora_addr: SocketAddr) {
     use rbitcoin_primitives::display_hash_hex;
     use rbitcoin_store::script_hash;
@@ -1303,6 +1366,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         .to_string();
     pin_esplora_block_json_raw_status(esplora_addr, new_hash, &parent_hash, 107, txs.len()).await;
     pin_esplora_txid_raw_hex_merkleblock(esplora_addr, new_hash, &cb_txid).await;
+    pin_esplora_block_height_and_header(esplora_addr, new_hash, 107).await;
+    pin_esplora_tx_status(esplora_addr, new_hash, &cb_txid, 107).await;
+    pin_esplora_tx_json_unknown_coinbase(esplora_addr, &cb_txid).await;
     pin_esplora_scripthash_pages(esplora_addr).await;
     let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
     let immature = Transaction {

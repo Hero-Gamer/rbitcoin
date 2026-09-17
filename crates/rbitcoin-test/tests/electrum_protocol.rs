@@ -348,6 +348,10 @@ async fn electrum_server_version_history_balance() {
         server.to_ascii_lowercase().contains("rbitcoin"),
         "version[0] must still identify rbitcoin, got {server:?}"
     );
+    assert!(
+        server.contains(env!("CARGO_PKG_VERSION")),
+        "version[0] must track workspace.package.version, got {server:?}"
+    );
 
     // OP_TRUE scripthash
     let sh_hex = electrum_scripthash_hex(&[0x51]);
@@ -466,6 +470,10 @@ async fn electrum_server_version_history_balance() {
     assert_eq!(v["result"]["silent_payments"], json!([0]));
     assert_eq!(v["result"]["tweaks"], json!(true));
     assert_eq!(v["result"]["asof"], json!(true));
+    assert_eq!(v["result"]["chain_tip"], json!(true));
+    assert_eq!(v["result"]["protocol_min"].as_str(), Some("1.4"));
+    assert_eq!(v["result"]["asof_protocol"].as_str(), Some("1.4.2-asof"));
+    assert_eq!(v["result"]["server_version"], ver[0]);
 
     let v = rpc(&mut stream, 5, "server.peers.subscribe", json!([])).await;
     assert_eq!(v["result"], json!([]));
