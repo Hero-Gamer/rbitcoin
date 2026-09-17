@@ -25,6 +25,24 @@ before 1.0).
 
 ### Changed
 
+- **IBD stamp skips header ensure when BQ carries `header_fk`:** header-sync
+  already stored the row. Load stamp uses the BQ fk/hash (store row must
+  match); hash mismatch is `BadBlock`. `ibd: perf` `header_skip=`. Packed
+  ins stay empty at stamp.
+
+- **Confirm size/weight is a sequential `header.body` rewrite:** contiguous
+  header-fk runs are one 96-byte-record write (`put_size_weight_run`), no
+  insert `put_lock`. Header-sync insert still stores zeros. `set_size_weight`
+  remains for query lazy-fill of leftover zeros.
+
+- **Class A loc rides on the InFlight `CreatePin` Arc:** write `set_loc`
+  after append; later-wave stamp binds spent/body from the pin (no disk
+  loc-by-fk on that path). A miss only when `create.loc.count()` already
+  covers the fk is `invariant: create.loc hole after count` (EngineFault).
+  EngineFault stamp fail reoffers the full batch and does not
+  `request_single_block` or rewind `lookup_taken_hi` (the 352k Cascade
+  isolate crawl).
+
 - **Sealed fuse8 mmap + no retained `open_keys`:** lookup maps every sealed
   `.fuse8` fingerprint array read-only (`fuse8=` heap **0** after
   `write_then_map` / `open_file`). Open OA is keyless; the seal sidecar

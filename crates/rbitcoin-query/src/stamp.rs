@@ -5,10 +5,9 @@
 //! One function for S0 plan (`archive_plan_batch_from_wire`) and plan=None
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
 //! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
-//! omitted from that skeleton; a later wave's TipOnly loc is adopted onto the
-//! in-flight identity so write ensure does not need RAM loc after prune.
-//! When TipOnly misses (lookup ahead of `tx.head`) and loc is already on disk,
-//! fill loc by fk onto that in-flight identity; miss is OK (same-wave).
+//! omitted from that skeleton. Class A `CreatePin::set_loc` after append;
+//! later-wave stamp reads pin loc. Disk loc-by-fk only if pin loc is unset
+//! (`create.loc.count() ≥ fk` and miss is a loc hole).
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -330,10 +329,10 @@ pub fn fill_missing_parent_ranges(
     Ok(())
 }
 
-/// Later-wave InFlight identity that TipOnly missed (`tx.head` lag): loc by fk.
+/// Disk loc-by-fk for InFlight identities that still lack spent (pin loc unset).
 ///
-/// Hit stamps spent so write ensure does not need RAM loc after prune. Miss is
-/// OK (same-wave, not on disk yet — write fill).
+/// Same-wave (`create.loc.count() < fk`) leaves spent unset (write fill).
+/// A miss when loc count already covers the fk is a loc hole.
 fn fill_inflight_spent_from_loc(
     store: &Store,
     in_flight: &InFlight,
