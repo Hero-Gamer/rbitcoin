@@ -726,6 +726,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
 
             if matches!(wake, TipFollowWake::Perf) {
+                if let Err(e) = mempool_blocking(&mempool, |mp| mp.persist_due()).await? {
+                    warn!("mempool persist_due: {e}");
+                }
                 let mp = mempool.sample_reset_perf();
                 let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
                 let (el_n, el_us, el_max) = rbitcoin_electrum::sample_reset_perf();

@@ -429,7 +429,12 @@ impl ActiveMempool {
 
     /// Best-effort sidecar persist of dirty accepts (no generation bump).
     pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
-        self.store.persist_if_dirty()
+        self.store.persist_due()
+    }
+
+    /// Time-based sidecar persist (5 s, no fsync). Body tail then slots.
+    pub fn persist_due(&mut self) -> Result<(), MempoolError> {
+        self.store.persist_due()
     }
 
     /// Compact durable storage (drop DEAD holes) and rebuild RAM graph.

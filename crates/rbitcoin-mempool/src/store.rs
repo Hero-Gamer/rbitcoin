@@ -20,6 +20,7 @@ use bitcoin::{Transaction, Txid};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// File magic: `rBMP` (rbitcoin mempool).
 pub const MEM_MAGIC: [u8; 4] = *b"rBMP";
@@ -57,13 +58,11 @@ pub struct MempoolMeta {
     pub live_count: u32,
 }
 
-/// Coalesce sidecar writes: flush RAM→disk after this many **body** ops (admits).
+/// Time-based sidecar persist interval (admits). Crash may lose ≤ this window.
 ///
-/// Crash may lose fewer than this many admits since the last persist (relay re-fetch).
-/// DEAD marks do not trip this — they leave `tx.body` unchanged and persist via
-/// [`Mempool::persist_if_dirty`] / [`Mempool::flush`] (block strip writes slots once).
-/// Structural ops (slot grow, compact) and [`Mempool::flush`] always persist.
-pub const PERSIST_COALESCE_OPS: u32 = 32;
+/// DEAD of an already-durable slot is an immediate `pwrite` (not this timer).
+/// Structural ops (slot grow, compact) and [`Mempool::flush`] persist immediately.
+pub const PERSIST_INTERVAL_MS: u64 = 5_000;
 
 /// Durable mempool under `dir` (`{datadir}/mempool`) — InRam buffers + file IO.
 pub struct Mempool {
@@ -78,11 +77,15 @@ pub struct Mempool {
     generation: u64,
     slot_cap: u32,
     live_count: u32,
-    /// Append/mark_dead ops since last sidecar persist.
-    dirty_ops: u32,
-    /// True when `tx.body` grew since last persist (admits). DEAD marks leave
-    /// body bytes unchanged and must not rewrite that file on the confirm path.
+    /// True when `tx.body` grew since last persist (admits).
     body_dirty: bool,
+    /// On-disk body length that slots may legally index (header + durable payloads).
+    body_persisted_len: u64,
+    opened: Instant,
+    mock_now_ms: Option<u64>,
+    last_persist_ms: u64,
+    /// Last `tx.body` write start offset (tests: incremental tail).
+    last_body_write_off: u64,
 }
 
 impl Mempool {
@@ -99,6 +102,7 @@ impl Mempool {
         let (meta_file, generation, slot_cap, live_count) = open_or_init_meta(&meta_path)?;
         let (slots_file, slots) = open_or_init_slots(&slots_path, slot_cap)?;
         let (body_file, body) = open_or_init_body(&body_path)?;
+        let body_persisted_len = body_logical_len(&body)? as u64;
 
         Ok(Self {
             dir,
@@ -110,8 +114,12 @@ impl Mempool {
             generation,
             slot_cap,
             live_count,
-            dirty_ops: 0,
             body_dirty: false,
+            body_persisted_len,
+            opened: Instant::now(),
+            mock_now_ms: None,
+            last_persist_ms: 0,
+            last_body_write_off: 0,
         })
     }
 
@@ -142,13 +150,12 @@ impl Mempool {
 
     /// Persist buffers, bump generation, and fsync sidecar files.
     ///
-    /// Accept path coalesces non-fsync writes ([`PERSIST_COALESCE_OPS`]); a crash
-    /// may lose admits since the last persist. [`Self::flush`] is the durable
-    /// checkpoint (generation + fsync).
+    /// Admits persist on [`Self::persist_due`] (5 s, no fsync). A crash may lose
+    /// admits since the last persist. [`Self::flush`] is the durable checkpoint
+    /// (generation + fsync). Body is written before LIVE slots.
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
-        self.persist_all()?;
-        self.clear_dirty();
+        self.persist_body_then_slots()?;
         self.meta_file
             .sync_data()
             .map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
@@ -161,42 +168,59 @@ impl Mempool {
         Ok(())
     }
 
-    /// Best-effort sidecar write if dirty (no generation bump / no fsync).
+    /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
     ///
-    /// Admits rewrite body+slots. DEAD-only dirt writes slots+meta (confirm
-    /// strip of thousands of txs must not dump `tx.body` per coalesce batch).
-    pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
-        if self.dirty_ops == 0 {
+    /// No fsync. Body tail first, then slots+meta. DEAD of durable slots is
+    /// [`Self::mark_slot_dead`], not this path.
+    pub fn persist_due(&mut self) -> Result<(), MempoolError> {
+        if !self.body_dirty {
             return Ok(());
         }
-        if self.body_dirty {
-            self.persist_all()?;
-        } else {
-            self.persist_slots_and_meta()?;
+        if self.now_ms().saturating_sub(self.last_persist_ms) < PERSIST_INTERVAL_MS {
+            return Ok(());
         }
-        self.clear_dirty();
-        Ok(())
+        self.persist_body_then_slots()
+    }
+
+    /// Best-effort alias of [`Self::persist_due`] (no generation bump / no fsync).
+    pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
+        self.persist_due()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.mock_now_ms
+            .unwrap_or_else(|| self.opened.elapsed().as_millis() as u64)
+    }
+
+    /// Test clock. Production uses [`Instant`] elapsed from open.
+    pub fn set_now_ms(&mut self, ms: u64) {
+        self.mock_now_ms = Some(ms);
+    }
+
+    pub fn body_persisted_len(&self) -> u64 {
+        self.body_persisted_len
+    }
+
+    pub fn last_body_write_off(&self) -> u64 {
+        self.last_body_write_off
     }
 
     fn clear_dirty(&mut self) {
-        self.dirty_ops = 0;
         self.body_dirty = false;
     }
 
-    fn note_dirty_op(&mut self) -> Result<(), MempoolError> {
-        self.dirty_ops = self.dirty_ops.saturating_add(1);
-        if self.body_dirty && self.dirty_ops >= PERSIST_COALESCE_OPS {
-            self.persist_all()?;
-            self.clear_dirty();
-        }
+    fn persist_body_then_slots(&mut self) -> Result<(), MempoolError> {
+        self.persist_body_tail()?;
+        self.persist_slots_and_meta()?;
+        self.clear_dirty();
+        self.last_persist_ms = self.now_ms();
         Ok(())
     }
 
     /// Append raw tx bytes + fee/weight prefix; mark a FREE slot LIVE.
     ///
     /// Returns the slot index. Updates `live_count` (not generation — call flush).
-    /// RAM is updated immediately; sidecar write is coalesced (see
-    /// [`PERSIST_COALESCE_OPS`]) unless this op trips the threshold.
+    /// RAM is updated immediately; sidecar write waits for [`Self::persist_due`].
     pub fn append_live_tx(
         &mut self,
         raw_tx: &[u8],
@@ -217,7 +241,6 @@ impl Mempool {
         self.write_slot(slot, SLOT_LIVE, body_off, payload_len as u32, txid)?;
         self.live_count = self.live_count.saturating_add(1);
         self.body_dirty = true;
-        self.note_dirty_op()?;
         Ok(slot)
     }
 
@@ -240,18 +263,39 @@ impl Mempool {
 
     /// Mark slot DEAD and decrement live_count (confirm / RBF / eviction).
     ///
-    /// Does not rewrite `tx.body` or trip [`PERSIST_COALESCE_OPS`]. Caller
-    /// [`Self::persist_if_dirty`] writes slots+meta once (block strip).
+    /// If the slot is already on disk, `pwrite` that one record to DEAD (and
+    /// meta live_count). An admit that was never durable stays RAM-only — crash
+    /// loses it; this path must not dump the full slot table (LIVE rows whose
+    /// body is still in the unpersisted tail).
     pub fn mark_slot_dead(&mut self, slot: u32) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
         }
         let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
-        if self.slots[off] == SLOT_LIVE {
-            self.slots[off] = SLOT_DEAD;
-            self.live_count = self.live_count.saturating_sub(1);
-            self.note_dirty_op()?;
+        if self.slots[off] != SLOT_LIVE {
+            return Ok(());
         }
+        let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+        let body_len =
+            u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+        self.slots[off] = SLOT_DEAD;
+        self.live_count = self.live_count.saturating_sub(1);
+        if body_off.saturating_add(body_len) <= self.body_persisted_len {
+            self.pwrite_slot_status(slot, SLOT_DEAD)?;
+            self.persist_meta()?;
+        }
+        Ok(())
+    }
+
+    fn pwrite_slot_status(&mut self, slot: u32, status: u8) -> Result<(), MempoolError> {
+        let path = self.dir.join("slots");
+        let off = (SLOTS_HEADER + (slot as usize) * SLOT_REC) as u64;
+        self.slots_file
+            .seek(SeekFrom::Start(off))
+            .map_err(|e| MempoolError::io(&path, e))?;
+        self.slots_file
+            .write_all(&[status])
+            .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
 
@@ -278,11 +322,11 @@ impl Mempool {
 
     /// Rewrite body/slots to contain only LIVE payloads packed from the header.
     ///
-    /// Returns `(live_after, body_bytes_after)`. Callers must rebuild RAM indexes
-    /// with the new slot numbers from [`load_live_txs`].
+    /// Copies existing packed payload ranges (does not re-serialize). Returns
+    /// `(live_after, body_bytes_after)`. Callers must rebuild RAM indexes with
+    /// the new slot numbers from [`load_live_txs`].
     pub fn compact(&mut self) -> Result<(u32, usize), MempoolError> {
-        let live = self.load_live_txs()?;
-
+        let logical = body_logical_len(&self.body)?;
         let mut new_body = vec![0u8; BODY_HEADER];
         new_body[0..4].copy_from_slice(&MEM_MAGIC);
         new_body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
@@ -292,29 +336,37 @@ impl Mempool {
         new_slots[8..12].copy_from_slice(&self.slot_cap.to_le_bytes());
 
         let mut next_slot = 0u32;
-        for (_old_slot, fee_sat, weight, tx) in &live {
-            let raw = bitcoin::consensus::encode::serialize(tx);
-            let payload_len = BODY_TX_PREFIX + raw.len();
-            let body_off = new_body.len() as u64;
-            new_body.extend_from_slice(&fee_sat.to_le_bytes());
-            new_body.extend_from_slice(&weight.to_le_bytes());
-            new_body.extend_from_slice(&raw);
-            let off = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
-            new_slots[off] = SLOT_LIVE;
-            new_slots[off + 4..off + 12].copy_from_slice(&body_off.to_le_bytes());
-            new_slots[off + 12..off + 16].copy_from_slice(&(payload_len as u32).to_le_bytes());
-            new_slots[off + 16..off + 48].copy_from_slice(tx.compute_txid().as_byte_array());
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let body_len =
+                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
+            if body_off as usize + body_len > logical || body_len < BODY_TX_PREFIX {
+                return Err(MempoolError::Corrupt("live slot body range"));
+            }
+            let start = body_off as usize;
+            let payload = self.body[start..start + body_len].to_vec();
+            let new_off = new_body.len() as u64;
+            new_body.extend_from_slice(&payload);
+            let dst = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
+            new_slots[dst] = SLOT_LIVE;
+            new_slots[dst + 4..dst + 12].copy_from_slice(&new_off.to_le_bytes());
+            new_slots[dst + 12..dst + 16].copy_from_slice(&(body_len as u32).to_le_bytes());
+            new_slots[dst + 16..dst + 48].copy_from_slice(&self.slots[off + 16..off + 48]);
             next_slot += 1;
         }
-        let logical = new_body.len();
-        new_body[8..16].copy_from_slice(&(logical as u64).to_le_bytes());
+        let packed_len = new_body.len();
+        new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
 
         self.body = new_body;
         self.slots = new_slots;
         self.live_count = next_slot;
         self.install_packed_images()?;
         self.clear_dirty();
-        Ok((self.live_count, logical))
+        Ok((self.live_count, packed_len))
     }
 
     /// Load all LIVE txs from slots/body for graph rebuild.
@@ -387,8 +439,7 @@ impl Mempool {
         self.slots.resize(need, 0);
         self.slots[8..12].copy_from_slice(&new_cap.to_le_bytes());
         self.slot_cap = new_cap;
-        self.persist_all()?;
-        self.clear_dirty();
+        self.persist_body_then_slots()?;
         rbitcoin_log::info!(
             "mempool: grew slot table {old_cap} → {new_cap} (live={})",
             self.live_count
@@ -425,42 +476,99 @@ impl Mempool {
         Ok(logical as u64)
     }
 
-    /// Write body, then LIVE slots, then meta (no fsync).
+    /// Write the dirty body tail, then LIVE slots, then meta (no fsync).
     ///
     /// Append-safe: a crash after a grown body and before new slots loses admits;
     /// old LIVE ranges stay a prefix of the new body. Packed compact must not
     /// use this order (see [`Self::install_packed_images`]).
-    fn persist_all(&mut self) -> Result<(), MempoolError> {
+    fn persist_body_tail(&mut self) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
-
-        let logical = body_logical_len(&self.body)?;
+        let logical = body_logical_len(&self.body)? as u64;
+        let start = self.body_persisted_len.min(logical);
+        self.last_body_write_off = start;
+        if start < BODY_HEADER as u64 {
+            self.body_file
+                .seek(SeekFrom::Start(0))
+                .map_err(|e| MempoolError::io(&body_path, e))?;
+            self.body_file
+                .write_all(&self.body[..logical as usize])
+                .map_err(|e| MempoolError::io(&body_path, e))?;
+        } else {
+            if start > BODY_HEADER as u64 || logical != start {
+                self.body_file
+                    .seek(SeekFrom::Start(8))
+                    .map_err(|e| MempoolError::io(&body_path, e))?;
+                self.body_file
+                    .write_all(&self.body[8..16])
+                    .map_err(|e| MempoolError::io(&body_path, e))?;
+            }
+            if logical > start {
+                self.body_file
+                    .seek(SeekFrom::Start(start))
+                    .map_err(|e| MempoolError::io(&body_path, e))?;
+                self.body_file
+                    .write_all(&self.body[start as usize..logical as usize])
+                    .map_err(|e| MempoolError::io(&body_path, e))?;
+            }
+        }
         self.body_file
-            .set_len(logical as u64)
+            .set_len(logical)
             .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.body_file
-            .write_all(&self.body[..logical])
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-
-        self.persist_slots_and_meta()
+        self.body_persisted_len = logical;
+        Ok(())
     }
 
-    /// Slots + live_count only. DEAD marks do not change `tx.body`.
+    /// Slots + live_count. LIVE rows whose body is not yet durable are written
+    /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
         let slots_path = self.dir.join("slots");
-        let slots_need = self.slots.len() as u64;
-        self.slots_file
-            .set_len(slots_need)
-            .map_err(|e| MempoolError::io(&slots_path, e))?;
-        self.slots_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| MempoolError::io(&slots_path, e))?;
-        self.slots_file
-            .write_all(&self.slots)
-            .map_err(|e| MempoolError::io(&slots_path, e))?;
+        if let Some(disk) = self.demoted_slots_image() {
+            self.write_slots_bytes(&slots_path, &disk)?;
+        } else {
+            let buf = std::mem::take(&mut self.slots);
+            let w = Self::write_slots_file(&mut self.slots_file, &slots_path, &buf);
+            self.slots = buf;
+            w?;
+        }
         self.persist_meta()
+    }
+
+    fn write_slots_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
+        Self::write_slots_file(&mut self.slots_file, path, bytes)
+    }
+
+    fn write_slots_file(file: &mut File, path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
+        file.set_len(bytes.len() as u64)
+            .map_err(|e| MempoolError::io(path, e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| MempoolError::io(path, e))?;
+        file.write_all(bytes)
+            .map_err(|e| MempoolError::io(path, e))?;
+        Ok(())
+    }
+
+    fn demoted_slots_image(&self) -> Option<Vec<u8>> {
+        let mut disk = None;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let body_len =
+                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            if body_off.saturating_add(body_len) > self.body_persisted_len {
+                let img = disk.get_or_insert_with(|| self.slots.clone());
+                img[off] = SLOT_FREE;
+            }
+        }
+        disk
+    }
+
+    /// Test pin: write slots without a prior body tail. Must not introduce
+    /// LIVE offsets ≥ [`Self::body_persisted_len`].
+    pub fn persist_slots_without_body(&mut self) -> Result<(), MempoolError> {
+        self.persist_slots_and_meta()
     }
 
     fn persist_meta(&mut self) -> Result<(), MempoolError> {
@@ -493,6 +601,8 @@ impl Mempool {
         fs::rename(&body_tmp, &body_path).map_err(|e| MempoolError::io(&body_path, e))?;
         fs::rename(&slots_tmp, &slots_path).map_err(|e| MempoolError::io(&slots_path, e))?;
         self.reopen_body_slots()?;
+        self.body_persisted_len = logical as u64;
+        self.last_persist_ms = self.now_ms();
         self.persist_meta()
     }
 
@@ -744,82 +854,118 @@ mod tests {
     }
 
     #[test]
-    fn append_coalesces_persist_until_threshold() {
+    fn persist_due_waits_five_seconds() {
         let dir = tmp_dir();
         {
             let mut mp = Mempool::open_or_create(&dir).unwrap();
+            mp.set_now_ms(0);
             let tid = Txid::from_byte_array([0x22; 32]);
             mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
                 .unwrap();
+            mp.persist_due().unwrap();
             assert_eq!(mp.live_count(), 1);
-            // Dirty but under coalesce threshold — drop without flush.
         }
         {
             let mp = Mempool::open_or_create(&dir).unwrap();
-            // Unpersisted admit is not durable.
-            assert_eq!(mp.live_count(), 0);
+            assert_eq!(mp.live_count(), 0, "admit at t=0 is not durable");
         }
         {
             let mut mp = Mempool::open_or_create(&dir).unwrap();
-            for i in 0..PERSIST_COALESCE_OPS {
-                let mut id = [0u8; 32];
-                id[0] = i as u8;
-                id[1] = (i >> 8) as u8;
-                let tid = Txid::from_byte_array(id);
-                mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
-                    .unwrap();
-            }
-            assert_eq!(mp.live_count(), PERSIST_COALESCE_OPS);
-            // Threshold trip persisted without flush.
+            mp.set_now_ms(0);
+            let tid = Txid::from_byte_array([0x33; 32]);
+            mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                .unwrap();
+            mp.set_now_ms(PERSIST_INTERVAL_MS);
+            mp.persist_due().unwrap();
         }
         {
             let mp = Mempool::open_or_create(&dir).unwrap();
-            assert_eq!(mp.live_count(), PERSIST_COALESCE_OPS);
+            assert_eq!(mp.live_count(), 1, "persist_due after 5s is durable");
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn mark_dead_does_not_coalesce_persist() {
+    fn dead_pwrite_of_flushed_slot_is_immediate() {
         let dir = tmp_dir();
-        let n = PERSIST_COALESCE_OPS + 8;
-        let mut slots = Vec::with_capacity(n as usize);
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let tid = Txid::from_byte_array([0x11; 32]);
+        let slot = mp
+            .append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+            .unwrap();
+        mp.flush().unwrap();
+        let body_before = fs::read(dir.join("tx.body")).unwrap();
+        mp.mark_slot_dead(slot).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        let body_after = fs::read(dir.join("tx.body")).unwrap();
+        assert_eq!(
+            body_before, body_after,
+            "DEAD pwrite must not rewrite tx.body"
+        );
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(
+            mp.live_count(),
+            0,
+            "DEAD of a flushed slot is durable without 5s"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dead_of_unpersisted_admit_does_not_resurrect() {
+        let dir = tmp_dir();
         {
             let mut mp = Mempool::open_or_create(&dir).unwrap();
-            for i in 0..n {
-                let mut id = [0u8; 32];
-                id[0] = i as u8;
-                id[1] = (i >> 8) as u8;
-                let tid = Txid::from_byte_array(id);
-                slots.push(
-                    mp.append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
-                        .unwrap(),
-                );
-            }
-            mp.flush().unwrap();
-            assert_eq!(mp.live_count(), n);
-            for slot in &slots {
-                mp.mark_slot_dead(*slot).unwrap();
-            }
-            assert_eq!(mp.live_count(), 0);
+            mp.set_now_ms(0);
+            let tid = Txid::from_byte_array([0x44; 32]);
+            let slot = mp
+                .append_live_tx(&[0x01, 0x00, 0x00, 0x00], &tid, 1, 400)
+                .unwrap();
+            mp.mark_slot_dead(slot).unwrap();
+            mp.persist_slots_without_body().unwrap();
         }
         {
             let mp = Mempool::open_or_create(&dir).unwrap();
-            assert_eq!(
-                mp.live_count(),
-                n,
-                "DEAD marks must not trip persist_all coalesce (body unchanged)"
+            assert_eq!(mp.live_count(), 0);
+            assert!(
+                mp.load_live_txs().unwrap().is_empty(),
+                "unpersisted admit DEAD must not resurrect"
             );
         }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn persist_slots_without_tail_does_not_point_live_past_body() {
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let raw = tiny_raw();
+        let t1 = Txid::from_byte_array([0x01; 32]);
+        mp.append_live_tx(&raw, &t1, 1, 400).unwrap();
+        let persisted = mp.body_persisted_len();
+        mp.persist_slots_without_body().unwrap();
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        let live = mp
+            .load_live_txs()
+            .expect("FREE-not-LIVE past EOF must load");
+        assert!(
+            live.is_empty(),
+            "LIVE must not be written past body_persisted_len={persisted}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn persist_deaths_writes_slots_not_body() {
         let dir = tmp_dir();
-        let n = PERSIST_COALESCE_OPS + 8;
+        let n = 8u32;
         let mut slots = Vec::with_capacity(n as usize);
         let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
         for i in 0..n {
             let mut id = [0u8; 32];
             id[0] = i as u8;
@@ -844,6 +990,39 @@ mod tests {
         drop(mp);
         let mp = Mempool::open_or_create(&dir).unwrap();
         assert_eq!(mp.live_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_body_persist_writes_only_dirty_tail() {
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let raw = tiny_raw();
+        let t1 = Txid::from_byte_array([0x01; 32]);
+        mp.append_live_tx(&raw, &t1, 1, 400).unwrap();
+        mp.set_now_ms(PERSIST_INTERVAL_MS);
+        mp.persist_due().unwrap();
+        let first_end = mp.body_persisted_len();
+        let body_after_first = fs::read(dir.join("tx.body")).unwrap();
+        let t2 = Txid::from_byte_array([0x02; 32]);
+        mp.append_live_tx(&raw, &t2, 2, 400).unwrap();
+        mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
+        mp.persist_due().unwrap();
+        assert_eq!(
+            mp.last_body_write_off(),
+            first_end,
+            "second persist must start at the first payload's end"
+        );
+        let body_after_second = fs::read(dir.join("tx.body")).unwrap();
+        assert_eq!(
+            &body_after_second[BODY_HEADER..first_end as usize],
+            &body_after_first[BODY_HEADER..],
+            "first payload bytes must be unchanged"
+        );
+        drop(mp);
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.load_live_txs().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -890,8 +1069,7 @@ mod tests {
         let (free, live, dead) = mp.slot_stats();
         assert_eq!(live, 1);
         assert!(free + live + dead >= 1);
-        // Coalesced persist: force sidecar write before reopen.
-        mp.persist_if_dirty().unwrap();
+        mp.flush().unwrap();
         drop(mp);
         let mut mp = Mempool::open_or_create(&dir).unwrap();
         assert_eq!(mp.live_count(), 1);

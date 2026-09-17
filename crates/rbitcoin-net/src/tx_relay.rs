@@ -1150,6 +1150,13 @@ impl MempoolHub {
             .map_err(|e| format!("mempool flush: {e}"))
     }
 
+    /// Time-based sidecar persist (5 s, no fsync). No-op when clean or too soon.
+    pub fn persist_due(&self) -> Result<(), String> {
+        self.lock_write()
+            .persist_due()
+            .map_err(|e| format!("mempool persist: {e}"))
+    }
+
     pub fn contains(&self, txid: &Txid) -> bool {
         self.lock_read().graph.contains(txid)
     }
