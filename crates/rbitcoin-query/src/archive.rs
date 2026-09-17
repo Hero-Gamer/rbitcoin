@@ -1068,15 +1068,13 @@ impl Query {
             if plan.per_header_sw.len() != plan.per_header_ranges.len() {
                 return Err(StoreError::Corrupt("invariant: header size/weight length"));
             }
-            for (&(hfk, _, _), &(size, weight)) in
-                plan.per_header_ranges.iter().zip(plan.per_header_sw.iter())
-            {
-                match self.store.headers.set_size_weight(hfk, size, weight) {
-                    Ok(()) => {}
-                    Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
-                    Err(e) => return Err(e),
-                }
-            }
+            let rows: Vec<(Fk, u32, u32)> = plan
+                .per_header_ranges
+                .iter()
+                .zip(plan.per_header_sw.iter())
+                .map(|(&(hfk, _, _), &(size, weight))| (hfk, size, weight))
+                .collect();
+            self.store.headers.put_size_weight_run(&rows)?;
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
