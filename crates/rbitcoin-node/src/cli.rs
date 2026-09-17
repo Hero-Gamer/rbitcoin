@@ -261,11 +261,7 @@ where
                 }
             }
             Err(e) => {
-                match &e {
-                    crate::error::NodeError::FutureTip => eprintln!("{e}"),
-                    crate::error::NodeError::Locked(_) => eprintln!("Error: {e}"),
-                    _ => error!("{e}"),
-                }
+                print_run_err(&e);
                 ExitCode::FAILURE
             }
         }
@@ -280,11 +276,7 @@ where
         let code = match rt.block_on(run_p2p(config)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                match &e {
-                    crate::error::NodeError::FutureTip => eprintln!("{e}"),
-                    crate::error::NodeError::Locked(_) => eprintln!("Error: {e}"),
-                    _ => error!("{e}"),
-                }
+                print_run_err(&e);
                 ExitCode::FAILURE
             }
         };
@@ -324,7 +316,7 @@ Check-blocks: --check-blocks N revalidates the last N confirmed heights on open 
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
-  --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …).\n\
+  --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora; both require it.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
@@ -450,6 +442,14 @@ fn parse_cli_flag(
         next
     };
     Ok(Some((key, val)))
+}
+
+fn print_run_err(e: &crate::error::NodeError) {
+    match e {
+        crate::error::NodeError::FutureTip => eprintln!("{e}"),
+        crate::error::NodeError::Locked(_) => eprintln!("Error: {e}"),
+        _ => error!("{e}"),
+    }
 }
 
 fn cli_apply_err(e: crate::error::NodeError) -> ExitCode {

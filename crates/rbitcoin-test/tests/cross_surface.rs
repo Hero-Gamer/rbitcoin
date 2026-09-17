@@ -452,7 +452,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let (coinbase_txid, rpc_cb, pkg_cb, exact_cb, chain_cb, cpfp_cb, relay_cb) = {
+    let (coinbase_txid, rpc_cb, pkg_cb, exact_cb, chain_cb, cpfp_cb, relay_cb, rpc_cpfp_cb) = {
         let q = Query::open_or_create_tiny(td.store_path()).unwrap();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
         let (_tip, _time, cbs) = pad_empty_from(
@@ -461,11 +461,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             genesis.block_hash(),
             genesis.header.time,
             1,
-            105,
-            7,
+            106,
+            8,
         );
         q.flush().unwrap();
-        (cbs[0], cbs[1], cbs[2], cbs[3], cbs[4], cbs[5], cbs[6])
+        (
+            cbs[0], cbs[1], cbs[2], cbs[3], cbs[4], cbs[5], cbs[6], cbs[7],
+        )
     };
 
     let electrum_addr = ephemeral_addr();
@@ -1194,6 +1196,35 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert!(
         again_row.get("error").is_none(),
         "already-in-mempool must not error: {again}"
+    );
+
+    let rpc_cpfp_parent = acs_spend(
+        rpc_cpfp_cb,
+        50_0000_0000,
+        1,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let rpc_cpfp_child = acs_spend(
+        rpc_cpfp_parent.compute_txid(),
+        50_0000_0000 - 1,
+        50_000,
+        ScriptBuf::from_bytes(vec![0x64]),
+    );
+    let rpc_cpfp = jsonrpc(
+        rpc_addr,
+        "submitpackage",
+        json!([[encode_tx(&rpc_cpfp_parent), encode_tx(&rpc_cpfp_child)]]),
+    )
+    .await;
+    assert_eq!(
+        rpc_cpfp["result"]["package_msg"], "success",
+        "RPC submitpackage CPFP: {rpc_cpfp}"
+    );
+    let mem = jsonrpc(rpc_addr, "getrawmempool", json!([])).await;
+    assert!(
+        mempool_has(&mem, &rpc_cpfp_parent.compute_txid().to_string())
+            && mempool_has(&mem, &rpc_cpfp_child.compute_txid().to_string()),
+        "submitpackage CPFP missing members: {mem}"
     );
 
     let n26 = jsonrpc(

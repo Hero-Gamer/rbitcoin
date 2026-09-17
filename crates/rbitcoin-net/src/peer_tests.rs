@@ -3581,9 +3581,9 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
         };
         let sess = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
         if via_cidr {
-            assert!(sess.has_net_perm("forcerelay"));
+            assert!(sess.has_net_perm(crate::NetPermissionFlags::FORCE_RELAY));
         } else {
-            assert!(!sess.has_net_perm("forcerelay"));
+            assert!(!sess.has_net_perm(crate::NetPermissionFlags::FORCE_RELAY));
             assert!(sess.session_forcerelay());
         }
 

@@ -5,8 +5,6 @@ use crate::error::NodeError;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 
 /// Held exclusive `.lock` files. Dropping releases the flock.
 #[derive(Debug)]
@@ -96,6 +94,7 @@ fn try_exclusive(file: &File) -> Result<(), LockBusy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> PathBuf {

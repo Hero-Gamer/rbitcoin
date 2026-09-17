@@ -219,6 +219,25 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
 /// Cap for Esplora `/mempool/recent` (newest accepts, process-local).
 pub const MEMPOOL_RECENT_CAP: usize = 32;
 
+fn package_rpc_retry(e: &AcceptError) -> bool {
+    matches!(
+        e,
+        AcceptError::Orphaned { .. } | AcceptError::Policy("min relay fee")
+    )
+}
+
+fn is_hard_recent_reject(e: &AcceptError) -> bool {
+    !matches!(
+        e,
+        AcceptError::Duplicate(_)
+            | AcceptError::Orphaned { .. }
+            | AcceptError::Policy("mempool full")
+            | AcceptError::Policy("min relay fee")
+            | AcceptError::RbfInsufficient
+            | AcceptError::ClusterTooLarge { .. }
+    )
+}
+
 /// One recently accepted mempool tx (for explorer "recent" strips).
 #[derive(Clone, Debug)]
 pub struct RecentAccept {
@@ -1372,8 +1391,15 @@ impl MempoolHub {
 
     /// Remember confirmed bodies for INV AlreadyHave (txid + wtxid).
     pub(crate) fn note_recent_confirmed(&self, txs: &[Transaction]) {
+        self.clear_recent_rejects();
         if let Ok(mut r) = self.recent_confirmed.lock() {
             r.note_block(txs);
+        }
+    }
+
+    pub(crate) fn clear_recent_rejects(&self) {
+        if let Ok(mut g) = self.recent_rejects.lock() {
+            g.clear();
         }
     }
 
@@ -1669,13 +1695,7 @@ impl MempoolHub {
     }
 
     fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
-        let soft = matches!(
-            e,
-            AcceptError::Duplicate(_)
-                | AcceptError::Orphaned { .. }
-                | AcceptError::Policy("mempool full")
-        );
-        if !soft {
+        if is_hard_recent_reject(e) {
             self.note_recent_reject(tx.compute_wtxid());
         }
         if let Some(rec) = rbitcoin_mempool::ActiveMempool::accept_failure_record(tx, e) {
@@ -2660,12 +2680,49 @@ impl MempoolHub {
         self.lock_read().graph.conflict_txid(op)
     }
 
-    /// Sequential submitpackage: keep successes, report per-tx errors. No rollback.
+    /// Sequential submitpackage: keep successes, then package-evaluate
+    /// min-relay / missing-input remainders (Core `AcceptPackage`).
     pub fn submit_package_rpc(
         &self,
         txs: &[Transaction],
     ) -> Vec<Result<AcceptResult, AcceptError>> {
-        txs.iter().map(|tx| self.accept_tx(tx)).collect()
+        let mut out: Vec<Result<AcceptResult, AcceptError>> =
+            txs.iter().map(|tx| self.accept_tx(tx)).collect();
+        let rest: Vec<Transaction> = txs
+            .iter()
+            .zip(out.iter())
+            .filter(|(tx, r)| {
+                r.as_ref().err().is_some_and(package_rpc_retry)
+                    && !self.contains(&tx.compute_txid())
+            })
+            .map(|(tx, _)| tx.clone())
+            .collect();
+        if rest.len() >= 2 {
+            let _ = self.accept_package(&rest);
+        }
+        for (tx, slot) in txs.iter().zip(out.iter_mut()) {
+            if slot.is_ok() {
+                continue;
+            }
+            if let Some(ok) = self.live_accept_result(&tx.compute_txid()) {
+                *slot = Ok(ok);
+            }
+        }
+        out
+    }
+
+    fn live_accept_result(&self, txid: &Txid) -> Option<AcceptResult> {
+        let g = self.lock_read();
+        let e = g.graph.get(txid)?;
+        Some(AcceptResult {
+            txid: e.txid,
+            fee_sat: e.fee_sat,
+            weight: e.weight,
+            slot: e.slot,
+            replaced: Vec::new(),
+            replaced_scripthashes: Vec::new(),
+            replaced_txs: Vec::new(),
+        })
     }
 
     #[allow(clippy::type_complexity)] // packed row / pin / script-hash tuple is the on-disk shape
@@ -4227,6 +4284,115 @@ mod tests {
             "package member missing parent: {err}"
         );
         assert_eq!(hub.orphan_count(), 0, "accept_package must not park");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    fn pad_one_cb() -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _t, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            101,
+            1,
+        );
+        (store_dir, Arc::new(q), cbs)
+    }
+
+    #[test]
+    fn submit_package_rpc_admits_cpfp_below_minrelay() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(
+            matches!(
+                hub.accept_tx(&parent),
+                Err(AcceptError::Policy("min relay fee"))
+            ),
+            "parent must fail min-relay alone"
+        );
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
+            }],
+        };
+        let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+        assert!(
+            rows.iter().all(|r| r.is_ok()),
+            "below-min-relay parent + paying child must admit, got {rows:?}"
+        );
+        assert!(hub.try_contains(&parent.compute_txid()));
+        assert!(hub.try_contains(&child.compute_txid()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn recent_rejects_skip_min_relay_and_clear_on_tip() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let cheap = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(matches!(
+            hub.accept_tx(&cheap),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        assert!(
+            !hub.try_recent_reject(&cheap.compute_wtxid()),
+            "min-relay is reconsiderable; must not skip a later ATMP"
+        );
+
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(matches!(
+            hub.accept_tx(&coinbase),
+            Err(AcceptError::Coinbase)
+        ));
+        assert!(
+            hub.try_recent_reject(&coinbase.compute_wtxid()),
+            "hard reject must land in recent_rejects"
+        );
+        hub.note_recent_confirmed(&[]);
+        assert!(
+            !hub.try_recent_reject(&coinbase.compute_wtxid()),
+            "tip connect must forget recent_rejects"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

@@ -521,14 +521,6 @@ impl ChainHub {
         parent_h.saturating_add(1) > tip.saturating_add(HeldBodies::STALE_BELOW)
     }
 
-    /// Unrequested body whose header-path work is strictly below the tip.
-    pub fn unrequested_weaker_than_tip(&self, header: &Header) -> bool {
-        let Ok(tip) = self.chain_work() else {
-            return false;
-        };
-        crate::most_work::work_better(tip, self.work_with_header(header))
-    }
-
     /// True when connecting `header` would still be below `-minimumchainwork`.
     pub fn header_below_minwork(&self, header: &Header) -> bool {
         let Some(min) = self.min_chain_work_floor() else {
@@ -1582,6 +1574,7 @@ impl ChainHub {
         need_meta: &[(u32, BlockHash)],
     ) -> Result<(), NetError> {
         if let Some(mp) = self.mempool() {
+            mp.clear_recent_rejects();
             if mp.relay_enabled() {
                 for &(_height, hash) in need_meta {
                     if let Ok(Some(block)) =
@@ -2570,6 +2563,7 @@ impl ChainHub {
         self.header_tips.write().unwrap().remove(&hash);
         let t_mp = std::time::Instant::now();
         if let Some(mp) = self.mempool() {
+            mp.clear_recent_rejects();
             if mp.relay_enabled() {
                 mp.note_recent_confirmed(&block.txdata);
             }
@@ -3649,7 +3643,10 @@ mod tests {
         hub.accept_block(b2.clone()).unwrap();
         let fork = mine(gen, 1_300_000_200, 1);
         assert!(
-            hub.unrequested_weaker_than_tip(&fork.header),
+            crate::most_work::work_better(
+                hub.chain_work().unwrap(),
+                hub.work_with_header(&fork.header)
+            ),
             "genesis-fork at height 1 is weaker than tip 2"
         );
         let _ = std::fs::remove_dir_all(dir);

@@ -1,6 +1,6 @@
 //! Core v31.1 `NetPermissions` (`net_permissions.cpp` / `.h`).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Core `NetPermissionFlags` bits (multiflags include their implied bits).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,24 +79,44 @@ impl std::ops::BitOrAssign for NetPermissionFlags {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Subnet {
-    addr: Ipv4Addr,
-    prefix: u8,
+pub enum Subnet {
+    V4 { addr: Ipv4Addr, prefix: u8 },
+    V6 { addr: Ipv6Addr, prefix: u8 },
 }
 
 impl Subnet {
     pub fn contains(self, ip: IpAddr) -> bool {
-        let IpAddr::V4(v4) = ip else {
-            return false;
-        };
-        let mask = if self.prefix == 0 {
-            0
-        } else if self.prefix >= 32 {
-            u32::MAX
-        } else {
-            !((1u32 << (32 - self.prefix)) - 1)
-        };
-        u32::from(v4) & mask == u32::from(self.addr) & mask
+        match (self, ip) {
+            (Self::V4 { addr, prefix }, IpAddr::V4(v4)) => {
+                let mask = ipv4_mask(prefix);
+                u32::from(v4) & mask == u32::from(addr) & mask
+            }
+            (Self::V6 { addr, prefix }, IpAddr::V6(v6)) => {
+                let mask = ipv6_mask(prefix);
+                u128::from(v6) & mask == u128::from(addr) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else if prefix >= 32 {
+        u32::MAX
+    } else {
+        !((1u32 << (32 - prefix)) - 1)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else if prefix >= 128 {
+        u128::MAX
+    } else {
+        !((1u128 << (128 - prefix)) - 1)
     }
 }
 
@@ -196,29 +216,39 @@ fn parse_permission_flags(s: &str, allow_out: bool) -> Result<ParsedFlags, Strin
 }
 
 fn parse_subnet(net: &str) -> Result<Subnet, String> {
-    if net.contains(':') {
-        return Err(format!(
-            "Invalid netmask specified in --net-permission: '{net}'"
-        ));
-    }
-    let (host, prefix) = match net.split_once('/') {
-        Some((h, p)) => {
-            let n: u8 = p
-                .parse()
-                .map_err(|_| format!("Invalid netmask specified in --net-permission: '{net}'"))?;
-            if n > 32 {
-                return Err(format!(
-                    "Invalid netmask specified in --net-permission: '{net}'"
-                ));
-            }
-            (h, n)
-        }
-        None => (net, 32),
+    let err = || format!("Invalid netmask specified in --net-permission: '{net}'");
+    let (host_raw, prefix_s) = match net.rsplit_once('/') {
+        Some((h, p)) => (h, Some(p)),
+        None => (net, None),
     };
-    let addr: Ipv4Addr = host
-        .parse()
-        .map_err(|_| format!("Invalid netmask specified in --net-permission: '{net}'"))?;
-    Ok(Subnet { addr, prefix })
+    let host = host_raw.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+        let prefix = match prefix_s {
+            None => 32,
+            Some(p) => {
+                let n: u8 = p.parse().map_err(|_| err())?;
+                if n > 32 {
+                    return Err(err());
+                }
+                n
+            }
+        };
+        return Ok(Subnet::V4 { addr, prefix });
+    }
+    if let Ok(addr) = host.parse::<Ipv6Addr>() {
+        let prefix = match prefix_s {
+            None => 128,
+            Some(p) => {
+                let n: u8 = p.parse().map_err(|_| err())?;
+                if n > 128 {
+                    return Err(err());
+                }
+                n
+            }
+        };
+        return Ok(Subnet::V6 { addr, prefix });
+    }
+    Err(err())
 }
 
 pub fn parse_whitelist(s: &str) -> Result<WhitelistGrant, String> {
@@ -469,6 +499,24 @@ mod tests {
         let err = parse_whitelist("noban@127.0.0.1/33").unwrap_err();
         assert!(err.contains("Invalid netmask specified in"), "{err}");
         let err = parse_whitelist("noban@127.0.0.1/nope").unwrap_err();
+        assert!(err.contains("Invalid netmask specified in"), "{err}");
+    }
+
+    #[test]
+    fn ipv6_cidr_matches_only_v6() {
+        let g = parse_whitelist("noban@::1").unwrap();
+        assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        assert!(!g.subnet.contains(ip()));
+        let g = parse_whitelist("noban@2001:db8::/32").unwrap();
+        assert!(g
+            .subnet
+            .contains(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        assert!(!g
+            .subnet
+            .contains(IpAddr::V6("2001:db9::1".parse().unwrap())));
+        let g = parse_whitelist("noban@[::1]/128").unwrap();
+        assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        let err = parse_whitelist("noban@::1/129").unwrap_err();
         assert!(err.contains("Invalid netmask specified in"), "{err}");
     }
 

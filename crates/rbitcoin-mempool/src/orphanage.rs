@@ -95,11 +95,6 @@ impl Orphanage {
         self.by_txid.values().map(|e| &e.tx)
     }
 
-    /// Insert orphan waiting on `missing` parent txids. Returns true if newly stored.
-    pub fn insert(&mut self, tx: Transaction, missing: BTreeSet<Txid>) -> bool {
-        self.insert_from(tx, missing, None)
-    }
-
     /// Insert (or add `from` as announcer if already parked).
     pub fn insert_from(
         &mut self,
@@ -334,7 +329,7 @@ mod tests {
         let mut miss = BTreeSet::new();
         miss.insert(p);
         let wtxid = tx.compute_wtxid();
-        assert!(o.insert(tx, miss));
+        assert!(o.insert_from(tx, miss, None));
         assert!(o.contains(&tid));
         assert!(o.contains_wtxid(&wtxid));
         assert_eq!(o.missing_of(&tid).map(|s| s.len()), Some(1));
@@ -353,7 +348,7 @@ mod tests {
             let tx = make_orphan(p, i + 1);
             let mut miss = BTreeSet::new();
             miss.insert(p);
-            o.insert(tx, miss);
+            o.insert_from(tx, miss, None);
         }
         assert!(o.len() <= 2);
         assert!(o.total_weight() <= DEFAULT_ORPHAN_MAX_WEIGHT);
@@ -376,12 +371,11 @@ mod tests {
         let p = txid_n(3);
         // Empty missing parents → refuse.
         let tx = make_orphan(p, 1);
-        assert!(!o.insert(tx.clone(), BTreeSet::new()));
+        assert!(!o.insert_from(tx.clone(), BTreeSet::new(), None));
         let mut miss = BTreeSet::new();
         miss.insert(p);
-        assert!(o.insert(tx.clone(), miss.clone()));
-        // Duplicate insert rejected.
-        assert!(!o.insert(tx.clone(), miss.clone()));
+        assert!(o.insert_from(tx.clone(), miss.clone(), None));
+        assert!(!o.insert_from(tx.clone(), miss.clone(), None));
         let tid = tx.compute_txid();
         o.remove_txid(&tid);
         assert!(!o.contains(&tid));
@@ -393,7 +387,7 @@ mod tests {
             let t = make_orphan(p, i + 1);
             let mut m = BTreeSet::new();
             m.insert(p);
-            o2.insert(t, m);
+            o2.insert_from(t, m, None);
         }
         assert!(o2.len() <= 3);
         // erase_for_block drops matching orphans.
@@ -401,7 +395,7 @@ mod tests {
         let tid3 = t3.compute_txid();
         let mut m = BTreeSet::new();
         m.insert(p);
-        o2.insert(t3, m);
+        o2.insert_from(t3, m, None);
         o2.erase_for_block(&[tid3]);
         assert!(!o2.contains(&tid3));
     }

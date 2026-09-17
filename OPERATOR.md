@@ -394,7 +394,7 @@ Clean smoke:
 | `--trusted` | `trusted=` | off — inbound is not evicted/banned |
 | `--always-relay` | `always_relay=` | off — always announce inbound txs |
 | `--relay` | `relay=` | off — permit tx relay to inbound while `--blocks-only` |
-| `--net-permission SPEC` | `net_permission=` | empty — repeatable CIDR grant (`noban@1.2.3.4`, bare IP, …) |
+| `--net-permission SPEC` | `net_permission=` | empty — repeatable CIDR grant (`noban@1.2.3.4`, `noban@::1`, `noban@2001:db8::/32`, bare IP, …) |
 | `--net-permission-bind SPEC` | `net_permission_bind=` | empty — repeatable bind grant (`noban@127.0.0.1:8333`) |
 | `--net-permission-relay[=0\|1]` | `net_permission_relay=` | **on** — implicit relay on a bare CIDR grant |
 | `--net-permission-force-relay[=0\|1]` | `net_permission_force_relay=` | **off** — implicit forcerelay on a bare CIDR grant |

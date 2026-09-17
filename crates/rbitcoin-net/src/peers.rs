@@ -731,29 +731,39 @@ impl LivePeer {
         self.owner.upgrade()
     }
 
-    pub fn has_net_perm(&self, name: &str) -> bool {
-        self.owner.upgrade().is_some_and(|h| {
-            h.permission_strings(self.addr, self.inbound, self.addrbind)
-                .iter()
-                .any(|p| p == name)
-        })
+    pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
+        self.owner
+            .upgrade()
+            .map(|h| h.permission_flags(self.addr, self.inbound, self.addrbind))
+            .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
+    }
+
+    pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
+        self.net_perm_flags().has(flag)
     }
 
     /// CIDR/bind table plus operator `--trusted`.
     pub fn session_noban(&self) -> bool {
-        self.peer_hub().is_some_and(|h| h.is_noban()) || self.has_net_perm("noban")
+        self.peer_hub().is_some_and(|h| h.is_noban())
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::NOBAN)
     }
 
     /// CIDR/bind table plus operator `--relay` / `--always-relay`.
     pub fn session_relay_perm(&self) -> bool {
         self.peer_hub().is_some_and(|h| h.is_relay_perm())
-            || self.has_net_perm("relay")
-            || self.has_net_perm("forcerelay")
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::RELAY)
     }
 
     /// CIDR/bind table plus operator `--always-relay`.
     pub fn session_forcerelay(&self) -> bool {
-        self.peer_hub().is_some_and(|h| h.is_forcerelay_perm()) || self.has_net_perm("forcerelay")
+        self.peer_hub().is_some_and(|h| h.is_forcerelay_perm())
+            || self
+                .net_perm_flags()
+                .has(crate::net_permissions::NetPermissionFlags::FORCE_RELAY)
     }
 
     pub fn set_inv_gen_floor(&self, floor: u64) {
@@ -1127,16 +1137,29 @@ impl PeerHub {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
+    pub fn permission_flags(
+        &self,
+        addr: SocketAddr,
+        inbound: bool,
+        bind: SocketAddr,
+    ) -> crate::net_permissions::NetPermissionFlags {
+        self.net_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flags_for(addr.ip(), inbound, bind)
+    }
+
     pub fn permission_strings(
         &self,
         addr: SocketAddr,
         inbound: bool,
         bind: SocketAddr,
     ) -> Vec<String> {
-        self.net_perms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .strings_for(addr.ip(), inbound, bind)
+        self.permission_flags(addr, inbound, bind)
+            .to_strings()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn set_asmap(&self, m: Option<Arc<crate::asmap::AsMap>>) {

@@ -284,7 +284,9 @@ before 1.0).
   Headers-sync stall timeout uses session `noban` (CIDR or `--trusted`).
   `getpeerinfo.permissions` is per-peer. 0-value
   spendable outputs are `dust` (Libre still admits 1-sat). Forcerelay and
-  `--always-relay` recent-rejects skip ATMP on the second send. Conf `net_permission_bind=`
+  `--always-relay` recent-rejects skip ATMP on the second send (cleared on
+  tip connect; fee / cluster-limit rejects stay reconsiderable). IPv6 CIDR
+  grants (`noban@::1`, `2001:db8::/32`). Conf `net_permission_bind=`
   listens (same sockets as `--listen`). Shim `-whitebind` is bind-only
   (no synthesized CIDR `--net-permission`).
   `p2p_permissions.py` is `run`.
@@ -348,8 +350,9 @@ before 1.0).
   when mempool relay is on, matching `note_confirmed_tip`. Txs confirmed
   during IBD are requested again after tip-follow (`p2p_ibd_txrelay.py`).
 
-- **RPC `submitpackage` is sequential ATMP:** a later member fail keeps already
-  admitted txs (`mempool_cluster.py` package cluster limit).
+- **RPC `submitpackage` is sequential ATMP then package remainder:** a later
+  member fail keeps already admitted txs. Min-relay / missing-input remainders
+  are re-evaluated as a package (CPFP parent below min-relay + paying child).
 
 - **Package rollback restores RBF victims:** a later package member fail
   re-admits txs the accepted members had replaced.

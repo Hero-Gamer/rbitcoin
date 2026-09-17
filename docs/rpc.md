@@ -96,7 +96,7 @@ still wait for durable SH when shindex is on.
 | `getmempoolcluster` | All networks. Cluster weight / chunks from the live graph (modified fees). Same prefix-maximal chunks as mining selection. |
 | `getmempoolancestors` / `getmempooldescendants` | All networks. Exclusive walks of the live cluster graph. `verbose` reuses `getmempoolentry` fields. |
 | `getmempoolfeeratediagram` | All networks. Mining chunks as `{weight, fee}` points (decreasing feerate). |
-| `submitpackage` | All networks. Sequential `MempoolHub::submit_package_rpc` (`accept_tx` per tx; keep successes). RPC `maxfeerate` / `maxburnamount` pre-checks. Min-relay waiver is a child-with-parents ancestor tree only. `package_msg` / `tx-results` / `replaced-transactions`. Esplora `POST /txs/package` and Electrum `broadcast_package` still use atomic `accept_package` (all-or-nothing; child-fail rollback). |
+| `submitpackage` | All networks. Sequential `MempoolHub::submit_package_rpc` (`accept_tx` per tx; keep successes). Remainders that failed `min relay fee` or missing inputs are then `accept_package` (CPFP waiver is a child-with-parents ancestor tree). RPC `maxfeerate` / `maxburnamount` pre-checks. `package_msg` / `tx-results` / `replaced-transactions`. Esplora `POST /txs/package` and Electrum `broadcast_package` still use atomic `accept_package` (all-or-nothing; child-fail rollback). |
 | `gettxspendingprevout` | All networks. Live mempool spender of each `{txid,vout}`. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
 | `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
