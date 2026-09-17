@@ -6,9 +6,8 @@
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
 //! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
 //! omitted from that skeleton. Class A `CreatePin::set_loc` after append;
-//! later-wave stamp reads pin loc. Disk loc-by-fk only if pin loc is unset.
-//! A live InFlight pin + disk miss is same-wave / write-in-progress, not a
-//! loc hole (`create.loc.count()` after the miss races Class A append).
+//! later-wave stamp reads pin loc. IBD (`skeleton = Some`) never loc-by-fk:
+//! spent is pin loc, skeleton TipOnly loc, or unset for write fill.
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -166,9 +165,8 @@ fn stamp_inflight_hits<'a>(
 /// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
 /// skeleton loc when TipOnly already has that create (later wave). Same-wave
 /// creates are omitted from the skeleton; those holes stay for write fill.
-/// In-flight identity that still lacks spent after that bind tries loc by fk
-/// (later-wave TipOnly miss / head lag). Disk miss on a live pin leaves spent
-/// unset (write fill / late `set_loc`); it is not a loc hole.
+/// IBD never loc-by-fk: pin loc unset and skeleton miss leaves spent unset
+/// (write TLS / late `set_loc`).
 /// `skeleton = None` is
 /// plan=None / S0 leftover TipOnly. Same-batch identities are not inputs —
 /// callers skip them in `need` and keep them offline at pin.
@@ -218,7 +216,6 @@ pub fn stamp_external_parents(
         stamp.head_need_n = 0;
         stats.note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
         stats.note_recent(stamp.recent_n, stamp.recent_ns);
-        fill_inflight_spent_from_loc(store, in_flight, &mut stamp.idents, stats)?;
         return Ok(stamp);
     }
     let mut need_head: Vec<[u8; 32]> = still_need.into_iter().copied().collect();
@@ -332,65 +329,6 @@ pub fn fill_missing_parent_ranges(
     Ok(())
 }
 
-/// Disk loc-by-fk for InFlight identities that still lack spent (pin loc unset).
-///
-/// Disk miss: adopt pin loc if Class A published it during the pread, else
-/// leave spent unset (write fill). Never re-read `create.loc.count()` — that
-/// races append (mainnet loc-hole EngineFault).
-fn fill_inflight_spent_from_loc(
-    store: &Store,
-    in_flight: &InFlight,
-    idents: &mut U64Map<ParentIdent>,
-    stats: &crate::ConfirmStats,
-) -> Result<(), QueryError> {
-    let mut need: Vec<Fk> = Vec::new();
-    for (&id, ident) in idents.iter() {
-        if ident.spent.is_some() {
-            continue;
-        }
-        if in_flight.get_out(id).is_some() {
-            need.push(Fk(id));
-        }
-    }
-    if need.is_empty() {
-        return Ok(());
-    }
-    stats.note_fill_missing();
-    let filled = store.tx_create_loc_range_batch(&need)?;
-    bind_inflight_loc_rows(in_flight, idents, need, filled);
-    Ok(())
-}
-
-fn bind_inflight_loc_rows(
-    in_flight: &InFlight,
-    idents: &mut U64Map<ParentIdent>,
-    need: Vec<Fk>,
-    filled: Vec<Option<rbitcoin_store::CreateLocPair>>,
-) {
-    for (fk, row) in need.into_iter().zip(filled) {
-        let Some(id) = fk.get() else {
-            continue;
-        };
-        let pair = match row {
-            Some(pair) => pair,
-            None => {
-                let Some(pin) = in_flight.get_out(id) else {
-                    continue;
-                };
-                let Some(pair) = pin.loc().copied() else {
-                    continue;
-                };
-                pair
-            }
-        };
-        if let Some(e) = idents.get_mut(&id) {
-            e.body = Some(pair.txout);
-            e.spent = Some(pair.spent);
-            e.n_out = Some(pair.n_out);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,12 +407,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Later-wave spend after lookup ran ahead of write: TipOnly missed the
-    /// parent (`tx.head` lag) so the skeleton is empty, InFlight still has the
-    /// pin, and loc is already on disk. Stamp must fill spent by fk (mainnet
-    /// 133433). Same-wave holes stay unset when loc is not on disk yet.
+    /// IBD skeleton miss + InFlight pin + loc on disk: load does not loc-by-fk.
+    /// Spent stays unset for write TLS / `CreatePin::set_loc` (mainnet 133433).
     #[test]
-    fn inflight_hit_skeleton_miss_fills_loc_by_fk() {
+    fn inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
+        use std::sync::atomic::Ordering;
         let (dir, q) = tmp_store();
         let p = pin(1);
         let txid = p.tx().txid;
@@ -497,7 +434,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(fks[0], Fk(1));
-        let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
+        assert!(q.store.txs.spent_range(Fk(1)).expect("spent range").1 > 0);
+        let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
@@ -509,12 +447,18 @@ mod tests {
             q.confirm_stats(),
         )
         .unwrap();
+        assert_eq!(st.head_need_n, 0);
         assert_eq!(st.resolved.get(&txid), Some(&Fk(1)));
         let ident = st.idents.get(&1).expect("inflight ident");
         assert!(ident.pin.is_some(), "inflight pin is kept");
-        assert_eq!(ident.spent, Some(spent));
-        assert!(ident.body.is_some_and(|r| r.1 > 0));
-        assert_eq!(ident.n_out, Some(1));
+        assert_eq!(ident.spent, None, "IBD stamp must not loc-by-fk");
+        assert_eq!(ident.body, None);
+        assert_eq!(ident.n_out, None);
+        assert_eq!(
+            q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
+            0,
+            "IBD skeleton path must not fill_missing"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -636,39 +580,6 @@ mod tests {
         assert_eq!(ident.spent, None);
         assert_eq!(ident.body, None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn inflight_loc_batch_miss_on_live_pin_is_not_hole() {
-        let p = pin(1);
-        let mut inflight = InFlight::new();
-        inflight.note_pins([(Fk(1), &p)], Some(1));
-        let mut idents = U64Map::default();
-        idents.insert(1, ParentIdent::new(p.tx().txid));
-        super::bind_inflight_loc_rows(&inflight, &mut idents, vec![Fk(1)], vec![None]);
-        let ident = idents.get(&1).expect("ident");
-        assert_eq!(ident.spent, None);
-        assert_eq!(ident.body, None);
-    }
-
-    #[test]
-    fn inflight_loc_batch_miss_adopts_late_pin_loc() {
-        let p = pin(1);
-        let pair = rbitcoin_store::CreateLocPair {
-            txout: (10, 8),
-            spent: (30, 8),
-            n_out: 1,
-        };
-        p.set_loc(pair);
-        let mut inflight = InFlight::new();
-        inflight.note_pins([(Fk(1), &p)], Some(1));
-        let mut idents = U64Map::default();
-        idents.insert(1, ParentIdent::new(p.tx().txid));
-        super::bind_inflight_loc_rows(&inflight, &mut idents, vec![Fk(1)], vec![None]);
-        let ident = idents.get(&1).expect("ident");
-        assert_eq!(ident.spent, Some(pair.spent));
-        assert_eq!(ident.body, Some(pair.txout));
-        assert_eq!(ident.n_out, Some(pair.n_out));
     }
 
     #[test]

@@ -2045,11 +2045,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// IBD skeleton miss + InFlight pin + loc on disk (lookup ahead of
-    /// `tx.head`): plan must still stamp spent so write ensure does not need
-    /// RAM loc after prune (mainnet 133433).
+    /// IBD skeleton miss + InFlight pin + loc on disk: plan does not loc-by-fk.
+    /// Spent stays unset for write TLS / `CreatePin::set_loc` (mainnet 133433).
     #[test]
-    fn plan_inflight_skeleton_miss_fills_loc_by_fk() {
+    fn plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
+        use std::sync::atomic::Ordering;
         let (dir, q) = temp_query("plan-inflight-skel-miss");
         let parent = coinbase_apply(1);
         let parent_txid = parent.tx.txid;
@@ -2061,11 +2061,8 @@ mod tests {
                 /*index=*/ true,
             )
             .unwrap();
-        let spent = q
-            .store
-            .txs
-            .spent_range(Fk(1))
-            .expect("archived spent range");
+        assert!(q.store.txs.spent_range(Fk(1)).expect("spent range").1 > 0);
+        let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
         let mut log = crate::InFlight::new();
         log.note_pins([(Fk(1), &pin)], Some(1));
         let child = child_spend(parent_txid, 0xee);
@@ -2076,8 +2073,8 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(
             plan.external_parents.get(&1).and_then(|p| p.spent),
-            Some(spent),
-            "TipOnly miss must still fill spent from create.loc by fk"
+            None,
+            "IBD stamp must not loc-by-fk"
         );
         assert!(
             plan.external_parents
@@ -2085,6 +2082,11 @@ mod tests {
                 .and_then(|p| p.pin.as_ref())
                 .is_some(),
             "inflight pin is kept"
+        );
+        assert_eq!(
+            q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
+            0,
+            "IBD skeleton path must not fill_missing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
