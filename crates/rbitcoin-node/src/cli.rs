@@ -157,9 +157,7 @@ fn finish_operator_config(
     smoke: bool,
     log_level_cli: Option<Option<Level>>,
 ) -> Result<OperatorArgs, ExitCode> {
-    if let Err(e) =
-        rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
-    {
+    if let Err(e) = config.subversion() {
         eprintln!("{e}");
         return Err(ExitCode::from(1));
     }
@@ -446,33 +444,22 @@ fn parse_cli_flag(
 
 fn print_run_err(e: &crate::error::NodeError) {
     match e {
-        crate::error::NodeError::FutureTip => eprintln!("{e}"),
+        crate::error::NodeError::FutureTip | crate::error::NodeError::Init(_) => eprintln!("{e}"),
         crate::error::NodeError::Locked(_) => eprintln!("Error: {e}"),
         _ => error!("{e}"),
     }
 }
 
 fn cli_apply_err(e: crate::error::NodeError) -> ExitCode {
-    let s = e.to_string();
-    if s.contains("peer-timeout must be a positive integer")
-        || s.contains("Invalid minimum work")
-        || s.contains("must be hexadecimal")
-        || s.contains("Duplicate binding configuration")
-        || s.contains("Invalid P2P permission")
-        || s.contains("Only direction was set, no permissions")
-        || s.contains("Invalid netmask specified in")
-        || s.contains("Cannot resolve --net-permission-bind address")
-        || s.contains("Need to specify a port with --net-permission-bind")
-    {
-        if s.contains("Duplicate binding configuration") {
-            eprintln!("Error: Duplicate binding configuration");
-        } else {
-            eprintln!("Error: {e}");
+    match e {
+        crate::error::NodeError::Init(_) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
         }
-        ExitCode::from(1)
-    } else {
-        eprintln!("error: {e}");
-        ExitCode::from(2)
+        other => {
+            eprintln!("error: {other}");
+            ExitCode::from(2)
+        }
     }
 }
 

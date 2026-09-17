@@ -32,7 +32,7 @@ pub fn rbitcoin_subversion(
         for ch in c.chars() {
             if matches!(ch, '/' | ':' | '(' | ')') || !ch.is_ascii() {
                 return Err(format!(
-                    "Error: User Agent comment ({ch}) contains unsafe characters."
+                    "User Agent comment ({ch}) contains unsafe characters."
                 ));
             }
         }
@@ -49,7 +49,7 @@ pub fn rbitcoin_subversion(
     };
     if s.len() > 256 {
         return Err(format!(
-            "Error: Total length of network version string ({}) exceeds maximum length (256). Reduce the number or size of uacomments.",
+            "Total length of network version string ({}) exceeds maximum length (256). Reduce the number or size of uacomments.",
             s.len()
         ));
     }

@@ -293,7 +293,7 @@ impl NodeConfig {
     /// `/rbitcoin:VERSION/` or `/rbitcoin:VERSION(comment; …)/`.
     pub fn subversion(&self) -> Result<String, crate::error::NodeError> {
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &self.uacomments)
-            .map_err(crate::error::NodeError::Config)
+            .map_err(crate::error::NodeError::Init)
     }
 
     pub fn with_datadir(mut self, datadir: impl Into<PathBuf>) -> Self {
@@ -383,7 +383,7 @@ impl NodeConfig {
 
     fn push_p2p_listen(&mut self, addr: SocketAddr) -> Result<(), NodeError> {
         if self.listen.p2p == Some(addr) || self.listen.p2p_extra.contains(&addr) {
-            return Err(NodeError::Config("Duplicate binding configuration".into()));
+            return Err(NodeError::Init("Duplicate binding configuration".into()));
         }
         if self.listen.p2p.is_none() {
             self.listen.p2p = Some(addr);
@@ -625,7 +625,7 @@ impl NodeConfig {
             "signet_challenge" => {
                 self.signet_challenge = Some(
                     parse_signet_challenge(val)
-                        .map_err(|e| NodeError::Config(format!("conf signet_challenge: {e}")))?,
+                        .map_err(|e| NodeError::Init(format!("conf signet_challenge: {e}")))?,
                 );
             }
             "signet_block_time" => {
@@ -743,13 +743,13 @@ impl NodeConfig {
             }
             "net_permission" | "net_permissions" => {
                 if !val.is_empty() {
-                    let g = rbitcoin_net::parse_whitelist(val).map_err(NodeError::Config)?;
+                    let g = rbitcoin_net::parse_whitelist(val).map_err(NodeError::Init)?;
                     self.net_perms.whitelist.push(g);
                 }
             }
             "net_permission_bind" => {
                 if !val.is_empty() {
-                    let g = rbitcoin_net::parse_whitebind(val).map_err(NodeError::Config)?;
+                    let g = rbitcoin_net::parse_whitebind(val).map_err(NodeError::Init)?;
                     if self.listen.p2p != Some(g.addr) && !self.listen.p2p_extra.contains(&g.addr) {
                         self.push_p2p_listen(g.addr)?;
                     }
@@ -823,7 +823,7 @@ impl NodeConfig {
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf peer_timeout: {e}")))?;
                 if n == 0 {
-                    return Err(NodeError::Config(
+                    return Err(NodeError::Init(
                         "peer-timeout must be a positive integer.".into(),
                     ));
                 }
@@ -831,7 +831,7 @@ impl NodeConfig {
             }
             "min_chain_work" => {
                 self.minimum_chain_work =
-                    Some(parse_minimum_chain_work(val).map_err(NodeError::Config)?);
+                    Some(parse_minimum_chain_work(val).map_err(NodeError::Init)?);
             }
             "milestone" => {
                 self.milestone_height = val
