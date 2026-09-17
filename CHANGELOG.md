@@ -52,7 +52,9 @@ before 1.0).
 - **Stop paying Core harness in production:** P2P logs use a `p2p:` prefix;
   `debuglog_map.toml` is the Core debug.log dialect. TCP RPC is Bearer-only
   (the test proxy still accepts TestNode Basic and forwards Bearer). Named
-  `args` peel is `echo` only. Hidden `getorphantxs` stays (operator dump of
+  `args` peel is `echo` only on the node; the functional proxy expands
+  AuthServiceProxy mixed `{args: […], maxfeerate: …}` into a positional list
+  before forwarding. Hidden `getorphantxs` stays (operator dump of
   parked txs + announcer peer ids; `rpc_orphans.py` is `run`).
   `estimaterawfee` is the native 10-minute object (no fake Core
   `short`/`decay` tree). `NodeError::Init` carries exit 1 and the `Error:`
@@ -61,6 +63,10 @@ before 1.0).
   to Core's disk phrase). In-tree TCP tests send Bearer. Labeled
   `test_runner` prints **72** jobs (**66** inventory `run`; **201** skip).
   `echo` stays.
+
+- **P2P shutdown waits a short grace** before aborting session tasks so a
+  still-running P2P job cannot use the store after drop. Lingering tasks
+  are still aborted (bounded). CI `rpc_invalidateblock` stop SIGSEGV.
 
 - **Core functional `run` is production-only:** skip scripts whose asserts
   were only the bitcoind shim (`feature_help`, `feature_blocksdir`,

@@ -18,6 +18,7 @@ from rpc_proxy import (
     esplora_port,
     node_authorization,
     node_rpc_port,
+    peel_authproxy_args,
     rewrite_core_maxfeerate,
 )
 
@@ -36,6 +37,32 @@ item = {
 }
 rewrite_core_maxfeerate(item)
 assert item["params"][1] == 10_000, item
+
+# AuthServiceProxy mixed: peel `args` into a positional list (echo keeps the object).
+mixed = {
+    "method": "submitpackage",
+    "params": {"args": [["aa", "bb"]], "maxfeerate": 0},
+}
+peel_authproxy_args(mixed)
+assert mixed["params"] == [["aa", "bb"], 0], mixed
+rewrite_core_maxfeerate(mixed)
+assert mixed["params"] == [["aa", "bb"], 0], mixed
+echo_mixed = {
+    "method": "echo",
+    "params": {"args": [0, 1], "arg3": 3},
+}
+peel_authproxy_args(echo_mixed)
+assert echo_mixed["params"] == {"args": [0, 1], "arg3": 3}, echo_mixed
+args_only = {"method": "getblockhash", "params": {"args": [0]}}
+peel_authproxy_args(args_only)
+assert args_only["params"] == [0], args_only
+send_mixed = {
+    "method": "sendrawtransaction",
+    "params": {"args": ["dead"], "maxfeerate": 0.1},
+}
+peel_authproxy_args(send_mixed)
+rewrite_core_maxfeerate(send_mixed)
+assert send_mixed["params"] == ["dead", 10_000], send_mixed
 
 assert node_rpc_port(18443) == 28443
 assert esplora_port(18443) == 38443

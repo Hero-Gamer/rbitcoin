@@ -30,7 +30,9 @@ Esplora** (with `--sh-index`) for address/script history.
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
 Bearer-authenticated (`{datadir}/rpc.token`). The Core-functional proxy still
 speaks TestNode cookie + HTTP Basic on the public port and forwards Bearer
-to the node.
+to the node. Mixed AuthServiceProxy `{args: […], maxfeerate: …}` is expanded
+to a positional list in that proxy (`echo` mixed `{args, argN}` stays on the
+node).
 
 ### curl example (TCP Bearer)
 
@@ -71,7 +73,7 @@ still wait for durable SH when shindex is on.
 | Method | Notes |
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
-| `echo` | Testing RPC. Returns arguments as a positional array. AuthServiceProxy `{args: [...], argN: ...}` is peeled only here. |
+| `echo` | Testing RPC. Returns arguments as a positional array. AuthServiceProxy `{args: [...], argN: ...}` is peeled only here. Mixed `submitpackage`/`sendrawtransaction`/`testmempoolaccept` `{args, maxfeerate}` is expanded in the Core-functional proxy, not on the node. |
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `getblockcount` / `getbestblockhash` wait for the in-flight tip-accept job (not the rest of a catch-up burst). `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). `chainwork` is summed header work (regtest 2 per block). `size_on_disk` is a walk of `{datadir}/store` file lengths (plus `--datadir-cold` inwit when split). `verificationprogress` is `blocks / headers` clamped to `[0, 1]` (`1.0` when `headers` is 0). `initialblockdownload` is the Core RPC name for **relay-inhibited**: `--min-chain-work` and `--max-tip-age` after densify/`enter_tip_mode`, not “still catching up”. |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. |
 | `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. Reconstruct miss is `block body not in store`. Dummy `blk00000.dat` is shim-only so `rpc_getblockstats.py`'s rename-file needle stays Core-phrased. |
