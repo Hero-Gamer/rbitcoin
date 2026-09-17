@@ -791,6 +791,7 @@ dependencies = [
  "bitcoin",
  "rbitcoin-consensus",
  "rbitcoin-log",
+ "rbitcoin-primitives",
  "rbitcoin-store",
 ]
 

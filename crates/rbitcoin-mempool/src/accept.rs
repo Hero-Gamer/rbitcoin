@@ -3,11 +3,13 @@
 use crate::error::MempoolError;
 use crate::graph::{TxEntry, TxGraph};
 use crate::orphanage::Orphanage;
+use crate::packed::VinAux;
 use crate::store::Mempool;
-use bitcoin::consensus::encode::serialize;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
+use rbitcoin_primitives::Fk;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 const EXTRA_COMPACT_CAP: usize = 100;
@@ -38,6 +40,8 @@ pub struct Coin {
     /// MTP of the block *before* the create block (BIP68 time locks). `0` if unknown.
     pub create_mtp: u32,
     pub is_coinbase: bool,
+    /// Class A create fk when the UTXO provider resolved a confirmed coin.
+    pub create_fk: Option<Fk>,
 }
 
 /// Tip snapshot for structural checks (finality / maturity / BIP68).
@@ -314,12 +318,21 @@ enum EvictUntil {
     WeightBudget,
 }
 
+struct IngestedLive {
+    graph: TxGraph,
+    bodies: std::collections::HashMap<Txid, Arc<Transaction>>,
+    vin_aux: std::collections::HashMap<Txid, Vec<VinAux>>,
+}
+
 /// Mempool with RAM TxGraph layered on durable store.
 pub struct ActiveMempool {
     pub store: Mempool,
     pub graph: TxGraph,
     /// Cached tx bodies for graph rebuild / remove (live set only).
-    bodies: std::collections::HashMap<Txid, Transaction>,
+    bodies: std::collections::HashMap<Txid, Arc<Transaction>>,
+    /// Per-vin aux from the packed sidecar (SH / purge). Missing only if a
+    /// leftover record omitted it.
+    vin_aux: std::collections::HashMap<Txid, Vec<VinAux>>,
     /// Evict worst chunks when live weight exceeds this.
     pub max_weight: u64,
     /// Side pool of txs waiting on missing parents (weight budget).
@@ -381,29 +394,13 @@ impl ActiveMempool {
             store.abandon_live()?;
         }
         let loaded = store.load_live_txs()?;
-        let mut graph = TxGraph::new();
-        let mut bodies = std::collections::HashMap::new();
-        let mut items = Vec::with_capacity(loaded.len());
-        for (slot, fee_sat, weight, tx) in loaded {
-            let txid = tx.compute_txid();
-            let entry = TxEntry {
-                txid,
-                wtxid: tx.compute_wtxid(),
-                fee_sat,
-                weight,
-                slot,
-                parents: BTreeSet::new(),
-                children: BTreeSet::new(),
-            };
-            bodies.insert(txid, tx.clone());
-            items.push((entry, tx));
-        }
-        graph.rebuild_from(items);
-        store.set_live_count(graph.len() as u32);
+        let ingested = Self::ingest_loaded(loaded);
+        store.set_live_count(ingested.graph.len() as u32);
         Ok(Self {
             store,
-            graph,
-            bodies,
+            graph: ingested.graph,
+            bodies: ingested.bodies,
+            vin_aux: ingested.vin_aux,
             max_weight,
             orphanage: Orphanage::new(),
             last_accept_stages: AcceptStageUs::default(),
@@ -441,29 +438,44 @@ impl ActiveMempool {
     pub fn compact(&mut self) -> Result<(u32, usize), MempoolError> {
         let (live, body_len) = self.store.compact()?;
         let loaded = self.store.load_live_txs()?;
+        let mut ingested = Self::ingest_loaded(loaded);
+        ingested
+            .graph
+            .set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
+        self.graph = ingested.graph;
+        self.bodies = ingested.bodies;
+        self.vin_aux = ingested.vin_aux;
+        self.store.set_live_count(live);
+        Ok((live, body_len))
+    }
+
+    fn ingest_loaded(loaded: Vec<crate::store::LiveTx>) -> IngestedLive {
         let mut graph = TxGraph::new();
         let mut bodies = std::collections::HashMap::new();
+        let mut vin_aux = std::collections::HashMap::new();
         let mut items = Vec::with_capacity(loaded.len());
-        for (slot, fee_sat, weight, tx) in loaded {
-            let txid = tx.compute_txid();
+        for live in loaded {
+            let p = live.packed;
+            let tx = Arc::new(p.tx);
             let entry = TxEntry {
-                txid,
-                wtxid: tx.compute_wtxid(),
-                fee_sat,
-                weight,
-                slot,
+                txid: p.txid,
+                wtxid: p.wtxid,
+                fee_sat: p.fee_sat,
+                weight: p.weight,
+                slot: live.slot,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
             };
-            bodies.insert(txid, tx.clone());
+            vin_aux.insert(p.txid, p.vins);
+            bodies.insert(p.txid, Arc::clone(&tx));
             items.push((entry, tx));
         }
         graph.rebuild_from(items);
-        graph.set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
-        self.graph = graph;
-        self.bodies = bodies;
-        self.store.set_live_count(live);
-        Ok((live, body_len))
+        IngestedLive {
+            graph,
+            bodies,
+            vin_aux,
+        }
     }
 
     /// Compact when DEAD slots are a large fraction of capacity (file growth bound).
@@ -481,9 +493,9 @@ impl ActiveMempool {
 
     /// Accept a single transaction under Libre policy + cluster limits.
     ///
-    /// Durable order: write body → LIVE slot → RAM graph. Call [`flush`] to
-    /// bump generation so a crash keeps the batch.
-    ///
+    /// RAM graph is source of truth. Packed body is appended in RAM; sidecar
+    /// write waits for [`Self::persist_due`] (5 s) or [`Self::flush`].
+    /// Crash may lose ≤5 s of admits.
     /// When prevouts are missing from both mempool and chain UTXO, the tx is
     /// parked in the [`Orphanage`] (weight budget) and
     /// [`AcceptError::Orphaned`] is returned — not a hard peer reject.
@@ -782,7 +794,8 @@ impl ActiveMempool {
         let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
         let mut replaced_txs: Vec<Transaction> = Vec::new();
         for c in &conflict_set {
-            if let Some(old_tx) = self.bodies.get(c).cloned() {
+            if let Some(old) = self.bodies.get(c) {
+                let old_tx = (**old).clone();
                 self.note_extra(&old_tx);
                 for o in &old_tx.output {
                     replaced_scripthashes
@@ -800,9 +813,11 @@ impl ActiveMempool {
 
         self.ensure_free_slot(Some(txid))?;
 
-        let raw = serialize(tx);
+        let aux = Self::vin_aux_from_prep(tx, &prep);
         let t_dur = Instant::now();
-        let slot = self.store.append_live_tx(&raw, &txid, fee_sat, weight)?;
+        let slot = self
+            .store
+            .append_live_tx(tx, &txid, &prep.wtxid, fee_sat, weight, &aux)?;
         self.last_accept_stages.durable_us = self
             .last_accept_stages
             .durable_us
@@ -817,8 +832,10 @@ impl ActiveMempool {
             parents: BTreeSet::new(),
             children: BTreeSet::new(),
         };
+        let body = Arc::new(tx.clone());
         self.graph.insert(entry, tx);
-        self.bodies.insert(txid, tx.clone());
+        self.bodies.insert(txid, Arc::clone(&body));
+        self.vin_aux.insert(txid, aux);
 
         if let Some(c) = self.graph.cluster_of(&txid) {
             if c.members.len() > self.graph.cluster_count_limit()
@@ -826,6 +843,7 @@ impl ActiveMempool {
             {
                 self.graph.remove(&txid, tx);
                 self.bodies.remove(&txid);
+                self.vin_aux.remove(&txid);
                 let _ = self.store.mark_slot_dead(slot);
                 return Err(AcceptError::ClusterTooLarge {
                     count: c.members.len(),
@@ -1228,6 +1246,7 @@ impl ActiveMempool {
         self.store.mark_slot_dead(entry.slot)?;
         self.graph.remove(txid, &tx);
         self.bodies.remove(txid);
+        self.vin_aux.remove(txid);
         Ok(())
     }
 
@@ -1515,7 +1534,36 @@ impl ActiveMempool {
 
     /// Lookup a live body (for tests / Electrum unconf).
     pub fn get_tx(&self, txid: &Txid) -> Option<&Transaction> {
-        self.bodies.get(txid)
+        self.bodies.get(txid).map(|a| a.as_ref())
+    }
+
+    /// Packed vin aux for a live tx (SH reindex / purge). Empty if unknown.
+    pub fn vin_aux(&self, txid: &Txid) -> &[VinAux] {
+        self.vin_aux.get(txid).map_or(&[], Vec::as_slice)
+    }
+
+    fn vin_aux_from_prep(tx: &Transaction, prep: &PreparedAdmit) -> Vec<VinAux> {
+        tx.input
+            .iter()
+            .enumerate()
+            .map(|(i, inp)| {
+                let script_hash = prep
+                    .prevouts
+                    .get(i)
+                    .map(|o| Self::electrum_scripthash(o.script_pubkey.as_bytes()));
+                let create_fk = prep
+                    .chain_coins
+                    .get(i)
+                    .and_then(|c| c.as_ref())
+                    .and_then(|c| c.create_fk);
+                VinAux {
+                    prev_txid: inp.previous_output.txid,
+                    vout: inp.previous_output.vout,
+                    script_hash,
+                    create_fk,
+                }
+            })
+            .collect()
     }
 
     /// Mining-order live txs that fit in `max_weight_wu` (best chunks first).
@@ -1624,6 +1672,7 @@ mod tests {
             create_height: 0,
             create_mtp: 0,
             is_coinbase: false,
+            create_fk: None,
         }
     }
 
@@ -1719,6 +1768,7 @@ mod tests {
                 create_height: 50,
                 create_mtp: 0,
                 is_coinbase: true,
+                create_fk: None,
             },
         );
         let utxos = MapUtxoProvider { map };
@@ -1758,6 +1808,7 @@ mod tests {
                 create_height: 10,
                 create_mtp: 1_000_000,
                 is_coinbase: false,
+                create_fk: None,
             },
         );
         let utxos = MapUtxoProvider { map };
@@ -1808,6 +1859,7 @@ mod tests {
                 create_height: 10,
                 create_mtp: 1,
                 is_coinbase: false,
+                create_fk: None,
             },
         );
         let utxos = MapUtxoProvider { map };
@@ -1858,6 +1910,7 @@ mod tests {
             create_height: 1,
             create_mtp: 0,
             is_coinbase: true,
+            create_fk: None,
         };
         let utxos = MapUtxoProvider {
             map: HashMap::from([(op, coin)]),
@@ -3453,17 +3506,17 @@ mod tests {
         {
             let mut meta = [0u8; 64];
             meta[0..4].copy_from_slice(b"rBMP");
-            meta[4..6].copy_from_slice(&1u16.to_le_bytes());
+            meta[4..6].copy_from_slice(&2u16.to_le_bytes());
             meta[16..20].copy_from_slice(&4u32.to_le_bytes());
             fs::write(dir.join("meta"), meta).unwrap();
             let mut slots = vec![0u8; 16 + 4 * 48];
             slots[0..4].copy_from_slice(b"rBMP");
-            slots[4..6].copy_from_slice(&1u16.to_le_bytes());
+            slots[4..6].copy_from_slice(&2u16.to_le_bytes());
             slots[8..12].copy_from_slice(&4u32.to_le_bytes());
             fs::write(dir.join("slots"), &slots).unwrap();
             let mut body = vec![0u8; 16];
             body[0..4].copy_from_slice(b"rBMP");
-            body[4..6].copy_from_slice(&1u16.to_le_bytes());
+            body[4..6].copy_from_slice(&2u16.to_le_bytes());
             body[8..16].copy_from_slice(&16u64.to_le_bytes());
             fs::write(dir.join("tx.body"), &body).unwrap();
         }
