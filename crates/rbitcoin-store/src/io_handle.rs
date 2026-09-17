@@ -123,8 +123,27 @@ fn win_pwrite(handle: isize, offset: u64, buf: &[u8]) -> i32 {
 }
 
 #[cfg(windows)]
+struct PositionalXferEvent(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for PositionalXferEvent {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        extern "system" {
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        unsafe {
+            CloseHandle(self.0);
+        }
+        self.0 = core::ptr::null_mut();
+    }
+}
+
+#[cfg(windows)]
 thread_local! {
-    static POSITIONAL_XFER_EVENT: *mut core::ffi::c_void = {
+    static POSITIONAL_XFER_EVENT: PositionalXferEvent = {
         use std::ptr::{null, null_mut};
         extern "system" {
             fn CreateEventW(
@@ -134,7 +153,7 @@ thread_local! {
                 name: *const u16,
             ) -> *mut core::ffi::c_void;
         }
-        unsafe { CreateEventW(null_mut(), 1, 0, null()) }
+        PositionalXferEvent(unsafe { CreateEventW(null_mut(), 1, 0, null()) })
     };
 }
 
@@ -174,7 +193,7 @@ fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -
     }
     const ERROR_IO_PENDING: u32 = 997;
     POSITIONAL_XFER_EVENT.with(|event| {
-        let event = *event;
+        let event = event.0;
         if event.is_null() {
             return -(unsafe { GetLastError() } as i32);
         }

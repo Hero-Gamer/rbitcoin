@@ -435,6 +435,12 @@ impl UringSession {
         self.poisoned = true;
     }
 
+    fn rollback_pending(&mut self, user_data: u64) {
+        if self.pending.expect_cqe(user_data).is_err() {
+            self.poison();
+        }
+    }
+
     fn check_live(&self) -> Result<(), StoreError> {
         if self.poisoned {
             Err(StoreError::Corrupt("invariant: io_uring session poisoned"))
@@ -510,7 +516,9 @@ impl UringSession {
                 // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
-                        let _ = self.pending.expect_cqe(user_data);
+                        if self.pending.expect_cqe(user_data).is_err() {
+                            self.poisoned = true;
+                        }
                         return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
@@ -521,7 +529,7 @@ impl UringSession {
             SessionBackend::Iocp(eng) => eng.push_pread(handle, offset, buf, user_data),
         };
         if r.is_err() {
-            let _ = self.pending.expect_cqe(user_data);
+            self.rollback_pending(user_data);
         }
         r
     }
@@ -577,7 +585,9 @@ impl UringSession {
                 // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
-                        let _ = self.pending.expect_cqe(user_data);
+                        if self.pending.expect_cqe(user_data).is_err() {
+                            self.poisoned = true;
+                        }
                         return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
@@ -588,7 +598,7 @@ impl UringSession {
             SessionBackend::Iocp(eng) => eng.push_pwrite(handle, offset, buf, user_data),
         };
         if r.is_err() {
-            let _ = self.pending.expect_cqe(user_data);
+            self.rollback_pending(user_data);
         }
         r
     }
