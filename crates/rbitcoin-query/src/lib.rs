@@ -1057,6 +1057,7 @@ impl Query {
         head.mphf_g_bytes = head
             .mphf_g_bytes
             .saturating_add(self.store.scripthash.mphf_g_resident_bytes());
+        head.mphf_occ_bytes = self.store.scripthash.mphf_occ_resident_bytes();
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),

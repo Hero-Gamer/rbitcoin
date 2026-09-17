@@ -941,6 +941,8 @@ pub struct HeadResizeSizeSnapshot {
     pub fuse8_bytes: u64,
     /// In-RAM BDZ `g` arrays (0 after FdOnly open).
     pub mphf_g_bytes: u64,
+    /// Compact BDZ occupancy heap (supers after mmap; 0 occ copy).
+    pub mphf_occ_bytes: u64,
     /// Class C L2 images (strong_tx + confirmed + header_txs).
     pub class_c_l2_bytes: u64,
 }
