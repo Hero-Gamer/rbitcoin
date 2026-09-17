@@ -1650,9 +1650,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// Format process RSS + known retain-structure occupancy (leak triage).
 ///
 /// All counts are O(1) lens / brief mutex snaps taken on the 5s tick. Compare
-/// `anon=` growth to heap caches and `file=` growth to store mmaps (segmented
-/// `tx.head.*` + fuse8). `locked=` is mlock only (usually 0) — **not** a
-/// filter on what enters RSS.
+/// `anon=` growth to heap caches and `file=` growth to store page cache
+/// (including mapped `.fuse8`). `fuse8=` / `open_keys=` are **heap** only
+/// (0 after map / no retained keys). `locked=` is mlock only (usually 0) —
+/// **not** a filter on what enters RSS.
 ///
 /// Process-owned occupancy: body queue + confirm pipeline + header plans + SH + head.
 pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
@@ -2467,6 +2468,8 @@ mod tests {
         s.conf_ready = 40;
         s.conf_script_q_cap = 5;
         s.conf_write_q_cap = 5;
+        s.owned.head.fuse8_bytes = 0;
+        s.owned.head.open_keys_bytes = 0;
         let line = format_sizes(&s);
         assert!(line.starts_with("ibd: sizes "), "{line}");
         assert!(line.contains("rss=2MiB"), "{line}");
@@ -2507,10 +2510,10 @@ mod tests {
         assert!(!line.contains("pstore"), "{line}");
         assert!(line.contains("accounted≈"), "{line}");
         assert!(line.contains("residual≈"), "{line}");
-        assert!(line.contains("fuse8="), "{line}");
+        assert!(line.contains("fuse8=0MiB"), "{line}");
         assert!(line.contains("mphf_g="), "{line}");
         assert!(line.contains("class_c_l2="), "{line}");
-        assert!(line.contains("open_keys="), "{line}");
+        assert!(line.contains("open_keys=0MiB"), "{line}");
         assert!(!line.contains("shadow"), "{line}");
         assert!(!line.contains("contig parked="), "{line}");
         assert!(!line.contains("residency creates="), "{line}");

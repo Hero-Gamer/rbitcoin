@@ -12,6 +12,9 @@
 //!
 //! Opening a v1 file **refuses** the store. Wipe `store/tx.head` (and
 //! `store/scripthash*` if SH overflow fuses are v1); Class A is kept.
+//!
+//! `build` owns fingerprints on the heap. After `write_then_map` /
+//! `read_from`, fingerprints are a read-only file map (`fuse8=` heap 0).
 
 use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
 use crate::error::StoreError;
