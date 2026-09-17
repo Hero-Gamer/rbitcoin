@@ -166,6 +166,9 @@ Aligned with AGENTS.md TDD + suite speed:
 
 Core functional `run` scripts are a nightly oracle. They are **not** the Red
 test for a default-CI story and **not** a reason to skip an in-tree journey.
+When the labeled `core-functional` job is red, run the failing script locally
+(`run.sh <test.py>`) until it passes before pushing — do not use that CI job
+as the inner loop ([`core-functional.md`](./core-functional.md)).
 
 | Plan-time rules | |
 |-----------------|--|
