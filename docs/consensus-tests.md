@@ -134,7 +134,7 @@ version floors and exact +2h).
 | C24 | Signet last 38-byte BIP141 commitment; challenge P2SH|WITNESS|DERSIG|NULLDUMMY (no CLEANSTACK) | accept / `signet solution invalid` | `witness_commitment_index_last_exact_38_byte`, `signet_challenge_op_true_twice_is_not_cleanstack`, `signet_challenge_p2wpkh_empty_witness_rejected` |
 | C25 | BIP342 tapscript validation weight | `tapscript validation weight` | `script_path_rejects_tapscript_validation_weight` |
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
-| C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings`; journey overlay interval=2: `header_and_spending_boundaries` |
+| C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings`; `rejects_coinbase_excess_value_fast`; journey overlay interval=2: `header_and_spending_boundaries` |
 | C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
 
 ## Adding a new rule

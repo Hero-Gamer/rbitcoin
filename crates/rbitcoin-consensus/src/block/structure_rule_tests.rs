@@ -757,6 +757,15 @@ fn p1_block_subsidy_halvings() {
 }
 
 #[test]
+fn rejects_coinbase_excess_value_fast() {
+    let mut cb = coinbase(1);
+    cb.output[0].value = Amount::from_sat(50_0000_0000 + 1);
+    let block = block_with(vec![cb]);
+    let err = super::check_coinbase_subsidy(&block, &ctx_h(1), 0).unwrap_err();
+    assert_bad_block(err, "coinbase excess value");
+}
+
+#[test]
 fn script_sigop_count_and_last_push_helpers() {
     // CHECKSIG / CHECKSIGVERIFY
     assert_eq!(script_sigop_count(&[0xac], false), 1);
@@ -1231,41 +1240,117 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Same-block coinbase spend is always immature (Core: nHeight < coinbaseHeight + 100).
+/// Connect-path spend rejects: same-block coinbase spend (always immature),
+/// same-block double spend, child-before-parent, `in < out`, and a height-1
+/// coinbase still immature 4 deep.
 #[test]
-fn accept_rejects_same_block_coinbase_spend() {
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("same-block-cb");
+fn accept_rejects_connect_spend_rules() {
+    use crate::{
+        accept_and_connect_block, mine_empty_regtest, pad_empty_from, prepare_regtest_candidate,
+    };
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("connect-spend-rules");
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let mut block = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    let cb_val = block.txdata[0].output[0].value;
-    let spend = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: block.txdata[0].compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: cb_val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
+
+    fn spend(op: OutPoint, sats: u64) -> Transaction {
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    let mut same_cb = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let cb_op = OutPoint {
+        txid: same_cb.txdata[0].compute_txid(),
+        vout: 0,
     };
-    block.txdata.push(spend);
-    prepare_regtest_candidate(&mut block, genesis.block_hash(), genesis.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(1), &block, Milestone::NONE)
+    same_cb
+        .txdata
+        .push(spend(cb_op, same_cb.txdata[0].output[0].value.to_sat()));
+    prepare_regtest_candidate(
+        &mut same_cb,
+        genesis.block_hash(),
+        genesis.header.time + 600,
+    );
+    let err = accept_and_connect_block(&q, &params, Height(1), &same_cb, Milestone::NONE)
         .expect_err("same-block coinbase spend must be immature");
     match err {
         ConsensusError::BadTx("coinbase immature") => {}
         other => panic!("expected coinbase immature, got {other}"),
     }
+
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let op = OutPoint {
+        txid: b1.txdata[0].compute_txid(),
+        vout: 0,
+    };
+
+    let mut dup = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    dup.txdata.push(spend(op, 1_000));
+    dup.txdata.push(spend(op, 2_000));
+    prepare_regtest_candidate(&mut dup, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &dup, Milestone::NONE)
+        .expect_err("same-block double spend");
+    assert!(
+        matches!(err, ConsensusError::BadTx(s) if s.contains("double spend")),
+        "same-block double spend: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(1)));
+
+    let parent = spend(op, 1_000);
+    let child = spend(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        500,
+    );
+    let mut bad_order = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    bad_order.txdata.push(child);
+    bad_order.txdata.push(parent);
+    prepare_regtest_candidate(&mut bad_order, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &bad_order, Milestone::NONE)
+        .expect_err("child-before-parent");
+    assert!(
+        matches!(err, ConsensusError::MissingPrevout),
+        "child-before-parent: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(1)));
+
+    let mut over = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    over.txdata.push(spend(op, 50_0000_0000 + 1));
+    prepare_regtest_candidate(&mut over, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &over, Milestone::NONE)
+        .expect_err("in < out");
+    assert!(
+        matches!(err, ConsensusError::BadTx(s) if s.contains("in < out")),
+        "in < out: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(1)));
+
+    let (tip, time, _) = pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, 4, 0);
+    assert_eq!(q.tip_height(), Some(Height(4)));
+    let mut b5 = mine_empty_regtest(tip, time + 600, 5);
+    b5.txdata.push(spend(op, 1_000));
+    prepare_regtest_candidate(&mut b5, tip, time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(5), &b5, Milestone::NONE)
+        .expect_err("height-1 coinbase still immature 4 deep");
+    assert!(
+        matches!(err, ConsensusError::BadTx(s) if s.contains("immature")),
+        "4-deep immature: {err:?}"
+    );
 }
 
 #[test]
@@ -2108,203 +2193,4 @@ fn pres_has_witness_matches_block_walk() {
         block_has_witness_from_pres(&wpres),
         block_has_witness(&block)
     );
-}
-
-#[test]
-fn rejects_double_spend_same_block_fast() {
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("ds-fast");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let op = OutPoint {
-        txid: b1.txdata[0].compute_txid(),
-        vout: 0,
-    };
-    let mk = |op| {
-        let _b = vec![0x51u8];
-        Transaction {
-            version: TxVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: op,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(_b),
-            }],
-        }
-    };
-    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    b2.txdata.push(mk(op));
-    b2.txdata.push(mk(op));
-    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
-        .expect_err("must reject double spend in block");
-    let m = format!("{:?}", err).to_lowercase();
-    assert!(
-        m.contains("double") || m.contains("duplicate") || m.contains("spend"),
-        "got {}",
-        m
-    );
-}
-
-#[test]
-fn rejects_forward_spend_pj_ge_ti_fast() {
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("fwd-fast");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let mk_spk = || {
-        let v = vec![0x51u8];
-        ScriptBuf::from_bytes(v)
-    };
-    let tx_b = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: b1.txdata[0].compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1_000),
-            script_pubkey: mk_spk(),
-        }],
-    };
-    let tx_b_id = tx_b.compute_txid();
-    let tx_a = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: tx_b_id,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(500),
-            script_pubkey: mk_spk(),
-        }],
-    };
-    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    b2.txdata.push(tx_a);
-    b2.txdata.push(tx_b);
-    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
-        .expect_err("must reject forward spend");
-    let m = format!("{:?}", err);
-    assert!(
-        m.contains("MissingPrevout") || m.contains("missing") || m.contains("prevout"),
-        "got {}",
-        m
-    );
-}
-
-#[test]
-fn rejects_coinbase_excess_value_fast() {
-    let mut cb = coinbase(1);
-    cb.output[0].value = Amount::from_sat(50_0000_0000 + 1);
-    let block = block_with(vec![cb]);
-    let err = super::check_coinbase_subsidy(&block, &ctx_h(1), 0).unwrap_err();
-    assert_bad_block(err, "coinbase excess value");
-}
-
-#[test]
-fn rejects_in_below_out_fast() {
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("in-below-out-fast");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let mk_spk = || {
-        let v = vec![0x51u8];
-        ScriptBuf::from_bytes(v)
-    };
-    let big = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: b1.txdata[0].compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000 + 1),
-            script_pubkey: mk_spk(),
-        }],
-    };
-    let mut b2 = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-    b2.txdata.push(big);
-    prepare_regtest_candidate(&mut b2, b1.block_hash(), b1.header.time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE)
-        .expect_err("must reject in < out");
-    assert!(format!("{:?}", err).contains("in < out"));
-}
-
-#[test]
-fn rejects_coinbase_maturity_durable_4_deep_fast() {
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("maturity-4-deep-fast");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let mut prev_hash = genesis.block_hash();
-    let mut prev_time = genesis.header.time;
-    let mut blocks = Vec::new();
-    for h in 1..=4 {
-        let b = mine_empty_regtest(prev_hash, prev_time + 600, h);
-        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
-        prev_hash = b.block_hash();
-        prev_time = b.header.time;
-        blocks.push(b);
-    }
-    let mk_spk = || {
-        let v = vec![0x51u8];
-        ScriptBuf::from_bytes(v)
-    };
-    let spend = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: blocks[0].txdata[0].compute_txid(),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1_000),
-            script_pubkey: mk_spk(),
-        }],
-    };
-    let mut b5 = mine_empty_regtest(prev_hash, prev_time + 600, 5);
-    b5.txdata.push(spend);
-    prepare_regtest_candidate(&mut b5, prev_hash, prev_time + 600);
-    let err = accept_and_connect_block(&q, &params, Height(5), &b5, Milestone::NONE)
-        .expect_err("must reject immature");
-    assert!(format!("{:?}", err).contains("immature"));
 }
