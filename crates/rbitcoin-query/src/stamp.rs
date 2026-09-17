@@ -359,9 +359,9 @@ fn fill_inflight_spent_from_loc(
             continue;
         };
         let Some(pair) = row else {
-            if fk.get().is_some_and(|id| store.txs.count() >= id) {
+            if fk.get().is_some_and(|id| store.tx_create_loc_count() >= id) {
                 return Err(rbitcoin_store::StoreError::Corrupt(
-                    "archive: inflight loc missing after Class A",
+                    "invariant: create.loc hole after count",
                 ));
             }
             continue;
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn inflight_hit_skeleton_miss_without_loc_after_class_a_is_corrupt() {
+    fn inflight_hit_skeleton_miss_body_without_loc_count_leaves_spent_unset() {
         let (dir, q) = tmp_store();
         let p = pin(1);
         let txid = p.tx().txid;
@@ -581,21 +581,21 @@ mod tests {
         assert_eq!(fks[0], Fk(1));
         assert!(q.store.txs.count() >= 1);
         q.store.txs.create_loc_truncate_to_count(0).unwrap();
+        assert!(q.store.tx_create_loc_count() < 1);
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
-        let err = stamp_external_parents(
+        let st = stamp_external_parents(
             q.store(),
             &[txid],
             &inflight,
             Some(&skel),
             q.confirm_stats(),
         )
-        .unwrap_err();
-        assert!(
-            format!("{err}").contains("inflight loc missing after Class A"),
-            "{err}"
-        );
+        .expect("body HWM without loc count is same-wave hole, not Corrupt");
+        let ident = st.idents.get(&1).expect("inflight ident");
+        assert!(ident.pin.is_some());
+        assert_eq!(ident.spent, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

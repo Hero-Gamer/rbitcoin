@@ -68,6 +68,10 @@ fn confirm_reject_class_matches_substring_table() {
             ConfirmRejectClass::EngineFault,
         ),
         (
+            "invariant: create.loc hole after count",
+            ConfirmRejectClass::EngineFault,
+        ),
+        (
             "consensus: store: corrupt record: tx put_full_batch fk mismatch (plan not committed in order)",
             ConfirmRejectClass::Cascade,
         ),

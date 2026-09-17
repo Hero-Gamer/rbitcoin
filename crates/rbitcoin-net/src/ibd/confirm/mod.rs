@@ -393,6 +393,7 @@ impl ConfirmRejectClass {
         }
         if s.contains("parent create_fk unresolved")
             || s.contains("spend annotate missing pin denserels")
+            || s.contains("create.loc hole after count")
             || s.contains("corrupt record")
             || s.contains("io error")
         {
