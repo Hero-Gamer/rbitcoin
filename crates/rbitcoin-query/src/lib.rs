@@ -153,7 +153,8 @@ pub mod process_mem_stats {
 }
 
 pub use archive::{
-    input_records_from_wire, ArchiveWritePlan, CreatePin, CreatePinInner, WirePlanNeed,
+    input_records_from_wire, ArchiveWritePlan, CreatePin, CreatePinArc, CreatePinInner,
+    WirePlanNeed,
 };
 pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{

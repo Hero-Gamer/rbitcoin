@@ -136,6 +136,11 @@ fn stamp_inflight_hits<'a>(
                 let e = stamp.bind(id, *t);
                 if let Some(pin) = in_flight.get_out(id) {
                     e.pin = Some(std::sync::Arc::clone(pin));
+                    if let Some(pair) = pin.loc() {
+                        e.body = Some(pair.txout);
+                        e.spent = Some(pair.spent);
+                        e.n_out = Some(pair.n_out);
+                    }
                 }
                 if let Some(skel) = skeleton {
                     if let Some((sk_fk, range, spent, n_out)) = skel.get(t) {
@@ -494,6 +499,59 @@ mod tests {
         assert_eq!(ident.spent, Some(spent));
         assert!(ident.body.is_some_and(|r| r.1 > 0));
         assert_eq!(ident.n_out, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_hit_uses_pin_loc_without_disk() {
+        let (dir, q) = tmp_store();
+        let p = pin(1);
+        let txid = p.tx().txid;
+        let fks = q
+            .store
+            .txs
+            .put_full_batch_indexed(
+                &[(
+                    p.tx().clone(),
+                    vec![rbitcoin_store::InputRecord::coinbase(
+                        u32::MAX,
+                        vec![0x01],
+                        vec![],
+                    )],
+                    (0..p.n_out() as u32)
+                        .filter_map(|v| p.out_record(v))
+                        .collect(),
+                )],
+                true,
+            )
+            .unwrap();
+        assert_eq!(fks[0], Fk(1));
+        let pair = q
+            .store
+            .txs
+            .create_loc_range_batch(&[Fk(1)])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("loc after append");
+        p.set_loc(pair);
+        q.store.txs.create_loc_truncate_to_count(0).unwrap();
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let skel = BatchParentIds::default();
+        let st = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .expect("pin loc must bind without disk loc");
+        let ident = st.idents.get(&1).expect("inflight ident");
+        assert_eq!(ident.spent, Some(pair.spent));
+        assert_eq!(ident.body, Some(pair.txout));
+        assert_eq!(ident.n_out, Some(pair.n_out));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
