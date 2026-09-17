@@ -165,16 +165,11 @@ impl SegmentedTxHead {
                 return Err(StoreError::Corrupt("tx.head segment fk gap/overlap"));
             }
         }
-        pin_hot_g_segments(&dir, &mut segs)?;
         // One summary for the whole head (not one line per segment).
         // Per-seg detail: `file_id@first_fk:count{s|o}` (s=sealed, o=open tail).
         let sealed_n = segs.iter().filter(|s| s.sealed).count();
         let open_n = segs.len().saturating_sub(sealed_n);
         let creates: u64 = segs.iter().map(|s| s.count.load(Ordering::Relaxed)).sum();
-        let mphf_g: u64 = segs
-            .iter()
-            .map(|s| s.pack.as_ref().map(|p| p.g_bytes_resident()).unwrap_or(0))
-            .sum();
         let detail: String = segs
             .iter()
             .map(|s| {
@@ -186,7 +181,7 @@ impl SegmentedTxHead {
             .join(" ");
         rbitcoin_log::info!(
             "store: tx.head open bits={bits} entry=4B slots={} segs={} sealed={sealed_n} \
-             open={open_n} creates≈{creates} mphf_g={mphf_g} [{detail}]",
+             open={open_n} creates≈{creates} [{detail}]",
             layout.slots(),
             segs.len(),
         );
@@ -295,22 +290,6 @@ impl SegmentedTxHead {
             .iter()
             .map(|s| s.pack.as_ref().map(|p| p.take_g_page_preads()).unwrap_or(0))
             .sum()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sealed_g_resident_by_age(&self) -> Vec<(u32, u64)> {
-        let segs = self.segments_snapshot();
-        let n = segs.len();
-        segs.iter()
-            .enumerate()
-            .filter(|(_, s)| s.sealed)
-            .map(|(si, s)| {
-                (
-                    crate::head_resolve_stats::sealed_age_from_index(si, n),
-                    s.pack.as_ref().map(|p| p.g_bytes_resident()).unwrap_or(0),
-                )
-            })
-            .collect()
     }
 
     /// Open-segment fuse-key Vec heap (`count × 8`).
@@ -863,7 +842,6 @@ impl SegmentedTxHead {
         if !found {
             return Err(StoreError::Corrupt("tx.head seal publish: file_id missing"));
         }
-        pin_hot_g_segments(&self.dir, &mut new_list)?;
         *guard = Arc::new(new_list);
         drop(guard);
         // Sealed meta must be durable before the OA is unlinked: a crash after
@@ -1041,12 +1019,6 @@ impl SegmentedTxHead {
         self.next_file_id
             .store(max_id.saturating_add(1), Ordering::Relaxed);
         self.open_new_locked(tail_first_fk)?;
-        {
-            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
-            let mut list = (**guard).clone();
-            pin_hot_g_segments(&self.dir, &mut list)?;
-            *guard = Arc::new(list);
-        }
         Ok(())
     }
 
@@ -1105,49 +1077,6 @@ fn build_seal_publish(
         pack,
         fuse,
     })
-}
-
-fn pin_hot_g_segments(dir: &Path, segs: &mut [Arc<Segment>]) -> Result<(), StoreError> {
-    let n = segs.len();
-    for (si, slot) in segs.iter_mut().enumerate() {
-        if !slot.sealed {
-            continue;
-        }
-        let age = crate::head_resolve_stats::sealed_age_from_index(si, n);
-        let want = age <= HEAD_PROBE_HOT_MAX_AGE;
-        let have = slot
-            .pack
-            .as_ref()
-            .map(|p| p.g_bytes_resident() > 0)
-            .unwrap_or(false);
-        if want == have {
-            continue;
-        }
-        let first_fk = slot.first_fk;
-        let file_id = slot.file_id;
-        let count = slot.count.load(Ordering::Relaxed);
-        let head = slot.head.clone();
-        let fuse = slot.fuse.clone();
-        let path = segment_head_path(dir, file_id);
-        let pack = if want {
-            let mut p = TxHeadMphf::open(&path)?;
-            p.pin_g_resident()?;
-            Some(Arc::new(p))
-        } else {
-            Some(Arc::new(TxHeadMphf::open(&path)?))
-        };
-        *slot = Arc::new(Segment {
-            first_fk,
-            count: AtomicU64::new(count),
-            file_id,
-            sealed: true,
-            head,
-            pack,
-            fuse,
-            open_keys: Mutex::new(Vec::new()),
-        });
-    }
-    Ok(())
 }
 
 #[inline]
@@ -1518,85 +1447,6 @@ mod tests {
             "newest first {cands:?}"
         );
         assert!(cands.iter().any(|f| f.0 == 821), "cands={cands:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn assert_hot_g_residency(h: &SegmentedTxHead) {
-        let by_age = h.sealed_g_resident_by_age();
-        assert!(
-            by_age.iter().any(|(age, _)| *age > HEAD_PROBE_HOT_MAX_AGE),
-            "need a cold sealed age, got {by_age:?}"
-        );
-        for &(age, bytes) in &by_age {
-            if age <= HEAD_PROBE_HOT_MAX_AGE {
-                assert!(bytes > 0, "sealed-hot age {age} must pin g, got {by_age:?}");
-            } else {
-                assert_eq!(
-                    bytes, 0,
-                    "cold age {age} must keep packed g on fd, got {by_age:?}"
-                );
-            }
-        }
-    }
-
-    /// Sealed-hot ages `1..=3` hold unpacked MPHF `g` in process RAM (IBD and
-    /// tip follow). Age ≥4 stays FdOnly so a 30-minute gap between tip blocks
-    /// does not re-fault those hot pages.
-    #[test]
-    fn hot_wave_sealed_g_stays_resident_and_evicts_age_4() {
-        let dir = tmp();
-        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
-        let n_full = 204u64;
-        {
-            let h = SegmentedTxHead::create(&dir, layout).unwrap();
-            let n = n_full.saturating_mul(6);
-            let mut entries: Vec<_> = (0..n).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-            h.insert_many(&mut entries).unwrap();
-            h.flush().unwrap();
-            assert!(
-                h.sealed_segment_count() >= 4,
-                "need a cold sealed age, segs={} sealed={}",
-                h.segment_count(),
-                h.sealed_segment_count()
-            );
-            assert_hot_g_residency(&h);
-
-            let first = h.first_fks_snapshot();
-            let hot_fk = first[first.len() - 2];
-            let hot = mixed(hot_fk);
-            let cold = mixed(1);
-            let _ = h.take_sealed_g_page_preads();
-            let hot_cands = h
-                .probe_candidates_batch_sealed_hot(&[hot], &[true])
-                .unwrap();
-            assert!(
-                hot_cands[0].iter().any(|f| f.0 == hot_fk),
-                "hot cand fk={hot_fk} got={:?}",
-                hot_cands[0]
-            );
-            assert_eq!(
-                h.take_sealed_g_page_preads(),
-                0,
-                "sealed-hot probe must not pread pinned g"
-            );
-            let cold_cands = h.probe_candidates_batch_cold(&[cold], &[true]).unwrap();
-            assert!(
-                cold_cands[0].iter().any(|f| f.0 == 1),
-                "cold cand got={:?}",
-                cold_cands[0]
-            );
-            assert!(
-                h.take_sealed_g_page_preads() > 0,
-                "cold age must still pread packed g pages"
-            );
-
-            let mut extra: Vec<_> = (n..n + n_full).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
-            h.insert_many(&mut extra).unwrap();
-            h.flush().unwrap();
-            assert_hot_g_residency(&h);
-        }
-        let h = SegmentedTxHead::open(&dir).unwrap();
-        assert_hot_g_residency(&h);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

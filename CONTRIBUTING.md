@@ -192,9 +192,8 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
    heads). Iterating those structures is expensive. Every algorithm should
    avoid wasting RAM and avoid wasting CPU. Spending one to save the other
    is allowed only as a **named trade** — owner doc or rustdoc on the
-   surface, not an accident of the first version that compiled. Sealed-hot
-   `tx.head` `g` in RAM versus FdOnly packed `g` for colder ages (fuse8 stays
-   in RAM for every sealed segment) is that kind of choice.
+   surface, not an accident of the first version that compiled. FdOnly
+   packed `g` (`mphf_g=0`) versus fuse8 in RAM is that kind of choice.
 
    Write as if the structure is huge, because in IBD it is. **Address** it
    (hash, slot, page, bit offset, subscript). Do not walk everything resident
