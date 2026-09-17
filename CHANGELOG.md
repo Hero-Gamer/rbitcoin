@@ -25,6 +25,16 @@ before 1.0).
 
 ### Changed
 
+- **Sealed fuse8 mmap + no retained `open_keys`:** lookup maps every sealed
+  `.fuse8` fingerprint array read-only (`fuse8=` heap **0** after
+  `write_then_map` / `open_file`). Open OA is keyless; seal collects keys once
+  from `txid.body` then drops them (`open_keys=0`). Kernel reclaim of idle
+  fuse is drop of file pages, not swap. Packed MPHF `g` stays FdOnly.
+  `strong_tx` and mempool stay process `Vec`. `ibd: sizes` / `tip: perf`
+  `fuse8=` is heap only; mapped fuse RSS is `file=`. After IBD, leftover
+  `anon − accounted` can be mimalloc arenas (`free` ≠ `munmap`); optional
+  operator `MIMALLOC_PURGE_DELAY=0`. Do not `malloc_trim` a mimalloc process.
+
 - **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
   `persist_due` every 5 s writes the body tail then slots+meta (no fsync).
   Shutdown `flush` still fsyncs. DEAD of a durable slot is a one-record
