@@ -182,15 +182,32 @@ git fetch origin
 git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
 gh pr create --repo reardencode/rbitcoin --head <area>/<short-name> --title "…" --body "…"
 gh pr view --repo reardencode/rbitcoin --json mergeable,mergeStateStatus
-gh pr checks --watch
+./scripts/pr-checks-watch.sh --repo reardencode/rbitcoin --pr <n> \
+  --interest windows
 ```
 
 No `-u` on push (that would retarget the branch remote away from `origin`).
 
+**Fail-fast poll.** Do **not** `gh pr checks --watch` as the only waiter. That
+blocks until *every* check finishes (slow `coverage`, CodeQL, `Analyze (rust)`)
+even after a job this change was meant to exercise (`windows`, `macos`,
+`clippy`, `test`, …) is already red. `./scripts/pr-checks-watch.sh` exits **1
+as soon as any required job fails**, and also as soon as a `--interest` job
+fails (pass the job(s) this change exercises). On exit 1: **stop polling**,
+fetch that job’s log **in this session**, and start the fix. Do not wait for
+coverage, macos, test, or CodeQL. The script prints the job URL.
+
+```bash
+# Watcher printed "start the fix now" + job URL (run may still be in progress):
+gh api --allow-escape-sequences repos/reardencode/rbitcoin/actions/jobs/<job-id>/logs
+# after the run finishes:
+gh run view <run-id> --repo reardencode/rbitcoin --job <job-id> --log-failed
+```
+
 **Unmergeable ⇒ tests do not run.** If `mergeable` is `CONFLICTING` or
 `mergeStateStatus` is `DIRTY` (or `BEHIND` when the branch is not on current
-`origin/master`), required **test** CI does not start. `gh pr checks --watch`
-will sit on skipped/missing `test` — that is not a flake. Rebase onto
+`origin/master`), required **test** CI does not start. `./scripts/pr-checks-watch.sh`
+will sit on pending `test` — that is not a flake. Rebase onto
 `origin/master`, lease-force the topic branch, then poll. Do not `gh run rerun`
 to wake jobs that never queued.
 
@@ -204,7 +221,7 @@ git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<ar
 |------|--------|
 | **One PR per plan** | Push more commits to the same branch. |
 | **Mergeable first** | Conflicted / behind PRs skip test CI. Rebase, then poll. |
-| **Poll until green** | Do not walk away and call the plan done. |
+| **Poll until green** | Fail-fast: `--interest` the job this change exercises. On that (or any required) fail, fetch the log and start the fix — do not wait out coverage/CodeQL on a red `windows`. Script: `./scripts/pr-checks-watch.sh`. |
 | **Done** | Required checks green **and** the PR is up for review. Do not merge unless asked. |
 | **No post-green PR-cite** | After required checks are green, do **not** push a docs-only follow-up whose only change is inserting this PR's number into CHANGELOG / quality.md / similar. That wastes a full CI run. Cite in the **PR body**. Owner docs can omit the GitHub number, or pick it up later in a docs change that was already needed. |
 | **Do not** | Force-push `master`, merge a red PR, collapse `origin` to a single URL, skip polling because “tests passed locally,” or invent **empty commits** to poke Actions. |
