@@ -38,6 +38,9 @@ const META_HEADER_LEN: usize = 24;
 const SEG_DESC_LEN: usize = 32;
 const FLAG_SEALED: u32 = 1;
 
+/// Collect `(fuse_key, rel)` for a sealed range (`first_fk`, `count`).
+type FusePairCollect<'a> = dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError> + 'a;
+
 /// Product default head width (2²⁵ slots × 4 B = 128 MiB per segment).
 pub const SEGMENT_HEAD_BITS: u32 = MAINNET_BITS;
 
@@ -54,7 +57,6 @@ struct Segment {
 pub(crate) struct SealPublish {
     file_id: u32,
     pack: crate::tx_head_mphf::TxHeadMphf,
-    fuse: SealedFuse8,
 }
 
 /// Multi-segment keyless address head with seal-time binary fuse8.
@@ -260,7 +262,7 @@ impl SegmentedTxHead {
             .sum()
     }
 
-    /// In-RAM sealed fuse8 fingerprints (process heap, not file RSS).
+    /// Heap-owned sealed fuse8 fingerprints (**0** when mapped from `.fuse8`).
     pub fn sealed_fuse_resident_bytes(&self) -> u64 {
         self.segments_snapshot()
             .iter()
@@ -397,7 +399,7 @@ impl SegmentedTxHead {
     pub(crate) fn insert_many_with(
         &self,
         entries: &mut [([u8; 32], Fk)],
-        collect: Option<&dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError>>,
+        collect: Option<&FusePairCollect<'_>>,
     ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -460,7 +462,7 @@ impl SegmentedTxHead {
 
     fn seal_pairs_locked(
         &self,
-        collect: Option<&dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError>>,
+        collect: Option<&FusePairCollect<'_>>,
         first_fk: u64,
         count: u64,
         pending: &mut Vec<(u64, u32)>,
@@ -844,14 +846,15 @@ impl SegmentedTxHead {
             }
             let count = s.count.load(Ordering::Relaxed);
             let first_fk = s.first_fk;
+            let file_id = p.file_id;
             *s = Arc::new(Segment {
                 first_fk,
                 count: AtomicU64::new(count),
-                file_id: p.file_id,
+                file_id,
                 sealed: true,
                 head: None,
                 pack: Some(Arc::new(p.pack)),
-                fuse: Some(p.fuse),
+                fuse: Some(map_segment_fuse(&self.dir, file_id)?),
             });
             found = true;
             break;
@@ -987,6 +990,7 @@ impl SegmentedTxHead {
         let mut list = Vec::with_capacity(sealed.len().saturating_add(1));
         for (first_fk, count, p) in sealed {
             max_id = max_id.max(p.file_id);
+            let fuse = map_segment_fuse(&self.dir, p.file_id)?;
             list.push(Arc::new(Segment {
                 first_fk,
                 count: AtomicU64::new(count),
@@ -994,7 +998,7 @@ impl SegmentedTxHead {
                 sealed: true,
                 head: None,
                 pack: Some(Arc::new(p.pack)),
-                fuse: Some(p.fuse),
+                fuse: Some(fuse),
             }));
         }
         {
@@ -1049,19 +1053,15 @@ fn build_seal_publish(
     );
     let t0 = Instant::now();
     let fuse = SealedFuse8::build(&grouped.keys)?;
+    let fuse_bytes = fuse.fingerprint_bytes();
     fuse.write_to(&segment_fuse_path(dir, file_id))?;
     let pack = TxHeadMphf::write_grouped(segment_head_path(dir, file_id), grouped)?;
-    let fuse_bytes = fuse.fingerprint_bytes();
     rbitcoin_log::info!(
         "store: tx.head seal done file_id={file_id} count={count} fuse_keys_unique={unique_n} \
          fuse_bytes={fuse_bytes} duration_ms={}",
         t0.elapsed().as_millis()
     );
-    Ok(SealPublish {
-        file_id,
-        pack,
-        fuse,
-    })
+    Ok(SealPublish { file_id, pack })
 }
 
 #[inline]
@@ -1158,6 +1158,10 @@ fn segment_head_path(dir: &Path, file_id: u32) -> PathBuf {
 
 fn segment_fuse_path(dir: &Path, file_id: u32) -> PathBuf {
     head_root(dir).join(format!("{file_id:06}.fuse8"))
+}
+
+fn map_segment_fuse(dir: &Path, file_id: u32) -> Result<SealedFuse8, StoreError> {
+    SealedFuse8::read_from(&segment_fuse_path(dir, file_id))
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
@@ -1359,6 +1363,11 @@ mod tests {
         assert!(h.segment_count() >= 2, "segs={}", h.segment_count());
         h.flush().unwrap();
         assert!(h.sealed_segment_count() >= 1);
+        assert_eq!(
+            h.sealed_fuse_resident_bytes(),
+            0,
+            "seal publish must map fuse, not keep the build Box"
+        );
 
         // Known members resolve (as candidates).
         for i in [1u64, 400, 819, 820] {

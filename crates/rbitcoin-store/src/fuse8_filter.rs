@@ -102,6 +102,12 @@ impl SealedFuse8 {
         Ok(())
     }
 
+    /// Write v2 then reopen as a file map (drop the build heap).
+    pub fn write_then_map(self, path: &Path) -> Result<Self, StoreError> {
+        self.write_to(path)?;
+        Self::read_from(path)
+    }
+
     pub fn read_from(path: &Path) -> Result<Self, StoreError> {
         match open_file(path)? {
             FuseFileOpen::Ready(f) => Ok(f),

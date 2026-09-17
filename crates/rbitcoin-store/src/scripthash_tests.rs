@@ -1154,6 +1154,17 @@ fn compact_merges_two_sealed_global_ovf_files() {
             t.ovf_l1.lock().unwrap().is_some(),
             "compact promotes L1 MPHF"
         );
+        assert_eq!(
+            t.ovf_l1
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .fuse
+                .fingerprint_heap_bytes(),
+            0,
+            "L1 fuse is mapped, not the build Box"
+        );
         assert_eq!(t.entries(&first_new).unwrap().len(), 1);
         assert_eq!(t.entries(&second_new).unwrap().len(), 1);
         assert_eq!(t.entries(&sh_main).unwrap().len(), 1);
