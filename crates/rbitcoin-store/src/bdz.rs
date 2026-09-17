@@ -604,6 +604,10 @@ impl BdzMphf {
 
     pub fn read_compact_from(path: &Path) -> Result<Self, StoreError> {
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
+        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
+        if meta.len() < HEADER_LEN3 {
+            return Err(StoreError::Corrupt("bdz mphf: g length"));
+        }
         let mut hdr = [0u8; HEADER_LEN3 as usize];
         pread_exact(&file, path, 0, &mut hdr)?;
         if &hdr[0..4] != MAGIC3 {
@@ -633,7 +637,6 @@ impl BdzMphf {
         let n_verts = if n == 1 { 1 } else { m };
         let g_bytes = packed_g_bytes(n_verts, COMPACT_G_BITS);
         let occ_n = occ_packed_bytes(n_verts) as usize;
-        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
         if meta.len() < HEADER_LEN3 + g_bytes + occ_n as u64 {
             return Err(StoreError::Corrupt("bdz mphf: g length"));
         }
@@ -1823,10 +1826,10 @@ mod tests {
         assert_eq!(fd.index(keys[0]).unwrap(), ram.index(keys[0]).unwrap());
         let empty = dir.join("empty.mphf");
         std::fs::File::create(&empty).unwrap();
-        assert!(matches!(
-            BdzMphf::read_compact_from(&empty),
-            Err(StoreError::Corrupt(_))
-        ));
+        match BdzMphf::read_compact_from(&empty) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("empty mphf must be Corrupt, got {other:?}"),
+        }
         assert!(fd.take_g_page_preads() >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
