@@ -493,7 +493,7 @@ impl UringSession {
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
-        match &mut self.backend {
+        let r = match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
                 use io_uring::{opcode, types};
@@ -519,7 +519,11 @@ impl UringSession {
             SessionBackend::Pool(pool) => pool.push_pread(handle, offset, buf, user_data),
             #[cfg(windows)]
             SessionBackend::Iocp(eng) => eng.push_pread(handle, offset, buf, user_data),
+        };
+        if r.is_err() {
+            let _ = self.pending.expect_cqe(user_data);
         }
+        r
     }
 
     /// Push a pwrite SQE. Buffer must stay live until the CQE is harvested.
@@ -556,7 +560,7 @@ impl UringSession {
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
-        match &mut self.backend {
+        let r = match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
                 use io_uring::{opcode, types};
@@ -582,7 +586,11 @@ impl UringSession {
             SessionBackend::Pool(pool) => pool.push_pwrite(handle, offset, buf, user_data),
             #[cfg(windows)]
             SessionBackend::Iocp(eng) => eng.push_pwrite(handle, offset, buf, user_data),
+        };
+        if r.is_err() {
+            let _ = self.pending.expect_cqe(user_data);
         }
+        r
     }
 
     pub fn sync_submission(&mut self) {
@@ -764,9 +772,10 @@ impl UringSession {
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
-            "store: io_uring drain slow pending={} waited={:?} thread={thread}",
+            "store: io_uring drain slow pending={} waited={:?} thread={thread} kind={:?}",
             self.pending.len(),
             waited,
+            self.kind,
         );
     }
 

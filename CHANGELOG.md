@@ -37,6 +37,13 @@ before 1.0).
   PR `windows` / `macos` smoke maps a sealed `.fuse8` and confirms a few
   blocks (`connect_chain_query_surface` / spend-edge).
 
+- **Windows positional IO on IOCP handles:** `IoHandle` pread/pwrite sets the
+  low bit of `OVERLAPPED.hEvent` so the packet is not queued to the completion
+  port. A stack OVERLAPPED on a bound handle was harvested with `Box::from_raw`
+  (`STATUS_HEAP_CORRUPTION` on seal-roll and query confirm smoke). A failed
+  IOCP `push_*` (handle already bound to another thread's port) rolls back
+  session pending so SH collect libc-completes instead of drain-hanging.
+
 - **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
   `persist_due` every 5 s writes the body tail then slots+meta (no fsync).
   Shutdown `flush` still fsyncs. DEAD of a durable slot is a one-record

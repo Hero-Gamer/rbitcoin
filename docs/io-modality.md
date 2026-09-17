@@ -38,6 +38,9 @@ Create, open, header/trailer, and grow use positional `IoHandle`
 pread/pwrite and `SetFileInformationByHandle(FileEndOfFileInfo)`. Do
 **not** mix those handles with std `Read`/`Write`/`Seek` — `WriteFile`
 with a NULL `OVERLAPPED` is os error 87 (`ERROR_INVALID_PARAMETER`).
+Positional xfer sets the low bit of `OVERLAPPED.hEvent` so the packet is
+**not** queued to the process IOCP (harvest `Box::from_raw`s only session
+heap OVERLAPPEDs).
 
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
 `read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also
