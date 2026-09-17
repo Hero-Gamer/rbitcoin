@@ -62,14 +62,15 @@ before 1.0).
   insert `put_lock`. Header-sync insert still stores zeros. `set_size_weight`
   remains for query lazy-fill of leftover zeros.
 
+- **IBD load stamp never `create.loc`:** TipOnly miss of an InFlight parent
+  leaves spent unset. Later-wave spent is `CreatePin::set_loc` or write TLS
+  (mainnet 133433). plan=None leftover still `fill_missing_parent_ranges`.
+
 - **Class A loc rides on the InFlight `CreatePin` Arc:** write `set_loc`
-  after append; later-wave stamp binds spent/body from the pin (no disk
-  loc-by-fk on that path). Disk loc-by-fk is only when pin loc is still
-  unset; a miss on a live pin is same-wave / write-in-progress (write fill
-  or late `set_loc`), not `create.loc.count()` after the pread (that race
-  was the mainnet loc-hole EngineFault). EngineFault stamp fail reoffers
-  the full batch and does not `request_single_block` or rewind
-  `lookup_taken_hi` (the 352k Cascade isolate crawl).
+  after append; later-wave stamp binds spent/body from the pin. IBD load
+  never loc-by-fk. EngineFault stamp fail reoffers the full batch and does
+  not `request_single_block` or rewind `lookup_taken_hi` (the 352k Cascade
+  isolate crawl).
 
 - **RPC tip wait is one in-flight accept:** `getblockcount` /
   `getbestblockhash` / `wait_height` wait for the tip-accept job that was
