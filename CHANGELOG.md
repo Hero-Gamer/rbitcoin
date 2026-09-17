@@ -61,6 +61,14 @@ before 1.0).
   `/block/:hash/header`, and `/tx` status/JSON (unknown OP_TRUE type).
   Dispatch twins of those contracts are gone.
 
+- **Catalog journeys absorb RPC remine generate / gettxout twins:**
+  live `esplora_broadcast` pins generate parent-before-child order and
+  `scantxoutset` dropping a spent coinbase. Crate leftover `gettxout`
+  covers include_mempool hide/show; `generate_selects_chained_mempool_parent_first`
+  keeps the 3-tx index + immature + scan needles on `pad_empty_from`.
+  `submitpackage_child_fail_keeps_parent` stays a crate unit (LCOV; the live
+  pad has no spare mature coinbase after generate).
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep
