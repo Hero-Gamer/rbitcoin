@@ -39,6 +39,12 @@ before 1.0).
   `height=-1`; CLI smoke refuses dropped Core `--rpcuser`/`--rpcport` names.
   Dispatch/crate twins of those contracts are gone.
 
+- **Catalog journeys absorb remine-pad confirm extras:** `three_stage` pins
+  header-plan BIP68 MTP, same-run create then spend, and 546-shaped 2-vout
+  merge; `confirm_load_ahead_of_write_does_not_badprev` pins tip-GC store MTP;
+  one `wire_prep_parent_layout_and_load_ahead` pad covers load-ahead parent
+  fill, already-archived plan=None annotate, and cold Class A denserels.
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep
