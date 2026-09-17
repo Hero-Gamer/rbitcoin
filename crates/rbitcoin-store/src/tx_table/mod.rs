@@ -10,6 +10,7 @@ use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Host RAM budget per parallel `tx.head` rebuild worker (not SH pack's 2 GiB).
 /// BDZ peel scratch + keys + g at the default 2²⁵ seal is ≈1 GiB peak.
@@ -821,6 +822,54 @@ impl TxTable {
             for txid in txids {
                 pairs.push((
                     crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(&txid)),
+                    rel,
+                ));
+                rel = rel.saturating_add(1);
+            }
+            cur = end + 1;
+        }
+        if pairs.len() as u64 != count {
+            return Err(StoreError::Corrupt(
+                "tx.head unsealed body range count mismatch",
+            ));
+        }
+        Ok(pairs)
+    }
+
+    /// Sidecar collect: libc pread of `[first_fk, first_fk+count)` (already
+    /// published on `txid.body` before head insert).
+    fn fuse_pairs_from_txid_pread(
+        fd: crate::io_handle::IoHandle,
+        path: &Path,
+        secret: &crate::store_secret::StoreSecret,
+        first_fk: u64,
+        count: u64,
+    ) -> Result<Vec<(u64, u32)>, StoreError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        const CHUNK: u64 = 65_536;
+        let last = first_fk.saturating_add(count).saturating_sub(1);
+        let mut pairs = Vec::with_capacity(count as usize);
+        let mut rel = 1u32;
+        let mut cur = first_fk;
+        while cur <= last {
+            let end = (cur + CHUNK - 1).min(last);
+            let n = (end - cur + 1) as usize;
+            let off = crate::txid_body::TxidBody::entry_offset(cur)?;
+            let mut blob = vec![0u8; n * 32];
+            let rc = crate::bulk_io::pread_single(fd, off, &mut blob);
+            if rc < 0 {
+                return Err(StoreError::io(path, std::io::Error::from_raw_os_error(-rc)));
+            }
+            if (rc as usize) != blob.len() {
+                return Err(StoreError::Corrupt("tx.head seal collect txid.body short"));
+            }
+            for i in 0..n {
+                let s = i * 32;
+                let txid: [u8; 32] = blob[s..s + 32].try_into().unwrap();
+                pairs.push((
+                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid)),
                     rel,
                 ));
                 rel = rel.saturating_add(1);
@@ -2257,7 +2306,14 @@ impl TxTable {
             .collect();
         self.head.insert_many_with(
             &mut mixed,
-            Some(&|first_fk, count| self.fuse_pairs_for_range(first_fk, count)),
+            Arc::new({
+                let secret = self.secret.clone();
+                let fd = self.txids.body_read_fd();
+                let path = self.txids.file_path().to_path_buf();
+                move |first_fk, count| {
+                    TxTable::fuse_pairs_from_txid_pread(fd, &path, &secret, first_fk, count)
+                }
+            }),
         )
     }
 
@@ -2278,7 +2334,6 @@ impl TxTable {
             sealed_segments: self.head.sealed_segment_count() as u64,
             fuse8_bytes: self.head.sealed_fuse_resident_bytes(),
             mphf_g_bytes: self.head.sealed_mphf_g_resident_bytes(),
-            open_keys_bytes: self.head.open_keys_resident_bytes(),
             class_c_l2_bytes: 0,
         }
     }

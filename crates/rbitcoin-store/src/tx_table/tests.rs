@@ -2642,13 +2642,10 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
             .unwrap();
         assert_eq!(t.head_segment_count(), 1);
         assert_eq!(t.head.sealed_segment_count(), 0);
-        assert_eq!(t.head.open_keys_len(), 0);
-        assert_eq!(t.head.open_keys_resident_bytes(), 0);
         t.flush().unwrap();
     }
     // Reopen: keys are not retained; seal collects from Class A.
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.head.open_keys_len(), 0, "open keys not retained");
     // Fill past 819 so first segment seals.
     let more: Vec<TxRecord> = (half..900)
         .map(|i| {
@@ -2710,8 +2707,6 @@ fn seal_without_retained_keys_matches_fuse_contains() {
         .collect();
     t.put_full_batch_indexed(&meta_only_items(&recs), true)
         .unwrap();
-    assert_eq!(t.head.open_keys_len(), 0);
-    assert_eq!(t.head.open_keys_resident_bytes(), 0);
     t.flush_head().unwrap();
     assert!(t.head.sealed_segment_count() >= 1);
     for i in [1u64, 50, 204, 205] {

@@ -93,7 +93,8 @@ pub(crate) struct WriteStageSample {
     /// `class_c_commit` join/flush minus tables (`class_c_join=`)
     pub class_c_join_ms: u64,
     pub class_c_join_ns: u64,
-    /// Residual `head_insert_queued` join after Class C (`drain_join=`)
+    /// Residual `head_insert_queued` join after Class C (`drain_join=`).
+    /// Includes seal-sidecar collect of `txid.body` keys plus fuse/MPHF build.
     pub drain_join_ms: u64,
     pub drain_join_ns: u64,
     /// Body-queue dequeue after confirm (`dequeue=`)
@@ -1651,8 +1652,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 ///
 /// All counts are O(1) lens / brief mutex snaps taken on the 5s tick. Compare
 /// `anon=` growth to heap caches and `file=` growth to store page cache
-/// (including mapped `.fuse8`). `fuse8=` / `open_keys=` are **heap** only
-/// (0 after map / no retained keys). `locked=` is mlock only (usually 0) —
+/// (including mapped `.fuse8`). `fuse8=` is **heap** only
+/// (0 after map). `locked=` is mlock only (usually 0) —
 /// **not** a filter on what enters RSS.
 ///
 /// Process-owned occupancy: body queue + confirm pipeline + header plans + SH + head.
@@ -1677,7 +1678,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(write_wire_mib)) as u64;
     let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
     let mphf_g_mib = h.mphf_g_bytes / (1024 * 1024);
-    let open_keys_mib = h.open_keys_bytes / (1024 * 1024);
     let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
@@ -1687,7 +1687,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
         .saturating_add(mphf_g_mib)
-        .saturating_add(open_keys_mib)
         .saturating_add(class_c_l2_mib);
     let anon_mib = kb_mib(s.rss_anon_kb);
     let residual_mib = anon_mib.saturating_sub(accounted_mib);
@@ -1701,7 +1700,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB wloc={}L/{}pair≈{}MiB \
            h2h={}k≈{}MiB fence={}≈{}MiB \
-           wire={}MiB fuse8={}MiB mphf_g={}MiB open_keys={}MiB class_c_l2={}MiB \
+           wire={}MiB fuse8={}MiB mphf_g={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} heads={}",
@@ -1757,7 +1756,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         conf_wire_mib,
         fuse8_mib,
         mphf_g_mib,
-        open_keys_mib,
         class_c_l2_mib,
         accounted_mib,
         residual_mib,
@@ -2469,7 +2467,6 @@ mod tests {
         s.conf_script_q_cap = 5;
         s.conf_write_q_cap = 5;
         s.owned.head.fuse8_bytes = 0;
-        s.owned.head.open_keys_bytes = 0;
         let line = format_sizes(&s);
         assert!(line.starts_with("ibd: sizes "), "{line}");
         assert!(line.contains("rss=2MiB"), "{line}");
@@ -2513,7 +2510,7 @@ mod tests {
         assert!(line.contains("fuse8=0MiB"), "{line}");
         assert!(line.contains("mphf_g="), "{line}");
         assert!(line.contains("class_c_l2="), "{line}");
-        assert!(line.contains("open_keys=0MiB"), "{line}");
+        assert!(!line.contains("open_keys="), "{line}");
         assert!(!line.contains("shadow"), "{line}");
         assert!(!line.contains("contig parked="), "{line}");
         assert!(!line.contains("residency creates="), "{line}");

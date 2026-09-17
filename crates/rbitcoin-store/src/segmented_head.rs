@@ -39,7 +39,11 @@ const SEG_DESC_LEN: usize = 32;
 const FLAG_SEALED: u32 = 1;
 
 /// Collect `(fuse_key, rel)` for a sealed range (`first_fk`, `count`).
-type FusePairCollect<'a> = dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError> + 'a;
+///
+/// Runs on the seal sidecar (or crash-reopen). `'static` so the worker can
+/// pread `txid.body` after the write thread has already rolled.
+pub(crate) type SealCollect =
+    Arc<dyn Fn(u64, u64) -> Result<Vec<(u64, u32)>, StoreError> + Send + Sync>;
 
 /// Product default head width (2²⁵ slots × 4 B = 128 MiB per segment).
 pub const SEGMENT_HEAD_BITS: u32 = MAINNET_BITS;
@@ -291,11 +295,6 @@ impl SegmentedTxHead {
             .sum()
     }
 
-    /// Open-segment fuse-key Vec heap. Always 0: seal collects from `txid.body`.
-    pub fn open_keys_resident_bytes(&self) -> u64 {
-        (self.open_keys_len() as u64).saturating_mul(12)
-    }
-
     /// Open-tail page hop dump for leftover-miss diagnostics.
     pub(crate) fn leftover_open_hop(
         &self,
@@ -368,11 +367,6 @@ impl SegmentedTxHead {
         Ok(())
     }
 
-    /// Fuse keys are not retained on the open tail (diagnostics / tests).
-    pub fn open_keys_len(&self) -> usize {
-        0
-    }
-
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
         Arc::clone(&self.segments.read().unwrap_or_else(|e| e.into_inner()))
     }
@@ -384,22 +378,30 @@ impl SegmentedTxHead {
     ///
     /// Rolls when open count reaches `max_keys` (80% of slots). Publish drains
     /// on the next `insert_many`, [`Self::flush`], or `Drop` — not joined on
-    /// the roll that started it. Seal keys are collected at roll (see
-    /// [`Self::insert_many_with`]); they are not retained on the open tail.
+    /// the roll that started it. Seal keys are collected on the sidecar from
+    /// `txid.body` (crash-reopen stays on the open thread).
     #[cfg(test)]
     pub fn insert_many(&self, entries: &mut [([u8; 32], Fk)]) -> Result<(), StoreError> {
-        self.insert_many_with(entries, None)
+        let snap: Vec<([u8; 32], u64)> = entries.iter().map(|(m, f)| (*m, f.0)).collect();
+        let collect: SealCollect = Arc::new(move |first_fk, count| {
+            let mut pairs = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let fk = first_fk + i;
+                let mixed = snap.iter().find(|(_, f)| *f == fk).map(|(m, _)| *m).ok_or(
+                    StoreError::Corrupt("tx.head seal collect: fk not in insert batch"),
+                )?;
+                pairs.push((fuse_key_from_mixed(&mixed), (i as u32) + 1));
+            }
+            Ok(pairs)
+        });
+        self.insert_many_with(entries, collect)
     }
 
-    /// Insert with an optional seal-key collector (Class A `txid.body` in production).
-    ///
-    /// `collect(first_fk, count)` must return `count` `(fuse_key, rel)` pairs.
-    /// When `None`, this call's inserted keys are used; a roll that needs keys
-    /// from a prior insert (no collector) is `Corrupt`.
+    /// Insert; `collect` runs on the seal sidecar at roll (not on this thread).
     pub(crate) fn insert_many_with(
         &self,
         entries: &mut [([u8; 32], Fk)],
-        collect: Option<&FusePairCollect<'_>>,
+        collect: SealCollect,
     ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -408,7 +410,6 @@ impl SegmentedTxHead {
 
         self.try_publish_seal_locked()?;
 
-        let mut pending: Vec<(u64, u32)> = Vec::new();
         let mut i = 0usize;
         while i < entries.len() {
             self.ensure_open_for(entries[i].1 .0)?;
@@ -421,8 +422,7 @@ impl SegmentedTxHead {
             }
             let count = last.count.load(Ordering::Relaxed);
             if count >= self.max_keys {
-                let pairs = self.seal_pairs_locked(collect, last.first_fk, count, &mut pending)?;
-                self.roll_tail_background_locked(pairs)?;
+                self.roll_tail_background_locked(collect.clone())?;
                 continue;
             }
             let room = self.max_keys - count;
@@ -430,7 +430,7 @@ impl SegmentedTxHead {
             let batch = &mut entries[i..i + take];
             let first_fk = last.first_fk;
 
-            for (mixed, fk) in batch.iter_mut() {
+            for (_mixed, fk) in batch.iter_mut() {
                 if fk.0 < first_fk {
                     return Err(StoreError::Corrupt("tx.head insert fk before segment"));
                 }
@@ -439,9 +439,6 @@ impl SegmentedTxHead {
                     return Err(StoreError::Corrupt("tx.head relative fk overflow"));
                 }
                 *fk = Fk(rel);
-                if collect.is_none() {
-                    pending.push((fuse_key_from_mixed(mixed), rel as u32));
-                }
             }
             last.head
                 .as_ref()
@@ -452,31 +449,11 @@ impl SegmentedTxHead {
 
             let new_count = last.count.load(Ordering::Relaxed);
             if new_count >= self.max_keys {
-                let pairs = self.seal_pairs_locked(collect, first_fk, new_count, &mut pending)?;
-                self.roll_tail_background_locked(pairs)?;
+                self.roll_tail_background_locked(collect.clone())?;
             }
         }
         self.persist_meta_locked()?;
         Ok(())
-    }
-
-    fn seal_pairs_locked(
-        &self,
-        collect: Option<&FusePairCollect<'_>>,
-        first_fk: u64,
-        count: u64,
-        pending: &mut Vec<(u64, u32)>,
-    ) -> Result<Vec<(u64, u32)>, StoreError> {
-        if let Some(c) = collect {
-            pending.clear();
-            return c(first_fk, count);
-        }
-        if pending.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
-            ));
-        }
-        Ok(std::mem::take(pending))
     }
 }
 
@@ -873,7 +850,7 @@ impl SegmentedTxHead {
         Ok(())
     }
 
-    fn roll_tail_background_locked(&self, pairs: Vec<(u64, u32)>) -> Result<(), StoreError> {
+    fn roll_tail_background_locked(&self, collect: SealCollect) -> Result<(), StoreError> {
         self.wait_seal_locked()?;
         let segs = self.segments_snapshot();
         let last = segs
@@ -886,11 +863,6 @@ impl SegmentedTxHead {
         if count == 0 {
             return Ok(());
         }
-        if pairs.len() as u64 != count {
-            return Err(StoreError::Corrupt(
-                "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
-            ));
-        }
         let file_id = last.file_id;
         let first_fk = last.first_fk;
         if let Some(h) = last.head.as_ref() {
@@ -899,16 +871,16 @@ impl SegmentedTxHead {
         let next_fk = first_fk.saturating_add(count);
         self.open_new_locked(next_fk)?;
         self.persist_meta_locked()?;
-        self.spawn_seal(file_id, first_fk, count, pairs);
+        self.spawn_seal(file_id, first_fk, count, collect);
         Ok(())
     }
 
-    fn spawn_seal(&self, file_id: u32, first_fk: u64, count: u64, pairs: Vec<(u64, u32)>) {
+    fn spawn_seal(&self, file_id: u32, first_fk: u64, count: u64, collect: SealCollect) {
         let dir = self.dir.clone();
         let (tx, rx) = mpsc::channel();
         *self.seal_rx.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
         std::thread::spawn(move || {
-            let _ = tx.send(build_seal_publish(&dir, file_id, first_fk, count, pairs));
+            let _ = tx.send(collect_and_seal(&dir, file_id, first_fk, count, collect));
         });
     }
 
@@ -1034,6 +1006,27 @@ impl Drop for SegmentedTxHead {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.wait_seal_locked();
     }
+}
+
+fn collect_and_seal(
+    dir: &Path,
+    file_id: u32,
+    first_fk: u64,
+    count: u64,
+    collect: SealCollect,
+) -> Result<SealPublish, StoreError> {
+    let t0 = Instant::now();
+    let pairs = collect(first_fk, count)?;
+    rbitcoin_log::info!(
+        "store: tx.head seal collect file_id={file_id} count={count} duration_ms={}",
+        t0.elapsed().as_millis()
+    );
+    if pairs.len() as u64 != count {
+        return Err(StoreError::Corrupt(
+            "tx.head seal collect pair count mismatch",
+        ));
+    }
+    build_seal_publish(dir, file_id, first_fk, count, pairs)
 }
 
 fn build_seal_publish(
@@ -1347,6 +1340,34 @@ mod tests {
     }
 
     #[test]
+    fn seal_collect_runs_on_sidecar_not_insert_thread() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let caller = std::thread::current().id();
+        let collect_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let tid = collect_tid.clone();
+        let collect: SealCollect = std::sync::Arc::new(move |first_fk, count| {
+            *tid.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+            Ok((0..count)
+                .map(|i| {
+                    let fk = first_fk + i;
+                    (fuse_key_from_mixed(&mixed(fk)), (i as u32) + 1)
+                })
+                .collect())
+        });
+        let mut entries: Vec<_> = (0..205u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many_with(&mut entries, collect).unwrap();
+        h.flush().unwrap();
+        let got = collect_tid
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("collect ran on sidecar");
+        assert_ne!(got, caller, "collect must run on the seal sidecar");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn insert_roll_seal_lookup_roundtrip() {
         let dir = tmp();
         // 10-bit head: 1024 slots, max_keys = floor(0.8*1024)=819
@@ -1430,7 +1451,7 @@ mod tests {
         assert!(fuse_skip, "fuse miss must not pread g pages");
 
         let k = mixed(0xB1B0);
-        let collect = |first_fk: u64, count: u64| {
+        let collect: SealCollect = Arc::new(move |first_fk, count| {
             Ok((0..count)
                 .map(|i| {
                     let fk = first_fk + i;
@@ -1438,13 +1459,12 @@ mod tests {
                     (fuse_key_from_mixed(&m), (i as u32) + 1)
                 })
                 .collect())
-        };
-        h.insert_many_with(&mut [(k, Fk(821))], Some(&collect))
+        });
+        h.insert_many_with(&mut [(k, Fk(821))], collect.clone())
             .unwrap();
         let mut fill: Vec<_> = (822..1639).map(|i| (mixed(i), Fk(i))).collect();
-        h.insert_many_with(&mut fill, Some(&collect)).unwrap();
-        h.insert_many_with(&mut [(k, Fk(1639))], Some(&collect))
-            .unwrap();
+        h.insert_many_with(&mut fill, collect.clone()).unwrap();
+        h.insert_many_with(&mut [(k, Fk(1639))], collect).unwrap();
         let cands = h.probe_candidates(&k).unwrap();
         assert_eq!(
             cands.first().copied(),
@@ -1544,7 +1564,6 @@ mod tests {
             h.install_sealed_fuse(0, fuse).unwrap();
             let p = h.fuse_path_for_file_id(0);
             assert!(p.to_string_lossy().contains("000000.fuse8"));
-            assert_eq!(h.open_keys_len(), 0);
             h.flush().unwrap();
         }
 
