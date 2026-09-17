@@ -20,6 +20,7 @@ STORE_PLATFORM_FILTERS=(
   uring_session::tests::pool_
   io_session_iocp
   fuse8_filter::tests::no_false_negatives_and_roundtrip
+  segmented_head::tests::insert_roll_seal_lookup_roundtrip
 )
 # Query confirm: TableFile + Class C write-behind on the native completion
 # session (IOCP / pool). Not the full query suite. Windows and Darwin run
@@ -37,14 +38,9 @@ case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT*)
     STORE_PLATFORM_SKIPS+=(concurrent_readers_during_append_and_grow)
     STORE_PLATFORM_FILTERS+=(create_loc::tests::prefix_sum)
-    STORE_PLATFORM_FILTERS+=(segmented_head::tests::insert_roll_seal_lookup_roundtrip)
     ;;
   Darwin*)
     STORE_PLATFORM_FILTERS+=(create_loc::tests::prefix_sum)
-    STORE_PLATFORM_FILTERS+=(segmented_head::tests::insert_roll_seal_lookup_roundtrip)
-    ;;
-  *)
-    STORE_PLATFORM_FILTERS+=(segmented_head::tests::insert_roll_seal_lookup_roundtrip)
     ;;
 esac
 

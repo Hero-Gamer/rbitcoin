@@ -6,7 +6,16 @@
 exception is **read-only immutable** sealed `.fuse8` fingerprint arrays in
 [`fuse8_filter.rs`](../crates/rbitcoin-store/src/fuse8_filter.rs) (Unix `mmap`
 `PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`). Packed MPHF
-`g` stays FdOnly 4 KiB. `strong_tx` and mempool stay process `Vec`.
+`g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
+thread, while `KIND_MPHF_G` keeps 128 pages in flight on the completion
+session. `strong_tx` and mempool stay process `Vec`.
+
+**Map vs FdOnly:** map when the bytes are immutable after write, touched as
+a few random bytes per key, and must stay resident for the hot path (sealed
+`.fuse8`: every unfinished key probes every sealed segment). Keep FdOnly +
+completion session when the file is larger than the residency budget or is
+read as page batches (`txid.body` / `txout` / `spent` / `create.loc`, packed
+BDZ `g`, SH tags/`.val`).
 
 Related: [`env-knobs.md`](./env-knobs.md), [`concurrency.md`](./concurrency.md),
 [`crash-recovery.md`](./crash-recovery.md), [`architecture.md`](./architecture.md).

@@ -105,7 +105,6 @@ TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | File page cache (FdOnly tables + mapped `.fuse8`) — not a Rust leak |
 | `fuse8=` | Heap-owned sealed fuse fingerprints; **0** after mmap open/seal. Idle fuse RSS is `file=` (kernel may drop pages; cheaper than swapping anon) |
-| `open_keys=` | Always **0**. Seal collects keys once from `txid.body` and drops them |
 | `mphf_g=` | Sealed BDZ `g` heap; **0** after FdOnly open (pages are `RssFile`) |
 | `class_c_l2=` ≈ creates/8 | Strong-tx bit image under the Class C in-RAM cap (process `Vec`; not mapped) |
 
@@ -132,7 +131,7 @@ grep 'tip: perf' mainnet.log
 | `conf loadq=` / `scriptq` / `writeq` | Real queue contents (loadq cap **14**) + pipeline-wide `parents=` + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH catalog runs / tip heads |
-| `heap … iflight= wloc= h2h= fence= fuse8= mphf_g= open_keys= class_c_l2= accounted= residual=` | Approx process **heap**: BQ + load-ahead CreatePins (`iflight=`) + write loc packs (`wloc=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + sealed fuse **heap** (`fuse8=`, 0 after mmap) + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + open-segment fuse keys (`open_keys=`, always 0) + Class C L2 images; residual = anon − accounted. Mapped `.fuse8` is `file=`, not `fuse8=` |
+| `heap … iflight= wloc= h2h= fence= fuse8= mphf_g= class_c_l2= accounted= residual=` | Approx process **heap**: BQ + load-ahead CreatePins (`iflight=`) + write loc packs (`wloc=`) + `height_by_hash` + height fence (`Arc` snapshot for leftover TipOnly — not a 15 MiB memcpy/wave) + confirm wire + sealed fuse **heap** (`fuse8=`, 0 after mmap) + FdOnly BDZ `g` heap (`mphf_g=`, 0 after open) + Class C L2 images; residual = anon − accounted. Mapped `.fuse8` is `file=`, not `fuse8=` |
 
 ## Residual heap audit (872k / ~1.42 B creates)
 
@@ -144,16 +143,15 @@ intentional:
 | Retain | Approx at 1.42 B creates | Notes |
 |--------|-------------------------:|-------|
 | **Sealed `tx.head` fuse8** | **0 heap**; ~1.5–1.6 GiB `file=` | Read-only mmap of every sealed `.fuse8` (~9 bits/key). Kernel may drop hot fuse under pressure; next `contains` faults the file. |
-| **Sealed BDZ `g`** | **0 heap** | Header only; 4 KiB `g` pages via uring stream (`KIND_MPHF_G`). Hot pages are kernel `RssFile`. Do not mmap packed `g`. |
+| **Sealed BDZ `g`** | **0 heap** | Header only; 4 KiB `g` pages via uring stream (`KIND_MPHF_G`). Hot pages are kernel `RssFile`. FdOnly because a mapped miss serializes one fault per lookup thread; the ring keeps 128 pages in flight. Do not mmap packed `g`. |
 | **Class C L2 `strong_tx`** | **~177 MiB** | 1 bit/create, under the 256 MiB in-RAM cap. Stays process `Vec`: `MAP_SHARED` would write before the tip barrier; `MAP_PRIVATE` COWs `set_bit` back into anon. |
-| **Open-segment `open_keys`** | **0** | Seal collects `(mix, rel)` once from `txid.body`, then drops. OA is keyless. |
 | **Mempool schema 2** | Slot table ~6 MiB at 128k + body weight | InRam `slots`/`body` Vecs + `pwrite`. Live set is also the graph. Not mapped. |
 | **`height_by_hash`** | **~60 MiB** | In-process confirmed hash→height map. Incremental on tip extend/shrink; full `0..=tip` walk on open / invalidate only. |
-| **mimalloc arenas** | **anon − accounted** after IBD | Product bins are global mimalloc. IBD allocates/frees GiB-class transients; `free` is not `munmap`. After tip catch-up, `anon=` can stay fat while `accounted=` collapses. That is allocator residue, not a store leak. Fuse mmap / `open_keys=0` does not mean RSS equals fuse. Do not `malloc_trim` a mimalloc process. Optional operator: `MIMALLOC_PURGE_DELAY=0`. The `mimalloc` crate does not expose `mi_collect` on `MiMalloc` (no in-process purge hook). |
+| **mimalloc arenas** | **anon − accounted** after IBD | Product bins are global mimalloc. IBD allocates/frees GiB-class transients; `free` is not `munmap`. After tip catch-up, `anon=` can stay fat while `accounted=` collapses. That is allocator residue, not a store leak. Fuse mmap does not mean RSS equals fuse. Do not `malloc_trim` a mimalloc process. Optional operator: `MIMALLOC_PURGE_DELAY=0`. The `mimalloc` crate does not expose `mi_collect` on `MiMalloc` (no in-process purge hook). |
 | **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |
 
-Meters `fuse8=` / `mphf_g=` / `open_keys=` / `class_c_l2=` enter `accounted`.
-`fuse8=` / `mphf_g=` / `open_keys=` are **0** after open (mmap / FdOnly / no retain).
+Meters `fuse8=` / `mphf_g=` / `class_c_l2=` enter `accounted`.
+`fuse8=` / `mphf_g=` are **0** after open (mmap / FdOnly).
 Mapped fuse RSS is `file=`, not a fake leak.
 
 Grep:

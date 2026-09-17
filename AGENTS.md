@@ -151,7 +151,7 @@ the leftover in **Refactor**. Checkpoint when `--lib` is green.
 ### Push, PR, poll CI
 
 Required jobs: **`fmt`**, **`deny`**, **`clippy`**, **`ast-grep`**, **`test`**,
-**`windows`**, **`macos`**, **`coverage`**. Structural scan is
+**`windows`**, **`macos`**, **`coverage`**, **`nixos-module-eval`**. Structural scan is
 `./scripts/ast-grep.sh` (rules live in `lint/ast-grep/`; do not copy them here).
 `windows` / `macos` are native
 store + `--smoke` (not operator zips). Operator binaries are GitHub Releases
