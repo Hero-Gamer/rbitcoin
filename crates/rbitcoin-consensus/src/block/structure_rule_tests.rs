@@ -1706,6 +1706,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     let tx_a = spend_acs(c1_txid, 0, Amount::from_sat(49_0000_0000));
     let tx_a_id = tx_a.compute_txid();
     let tx_b = spend_acs(tx_a_id, 0, Amount::from_sat(48_0000_0000));
+    let tx_b_id = tx_b.compute_txid();
     let b_s1 = mine_with(tip, tip_time + 600, h_spend, vec![tx_a, tx_b]);
     commit_class_a_block(&q, &params, Height(h_spend), &b_s1, ms).unwrap();
     assert_eq!(q.tip_height().map(|h| h.0), Some(maturity + 2));
@@ -1725,6 +1726,16 @@ fn already_archived_schema13_pin_identity_tip_follow() {
         let ok = confirm_scripts_phase(mat.batch).expect("scripts");
         confirm_write_phase(&q, &params, ms, ok.batch)
             .expect("plan=None confirm with same-block spends must succeed");
+        let tx_a_fk = q.tx_fk_by_txid(tx_a_id.as_byte_array()).unwrap().unwrap();
+        let tx_b_fk = q.tx_fk_by_txid(tx_b_id.as_byte_array()).unwrap().unwrap();
+        let (off, _) = q.store().tx_spent_range(tx_a_fk).unwrap();
+        let abs0 = rbitcoin_store::spent_abs(off, 0);
+        let bulk = q.store().get_spender_meta_at_abs_batch(&[abs0]).unwrap();
+        assert_eq!(bulk[0].unwrap().0, tx_b_fk);
+        let (boff, _) = q.store().tx_spent_range(tx_b_fk).unwrap();
+        let babs = rbitcoin_store::spent_abs(boff, 0);
+        let bbulk = q.store().get_spender_meta_at_abs_batch(&[babs]).unwrap();
+        assert!(bbulk[0].unwrap().0.is_null());
     }
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_spend));
     assert!(q.is_outpoint_spent(c1_txid.as_byte_array(), 0).unwrap());

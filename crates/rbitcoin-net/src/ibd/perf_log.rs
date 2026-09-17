@@ -224,6 +224,8 @@ pub(crate) struct IbdPerfSample {
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
+    /// Same-batch overlay slots that skipped the structural meta pread.
+    pub ovl_n: u64,
     pub load_ms: u64,
     /// Wire load residual (inside load/pre_asm, outside pin): Arc clone.
     pub prep_wire_arc_ms: u64,
@@ -487,6 +489,7 @@ impl Default for IbdPerfSample {
             ann_pread_skip: 0,
             meta_ms: 0,
             meta_n: 0,
+            ovl_n: 0,
             load_ms: 0,
             prep_wire_arc_ms: 0,
             prep_struct_ms: 0,
@@ -830,6 +833,7 @@ pub(crate) fn sample(
     let ann_pread_skip = w.spend_ann_pread_skip;
     let meta_ns = w.spend_meta_ns;
     let meta_n = w.spend_meta_n;
+    let ovl_n = w.spend_overlay_skip_n;
     let ensure_res_hit = w.ensure_res_hit;
     let ensure_cold_n = w.ensure_cold_n;
     let asm_prevout_ns = w.asm_prevout_ns;
@@ -939,6 +943,7 @@ pub(crate) fn sample(
         ann_pread_skip,
         meta_ms: ns_ms(meta_ns),
         meta_n,
+        ovl_n,
         load_ms: ns_ms(load_ns),
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
         prep_struct_ms: ns_ms(prep_struct_ns),
@@ -1443,6 +1448,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.meta_ms,
         s.meta_n,
     ));
+    append_nz(&mut out, "ovl_n", s.ovl_n);
     if s.arch_write_body_ms > 0 || s.arch_write_head_ms > 0 || s.arch_write_htxs_ms > 0 {
         out.push_str(&format!(
             " class_a_sub(body={} head={} htxs={} reserve={})",
@@ -2184,6 +2190,17 @@ mod tests {
         assert!(line.contains("us/new=200"), "{line}");
         assert!(!line.contains("res_lk"), "{line}");
         assert!(!line.contains("pin_res="), "{line}");
+    }
+
+    #[test]
+    fn format_info_ovl_n_next_to_meta() {
+        let mut s = IbdPerfSample::default();
+        s.meta_n = 40;
+        s.ovl_n = 12;
+        let line = format_info(&s);
+        assert!(line.contains("meta="), "{line}");
+        assert!(line.contains("ovl_n=12"), "{line}");
+        assert!(!line.contains("same_n=12"), "{line}");
     }
 
     /// Optional stamp_sub / head_loc / lookup_sub / plan_batch tokens on the
