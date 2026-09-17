@@ -193,9 +193,10 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
    avoid wasting RAM and avoid wasting CPU. Spending one to save the other
    is allowed only as a **named trade** — owner doc or rustdoc on the
    surface, not an accident of the first version that compiled. FdOnly
-   packed `g` (`mphf_g=0`) versus mmap sealed `.fuse8` (`fuse8=0` heap;
-   reclaim is drop of file pages, not swap) is that kind of choice.
-   `strong_tx` and mempool stay process `Vec` (Class C tip-last write-behind
+   packed `g` (`mphf_g=0`) versus mmap sealed `.fuse8` (`fuse8=0` heap)
+   and SH BDZ3 occupancy (`mphf_occ=` supers only; occ bits are `file=`)
+   is that kind of choice. Reclaim of mapped fuse/occ is drop of file pages,
+   not swap. `strong_tx` and mempool stay process `Vec` (Class C tip-last write-behind
    / live graph); do not mmap those because fuse mapping looked good.
 
    Write as if the structure is huge, because in IBD it is. **Address** it

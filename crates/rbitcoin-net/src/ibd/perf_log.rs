@@ -1678,6 +1678,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(write_wire_mib)) as u64;
     let fuse8_mib = h.fuse8_bytes / (1024 * 1024);
     let mphf_g_mib = h.mphf_g_bytes / (1024 * 1024);
+    let mphf_occ_mib = h.mphf_occ_bytes / (1024 * 1024);
     let class_c_l2_mib = h.class_c_l2_bytes / (1024 * 1024);
     let accounted_mib = bq_mib
         .saturating_add(if_mib)
@@ -1687,6 +1688,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         .saturating_add(conf_wire_mib)
         .saturating_add(fuse8_mib)
         .saturating_add(mphf_g_mib)
+        .saturating_add(mphf_occ_mib)
         .saturating_add(class_c_l2_mib);
     let anon_mib = kb_mib(s.rss_anon_kb);
     let residual_mib = anon_mib.saturating_sub(accounted_mib);
@@ -1700,7 +1702,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
            feed ready={} inflight={} \
          | heap bq={}MiB iflight={}L/{}pin≈{}MiB wloc={}L/{}pair≈{}MiB \
            h2h={}k≈{}MiB fence={}≈{}MiB \
-           wire={}MiB fuse8={}MiB mphf_g={}MiB class_c_l2={}MiB \
+           wire={}MiB fuse8={}MiB mphf_g={}MiB mphf_occ={}MiB class_c_l2={}MiB \
            accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} heads={}",
@@ -1756,6 +1758,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         conf_wire_mib,
         fuse8_mib,
         mphf_g_mib,
+        mphf_occ_mib,
         class_c_l2_mib,
         accounted_mib,
         residual_mib,
@@ -2509,6 +2512,7 @@ mod tests {
         assert!(line.contains("residual≈"), "{line}");
         assert!(line.contains("fuse8=0MiB"), "{line}");
         assert!(line.contains("mphf_g="), "{line}");
+        assert!(line.contains("mphf_occ="), "{line}");
         assert!(line.contains("class_c_l2="), "{line}");
         assert!(!line.contains("open_keys="), "{line}");
         assert!(!line.contains("shadow"), "{line}");

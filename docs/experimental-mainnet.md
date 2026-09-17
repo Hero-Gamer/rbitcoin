@@ -131,7 +131,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 
 | Risk | Notes |
 |------|--------|
-| Disk / RAM | Multi‑100 GiB Class A; segmented 25-bit `tx.head.*` + mapped `.fuse8` (~1.5 GiB `RssFile`, heap `fuse8=0`); sealed BDZ `g` FdOnly (not anon heap) |
+| Disk / RAM | Multi‑100 GiB Class A; segmented 25-bit `tx.head.*` + mapped `.fuse8` (~1.5 GiB `RssFile`, heap `fuse8=0`); SH BDZ3 occ mapped (~150 MiB `file=` at ~1 B keys); sealed BDZ `g` FdOnly (not anon heap) |
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB**; **scripts verified on accept** |

@@ -118,7 +118,8 @@ checklist.
 - **Build:** rustc **1.95.0** in CI and Nix; `cargo deny`; no floating
   `stable`. Musl operator binary is GitHub Release only.
 - **Fuse8 / leftover:** sealed `.fuse8` fingerprints are read-only mmap
-  (heap `fuse8=0`); BDZ `g` is FdOnly. Optional `sp_tweaks` leftover
+  (heap `fuse8=0`); SH BDZ3 occupancy is the same class (prefix map;
+  `mphf_occ=` supers); BDZ `g` is FdOnly. Optional `sp_tweaks` leftover
   regenerate is not a Class A wipe.
 - **Meters:** instance `ConfirmStats` / session IO stats. No process-global
   confirm meters, no TLS `test_take_*` probes.

@@ -21,6 +21,7 @@ STORE_PLATFORM_FILTERS=(
   io_session_iocp
   fuse8_filter::tests::no_false_negatives_and_roundtrip
   segmented_head::tests::insert_roll_seal_lookup_roundtrip
+  bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram
 )
 # Query confirm: TableFile + Class C write-behind on the native completion
 # session (IOCP / pool). Not the full query suite. Windows and Darwin run

@@ -4,6 +4,7 @@
 
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
+use crate::readonly_map::ReadonlyMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,10 +36,32 @@ enum GStore {
     },
 }
 
+enum OccBits {
+    Words(Box<[u64]>),
+    Map {
+        map: ReadonlyMap,
+        off: usize,
+        len: usize,
+    },
+}
+
+impl std::fmt::Debug for OccBits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Words(w) => f.debug_tuple("Words").field(&w.len()).finish(),
+            Self::Map { off, len, .. } => f
+                .debug_struct("Map")
+                .field("off", off)
+                .field("len", len)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CompactRank {
     m: u32,
-    occ: Box<[u64]>,
+    occ: OccBits,
     supers: Box<[u32]>,
 }
 
@@ -134,6 +157,17 @@ impl BdzMphf {
             GStore::Ram(g) => g.len() * 4,
             GStore::Fd { .. } => 0,
         }
+    }
+
+    pub fn occ_bytes_resident(&self) -> usize {
+        let Some(rank) = &self.compact else {
+            return 0;
+        };
+        let occ = match &rank.occ {
+            OccBits::Words(w) => w.len() * 8,
+            OccBits::Map { .. } => 0,
+        };
+        occ + rank.supers.len() * 4
     }
 
     #[cfg(test)]
@@ -559,7 +593,10 @@ impl BdzMphf {
             f.write_all(&hdr).map_err(|e| StoreError::io(path, e))?;
             if self.n > 0 {
                 pack_g_write(g, COMPACT_G_BITS, f).map_err(|e| StoreError::io(path, e))?;
-                write_occ(&rank.occ, rank.m, f).map_err(|e| StoreError::io(path, e))?;
+                let OccBits::Words(occ) = &rank.occ else {
+                    return Err(StoreError::Corrupt("bdz mphf: write requires RAM occ"));
+                };
+                write_occ(occ, rank.m, f).map_err(|e| StoreError::io(path, e))?;
             }
             Ok(())
         })
@@ -567,6 +604,10 @@ impl BdzMphf {
 
     pub fn read_compact_from(path: &Path) -> Result<Self, StoreError> {
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
+        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
+        if meta.len() < HEADER_LEN3 {
+            return Err(StoreError::Corrupt("bdz mphf: g length"));
+        }
         let mut hdr = [0u8; HEADER_LEN3 as usize];
         pread_exact(&file, path, 0, &mut hdr)?;
         if &hdr[0..4] != MAGIC3 {
@@ -596,13 +637,12 @@ impl BdzMphf {
         let n_verts = if n == 1 { 1 } else { m };
         let g_bytes = packed_g_bytes(n_verts, COMPACT_G_BITS);
         let occ_n = occ_packed_bytes(n_verts) as usize;
-        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
         if meta.len() < HEADER_LEN3 + g_bytes + occ_n as u64 {
             return Err(StoreError::Corrupt("bdz mphf: g length"));
         }
-        let mut occ_buf = vec![0u8; occ_n];
-        pread_exact(&file, path, HEADER_LEN3 + g_bytes, &mut occ_buf)?;
-        let occ = read_occ(&occ_buf, n_verts);
+        let prefix = (HEADER_LEN3 + g_bytes + occ_n as u64) as usize;
+        let map = ReadonlyMap::map_prefix(path, prefix)?;
+        let occ_off = HEADER_LEN3 as usize + g_bytes as usize;
         Ok(Self {
             n,
             m: n_verts,
@@ -616,7 +656,7 @@ impl BdzMphf {
                 g_bits: COMPACT_G_BITS,
                 page_preads: AtomicU64::new(0),
             },
-            compact: Some(CompactRank::from_occ(occ, n_verts)),
+            compact: Some(CompactRank::from_mapped(map, occ_off, occ_n, n_verts)?),
         })
     }
 
@@ -1213,68 +1253,94 @@ fn occ_set(occ: &mut [u64], v: u32) {
 
 fn write_occ(occ: &[u64], m: u32, w: &mut impl Write) -> std::io::Result<()> {
     let n = occ_packed_bytes(m) as usize;
-    let mut buf = vec![0u8; n];
-    for v in 0..m {
-        if occ[(v / 64) as usize] & (1u64 << (v % 64)) != 0 {
-            buf[(v / 8) as usize] |= 1 << (v % 8);
-        }
-    }
-    w.write_all(&buf)
+    let bytes = u64_words_as_bytes(occ);
+    w.write_all(&bytes[..n])
 }
 
-fn read_occ(buf: &[u8], m: u32) -> Box<[u64]> {
-    let mut occ = vec![0u64; (m as usize).div_ceil(64)];
-    for v in 0..m {
-        let byte = buf.get((v / 8) as usize).copied().unwrap_or(0);
-        if byte & (1 << (v % 8)) != 0 {
-            occ_set(&mut occ, v);
-        }
-    }
-    occ.into_boxed_slice()
+fn u64_words_as_bytes(occ: &[u64]) -> &[u8] {
+    // SAFETY: occupancy bits are the LE byte image of the u64 words.
+    unsafe { std::slice::from_raw_parts(occ.as_ptr().cast::<u8>(), occ.len() * 8) }
 }
 
-fn popcount_range(occ: &[u64], lo: usize, hi: usize) -> u32 {
+fn popcount_bits(occ: &[u8], lo: usize, hi: usize) -> u32 {
+    if lo >= hi {
+        return 0;
+    }
     let mut n = 0u32;
     let mut b = lo;
     while b < hi {
-        let word = b / 64;
-        let bit = b % 64;
-        let take = (64 - bit).min(hi - b);
-        let mask = if take == 64 {
-            u64::MAX
+        let byte_i = b / 8;
+        let bit = b % 8;
+        let take = (8 - bit).min(hi - b);
+        let byte = occ.get(byte_i).copied().unwrap_or(0);
+        let mask = if take == 8 {
+            0xFFu8
         } else {
-            ((1u64 << take) - 1) << bit
+            ((1u8 << take) - 1) << bit
         };
-        n += (occ.get(word).copied().unwrap_or(0) & mask).count_ones();
+        n += (byte & mask).count_ones();
         b += take;
     }
     n
+}
+
+fn supers_from_occ_bytes(occ: &[u8], m: u32) -> Box<[u32]> {
+    let n_supers = (m as usize).div_ceil(RANK_SUPER_BITS as usize);
+    let mut supers = vec![0u32; n_supers + 1];
+    let mut acc = 0u32;
+    for (i, slot) in supers.iter_mut().enumerate().take(n_supers) {
+        *slot = acc;
+        let bit0 = i * RANK_SUPER_BITS as usize;
+        let bit1 = ((i + 1) * RANK_SUPER_BITS as usize).min(m as usize);
+        acc += popcount_bits(occ, bit0, bit1);
+    }
+    supers[n_supers] = acc;
+    supers.into_boxed_slice()
 }
 
 impl CompactRank {
     fn empty() -> Self {
         Self {
             m: 0,
-            occ: Box::new([]),
+            occ: OccBits::Words(Box::new([])),
             supers: Box::new([0]),
         }
     }
 
     fn from_occ(occ: Box<[u64]>, m: u32) -> Self {
-        let n_supers = (m as usize).div_ceil(RANK_SUPER_BITS as usize);
-        let mut supers = vec![0u32; n_supers + 1];
-        let mut acc = 0u32;
-        for (i, slot) in supers.iter_mut().enumerate().take(n_supers) {
-            *slot = acc;
-            let bit0 = i * RANK_SUPER_BITS as usize;
-            let bit1 = ((i + 1) * RANK_SUPER_BITS as usize).min(m as usize);
-            acc += popcount_range(&occ, bit0, bit1);
-        }
-        supers[n_supers] = acc;
+        let supers = supers_from_occ_bytes(u64_words_as_bytes(&occ), m);
         Self {
             m,
-            occ,
-            supers: supers.into_boxed_slice(),
+            occ: OccBits::Words(occ),
+            supers,
+        }
+    }
+
+    fn from_mapped(map: ReadonlyMap, off: usize, len: usize, m: u32) -> Result<Self, StoreError> {
+        let bytes = map.as_file_bytes();
+        if off.saturating_add(len) > bytes.len() {
+            return Err(StoreError::Corrupt("bdz mphf: occ truncated"));
+        }
+        let need = occ_packed_bytes(m) as usize;
+        if len < need {
+            return Err(StoreError::Corrupt("bdz mphf: occ truncated"));
+        }
+        let supers = supers_from_occ_bytes(&bytes[off..off + len], m);
+        Ok(Self {
+            m,
+            occ: OccBits::Map { map, off, len },
+            supers,
+        })
+    }
+
+    fn occ_bytes(&self) -> &[u8] {
+        match &self.occ {
+            OccBits::Words(w) => {
+                let n = occ_packed_bytes(self.m) as usize;
+                let b = u64_words_as_bytes(w);
+                &b[..n.min(b.len())]
+            }
+            OccBits::Map { map, off, len } => &map.as_file_bytes()[*off..*off + *len],
         }
     }
 
@@ -1282,7 +1348,7 @@ impl CompactRank {
         let v = v.min(self.m);
         let si = (v / RANK_SUPER_BITS) as usize;
         let rem_lo = si * RANK_SUPER_BITS as usize;
-        self.supers[si] + popcount_range(&self.occ, rem_lo, v as usize)
+        self.supers[si] + popcount_bits(self.occ_bytes(), rem_lo, v as usize)
     }
 }
 
@@ -1733,6 +1799,21 @@ mod tests {
         assert_eq!(g_bits, 2);
         let fd = BdzMphf::read_compact_from(&p).unwrap();
         assert_eq!(fd.g_bytes_resident(), 0);
+        let m = compact_vertex_count(keys.len() as u32);
+        let occ_off = HEADER_LEN3 + packed_g_bytes(m, COMPACT_G_BITS);
+        assert_ne!(
+            occ_off % 8,
+            0,
+            "occ follows packed g; rank must popcount bytes, not &[u64]"
+        );
+        let n_supers = (m as usize).div_ceil(RANK_SUPER_BITS as usize);
+        let supers_heap = (n_supers + 1) * 4;
+        assert_eq!(
+            fd.occ_bytes_resident(),
+            supers_heap,
+            "open must map occ; heap is supers only"
+        );
+        assert!(occ_packed_bytes(m) as usize > supers_heap);
         assert_eq!(raw.len() as u64, ram.trailer_off());
         assert_eq!(fd.trailer_off(), ram.trailer_off());
         for &k in &keys {
@@ -1745,10 +1826,10 @@ mod tests {
         assert_eq!(fd.index(keys[0]).unwrap(), ram.index(keys[0]).unwrap());
         let empty = dir.join("empty.mphf");
         std::fs::File::create(&empty).unwrap();
-        assert!(matches!(
-            BdzMphf::read_compact_from(&empty),
-            Err(StoreError::Corrupt(_))
-        ));
+        match BdzMphf::read_compact_from(&empty) {
+            Err(StoreError::Corrupt(_)) => {}
+            other => panic!("empty mphf must be Corrupt, got {other:?}"),
+        }
         assert!(fd.take_g_page_preads() >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

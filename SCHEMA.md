@@ -608,8 +608,9 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 - Key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire APIs still use 32 B).
 - **Main (sealed):** `scripthash.head/NN.mphf` (`BDZ3` 32 B header, packed 2-bit
   `g[m]`, occupancy bitvector `[m]`, then `n` mix64(key16) tags) + `NN.val`
-  (`n × 8` pack8). Packed `g` is FdOnly 4 KiB pages; occupancy is
-  sequential-read into RAM on open. MPHF maps into `[0, n)`; a miss fails the
+  (`n × 8` pack8). Packed `g` is FdOnly 4 KiB pages; occupancy is a
+  read-only map of the header+`g`+occ prefix (not tags; `HEADER+g` is not
+  8-aligned, so rank popcounts bytes). MPHF maps into `[0, n)`; a miss fails the
   tag check (no main `.fuse8`). Record count is immutable after seal. Existing
   keys pwrite pack8 at `i×8`. New keys are **not** punched into main.
 - pack8 (LE u64): bits 63–62 mode; `00` = 1-fk `create_fk`; `01` = slab

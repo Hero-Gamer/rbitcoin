@@ -39,6 +39,12 @@ before 1.0).
   sealed `.fuse8` and confirms a few blocks (`connect_chain_query_surface` /
   spend-edge).
 
+- **SH BDZ3 occupancy mmap:** compact `read_compact_from` maps the
+  `NN.mphf` prefix through occ (not tags). Rank popcounts mapped bytes
+  (`HEADER+g` is not 8-aligned). Heap after open is the superblock table
+  (`mphf_occ=`); packed `g` stays FdOnly. Windows/macOS smoke runs the
+  compact packed-fd roundtrip.
+
 - **Windows positional IO on IOCP handles:** `IoHandle` pread/pwrite sets the
   low bit of `OVERLAPPED.hEvent` so the packet is not queued to the completion
   port. A stack OVERLAPPED on a bound handle was harvested with `Box::from_raw`

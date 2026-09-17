@@ -2334,6 +2334,7 @@ impl TxTable {
             sealed_segments: self.head.sealed_segment_count() as u64,
             fuse8_bytes: self.head.sealed_fuse_resident_bytes(),
             mphf_g_bytes: self.head.sealed_mphf_g_resident_bytes(),
+            mphf_occ_bytes: 0,
             class_c_l2_bytes: 0,
         }
     }
