@@ -511,6 +511,26 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+ENV_DD="$WORKDIR/rpc-wait-idle"
+mkdir -p "$ENV_DD"
+printf 'regtest=1\n' >"$ENV_DD/bitcoin.conf"
+ENV_FAKE="$WORKDIR/env-node"
+ENV_OUT="$WORKDIR/child-env"
+cat >"$ENV_FAKE" <<EOF
+#!/bin/sh
+env | grep -F RBITCOIN_RPC_WAIT_TIP_IDLE >"$ENV_OUT" || true
+exit 0
+EOF
+chmod +x "$ENV_FAKE"
+RBITCOIN_NODE="$ENV_FAKE" "$SHIM" -datadir="$ENV_DD" -regtest -noserver >/dev/null 2>&1 || true
+if grep -q '^RBITCOIN_RPC_WAIT_TIP_IDLE=1$' "$ENV_OUT" 2>/dev/null; then
+  echo "ok - shim sets RBITCOIN_RPC_WAIT_TIP_IDLE on the node"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - shim sets RBITCOIN_RPC_WAIT_TIP_IDLE (got: $([[ -f $ENV_OUT ]] && cat "$ENV_OUT" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
 FAKE_MCW="$WORKDIR/rbitcoin-node-minchainwork"
 printf '%s\n' '#!/bin/sh' \
   'echo "Error: configuration error: Invalid minimum work specified (test), must be up to 64 hex digits"' \

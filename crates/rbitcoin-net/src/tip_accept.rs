@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
@@ -21,6 +21,7 @@ type Job = Box<dyn FnOnce() + Send>;
 
 struct Inflight {
     n: AtomicU32,
+    gen: AtomicU64,
     mu: Mutex<()>,
     cv: Condvar,
 }
@@ -29,13 +30,16 @@ fn inflight() -> &'static Inflight {
     static I: OnceLock<Inflight> = OnceLock::new();
     I.get_or_init(|| Inflight {
         n: AtomicU32::new(0),
+        gen: AtomicU64::new(0),
         mu: Mutex::new(()),
         cv: Condvar::new(),
     })
 }
 
 fn begin_job() {
-    inflight().n.fetch_add(1, Ordering::SeqCst);
+    let i = inflight();
+    i.gen.fetch_add(1, Ordering::SeqCst);
+    i.n.fetch_add(1, Ordering::SeqCst);
 }
 
 fn end_job() {
@@ -64,6 +68,34 @@ pub(crate) fn wait_idle() {
     let mut g = i.mu.lock().unwrap_or_else(|e| e.into_inner());
     while i.n.load(Ordering::SeqCst) > 0 {
         g = i.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+fn wait_tip_idle_from_env(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if s == "1" || s.eq_ignore_ascii_case("true"))
+}
+
+/// Wait until the tip-accept job that was running when this call started
+/// finishes. A queued follow-on accept may still be in flight.
+pub(crate) fn wait_current_job() {
+    if on_tip_accept_thread() {
+        return;
+    }
+    let i = inflight();
+    let mut g = i.mu.lock().unwrap_or_else(|e| e.into_inner());
+    let snapshot = i.gen.load(Ordering::SeqCst);
+    while i.n.load(Ordering::SeqCst) > 0 && i.gen.load(Ordering::SeqCst) == snapshot {
+        g = i.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// RPC / `wait_height` tip latch. Default is [`wait_current_job`].
+/// `RBITCOIN_RPC_WAIT_TIP_IDLE=1` restores [`wait_idle`] (Core `sync_blocks`).
+pub(crate) fn wait_for_rpc() {
+    if wait_tip_idle_from_env(std::env::var("RBITCOIN_RPC_WAIT_TIP_IDLE").ok().as_deref()) {
+        wait_idle();
+    } else {
+        wait_current_job();
     }
 }
 
@@ -214,6 +246,64 @@ mod tests {
         waiter.join().expect("wait_idle");
         worker.join().expect("job");
         wait_idle();
+    }
+
+    #[test]
+    fn wait_current_job_returns_while_second_job_queued() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (started1_tx, started1_rx) = mpsc::sync_channel(1);
+        let (release1_tx, release1_rx) = mpsc::sync_channel(1);
+        let (started2_tx, started2_rx) = mpsc::sync_channel(1);
+        let (release2_tx, release2_rx) = mpsc::sync_channel(1);
+        let first = thread::spawn(move || {
+            run_on_tip_accept(move || {
+                started1_tx.send(()).unwrap();
+                release1_rx.recv().unwrap();
+            });
+        });
+        started1_rx.recv().unwrap();
+        let second = thread::spawn(move || {
+            run_on_tip_accept(move || {
+                started2_tx.send(()).unwrap();
+                release2_rx.recv().unwrap();
+            });
+        });
+        thread::sleep(Duration::from_millis(20));
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            wait_current_job();
+            done_tx.send(()).ok();
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "wait_current_job must not return while the snapshotted job is running"
+        );
+        release1_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait_current_job must return when job 1 ends");
+        waiter.join().expect("wait_current_job thread");
+        assert!(
+            started2_rx.try_recv().is_err() || !second.is_finished(),
+            "second job must still be queued or running after wait_current_job returns"
+        );
+        release2_tx.send(()).unwrap();
+        first.join().expect("job1");
+        second.join().expect("job2");
+    }
+
+    #[test]
+    fn wait_tip_idle_from_env_only_one_and_true() {
+        assert!(!wait_tip_idle_from_env(None));
+        assert!(!wait_tip_idle_from_env(Some("")));
+        assert!(!wait_tip_idle_from_env(Some("0")));
+        assert!(!wait_tip_idle_from_env(Some("false")));
+        assert!(wait_tip_idle_from_env(Some("1")));
+        assert!(wait_tip_idle_from_env(Some("true")));
+        assert!(wait_tip_idle_from_env(Some("TRUE")));
     }
 
     #[tokio::test]

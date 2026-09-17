@@ -49,7 +49,10 @@ as `N−11`, `-whitelist` → `--net-permission`, `-whitebind` → `--net-permis
 `-whitelistrelay` → `--net-permission-relay`, `-checkblocks` → `--check-blocks`,
 `-blocksonly` → `--blocks-only`,
 `-minimumchainwork` → `--min-chain-work`, …). The operator CLI does not accept
-those Core aliases.
+those Core aliases. The shim sets `RBITCOIN_RPC_WAIT_TIP_IDLE=1` on the child so
+`getblockcount` waits until the tip-accept lane is empty (`sync_blocks`).
+Production (unset) waits only for the accept that was running when the RPC
+arrived.
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh

@@ -708,9 +708,15 @@ def main(argv: list[str] | None = None) -> int:
         log_f.write(f"{line}\n".encode())
     map_path = HERE / "debuglog_map.toml"
     rules = load_rules(map_path) if map_path.is_file() else []
+    child_env = os.environ.copy()
+    child_env["RBITCOIN_RPC_WAIT_TIP_IDLE"] = "1"
     try:
         child = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env=child_env,
         )
     except OSError as e:
         log_f.close()

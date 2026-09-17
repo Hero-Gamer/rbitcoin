@@ -34,6 +34,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, free-RAM/2 GiB) | Unsorted SH pack (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--max-inbound` / conf omitted |
 | `RBITCOIN_URING_DRAIN_HARD_SECS` | 120 | `drain_all` zero-CQE abort (Linux/pool/IOCP). Raise if completions are slow but still arriving |
+| `RBITCOIN_RPC_WAIT_TIP_IDLE` | off | `getblockcount` / `getbestblockhash` / `wait_height` wait until the tip-accept lane is empty. Default (unset) waits only for the job that was running when the RPC arrived. The Core-functional bitcoind shim sets `1` so `sync_blocks` stays deterministic. **Not** a production operator knob |
 
 ## Hardcoded (no env)
 

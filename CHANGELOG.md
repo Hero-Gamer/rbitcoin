@@ -43,6 +43,12 @@ before 1.0).
   `request_single_block` or rewind `lookup_taken_hi` (the 352k Cascade
   isolate crawl).
 
+- **RPC tip wait is one in-flight accept:** `getblockcount` /
+  `getbestblockhash` / `wait_height` wait for the tip-accept job that was
+  running when the call arrived (a queued follow-on connect may still be
+  in flight). Unstable `RBITCOIN_RPC_WAIT_TIP_IDLE=1` restores lane-empty
+  wait; the Core-functional bitcoind shim sets it. Not a production knob.
+
 - **Sealed fuse8 mmap + no retained `open_keys`:** lookup maps every sealed
   `.fuse8` fingerprint array read-only (`fuse8=` heap **0** after
   `write_then_map` / `open_file`). Open OA is keyless; the seal sidecar
