@@ -1741,6 +1741,8 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
         in_flight: &inflight,
         skeleton: None,
         carried_need: Vec::new(),
+        carried_header_fks: Vec::new(),
+        carried_header_hashes: Vec::new(),
     };
     let mat_b = confirm_wire_load_phase_pipelined(&q, &params, ms, batch_b, &none, Some(&pipe))
         .unwrap_or_else(|e| {
