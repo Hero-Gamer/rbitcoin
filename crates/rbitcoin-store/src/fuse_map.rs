@@ -35,7 +35,7 @@ impl FuseMap {
         let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
         let map_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len() as usize;
         if map_len == 0 {
-            return Err(StoreError::Corrupt("tx.head fuse magic"));
+            return Err(StoreError::Corrupt("fuse8 file empty"));
         }
         let ptr = map_readonly(&file, map_len).map_err(|e| StoreError::io(path, e))?;
         Ok(Self {

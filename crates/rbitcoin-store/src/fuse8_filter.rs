@@ -121,7 +121,7 @@ impl SealedFuse8 {
 /// Open a BF8R fuse file. v1 and unreadable v2 refuse (no always-probe).
 pub fn open_file(path: &Path) -> Result<FuseFileOpen, StoreError> {
     let mut map = FuseMap::map_path(path)?;
-    let (ver, geo) = {
+    let geo = {
         let bytes = map.as_file_bytes();
         if bytes.len() < 16 {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
@@ -138,14 +138,12 @@ pub fn open_file(path: &Path) -> Result<FuseFileOpen, StoreError> {
             VERSION_V1 => return Err(StoreError::Corrupt(INDEX_REFUSE_FUSE8_V1)),
             VERSION_V2 => {
                 let payload = &bytes[16..16 + len];
-                let geo = parse_v2_geometry(payload)
-                    .map_err(|_| StoreError::Corrupt("fuse8 v2 body unreadable"))?;
-                (ver, geo)
+                parse_v2_geometry(payload)
+                    .map_err(|_| StoreError::Corrupt("fuse8 v2 body unreadable"))?
             }
             _ => return Err(StoreError::Corrupt("tx.head fuse version")),
         }
     };
-    let _ = ver;
     map.set_fingerprint_range(16 + geo.fp_off, geo.fp_len)?;
     Ok(FuseFileOpen::Ready(SealedFuse8 {
         filter: Some(BinaryFuse8 {
@@ -219,23 +217,6 @@ fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
     body
 }
 
-#[cfg(test)]
-fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
-    let geo = parse_v2_geometry(payload)?;
-    let fingerprints = Fingerprints::Heap(
-        payload[geo.fp_off..geo.fp_off + geo.fp_len]
-            .to_vec()
-            .into_boxed_slice(),
-    );
-    Ok(BinaryFuse8 {
-        seed: geo.seed,
-        segment_length: geo.segment_length,
-        segment_length_mask: geo.segment_length_mask,
-        segment_count_length: geo.segment_count_length,
-        fingerprints,
-    })
-}
-
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
 #[inline]
 pub fn fuse_key_from_mixed(mixed: &[u8; 32]) -> u64 {
@@ -258,6 +239,34 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rbitcoin-fuse8-{n}"));
         let _ = std::fs::create_dir_all(&p);
         p
+    }
+
+    fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
+        let geo = parse_v2_geometry(payload)?;
+        let fingerprints = Fingerprints::Heap(
+            payload[geo.fp_off..geo.fp_off + geo.fp_len]
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        Ok(BinaryFuse8 {
+            seed: geo.seed,
+            segment_length: geo.segment_length,
+            segment_length_mask: geo.segment_length_mask,
+            segment_count_length: geo.segment_count_length,
+            fingerprints,
+        })
+    }
+
+    #[test]
+    fn empty_fuse_file_is_corrupt_empty() {
+        let dir = tmp();
+        let path = dir.join("empty.fuse8");
+        std::fs::write(&path, b"").unwrap();
+        match SealedFuse8::read_from(&path) {
+            Err(StoreError::Corrupt(m)) => assert_eq!(m, "fuse8 file empty"),
+            other => panic!("empty fuse must be Corrupt empty, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
