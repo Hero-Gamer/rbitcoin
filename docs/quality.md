@@ -31,9 +31,11 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
 | 5 | **Q-54** | ast-grep named-cap rules | One rule per easy-to-delete cap from [`ibd-memory.md`](./ibd-memory.md): `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each has `lint/ast-grep/fixtures/{good,bad}/`. Today **four** structural rules, **zero** cap rules. |
 | 6 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
+| 7 | **Q-66** | CLI `InitError` instead of `cli_apply_err` string bag | `cli_apply_err` matches `NodeError::Config(String)` with `s.contains` needles (peer-timeout, min work, hex, duplicate bind, net permission, netmask, bind resolve/port). An `InitError` variant should carry exit `1` and the `Error:` prefix so Core functional InitError mapping is not a substring bag. Owner: `crates/rbitcoin-node/src/cli.rs`. |
+| 8 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
-**R-11+**. Next unused Q-id is **Q-66**.
+**R-11+**. Next unused Q-id is **Q-68**.
 
 Close work by **moving the Open row into CHANGELOG** in the same edit as
 the landing change (do not grow a Completed museum here). New item: insert
