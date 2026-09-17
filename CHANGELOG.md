@@ -52,14 +52,15 @@ before 1.0).
 - **Stop paying Core harness in production:** P2P logs use a `p2p:` prefix;
   `debuglog_map.toml` is the Core debug.log dialect. TCP RPC is Bearer-only
   (the test proxy still accepts TestNode Basic and forwards Bearer). Named
-  `args` peel is `echo` only. Hidden `getorphantxs` is gone (`rpc_orphans.py`
-  skip `rpc-missing`: Core dump RPC, not an operator method; park /
-  `EraseForPeer` stay). `estimaterawfee` is the native 10-minute object
-  (no fake Core `short`/`decay` tree). `NodeError::Init` carries exit 1 and
-  the `Error:` prefix (**Q-66**). `getblockstats` reconstruct miss is
+  `args` peel is `echo` only. Hidden `getorphantxs` stays (operator dump of
+  parked txs + announcer peer ids; `rpc_orphans.py` is `run`).
+  `estimaterawfee` is the native 10-minute object (no fake Core
+  `short`/`decay` tree). `NodeError::Init` carries exit 1 and the `Error:`
+  prefix (**Q-66**). `getblockstats` reconstruct miss is
   `block body not in store` (shim still maps dummy `blk00000.dat` absence
-  to Core's disk phrase). Labeled `test_runner` prints **71** jobs
-  (**65** inventory `run`; **202** skip). `echo` stays.
+  to Core's disk phrase). In-tree TCP tests send Bearer. Labeled
+  `test_runner` prints **72** jobs (**66** inventory `run`; **201** skip).
+  `echo` stays.
 
 - **Core functional `run` is production-only:** skip scripts whose asserts
   were only the bitcoind shim (`feature_help`, `feature_blocksdir`,
@@ -68,8 +69,8 @@ before 1.0).
   (`rpc_decodescript`, `rpc_invalid_address_message`). Live proxy no longer
   intercepts `decoderawtransaction` / `decodescript` / `validateaddress`.
   `feature_filelock.py` stays skip (`harness`). Labeled `test_runner` prints
-  **71** jobs (**65** inventory `run`; Core expands transport twins and
-  `wallet_txn_*` flags; **202** skip).
+  **72** jobs (**66** inventory `run`; Core expands transport twins and
+  `wallet_txn_*` flags; **201** skip).
 
 - **Sealed fuse8 mmap + no retained `open_keys`:** lookup maps every sealed
   `.fuse8` fingerprint array read-only (`fuse8=` heap **0** after
@@ -326,7 +327,8 @@ before 1.0).
   InitError.
 
 - **Orphan park / `EraseForPeer`:** announcer peer ids on parked txs;
-  handshake/INV stay off the tokio reactor write lock. No dump RPC.
+  handshake/INV stay off the tokio reactor write lock. Hidden
+  `getorphantxs` dumps the park.
 
 - **CIDR / bind net permissions:** shim `-whitelist` / `-whitebind` → `--net-permission` /
   `--net-permission-bind` (implicit flags, in/out, `--net-permission-relay` /

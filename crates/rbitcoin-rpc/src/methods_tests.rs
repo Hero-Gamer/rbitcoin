@@ -108,7 +108,7 @@ fn help_and_getrpcinfo_list_every_dispatched_method() {
 }
 
 #[test]
-fn getorphantxs_is_not_a_node_rpc() {
+fn getorphantxs_is_hidden_and_lists_parked() {
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
@@ -119,12 +119,28 @@ fn getorphantxs_is_not_a_node_rpc() {
     let s = help_all.as_str().unwrap();
     assert!(
         !s.lines().any(|l| l == "getorphantxs"),
-        "getorphantxs must not appear in help()"
+        "getorphantxs must stay hidden from help()"
     );
     let one = dispatch(&ctx, "help", vec![json!("getorphantxs")]).unwrap();
-    assert!(one.as_str().unwrap().contains("unknown method"), "{one}");
-    let err = dispatch(&ctx, "getorphantxs", vec![]).unwrap_err();
-    assert_eq!(err["message"], "Method not found");
+    let one_s = one.as_str().unwrap();
+    assert!(one_s.contains("getorphantxs"));
+    assert!(!one_s.contains("unknown command: getorphantxs"));
+
+    let empty = dispatch(&ctx, "getorphantxs", vec![]).unwrap();
+    assert_eq!(empty, json!([]));
+
+    let bool_err = dispatch(&ctx, "getorphantxs", vec![json!(true)]).unwrap_err();
+    assert_eq!(bool_err["code"], ERR_TYPE_ERROR);
+    assert!(bool_err["message"]
+        .as_str()
+        .unwrap()
+        .contains("Verbosity was boolean but only integer allowed"));
+    let bad = dispatch(&ctx, "getorphantxs", vec![json!(-1)]).unwrap_err();
+    assert_eq!(bad["code"], ERR_INVALID_PARAMETER);
+    assert!(bad["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid verbosity value -1"));
 
     let mp = ctx.mempool.as_ref().unwrap();
     let tx = Transaction {
@@ -149,8 +165,15 @@ fn getorphantxs_is_not_a_node_rpc() {
         matches!(err, rbitcoin_net::AcceptError::Orphaned { .. }),
         "{err}"
     );
-    assert_eq!(mp.orphan_snapshot().len(), 1);
-    assert_eq!(mp.orphan_snapshot()[0].announcers, vec![3]);
+    let ids = dispatch(&ctx, "getorphantxs", vec![]).unwrap();
+    let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+    assert_eq!(ids, json!([txid]));
+    let v1 = dispatch(&ctx, "getorphantxs", vec![json!(1)]).unwrap();
+    assert_eq!(v1[0]["txid"], json!(txid));
+    assert_eq!(v1[0]["from"], json!([3]));
+    assert!(v1[0].get("hex").is_none());
+    let v2 = dispatch(&ctx, "getorphantxs", vec![json!(2)]).unwrap();
+    assert!(v2[0]["hex"].as_str().unwrap().len() > 20);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -220,6 +243,7 @@ fn method_help_named_arms_and_unknown() {
         "submitblock",
         "submitheader",
         "getpeerinfo",
+        "getorphantxs",
         "help",
         "echo",
         "ping",

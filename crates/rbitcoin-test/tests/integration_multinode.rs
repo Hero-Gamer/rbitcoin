@@ -148,7 +148,7 @@ async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-const RPC_BASIC: &str = "Basic dXNlcjpwYXNz"; // password `pass` == rpc.token
+const RPC_BEARER: &str = "Bearer pass"; // `{datadir}/rpc.token` written by the tests
 
 fn ephemeral_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -185,7 +185,7 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: serde_json::Value) -> s
     let body = serde_json::json!({"jsonrpc":"1.0","id":"test","method":method,"params":params})
         .to_string();
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BASIC}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BEARER}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(addr).await.expect("rpc connect");

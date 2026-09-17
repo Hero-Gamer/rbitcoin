@@ -169,9 +169,8 @@ of that script is `submitblock` + archive `getblockstats`. `feature_port.py`
 is `run`: `-bind`/`-port` become `--listen` on those sockets.
 `feature_filelock.py` is skip (`harness`): the node exclusive-locks `{datadir}`
 (unit + shim InitError tests). Core `-wallet` SQLite flock and `-blocksdir`
-`blocks/.lock` are not product. `rpc_orphans.py` is skip (`rpc-missing`):
-Core's hidden `getorphantxs` dump RPC is a test API, not an operator method.
-Orphan park / announcers / `EraseForPeer` stay. `p2p_permissions.py`
+`blocks/.lock` are not product. `rpc_orphans.py` is `run`: hidden
+`getorphantxs` plus orphan announcers / `EraseForPeer`. `p2p_permissions.py`
 is `run`: Core `NetPermissions` on `-whitelist`/`-whitebind`, per-peer
 `getpeerinfo.permissions`, 0-value spendable `dust`, and forcerelay
 recent-rejects.
@@ -187,7 +186,7 @@ merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ([`TESTING.md`](../TESTING.md)). Label harness PRs and every version-bump
 ship PR (see [`releases.md`](./releases.md)). The `release-extra` job on
 that workflow fails when a ship PR did not get a green `core-functional`.
-The `core-functional` job is **30 minutes** (71 `test_runner` jobs: 65
+The `core-functional` job is **30 minutes** (72 `test_runner` jobs: 66
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
 When that job is red, the inner loop is **local**, not another CI wait.
