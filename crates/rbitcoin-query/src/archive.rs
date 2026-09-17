@@ -792,6 +792,9 @@ impl Query {
     ///
     /// Does not build [`TxApply`] / clone `script_sig` / witness. Write fills
     /// packed ins from `Arc<Block>` + edges. `body_est` uses wire compact sizes.
+    /// Same txid in one block is Corrupt. Same txid across headers in the wave
+    /// is BIP30 (91842/91880): both rows are planned; `batch_map` keeps the
+    /// later fk.
     pub fn archive_plan_batch_from_wire(
         &self,
         need: &[WirePlanNeed<'_>],
@@ -825,14 +828,17 @@ impl Query {
             }
             let first_tx_fk = Fk(next_tx);
             let n_txs = block.txdata.len() as u32;
+            let mut in_block =
+                crate::TxidSet::with_capacity_and_hasher(txids.len(), Default::default());
             for (tx_index, (tx, txid)) in block.txdata.iter().zip(txids.iter()).enumerate() {
-                let tx_fk = Fk(next_tx);
-                next_tx += 1;
-                if batch_map.insert(*txid, tx_fk).is_some() {
+                if !in_block.insert(*txid) {
                     return Err(StoreError::Corrupt(
                         "duplicate txid in block body (consensus violation)",
                     ));
                 }
+                let tx_fk = Fk(next_tx);
+                next_tx += 1;
+                batch_map.insert(*txid, tx_fk);
                 let rec = tx_record_from_wire(tx, *txid);
                 let ins: Vec<PlanIn> = tx.input.iter().map(plan_in_from_txin).collect();
                 work.push(PlanRow {
@@ -2415,6 +2421,51 @@ mod tests {
             plan.body_est >= 10_000,
             "body_est must count wire ins, got {}",
             plan.body_est
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mainnet 91842/91880 share a coinbase txid with 91812/91722. A 144-block
+    /// load wave includes both; batch_map must not treat that as in-block dup.
+    #[test]
+    fn plan_batch_from_wire_bip30_same_txid_across_headers() {
+        let (dir, q) = temp_query("bip30-wave-txid");
+        let txid = coinbase_apply(1).tx.txid;
+        let child = child_spend(txid, 0x99);
+        let child_txid = child.tx.txid;
+        let need = vec![
+            (Fk(1), vec![coinbase_apply(1)]),
+            (Fk(2), vec![coinbase_apply(1)]),
+            (Fk(3), vec![child]),
+        ];
+        let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
+            .expect("BIP30 same-txid across headers in one wave");
+        assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2), Fk(3)]);
+        assert_eq!(plan.packed[0].0.tx().txid, txid);
+        assert_eq!(plan.packed[1].0.tx().txid, txid);
+        assert_eq!(
+            plan.batch_creates,
+            vec![(txid, Fk(1)), (txid, Fk(2)), (child_txid, Fk(3))]
+        );
+        let spend = plan.edges.get(&3).expect("child");
+        assert_eq!(
+            spend[0].create_fk,
+            Fk(2),
+            "same-wave spend binds newest BIP30 create"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_batch_from_wire_duplicate_txid_in_one_block_is_corrupt() {
+        let (dir, q) = temp_query("dup-txid-in-block");
+        let need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(1)])];
+        let err = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
+            .expect_err("in-block duplicate txid");
+        assert!(
+            err.to_string()
+                .contains("duplicate txid in block body (consensus violation)"),
+            "got: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

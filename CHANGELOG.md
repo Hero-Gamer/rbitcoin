@@ -25,6 +25,13 @@ before 1.0).
 
 ### Changed
 
+- **IBD plan allows BIP30 same-txid across headers in one wave:**
+  `archive_plan_batch_from_wire` rejects duplicate txid only inside one
+  block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep
+  both Class A rows; `batch_map` binds spends to the later fk. A 144-block
+  load wave that used to `Corrupt("duplicate txid in block body")` at the
+  first height of the batch (logged `@91699`) can IBD past that era.
+
 - **IBD stamp skips header ensure when BQ carries `header_fk`:** header-sync
   already stored the row. Load stamp uses the BQ fk/hash (store row must
   match); hash mismatch is `BadBlock`. `ibd: perf` `header_skip=`. Packed
