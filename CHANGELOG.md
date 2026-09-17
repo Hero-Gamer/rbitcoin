@@ -43,6 +43,8 @@ before 1.0).
   (`STATUS_HEAP_CORRUPTION` on seal-roll and query confirm smoke). A failed
   IOCP `push_*` (handle already bound to another thread's port) rolls back
   session pending so SH collect libc-completes instead of drain-hanging.
+  Sealed `.mphf` is synced at write; `flush` only `sync_data`s the mutable
+  `.val` (Windows `FlushFileBuffers` on a read-only handle is Access denied).
 
 - **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
   `persist_due` every 5 s writes the body tail then slots+meta (no fsync).
