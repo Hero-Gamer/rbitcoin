@@ -1601,6 +1601,242 @@ fn fill_just_written_survives_until_last_started_write() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Mainnet 133433 unit: IBD stamp left spent unset (TipOnly miss, pin loc
+/// unset). Write TLS fills abs. No `create.loc` pread.
+#[test]
+fn fill_stamp_spent_hole_from_write_tls() {
+    use super::{ensure_spend_abs_layouts, fill_planned_create_layout_after_commit, Prepared};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{stamp_external_parents, BatchParentIds, BatchParents, InFlight};
+    use rbitcoin_store::OutputRecord;
+    use std::sync::atomic::Ordering;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x32, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    q.store().reset_spent_range_batch();
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![rbitcoin_store::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    let mut inflight = InFlight::new();
+    inflight.note_pins([(fks[0], &parent_pin)], Some(360));
+    let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
+    let st = stamp_external_parents(
+        q.store(),
+        &[parent_pin.tx().txid],
+        &inflight,
+        Some(&BatchParentIds::default()),
+        q.confirm_stats(),
+    )
+    .expect("inflight identity with empty skeleton");
+    let id = fks[0].get().expect("fk");
+    let ident = st.idents.get(&id).expect("ident");
+    assert_eq!(ident.spent, None, "IBD stamp must not loc-by-fk");
+    assert_eq!(
+        q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
+        0
+    );
+
+    q.set_lookup_started_hi(Some(133_433));
+    q.note_write_create_loc(&fks, &loc, 360);
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        std::sync::Arc::clone(&parent_pin),
+        vec![0],
+        None,
+        None,
+        Vec::new(),
+    );
+    let child = [Prepared {
+        height: Height(133_433),
+        header_fk: Fk(2),
+        tx_fks: vec![Fk(3)],
+        jobs: vec![],
+        spends: vec![([0x32u8; 32], 0, Fk(3), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [9u8; 32],
+        txids: vec![],
+        prev_mtp: 0,
+    }];
+    q.store().reset_spent_range_batch();
+    fill_planned_create_layout_after_commit(&q, &mut bp, &[], &[], &[], &child)
+        .expect("child fill from write TLS after stamp spent hole");
+    ensure_spend_abs_layouts(&bp, &child).expect("abs from write TLS");
+    assert!(
+        q.store().spent_range_batch_fks().is_empty(),
+        "write fill/ensure must not pread create.loc"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Write already finished: `CreatePin::set_loc` is the spent source after TLS
+/// prune and disk loc truncate. Pin copies stamp range; ensure needs no TLS.
+#[test]
+fn pin_and_ensure_from_pin_loc_without_tls() {
+    use super::{ensure_spend_abs_layouts, pin_for_wire_batch, ParentPinStamp, Prepared};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{stamp_external_parents, ArchiveWritePlan, InFlight};
+    use rbitcoin_store::{InputRecord, OutputRecord};
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x41, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    parent_pin.set_loc(loc[0]);
+    q.store().txs.create_loc_truncate_to_count(0).unwrap();
+    q.set_lookup_started_hi(Some(1));
+    q.note_write_create_loc(&fks, &loc, 1);
+    q.prune_write_create_loc(2);
+    assert!(q.write_create_loc(fks[0]).is_none(), "TLS pruned");
+
+    let mut inflight = InFlight::new();
+    inflight.note_pins([(fks[0], &parent_pin)], Some(1));
+    let st = stamp_external_parents(
+        q.store(),
+        &[parent_pin.tx().txid],
+        &inflight,
+        Some(&rbitcoin_query::BatchParentIds::default()),
+        q.confirm_stats(),
+    )
+    .expect("pin loc without disk");
+    let id = fks[0].get().expect("fk");
+    let ident = st.idents.get(&id).expect("ident");
+    assert_eq!(ident.spent, Some(loc[0].spent));
+
+    let spend_ins = vec![InputRecord {
+        prev_txid: parent_pin.tx().txid,
+        create_fk: fks[0],
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0x42, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
+        spend_ins,
+    )];
+    plan.planned_fks = vec![Fk(2)];
+    plan.external_parents = st.idents;
+    fill_edges_from_packed(&mut plan);
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    q.store().reset_spent_range_batch();
+    let (parents, _) = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], Some(&inflight))
+        .expect("pin from CreatePin outs + stamp loc");
+    let child = [Prepared {
+        height: Height(2),
+        header_fk: Fk(2),
+        tx_fks: vec![Fk(2)],
+        jobs: vec![],
+        spends: vec![(parent_pin.tx().txid, 0, Fk(2), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        hash: [8u8; 32],
+        txids: vec![],
+        prev_mtp: 0,
+    }];
+    ensure_spend_abs_layouts(&parents, &child).expect("abs from pin loc");
+    assert!(
+        q.store().spent_range_batch_fks().is_empty(),
+        "pin/ensure must not pread create.loc"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// IBD skeleton miss + creates-only InFlight (no pin): identity without range
+/// is a lookup miss, not a load loc rescue.
+#[test]
+fn pin_creates_only_ibd_skeleton_miss_is_lookup_stage_miss() {
+    use super::{pin_for_wire_batch, ParentPinStamp};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{ArchiveWritePlan, ParentIdent};
+    use rbitcoin_store::{InputRecord, OutputRecord};
+
+    let (path, q) = tiny_query();
+    let parent_tx = rec_tx(0x51, 1);
+    q.store()
+        .put_tx_full_batch_indexed(
+            &[(
+                parent_tx.clone(),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap();
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        rbitcoin_query::CreatePinInner::records(
+            rec_tx(0x52, 1),
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ),
+        vec![InputRecord {
+            prev_txid: parent_tx.txid,
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![Fk(2)];
+    plan.external_parents
+        .insert(1, ParentIdent::new(parent_tx.txid));
+    fill_edges_from_packed(&mut plan);
+    let mut stamp = ParentPinStamp::take_from_plan(&mut plan);
+    q.store().reset_spent_range_batch();
+    let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
+        .expect_err("creates-only without range is lookup miss");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("lookup stage miss"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        q.store().spent_range_batch_fks().is_empty(),
+        "pin must not loc-by-fk to rescue a lookup miss"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Wire pin: in-flight outs shorter than need → cold miss → hard invariant.
 #[test]
 fn pin_for_wire_incomplete_outs_is_invariant_error() {

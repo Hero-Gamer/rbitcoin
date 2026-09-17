@@ -2163,6 +2163,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// IBD skeleton miss + creates-only InFlight: load does not loc-by-fk even
+    /// when loc is on disk. Lookup leftover (skeleton = None) still fills.
+    #[test]
+    fn plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill() {
+        use std::sync::atomic::Ordering;
+        let (dir, q) = temp_query("plan-inflight-creates-skel-miss");
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        q.store
+            .txs
+            .put_full_batch_indexed(
+                &[(parent.tx, parent.inputs, parent.outputs)],
+                /*index=*/ true,
+            )
+            .unwrap();
+        let mut log = crate::InFlight::new();
+        log.note_creates([(parent_txid, Fk(1))], None);
+        assert!(log.get_out(1).is_none());
+        let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
+        let child = child_spend(parent_txid, 0xee);
+        let need = vec![(Fk(2), vec![child])];
+        let skel = crate::BatchParentIds::default();
+        let plan = plan_applies(&q, &need, 2, &log, Some(&skel))
+            .expect("creates-only identity with empty skeleton");
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(
+            plan.external_parents.get(&1).and_then(|p| p.body),
+            None,
+            "IBD stamp must not loc-by-fk for creates-only"
+        );
+        assert_eq!(plan.external_parents.get(&1).and_then(|p| p.spent), None);
+        assert_eq!(
+            q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// TipOnly leftover parent: body range from head, spent range on the stamp.
     #[test]
     fn fill_missing_parent_ranges_stamps_spent_idx_for_archived() {
