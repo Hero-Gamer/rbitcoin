@@ -5,9 +5,9 @@ in [`CHANGELOG.md`](../CHANGELOG.md). 1.0 product gates:
 [`road-to-1.0.md`](./road-to-1.0.md). Peer-node notes:
 [`peer-clients.md`](./peer-clients.md) (do not copy here).
 
-**Last reaudit:** 2026-09-17. Schema **24**. Core functional **72**
-`test_runner` jobs (**66** inventory `run`; Core expands transport twins and
-`wallet_txn_*` flags) / **201** `skip`. Findings **001–023** fixed. Nightly
+**Last reaudit:** 2026-09-17. Schema **24**. Core functional **71**
+`test_runner` jobs (**65** inventory `run`; Core expands transport twins and
+`wallet_txn_*` flags) / **202** `skip`. Findings **001–023** fixed. Nightly
 fuzz **20** jobs. Previous: 2026-09-15.
 
 | Section | Purpose |
@@ -25,14 +25,13 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 
 | Rank | ID | Item | Done looks like |
 |-----:|----|------|-----------------|
-| 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation. Labeled `test_runner` prints **72** (**66** inventory `run` / **201** skip; 19 `rpc-missing`, 17 `core-log`, 68 `no-wallet`; Core expands transport twins and `wallet_txn_*` flags). COMPAT leftovers are `rpc-dialect`, not `rpc-missing`. `run` must hit node production (not only shim argv / dummy `blk*.dat` / Core decode dialect). Next inventory `run`: recover to 71. `mempool_accept` stays skip (`policy-libre`). Unlabeled PRs stay cargo-only. Owner: [`core-functional.md`](./core-functional.md). |
+| 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation. Labeled `test_runner` prints **71** (**65** inventory `run` / **202** skip; 20 `rpc-missing`, 17 `core-log`, 68 `no-wallet`; Core expands transport twins and `wallet_txn_*` flags). COMPAT leftovers are `rpc-dialect`, not `rpc-missing`. `run` must hit node production (not only shim argv / dummy `blk*.dat` / Core decode dialect). Next inventory `run`: recover to 66. `mempool_accept` stays skip (`policy-libre`). Unlabeled PRs stay cargo-only. Owner: [`core-functional.md`](./core-functional.md). |
 | 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Local packages: RPC `submitpackage`, Esplora `POST /txs/package`, Electrum 1.6 `broadcast_package`. `protocol_max` is **1.6**; 1.7 `scriptpubkey.*` still missing. |
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
 | 5 | **Q-54** | ast-grep named-cap rules | One rule per easy-to-delete cap from [`ibd-memory.md`](./ibd-memory.md): `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each has `lint/ast-grep/fixtures/{good,bad}/`. Today **four** structural rules, **zero** cap rules. |
 | 6 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
-| 7 | **Q-66** | CLI `InitError` instead of `cli_apply_err` string bag | `cli_apply_err` matches `NodeError::Config(String)` with `s.contains` needles (peer-timeout, min work, hex, duplicate bind, net permission, netmask, bind resolve/port). An `InitError` variant should carry exit `1` and the `Error:` prefix so Core functional InitError mapping is not a substring bag. Owner: `crates/rbitcoin-node/src/cli.rs`. |
-| 8 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
+| 7 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-68**.

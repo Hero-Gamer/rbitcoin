@@ -28,7 +28,9 @@ Esplora** (with `--sh-index`) for address/script history.
 | `--rpc-work-queue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
-always Bearer-authenticated (harness-only Basic is password == token).
+Bearer-authenticated (`{datadir}/rpc.token`). The Core-functional proxy still
+speaks TestNode cookie + HTTP Basic on the public port and forwards Bearer
+to the node.
 
 ### curl example (TCP Bearer)
 
@@ -69,10 +71,10 @@ still wait for durable SH when shindex is on.
 | Method | Notes |
 |--------|-------|
 | `help` / `getrpcinfo` / `uptime` / `stop` | Control |
-| `echo` | Testing RPC. Returns arguments as a positional array. Mixed AuthServiceProxy `{args: [...], argN: ...}` is supported. |
+| `echo` | Testing RPC. Returns arguments as a positional array. AuthServiceProxy `{args: [...], argN: ...}` is peeled only here. |
 | `getblockchaininfo` / `getblockcount` / `getbestblockhash` / `getblockhash` | Chain tip. `getblockcount` / `getbestblockhash` wait for the in-flight tip-accept job (not the rest of a catch-up burst). `headers` is the best known header height (`submitheader` / P2P headers may lead `blocks`). `chainwork` is summed header work (regtest 2 per block). `size_on_disk` is a walk of `{datadir}/store` file lengths (plus `--datadir-cold` inwit when split). `verificationprogress` is `blocks / headers` clamped to `[0, 1]` (`1.0` when `headers` is 0). `initialblockdownload` is the Core RPC name for **relay-inhibited**: `--min-chain-work` and `--max-tip-age` after densify/`enter_tip_mode`, not “still catching up”. |
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. |
-| `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. We do not have Core `blk*.dat`, so `rpc_getblockstats.py`'s rename-file needle stays skip. |
+| `getblockstats` | All networks. Reconstruct the block; Core named keys `hash_or_height` / `stats`. Fees from archive prevouts. Genesis excluded from actual UTXO counts. OP_RETURN unspendable. Reconstruct miss is `block body not in store`. Dummy `blk00000.dat` is shim-only so `rpc_getblockstats.py`'s rename-file needle stays Core-phrased. |
 | `getdifficulty` | From tip bits |
 | `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `timeoffset` is VERSION clock minus connect time (`0` before handshake). `synced_headers` is the height of that peer's advertised best block when we know it, else `-1`. `synced_blocks` is that height when the hash is on our best chain, else `-1`. `getnetworkinfo.timeoffset` is the median of outbound handshake-complete offsets (`0` if none). `mapped_as` is present when `--asmap` / `{datadir}/ip_asn.dat` mapped the peer (Core field; omitted without a map or ASN 0). `version` is rbitcoin semver as a Core integer (`major*10000+minor*100+patch`: `0.1.0` → `100`, `0.5.0` → `500`, `0.6.0` → `600`, `0.6.99` → `699`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2`. `localaddresses` lists `--external-ip` (`score` = Core `LOCAL_MANUAL`) |
 | `getnettotals` | All networks. Raw TCP `totalbytesrecv` / `totalbytessent` on live sessions. `uploadtarget` is a Core-shaped stub (`target` 0). |
@@ -81,7 +83,6 @@ still wait for durable SH when shindex is on.
 | `getnodeaddresses` | Sample from addrman (`count=0` → all). Optional `network` filter. |
 | `addnode` / `disconnectnode` / `addconnection` | All networks. `addnode onetry` / `add` dial; `disconnectnode` by `nodeid` or address |
 | `getmempoolinfo` / `getrawmempool` / `getmempoolentry` | MempoolHub. `maxmempool` is the operator weight budget (`--mempool-size-mb`). `ancestorcount` / `descendantcount` (and size/fee sums) walk the cluster graph. Verbose `fees.{base,modified,ancestor,descendant,chunk}` and `chunkweight` include `prioritisetransaction` deltas; top-level `ancestorfees` / `descendantfees` stay base satoshis. `unbroadcastcount` / `unbroadcast` track `sendrawtransaction` txs until a peer getdata's them. `orphanage.{size,bytes}` is the parked missing-parent side pool (vsize). `permitbaremultisig` is always `true` (Libre has no Core `IsStandard` bare-multisig gate; `--permitbaremultisig` is not a node flag). |
-| `getorphantxs` | Hidden. Verbosity 0 txids, 1 details + `from` peer ids, 2 + hex. Not listed by `help` / `getrpcinfo`. |
 | `getrawtransaction` | Class A + mempool. Optional Core `blockhash` arg is accepted and ignored. Verbose objects share `tx_to_json` with `decoderawtransaction` / `getblock` verbosity 2 (`scriptSig`, `scriptPubKey.type`). |
 | `decoderawtransaction` | All networks. Decode hex. Optional `iswitness`: `false` refuses a BIP141 marker (`-22 TX decode failed`). Extra trailing bytes also `-22`. `scriptSig.asm` is rust-bitcoin, not Core `ScriptToAsmStr` sighash suffixes. Coinbase vin is `txid`/`vout`/`scriptSig` (not Core's `coinbase` key). |
 | `decodescript` | All networks. `asm`, Core-style `type`, `hex`, and `address` when `Address::from_script` succeeds. No `p2sh` wrap, `segwit` wrap, or `desc` / miniscript. |
@@ -130,7 +131,7 @@ still wait for durable SH when shindex is on.
 |-----|-----------------|
 | `{datadir}/rpc.sock` (filesystem) | TLS in-process / mTLS |
 | `{datadir}/rpc.token` Bearer on TCP | multi-user tokens |
-| Harness `.cookie` + Basic password==token | `rpcallowip` |
+| Harness `.cookie` + Basic on the test proxy only | `rpcallowip` |
 
 ## Related
 
