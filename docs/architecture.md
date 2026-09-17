@@ -41,9 +41,11 @@ are one confirm-write era. Do not reintroduce plan-time “archive lead” heuri
 just-written body pages stay tip-hot. **No** ContigPark / archive-job fallback
 for unknown-height bodies (mark missing → re-getdata).
 
-- **Storage center** is a **transaction-relational archive** on **map-free**
-  tables (pread/pwrite + fallocate; no process `mmap` of Class A/B/C), not a
-  UTXO set + LevelDB chainstate. IO modality: [`io-modality.md`](./io-modality.md).
+- **Storage center** is a **transaction-relational archive** on **map-free
+  tables** (pread/pwrite + fallocate; no process `mmap` of Class A/B/C
+  `TableFile`s), not a UTXO set + LevelDB chainstate. Sealed `.fuse8`
+  sidecars are a **read-only mmap** exception. Packed MPHF `g` stays FdOnly.
+  IO modality: [`io-modality.md`](./io-modality.md).
 - **Consensus scripts** are verified in **pure Rust** (secp256k1 only as the
   crypto primitive via the rust-bitcoin stack — **no** `libbitcoinconsensus`
   dual-eval).

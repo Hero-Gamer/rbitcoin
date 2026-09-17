@@ -2642,12 +2642,10 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
             .unwrap();
         assert_eq!(t.head_segment_count(), 1);
         assert_eq!(t.head.sealed_segment_count(), 0);
-        assert_eq!(t.head.open_keys_len() as u64, half);
         t.flush().unwrap();
     }
-    // Reopen: open_keys must rebuild from Class A.
+    // Reopen: keys are not retained; seal collects from Class A.
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.head.open_keys_len() as u64, half, "open keys rebuilt");
     // Fill past 819 so first segment seals.
     let more: Vec<TxRecord> = (half..900)
         .map(|i| {
@@ -2682,6 +2680,43 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&i.to_le_bytes());
         assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Insert does not retain fuse keys; seal still membership-tests from Class A.
+#[test]
+fn seal_without_retained_keys_matches_fuse_contains() {
+    let dir = tempfile_dir("seal-no-retain-keys");
+    let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+    let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+    let recs: Vec<TxRecord> = (0..205u64)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        })
+        .collect();
+    t.put_full_batch_indexed(&meta_only_items(&recs), true)
+        .unwrap();
+    t.flush_head().unwrap();
+    assert!(t.head.sealed_segment_count() >= 1);
+    for i in [1u64, 50, 204, 205] {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(
+            t.probe_body_match_fk(&txid).unwrap(),
+            Some(Fk(i)),
+            "fk={i} after seal without retained keys"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

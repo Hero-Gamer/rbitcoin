@@ -87,8 +87,8 @@ Windows operator binary the same way:
 
 | OS | Why not Nix `pkgsStatic` | What ships / what PR CI runs |
 |----|--------------------------|----------------|
-| **Windows** | No musl-style fully static PE from this flake; mingw cross is a different CRT than operators run | **Release:** `windows-2022` + rustc **1.95** + `-C target-feature=+crt-static`. Stage script refuses VC++ / MinGW runtime DLLs. **PR `ci`:** store platform tests + `--smoke` |
-| **Darwin** | Apple forbids a static `libSystem` link. `nix build` on a Mac is store-rpath (not portable) | **Release:** `macos-14` + rustc **1.95**. Stage script allows only `/usr/lib` and `/System/Library` dylibs. Ad-hoc `codesign -s -` (not notarized). **aarch64 only**. **PR `ci`:** store platform tests + `--smoke` |
+| **Windows** | No musl-style fully static PE from this flake; mingw cross is a different CRT than operators run | **Release:** `windows-2022` + rustc **1.95** + `-C target-feature=+crt-static`. Stage script refuses VC++ / MinGW runtime DLLs. **PR `ci`:** `./scripts/ci-os-smoke.sh` (store IO + mmap fuse + query confirm + `--smoke`) |
+| **Darwin** | Apple forbids a static `libSystem` link. `nix build` on a Mac is store-rpath (not portable) | **Release:** `macos-14` + rustc **1.95**. Stage script allows only `/usr/lib` and `/System/Library` dylibs. Ad-hoc `codesign -s -` (not notarized). **aarch64 only**. **PR `ci`:** `./scripts/ci-os-smoke.sh` |
 
 Staging for Releases: `scripts/stage-native-artifacts.sh`. Not byte-identical
 with the musl package. Windows IoRing is not supported.

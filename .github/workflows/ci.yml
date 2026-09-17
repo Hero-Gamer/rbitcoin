@@ -121,6 +121,8 @@ jobs:
         run: ./scripts/release-gate.sh
       - name: os-smoke self-test
         run: ./scripts/ci-os-smoke.test.sh
+      - name: pr-checks-watch self-test
+        run: ./scripts/pr-checks-watch.test.sh
       - name: cargo test
         run: cargo test --workspace
 
@@ -142,7 +144,7 @@ jobs:
       - name: Evaluate NixOS module
         run: timeout 2m nix build .#checks.x86_64-linux.nixos-module-eval --no-link
 
-  # Windows IOCP store + --smoke. Required. Not a CRT-static snapshot.
+  # Windows IOCP store + mmap fuse + query confirm + --smoke. Required. Not a CRT-static snapshot.
   windows:
     name: windows
     runs-on: windows-2022
@@ -166,7 +168,7 @@ jobs:
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
 
-  # Darwin pool IO + --smoke. Required. Not a notarized / operator zip.
+  # Darwin pool IO + mmap fuse + query confirm + --smoke. Required. Not a notarized / operator zip.
   macos:
     name: macos
     runs-on: macos-14

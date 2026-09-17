@@ -359,6 +359,11 @@ mod tests {
         let h = SortedHead::write(&path, &recs).unwrap();
         assert_eq!(h.count, u64::from(n));
         assert!(h.fuse.is_some());
+        assert_eq!(
+            h.fuse.as_ref().unwrap().fingerprint_heap_bytes(),
+            0,
+            "sorted head fuse is mapped, not the build Box"
+        );
         assert_eq!(h.path(), path.as_path());
         assert!(path.is_file());
         assert!(idx_path(&path).is_file());

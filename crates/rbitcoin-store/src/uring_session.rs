@@ -435,6 +435,12 @@ impl UringSession {
         self.poisoned = true;
     }
 
+    fn rollback_pending(&mut self, user_data: u64) {
+        if self.pending.expect_cqe(user_data).is_err() {
+            self.poison();
+        }
+    }
+
     fn check_live(&self) -> Result<(), StoreError> {
         if self.poisoned {
             Err(StoreError::Corrupt("invariant: io_uring session poisoned"))
@@ -493,7 +499,7 @@ impl UringSession {
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
-        match &mut self.backend {
+        let r = match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
                 use io_uring::{opcode, types};
@@ -510,7 +516,9 @@ impl UringSession {
                 // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
-                        let _ = self.pending.expect_cqe(user_data);
+                        if self.pending.expect_cqe(user_data).is_err() {
+                            self.poisoned = true;
+                        }
                         return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
@@ -519,7 +527,11 @@ impl UringSession {
             SessionBackend::Pool(pool) => pool.push_pread(handle, offset, buf, user_data),
             #[cfg(windows)]
             SessionBackend::Iocp(eng) => eng.push_pread(handle, offset, buf, user_data),
+        };
+        if r.is_err() {
+            self.rollback_pending(user_data);
         }
+        r
     }
 
     /// Push a pwrite SQE. Buffer must stay live until the CQE is harvested.
@@ -556,7 +568,7 @@ impl UringSession {
         }
         self.pending.insert(user_data)?;
         let handle = fd.into();
-        match &mut self.backend {
+        let r = match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
                 use io_uring::{opcode, types};
@@ -573,7 +585,9 @@ impl UringSession {
                 // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
                 unsafe {
                     if ring.submission().push(&sqe).is_err() {
-                        let _ = self.pending.expect_cqe(user_data);
+                        if self.pending.expect_cqe(user_data).is_err() {
+                            self.poisoned = true;
+                        }
                         return Err(StoreError::BudgetFull("io_uring SQ"));
                     }
                 }
@@ -582,7 +596,11 @@ impl UringSession {
             SessionBackend::Pool(pool) => pool.push_pwrite(handle, offset, buf, user_data),
             #[cfg(windows)]
             SessionBackend::Iocp(eng) => eng.push_pwrite(handle, offset, buf, user_data),
+        };
+        if r.is_err() {
+            self.rollback_pending(user_data);
         }
+        r
     }
 
     pub fn sync_submission(&mut self) {
@@ -764,9 +782,10 @@ impl UringSession {
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
-            "store: io_uring drain slow pending={} waited={:?} thread={thread}",
+            "store: io_uring drain slow pending={} waited={:?} thread={thread} kind={:?}",
             self.pending.len(),
             waited,
+            self.kind,
         );
     }
 

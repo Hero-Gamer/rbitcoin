@@ -123,8 +123,42 @@ fn win_pwrite(handle: isize, offset: u64, buf: &[u8]) -> i32 {
 }
 
 #[cfg(windows)]
+struct PositionalXferEvent(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for PositionalXferEvent {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        extern "system" {
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        unsafe {
+            CloseHandle(self.0);
+        }
+        self.0 = core::ptr::null_mut();
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static POSITIONAL_XFER_EVENT: PositionalXferEvent = {
+        use std::ptr::{null, null_mut};
+        extern "system" {
+            fn CreateEventW(
+                sec: *mut core::ffi::c_void,
+                manual_reset: i32,
+                initial: i32,
+                name: *const u16,
+            ) -> *mut core::ffi::c_void;
+        }
+        PositionalXferEvent(unsafe { CreateEventW(null_mut(), 1, 0, null()) })
+    };
+}
+
+#[cfg(windows)]
 fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -> i32 {
-    use std::ptr::null_mut;
     #[repr(C)]
     struct Overlapped {
         internal: usize,
@@ -154,34 +188,48 @@ fn win_xfer(handle: isize, offset: u64, ptr: *mut u8, len: usize, write: bool) -
             got: *mut u32,
             wait: i32,
         ) -> i32;
+        fn ResetEvent(h: *mut core::ffi::c_void) -> i32;
         fn GetLastError() -> u32;
     }
     const ERROR_IO_PENDING: u32 = 997;
-    let mut ov = Overlapped {
-        internal: 0,
-        internal_high: 0,
-        off: offset as u32,
-        off_high: (offset >> 32) as u32,
-        event: null_mut(),
-    };
-    let mut got: u32 = 0;
-    let h = handle as *mut core::ffi::c_void;
-    let ovp = (&mut ov) as *mut Overlapped as *mut core::ffi::c_void;
-    let ok = if write {
-        unsafe { WriteFile(h, ptr, len as u32, &mut got, ovp) }
-    } else {
-        unsafe { ReadFile(h, ptr, len as u32, &mut got, ovp) }
-    };
-    if ok == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
-            return -(err as i32);
-        }
-        if unsafe { GetOverlappedResult(h, ovp, &mut got, 1) } == 0 {
+    POSITIONAL_XFER_EVENT.with(|event| {
+        let event = event.0;
+        if event.is_null() {
             return -(unsafe { GetLastError() } as i32);
         }
-    }
-    got as i32
+        unsafe {
+            ResetEvent(event);
+        }
+        // SAFETY: this OVERLAPPED is stack-local. If the handle is bound to an
+        // IOCP, a NULL hEvent queues the packet to the port and harvest
+        // `Box::from_raw`s it (STATUS_HEAP_CORRUPTION). The low bit of hEvent
+        // tells Windows not to queue (GetOverlappedResult still waits).
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            off: offset as u32,
+            off_high: (offset >> 32) as u32,
+            event: ((event as usize) | 1) as *mut core::ffi::c_void,
+        };
+        let mut got: u32 = 0;
+        let h = handle as *mut core::ffi::c_void;
+        let ovp = (&mut ov) as *mut Overlapped as *mut core::ffi::c_void;
+        let ok = if write {
+            unsafe { WriteFile(h, ptr, len as u32, &mut got, ovp) }
+        } else {
+            unsafe { ReadFile(h, ptr, len as u32, &mut got, ovp) }
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return -(err as i32);
+            }
+            if unsafe { GetOverlappedResult(h, ovp, &mut got, 1) } == 0 {
+                return -(unsafe { GetLastError() } as i32);
+            }
+        }
+        got as i32
+    })
 }
 
 /// Resize an overlapped file without `SetFilePointer` / std `Seek`.

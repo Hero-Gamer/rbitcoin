@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Native OS smoke for ci.yml windows / macos (and local). Store tests that
-# hit OS-specific IO / RAM probes, plus rbitcoin-node --smoke. Not a
-# packaged snapshot.
+# hit OS-specific IO / RAM / mmap probes, a few-block query confirm (IOCP /
+# pool vs uring), plus rbitcoin-node --smoke. Not a packaged snapshot.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,10 +19,20 @@ STORE_PLATFORM_FILTERS=(
   uring_session::tests::default_kind_follows_os
   uring_session::tests::pool_
   io_session_iocp
+  fuse8_filter::tests::no_false_negatives_and_roundtrip
+  segmented_head::tests::insert_roll_seal_lookup_roundtrip
+)
+# Query confirm: TableFile + Class C write-behind on the native completion
+# session (IOCP / pool). Not the full query suite. Windows and Darwin run
+# the same confirm + seal-roll surface (mmap fuse + a few blocks).
+QUERY_PLATFORM_FILTERS=(
+  connect_chain_query_surface
+  spend_edge_and_confirm_idempotent_path
 )
 # Windows OVERLAPPED + concurrent grow can `pread short` and abort the
-# process (STATUS_STACK_BUFFER_OVERRUN). Windows-only skip; Linux and
-# Darwin run it. CI_OS_SMOKE_UNAME overrides uname for the self-test.
+# process (STATUS_STACK_BUFFER_OVERRUN). Same-thread fuse roundtrip, seal
+# roll, and query confirm still run. CI_OS_SMOKE_UNAME overrides uname
+# for the self-test.
 STORE_PLATFORM_SKIPS=()
 case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT*)
@@ -35,8 +45,9 @@ case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
 esac
 
 if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then
-  echo "smoke=store-platform+node-smoke"
+  echo "smoke=store-platform+query-confirm+node-smoke"
   echo "filters=${STORE_PLATFORM_FILTERS[*]}"
+  echo "query=${QUERY_PLATFORM_FILTERS[*]}"
   echo "skip=${STORE_PLATFORM_SKIPS[*]:-}"
   exit 0
 fi
@@ -48,6 +59,10 @@ done
 
 for f in "${STORE_PLATFORM_FILTERS[@]}"; do
   cargo test -p rbitcoin-store --lib -- "$f" ${skip_args[@]+"${skip_args[@]}"}
+done
+
+for f in "${QUERY_PLATFORM_FILTERS[@]}"; do
+  cargo test -p rbitcoin-query --lib -- "$f"
 done
 
 cargo build -p rbitcoin-node -p rbitcoin-cli

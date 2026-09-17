@@ -1,7 +1,21 @@
 # Store IO modality matrix
 
 **Source of truth** for bulk `RBITCOIN_IO` vs table transport (fd + tiered RAM).
-**Phase 6 complete:** workspace has **zero `memmap2` / `MmapMut`** for store tables.
+**Phase 6 complete:** workspace has **zero `memmap2` / `MmapMut`**.
+[`TableFile`](../crates/rbitcoin-store/src/file.rs) stays **FdOnly**. The mmap
+exception is **read-only immutable** sealed `.fuse8` fingerprint arrays in
+[`fuse8_filter.rs`](../crates/rbitcoin-store/src/fuse8_filter.rs) (Unix `mmap`
+`PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`). Packed MPHF
+`g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
+thread, while `KIND_MPHF_G` keeps 128 pages in flight on the completion
+session. `strong_tx` and mempool stay process `Vec`.
+
+**Map vs FdOnly:** map when the bytes are immutable after write, touched as
+a few random bytes per key, and must stay resident for the hot path (sealed
+`.fuse8`: every unfinished key probes every sealed segment). Keep FdOnly +
+completion session when the file is larger than the residency budget or is
+read as page batches (`txid.body` / `txout` / `spent` / `create.loc`, packed
+BDZ `g`, SH tags/`.val`).
 
 Related: [`env-knobs.md`](./env-knobs.md), [`concurrency.md`](./concurrency.md),
 [`crash-recovery.md`](./crash-recovery.md), [`architecture.md`](./architecture.md).
@@ -13,7 +27,7 @@ Related: [`env-knobs.md`](./env-knobs.md), [`concurrency.md`](./concurrency.md),
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
 | **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pool` \| `iocp` \| `pread` | Multi-op **completion session** on file handles (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
-| **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
+| **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps. Sealed `.fuse8` is a sidecar map, not TableFile |
 
 **`RBITCOIN_IO` selects the completion-session backend** (not per-path).
 Unknown tokens (including deleted `mmap`) fall through to the platform default.
@@ -33,6 +47,9 @@ Create, open, header/trailer, and grow use positional `IoHandle`
 pread/pwrite and `SetFileInformationByHandle(FileEndOfFileInfo)`. Do
 **not** mix those handles with std `Read`/`Write`/`Seek` — `WriteFile`
 with a NULL `OVERLAPPED` is os error 87 (`ERROR_INVALID_PARAMETER`).
+Positional xfer sets the low bit of `OVERLAPPED.hEvent` so the packet is
+**not** queued to the process IOCP (harvest `Box::from_raw`s only session
+heap OVERLAPPEDs).
 
 **kqueue is not a regular-file backend.** Darwin files report ready immediately;
 `read` still blocks. POSIX AIO (`EVFILT_AIO`) and `dispatch_io` are also
@@ -138,10 +155,10 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
 | **`create.loc` / `inwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
-| **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: RAM fuse8; packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
+| **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
-| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx+fuse8. L1 ovf: RAM fuse + FdOnly `g`. Body slabs L0 |
+| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx + mapped `.fuse8`. L1 ovf: mapped fuse + FdOnly `g`. Body slabs L0 |
 | **Spenders** | L0 | Linear append |
 | `confirmed` / `header_txs_*` / `strong_tx` | **L2** | InRam write-behind; barrier = `Store::flush_class_c_tip` |
 | Create-height fence | RAM | Built from confirmed + header_txs; no `tx_height.body` |
@@ -224,9 +241,12 @@ There is no separate store microbench binary (`rbitcoin-store-bench` was
 removed; default graph is product + suite). Head-insert A/B is the live
 `ibd: perf` / `ibd: perf_dbg` window above.
 
-Maps are gone (`memmap2` not in the workspace). There is no `RBITCOIN_TX_HEAD_ACCESS`
-hatch. Tables are fd pread/pwrite + fallocate.
-Class C is L2 write-behind (`flush_class_c_tip` before BQ dequeue).
+`TableFile` has no maps (`memmap2` not in the workspace). There is no
+`RBITCOIN_TX_HEAD_ACCESS` hatch. Tables are fd pread/pwrite + fallocate.
+Sealed `.fuse8` sidecars are the mmap exception (read-only, not `MmapMut`).
+Packed `g` stays FdOnly. Class C is L2 write-behind (`flush_class_c_tip`
+before BQ dequeue) — **not** mapped (`strong_tx` write-behind is tip-last).
+Mempool schema 2 is InRam Vecs + `pwrite`.
 
 Live head insert is page-coalesced pread → mutate → pwrite (not per-slot uring).
 Head resolve batches one pread per distinct probe page, then one loc batch

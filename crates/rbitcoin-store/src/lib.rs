@@ -17,6 +17,7 @@ mod delta_loc;
 mod error;
 mod file;
 mod fuse8_filter;
+mod fuse_map;
 mod hashhead;
 mod head_resolve_denserels;
 mod head_resolve_pick;

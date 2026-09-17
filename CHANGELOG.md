@@ -25,6 +25,31 @@ before 1.0).
 
 ### Changed
 
+- **Sealed fuse8 mmap + no retained `open_keys`:** lookup maps every sealed
+  `.fuse8` fingerprint array read-only (`fuse8=` heap **0** after
+  `write_then_map` / `open_file`). Open OA is keyless; the seal sidecar
+  collects keys from `txid.body` (crash-reopen still collects on open).
+  Kernel reclaim of idle fuse is drop of file pages, not swap. Packed MPHF
+  `g` stays FdOnly (mapped miss is one fault per lookup thread; `KIND_MPHF_G`
+  keeps 128 pages in flight). `strong_tx` and mempool stay process `Vec`.
+  `ibd: sizes` / `tip: perf` `fuse8=` is heap only; mapped fuse RSS is
+  `file=`. After IBD, leftover `anon − accounted` can be mimalloc arenas
+  (`free` ≠ `munmap`); optional operator `MIMALLOC_PURGE_DELAY=0`. Do not
+  `malloc_trim` a mimalloc process. PR `windows` / `macos` smoke maps a
+  sealed `.fuse8` and confirms a few blocks (`connect_chain_query_surface` /
+  spend-edge).
+
+- **Windows positional IO on IOCP handles:** `IoHandle` pread/pwrite sets the
+  low bit of `OVERLAPPED.hEvent` so the packet is not queued to the completion
+  port. A stack OVERLAPPED on a bound handle was harvested with `Box::from_raw`
+  (`STATUS_HEAP_CORRUPTION` on seal-roll and query confirm smoke). A failed
+  IOCP `push_*` (handle already bound to another thread's port) rolls back
+  session pending so SH collect libc-completes instead of drain-hanging.
+  A failed pending rollback poisons the session. The positional wait event
+  is closed when the thread exits.
+  Sealed `.mphf` is synced at write; `flush` only `sync_data`s the mutable
+  `.val` (Windows `FlushFileBuffers` on a read-only handle is Access denied).
+
 - **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
   `persist_due` every 5 s writes the body tail then slots+meta (no fsync).
   Shutdown `flush` still fsyncs. DEAD of a durable slot is a one-record

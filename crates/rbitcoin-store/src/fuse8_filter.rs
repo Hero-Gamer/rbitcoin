@@ -12,11 +12,15 @@
 //!
 //! Opening a v1 file **refuses** the store. Wipe `store/tx.head` (and
 //! `store/scripthash*` if SH overflow fuses are v1); Class A is kept.
+//!
+//! `build` owns fingerprints on the heap. After `write_then_map` /
+//! `read_from`, fingerprints are a read-only file map (`fuse8=` heap 0).
 
-use crate::binary_fuse8::BinaryFuse8;
+use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
 use crate::error::StoreError;
+use crate::fuse_map::FuseMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"BF8R";
@@ -29,14 +33,14 @@ pub const VERSION_V2: u32 = 2;
 pub const INDEX_REFUSE_FUSE8_V1: &str = "index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)";
 
 /// Result of opening a sealed fuse file.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum FuseFileOpen {
     /// Current v2 format; safe to use as a membership gate.
     Ready(SealedFuse8),
 }
 
 /// On-disk / in-memory sealed fuse for one head segment.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SealedFuse8 {
     /// `None` ⇒ always probe (migration placeholder; no false negatives).
     filter: Option<BinaryFuse8>,
@@ -75,6 +79,14 @@ impl SealedFuse8 {
         self.filter.as_ref().map(|f| f.len()).unwrap_or(0)
     }
 
+    /// Heap-owned fingerprint bytes (0 when mapped from the sealed file).
+    pub fn fingerprint_heap_bytes(&self) -> usize {
+        self.filter
+            .as_ref()
+            .map(|f| f.fingerprint_heap_bytes())
+            .unwrap_or(0)
+    }
+
     /// Write current (v2) layout.
     pub fn write_to(&self, path: &Path) -> Result<(), StoreError> {
         let filter = self
@@ -93,6 +105,12 @@ impl SealedFuse8 {
         Ok(())
     }
 
+    /// Write v2 then reopen as a file map (drop the build heap).
+    pub fn write_then_map(self, path: &Path) -> Result<Self, StoreError> {
+        self.write_to(path)?;
+        Self::read_from(path)
+    }
+
     pub fn read_from(path: &Path) -> Result<Self, StoreError> {
         match open_file(path)? {
             FuseFileOpen::Ready(f) => Ok(f),
@@ -102,44 +120,52 @@ impl SealedFuse8 {
 
 /// Open a BF8R fuse file. v1 and unreadable v2 refuse (no always-probe).
 pub fn open_file(path: &Path) -> Result<FuseFileOpen, StoreError> {
-    let mut f = File::open(path).map_err(|e| StoreError::io(path, e))?;
-    let mut hdr = [0u8; 16];
-    f.read_exact(&mut hdr)
-        .map_err(|e| StoreError::io(path, e))?;
-    if &hdr[0..4] != MAGIC {
-        return Err(StoreError::Corrupt("tx.head fuse magic"));
-    }
-    let ver = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let len = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; len];
-    f.read_exact(&mut payload)
-        .map_err(|e| StoreError::io(path, e))?;
-
-    match ver {
-        VERSION_V1 => Err(StoreError::Corrupt(INDEX_REFUSE_FUSE8_V1)),
-        VERSION_V2 => match decode_body(&payload) {
-            Ok(filter) => Ok(FuseFileOpen::Ready(SealedFuse8 {
-                filter: Some(filter),
-            })),
-            Err(_) => Err(StoreError::Corrupt("fuse8 v2 body unreadable")),
-        },
-        _ => Err(StoreError::Corrupt("tx.head fuse version")),
-    }
+    let mut map = FuseMap::map_path(path)?;
+    let geo = {
+        let bytes = map.as_file_bytes();
+        if bytes.len() < 16 {
+            return Err(StoreError::Corrupt("tx.head fuse magic"));
+        }
+        if &bytes[0..4] != MAGIC {
+            return Err(StoreError::Corrupt("tx.head fuse magic"));
+        }
+        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        if bytes.len() < 16 + len {
+            return Err(StoreError::Corrupt("fuse8 v2 body unreadable"));
+        }
+        match ver {
+            VERSION_V1 => return Err(StoreError::Corrupt(INDEX_REFUSE_FUSE8_V1)),
+            VERSION_V2 => {
+                let payload = &bytes[16..16 + len];
+                parse_v2_geometry(payload)
+                    .map_err(|_| StoreError::Corrupt("fuse8 v2 body unreadable"))?
+            }
+            _ => return Err(StoreError::Corrupt("tx.head fuse version")),
+        }
+    };
+    map.set_fingerprint_range(16 + geo.fp_off, geo.fp_len)?;
+    Ok(FuseFileOpen::Ready(SealedFuse8 {
+        filter: Some(BinaryFuse8 {
+            seed: geo.seed,
+            segment_length: geo.segment_length,
+            segment_length_mask: geo.segment_length_mask,
+            segment_count_length: geo.segment_count_length,
+            fingerprints: Fingerprints::Map(map),
+        }),
+    }))
 }
 
-fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
-    let fp = filter.fingerprints.as_ref();
-    let mut body = Vec::with_capacity(8 + 4 + 4 + 4 + 8 + fp.len());
-    body.extend_from_slice(&filter.seed.to_le_bytes());
-    body.extend_from_slice(&filter.segment_length.to_le_bytes());
-    body.extend_from_slice(&filter.segment_length_mask.to_le_bytes());
-    body.extend_from_slice(&filter.segment_count_length.to_le_bytes());
-    body.extend_from_slice(&(fp.len() as u64).to_le_bytes());
-    body.extend_from_slice(fp);
-    body
+struct V2Geometry {
+    seed: u64,
+    segment_length: u32,
+    segment_length_mask: u32,
+    segment_count_length: u32,
+    fp_off: usize,
+    fp_len: usize,
 }
 
-fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
+fn parse_v2_geometry(payload: &[u8]) -> Result<V2Geometry, StoreError> {
     if payload.len() < 8 + 4 + 4 + 4 + 8 {
         return Err(StoreError::Corrupt("fuse8 body short"));
     }
@@ -154,8 +180,6 @@ fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
     o += 4;
     let fp_len = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap()) as usize;
     o += 8;
-    // Sanity first: refuse absurd lengths before comparing to payload (avoids
-    // saturating arithmetic games and keeps OOM claims out of the heap path).
     if fp_len > 512 * 1024 * 1024 {
         return Err(StoreError::Corrupt("fuse8 fingerprints too large"));
     }
@@ -171,14 +195,26 @@ fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
             "fuse8 fingerprints shorter than hash geometry",
         ));
     }
-    let fingerprints = payload[o..o + fp_len].to_vec().into_boxed_slice();
-    Ok(BinaryFuse8 {
+    Ok(V2Geometry {
         seed,
         segment_length,
         segment_length_mask,
         segment_count_length,
-        fingerprints,
+        fp_off: o,
+        fp_len,
     })
+}
+
+fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
+    let fp = filter.fingerprints.as_slice();
+    let mut body = Vec::with_capacity(8 + 4 + 4 + 4 + 8 + fp.len());
+    body.extend_from_slice(&filter.seed.to_le_bytes());
+    body.extend_from_slice(&filter.segment_length.to_le_bytes());
+    body.extend_from_slice(&filter.segment_length_mask.to_le_bytes());
+    body.extend_from_slice(&filter.segment_count_length.to_le_bytes());
+    body.extend_from_slice(&(fp.len() as u64).to_le_bytes());
+    body.extend_from_slice(fp);
+    body
 }
 
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
@@ -205,6 +241,34 @@ mod tests {
         p
     }
 
+    fn decode_body(payload: &[u8]) -> Result<BinaryFuse8, StoreError> {
+        let geo = parse_v2_geometry(payload)?;
+        let fingerprints = Fingerprints::Heap(
+            payload[geo.fp_off..geo.fp_off + geo.fp_len]
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        Ok(BinaryFuse8 {
+            seed: geo.seed,
+            segment_length: geo.segment_length,
+            segment_length_mask: geo.segment_length_mask,
+            segment_count_length: geo.segment_count_length,
+            fingerprints,
+        })
+    }
+
+    #[test]
+    fn empty_fuse_file_is_corrupt_empty() {
+        let dir = tmp();
+        let path = dir.join("empty.fuse8");
+        std::fs::write(&path, b"").unwrap();
+        match SealedFuse8::read_from(&path) {
+            Err(StoreError::Corrupt(m)) => assert_eq!(m, "fuse8 file empty"),
+            other => panic!("empty fuse must be Corrupt empty, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn no_false_negatives_and_roundtrip() {
         let keys: Vec<u64> = (0..10_000u64)
@@ -218,6 +282,12 @@ mod tests {
         let path = dir.join("seg.fuse8");
         f.write_to(&path).unwrap();
         let f2 = SealedFuse8::read_from(&path).unwrap();
+        assert_eq!(
+            f2.fingerprint_heap_bytes(),
+            0,
+            "open_file must map fingerprints, not copy them"
+        );
+        assert_eq!(f2.fingerprint_bytes(), f.fingerprint_bytes());
         for &k in &keys {
             assert!(f2.contains(k));
         }

@@ -1860,9 +1860,9 @@ impl ScriptHashTable {
         {
             let mut fp = path.as_os_str().to_os_string();
             fp.push(".fuse8");
-            fuse.write_to(&PathBuf::from(fp))?;
+            let fuse = fuse.write_then_map(&PathBuf::from(fp))?;
+            *self.ovf_l1.lock().unwrap() = Some(OvfL1 { head, fuse });
         }
-        *self.ovf_l1.lock().unwrap() = Some(OvfL1 { head, fuse });
         let old = {
             let mut g = self.sealed_ovf.lock().unwrap();
             std::mem::take(&mut *g)

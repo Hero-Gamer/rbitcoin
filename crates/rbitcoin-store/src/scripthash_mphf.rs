@@ -81,10 +81,7 @@ impl MphfHead {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.val_file
             .sync_data()
-            .map_err(|e| StoreError::io(val_path(&self.base), e))?;
-        self.mphf_file
-            .sync_data()
-            .map_err(|e| StoreError::io(mphf_path(&self.base), e))
+            .map_err(|e| StoreError::io(val_path(&self.base), e))
     }
 
     pub fn write_pack8(
@@ -298,6 +295,7 @@ mod tests {
         assert_eq!(h.get(&key(1)).unwrap().unwrap(), a);
         assert_eq!(h.get(&key(2)).unwrap().unwrap(), b);
         assert!(h.get(&key(9)).unwrap().is_none());
+        h.flush().unwrap();
         assert!(MphfHead::exists(&base));
         assert!(mphf_path(&base).is_file());
         assert!(val_path(&base).is_file());

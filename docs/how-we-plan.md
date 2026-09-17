@@ -182,7 +182,9 @@ Worktree, local tests, push URL, poll CI, musl-after-merge, after-merge
 cleanup: [`AGENTS.md`](../AGENTS.md). Suite speed and fixture size:
 [`TESTING.md`](../TESTING.md). A PR that cannot merge (`CONFLICTING` /
 `DIRTY` / behind master) **does not run test CI** — rebase, then poll
-(AGENTS.md **Mergeable first**).
+(AGENTS.md **Mergeable first**). Fail-fast poll: [`AGENTS.md`](../AGENTS.md)
+(`./scripts/pr-checks-watch.sh --interest <job>` — do not `gh pr checks --watch`
+past a red job of interest).
 
 Do not call the plan done on a red PR. A plan that multiplies multi-second
 full-store opens is a bad plan even if slices are “vertical.”

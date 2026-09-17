@@ -116,8 +116,9 @@ checklist.
   shipped surface (including Esplora `/txs/summary` as a dialect).
 - **Build:** rustc **1.95.0** in CI and Nix; `cargo deny`; no floating
   `stable`. Musl operator binary is GitHub Release only.
-- **Fuse8 / leftover:** sealed fuse8 fingerprints stay RAM; BDZ `g` is
-  FdOnly. Optional `sp_tweaks` leftover regenerate is not a Class A wipe.
+- **Fuse8 / leftover:** sealed `.fuse8` fingerprints are read-only mmap
+  (heap `fuse8=0`); BDZ `g` is FdOnly. Optional `sp_tweaks` leftover
+  regenerate is not a Class A wipe.
 - **Meters:** instance `ConfirmStats` / session IO stats. No process-global
   confirm meters, no TLS `test_take_*` probes.
 - **Crate graph:** unused `pub` is forbidden; fuzz lives in `fuzz/`.
