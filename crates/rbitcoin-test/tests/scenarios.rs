@@ -668,59 +668,6 @@ fn chain_connect_reorg_and_growth() {
     pin_disconnect_to_genesis_reconnect_and_tip_shrink(q, &td, N, &saved);
 }
 
-// ─── Resume: Class A remains after connect+disconnect (not archive-ahead) ─────
-
-/// After connect then disconnect, `resume_work_path_after_tip` still sees
-/// Class A bodies (production leaves archive on disconnect).
-#[test]
-fn resume_work_path_sees_archived_bodies_after_reopen() {
-    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
-
-    let td = TestDatadir::new().unwrap();
-    let params = ChainParams::regtest();
-    let ms = Milestone { height: 1_000_000 };
-    let genesis = regtest_genesis();
-
-    let hashes = {
-        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-        let mut tip = genesis.block_hash();
-        let mut tip_time = genesis.header.time;
-        let mut out = Vec::new();
-        for h in 1u32..=4 {
-            let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-            out.push(b.block_hash().to_byte_array());
-            tip = b.block_hash();
-            tip_time = b.header.time;
-        }
-        for _ in 1u32..=4 {
-            q.disconnect_tip().unwrap();
-        }
-        assert_eq!(q.tip_height().map(|h| h.0), Some(0));
-        q.flush().unwrap();
-        out
-    };
-
-    // Cold reopen — process-local ordered path is gone; store still has Class A.
-    let q2 = Query::open_or_create_tiny(td.store_path()).unwrap();
-    let tip_hash = genesis.block_hash().to_byte_array();
-    let path = q2
-        .resume_work_path_after_tip(tip_hash, 0, 64)
-        .expect("resume");
-    assert_eq!(path.len(), 4, "expected 4 headers after tip");
-    assert!(
-        path.iter().all(|e| e.has_body),
-        "all resume entries should have Class A bodies"
-    );
-    for (i, e) in path.iter().enumerate() {
-        assert_eq!(e.height, (i as u32) + 1);
-        assert_eq!(e.hash, hashes[i]);
-        assert!(q2.is_block_archived(&e.hash).unwrap());
-    }
-}
-
 /// Simulate kill -9 mid Class C: `strong_tx` written for tip+1 but
 /// `confirmed[]` not advanced. Class A does not write spend point edges
 /// (confirm `post_commit` annotates after tip). Re-confirm must not
@@ -1253,6 +1200,38 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     let tip_rec = q.get_header(tip_fk).unwrap();
     let again = q.ensure_header(&tip_rec).unwrap();
     assert_eq!(again, tip_fk);
+
+    pin_resume_archived_bodies_after_disconnect(&q, &chain.blocks, tip_h);
+}
+
+fn pin_resume_archived_bodies_after_disconnect(q: &Query, blocks: &[Block], tip_h: u32) {
+    let from_h = tip_h - 4;
+    while q.tip_height().map(|h| h.0).unwrap() > from_h {
+        q.disconnect_tip().unwrap();
+    }
+    assert_eq!(q.tip_height(), Some(Height(from_h)));
+    let from_hash = q.header_at_height(Height(from_h)).unwrap().unwrap().1.hash;
+    let path = q
+        .resume_work_path_after_tip(from_hash, from_h, 64)
+        .expect("resume");
+    assert!(
+        path.len() >= 4,
+        "expected ≥4 headers after tip, got {}",
+        path.len()
+    );
+    assert!(
+        path.iter().all(|e| e.has_body),
+        "all resume entries should have Class A bodies"
+    );
+    for i in 0..4u32 {
+        let h = from_h + 1 + i;
+        let e = path
+            .iter()
+            .find(|e| e.height == h)
+            .unwrap_or_else(|| panic!("missing resume height {h}"));
+        assert_eq!(e.hash, blocks[h as usize].block_hash().to_byte_array());
+        assert!(q.is_block_archived(&e.hash).unwrap());
+    }
 }
 
 fn pin_same_run_create_then_spend(

@@ -1853,49 +1853,29 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
 /// annotations (reorg path). Extending the winning tip must resolve multi via
 /// confirmed-strong walk — not hard-fail `structural multi-spender` (mainnet
 /// tip-follow freeze at 961396 after reorg annotate near tip).
-#[test]
-fn reorg_competing_spend_extends_without_multi_fail() {
+fn pin_competing_spend_extends_without_multi_fail(
+    hub: &rbitcoin_net::ChainHub,
+    cb1: bitcoin::Txid,
+    fork_h: u32,
+) {
     use bitcoin::Amount;
-    use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_net::{AcceptOutcome, ChainHub};
+    use rbitcoin_net::AcceptOutcome;
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
-    let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
-    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
-    let maturity = ChainParams::regtest().coinbase_maturity();
+    let fork_rec = hub
+        .query
+        .header_at_height(Height(fork_h))
+        .unwrap()
+        .unwrap()
+        .1;
+    let fork_parent = BlockHash::from_byte_array(fork_rec.hash);
+    let fork_time = fork_rec.timestamp;
 
-    let genesis = regtest_genesis();
-    hub.accept_block(genesis.clone()).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut time = genesis.header.time;
-
-    // Height 1: coinbase we will double-spend across forks after maturity.
-    let b1 = mine_regtest_block(tip, time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    tip = b1.block_hash();
-    time = b1.header.time;
-    hub.accept_block(b1).unwrap();
-
-    // Pad until height-1 has `maturity` confirmations (spendable next).
-    let last_pad = maturity + 1;
-    for h in 2..=last_pad {
-        let b = mine_regtest_block(tip, time + 600, h, vec![]);
-        tip = b.block_hash();
-        time = b.header.time;
-        hub.accept_block(b).unwrap();
-    }
-    let fork_parent = tip;
-    let fork_time = time;
-    let fork_h = last_pad;
-
-    // Main branch: spend coinbase once at fork_h+1.
     let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
     let main = mine_regtest_block(fork_parent, fork_time + 600, fork_h + 1, vec![spend_a]);
     hub.accept_block(main).unwrap();
     assert_eq!(hub.tip_height(), Some(fork_h + 1));
 
-    // Longer competing branch from fork_parent: different spend of same out + pad.
     let spend_b = spend_anyone_can_spend(cb1, 0, Amount::from_sat(48_5000_0000));
     let mut branch = Vec::new();
     let mut p = fork_parent;
@@ -1906,7 +1886,6 @@ fn reorg_competing_spend_extends_without_multi_fail() {
         } else {
             vec![]
         };
-        // Distinct time so PoW/hash differs from main.
         let b = mine_regtest_block(p, t + 601 + i as u32, h, extra);
         p = b.block_hash();
         t = b.header.time;
@@ -1922,9 +1901,6 @@ fn reorg_competing_spend_extends_without_multi_fail() {
     }
     assert_eq!(hub.tip_height(), Some(fork_h + 3));
 
-    // Coinbase is multi-list (main spend_a + winning spend_b) with spend_b strong.
-    // A third spend must be PrevoutSpent — **not** `structural multi-spender`
-    // hard-fail (that was the mainnet tip freeze after tip-follow reorgs).
     let spend_c = spend_anyone_can_spend(cb1, 0, Amount::from_sat(47_0000_0000));
     let double = mine_regtest_block(p, t + 600, fork_h + 4, vec![spend_c]);
     let err = hub
@@ -1942,7 +1918,6 @@ fn reorg_competing_spend_extends_without_multi_fail() {
         "expected prevout-spent class error, got: {msg}"
     );
 
-    // Honest tip extension still works after multi-list exists on disk.
     let ext = mine_regtest_block(p, t + 600, fork_h + 4, vec![]);
     let o = hub
         .accept_block(ext)
@@ -1954,13 +1929,13 @@ fn reorg_competing_spend_extends_without_multi_fail() {
     assert_eq!(hub.tip_height(), Some(fork_h + 4));
 }
 
-fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block) {
+fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block, tip_h: u32) {
     use rbitcoin_net::AcceptOutcome;
 
     let tips = hub.chaintips();
     assert!(
         tips.iter()
-            .any(|t| t.status == "active" && t.hash == ext.block_hash() && t.height == 6),
+            .any(|t| t.status == "active" && t.hash == ext.block_hash() && t.height == tip_h),
         "{tips:?}"
     );
     assert!(
@@ -1968,15 +1943,20 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         "disconnected stem must be valid-fork: {tips:?}"
     );
 
-    let p5 = hub.query.header_at_height(Height(5)).unwrap().unwrap().1;
-    let p5_hash = BlockHash::from_byte_array(p5.hash);
-    let sibling = mine_regtest_block(p5_hash, p5.timestamp + 900, 6, vec![]);
+    let p_prev = hub
+        .query
+        .header_at_height(Height(tip_h - 1))
+        .unwrap()
+        .unwrap()
+        .1;
+    let p_prev_hash = BlockHash::from_byte_array(p_prev.hash);
+    let sibling = mine_regtest_block(p_prev_hash, p_prev.timestamp + 900, tip_h, vec![]);
     assert!(matches!(
         hub.accept_received_block(sibling.clone()).unwrap(),
         AcceptOutcome::IgnoredWeaker
     ));
     assert!(hub.held_body(&sibling.block_hash()).is_some());
-    pin_held_sixteen_vs_seventeen(hub, p5_hash, p5.timestamp);
+    pin_held_sixteen_vs_seventeen(hub, p_prev_hash, p_prev.timestamp, tip_h);
     let tips = hub.chaintips();
     assert!(
         tips.iter()
@@ -2008,12 +1988,17 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
 
 /// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
 /// FIFO eviction at the cap stays `hold_body_caps_fifo`.
-fn pin_held_sixteen_vs_seventeen(hub: &rbitcoin_net::ChainHub, parent: BlockHash, timestamp: u32) {
+fn pin_held_sixteen_vs_seventeen(
+    hub: &rbitcoin_net::ChainHub,
+    parent: BlockHash,
+    timestamp: u32,
+    height: u32,
+) {
     use rbitcoin_net::AcceptOutcome;
 
     let mut hashes = Vec::with_capacity(17);
     for i in 0..17u32 {
-        let b = mine_regtest_block(parent, timestamp.saturating_add(910 + i), 6, vec![]);
+        let b = mine_regtest_block(parent, timestamp.saturating_add(910 + i), height, vec![]);
         let h = b.block_hash();
         assert!(
             matches!(
@@ -2049,58 +2034,51 @@ fn pin_held_sixteen_vs_seventeen(hub: &rbitcoin_net::ChainHub, parent: BlockHash
 /// longer side branch (tip-mode accept path, not IBD body-queue).
 #[test]
 fn reorg_same_height_then_multi_block_branch() {
-    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
     use rbitcoin_net::{AcceptOutcome, ChainHub};
+    use rbitcoin_test::pad_empty_from;
 
     let dir = TempDir::new().unwrap();
     let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
-    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
-
+    let params = ChainParams::regtest();
     let genesis = regtest_genesis();
-    hub.accept_block(genesis.clone()).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut time = genesis.header.time;
-    for h in 1..=3u32 {
-        let b = mine_regtest_block(tip, time + 600, h, vec![]);
-        tip = b.block_hash();
-        time = b.header.time;
-        hub.accept_block(b).unwrap();
-    }
-    assert_eq!(hub.tip_height(), Some(3));
-    let parent_h2 = hub
-        .query
-        .header_at_height(Height(2))
-        .unwrap()
-        .unwrap()
-        .1
-        .hash;
-    let parent = BlockHash::from_byte_array(parent_h2);
-    let t2 = hub
-        .query
-        .header_at_height(Height(2))
-        .unwrap()
-        .unwrap()
-        .1
-        .timestamp;
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let last_pad = params.coinbase_maturity() + 1;
+    pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, last_pad);
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    assert_eq!(hub.tip_height(), Some(last_pad));
 
-    // Competing tip at height 3 (more work via later timestamp when PoW allows).
-    let rival = mine_regtest_block(parent, t2 + 900, 3, vec![]);
+    pin_competing_spend_extends_without_multi_fail(&hub, cb1, last_pad);
+    let tip_h = hub.tip_height().unwrap();
+
+    let parent_rec = hub
+        .query
+        .header_at_height(Height(tip_h - 1))
+        .unwrap()
+        .unwrap()
+        .1;
+    let parent = BlockHash::from_byte_array(parent_rec.hash);
+    let t_parent = parent_rec.timestamp;
+
+    let rival = mine_regtest_block(parent, t_parent + 900, tip_h, vec![]);
     let outcome = hub.accept_block(rival.clone()).unwrap();
     match outcome {
-        AcceptOutcome::Accepted { height: 3 } => {
+        AcceptOutcome::Accepted { height } if height == tip_h => {
             assert_eq!(hub.tip_hash().unwrap(), rival.block_hash());
         }
         AcceptOutcome::IgnoredWeaker => {
-            // Equal work is OK for this network — still exercise multi-block reorg below.
-            assert_eq!(hub.tip_height(), Some(3));
+            assert_eq!(hub.tip_height(), Some(tip_h));
         }
         other => panic!("unexpected same-height outcome: {other:?}"),
     }
 
-    // Multi-block reorg from height 1: longer path 2'..5'.
+    let fork_parent_h = tip_h - 2;
     let fork_parent = hub
         .query
-        .header_at_height(Height(1))
+        .header_at_height(Height(fork_parent_h))
         .unwrap()
         .unwrap()
         .1
@@ -2108,33 +2086,37 @@ fn reorg_same_height_then_multi_block_branch() {
     let mut p = BlockHash::from_byte_array(fork_parent);
     let mut t = hub
         .query
-        .header_at_height(Height(1))
+        .header_at_height(Height(fork_parent_h))
         .unwrap()
         .unwrap()
         .1
         .timestamp;
     let mut branch = Vec::new();
-    for h in 2..=5u32 {
+    let lo = tip_h - 1;
+    let hi = tip_h + 2;
+    for h in lo..=hi {
         let b = mine_regtest_block(p, t + 700 + h, h, vec![]);
         p = b.block_hash();
         t = b.header.time;
         branch.push(b);
     }
     let o = hub.accept_branch(&branch).unwrap();
-    assert!(
-        matches!(o, AcceptOutcome::Accepted { height: 5 }),
-        "multi-block reorg to height 5, got {o:?}"
-    );
-    assert_eq!(hub.tip_height(), Some(5));
+    match o {
+        AcceptOutcome::Accepted { height } => {
+            assert_eq!(height, hi, "multi-block reorg to {hi}");
+        }
+        other => panic!("multi-block reorg to {hi}, got {other:?}"),
+    }
+    assert_eq!(hub.tip_height(), Some(hi));
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
 
-    // Tip extension after multi-block reorg.
-    let ext = mine_regtest_block(p, t + 600, 6, vec![]);
-    assert!(matches!(
-        hub.accept_block(ext.clone()).unwrap(),
-        AcceptOutcome::Accepted { height: 6 }
-    ));
-    pin_precious_held_chaintips(&hub, ext);
+    let ext_h = hi + 1;
+    let ext = mine_regtest_block(p, t + 600, ext_h, vec![]);
+    match hub.accept_block(ext.clone()).unwrap() {
+        AcceptOutcome::Accepted { height } => assert_eq!(height, ext_h),
+        other => panic!("expected Accepted {ext_h}, got {other:?}"),
+    }
+    pin_precious_held_chaintips(&hub, ext, ext_h);
 }
 
 /// After catch-up (`initialblockdownload` false; `-maxtipage` so the 2011

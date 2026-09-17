@@ -70,6 +70,26 @@ async fn http_exchange(addr: SocketAddr, req: &str) -> (u16, String) {
     (status, body)
 }
 
+async fn http_get_raw(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.expect("http connect");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let status = buf
+        .split(|&b| b == b'\n')
+        .next()
+        .and_then(|l| std::str::from_utf8(l).ok())
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let sep = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("http headers");
+    (status, buf[sep + 4..].to_vec())
+}
+
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
     http_exchange(
         addr,
@@ -307,6 +327,148 @@ async fn pin_esplora_block_txids_merkle_and_outspend(
     assert_eq!(st, 200, "GET outspend: {body}");
     let os: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(os["spent"], false, "{body}");
+
+    let (st, body, oss) =
+        esplora_json_array(esplora_addr, &format!("/tx/{cb_txid}/outspends")).await;
+    assert_eq!(st, 200, "GET outspends: {body}");
+    assert!(!oss.is_empty(), "{body}");
+    assert_eq!(oss[0]["spent"], false, "{body}");
+}
+
+async fn pin_esplora_block_json_raw_status(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    parent_hash: &str,
+    tip_height: u64,
+    n_tx: usize,
+) {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::Block;
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}")).await;
+    assert_eq!(st, 200, "block json {body}");
+    let bj: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(bj["height"], tip_height, "{body}");
+    assert_eq!(bj["id"], tip_hash, "{body}");
+    assert_eq!(bj["tx_count"], n_tx, "{body}");
+    assert!(bj["size"].as_u64().unwrap() > 80, "{body}");
+    assert!(bj["weight"].as_u64().unwrap() > 0, "{body}");
+    assert!(bj.get("difficulty").is_some(), "{body}");
+    assert!(bj.get("mediantime").is_some(), "{body}");
+    assert!(bj["bits"].is_u64(), "Esplora bits is u32: {}", bj["bits"]);
+    assert_eq!(bj["previousblockhash"], parent_hash, "{body}");
+
+    let (st, raw) = http_get_raw(esplora_addr, &format!("/block/{tip_hash}/raw")).await;
+    assert_eq!(st, 200, "raw status");
+    let block: Block = deserialize(&raw).expect("decode raw block");
+    assert_eq!(block.txdata.len(), n_tx);
+    assert!(raw.len() > 80);
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/status")).await;
+    assert_eq!(st, 200, "{body}");
+    let stj: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(stj["in_best_chain"], true, "{body}");
+    assert_eq!(stj["height"], tip_height, "{body}");
+    assert!(stj["next_best"].is_null(), "tip has no next: {body}");
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{parent_hash}/status")).await;
+    assert_eq!(st, 200, "{body}");
+    let pst: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(pst["next_best"], tip_hash, "{body}");
+}
+
+async fn pin_esplora_txid_raw_hex_merkleblock(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    cb_txid: &str,
+) {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::MerkleBlock;
+
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txid/0")).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body.trim(), cb_txid, "{body}");
+    let (st, _) = http_get(esplora_addr, &format!("/block/{tip_hash}/txid/999")).await;
+    assert_eq!(st, 404);
+
+    let (st, body, txs) = esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs")).await;
+    assert_eq!(st, 200, "/txs no start: {body}");
+    assert!(!txs.is_empty(), "{body}");
+    assert!(txs[0].get("txid").is_some(), "{body}");
+
+    let (st, raw_tx) = http_get_raw(esplora_addr, &format!("/tx/{cb_txid}/raw")).await;
+    assert_eq!(st, 200);
+    let (st, hex_body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/hex")).await;
+    assert_eq!(st, 200, "{hex_body}");
+    let hex_bytes = rbitcoin_primitives::hex_decode(hex_body.trim()).unwrap();
+    assert_eq!(raw_tx, hex_bytes);
+
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{cb_txid}/merkleblock-proof")).await;
+    assert_eq!(st, 200, "{body}");
+    let mb_bytes = rbitcoin_primitives::hex_decode(body.trim()).unwrap();
+    let mb: MerkleBlock = deserialize(&mb_bytes).expect("merkleblock");
+    let mut matches = Vec::new();
+    let mut indexes = Vec::new();
+    mb.extract_matches(&mut matches, &mut indexes).unwrap();
+    assert_eq!(indexes, vec![0]);
+    assert_eq!(matches.len(), 1);
+}
+
+async fn pin_esplora_scripthash_pages(esplora_addr: SocketAddr) {
+    use rbitcoin_primitives::display_hash_hex;
+    use rbitcoin_store::script_hash;
+
+    let sh_hex = display_hash_hex(&script_hash(&[0x51]));
+    let (st, body) = http_get(esplora_addr, &format!("/scripthash/{sh_hex}")).await;
+    assert_eq!(st, 200, "{body}");
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        info["chain_stats"]["tx_count"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+    assert!(
+        info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
+
+    let (st, body, sum) =
+        esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs/summary")).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(!sum.is_empty(), "{body}");
+    assert!(sum[0].get("txid").is_some(), "{body}");
+    assert!(sum[0].get("value").is_some(), "{body}");
+    assert!(sum[0].get("height").is_some(), "{body}");
+    assert!(sum[0].get("time").is_some(), "{body}");
+
+    let (st, body, utxos) =
+        esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/utxo")).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(!utxos.is_empty(), "{body}");
+
+    let (st, body, page1) =
+        esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs/chain")).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(!page1.is_empty(), "{body}");
+    assert!(page1.len() <= 25, "{body}");
+    let last = page1[0]["txid"]
+        .as_str()
+        .expect("chain page txid")
+        .to_string();
+    let (st, body, page2) = esplora_json_array(
+        esplora_addr,
+        &format!("/scripthash/{sh_hex}/txs/chain/{last}"),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        page2.iter().all(|row| row["txid"] != last),
+        "cursor page must omit {last}: {body}"
+    );
+
+    let (st, body, combined) =
+        esplora_json_array(esplora_addr, &format!("/scripthash/{sh_hex}/txs")).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(!combined.is_empty(), "{body}");
 }
 
 /// B13: one live `want: blocks` + `track-tx` on this `run_p2p` process.
@@ -1135,6 +1297,13 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     }
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
     pin_esplora_block_txids_merkle_and_outspend(esplora_addr, new_hash, &cb_txid, txs.len()).await;
+    let parent_hash = blk["result"]["previousblockhash"]
+        .as_str()
+        .expect("previousblockhash")
+        .to_string();
+    pin_esplora_block_json_raw_status(esplora_addr, new_hash, &parent_hash, 107, txs.len()).await;
+    pin_esplora_txid_raw_hex_merkleblock(esplora_addr, new_hash, &cb_txid).await;
+    pin_esplora_scripthash_pages(esplora_addr).await;
     let cb_val = (txs[0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
     let immature = Transaction {
         version: TxVersion::TWO,
