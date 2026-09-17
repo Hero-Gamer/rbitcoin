@@ -887,7 +887,7 @@ impl TxGraph {
     }
 
     /// Rebuild helper: clear and re-insert from an ordered list (parents first best-effort).
-    pub fn rebuild_from(&mut self, items: Vec<(TxEntry, Transaction)>) {
+    pub fn rebuild_from(&mut self, items: Vec<(TxEntry, std::sync::Arc<Transaction>)>) {
         self.invalidate_chunk_cache();
         self.entries.clear();
         self.by_wtxid.clear();
@@ -897,7 +897,7 @@ impl TxGraph {
         self.conflicts.clear();
         self.created.clear();
         self.total_weight = 0;
-        let mut pending: BTreeMap<Txid, (TxEntry, Transaction)> =
+        let mut pending: BTreeMap<Txid, (TxEntry, std::sync::Arc<Transaction>)> =
             items.into_iter().map(|(e, tx)| (e.txid, (e, tx))).collect();
         let all: HashSet<Txid> = pending.keys().copied().collect();
         while !pending.is_empty() {
@@ -1031,7 +1031,7 @@ mod tests {
         let e = make_tx(None, 1, 5);
         let ee = entry_for(&e, 1, 4);
         let we = ee.wtxid;
-        g.rebuild_from(vec![(ee, e.clone())]);
+        g.rebuild_from(vec![(ee, std::sync::Arc::new(e.clone()))]);
         assert_eq!(g.txid_for_wtxid(&we), Some(e.compute_txid()));
         assert!(!g.contains_wtxid(&wb));
     }
@@ -1450,8 +1450,11 @@ mod tests {
         let child = make_tx(Some((parent.compute_txid(), 0)), 1, 21);
         // Deliberately child-first in input list.
         let items = vec![
-            (entry_for(&child, 10, 1), child.clone()),
-            (entry_for(&parent, 10, 0), parent.clone()),
+            (entry_for(&child, 10, 1), std::sync::Arc::new(child.clone())),
+            (
+                entry_for(&parent, 10, 0),
+                std::sync::Arc::new(parent.clone()),
+            ),
         ];
         g.rebuild_from(items);
         assert!(g.contains(&parent.compute_txid()));

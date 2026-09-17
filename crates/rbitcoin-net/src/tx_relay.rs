@@ -211,6 +211,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             create_height,
             create_mtp,
             is_coinbase,
+            create_fk: Some(fk),
         })
     }
 }
@@ -605,27 +606,36 @@ impl MempoolHub {
     }
 
     /// Output + spent-input Electrum scripthashes for a live (or just-accepted) tx.
-    fn collect_tx_scripthashes(&self, tx: &Transaction, mp: &ActiveMempool) -> Vec<[u8; 32]> {
+    fn collect_tx_scripthashes(
+        &self,
+        txid: &Txid,
+        tx: &Transaction,
+        mp: &ActiveMempool,
+        missing: &mut Vec<OutPoint>,
+    ) -> Vec<[u8; 32]> {
         use rbitcoin_store::script_hash;
         let mut out = Vec::with_capacity(tx.output.len() + tx.input.len());
         for o in &tx.output {
             out.push(script_hash(o.script_pubkey.as_bytes()));
         }
-        let provider = QueryUtxoProvider::new(self.query.as_ref());
-        for inp in &tx.input {
+        let aux = mp.vin_aux(txid);
+        for (i, inp) in tx.input.iter().enumerate() {
             let op = inp.previous_output;
-            let spk = if let Some(creator) = mp.graph.creator(&op) {
-                mp.get_tx(&creator)
+            if let Some(creator) = mp.graph.creator(&op) {
+                if let Some(s) = mp
+                    .get_tx(&creator)
                     .and_then(|t| t.output.get(op.vout as usize))
-                    .map(|o| o.script_pubkey.as_bytes().to_vec())
-            } else {
-                provider
-                    .get_txout(&op)
-                    .map(|o| o.script_pubkey.as_bytes().to_vec())
-            };
-            if let Some(s) = spk {
-                out.push(script_hash(&s));
+                    .map(|o| script_hash(o.script_pubkey.as_bytes()))
+                {
+                    out.push(s);
+                    continue;
+                }
             }
+            if let Some(sh) = aux.get(i).and_then(|a| a.script_hash) {
+                out.push(sh);
+                continue;
+            }
+            missing.push(op);
         }
         out.sort_unstable();
         out.dedup();
@@ -635,13 +645,67 @@ impl MempoolHub {
     fn reindex_live_scripthashes(&self) {
         let g = self.lock_read();
         let mut idx = MempoolShIndex::new();
+        let mut missing_ops: Vec<OutPoint> = Vec::new();
+        let mut pending: Vec<(Txid, Vec<[u8; 32]>, Vec<OutPoint>)> = Vec::new();
         for (txid, _) in g.graph.iter() {
             let Some(tx) = g.get_tx(txid) else { continue };
-            let shs = self.collect_tx_scripthashes(tx, &g);
-            idx.insert(*txid, shs);
+            let mut miss = Vec::new();
+            let shs = self.collect_tx_scripthashes(txid, tx, &g, &mut miss);
+            if miss.is_empty() {
+                idx.insert(*txid, shs);
+            } else {
+                missing_ops.extend_from_slice(&miss);
+                pending.push((*txid, shs, miss));
+            }
         }
         drop(g);
+        let filled = self.batch_fill_script_hashes(&missing_ops);
+        for (txid, mut shs, miss) in pending {
+            for op in miss {
+                if let Some(sh) = filled.get(&op) {
+                    shs.push(*sh);
+                }
+            }
+            shs.sort_unstable();
+            shs.dedup();
+            idx.insert(txid, shs);
+        }
         *self.sh_index.lock().unwrap() = idx;
+    }
+
+    fn batch_fill_script_hashes(&self, ops: &[OutPoint]) -> HashMap<OutPoint, [u8; 32]> {
+        use rbitcoin_store::script_hash;
+        let mut out = HashMap::new();
+        if ops.is_empty() {
+            return out;
+        }
+        let mut by_txid: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
+        for op in ops {
+            by_txid
+                .entry(op.txid.to_byte_array())
+                .or_default()
+                .push(op.vout);
+        }
+        let txids: Vec<[u8; 32]> = by_txid.keys().copied().collect();
+        let Ok(hits) = self.query.store().get_fk_by_txid_batch(&txids) else {
+            return out;
+        };
+        for (tid, row) in hits {
+            let Some((fk, _pair)) = row else { continue };
+            let Some(vouts) = by_txid.get(&tid) else {
+                continue;
+            };
+            for &vout in vouts {
+                if let Ok(rec) = self.query.tx_output_at_fk(fk, vout) {
+                    let op = OutPoint {
+                        txid: Txid::from_byte_array(tid),
+                        vout,
+                    };
+                    out.insert(op, script_hash(&rec.script));
+                }
+            }
+        }
+        out
     }
 
     fn index_txid(&self, txid: Txid, tx: &Transaction, prevouts: &[TxOut]) {
@@ -659,13 +723,11 @@ impl MempoolHub {
     }
 
     fn utxo_provider(&self) -> QueryUtxoProvider<'_> {
-        QueryUtxoProvider {
-            query: self.query.as_ref(),
-            need_create_mtp: AtomicBool::new(false),
-            meter_get_coin: Some(&self.meter_get_coin),
-            meter_block_tx_fks: Some(&self.meter_get_coin_block_tx_fks),
-            meter_create_mtp: Some(&self.meter_get_coin_create_mtp),
-        }
+        let mut p = QueryUtxoProvider::new(self.query.as_ref());
+        p.meter_get_coin = Some(&self.meter_get_coin);
+        p.meter_block_tx_fks = Some(&self.meter_get_coin_block_tx_fks);
+        p.meter_create_mtp = Some(&self.meter_get_coin_create_mtp);
+        p
     }
 
     fn unindex_txid(&self, txid: &Txid) {
@@ -1043,18 +1105,7 @@ impl MempoolHub {
         if live.is_empty() {
             return 0;
         }
-        let mut to_drop: Vec<Txid> = Vec::new();
-        for tid in &live {
-            let tid_b = tid.to_byte_array();
-            let confirmed = match self.query.store().get_fk_by_txid_tip(&tid_b) {
-                Ok(Some(fk)) => self.query.store().is_confirmed_strong(fk).unwrap_or(false),
-                _ => false,
-            };
-            if confirmed {
-                to_drop.push(*tid);
-            }
-        }
-        let utxo = self.utxo_provider();
+        let to_drop = self.live_confirmed_strong(&live);
         let mut g = self.lock_write();
         let mut gone = Vec::new();
         for tid in &to_drop {
@@ -1063,24 +1114,8 @@ impl MempoolHub {
             }
         }
         let remain: Vec<Txid> = g.graph.iter().map(|(t, _)| *t).collect();
-        let mut spent = Vec::new();
-        for tid in remain {
-            let Some(tx) = g.get_tx(&tid).cloned() else {
-                continue;
-            };
-            for inp in &tx.input {
-                if g.graph.contains(&inp.previous_output.txid) {
-                    continue;
-                }
-                if matches!(
-                    utxo.chain_prevout(&inp.previous_output),
-                    ChainPrevout::KnownUnavailable
-                ) {
-                    spent.push(inp.previous_output);
-                }
-            }
-        }
-        gone.extend(g.evict_conflicts_with(&spent));
+        let spent_ops = self.spent_chain_prevouts(&g, &remain);
+        gone.extend(g.evict_conflicts_with(&spent_ops));
         if gone.is_empty() {
             return 0;
         }
@@ -1090,6 +1125,106 @@ impl MempoolHub {
         drop(g);
         self.unindex_evicted(&gone);
         gone.len()
+    }
+
+    fn live_confirmed_strong(&self, live: &[Txid]) -> Vec<Txid> {
+        let tid_bytes: Vec<[u8; 32]> = live.iter().map(|t| t.to_byte_array()).collect();
+        let hits = self
+            .query
+            .store()
+            .get_fk_by_txid_batch(&tid_bytes)
+            .unwrap_or_default();
+        let mut to_drop = Vec::new();
+        for (tid_b, row) in hits {
+            let Some((fk, _)) = row else { continue };
+            if self.query.store().is_confirmed_strong(fk).unwrap_or(false) {
+                to_drop.push(Txid::from_byte_array(tid_b));
+            }
+        }
+        to_drop
+    }
+
+    fn spent_chain_prevouts(&self, g: &ActiveMempool, remain: &[Txid]) -> Vec<OutPoint> {
+        let op_fk = self.chain_create_fks(g, remain);
+        if op_fk.is_empty() {
+            return Vec::new();
+        }
+        let mut fk_vouts: HashMap<Fk, Vec<u32>> = HashMap::new();
+        for (op, fk) in &op_fk {
+            fk_vouts.entry(*fk).or_default().push(op.vout);
+        }
+        let items: Vec<(Fk, Vec<u32>)> = fk_vouts
+            .into_iter()
+            .map(|(fk, mut v)| {
+                v.sort_unstable();
+                v.dedup();
+                (fk, v)
+            })
+            .collect();
+        let Ok(unspent) = self.query.unspent_create_vouts_batch(&items) else {
+            return Vec::new();
+        };
+        let mut spent_pair: HashSet<(u64, u32)> = HashSet::new();
+        for ((fk, vouts), keep) in items.iter().zip(unspent.iter()) {
+            let keep_set: HashSet<u32> = keep.iter().copied().collect();
+            for &vout in vouts {
+                if !keep_set.contains(&vout) {
+                    spent_pair.insert((fk.0, vout));
+                }
+            }
+        }
+        op_fk
+            .into_iter()
+            .filter(|(op, fk)| spent_pair.contains(&(fk.0, op.vout)))
+            .map(|(op, _)| op)
+            .collect()
+    }
+
+    fn chain_create_fks(&self, g: &ActiveMempool, remain: &[Txid]) -> HashMap<OutPoint, Fk> {
+        let mut op_fk: HashMap<OutPoint, Fk> = HashMap::new();
+        let mut need_id: Vec<[u8; 32]> = Vec::new();
+        for tid in remain {
+            let Some(tx) = g.get_tx(tid) else { continue };
+            let aux = g.vin_aux(tid);
+            for (i, inp) in tx.input.iter().enumerate() {
+                let op = inp.previous_output;
+                if g.graph.contains(&op.txid) {
+                    continue;
+                }
+                if let Some(fk) = aux.get(i).and_then(|a| a.create_fk) {
+                    op_fk.insert(op, fk);
+                } else {
+                    need_id.push(op.txid.to_byte_array());
+                }
+            }
+        }
+        if need_id.is_empty() {
+            return op_fk;
+        }
+        need_id.sort_unstable();
+        need_id.dedup();
+        let Ok(rows) = self.query.store().get_fk_by_txid_batch(&need_id) else {
+            return op_fk;
+        };
+        let mut fk_of: HashMap<[u8; 32], Fk> = HashMap::new();
+        for (tid, row) in rows {
+            if let Some((fk, _)) = row {
+                fk_of.insert(tid, fk);
+            }
+        }
+        for tid in remain {
+            let Some(tx) = g.get_tx(tid) else { continue };
+            for inp in &tx.input {
+                let op = inp.previous_output;
+                if op_fk.contains_key(&op) || g.graph.contains(&op.txid) {
+                    continue;
+                }
+                if let Some(&fk) = fk_of.get(&op.txid.to_byte_array()) {
+                    op_fk.insert(op, fk);
+                }
+            }
+        }
+        op_fk
     }
 
     pub fn subscribe_announces(&self) -> broadcast::Receiver<MempoolAnnounce> {
@@ -1148,6 +1283,13 @@ impl MempoolHub {
         self.lock_write()
             .flush()
             .map_err(|e| format!("mempool flush: {e}"))
+    }
+
+    /// Time-based sidecar persist (5 s, no fsync). No-op when clean or too soon.
+    pub fn persist_due(&self) -> Result<(), String> {
+        self.lock_write()
+            .persist_due()
+            .map_err(|e| format!("mempool persist: {e}"))
     }
 
     pub fn contains(&self, txid: &Txid) -> bool {
@@ -2829,6 +2971,15 @@ mod tests {
             hub.flush().expect("shutdown flush");
             drop(hub);
             let hub2 = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            let reopen = hub2.sample_reset_perf();
+            assert_eq!(
+                reopen.get_coin, 0,
+                "SH reindex must use stored vin aux, not get_txout"
+            );
+            assert!(
+                !hub2.scripthash_mempool(&sh).is_empty(),
+                "reopen SH index from stored hashes"
+            );
             hub2.set_relay_enabled(true);
             assert_eq!(hub2.unbroadcast_count(), 1);
             let mut rx = hub2.subscribe_announces();
@@ -3003,6 +3154,31 @@ mod tests {
             let s = hub.sample_reset_perf();
             assert_eq!(s.delta_prevouts, 0);
             assert_eq!(hub.scripthash_unconfirmed_delta(&sh).unwrap(), -fee_sum);
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            let mp = tmp();
+            let tx = spend_true(cbs[0], 1_000, spk.clone());
+            let tid = tx.compute_txid();
+            let wtxid = tx.compute_wtxid();
+            {
+                let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
+                store
+                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, &[])
+                    .unwrap();
+                store.flush().unwrap();
+            }
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            let s = hub.sample_reset_perf();
+            assert_eq!(
+                s.get_coin, 0,
+                "missing-aux fill must batch Class A, not get_txout"
+            );
+            assert!(
+                !hub.scripthash_mempool(&sh).is_empty(),
+                "batch-fill the vin that lacked aux"
+            );
             let _ = std::fs::remove_dir_all(&mp);
         }
 

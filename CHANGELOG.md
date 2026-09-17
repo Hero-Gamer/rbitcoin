@@ -25,6 +25,18 @@ before 1.0).
 
 ### Changed
 
+- **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
+  `persist_due` every 5 s writes the body tail then slots+meta (no fsync).
+  Shutdown `flush` still fsyncs. DEAD of a durable slot is a one-record
+  `pwrite`. Packed live records store fee/weight/txid/wtxid, a Class A–style
+  packed tx, and per-vin `script_hash` / optional `create_fk`. Load uses stored
+  hashes and one `Arc<Transaction>`. SH reindex and tip-entry purge batch
+  Class A instead of per-vin `get_txout` / `chain_prevout`. Leftover schema 1
+  converts to packed on open (vin aux empty; SH reindex batch-fills). Packed
+  size is not promised smaller than bitcoin serialize (vin aux adds bytes).
+  The 5 s path appends the body tail and `pwrite`s only new LIVE slot records
+  (full slot table still on flush/grow/compact).
+
 - **Same-peer compact retry:** a second `cmpctblock` for a hash already in
   `pending_cmpct` does not take another BIP152 fill slot or send a second
   `getblocktxn`. Two inbound peers can still fill the same hash.

@@ -5,19 +5,25 @@
 //!
 //! | File | Role |
 //! |------|------|
-//! | `meta` | Magic, schema, commit generation **G**, slot capacity, live count |
+//! | `meta` | Magic, schema **2**, commit generation **G**, slot capacity, live count |
 //! | `slots` | Fixed-size slot records (status + body range + txid) |
-//! | `tx.body` | Unconfirmed payloads only: `fee(8)‖weight(8)‖raw_tx` per LIVE slot |
+//! | `tx.body` | Packed live records (fee, weight, txid, wtxid, packed tx, vin aux) |
 //!
-//! **Commit model:** body complete → slot LIVE → RAM graph → no fsync per tx.
-//! Admits coalesce sidecar writes every 32 body ops. Confirm/RBF DEAD marks
-//! persist slots+meta once ([`ActiveMempool::persist_if_dirty`]) and do **not**
-//! rewrite `mempool/tx.body`. [`ActiveMempool::flush`] bumps `G` and `sync_data`s
-//! sidecars. Kill loses at most the last unflushed admit batch; never claim
-//! incomplete bodies.
+//! **Commit model:** body tail complete → slot LIVE → RAM graph. No fsync per
+//! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); that path
+//! appends the body tail and `pwrite`s only new LIVE slot records. Tip-follow
+//! drives it from the perf tick. Confirm/RBF DEAD of an already-durable slot
+//! is an immediate one-record `pwrite` (not a full slot dump).
+//! [`ActiveMempool::flush`] bumps `G`, rewrites slots, and `sync_data`s. Crash
+//! may lose ≤5 s of admits; never LIVE slots past durable `tx.body`. Leftover
+//! schema 1 converts to packed on open (vin aux empty; SH reindex batch-fills).
 //!
-//! **Memory rule:** graph + body buffers stay proportional to the live set.
-//! Sidecars use process `Vec` + file write (no `memmap2`).
+//! Packed decode uses stored txid/wtxid (no SHA256d). Vin aux is hashed at
+//! admit from resolved prevouts. Compact copies packed payload ranges.
+//!
+//! **Memory rule:** graph + body buffers stay proportional to the live set
+//! (`Arc<Transaction>` shared by load/accept). Sidecars use process `Vec` +
+//! file write (no `memmap2`).
 //!
 //! # Phases (plan.md)
 //!
@@ -32,6 +38,7 @@ mod fee_est;
 mod fee_flow;
 mod graph;
 mod orphanage;
+mod packed;
 mod store;
 
 pub use accept::{
@@ -51,4 +58,5 @@ pub use graph::{
     TxEntry, TxGraph,
 };
 pub use orphanage::Orphanage;
+pub use packed::VinAux;
 pub use store::{Mempool, MempoolMeta};
