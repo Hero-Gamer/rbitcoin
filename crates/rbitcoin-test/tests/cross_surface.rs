@@ -658,6 +658,38 @@ fn mempool_has(mem: &Value, txid: &str) -> bool {
         .any(|v| v.as_str() == Some(txid))
 }
 
+fn pin_mined_parent_before_child(txs: &[Value], parent: &str, child: &str) {
+    let ids: Vec<&str> = txs.iter().filter_map(|t| t["txid"].as_str()).collect();
+    let p = ids
+        .iter()
+        .position(|t| *t == parent)
+        .unwrap_or_else(|| panic!("mined block missing parent {parent}: {ids:?}"));
+    let c = ids
+        .iter()
+        .position(|t| *t == child)
+        .unwrap_or_else(|| panic!("mined block missing child {child}: {ids:?}"));
+    assert!(
+        p < c,
+        "generate must select parent before child ({parent} @{p}, {child} @{c}): {ids:?}"
+    );
+}
+
+async fn pin_scantxoutset_drops_spent_coinbase(rpc_addr: SocketAddr, spent_cb: &str) {
+    let scan = jsonrpc(rpc_addr, "scantxoutset", json!(["start", ["raw(51)"]])).await;
+    assert_eq!(scan["result"]["success"], true, "{scan}");
+    let uns = scan["result"]["unspents"]
+        .as_array()
+        .expect("scantxoutset unspents");
+    assert!(
+        uns.iter().all(|u| u["txid"].as_str() != Some(spent_cb)),
+        "spent coinbase must drop from scan: {scan}"
+    );
+    assert!(
+        uns.iter().any(|u| u["coinbase"] == false),
+        "scan must still see a non-coinbase unspent: {scan}"
+    );
+}
+
 async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {
     let req = json!({"jsonrpc":"2.0","id": id, "method": method, "params": params});
     let mut line = serde_json::to_string(&req).unwrap();
@@ -1358,6 +1390,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             "generate must include {tid}: {blk}"
         );
     }
+    pin_mined_parent_before_child(txs, &pkg_parent_txid, &pkg_child_txid);
+    pin_scantxoutset_drops_spent_coinbase(rpc_addr, &cb_hex).await;
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
     pin_esplora_block_txids_merkle_and_outspend(esplora_addr, new_hash, &cb_txid, txs.len()).await;
     let parent_hash = blk["result"]["previousblockhash"]

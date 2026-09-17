@@ -1625,59 +1625,6 @@ fn miniwallet_raw_scan_and_gettxout() {
 }
 
 #[test]
-fn gettxout_include_mempool_hides_mempool_spent_confirmed() {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
-    let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
-    let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
-    let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
-    let cb_val =
-        (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
-    let spend = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_val - 1_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&spend)))],
-    )
-    .unwrap();
-    let hidden = dispatch(&ctx, "gettxout", vec![json!(cb_txid), json!(0)]).unwrap();
-    assert!(
-        hidden.is_null(),
-        "default include_mempool must hide mempool-spent confirmed out: {hidden}"
-    );
-    let shown = dispatch(
-        &ctx,
-        "gettxout",
-        vec![json!(cb_txid), json!(0), json!(false)],
-    )
-    .unwrap();
-    assert_eq!(shown["coinbase"], true, "{shown}");
-    assert!(shown["confirmations"].as_u64().unwrap() >= 1, "{shown}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn gettxout_disconnected_archive_row_is_null() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let (addr, _) = p2wpkh_regtest();
@@ -1715,6 +1662,20 @@ fn gettxout_leftover_is_connected_not_unconfirmed() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let cb_txid = hash_hex_display(&spend.input[0].previous_output.txid.to_byte_array());
+    let hidden = dispatch(&ctx, "gettxout", vec![json!(cb_txid.clone()), json!(0)]).unwrap();
+    assert!(
+        hidden.is_null(),
+        "default include_mempool must hide mempool-spent confirmed out: {hidden}"
+    );
+    let shown = dispatch(
+        &ctx,
+        "gettxout",
+        vec![json!(cb_txid), json!(0), json!(false)],
+    )
+    .unwrap();
+    assert_eq!(shown["coinbase"], true, "{shown}");
+    assert!(shown["confirmations"].as_u64().unwrap() >= 1, "{shown}");
     ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let tid = spend.compute_txid();
@@ -2147,127 +2108,34 @@ fn scantxoutset_txout_fallback_without_shindex() {
 }
 
 #[test]
-fn generate_includes_mempool_and_maps_immature() {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
-    assert_eq!(dispatch(&ctx, "getblockcount", vec![]).unwrap(), json!(101));
-
-    let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
-    let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
-    let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
-    let cb_val =
-        (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
-
-    let spend = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(cb_val - 1_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let hex = hex_encode(serialize(&spend));
-    let tid = dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    let pool = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
-    assert_eq!(pool, json!([tid]));
-
-    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
-    let empty = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
-    assert_eq!(empty, json!([]));
-    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
-    let mined = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
-    assert_eq!(mined["tx"].as_array().unwrap().len(), 2);
-    let parent = dispatch(
-        &ctx,
-        "getblockhash",
-        vec![json!(mined["height"].as_u64().unwrap() - 1)],
-    )
-    .unwrap();
-    assert_eq!(mined["previousblockhash"], parent);
-
-    let scan = dispatch(
-        &ctx,
-        "scantxoutset",
-        vec![json!("start"), json!(["raw(51)"])],
-    )
-    .unwrap();
-    let uns = scan["unspents"].as_array().unwrap();
-    assert!(
-        uns.iter().all(|u| u["txid"] != json!(cb_txid)),
-        "spent coinbase must drop from scan: {scan}"
-    );
-    assert!(uns.iter().any(|u| u["coinbase"] == false));
-
-    // At tip 102, coinbase N is mempool-mature when 102 >= N+99 → N<=3.
-    let hash2 = dispatch(&ctx, "getblockhash", vec![json!(10)]).unwrap();
-    let blk2 = dispatch(&ctx, "getblock", vec![hash2, json!(2)]).unwrap();
-    let immature_txid = blk2["tx"][0]["txid"].as_str().unwrap();
-    let immature_val =
-        (blk2["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
-    let bad = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array(parse_hash32_display(immature_txid).unwrap()),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(immature_val - 1_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let e = dispatch(
-        &ctx,
-        "sendrawtransaction",
-        vec![json!(hex_encode(serialize(&bad)))],
-    )
-    .unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_REJECTED);
-    assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn generate_selects_chained_mempool_parent_first() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{pad_empty_from, ChainParams};
 
     let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
-    let hash1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
-    let blk = dispatch(&ctx, "getblock", vec![hash1, json!(2)]).unwrap();
-    let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
-    let cb_val =
-        (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64;
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let (_tip, _t, cbs) = pad_empty_from(
+        ctx.query.as_ref(),
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        101,
+        10,
+    );
+    let cb_txid = cbs[0];
+    let cb_val = 50_0000_0000u64;
 
     let parent = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array(parse_hash32_display(cb_txid).unwrap()),
+                txid: cb_txid,
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),
@@ -2311,6 +2179,48 @@ fn generate_selects_chained_mempool_parent_first() {
     assert_eq!(txids.len(), 3, "coinbase + parent + child: {mined}");
     assert_eq!(txids[1], parent_id);
     assert_eq!(txids[2], child_id);
+
+    let scan = dispatch(
+        &ctx,
+        "scantxoutset",
+        vec![json!("start"), json!(["raw(51)"])],
+    )
+    .unwrap();
+    let uns = scan["unspents"].as_array().unwrap();
+    let cb_hex = hash_hex_display(&cb_txid.to_byte_array());
+    assert!(
+        uns.iter().all(|u| u["txid"] != json!(cb_hex)),
+        "spent coinbase must drop from scan: {scan}"
+    );
+    assert!(uns.iter().any(|u| u["coinbase"] == false));
+
+    let immature_txid = cbs[9];
+    let bad = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: immature_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb_val - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let e = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(hex_encode(serialize(&bad)))],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_REJECTED);
+    assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
