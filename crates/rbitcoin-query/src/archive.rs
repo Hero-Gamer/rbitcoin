@@ -646,7 +646,7 @@ fn collect_plan_need_external(
     need_external.into_iter().collect()
 }
 
-/// Class A ins from wire + stamped spend edges (write-time encode).
+/// Class A ins from wire + stamped spend edges (plan fill; write is then a no-op).
 pub fn input_records_from_wire(
     tx: &bitcoin::Transaction,
     spend_fk: Fk,
@@ -788,10 +788,10 @@ impl Query {
         Ok(need)
     }
 
-    /// IBD stamp: CreatePin + SpendEdges from wire txs. Packed ins stay empty.
+    /// IBD stamp: CreatePin + SpendEdges from wire txs. Packed ins filled from
+    /// the same edge walk (write `fill_packed_ins_from_blocks` is then a no-op).
     ///
-    /// Does not build [`TxApply`] / clone `script_sig` / witness. Write fills
-    /// packed ins from `Arc<Block>` + edges. `body_est` uses wire compact sizes.
+    /// Does not build [`TxApply`]. `body_est` uses packed encoded lengths.
     /// Same txid in one block is Corrupt. Same txid across headers in the wave
     /// is BIP30 (91842/91880): both rows are planned; `batch_map` keeps the
     /// later fk.
@@ -986,6 +986,13 @@ impl Query {
                         vin: i as u32,
                     });
                 }
+            }
+            if packed_ins.is_empty() {
+                let tx = block
+                    .txdata
+                    .get(tx_index as usize)
+                    .ok_or(StoreError::Corrupt("invariant: plan tx_index"))?;
+                packed_ins = input_records_from_wire(tx, tx_fk, &tx_edges)?;
             }
             if let Some(sid) = tx_fk.get() {
                 edges.insert(sid, tx_edges);
@@ -2355,7 +2362,7 @@ mod tests {
         assert_eq!(pin.loc().copied(), Some(first));
     }
 
-    /// D1: wire planner never builds TxApply; packed ins empty; CreatePin matches wire outs.
+    /// D1: wire planner never builds TxApply; packed ins from stamp edges; CreatePin matches wire outs.
     #[test]
     fn plan_batch_from_wire_skips_tx_apply() {
         use std::sync::Arc;
@@ -2379,10 +2386,11 @@ mod tests {
             )
             .expect("wire plan");
         assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2)]);
-        assert!(
-            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
-            "wire planner must not clone script_sig into packed ins"
+        assert_eq!(
+            plan.packed[1].1[0].script_sig, script_sig,
+            "wire planner fills packed ins from stamp edges"
         );
+        assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(
             plan.batch_pin[0]
                 .out_parts(0)
@@ -2402,7 +2410,18 @@ mod tests {
             "plan must not copy scriptPubKey"
         );
         plan.fill_packed_ins_from_blocks(&[block.as_ref()])
-            .expect("write fill");
+            .expect("write fill no-op");
+        assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
+        plan.packed[1].1.clear();
+        match plan.fill_packed_ins_from_blocks(&[]) {
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("write encode prepared/wire length"), "{s}");
+            }
+            Ok(()) => panic!("empty blocks must not fill a non-empty plan"),
+        }
+        plan.fill_packed_ins_from_blocks(&[block.as_ref()])
+            .expect("write fill empty row");
         assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
         assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_pin.len(), 2);
