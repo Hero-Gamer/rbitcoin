@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Contract: PR OS smoke is store platform-diff tests + node --smoke, not a
-# packaged musl/Windows/Darwin snapshot. Does not invoke cargo.
+# Contract: PR OS smoke is store platform-diff tests (including mmap
+# sealed fuse) + a few-block query confirm + node --smoke, not a packaged
+# musl/Windows/Darwin snapshot. Does not invoke cargo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,12 +22,20 @@ assert_ok() {
 }
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 "$RUN")"
-assert_ok "dry-run names store platform + node --smoke" \
-  grep -qx "smoke=store-platform+node-smoke" <<<"$out"
+assert_ok "dry-run names store platform + query confirm + node --smoke" \
+  grep -qx "smoke=store-platform+query-confirm+node-smoke" <<<"$out"
 assert_ok "dry-run does not export deleted RBITCOIN_HEAD_SCALE" \
   test "$(grep -c 'RBITCOIN_HEAD_SCALE' <<<"$out" || true)" = "0"
 assert_ok "dry-run lists TableFile advise tests" \
   grep -q "file::advise_tests" <<<"$out"
+assert_ok "dry-run lists mmap sealed fuse roundtrip" \
+  grep -q "fuse8_filter::tests::no_false_negatives_and_roundtrip" <<<"$out"
+assert_ok "dry-run lists seal publish remap" \
+  grep -q "segmented_head::tests::insert_roll_seal_lookup_roundtrip" <<<"$out"
+assert_ok "dry-run lists query connect-chain confirm" \
+  grep -q "connect_chain_query_surface" <<<"$out"
+assert_ok "dry-run lists query spend-edge confirm" \
+  grep -q "spend_edge_and_confirm_idempotent_path" <<<"$out"
 assert_ok "dry-run has no skips off Windows" \
   grep -qx "skip=" <<<"$out"
 assert_ok "dry-run lists SH RAM / host_mem probes" \
@@ -43,12 +52,20 @@ assert_ok "dry-run lists pool session tests" \
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=MINGW64_NT-10.0-20348 "$RUN")"
 assert_ok "Windows dry-run skips concurrent grow/read abort" \
   grep -qx "skip=concurrent_readers_during_append_and_grow" <<<"$out"
+assert_ok "Windows dry-run still maps sealed fuse" \
+  grep -q "fuse8_filter::tests::no_false_negatives_and_roundtrip" <<<"$out"
+assert_ok "Windows dry-run still rolls seal + maps fuse" \
+  grep -q "segmented_head::tests::insert_roll_seal_lookup_roundtrip" <<<"$out"
+assert_ok "Windows dry-run still confirms a few blocks" \
+  grep -q "connect_chain_query_surface" <<<"$out"
 assert_ok "Windows dry-run pins loc SIMD vs scalar" \
   grep -q "create_loc::tests::prefix_sum" <<<"$out"
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Darwin "$RUN")"
 assert_ok "Darwin dry-run runs concurrent grow/read" \
   grep -qx "skip=" <<<"$out"
+assert_ok "Darwin dry-run still confirms a few blocks" \
+  grep -q "connect_chain_query_surface" <<<"$out"
 assert_ok "Darwin dry-run pins loc SIMD vs scalar" \
   grep -q "create_loc::tests::prefix_sum" <<<"$out"
 

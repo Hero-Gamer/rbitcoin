@@ -148,7 +148,8 @@ tag, and `vX.Y.x` / `.99` follow-up: [`docs/releases.md`](./docs/releases.md).
 ```
 
 Retry from Actions → **release** → Run workflow (artifacts only, no tag).
-PR `ci` **windows** / **macos** jobs smoke store create/open + `--smoke`;
+PR `ci` **windows** / **macos** jobs run `./scripts/ci-os-smoke.sh` (native
+store IO, mmap sealed fuse, a few-block query confirm, `--smoke`);
 they do not upload binaries. Local Linux `target/release/` install is still
 `nix build .#rbitcoin-musl` on a clean master tree. Windows IoRing is not
 supported. Darwin/Windows are not Nix packages — see

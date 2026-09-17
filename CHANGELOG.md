@@ -34,6 +34,8 @@ before 1.0).
   `fuse8=` is heap only; mapped fuse RSS is `file=`. After IBD, leftover
   `anon − accounted` can be mimalloc arenas (`free` ≠ `munmap`); optional
   operator `MIMALLOC_PURGE_DELAY=0`. Do not `malloc_trim` a mimalloc process.
+  PR `windows` / `macos` smoke maps a sealed `.fuse8` and confirms a few
+  blocks (`connect_chain_query_surface` / spend-edge).
 
 - **Mempool packed incremental persist (schema 2):** admits dirty RAM only;
   `persist_due` every 5 s writes the body tail then slots+meta (no fsync).

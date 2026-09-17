@@ -88,7 +88,8 @@ cargo test --workspace
 ./scripts/coverage.sh   # uses target/cov — does not thrash target/dev
 ```
 
-Windows/macOS PR surface is `./scripts/ci-os-smoke.sh`, not this full suite —
+Windows/macOS PR surface is `./scripts/ci-os-smoke.sh` (store IO/RAM/mmap
+fuse, a few-block query confirm, `--smoke`), not this full suite —
 see CONTRIBUTING (What works on each OS). No `libbitcoinconsensus` in the graph:
 `cargo tree -i bitcoinconsensus` must fail to resolve.
 

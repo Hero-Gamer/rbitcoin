@@ -68,7 +68,7 @@ IO on Windows and Darwin.
 |----------|-------|-------|---------|
 | `cargo build -p rbitcoin-node -p rbitcoin-cli` | yes | yes | yes |
 | `rbitcoin-node --smoke` | yes | yes | yes |
-| `./scripts/ci-os-smoke.sh` (store platform tests + `--smoke`) | yes | yes — this **is** the required `macos` job | **Git Bash** — this **is** the required `windows` job |
+| `./scripts/ci-os-smoke.sh` (store platform + mmap fuse + query confirm + `--smoke`) | yes | yes — this **is** the required `macos` job | **Git Bash** — this **is** the required `windows` job |
 | `cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` | yes | yes | yes |
 | `cargo test --workspace` (required `test` job) | yes | usually (see `flock` below) | use **WSL2** (Ubuntu + rustup inside the distro). Native CI does **not** run the full workspace suite |
 | `./scripts/coverage.sh` / `cargo deny` / `./scripts/ast-grep.sh` | yes (install extras below, or Nix) | possible; not the CI host | not the supported path |
