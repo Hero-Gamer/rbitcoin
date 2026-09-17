@@ -205,6 +205,12 @@ pub struct NodeConfig {
     pub always_relay: bool,
     /// Permit tx relay to inbound while `--blocks-only` (`--relay`; Core `relay`).
     pub relay: bool,
+    /// Parsed `--net-permission` / `--net-permission-bind` (implicit bits in [`Self::finalized_net_perms`]).
+    pub net_perms: rbitcoin_net::NetPermTable,
+    /// `--net-permission-relay` (default true): implicit relay on a bare CIDR grant.
+    pub net_permission_relay: bool,
+    /// `--net-permission-force-relay` (default false): implicit forcerelay on a bare CIDR grant.
+    pub net_permission_force_relay: bool,
     /// `--startup-notify` shell command (run once after start).
     pub startup_notify: Option<String>,
     /// `--alert-notify` shell command (`%s` = warning text).
@@ -221,6 +227,8 @@ pub struct NodeConfig {
     pub block_min_tx_fee_btc: Option<String>,
     /// BIP152 extra compact-block prefill (default **on**; `--prefill-compact=0` disables).
     pub prefill_compact: bool,
+    /// `--check-blocks` window. `None` = store default (6). `<= 0` means the whole chain.
+    pub check_blocks: Option<i64>,
 }
 
 impl Default for NodeConfig {
@@ -256,6 +264,9 @@ impl Default for NodeConfig {
             trusted: false,
             always_relay: false,
             relay: false,
+            net_perms: rbitcoin_net::NetPermTable::default(),
+            net_permission_relay: rbitcoin_net::DEFAULT_WHITELISTRELAY,
+            net_permission_force_relay: rbitcoin_net::DEFAULT_WHITELISTFORCERELAY,
             startup_notify: None,
             alert_notify: None,
             minimum_chain_work: None,
@@ -264,6 +275,7 @@ impl Default for NodeConfig {
             block_version: None,
             block_min_tx_fee_btc: None,
             prefill_compact: true,
+            check_blocks: None,
         }
     }
 }
@@ -338,6 +350,47 @@ impl NodeConfig {
                 height: self.milestone_height,
             }
         }
+    }
+
+    /// `--check-blocks` window. `0` = whole chain (store genesis walk).
+    pub fn check_blocks_window(&self) -> u32 {
+        match self.check_blocks {
+            None => rbitcoin_store::VERIFY_TIP_BLOCKS,
+            Some(n) if n <= 0 => 0,
+            Some(n) => u32::try_from(n).unwrap_or(0),
+        }
+    }
+
+    /// Implicit bits on a bare `--net-permission` CIDR grant.
+    pub fn finalized_net_perms(&self) -> rbitcoin_net::NetPermTable {
+        let mut t = self.net_perms.clone();
+        for g in &mut t.whitelist {
+            g.flags = rbitcoin_net::apply_implicit(
+                g.flags,
+                self.net_permission_relay,
+                self.net_permission_force_relay,
+            );
+        }
+        for g in &mut t.whitebind {
+            g.flags = rbitcoin_net::apply_implicit(
+                g.flags,
+                self.net_permission_relay,
+                self.net_permission_force_relay,
+            );
+        }
+        t
+    }
+
+    fn push_p2p_listen(&mut self, addr: SocketAddr) -> Result<(), NodeError> {
+        if self.listen.p2p == Some(addr) || self.listen.p2p_extra.contains(&addr) {
+            return Err(NodeError::Config("Duplicate binding configuration".into()));
+        }
+        if self.listen.p2p.is_none() {
+            self.listen.p2p = Some(addr);
+        } else {
+            self.listen.p2p_extra.push(addr);
+        }
+        Ok(())
     }
 
     /// Compose immutable consensus parameters from operator configuration.
@@ -503,6 +556,8 @@ impl NodeConfig {
     ///
     /// Operator keys are snake_case (`max_inbound=`). Hyphens match underscores.
     /// Core CLI names stay on the functional shim only.
+    /// Repeatable: `net_permission`, `net_permission_bind`. Also `net_permission_relay`,
+    /// `net_permission_force_relay`.
     pub fn merge_conf_file(&mut self, path: &Path) -> Result<(), NodeError> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             NodeError::Config(format!("read conf {}: {source}", path.display()))
@@ -583,11 +638,7 @@ impl NodeConfig {
                 let addr: SocketAddr = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
-                if self.listen.p2p.is_none() {
-                    self.listen.p2p = Some(addr);
-                } else {
-                    self.listen.p2p_extra.push(addr);
-                }
+                self.push_p2p_listen(addr)?;
             }
             "connect" => {
                 self.listen.connect.push(
@@ -689,6 +740,30 @@ impl NodeConfig {
             "relay" => {
                 self.relay = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf relay: {e}")))?;
+            }
+            "net_permission" | "net_permissions" => {
+                if !val.is_empty() {
+                    let g = rbitcoin_net::parse_whitelist(val).map_err(NodeError::Config)?;
+                    self.net_perms.whitelist.push(g);
+                }
+            }
+            "net_permission_bind" => {
+                if !val.is_empty() {
+                    let g = rbitcoin_net::parse_whitebind(val).map_err(NodeError::Config)?;
+                    if self.listen.p2p != Some(g.addr) && !self.listen.p2p_extra.contains(&g.addr) {
+                        self.push_p2p_listen(g.addr)?;
+                    }
+                    self.net_perms.whitebind.push(g);
+                }
+            }
+            "net_permission_relay" => {
+                self.net_permission_relay = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf net-permission-relay: {e}")))?;
+            }
+            "net_permission_force_relay" => {
+                self.net_permission_force_relay = parse_conf_bool(val).map_err(|e| {
+                    NodeError::Config(format!("conf net-permission-force-relay: {e}"))
+                })?;
             }
             "blocks_only" => {
                 self.mempool.blocksonly = parse_conf_bool(val)
@@ -839,6 +914,12 @@ impl NodeConfig {
                     return Err(NodeError::Config("conf mock_time must be >= 0".into()));
                 }
                 self.mock_time = Some(n);
+            }
+            "check_blocks" => {
+                let n: i64 = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf check-blocks: {e}")))?;
+                self.check_blocks = Some(n);
             }
             "max_tip_age" => {
                 let n: i64 = val
@@ -1084,6 +1165,121 @@ mod tests {
             ConfApply::Unknown(k) => assert_eq!(k, "minrelaytxfee"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn check_blocks_apply_kv_zero_is_all() {
+        let mut c = NodeConfig::default();
+        assert_eq!(c.check_blocks, None);
+        assert_eq!(c.check_blocks_window(), rbitcoin_store::VERIFY_TIP_BLOCKS);
+        assert_eq!(c.apply_kv("check_blocks", "6").unwrap(), ConfApply::Applied);
+        assert_eq!(c.check_blocks, Some(6));
+        assert_eq!(c.check_blocks_window(), 6);
+        assert_eq!(c.apply_kv("check-blocks", "0").unwrap(), ConfApply::Applied);
+        assert_eq!(c.check_blocks, Some(0));
+        assert_eq!(c.check_blocks_window(), 0);
+        assert_eq!(
+            c.apply_kv("check_blocks", "-1").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.check_blocks, Some(-1));
+        assert_eq!(c.check_blocks_window(), 0);
+        let bad = c.apply_kv("check_blocks", "nope").unwrap_err();
+        assert!(bad.to_string().contains("check-blocks"), "{bad}");
+        assert_eq!(
+            c.apply_kv("checkblocks", "6").unwrap(),
+            ConfApply::Unknown("checkblocks".into())
+        );
+    }
+
+    #[test]
+    fn blocks_dir_is_not_an_operator_key() {
+        let mut c = NodeConfig::default();
+        assert_eq!(
+            c.apply_kv("blocks_dir", "/tmp/x").unwrap(),
+            ConfApply::Unknown("blocks_dir".into())
+        );
+        assert_eq!(
+            c.apply_kv("blocks-dir", "/tmp/x").unwrap(),
+            ConfApply::Unknown("blocks-dir".into())
+        );
+        assert_eq!(
+            c.apply_kv("blocksdir", "/tmp/x").unwrap(),
+            ConfApply::Unknown("blocksdir".into())
+        );
+    }
+
+    #[test]
+    fn duplicate_listen_is_init_error() {
+        let mut c = NodeConfig::default();
+        assert_eq!(
+            c.apply_kv("listen", "127.0.0.1:18444").unwrap(),
+            ConfApply::Applied
+        );
+        let err = c.apply_kv("listen", "127.0.0.1:18444").unwrap_err();
+        assert!(
+            err.to_string().contains("Duplicate binding configuration"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn whitelist_parse_errors_match_core() {
+        let mut c = NodeConfig::default();
+        let err = c
+            .apply_kv("net-permission", "in,out@127.0.0.1")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Only direction was set, no permissions"),
+            "{err}"
+        );
+        let err = c
+            .apply_kv("net-permission", "oopsie@127.0.0.1")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid P2P permission"), "{err}");
+        let err = c
+            .apply_kv("net-permission", "noban@127.0.0.1:230")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid netmask specified in --net-permission"),
+            "{err}"
+        );
+        let err = c
+            .apply_kv("net-permission-bind", "noban@127.0.0.1/10")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Cannot resolve --net-permission-bind address"),
+            "{err}"
+        );
+        assert_eq!(
+            c.apply_kv("net-permission", "127.0.0.1").unwrap(),
+            ConfApply::Applied
+        );
+        let t = c.finalized_net_perms();
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let bind = "127.0.0.1:18444".parse().unwrap();
+        assert_eq!(
+            t.strings_for(ip, true, bind),
+            ["noban", "relay", "mempool", "download"]
+        );
+        c.net_permission_relay = false;
+        let t = c.finalized_net_perms();
+        assert_eq!(
+            t.strings_for(ip, true, bind),
+            ["noban", "mempool", "download"]
+        );
+        let mut c2 = NodeConfig::default();
+        c2.apply_kv("net-permission-bind", "noban@127.0.0.1:18445")
+            .unwrap();
+        assert_eq!(
+            c2.listen.p2p,
+            Some("127.0.0.1:18445".parse().unwrap()),
+            "net_permission_bind listens"
+        );
+        assert_eq!(c2.net_perms.whitebind.len(), 1);
     }
 
     #[test]
