@@ -14,7 +14,7 @@ header.hash ──► header.head          HashHead gen 0 (2²² mainnet; 64 tin
 
 txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead
                     open: 4 B rel, page-local mix_txid; seal: MPHF+fuse8
-                    (fuse in RAM; packed BDZ g FdOnly 4 KiB pages; index = rel-1)
+                    (fuse in RAM; sealed-hot g in RAM; colder g FdOnly 4 KiB pages; index = rel-1)
 
 spk hash    ──► scripthash.head/NN.mphf+.val  sealed BDZ3 main (2-bit g + rank; pack8; tags, no fuse)
             ──► scripthash.body/NN     dir-variant main slabs/pages (file variant: scripthash.body)
@@ -28,7 +28,7 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed BDZ3 main (2-bit g + 
 | Module | On disk | Key → value | Who reads it |
 |--------|---------|-------------|--------------|
 | `HashHead` | `header.head` (+ `.gN`) | header **hash prefix** → header fk (`.mlt` if several) | Header ensure / `has_block` / prev walk |
-| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁵** keys/range in parallel (no OA). Open keeps fuse8 in RAM; packed BDZ `g` is FdOnly (4 KiB page stream); MPHF output is `rel−1`. | Confirm **lookup** stamp after live pin miss |
+| `AddressHead` + `SegmentedTxHead` | `tx.head/` (`meta`, open `NNNNNN`, sealed `.mphf|.fuse8`) | **mixed txid** → relative **create_fk** (body-verify on `txid.body`). Live OA rolls at 80% slots; wipe-rebuild seals **2²⁵** keys/range in parallel (no OA). Open keeps fuse8 in RAM; sealed-hot (ages `1..=3`) unpacks BDZ `g` into process RAM; colder ages stay FdOnly (4 KiB page stream); MPHF output is `rel−1`. | Confirm **lookup** stamp after live pin miss |
 | Sealed SH main | `scripthash.head/NN.mphf` + `.val` | Electrum **scripthash prefix** → pack8 locators. Compact BDZ3: packed 2-bit `g` FdOnly; occupancy RAM; tags/val FdOnly. | After tip bulk |
 | Ingest + L0/L1 ovf | `scripthash.ovf/ingest`, L0 `SHSR`, L1 MPHF, `ovf/body` | Same pack8 key for incremental / post-seal new keys | Tip; lookup ingest → L0 → L1 → main |
 
@@ -48,7 +48,9 @@ hit so a connected sibling in an older age can win.
 
 `sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) splits sealed-hot vs
 cold. Open is its own wave. It is not an IO flag. `RWF_DONTCACHE`
-is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
+is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze). Sealed-hot MPHF `g`
+is unpacked into process RAM (`mphf_g=`); colder ages stay the FdOnly 4 KiB
+page stream. SH compact `g` stays FdOnly.
 
 ## Confirm stages (head contact only)
 
