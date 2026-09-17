@@ -412,6 +412,7 @@ pub(crate) fn dispatch_inner(
             getmempoolinfo(ctx)
         }
         "getrawmempool" => getrawmempool(ctx, &params),
+        "getorphantxs" => getorphantxs(ctx, &params),
         "getmempoolentry" => getmempoolentry(ctx, &params),
         "getrawtransaction" => getrawtransaction(ctx, &params),
         "decoderawtransaction" => decoderawtransaction(ctx, &params),
@@ -598,108 +599,167 @@ const METHOD_LIST: &[&str] = &[
     "preciousblock",
 ];
 
+const NAMED_HELP: &[(&str, &str)] = &[
+    (
+        "estimatesmartfee",
+        "estimatesmartfee conf_target (estimate_mode)\n\
+         Returns this node's 10-minute inclusion frontier feerate (BTC/kvB), \
+         not Core historical multi-horizon. See docs/mempool-fee-estimation.md.",
+    ),
+    (
+        "estimaterawfee",
+        "estimaterawfee conf_target (threshold)\n\
+         Regtest/harness surface matching Core's RPC name. Returns this node's \
+         10-minute inclusion frontier (same product as estimatesmartfee).",
+    ),
+    (
+        "getblockchaininfo",
+        "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
+         initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
+         max-tip-age), not still catching up. chainwork is summed header work\n\
+         (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
+         cold inwit when split). verificationprogress is blocks/headers (1.0 when\n\
+         headers is 0).",
+    ),
+    (
+        "getblockstats",
+        "getblockstats hash_or_height ( stats )\n\
+         Reconstruct the block and return fee / UTXO / weight statistics.",
+    ),
+    (
+        "generatetoaddress",
+        "generatetoaddress nblocks address (maxtries)\n\
+         Regtest harness only. Mines nblocks paying address via the P2P accept path.",
+    ),
+    (
+        "generateblock",
+        "generateblock output transactions (submit)\n\
+         Regtest harness only. One block paying output (address or hex script). \
+         submit=false returns {hash,hex} without connecting the block.",
+    ),
+    (
+        "generate",
+        "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n",
+    ),
+    (
+        "mockscheduler",
+        "mockscheduler delta_seconds\n\
+         Regtest harness only. Advance the scheduler; rebroadcast unbroadcast txs.",
+    ),
+    (
+        "generatetodescriptor",
+        "generatetodescriptor nblocks descriptor (maxtries)\n\
+         Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address.",
+    ),
+    (
+        "scantxoutset",
+        "scantxoutset action (scanobjects)\n\
+         raw() scripts over Class A. MiniWallet support, not Core coins-DB.",
+    ),
+    (
+        "decoderawtransaction",
+        "decoderawtransaction hexstring (iswitness)\n\
+         Decode a serialized transaction. iswitness=false refuses the BIP141 marker. \
+         scriptSig asm is rust-bitcoin, not Core ScriptToAsmStr sighash suffixes.",
+    ),
+    (
+        "decodescript",
+        "decodescript hexstring\n\
+         asm, type, hex, and address when standard. No p2sh wrap, segwit wrap, \
+         or descriptor inference.",
+    ),
+    (
+        "validateaddress",
+        "validateaddress address\n\
+         Happy path: isvalid, scriptPubKey, isscript, iswitness. Invalid is \
+         {isvalid:false} only (no error_locations).",
+    ),
+    (
+        "gettxout",
+        "gettxout txid n (include_mempool)\n\
+         Connected Class A + mempool. Default include_mempool hides confirmed outs spent by a live mempool tx.",
+    ),
+    (
+        "sendrawtransaction",
+        "sendrawtransaction hexstring (maxfeerate) (maxburnamount)\n\
+         RPC submit only. Default maxfeerate 10000 sat/vB (0 unlimited; >=100000 sat/vB is a parameter error). \
+         Default maxburnamount 0. P2P relay is not capped.",
+    ),
+    (
+        "getchaintips",
+        "getchaintips — active + held/archive side tips + headers-only.",
+    ),
+    (
+        "getdeploymentinfo",
+        "getdeploymentinfo (blockhash)\nBuried deployments from ChainParams. No BIP9.",
+    ),
+    (
+        "getblocktemplate",
+        "getblocktemplate (template_request)\n\
+         All networks. Template from select_block_txs; proposal validates \
+         without connecting. rules must include segwit. longpollid waits \
+         for a new tip or mempool/priority change. No BIP9 testdummy.",
+    ),
+    (
+        "getmininginfo",
+        "getmininginfo\nTip height, difficulty, pooledtx, blockmintxfee (BTC/kvB). All networks.",
+    ),
+    (
+        "getnetworkhashps",
+        "getnetworkhashps (nblocks) (height)\n\
+         Dummy 2-work-per-block / elapsed seconds — not Core chainwork hashrate. \
+         Useful on regtest (2 work/block). See docs/rpc.md.",
+    ),
+    (
+        "prioritisetransaction",
+        "prioritisetransaction txid dummy fee_delta\nLocal mining fee delta (sat). dummy must be 0.",
+    ),
+    (
+        "getprioritisedtransactions",
+        "getprioritisedtransactions\nMap of txid → fee_delta / in_mempool / modified_fee.",
+    ),
+    (
+        "submitblock",
+        "submitblock hexdata (dummy)\n\
+         All networks. Same receive path as a P2P block.",
+    ),
+    (
+        "submitheader",
+        "submitheader hexdata\n\
+         All networks. Persist a header via the P2P header path (`ensure_header`).",
+    ),
+    (
+        "getpeerinfo",
+        "getpeerinfo\n\
+         Returns data about each connected network node as a json array of objects.\n\
+         Valid networks: (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)",
+    ),
+    (
+        "getorphantxs",
+        "getorphantxs ( verbosity )\n\
+         Shows transactions in the tx orphanage.\n\
+         EXPERIMENTAL warning: this call may be changed in future releases.",
+    ),
+    (
+        "help",
+        "help\nhelp ( \"command\" ) — list methods or describe one.",
+    ),
+    (
+        "echo",
+        "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.",
+    ),
+];
+
 pub(crate) fn method_help(m: &str) -> String {
-    match m {
-        "estimatesmartfee" => {
-            "estimatesmartfee conf_target (estimate_mode)\n\
-             Returns this node's 10-minute inclusion frontier feerate (BTC/kvB), \
-             not Core historical multi-horizon. See docs/mempool-fee-estimation.md."
-                .into()
+    for (name, text) in NAMED_HELP {
+        if *name == m {
+            return (*text).into();
         }
-        "estimaterawfee" => {
-            "estimaterawfee conf_target (threshold)\n\
-             Regtest/harness surface matching Core's RPC name. Returns this node's \
-             10-minute inclusion frontier (same product as estimatesmartfee)."
-                .into()
-        }
-        "getblockchaininfo" => "getblockchaininfo\nReturns tip height, chain name, and IBD flag.\n\
-             initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
-             max-tip-age), not still catching up. chainwork is summed header work\n\
-             (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
-             cold inwit when split). verificationprogress is blocks/headers (1.0 when\n\
-             headers is 0)."
-            .into(),
-        "getblockstats" => "getblockstats hash_or_height ( stats )\n\
-             Reconstruct the block and return fee / UTXO / weight statistics."
-            .into(),
-        "generatetoaddress" => "generatetoaddress nblocks address (maxtries)\n\
-             Regtest harness only. Mines nblocks paying address via the P2P accept path."
-            .into(),
-        "generateblock" => "generateblock output transactions (submit)\n\
-             Regtest harness only. One block paying output (address or hex script). \
-             submit=false returns {hash,hex} without connecting the block."
-            .into(),
-        "generate" => "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
-            .into(),
-        "mockscheduler" => "mockscheduler delta_seconds\n\
-             Regtest harness only. Advance the scheduler; rebroadcast unbroadcast txs."
-            .into(),
-        "generatetodescriptor" => "generatetodescriptor nblocks descriptor (maxtries)\n\
-             Regtest harness only. raw(HEX), addr(ADDRESS), or a bare address."
-            .into(),
-        "scantxoutset" => "scantxoutset action (scanobjects)\n\
-             raw() scripts over Class A. MiniWallet support, not Core coins-DB."
-            .into(),
-        "decoderawtransaction" => "decoderawtransaction hexstring (iswitness)\n\
-             Decode a serialized transaction. iswitness=false refuses the BIP141 marker. \
-             scriptSig asm is rust-bitcoin, not Core ScriptToAsmStr sighash suffixes."
-            .into(),
-        "decodescript" => "decodescript hexstring\n\
-             asm, type, hex, and address when standard. No p2sh wrap, segwit wrap, \
-             or descriptor inference."
-            .into(),
-        "validateaddress" => "validateaddress address\n\
-             Happy path: isvalid, scriptPubKey, isscript, iswitness. Invalid is \
-             {isvalid:false} only (no error_locations)."
-            .into(),
-        "gettxout" => "gettxout txid n (include_mempool)\n\
-             Connected Class A + mempool. Default include_mempool hides confirmed outs spent by a live mempool tx."
-            .into(),
-        "sendrawtransaction" => {
-            "sendrawtransaction hexstring (maxfeerate) (maxburnamount)\n\
-             RPC submit only. Default maxfeerate 10000 sat/vB (0 unlimited; >=100000 sat/vB is a parameter error). \
-             Default maxburnamount 0. P2P relay is not capped."
-                .into()
-        }
-        "getchaintips" => "getchaintips — active + held/archive side tips + headers-only.".into(),
-        "getdeploymentinfo" => {
-            "getdeploymentinfo (blockhash)\nBuried deployments from ChainParams. No BIP9.".into()
-        }
-        "getblocktemplate" => "getblocktemplate (template_request)\n\
-             All networks. Template from select_block_txs; proposal validates \
-             without connecting. rules must include segwit. longpollid waits \
-             for a new tip or mempool/priority change. No BIP9 testdummy."
-            .into(),
-        "getmininginfo" => {
-            "getmininginfo\nTip height, difficulty, pooledtx, blockmintxfee (BTC/kvB). All networks."
-                .into()
-        }
-        "getnetworkhashps" => "getnetworkhashps (nblocks) (height)\n\
-             Dummy 2-work-per-block / elapsed seconds — not Core chainwork hashrate. \
-             Useful on regtest (2 work/block). See docs/rpc.md."
-            .into(),
-        "prioritisetransaction" => {
-            "prioritisetransaction txid dummy fee_delta\nLocal mining fee delta (sat). dummy must be 0."
-                .into()
-        }
-        "getprioritisedtransactions" => {
-            "getprioritisedtransactions\nMap of txid → fee_delta / in_mempool / modified_fee."
-                .into()
-        }
-        "submitblock" => "submitblock hexdata (dummy)\n\
-             All networks. Same receive path as a P2P block."
-            .into(),
-        "submitheader" => "submitheader hexdata\n\
-             All networks. Persist a header via the P2P header path (`ensure_header`)."
-            .into(),
-        "getpeerinfo" => "getpeerinfo\n\
-             Returns data about each connected network node as a json array of objects.\n\
-             Valid networks: (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)"
-            .into(),
-        "help" => "help\nhelp ( \"command\" ) — list methods or describe one.".into(),
-        "echo" => "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.".into(),
-        other if METHOD_LIST.contains(&other) => format!("{other} — see docs/rpc.md"),
-        other => format!("unknown method {other}"),
+    }
+    if METHOD_LIST.contains(&m) {
+        format!("{m} — see docs/rpc.md")
+    } else {
+        format!("unknown method {m}")
     }
 }
 
