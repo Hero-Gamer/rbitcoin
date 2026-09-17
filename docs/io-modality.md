@@ -3,16 +3,18 @@
 **Source of truth** for bulk `RBITCOIN_IO` vs table transport (fd + tiered RAM).
 **Phase 6 complete:** workspace has **zero `memmap2` / `MmapMut`**.
 [`TableFile`](../crates/rbitcoin-store/src/file.rs) stays **FdOnly**. The mmap
-exception is **read-only immutable** sealed `.fuse8` fingerprint arrays in
-[`fuse8_filter.rs`](../crates/rbitcoin-store/src/fuse8_filter.rs) (Unix `mmap`
-`PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`). Packed MPHF
-`g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
+exceptions are **read-only immutable** sealed `.fuse8` fingerprint arrays
+([`fuse8_filter.rs`](../crates/rbitcoin-store/src/fuse8_filter.rs)) and SH
+BDZ3 occupancy bitvectors (prefix of `NN.mphf` through occ, not tags). Unix
+`mmap` `PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`. Packed
+MPHF `g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
 thread, while `KIND_MPHF_G` keeps 128 pages in flight on the completion
 session. `strong_tx` and mempool stay process `Vec`.
 
 **Map vs FdOnly:** map when the bytes are immutable after write, touched as
 a few random bytes per key, and must stay resident for the hot path (sealed
-`.fuse8`: every unfinished key probes every sealed segment). Keep FdOnly +
+`.fuse8`: every unfinished key probes every sealed segment; SH BDZ3 `occ`:
+1.23 bits/key, rank on every compact index). Keep FdOnly +
 completion session when the file is larger than the residency budget or is
 read as page batches (`txid.body` / `txout` / `spent` / `create.loc`, packed
 BDZ `g`, SH tags/`.val`).
@@ -27,7 +29,7 @@ Related: [`env-knobs.md`](./env-knobs.md), [`concurrency.md`](./concurrency.md),
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
 | **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pool` \| `iocp` \| `pread` | Multi-op **completion session** on file handles (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
-| **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps. Sealed `.fuse8` is a sidecar map, not TableFile |
+| **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps. Sealed `.fuse8` and SH BDZ3 occ are sidecar maps, not TableFile |
 
 **`RBITCOIN_IO` selects the completion-session backend** (not per-path).
 Unknown tokens (including deleted `mmap`) fall through to the platform default.
@@ -158,7 +160,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
-| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx + mapped `.fuse8`. L1 ovf: mapped fuse + FdOnly `g`. Body slabs L0 |
+| **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: mapped occ + BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx + mapped `.fuse8`. L1 ovf: mapped fuse + mapped occ + FdOnly `g`. Body slabs L0 |
 | **Spenders** | L0 | Linear append |
 | `confirmed` / `header_txs_*` / `strong_tx` | **L2** | InRam write-behind; barrier = `Store::flush_class_c_tip` |
 | Create-height fence | RAM | Built from confirmed + header_txs; no `tx_height.body` |
@@ -243,8 +245,9 @@ removed; default graph is product + suite). Head-insert A/B is the live
 
 `TableFile` has no maps (`memmap2` not in the workspace). There is no
 `RBITCOIN_TX_HEAD_ACCESS` hatch. Tables are fd pread/pwrite + fallocate.
-Sealed `.fuse8` sidecars are the mmap exception (read-only, not `MmapMut`).
-Packed `g` stays FdOnly. Class C is L2 write-behind (`flush_class_c_tip`
+Sealed `.fuse8` sidecars and SH BDZ3 occupancy prefixes are the mmap
+exceptions (read-only, not `MmapMut`). Packed `g` stays FdOnly. Class C is
+L2 write-behind (`flush_class_c_tip`
 before BQ dequeue) — **not** mapped (`strong_tx` write-behind is tip-last).
 Mempool schema 2 is InRam Vecs + `pwrite`.
 

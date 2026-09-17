@@ -32,6 +32,8 @@ assert_ok "dry-run lists mmap sealed fuse roundtrip" \
   grep -q "fuse8_filter::tests::no_false_negatives_and_roundtrip" <<<"$out"
 assert_ok "dry-run lists seal publish remap" \
   grep -q "segmented_head::tests::insert_roll_seal_lookup_roundtrip" <<<"$out"
+assert_ok "dry-run lists mapped SH BDZ3 occ" \
+  grep -q "bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram" <<<"$out"
 assert_ok "dry-run lists query connect-chain confirm" \
   grep -q "connect_chain_query_surface" <<<"$out"
 assert_ok "dry-run lists query spend-edge confirm" \
@@ -56,6 +58,8 @@ assert_ok "Windows dry-run still maps sealed fuse" \
   grep -q "fuse8_filter::tests::no_false_negatives_and_roundtrip" <<<"$out"
 assert_ok "Windows dry-run still rolls seal + maps fuse" \
   grep -q "segmented_head::tests::insert_roll_seal_lookup_roundtrip" <<<"$out"
+assert_ok "Windows dry-run still maps SH BDZ3 occ" \
+  grep -q "bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram" <<<"$out"
 assert_ok "Windows dry-run still confirms a few blocks" \
   grep -q "connect_chain_query_surface" <<<"$out"
 assert_ok "Windows dry-run pins loc SIMD vs scalar" \
