@@ -231,6 +231,8 @@ pub(crate) struct IbdPerfSample {
     pub prep_struct_ms: u64,
     /// Header validate/put + cache seed.
     pub prep_header_ms: u64,
+    /// IBD stamp used BQ `header_fk` (skipped POW / header-table ensure).
+    pub prep_header_skip_n: u64,
     /// prepare_block_for_archive.
     pub prep_prepare_ms: u64,
     /// filter need + plan batch + tx_fks wiring.
@@ -491,6 +493,7 @@ impl Default for IbdPerfSample {
             prep_wire_arc_ms: 0,
             prep_struct_ms: 0,
             prep_header_ms: 0,
+            prep_header_skip_n: 0,
             prep_prepare_ms: 0,
             prep_filter_plan_ms: 0,
             connect_ns: 0,
@@ -847,6 +850,7 @@ pub(crate) fn sample(
     let prep_wire_arc_ns = w.phase_prep_wire_arc_ns;
     let prep_struct_ns = w.phase_prep_struct_ns;
     let prep_header_ns = w.phase_prep_header_ns;
+    let prep_header_skip_n = w.phase_prep_header_skip_n;
     let prep_prepare_ns = w.phase_prep_prepare_ns;
     let prep_filter_plan_ns = w.phase_prep_filter_plan_ns;
     let sh_collect = w.sh_collect_ns;
@@ -943,6 +947,7 @@ pub(crate) fn sample(
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
         prep_struct_ms: ns_ms(prep_struct_ns),
         prep_header_ms: ns_ms(prep_header_ns),
+        prep_header_skip_n,
         prep_prepare_ms: ns_ms(prep_prepare_ns),
         prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
         connect_ns,
@@ -1273,6 +1278,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "uring_recover", s.uring_recover_n);
     append_nz(&mut out, "slow_drain", s.uring_slow_drain);
     append_nz(&mut out, "lookup_faults", s.lookup_faults);
+    append_nz(&mut out, "header_skip", s.prep_header_skip_n);
     let _ = thr_lookup_wait;
     if s.stamp_struct_ms > 0
         || s.stamp_prepare_ms > 0
@@ -2262,6 +2268,7 @@ mod tests {
         s.stamp_struct_ms = 8;
         s.stamp_struct_txid_ms = 6;
         s.stamp_struct_walk_ms = 2;
+        s.prep_header_skip_n = 4;
         rbitcoin_log::init(Level::Debug);
         rbitcoin_log::capture_logs(true);
         log_sample(&s);
@@ -2277,6 +2284,7 @@ mod tests {
             .map(|(_, m)| m.as_str())
             .unwrap_or("");
         assert!(info.contains("stamp_sub("), "{info}");
+        assert!(info.contains("header_skip=4"), "{info}");
         assert!(info.contains("struct_txid=6ms"), "{info}");
         assert!(info.contains("struct_walk=2ms"), "{info}");
         assert!(info.contains("pin_txid=15"), "{info}");

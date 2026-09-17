@@ -947,6 +947,11 @@ impl Store {
         self.txs.create_loc_range_batch(fks)
     }
 
+    /// Durable `create.loc` row count (not `tx.body` HWM).
+    pub fn tx_create_loc_count(&self) -> u64 {
+        self.txs.create_loc_count()
+    }
+
     pub fn tx_body_range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         Ok(self
             .tx_create_loc_range_batch(fks)?

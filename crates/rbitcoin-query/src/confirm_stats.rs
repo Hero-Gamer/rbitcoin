@@ -173,6 +173,7 @@ confirm_window! {
     phase_prep_wire_arc_ns,
     phase_prep_struct_ns,
     phase_prep_header_ns,
+    phase_prep_header_skip_n,
     phase_prep_prepare_ns,
     phase_prep_filter_plan_ns,
     phase_blocks,

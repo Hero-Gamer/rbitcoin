@@ -5,10 +5,9 @@
 //! One function for S0 plan (`archive_plan_batch_from_wire`) and plan=None
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
 //! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
-//! omitted from that skeleton; a later wave's TipOnly loc is adopted onto the
-//! in-flight identity so write ensure does not need RAM loc after prune.
-//! When TipOnly misses (lookup ahead of `tx.head`) and loc is already on disk,
-//! fill loc by fk onto that in-flight identity; miss is OK (same-wave).
+//! omitted from that skeleton. Class A `CreatePin::set_loc` after append;
+//! later-wave stamp reads pin loc. Disk loc-by-fk only if pin loc is unset
+//! (`create.loc.count() ≥ fk` and miss is a loc hole).
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -136,6 +135,11 @@ fn stamp_inflight_hits<'a>(
                 let e = stamp.bind(id, *t);
                 if let Some(pin) = in_flight.get_out(id) {
                     e.pin = Some(std::sync::Arc::clone(pin));
+                    if let Some(pair) = pin.loc() {
+                        e.body = Some(pair.txout);
+                        e.spent = Some(pair.spent);
+                        e.n_out = Some(pair.n_out);
+                    }
                 }
                 if let Some(skel) = skeleton {
                     if let Some((sk_fk, range, spent, n_out)) = skel.get(t) {
@@ -325,10 +329,10 @@ pub fn fill_missing_parent_ranges(
     Ok(())
 }
 
-/// Later-wave InFlight identity that TipOnly missed (`tx.head` lag): loc by fk.
+/// Disk loc-by-fk for InFlight identities that still lack spent (pin loc unset).
 ///
-/// Hit stamps spent so write ensure does not need RAM loc after prune. Miss is
-/// OK (same-wave, not on disk yet — write fill).
+/// Same-wave (`create.loc.count() < fk`) leaves spent unset (write fill).
+/// A miss when loc count already covers the fk is a loc hole.
 fn fill_inflight_spent_from_loc(
     store: &Store,
     in_flight: &InFlight,
@@ -354,9 +358,9 @@ fn fill_inflight_spent_from_loc(
             continue;
         };
         let Some(pair) = row else {
-            if fk.get().is_some_and(|id| store.txs.count() >= id) {
+            if fk.get().is_some_and(|id| store.tx_create_loc_count() >= id) {
                 return Err(rbitcoin_store::StoreError::Corrupt(
-                    "archive: inflight loc missing after Class A",
+                    "invariant: create.loc hole after count",
                 ));
             }
             continue;
@@ -498,7 +502,60 @@ mod tests {
     }
 
     #[test]
-    fn inflight_hit_skeleton_miss_without_loc_after_class_a_is_corrupt() {
+    fn inflight_hit_uses_pin_loc_without_disk() {
+        let (dir, q) = tmp_store();
+        let p = pin(1);
+        let txid = p.tx().txid;
+        let fks = q
+            .store
+            .txs
+            .put_full_batch_indexed(
+                &[(
+                    p.tx().clone(),
+                    vec![rbitcoin_store::InputRecord::coinbase(
+                        u32::MAX,
+                        vec![0x01],
+                        vec![],
+                    )],
+                    (0..p.n_out() as u32)
+                        .filter_map(|v| p.out_record(v))
+                        .collect(),
+                )],
+                true,
+            )
+            .unwrap();
+        assert_eq!(fks[0], Fk(1));
+        let pair = q
+            .store
+            .txs
+            .create_loc_range_batch(&[Fk(1)])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("loc after append");
+        p.set_loc(pair);
+        q.store.txs.create_loc_truncate_to_count(0).unwrap();
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let skel = BatchParentIds::default();
+        let st = stamp_external_parents(
+            q.store(),
+            &[txid],
+            &inflight,
+            Some(&skel),
+            q.confirm_stats(),
+        )
+        .expect("pin loc must bind without disk loc");
+        let ident = st.idents.get(&1).expect("inflight ident");
+        assert_eq!(ident.spent, Some(pair.spent));
+        assert_eq!(ident.body, Some(pair.txout));
+        assert_eq!(ident.n_out, Some(pair.n_out));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_hit_skeleton_miss_body_without_loc_count_leaves_spent_unset() {
         let (dir, q) = tmp_store();
         let p = pin(1);
         let txid = p.tx().txid;
@@ -523,21 +580,21 @@ mod tests {
         assert_eq!(fks[0], Fk(1));
         assert!(q.store.txs.count() >= 1);
         q.store.txs.create_loc_truncate_to_count(0).unwrap();
+        assert!(q.store.tx_create_loc_count() < 1);
         let mut inflight = InFlight::new();
         inflight.note_pins([(Fk(1), &p)], Some(1));
         let skel = BatchParentIds::default();
-        let err = stamp_external_parents(
+        let st = stamp_external_parents(
             q.store(),
             &[txid],
             &inflight,
             Some(&skel),
             q.confirm_stats(),
         )
-        .unwrap_err();
-        assert!(
-            format!("{err}").contains("inflight loc missing after Class A"),
-            "{err}"
-        );
+        .expect("body HWM without loc count is same-wave hole, not Corrupt");
+        let ident = st.idents.get(&1).expect("inflight ident");
+        assert!(ident.pin.is_some());
+        assert_eq!(ident.spent, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

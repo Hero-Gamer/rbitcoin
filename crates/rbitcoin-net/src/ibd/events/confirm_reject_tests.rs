@@ -68,6 +68,10 @@ fn confirm_reject_class_matches_substring_table() {
             ConfirmRejectClass::EngineFault,
         ),
         (
+            "invariant: create.loc hole after count",
+            ConfirmRejectClass::EngineFault,
+        ),
+        (
             "consensus: store: corrupt record: tx put_full_batch fk mismatch (plan not committed in order)",
             ConfirmRejectClass::Cascade,
         ),
@@ -1683,8 +1687,9 @@ fn post_lookup_reject_rewinds_taken_hi() {
         ("consensus: bad block: merkle root mismatch", true),
         (
             "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
-            true,
+            false,
         ),
+        ("invariant: create.loc hole after count", false),
         ("connect height not tip+1", true),
         ("consensus: prevout already spent on best chain", true),
         ("confirm cancelled", false),
@@ -1720,6 +1725,49 @@ fn post_lookup_reject_rewinds_taken_hi() {
             );
         }
     }
+}
+
+#[test]
+fn engine_fault_loc_hole_does_not_isolate_or_rewind() {
+    use super::super::confirm::ConfirmFeed;
+    use crate::chain::ChainHub;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("loc-hole-no-isolate");
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub.query.set_lookup_taken_hi(Some(2));
+    hub.query.set_lookup_started_hi(Some(2));
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
+    let hash = h(0x5b);
+    st.record_height(hash, 2);
+    let feed = ConfirmFeed::new();
+    apply_confirm_reject_class(
+        &mut st,
+        2,
+        hash,
+        ConfirmRejectClass::EngineFault,
+        "invariant: create.loc hole after count",
+        Some(hub.query.as_ref()),
+        Some(&hub),
+        8,
+        Some(&feed),
+    );
+    assert_eq!(
+        feed.isolate_until(),
+        u32::MAX,
+        "EngineFault must not enter single-block isolate"
+    );
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(2),
+        "EngineFault must not rewind taken_hi"
+    );
+    assert_eq!(hub.query.lookup_started_hi(), Some(2));
+    assert!(
+        st.halt.is_none(),
+        "first engine fault requeues, does not halt"
+    );
 }
 
 /// Wire-path soft budget charged on receive must release on script reject

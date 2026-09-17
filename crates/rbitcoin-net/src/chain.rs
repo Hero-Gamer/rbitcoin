@@ -4114,6 +4114,8 @@ mod tests {
                 in_flight: &inflight,
                 skeleton: None,
                 carried_need: Vec::new(),
+                carried_header_fks: Vec::new(),
+                carried_header_hashes: Vec::new(),
             };
             hub.confirm_wire_load_phase_pipelined(&batch1, Some(&pipe))
                 .expect("prep1")
@@ -4160,6 +4162,8 @@ mod tests {
                 in_flight: &inflight,
                 skeleton: None,
                 carried_need: Vec::new(),
+                carried_header_fks: Vec::new(),
+                carried_header_hashes: Vec::new(),
             };
             hub.confirm_wire_load_phase_pipelined(&batch2, Some(&pipe))
                 .expect("prep2 err")

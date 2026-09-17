@@ -23,10 +23,44 @@ use std::sync::Arc;
 /// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
 /// Wire pins borrow `scriptPubKey` from [`Arc<bitcoin::Block>`] until write
 /// encodes Class A; records pins own [`OutputRecord`] scripts (tests / SH).
-pub type CreatePin = Arc<CreatePinInner>;
+pub type CreatePin = Arc<CreatePinArc>;
 
 /// One header's wire block + txids for Class A plan/commit.
 pub type WirePlanNeed<'a> = (Fk, &'a Arc<bitcoin::Block>, &'a [[u8; 32]]);
+
+/// Shared pin: Class A loc is filled once after append (later-wave stamp reads it).
+#[derive(Debug)]
+pub struct CreatePinArc {
+    loc: std::sync::OnceLock<rbitcoin_store::CreateLocPair>,
+    inner: CreatePinInner,
+}
+
+impl CreatePinArc {
+    fn wrap(inner: CreatePinInner) -> CreatePin {
+        Arc::new(Self {
+            loc: std::sync::OnceLock::new(),
+            inner,
+        })
+    }
+
+    /// Loc from Class A append (None until write sets it).
+    #[inline]
+    pub fn loc(&self) -> Option<&rbitcoin_store::CreateLocPair> {
+        self.loc.get()
+    }
+
+    /// Set loc once after Class A append. Second set is ignored.
+    pub fn set_loc(&self, pair: rbitcoin_store::CreateLocPair) {
+        let _ = self.loc.set(pair);
+    }
+}
+
+impl std::ops::Deref for CreatePinArc {
+    type Target = CreatePinInner;
+    fn deref(&self) -> &CreatePinInner {
+        &self.inner
+    }
+}
 
 /// [`CreatePin`] payload.
 #[derive(Debug)]
@@ -44,11 +78,11 @@ pub enum CreatePinInner {
 
 impl CreatePinInner {
     pub fn records(tx: TxRecord, outs: Vec<OutputRecord>) -> CreatePin {
-        Arc::new(Self::Records { tx, outs })
+        CreatePinArc::wrap(Self::Records { tx, outs })
     }
 
     pub fn wire(block: Arc<bitcoin::Block>, tx_index: u32, tx: TxRecord) -> CreatePin {
-        Arc::new(Self::Wire {
+        CreatePinArc::wrap(Self::Wire {
             block,
             tx_index,
             tx,
@@ -130,6 +164,32 @@ impl CreatePinInner {
     }
 }
 
+impl PackedCreate for CreatePinArc {
+    #[inline]
+    fn packed_txid(&self) -> [u8; 32] {
+        self.inner.packed_txid()
+    }
+    #[inline]
+    fn packed_tx(&self) -> &TxRecord {
+        self.inner.packed_tx()
+    }
+    #[inline]
+    fn packed_n_out(&self) -> u32 {
+        self.inner.packed_n_out()
+    }
+    #[inline]
+    fn packed_has_negative_amount(&self) -> bool {
+        self.inner.packed_has_negative_amount()
+    }
+    #[inline]
+    fn packed_outs_est(&self) -> usize {
+        self.inner.packed_outs_est()
+    }
+    fn encode_txout_body(&self, buf: &mut Vec<u8>, secret: Option<&rbitcoin_store::StoreSecret>) {
+        self.inner.encode_txout_body(buf, secret)
+    }
+}
+
 impl PackedCreate for CreatePinInner {
     #[inline]
     fn packed_txid(&self) -> [u8; 32] {
@@ -198,7 +258,7 @@ impl PackedCreate for CreatePinInner {
 #[inline]
 pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     let mut n = 96usize; // TxRecord + Arc shell overhead (order-of-magnitude)
-    match pin.as_ref() {
+    match &pin.inner {
         CreatePinInner::Records { outs, .. } => {
             for o in outs {
                 n = n.saturating_add(24).saturating_add(o.script.len());
@@ -1043,6 +1103,9 @@ impl Query {
                 "tx put_full_batch fk mismatch (plan not committed in order)",
             ));
         }
+        for ((pin, _), pair) in plan.packed.iter().zip(loc.iter()) {
+            pin.set_loc(*pair);
+        }
 
         // Head write-behind: publish pending txid→fk so resolve can hit before drain.
         let t = Instant::now();
@@ -1068,15 +1131,13 @@ impl Query {
             if plan.per_header_sw.len() != plan.per_header_ranges.len() {
                 return Err(StoreError::Corrupt("invariant: header size/weight length"));
             }
-            for (&(hfk, _, _), &(size, weight)) in
-                plan.per_header_ranges.iter().zip(plan.per_header_sw.iter())
-            {
-                match self.store.headers.set_size_weight(hfk, size, weight) {
-                    Ok(()) => {}
-                    Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => {}
-                    Err(e) => return Err(e),
-                }
-            }
+            let rows: Vec<(Fk, u32, u32)> = plan
+                .per_header_ranges
+                .iter()
+                .zip(plan.per_header_sw.iter())
+                .map(|(&(hfk, _, _), &(size, weight))| (hfk, size, weight))
+                .collect();
+            self.store.headers.put_size_weight_run(&rows)?;
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
@@ -2257,6 +2318,35 @@ mod tests {
             txdata: vec![parent, child],
         };
         (block, txids, script_sig)
+    }
+
+    #[test]
+    fn create_pin_loc_set_once_after_append() {
+        use rbitcoin_store::CreateLocPair;
+        let pin = crate::CreatePinInner::records(
+            TxRecord {
+                txid: [1u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        );
+        let first = CreateLocPair {
+            txout: (8, 16),
+            spent: (8, 8),
+            n_out: 1,
+        };
+        pin.set_loc(first);
+        pin.set_loc(CreateLocPair {
+            txout: (99, 1),
+            spent: (99, 1),
+            n_out: 9,
+        });
+        assert_eq!(pin.loc().copied(), Some(first));
     }
 
     /// D1: wire planner never builds TxApply; packed ins empty; CreatePin matches wire outs.

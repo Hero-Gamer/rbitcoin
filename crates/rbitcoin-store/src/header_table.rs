@@ -477,19 +477,60 @@ impl HeaderTable {
         HeaderRecord::decode(&buf)
     }
 
-    /// Patch trailing size/weight on an existing row (confirm stamp / lazy fill).
+    /// Patch trailing size/weight on an existing row (query lazy-fill of leftover zeros).
+    ///
+    /// Confirm uses [`Self::put_size_weight_run`] (no insert lock).
     pub fn set_size_weight(&self, fk: Fk, size: u32, weight: u32) -> Result<(), StoreError> {
+        self.put_size_weight_run(&[(fk, size, weight)])
+    }
+
+    /// Write size/weight for already-published header rows.
+    ///
+    /// Not an insert: does not take [`Self::put_lock`]. Contiguous fk runs are
+    /// one sequential `header.body` rewrite of 96-byte records.
+    pub fn put_size_weight_run(&self, rows: &[(Fk, u32, u32)]) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = self.count.load(Ordering::Acquire);
-        if id == 0 || id > count {
-            return Err(StoreError::NotFound);
+        if rows.is_empty() {
+            return Ok(());
         }
-        let _g = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let offset = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64 + 88;
-        let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&size.to_le_bytes());
-        buf[4..8].copy_from_slice(&weight.to_le_bytes());
+        let count = self.count.load(Ordering::Acquire);
+        let mut items: Vec<(u64, u32, u32)> = Vec::with_capacity(rows.len());
+        for &(fk, size, weight) in rows {
+            let Some(id) = fk.get() else {
+                return Err(StoreError::InvalidFk);
+            };
+            if id == 0 || id > count {
+                continue;
+            }
+            items.push((id, size, weight));
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
+        items.sort_unstable_by_key(|r| r.0);
+        let mut i = 0;
+        while i < items.len() {
+            let mut j = i + 1;
+            while j < items.len() && items[j].0 == items[j - 1].0.saturating_add(1) {
+                j += 1;
+            }
+            self.patch_size_weight_run(&items[i..j])?;
+            i = j;
+        }
+        Ok(())
+    }
+
+    fn patch_size_weight_run(&self, run: &[(u64, u32, u32)]) -> Result<(), StoreError> {
+        let n = run.len();
+        let first = run[0].0;
+        let offset = FILE_HEADER_LEN as u64 + (first - 1) * HEADER_RECORD_LEN as u64;
+        let mut buf = vec![0u8; n.saturating_mul(HEADER_RECORD_LEN)];
+        self.body.read_at(offset, &mut buf)?;
+        for (k, &(_, size, weight)) in run.iter().enumerate() {
+            let rec = k.saturating_mul(HEADER_RECORD_LEN);
+            buf[rec + 88..rec + 92].copy_from_slice(&size.to_le_bytes());
+            buf[rec + 92..rec + 96].copy_from_slice(&weight.to_le_bytes());
+        }
         self.body.write_at(offset, &buf)
     }
 
@@ -1024,6 +1065,41 @@ mod tests {
         assert_eq!(got.size, 200);
         assert_eq!(got.weight, 800);
         assert_eq!(got.hash, [0x33; 32]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_size_weight_run_contiguous_rewrites_records() {
+        let dir = tmp();
+        let t = HeaderTable::create_tiny(&dir).unwrap();
+        let mut fks = Vec::new();
+        for i in 0u8..3 {
+            let fk = t.ensure(&sample([0x40 + i; 32])).unwrap();
+            fks.push(fk);
+        }
+        t.put_size_weight_run(&[(fks[0], 100, 400), (fks[1], 200, 800), (fks[2], 300, 1200)])
+            .unwrap();
+        for (i, &fk) in fks.iter().enumerate() {
+            let got = t.get(fk).unwrap();
+            let want = ((i as u32 + 1) * 100, (i as u32 + 1) * 400);
+            assert_eq!((got.size, got.weight), want);
+            assert_eq!(got.hash, [0x40 + i as u8; 32]);
+            assert_eq!(t.get_by_hash(&got.hash).unwrap().map(|(f, _)| f), Some(fk));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_size_weight_run_splits_noncontiguous_fks() {
+        let dir = tmp();
+        let t = HeaderTable::create_tiny(&dir).unwrap();
+        let a = t.ensure(&sample([0x51; 32])).unwrap();
+        let b = t.ensure(&sample([0x52; 32])).unwrap();
+        let c = t.ensure(&sample([0x53; 32])).unwrap();
+        t.put_size_weight_run(&[(a, 11, 44), (c, 33, 132)]).unwrap();
+        assert_eq!(t.get(a).unwrap().size, 11);
+        assert_eq!(t.get(b).unwrap().size, 0);
+        assert_eq!(t.get(c).unwrap().weight, 132);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -915,6 +915,11 @@ impl TxTable {
         self.create_loc.range_batch(fks)
     }
 
+    /// Durable `create.loc` row count (not `tx.body` HWM).
+    pub fn create_loc_count(&self) -> u64 {
+        self.create_loc.count()
+    }
+
     /// Truncate `create.loc` to `n` rows without touching Class A bodies.
     pub fn create_loc_truncate_to_count(&self, n: u64) -> Result<(), StoreError> {
         self.create_loc.truncate_to_count(n)

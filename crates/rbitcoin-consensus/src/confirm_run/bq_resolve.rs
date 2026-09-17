@@ -1070,6 +1070,8 @@ mod tests {
                 .iter()
                 .flat_map(|(_, _, w)| w.spend_keys.iter().map(|&(t, _)| t))
                 .collect(),
+            carried_header_fks: Vec::new(),
+            carried_header_hashes: Vec::new(),
         };
         let items = [(Height(1), std::sync::Arc::new(b1), None)];
         let stamped =
@@ -1200,6 +1202,8 @@ mod tests {
                 in_flight: &log,
                 skeleton: None,
                 carried_need: Vec::new(),
+                carried_header_fks: Vec::new(),
+                carried_header_hashes: Vec::new(),
             };
             let items = [(Height(1), std::sync::Arc::new(b1), None)];
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
@@ -1288,6 +1292,8 @@ mod tests {
                 in_flight: &log,
                 skeleton: None,
                 carried_need: Vec::new(),
+                carried_header_fks: Vec::new(),
+                carried_header_hashes: Vec::new(),
             };
             let items = [(Height(1), std::sync::Arc::new(b1), None)];
             crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))

@@ -639,7 +639,7 @@ pub(crate) fn apply_confirm_reject(
             f.request_single_block(until);
         }
     }
-    if class != ConfirmRejectClass::Cancelled {
+    if class != ConfirmRejectClass::Cancelled && class != ConfirmRejectClass::EngineFault {
         if let Some(q) = query {
             let tip = hub.and_then(|h| h.tip_height());
             q.set_lookup_taken_hi(tip);
@@ -760,11 +760,11 @@ fn apply_engine_fault_reject(
     err: &str,
     query: Option<&rbitcoin_query::Query>,
 ) {
-    if let Some(q) = query {
-        let _ = q.block_queue_dequeue_height(height);
-    }
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     if st.engine_fault_seen.contains(&hash) {
+        if let Some(q) = query {
+            let _ = q.block_queue_dequeue_height(height);
+        }
         st.halt = Some(format!("engine fault repeated @{height} {hash}: {err}"));
         warn!(
             "ibd: engine fault halt @{height} {hash}: {err} (second occurrence, not blacklisted)"
