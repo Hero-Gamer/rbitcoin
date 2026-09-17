@@ -23,6 +23,13 @@ before 1.0).
   as `[]` (not 404), plus `/txids`, coinbase merkle-proof, and unspent
   `outspend/0` on the mined tip.
 
+### Fixed
+
+- **IBD loc-hole EngineFault:** load stamp no longer treats a live InFlight
+  pin + `create.loc` miss as `invariant: create.loc hole after count`.
+  Rereading loc count after the miss raced Class A append (mainnet 369k /
+  407k). Miss stays same-wave (write fill / late `set_loc`).
+
 ### Changed
 
 - **Catalog journeys absorb leftover twins:** mature confirm pins Class A then
@@ -51,11 +58,12 @@ before 1.0).
 
 - **Class A loc rides on the InFlight `CreatePin` Arc:** write `set_loc`
   after append; later-wave stamp binds spent/body from the pin (no disk
-  loc-by-fk on that path). A miss only when `create.loc.count()` already
-  covers the fk is `invariant: create.loc hole after count` (EngineFault).
-  EngineFault stamp fail reoffers the full batch and does not
-  `request_single_block` or rewind `lookup_taken_hi` (the 352k Cascade
-  isolate crawl).
+  loc-by-fk on that path). Disk loc-by-fk is only when pin loc is still
+  unset; a miss on a live pin is same-wave / write-in-progress (write fill
+  or late `set_loc`), not `create.loc.count()` after the pread (that race
+  was the mainnet loc-hole EngineFault). EngineFault stamp fail reoffers
+  the full batch and does not `request_single_block` or rewind
+  `lookup_taken_hi` (the 352k Cascade isolate crawl).
 
 - **RPC tip wait is one in-flight accept:** `getblockcount` /
   `getbestblockhash` / `wait_height` wait for the tip-accept job that was

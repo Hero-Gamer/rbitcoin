@@ -6,8 +6,9 @@
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
 //! lookup-wave drain+fence snapshot taken before TipOnly. Same-wave creates are
 //! omitted from that skeleton. Class A `CreatePin::set_loc` after append;
-//! later-wave stamp reads pin loc. Disk loc-by-fk only if pin loc is unset
-//! (`create.loc.count() ≥ fk` and miss is a loc hole).
+//! later-wave stamp reads pin loc. Disk loc-by-fk only if pin loc is unset.
+//! A live InFlight pin + disk miss is same-wave / write-in-progress, not a
+//! loc hole (`create.loc.count()` after the miss races Class A append).
 
 use crate::id_map::{IdMap, TxidHasher};
 use crate::{CreatePin, InFlight, QueryError, U64Map};
@@ -166,7 +167,9 @@ fn stamp_inflight_hits<'a>(
 /// skeleton loc when TipOnly already has that create (later wave). Same-wave
 /// creates are omitted from the skeleton; those holes stay for write fill.
 /// In-flight identity that still lacks spent after that bind tries loc by fk
-/// (later-wave TipOnly miss / head lag); miss is OK. `skeleton = None` is
+/// (later-wave TipOnly miss / head lag). Disk miss on a live pin leaves spent
+/// unset (write fill / late `set_loc`); it is not a loc hole.
+/// `skeleton = None` is
 /// plan=None / S0 leftover TipOnly. Same-batch identities are not inputs —
 /// callers skip them in `need` and keep them offline at pin.
 pub fn stamp_external_parents(
@@ -331,8 +334,9 @@ pub fn fill_missing_parent_ranges(
 
 /// Disk loc-by-fk for InFlight identities that still lack spent (pin loc unset).
 ///
-/// Same-wave (`create.loc.count() < fk`) leaves spent unset (write fill).
-/// A miss when loc count already covers the fk is a loc hole.
+/// Disk miss: adopt pin loc if Class A published it during the pread, else
+/// leave spent unset (write fill). Never re-read `create.loc.count()` — that
+/// races append (mainnet loc-hole EngineFault).
 fn fill_inflight_spent_from_loc(
     store: &Store,
     in_flight: &InFlight,
@@ -353,17 +357,31 @@ fn fill_inflight_spent_from_loc(
     }
     stats.note_fill_missing();
     let filled = store.tx_create_loc_range_batch(&need)?;
+    bind_inflight_loc_rows(in_flight, idents, need, filled);
+    Ok(())
+}
+
+fn bind_inflight_loc_rows(
+    in_flight: &InFlight,
+    idents: &mut U64Map<ParentIdent>,
+    need: Vec<Fk>,
+    filled: Vec<Option<rbitcoin_store::CreateLocPair>>,
+) {
     for (fk, row) in need.into_iter().zip(filled) {
         let Some(id) = fk.get() else {
             continue;
         };
-        let Some(pair) = row else {
-            if fk.get().is_some_and(|id| store.tx_create_loc_count() >= id) {
-                return Err(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: create.loc hole after count",
-                ));
+        let pair = match row {
+            Some(pair) => pair,
+            None => {
+                let Some(pin) = in_flight.get_out(id) else {
+                    continue;
+                };
+                let Some(pair) = pin.loc().copied() else {
+                    continue;
+                };
+                pair
             }
-            continue;
         };
         if let Some(e) = idents.get_mut(&id) {
             e.body = Some(pair.txout);
@@ -371,7 +389,6 @@ fn fill_inflight_spent_from_loc(
             e.n_out = Some(pair.n_out);
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -619,6 +636,39 @@ mod tests {
         assert_eq!(ident.spent, None);
         assert_eq!(ident.body, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inflight_loc_batch_miss_on_live_pin_is_not_hole() {
+        let p = pin(1);
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let mut idents = U64Map::default();
+        idents.insert(1, ParentIdent::new(p.tx().txid));
+        super::bind_inflight_loc_rows(&inflight, &mut idents, vec![Fk(1)], vec![None]);
+        let ident = idents.get(&1).expect("ident");
+        assert_eq!(ident.spent, None);
+        assert_eq!(ident.body, None);
+    }
+
+    #[test]
+    fn inflight_loc_batch_miss_adopts_late_pin_loc() {
+        let p = pin(1);
+        let pair = rbitcoin_store::CreateLocPair {
+            txout: (10, 8),
+            spent: (30, 8),
+            n_out: 1,
+        };
+        p.set_loc(pair);
+        let mut inflight = InFlight::new();
+        inflight.note_pins([(Fk(1), &p)], Some(1));
+        let mut idents = U64Map::default();
+        idents.insert(1, ParentIdent::new(p.tx().txid));
+        super::bind_inflight_loc_rows(&inflight, &mut idents, vec![Fk(1)], vec![None]);
+        let ident = idents.get(&1).expect("ident");
+        assert_eq!(ident.spent, Some(pair.spent));
+        assert_eq!(ident.body, Some(pair.txout));
+        assert_eq!(ident.n_out, Some(pair.n_out));
     }
 
     #[test]
