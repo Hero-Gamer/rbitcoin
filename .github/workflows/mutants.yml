@@ -1,0 +1,43 @@
+name: mutants
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch: {}
+  pull_request:
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', '.cargo/mutants.toml', '.github/workflows/mutants.yml']
+permissions:
+  contents: read
+jobs:
+  mutants-pr:
+    name: mutants (pr diff)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: dtolnay/rust-toolchain@master
+        with: {toolchain: 1.95}
+      - uses: taiki-e/install-action@v2
+        with: {tool: cargo-mutants@0.14.5}
+      - run: cargo mutants --in-diff origin/${{ github.base_ref }} --baseline=skip --no-shuffle --timeout 60 --cap-lints true
+        env: {CARGO_TARGET_DIR: target/dev}
+  mutants-weekly:
+    name: mutants (weekly shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: {shard: [0,1,2,3,4,5,6,7]}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: {toolchain: 1.95}
+      - uses: taiki-e/install-action@v2
+        with: {tool: cargo-mutants@0.14.5}
+      - run: cargo mutants -p rbitcoin-consensus -p rbitcoin-primitives -p rbitcoin-mempool --shard ${{ matrix.shard }}/8 --no-shuffle --cap-lints true --timeout 90 --baseline=skip
+        env: {CARGO_TARGET_DIR: target/dev}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: mutants-out-${{ matrix.shard }}, path: mutants.out/, if-no-files-found: ignore}
