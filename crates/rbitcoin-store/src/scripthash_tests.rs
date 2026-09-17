@@ -14,6 +14,25 @@ fn tmp() -> crate::testutil::TempDir {
     crate::testutil::TempDir::labeled("sh").expect("temp dir")
 }
 
+fn assert_no_l0_ovf_leftover(dir: &std::path::Path) {
+    let ovf = dir.join("scripthash.ovf");
+    for ent in std::fs::read_dir(&ovf).unwrap().flatten() {
+        let name = ent.file_name();
+        let s = name.to_string_lossy();
+        let stem = s
+            .strip_suffix(".idx")
+            .or_else(|| s.strip_suffix(".fuse8"))
+            .unwrap_or(s.as_ref());
+        if stem.len() == 6 && stem.chars().all(|c| c.is_ascii_digit()) {
+            let mphf = ovf.join(format!("{stem}.mphf"));
+            assert!(
+                mphf.is_file(),
+                "L0 leftover {s} after compact (no {stem}.mphf)"
+            );
+        }
+    }
+}
+
 fn four_shard_dir_table(dir: &std::path::Path) -> ScriptHashTable {
     let body_dir = dir.join("scripthash.body");
     std::fs::create_dir_all(&body_dir).unwrap();
@@ -1150,6 +1169,7 @@ fn compact_merges_two_sealed_global_ovf_files() {
             0,
             "L0 unlinked after promote"
         );
+        assert_no_l0_ovf_leftover(&dir);
         assert!(
             t.ovf_l1.lock().unwrap().is_some(),
             "compact promotes L1 MPHF"
