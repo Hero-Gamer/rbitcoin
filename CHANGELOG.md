@@ -281,6 +281,7 @@ before 1.0).
   `--net-permission-bind` (implicit flags, in/out, `--net-permission-relay` /
   `--net-permission-force-relay`). Operator `--trusted` / `--always-relay` / `--relay`
   stay global inbound knobs (not promoted from a CIDR/bind grant).
+  Headers-sync stall timeout uses session `noban` (CIDR or `--trusted`).
   `getpeerinfo.permissions` is per-peer. 0-value
   spendable outputs are `dust` (Libre still admits 1-sat). Forcerelay and
   `--always-relay` recent-rejects skip ATMP on the second send. Conf `net_permission_bind=`

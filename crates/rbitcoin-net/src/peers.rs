@@ -1429,7 +1429,6 @@ impl PeerHub {
             .values()
             .filter(|p| Self::is_preferred_download(p))
             .count();
-        let noban_all = self.noban.load(Ordering::Relaxed);
         for p in g.values() {
             if !p.sync_started.load(Ordering::Relaxed) {
                 continue;
@@ -1442,12 +1441,10 @@ impl PeerHub {
             if n_preferred.saturating_sub(stalling_pref as usize) < 1 {
                 continue;
             }
-            if noban_all {
+            if p.session_noban() {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
                 p.sync_started.store(false, Ordering::Relaxed);
                 p.headers_sync_timeout.store(0, Ordering::Relaxed);
-                // In-flight getheaders timed out; allow a new one
-                // (`p2p_initial_headers_sync` noban recipient).
                 let _ = p.take_awaiting_headers();
                 self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
             } else {
@@ -2618,8 +2615,20 @@ mod tests {
 
     #[test]
     fn noban_headers_timeout_clears_awaiting_so_a_new_getheaders_can_send() {
+        pin_noban_headers_timeout_keep(true);
+        pin_noban_headers_timeout_keep(false);
+    }
+
+    fn pin_noban_headers_timeout_keep(via_cidr: bool) {
         let hub = PeerHub::new();
-        hub.set_noban(true);
+        if via_cidr {
+            let mut t = crate::NetPermTable::default();
+            t.whitelist
+                .push(crate::parse_whitelist("noban@127.0.0.1").unwrap());
+            hub.set_net_perms(t);
+        } else {
+            hub.set_noban(true);
+        }
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
@@ -2630,6 +2639,10 @@ mod tests {
             false,
             PeerConnType::OutboundFullRelay,
         );
+        if via_cidr {
+            assert!(!hub.is_noban(), "CIDR noban must not set hub --trusted");
+            assert!(inbound.session_noban());
+        }
         let now = 1_700_000_000u64;
         let best = 1_231_006_505u64;
         assert!(hub.try_start_headers_sync(&inbound, now, best));
@@ -2638,8 +2651,12 @@ mod tests {
         let deadline = crate::chain::headers_download_timeout_secs(now, best);
         hub.set_mock_now(deadline + 1);
         assert!(
+            !inbound.stop.load(Ordering::SeqCst),
+            "noban stall must keep the TCP session (via_cidr={via_cidr})"
+        );
+        assert!(
             !inbound.is_sync_started(),
-            "noban timeout must end the stalling sync"
+            "noban timeout must end the stalling sync (via_cidr={via_cidr})"
         );
         assert!(
             !inbound.is_awaiting_headers(),
