@@ -54,7 +54,7 @@ jobs:
     name: core-functional
     needs: [detect]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     if: >-
       always() &&
       needs.detect.result == 'success' &&

@@ -25,6 +25,10 @@ run "listen maps to Bound to" \
   "2026-01-01T00:00:00Z INFO rbitcoin-node listening on 127.0.0.1:18444 (regtest)" \
   "Bound to 127.0.0.1:18444"
 
+run "0.0.0.0 listen maps to Bound to" \
+  "2026-01-01T00:00:00Z INFO rbitcoin-node listening on 0.0.0.0:18555 (regtest)" \
+  "Bound to 0.0.0.0:18555"
+
 run "p2p dial maps to Core trying v1 needle" \
   "2026-01-01T00:00:00Z DEBUG p2p: trying connection (outbound-full-relay) to 25.0.0.1:8333" \
   "trying v1 connection (outbound-full-relay) to 25.0.0.1:8333"
@@ -84,6 +88,26 @@ run "CLI InitError maps peer-timeout to Core peertimeout" \
 run "CLI InitError drops configuration error prefix (minchainwork)" \
   "Error: configuration error: Invalid minimum work specified (test), must be up to 64 hex digits" \
   "Error: Invalid minimum work specified (test), must be up to 64 hex digits"
+
+run "datadir flock maps rbitcoin to Bitcoin Core" \
+  "Error: Cannot obtain a lock on directory /tmp/dd. rbitcoin is probably already running." \
+  "Error: Cannot obtain a lock on directory /tmp/dd. Bitcoin Core is probably already running."
+
+run "net-permission-bind CIDR maps to Core -whitebind" \
+  "Error: Cannot resolve --net-permission-bind address: '127.0.0.1/10'" \
+  "Cannot resolve -whitebind address"
+
+run "net-permission-bind missing port maps to Core -whitebind" \
+  "Error: Need to specify a port with --net-permission-bind: '127.0.0.1'" \
+  "Need to specify a port with -whitebind"
+
+run "net-permission netmask maps to Core -whitelist" \
+  "Error: Invalid netmask specified in --net-permission: '127.0.0.1:230'" \
+  "Invalid netmask specified in -whitelist"
+
+run "net-permission-bind out maps to Core whitebind" \
+  "Error: --net-permission-bind may only be used for incoming connections (\"out\" was passed)" \
+  "whitebind may only be used for incoming connections"
 
 run "unmapped is empty" \
   "2026-01-01T00:00:00Z INFO something else" \
