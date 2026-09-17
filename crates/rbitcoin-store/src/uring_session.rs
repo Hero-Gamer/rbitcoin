@@ -1029,7 +1029,7 @@ impl UringSession {
 
 impl Drop for DrainOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = self.session.drain_all();
+        let _ = self.session.drain_all_inner(false);
     }
 }
 
@@ -1524,6 +1524,17 @@ mod tests {
                 other => panic!("expected undrained after hard cap, got {other:?}"),
             }
             assert!(session.is_poisoned());
+            drop(session);
+        });
+    }
+
+    #[test]
+    fn drain_guard_drop_with_leftover_pending_does_not_abort() {
+        let mut session = UringSession::try_open(32)
+            .unwrap_or_else(|_| UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool"));
+        session.pending.insert(1).unwrap();
+        with_drain_hard_cap(Duration::from_millis(200), || {
+            drop(session.drain_guard());
             drop(session);
         });
     }
