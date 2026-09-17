@@ -67,8 +67,7 @@ pub fn classify_v2_cmpct_peer(contents: &[u8]) -> CmpctPeerFrame {
     }
 }
 
-/// Core: prefilled indexes must decode in-range. Out-of-range is a
-/// malformed `cmpctblock` (`p2p_compactblocks` `test_invalid_cmpctblock_message`).
+/// Prefill indexes must decode in-range. Out-of-range is a malformed `cmpctblock`.
 pub fn prefilled_indexes_ok(hsi: &HeaderAndShortIds) -> bool {
     let total = hsi.short_ids.len().saturating_add(hsi.prefilled_txs.len());
     let mut last: Option<usize> = None;

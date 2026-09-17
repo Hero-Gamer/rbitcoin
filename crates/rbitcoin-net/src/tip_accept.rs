@@ -7,8 +7,9 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
@@ -17,6 +18,54 @@ pub(crate) const TIP_ACCEPT_THREAD_NAME: &str = "tip-accept";
 const QUEUE_CAP: usize = 8;
 
 type Job = Box<dyn FnOnce() + Send>;
+
+struct Inflight {
+    n: AtomicU32,
+    mu: Mutex<()>,
+    cv: Condvar,
+}
+
+fn inflight() -> &'static Inflight {
+    static I: OnceLock<Inflight> = OnceLock::new();
+    I.get_or_init(|| Inflight {
+        n: AtomicU32::new(0),
+        mu: Mutex::new(()),
+        cv: Condvar::new(),
+    })
+}
+
+fn begin_job() {
+    inflight().n.fetch_add(1, Ordering::SeqCst);
+}
+
+fn end_job() {
+    let i = inflight();
+    let prev = i.n.fetch_sub(1, Ordering::SeqCst);
+    if prev == 1 {
+        let _g = i.mu.lock().unwrap_or_else(|e| e.into_inner());
+        i.cv.notify_all();
+    }
+}
+
+struct InflightEnd;
+impl Drop for InflightEnd {
+    fn drop(&mut self) {
+        end_job();
+    }
+}
+
+/// Block until no tip-accept job is running. No-op on the lane itself
+/// (nested generate/RPC must not deadlock).
+pub(crate) fn wait_idle() {
+    if on_tip_accept_thread() {
+        return;
+    }
+    let i = inflight();
+    let mut g = i.mu.lock().unwrap_or_else(|e| e.into_inner());
+    while i.n.load(Ordering::SeqCst) > 0 {
+        g = i.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+}
 
 fn sender() -> SyncSender<Job> {
     static TX: OnceLock<SyncSender<Job>> = OnceLock::new();
@@ -51,7 +100,10 @@ pub(crate) fn run_on_tip_accept<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     crate::reactor::assert_not_reactor("tip-accept wait");
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let job = erase_lifetime(Box::new(move || {
-        let _ = tx.send(panic::catch_unwind(AssertUnwindSafe(f)));
+        begin_job();
+        let _end = InflightEnd;
+        let r = panic::catch_unwind(AssertUnwindSafe(f));
+        let _ = tx.send(r);
     }));
     sender().send(job).expect("tip-accept thread");
     match rx.recv().expect("tip-accept job") {
@@ -97,7 +149,10 @@ pub(crate) async fn run_on_tip_accept_async<R: Send>(f: impl FnOnce() -> R + Sen
     });
     let cell_w = Arc::clone(&cell);
     let job = erase_lifetime(Box::new(move || {
-        finish_cell(&cell_w, panic::catch_unwind(AssertUnwindSafe(f)));
+        begin_job();
+        let _end = InflightEnd;
+        let r = panic::catch_unwind(AssertUnwindSafe(f));
+        finish_cell(&cell_w, r);
     }));
     let mut job = job;
     loop {
@@ -133,6 +188,32 @@ mod tests {
         });
         assert!(panicked.is_err());
         assert_eq!(run_on_tip_accept(|| 2 + 2), 4);
+    }
+
+    #[test]
+    fn wait_idle_blocks_until_job_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            run_on_tip_accept(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx.recv().unwrap();
+        let waiter = thread::spawn(wait_idle);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !waiter.is_finished(),
+            "wait_idle must not return while a tip-accept job is running"
+        );
+        release_tx.send(()).unwrap();
+        waiter.join().expect("wait_idle");
+        worker.join().expect("job");
+        wait_idle();
     }
 
     #[tokio::test]
