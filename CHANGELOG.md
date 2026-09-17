@@ -32,8 +32,8 @@ before 1.0).
   packed tx, and per-vin `script_hash` / optional `create_fk`. Load uses stored
   hashes and one `Arc<Transaction>`. SH reindex and tip-entry purge batch
   Class A instead of per-vin `get_txout` / `chain_prevout`. Leftover schema 1
-  refuses — wipe `{datadir}/mempool/`. Packed size is not promised smaller
-  than bitcoin serialize (vin aux adds bytes).
+  converts to packed on open (vin aux empty; SH reindex batch-fills). Packed
+  size is not promised smaller than bitcoin serialize (vin aux adds bytes).
 
 - **Same-peer compact retry:** a second `cmpctblock` for a hash already in
   `pending_cmpct` does not take another BIP152 fill slot or send a second

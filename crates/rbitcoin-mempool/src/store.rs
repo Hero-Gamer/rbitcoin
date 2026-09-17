@@ -19,6 +19,7 @@
 
 use crate::error::MempoolError;
 use crate::packed::{decode_packed_live, encode_packed_live, PackedLive, VinAux};
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
 use std::fs::{self, File, OpenOptions};
@@ -46,6 +47,8 @@ const SLOTS_HEADER: usize = 16;
 const BODY_HEADER: usize = 16;
 /// Prefix before each packed live record in `mempool/tx.body` (min size).
 const BODY_TX_PREFIX: usize = 80;
+/// Schema 1 payload: `fee(8)‖weight(8)‖bitcoin-serialize`.
+const V1_BODY_PREFIX: usize = 16;
 
 const SLOT_FREE: u8 = 0;
 const SLOT_LIVE: u8 = 1;
@@ -110,12 +113,13 @@ impl Mempool {
         let slots_path = dir.join("slots");
         let body_path = dir.join("tx.body");
 
-        let (meta_file, generation, slot_cap, live_count) = open_or_init_meta(&meta_path)?;
+        let (meta_file, generation, slot_cap, live_count, meta_schema) =
+            open_or_init_meta(&meta_path)?;
         let (slots_file, slots) = open_or_init_slots(&slots_path, slot_cap)?;
         let (body_file, body) = open_or_init_body(&body_path)?;
         let body_persisted_len = body_logical_len(&body)? as u64;
 
-        Ok(Self {
+        let mut mp = Self {
             dir,
             meta_file,
             slots_file,
@@ -131,7 +135,16 @@ impl Mempool {
             mock_now_ms: None,
             last_persist_ms: 0,
             last_body_write_off: 0,
-        })
+        };
+        let body_schema = u16::from_le_bytes(mp.body[4..6].try_into().unwrap());
+        if body_schema == 1 {
+            mp.migrate_v1_to_packed()?;
+        } else if meta_schema == 1 || u16::from_le_bytes(mp.slots[4..6].try_into().unwrap()) == 1 {
+            mp.slots[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+            mp.body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+            mp.persist_slots_and_meta()?;
+        }
+        Ok(mp)
     }
 
     pub fn dir(&self) -> &Path {
@@ -379,6 +392,62 @@ impl Mempool {
         self.install_packed_images()?;
         self.clear_dirty();
         Ok((self.live_count, packed_len))
+    }
+
+    /// Recode leftover schema-1 `fee‖weight‖raw_tx` LIVE slots into packed schema 2.
+    ///
+    /// Same install as compact (tmp+rename). Vin aux is empty; SH reindex
+    /// batch-fills missing hashes. Schema other than 1/2 still refuses.
+    fn migrate_v1_to_packed(&mut self) -> Result<(), MempoolError> {
+        let logical = body_logical_len(&self.body)?;
+        let mut new_body = vec![0u8; BODY_HEADER];
+        new_body[0..4].copy_from_slice(&MEM_MAGIC);
+        new_body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+        let mut new_slots = vec![0u8; SLOTS_HEADER + (self.slot_cap as usize) * SLOT_REC];
+        new_slots[0..4].copy_from_slice(&MEM_MAGIC);
+        new_slots[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
+        new_slots[8..12].copy_from_slice(&self.slot_cap.to_le_bytes());
+
+        let mut next_slot = 0u32;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let body_len =
+                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
+            if body_off as usize + body_len > logical || body_len < V1_BODY_PREFIX {
+                return Err(MempoolError::Corrupt("v1 live slot body range"));
+            }
+            let start = body_off as usize;
+            let fee_sat = u64::from_le_bytes(self.body[start..start + 8].try_into().unwrap());
+            let weight = u64::from_le_bytes(self.body[start + 8..start + 16].try_into().unwrap());
+            let raw = &self.body[start + V1_BODY_PREFIX..start + body_len];
+            let tx: Transaction =
+                deserialize(raw).map_err(|_| MempoolError::Corrupt("v1 tx deserialize"))?;
+            let txid = tx.compute_txid();
+            let wtxid = tx.compute_wtxid();
+            let payload = encode_packed_live(&tx, &txid, &wtxid, fee_sat, weight, &[])?;
+            let new_off = new_body.len() as u64;
+            let plen = payload.len() as u32;
+            new_body.extend_from_slice(&payload);
+            let dst = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
+            new_slots[dst] = SLOT_LIVE;
+            new_slots[dst + 4..dst + 12].copy_from_slice(&new_off.to_le_bytes());
+            new_slots[dst + 12..dst + 16].copy_from_slice(&plen.to_le_bytes());
+            new_slots[dst + 16..dst + 48].copy_from_slice(txid.as_byte_array());
+            next_slot += 1;
+        }
+        let packed_len = new_body.len();
+        new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
+        self.body = new_body;
+        self.slots = new_slots;
+        self.live_count = next_slot;
+        self.install_packed_images()?;
+        self.clear_dirty();
+        rbitcoin_log::info!("mempool: converted schema 1 sidecar to packed (live={next_slot})");
+        Ok(())
     }
 
     /// Load all LIVE txs from slots/body for graph rebuild.
@@ -671,7 +740,15 @@ fn finish_pending_compact(dir: &Path) -> Result<(), MempoolError> {
     Ok(())
 }
 
-fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32), MempoolError> {
+fn accepted_schema(schema: u16) -> Result<u16, MempoolError> {
+    if schema == 1 || schema == MEM_SCHEMA {
+        Ok(schema)
+    } else {
+        Err(MempoolError::BadSchema(schema))
+    }
+}
+
+fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), MempoolError> {
     if path.exists() {
         let mut file = OpenOptions::new()
             .read(true)
@@ -684,17 +761,14 @@ fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32), MempoolError>
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
-        let schema = u16::from_le_bytes([buf[4], buf[5]]);
-        if schema != MEM_SCHEMA {
-            return Err(MempoolError::BadSchema(schema));
-        }
+        let schema = accepted_schema(u16::from_le_bytes([buf[4], buf[5]]))?;
         let generation = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let slot_cap = u32::from_le_bytes(buf[16..20].try_into().unwrap());
         let live_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
         if slot_cap == 0 {
             return Err(MempoolError::Corrupt("slot_cap zero"));
         }
-        Ok((file, generation, slot_cap, live_count))
+        Ok((file, generation, slot_cap, live_count, schema))
     } else {
         let mut file = OpenOptions::new()
             .read(true)
@@ -707,7 +781,7 @@ fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32), MempoolError>
         file.write_all(&buf)
             .map_err(|e| MempoolError::io(path, e))?;
         file.flush().map_err(|e| MempoolError::io(path, e))?;
-        Ok((file, 0, DEFAULT_SLOT_CAP, 0))
+        Ok((file, 0, DEFAULT_SLOT_CAP, 0, MEM_SCHEMA))
     }
 }
 
@@ -741,10 +815,7 @@ fn open_or_init_slots(path: &Path, slot_cap: u32) -> Result<(File, Vec<u8>), Mem
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
-        let schema = u16::from_le_bytes([buf[4], buf[5]]);
-        if schema != MEM_SCHEMA {
-            return Err(MempoolError::BadSchema(schema));
-        }
+        accepted_schema(u16::from_le_bytes([buf[4], buf[5]]))?;
         Ok((file, buf))
     } else {
         let mut file = OpenOptions::new()
@@ -787,10 +858,7 @@ fn open_or_init_body(path: &Path) -> Result<(File, Vec<u8>), MempoolError> {
         if buf[0..4] != MEM_MAGIC {
             return Err(MempoolError::BadMagic);
         }
-        let schema = u16::from_le_bytes([buf[4], buf[5]]);
-        if schema != MEM_SCHEMA {
-            return Err(MempoolError::BadSchema(schema));
-        }
+        accepted_schema(u16::from_le_bytes([buf[4], buf[5]]))?;
         let logical = body_logical_len(&buf)?;
         if logical > len {
             return Err(MempoolError::Corrupt("body logical past file"));
@@ -1276,28 +1344,101 @@ mod tests {
     }
 
     #[test]
-    fn leftover_schema_v1_is_refused() {
+    fn leftover_schema_v1_converts_on_open() {
+        use bitcoin::consensus::encode::serialize;
         let dir = tmp_dir();
         fs::create_dir_all(&dir).unwrap();
+        let tx = tiny_tx();
+        let raw = serialize(&tx);
+        let tid = tx.compute_txid();
+        let fee = 123u64;
+        let weight = 400u64;
         {
             let mut meta = [0u8; META_LEN];
-            write_meta_bytes(&mut meta, 0, 4, 0);
+            write_meta_bytes(&mut meta, 0, 4, 1);
             meta[4..6].copy_from_slice(&1u16.to_le_bytes());
             fs::write(dir.join("meta"), meta).unwrap();
             let mut slots = vec![0u8; SLOTS_HEADER + 4 * SLOT_REC];
             slots[0..4].copy_from_slice(&MEM_MAGIC);
             slots[4..6].copy_from_slice(&1u16.to_le_bytes());
+            slots[8..12].copy_from_slice(&4u32.to_le_bytes());
+            let off = SLOTS_HEADER;
+            slots[off] = SLOT_LIVE;
+            let body_off = BODY_HEADER as u64;
+            let body_len = (16 + raw.len()) as u32;
+            slots[off + 4..off + 12].copy_from_slice(&body_off.to_le_bytes());
+            slots[off + 12..off + 16].copy_from_slice(&body_len.to_le_bytes());
+            slots[off + 16..off + 48].copy_from_slice(tid.as_byte_array());
+            fs::write(dir.join("slots"), &slots).unwrap();
+            let mut body = vec![0u8; BODY_HEADER + body_len as usize];
+            body[0..4].copy_from_slice(&MEM_MAGIC);
+            body[4..6].copy_from_slice(&1u16.to_le_bytes());
+            body[8..16].copy_from_slice(&((BODY_HEADER + body_len as usize) as u64).to_le_bytes());
+            body[BODY_HEADER..BODY_HEADER + 8].copy_from_slice(&fee.to_le_bytes());
+            body[BODY_HEADER + 8..BODY_HEADER + 16].copy_from_slice(&weight.to_le_bytes());
+            body[BODY_HEADER + 16..].copy_from_slice(&raw);
+            fs::write(dir.join("tx.body"), &body).unwrap();
+        }
+        {
+            let mp = Mempool::open_or_create(&dir).expect("v1 leftover converts");
+            let live = mp.load_live_txs().unwrap();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].packed.fee_sat, fee);
+            assert_eq!(live[0].packed.weight, weight);
+            assert_eq!(live[0].packed.txid, tid);
+            assert_eq!(live[0].packed.wtxid, tx.compute_wtxid());
+            assert_eq!(serialize(&live[0].packed.tx), raw);
+            assert!(live[0]
+                .packed
+                .vins
+                .iter()
+                .all(|v| v.script_hash.is_none() && v.create_fk.is_none()));
+        }
+        let meta = fs::read(dir.join("meta")).unwrap();
+        assert_eq!(
+            &meta[4..6],
+            &MEM_SCHEMA.to_le_bytes(),
+            "meta stamped schema 2"
+        );
+        let body = fs::read(dir.join("tx.body")).unwrap();
+        assert_eq!(
+            &body[4..6],
+            &MEM_SCHEMA.to_le_bytes(),
+            "body stamped schema 2"
+        );
+        {
+            let mp = Mempool::open_or_create(&dir).unwrap();
+            let live = mp.load_live_txs().unwrap();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].packed.txid, tid);
+            assert_eq!(serialize(&live[0].packed.tx), raw);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftover_schema_unknown_is_refused() {
+        let dir = tmp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        {
+            let mut meta = [0u8; META_LEN];
+            write_meta_bytes(&mut meta, 0, 4, 0);
+            meta[4..6].copy_from_slice(&3u16.to_le_bytes());
+            fs::write(dir.join("meta"), meta).unwrap();
+            let mut slots = vec![0u8; SLOTS_HEADER + 4 * SLOT_REC];
+            slots[0..4].copy_from_slice(&MEM_MAGIC);
+            slots[4..6].copy_from_slice(&3u16.to_le_bytes());
             fs::write(dir.join("slots"), &slots).unwrap();
             let mut body = vec![0u8; BODY_HEADER];
             body[0..4].copy_from_slice(&MEM_MAGIC);
-            body[4..6].copy_from_slice(&1u16.to_le_bytes());
+            body[4..6].copy_from_slice(&3u16.to_le_bytes());
             body[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
             fs::write(dir.join("tx.body"), &body).unwrap();
         }
         match Mempool::open_or_create(&dir) {
-            Err(MempoolError::BadSchema(1)) => {}
-            Ok(_) => panic!("expected BadSchema(1), got Ok"),
-            Err(e) => panic!("expected BadSchema(1), got {e}"),
+            Err(MempoolError::BadSchema(3)) => {}
+            Ok(_) => panic!("expected BadSchema(3), got Ok"),
+            Err(e) => panic!("expected BadSchema(3), got {e}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -94,7 +94,7 @@ Private, **not** Class A. RAM graph is source of truth; files may lag.
 - **Order:** packed `tx.body` tail first, then LIVE slots, then meta. A crash after a grown body and before new slots loses admits; it does not claim LIVE ranges past durable body. Compact is tmp+rename of packed images.
 - **5 s admits:** `persist_due` (no fsync) from the tip-follow perf tick. Crash may lose ≤5 s of admits (relay re-fetch). Shutdown `flush` still generation-bumps and `sync_data`s.
 - **DEAD:** already-durable slots are one-record `pwrite`. An admit that never hit disk stays RAM-only (crash loses it). Do not dump the full slot table on strip — that would write LIVE rows whose body is still in the unpersisted tail.
-- **Leftover schema 1:** refuse. Wipe `{datadir}/mempool/` (Class A kept). See [`OPERATOR.md`](../OPERATOR.md).
+- **Leftover schema 1:** convert on open (recode LIVE payloads, tmp+rename like compact). Vin aux is empty; SH reindex batch-fills. Unknown schema still refuses — wipe `{datadir}/mempool/` (Class A kept). See [`OPERATOR.md`](../OPERATOR.md).
 
 ## Operator
 

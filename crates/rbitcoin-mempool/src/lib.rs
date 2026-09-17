@@ -15,7 +15,7 @@
 //! is an immediate one-record `pwrite` (not a full slot dump).
 //! [`ActiveMempool::flush`] bumps `G` and `sync_data`s sidecars. Crash may lose
 //! ≤5 s of admits; never LIVE slots past durable `tx.body`. Leftover schema 1
-//! **refuses** — wipe `{datadir}/mempool/` (Class A kept).
+//! converts to packed on open (vin aux empty; SH reindex batch-fills).
 //!
 //! Packed decode uses stored txid/wtxid (no SHA256d). Vin aux is hashed at
 //! admit from resolved prevouts. Compact copies packed payload ranges.
