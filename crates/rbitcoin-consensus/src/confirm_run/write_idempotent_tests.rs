@@ -1356,6 +1356,173 @@ fn fill_same_batch_abs_from_append_loc_ram() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Overlay slot already in Class A: structural must not meta-pread it.
+#[test]
+fn structural_same_batch_overlay_skips_meta_pread() {
+    use crate::block::structural_validate_spends;
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet};
+    use rbitcoin_store::{InputRecord, OutputRecord};
+    use std::sync::atomic::Ordering;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x32, 2),
+        vec![
+            OutputRecord::unspent(7, vec![0x51]),
+            OutputRecord::unspent(8, vec![0x52]),
+        ],
+    );
+    let child_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x33, 1),
+        vec![OutputRecord::unspent(5, vec![0x51])],
+    );
+    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let child_ins = vec![InputRecord {
+        prev_txid: [0x32; 32],
+        create_fk: Fk(1),
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[
+                (std::sync::Arc::clone(&parent_pin), parent_ins),
+                (std::sync::Arc::clone(&child_pin), child_ins),
+            ],
+            false,
+            &overlay,
+        )
+        .unwrap();
+    assert_eq!(fks, vec![Fk(1), Fk(2)]);
+
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x32; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(5),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1_300_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![coinbase, child],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        std::sync::Arc::clone(&parent_pin),
+        vec![0],
+        Some(false),
+        Some(loc[0].txout),
+        Vec::new(),
+    );
+    bp.set_spent_range_only(fks[0], loc[0].spent);
+
+    let spends = vec![([0x32u8; 32], 0u32, fks[1], fks[0], 0)];
+    let mut run = FkMap::default();
+    run.insert(fks[0], 1);
+    run.insert(fks[1], 1);
+    let params = ChainParams::regtest();
+    let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
+    let mut pending = OutPointSet::default();
+    let mut mtp = rbitcoin_query::U32Map::<u32>::default();
+    mtp.insert(0, 1_300_000_000);
+    let mut annotate = Vec::new();
+    let meta0 = q.confirm_stats().spend_meta_n.load(Ordering::Relaxed);
+    let ovl0 = q
+        .confirm_stats()
+        .spend_overlay_skip_n
+        .load(Ordering::Relaxed);
+    structural_validate_spends(
+        &q,
+        &block,
+        &ctx,
+        Some(&fks),
+        &spends,
+        0,
+        &mut pending,
+        &bp,
+        &mut mtp,
+        &run,
+        &mut annotate,
+    )
+    .expect("overlay spend is not durable-spent before tip");
+    let meta_n = q
+        .confirm_stats()
+        .spend_meta_n
+        .load(Ordering::Relaxed)
+        .saturating_sub(meta0);
+    let ovl_n = q
+        .confirm_stats()
+        .spend_overlay_skip_n
+        .load(Ordering::Relaxed)
+        .saturating_sub(ovl0);
+    assert_eq!(meta_n, 0, "overlay abs must not structural-pread");
+    assert_eq!(ovl_n, 1);
+    assert!(
+        annotate.is_empty(),
+        "Skip annotate job is a no-op write; omit it"
+    );
+    let (off, _) = q.store().tx_spent_range(fks[0]).unwrap();
+    let abs0 = rbitcoin_store::spent_abs(off, 0);
+    let abs1 = rbitcoin_store::spent_abs(off, 1);
+    let bulk = q
+        .store()
+        .get_spender_meta_at_abs_batch(&[abs0, abs1])
+        .unwrap();
+    assert_eq!(bulk[0].unwrap().0, fks[1]);
+    assert!(bulk[1].unwrap().0.is_null());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Mainnet 496: lookup TipOnly already covers the child; note stamps
 /// `keep_until = started_hi` and intervening writes must not drop loc.
 #[test]

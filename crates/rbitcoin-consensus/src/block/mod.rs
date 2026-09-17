@@ -1419,7 +1419,9 @@ pub(crate) fn structural_validate_spends(
     let mut durable_spent: HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>> =
         HashSet::with_hasher(Default::default());
     if !abs_jobs.is_empty() {
-        let loaded = structural_load_durable_spent(query, &abs_jobs, &height_by_id, tip, annotate)?;
+        let skip = overlay_meta_skip_map(spends, run_create_height);
+        let loaded =
+            structural_load_durable_spent(query, &abs_jobs, &height_by_id, tip, annotate, &skip)?;
         durable_spent = loaded.0;
         multi_list_ns = loaded.1;
         spent_strong_ns = loaded.2;
@@ -1459,6 +1461,52 @@ pub(crate) fn structural_validate_spends(
 type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32);
 type DurableSpentSet =
     std::collections::HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>>;
+type OverlayMetaSkip = std::collections::HashMap<
+    (u64, u32),
+    (rbitcoin_primitives::Fk, u32),
+    BuildHasherDefault<rbitcoin_query::OutPointHasher>,
+>;
+
+fn overlay_meta_skip_map(
+    spends: &[(
+        [u8; 32],
+        u32,
+        rbitcoin_primitives::Fk,
+        rbitcoin_primitives::Fk,
+        u32,
+    )],
+    run_create_height: &FkMap<u32>,
+) -> OverlayMetaSkip {
+    let mut n: std::collections::HashMap<
+        (u64, u32),
+        u32,
+        BuildHasherDefault<rbitcoin_query::OutPointHasher>,
+    > = std::collections::HashMap::with_hasher(Default::default());
+    let mut first: OverlayMetaSkip = std::collections::HashMap::with_hasher(Default::default());
+    for &(_, vout, sfk, cfk, vin) in spends {
+        if !run_create_height.contains_key(&cfk) {
+            continue;
+        }
+        let Some(id) = cfk.get() else {
+            continue;
+        };
+        let key = (id, vout);
+        *n.entry(key).or_insert(0) += 1;
+        first.entry(key).or_insert((sfk, vin));
+    }
+    first.retain(|k, _| n.get(k).copied() == Some(1));
+    first
+}
+
+fn overlay_meta_is_skip(
+    id: u64,
+    vout: u32,
+    sfk: rbitcoin_primitives::Fk,
+    vin: u32,
+    skip: &OverlayMetaSkip,
+) -> bool {
+    skip.get(&(id, vout)) == Some(&(sfk, vin))
+}
 
 type StructuralAbsHeights = (
     Vec<StructuralAbsJob>,
@@ -1516,9 +1564,25 @@ fn structural_load_durable_spent(
     height_by_id: &U64Map<u32>,
     tip: Option<u32>,
     annotate: &mut Vec<SpendAnnotateJob>,
+    skip: &OverlayMetaSkip,
 ) -> Result<(DurableSpentSet, u64, u64), ConsensusError> {
     use std::time::Instant;
-    let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a, _, _)| *a).collect();
+    let mut disk_jobs: Vec<StructuralAbsJob> = Vec::new();
+    let mut abs_offs: Vec<u64> = Vec::new();
+    let mut ovl_n = 0u64;
+    for &job in abs_jobs {
+        let (id, vout, abs, sfk, vin) = job;
+        if overlay_meta_is_skip(id, vout, sfk, vin, skip) {
+            ovl_n = ovl_n.saturating_add(1);
+            continue;
+        }
+        disk_jobs.push(job);
+        abs_offs.push(abs);
+    }
+    rbitcoin_query::note_confirm(&query.confirm_stats().spend_overlay_skip_n, ovl_n);
+    if abs_offs.is_empty() {
+        return Ok((DurableSpentSet::with_hasher(Default::default()), 0, 0));
+    }
     let meta_backend = rbitcoin_store::spend_meta_backend();
     let t_meta = Instant::now();
     let metas = query
@@ -1529,7 +1593,7 @@ fn structural_load_durable_spent(
     rbitcoin_query::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
     rbitcoin_query::note_confirm(&query.confirm_stats().spend_meta_n, abs_offs.len() as u64);
     let _ = meta_backend;
-    if metas.len() != abs_jobs.len() {
+    if metas.len() != disk_jobs.len() {
         return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta batch length",
         )));
@@ -1561,7 +1625,7 @@ fn structural_load_durable_spent(
         .collect();
     let mut durable_spent: DurableSpentSet = DurableSpentSet::with_hasher(Default::default());
     let mut multi_list_ns = 0u64;
-    for (i, &(id, vout, abs, sfk, vin)) in abs_jobs.iter().enumerate() {
+    for (i, &(id, vout, abs, sfk, vin)) in disk_jobs.iter().enumerate() {
         multi_list_ns = multi_list_ns.saturating_add(structural_apply_one_meta(
             query,
             metas[i],
@@ -2109,6 +2173,48 @@ fn is_anyone_can_spend(script: &Script) -> bool {
 }
 
 pub use rbitcoin_query::TxPrecompute;
+
+#[cfg(test)]
+mod overlay_meta_skip_tests {
+    use super::*;
+    use rbitcoin_primitives::Fk;
+
+    fn spends(rows: &[(u32, Fk, Fk, u32)]) -> Vec<([u8; 32], u32, Fk, Fk, u32)> {
+        rows.iter()
+            .map(|&(vout, sfk, cfk, vin)| ([0u8; 32], vout, sfk, cfk, vin))
+            .collect()
+    }
+
+    #[test]
+    fn overlay_meta_skip_omits_matching_abs() {
+        let mut run = FkMap::default();
+        run.insert(Fk(10), 5);
+        let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
+        let skip = overlay_meta_skip_map(&spends, &run);
+        assert!(overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 1, &skip));
+        assert!(!overlay_meta_is_skip(10, 1, Fk(11), 0, &skip));
+        assert!(!overlay_meta_is_skip(99, 0, Fk(11), 0, &skip));
+    }
+
+    #[test]
+    fn overlay_meta_skip_keeps_conflicting_spender_on_disk_list() {
+        let mut run = FkMap::default();
+        run.insert(Fk(10), 5);
+        let spends = spends(&[(0, Fk(11), Fk(10), 0), (0, Fk(12), Fk(10), 0)]);
+        let skip = overlay_meta_skip_map(&spends, &run);
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
+        assert!(!overlay_meta_is_skip(10, 0, Fk(12), 0, &skip));
+    }
+
+    #[test]
+    fn overlay_meta_skip_historical_create_stays_on_disk() {
+        let run = FkMap::default();
+        let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
+        let skip = overlay_meta_skip_map(&spends, &run);
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
+    }
+}
 
 #[cfg(test)]
 mod bip34_tests;
