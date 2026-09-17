@@ -45,6 +45,14 @@ before 1.0).
   one `wire_prep_parent_layout_and_load_ahead` pad covers load-ahead parent
   fill, already-archived plan=None annotate, and cold Class A denserels.
 
+- **Catalog journeys absorb resume / hub-reorg / Esplora HTTP leftovers:**
+  mature reconstruct pins `resume_work_path_after_tip` Class A after
+  disconnect; `reorg_same_height_then_multi_block_branch` pins competing-spend
+  multi-list (not `multi-spender`); live `esplora_broadcast` pins block
+  JSON/raw/status/txid, outspends, merkleblock-proof, and scripthash
+  info/summary/utxo/chain pages. Crate Esplora tests keep no-hub mempool/fees
+  and reconstruct meters.
+
 - **IBD plan allows BIP30 same-txid across headers in one wave:**
   `archive_plan_batch_from_wire` rejects duplicate txid only inside one
   block. Cross-header repeats (mainnet 91842/91880 vs 91812/91722) keep

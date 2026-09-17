@@ -1362,23 +1362,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Steps 8–11: txids, merkle-proof, outspends, scripthash stats/utxo/pages, mempool empty.
+    /// No-hub Esplora: empty mempool, flat fee estimates, POST /tx is 503.
+    /// Live `esplora_broadcast` always has a hub.
     #[tokio::test]
     async fn remaining_routes_fixture() {
-        use rbitcoin_store::script_hash;
-
         let (dir, q) = temp_query("remain");
-        let mut prev = Fk::NULL;
-        let mut parent_hash: Option<[u8; 32]> = None;
-        let mut hashes = Vec::new();
-        let mut coinbase_txids = Vec::new();
-        for h in 0..4u32 {
-            let (header, ta) = coinbase(h, prev, parent_hash);
-            parent_hash = Some(header.hash);
-            hashes.push(header.hash);
-            coinbase_txids.push(ta.tx.txid);
-            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-        }
+        let (header, ta) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &header, &[ta]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
         let handle = run_esplora(cfg, Arc::clone(&q), None, None)
@@ -1386,100 +1376,6 @@ mod tests {
             .expect("listen");
         let addr = handle.local_addr;
 
-        let hash0 = block_hash_hex(&hashes[0]);
-        let (st, body) = http_get(addr, &format!("/block/{hash0}/txids")).await;
-        assert_eq!(st, 200, "{body}");
-        let ids: Vec<String> = serde_json::from_str(&body).unwrap();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], block_hash_hex(&coinbase_txids[0]));
-
-        let (st, body) = http_get(addr, &format!("/block/{hash0}/txs")).await;
-        assert_eq!(st, 200, "{body}");
-        let txs: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(txs.len(), 1);
-        assert!(txs[0].get("txid").is_some());
-
-        // start not multiple of 25 → 400
-        let (st, _) = http_get(addr, &format!("/block/{hash0}/txs/1")).await;
-        assert_eq!(st, 400);
-
-        let txid0 = block_hash_hex(&coinbase_txids[0]);
-        let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkle-proof")).await;
-        assert_eq!(st, 200, "{body}");
-        let mp: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(mp["block_height"], 0);
-        assert_eq!(mp["pos"], 0);
-        assert!(mp.get("merkle").is_some());
-
-        let (st, body) = http_get(addr, &format!("/tx/{txid0}/outspend/0")).await;
-        assert_eq!(st, 200, "{body}");
-        let os: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(os["spent"], false);
-        assert!(
-            os.get("vin").is_none(),
-            "outspend vin is an explorer gap: {os}"
-        );
-
-        let (st, body) = http_get(addr, &format!("/tx/{txid0}/outspends")).await;
-        assert_eq!(st, 200, "{body}");
-        let oss: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(oss.len(), 1);
-
-        // Scripthash for OP_TRUE
-        let sh = script_hash(&[0x51]);
-        let sh_hex = block_hash_hex(&sh);
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}")).await;
-        assert_eq!(st, 200, "{body}");
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(info["chain_stats"]["tx_count"].as_u64().unwrap() >= 4);
-        assert!(info["chain_stats"]["funded_txo_count"].as_u64().unwrap() >= 4);
-
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/summary")).await;
-        assert_eq!(st, 200, "{body}");
-        let sum: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert!(!sum.is_empty());
-        assert!(sum[0].get("txid").is_some());
-        assert!(sum[0].get("value").is_some());
-        assert!(sum[0].get("height").is_some());
-        assert!(sum[0].get("time").is_some());
-
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/utxo")).await;
-        assert_eq!(st, 200, "{body}");
-        let utxos: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert!(!utxos.is_empty());
-
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/chain")).await;
-        assert_eq!(st, 200, "{body}");
-        let page1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert!(page1.len() <= 25);
-        assert!(!page1.is_empty());
-        // Newest first: tip coinbase first.
-        assert_eq!(page1[0]["status"]["block_height"], 3);
-
-        // Cursor uses Class A / history txids (fixture synthetic ids), not recomputed wire txids.
-        use rbitcoin_query::HistoryFilter;
-        let full = q
-            .scripthash_history_filtered(&sh, &HistoryFilter::esplora_chain_page(None))
-            .unwrap();
-        assert_eq!(full.len(), 4);
-        let after = full[0].txid;
-        let page2_items = q
-            .scripthash_history_filtered(&sh, &HistoryFilter::esplora_chain_page(Some(after)))
-            .unwrap();
-        assert_eq!(page2_items.len(), 3);
-        assert!(!page2_items.iter().any(|i| i.txid == after));
-        let last = block_hash_hex(&after);
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/chain/{last}")).await;
-        assert_eq!(st, 200, "{body}");
-        let page2: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(page2.len(), page2_items.len());
-
-        let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs")).await;
-        assert_eq!(st, 200, "{body}");
-        let combined: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert!(!combined.is_empty());
-
-        // No mempool hub: empty-ish mempool, fee estimates still 200, POST 503.
         let (st, body) = http_get(addr, "/mempool").await;
         assert_eq!(st, 200, "{body}");
         let mem: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1494,7 +1390,6 @@ mod tests {
             assert_eq!(fees[t].as_f64(), Some(1.0), "{t}: {body}");
         }
 
-        // POST /tx without hub
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let req = "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nab";
         stream.write_all(req.as_bytes()).await.unwrap();
@@ -1510,7 +1405,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P0 gaps: block JSON/raw/status/txid-index/blocks list, tx raw, merkleblock, mempool lists.
+    /// Reconstruct meters + no-hub empty mempool lists (HTTP JSON/raw/status ride
+    /// `esplora_broadcast_visible_in_rpc_and_electrum`).
     #[tokio::test]
     async fn block_raw_summary_status_and_mempool_routes() {
         use bitcoin::consensus::encode::deserialize;
@@ -1540,24 +1436,12 @@ mod tests {
         let h1 = block_hash_hex(&hashes[1]);
         let (st, body) = http_get(addr, &format!("/block/{h1}")).await;
         assert_eq!(st, 200, "block json {body}");
-        let bj: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(bj["height"], 1);
-        assert_eq!(bj["id"], h1);
-        assert_eq!(bj["tx_count"], 1);
-        assert!(bj["size"].as_u64().unwrap() > 80);
-        assert!(bj["weight"].as_u64().unwrap() > 0);
-        assert!(bj.get("difficulty").is_some());
-        assert!(bj.get("mediantime").is_some());
-        assert_eq!(bj["previousblockhash"], block_hash_hex(&hashes[0]));
         assert_eq!(
             q.sample_reset_reconstruct_archived(),
             0,
             "/block JSON uses stamped size/weight"
         );
-        assert!(bj["bits"].is_u64(), "Esplora bits is u32: {}", bj["bits"]);
-        assert_eq!(bj["bits"], 0x207fffff);
 
-        // Raw block binary (HTTP body after headers — use binary-aware read).
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let req =
             format!("GET /block/{h1}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
@@ -1574,39 +1458,12 @@ mod tests {
             "raw status"
         );
         let block: Block = deserialize(raw).expect("decode raw block");
-        // Fixture headers use lab hashes; wire block still has 1 coinbase.
         assert_eq!(block.txdata.len(), 1);
-        assert!(raw.len() > 80);
         assert!(
             q.sample_reset_reconstruct_archived() >= 1,
             "/block/:hash/raw must reconstruct wire"
         );
 
-        let (st, body) = http_get(addr, &format!("/block/{h1}/status")).await;
-        assert_eq!(st, 200, "{body}");
-        let stj: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(stj["in_best_chain"], true);
-        assert_eq!(stj["height"], 1);
-        assert_eq!(stj["next_best"], block_hash_hex(&hashes[2]));
-
-        let (st, body) = http_get(addr, &format!("/block/{h1}/txid/0")).await;
-        assert_eq!(st, 200, "{body}");
-        assert_eq!(body, block_hash_hex(&coinbase_txids[1]));
-        let (st, _) = http_get(addr, &format!("/block/{h1}/txid/9")).await;
-        assert_eq!(st, 404);
-
-        let (st, body) = http_get(addr, "/blocks").await;
-        assert_eq!(st, 200, "{body}");
-        let list: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(list.len(), 3);
-        assert_eq!(list[0]["height"], 2);
-        assert_eq!(list[2]["height"], 0);
-
-        let (st, body) = http_get(addr, "/blocks/1").await;
-        assert_eq!(st, 200, "{body}");
-        let list1: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(list1[0]["height"], 1);
-        assert_eq!(list1.len(), 2);
         let _ = q.sample_reset_reconstruct_archived();
         let (st, _) = http_get(addr, "/blocks").await;
         assert_eq!(st, 200);
@@ -1617,20 +1474,6 @@ mod tests {
         );
 
         let txid0 = block_hash_hex(&coinbase_txids[0]);
-        // Binary raw tx
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req =
-            format!("GET /tx/{txid0}/raw HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-        let raw_tx = &buf[sep + 4..];
-        let (st, hex_body) = http_get(addr, &format!("/tx/{txid0}/hex")).await;
-        assert_eq!(st, 200);
-        let hex_bytes = rbitcoin_primitives::hex_decode(&hex_body).unwrap();
-        assert_eq!(raw_tx, hex_bytes.as_slice());
-
         let _ = q.sample_reset_reconstruct_archived();
         let (st, body) = http_get(addr, &format!("/tx/{txid0}/merkleblock-proof")).await;
         assert_eq!(st, 200, "{body}");
@@ -1644,7 +1487,7 @@ mod tests {
         let mut matches = Vec::new();
         let mut indexes = Vec::new();
         mb.extract_matches(&mut matches, &mut indexes).unwrap();
-        assert_eq!(indexes, vec![0]); // coinbase at pos 0
+        assert_eq!(indexes, vec![0]);
         assert_eq!(matches.len(), 1);
         assert_eq!(
             matches[0],
