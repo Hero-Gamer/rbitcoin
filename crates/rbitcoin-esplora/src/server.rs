@@ -850,42 +850,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tip_endpoints_and_unknown_404() {
-        let (dir, q) = temp_query("tip");
-        let mut prev = Fk::NULL;
-        let mut parent_hash: Option<[u8; 32]> = None;
-        let mut tip_hash = [0u8; 32];
-        for h in 0..3u32 {
-            let (header, ta) = coinbase(h, prev, parent_hash);
-            parent_hash = Some(header.hash);
-            tip_hash = header.hash;
-            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-        }
-        assert_eq!(q.tip_height(), Some(Height(2)));
-
-        let q = Arc::new(q);
-        let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
-        let addr = handle.local_addr;
-
-        let (st, body) = http_get(addr, "/blocks/tip/height").await;
-        assert_eq!(st, 200, "height body={body}");
-        assert_eq!(body, "2");
-
-        let (st, body) = http_get(addr, "/blocks/tip/hash").await;
-        assert_eq!(st, 200, "hash body={body}");
-        assert_eq!(body, block_hash_hex(&tip_hash));
-        assert_eq!(body.len(), 64);
-
-        let (st, body) = http_get(addr, "/no/such/path").await;
-        assert_eq!(st, 404, "404 body={body}");
-        assert!(body.to_ascii_lowercase().contains("not found") || body.contains("Not Found"));
-
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
     async fn block_template_default_404() {
         let (dir, q) = temp_query("gbt-404");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -1012,6 +976,10 @@ mod tests {
             header_value(&raw, HDR_CHAIN_TIP).as_deref(),
             Some(tip.as_str())
         );
+
+        let (st, body) = http_get(addr, "/no/such/path").await;
+        assert_eq!(st, 404, "404 body={body}");
+        assert!(body.to_ascii_lowercase().contains("not found") || body.contains("Not Found"));
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -1251,117 +1219,6 @@ mod tests {
         assert!(parse_hash32("zz".repeat(32).as_str()).is_err());
     }
 
-    /// Phase A: block-height, header, tx hex, tx status on one fixture store.
-    #[tokio::test]
-    async fn block_and_tx_read_path() {
-        let (dir, q) = temp_query("block-tx");
-        let mut prev = Fk::NULL;
-        let mut parent_hash: Option<[u8; 32]> = None;
-        let mut hashes = Vec::new();
-        let mut coinbase_txids = Vec::new();
-        for h in 0..3u32 {
-            let (header, ta) = coinbase(h, prev, parent_hash);
-            parent_hash = Some(header.hash);
-            hashes.push(header.hash);
-            coinbase_txids.push(ta.tx.txid);
-            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-        }
-        assert_eq!(q.tip_height(), Some(Height(2)));
-
-        let q = Arc::new(q);
-        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
-        let addr = handle.local_addr;
-
-        // /block-height/1
-        let (st, body) = http_get(addr, "/block-height/1").await;
-        assert_eq!(st, 200, "block-height body={body}");
-        assert_eq!(body, block_hash_hex(&hashes[1]));
-
-        // missing height
-        let (st, _) = http_get(addr, "/block-height/99").await;
-        assert_eq!(st, 404);
-
-        // /block/:hash/header — 80 bytes → 160 hex chars
-        let hash_disp = block_hash_hex(&hashes[1]);
-        let (st, body) = http_get(addr, &format!("/block/{hash_disp}/header")).await;
-        assert_eq!(st, 200, "header body len={}", body.len());
-        assert_eq!(body.len(), 160);
-        // Matches Query wire encode.
-        let wire = q.wire_header_at_height(Height(1)).unwrap();
-        let expected = encode_header_hex(&wire).unwrap();
-        assert_eq!(body, expected);
-
-        // unknown hash
-        let miss = "ff".repeat(32);
-        let (st, _) = http_get(addr, &format!("/block/{miss}/header")).await;
-        assert_eq!(st, 404);
-
-        // /tx/:txid/hex
-        let txid_disp = block_hash_hex(&coinbase_txids[0]); // same display reverse helper
-        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}/hex")).await;
-        assert_eq!(st, 200, "tx hex body={body}");
-        assert!(!body.is_empty());
-        assert!(body.len() % 2 == 0);
-        let (fk, _) = q.get_tx_by_txid(&coinbase_txids[0]).unwrap().unwrap();
-        let raw = q.tx_wire_bytes(fk).unwrap();
-        assert_eq!(body, rbitcoin_primitives::hex_encode(raw));
-
-        // /tx/:txid/status
-        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}/status")).await;
-        assert_eq!(st, 200, "status body={body}");
-        let v: serde_json::Value = serde_json::from_str(&body).expect("status json");
-        assert_eq!(v["confirmed"], true);
-        assert_eq!(v["block_height"], 0);
-        assert_eq!(v["block_hash"], block_hash_hex(&hashes[0]));
-        assert!(v.get("block_time").is_some());
-
-        // /tx/:txid full projection (asm/type keys present)
-        let (st, body) = http_get(addr, &format!("/tx/{txid_disp}")).await;
-        assert_eq!(st, 200, "tx full body={body}");
-        let full: serde_json::Value = serde_json::from_str(&body).expect("tx json");
-        assert!(full.get("txid").is_some());
-        assert!(full.get("vin").is_some());
-        assert!(full.get("vout").is_some());
-        assert!(full.get("status").is_some());
-        assert!(full.get("size").is_some());
-        assert!(full.get("weight").is_some());
-        assert_eq!(full["fee"], 0); // coinbase
-        let v0 = &full["vout"][0];
-        assert!(v0.get("scriptpubkey").is_some());
-        assert!(v0.get("scriptpubkey_asm").is_some());
-        assert!(v0.get("scriptpubkey_type").is_some());
-        // OP_TRUE coinbase → unknown type, no address
-        assert_eq!(v0["scriptpubkey_type"], "unknown");
-        assert!(v0
-            .get("scriptpubkey_asm")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("OP_"));
-        let vin0 = &full["vin"][0];
-        assert_eq!(vin0["is_coinbase"], true);
-        assert!(vin0.get("scriptsig_asm").is_some());
-
-        // missing tx
-        let (st, _) = http_get(addr, &format!("/tx/{miss}/hex")).await;
-        assert_eq!(st, 404);
-        let (st, _) = http_get(addr, &format!("/tx/{miss}/status")).await;
-        assert_eq!(st, 404);
-        let (st, _) = http_get(addr, &format!("/tx/{miss}")).await;
-        assert_eq!(st, 404);
-
-        // status helper unit
-        let st_json = tx_status_json(&q, fk).unwrap();
-        assert_eq!(st_json["confirmed"], true);
-        assert_eq!(st_json["block_height"], 0);
-
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// No-hub Esplora: empty mempool, flat fee estimates, POST /tx is 503.
     /// Live `esplora_broadcast` always has a hub.
     #[tokio::test]
@@ -1407,6 +1264,7 @@ mod tests {
 
     /// Reconstruct meters + no-hub empty mempool lists (HTTP JSON/raw/status ride
     /// `esplora_broadcast_visible_in_rpc_and_electrum`).
+    #[allow(clippy::cognitive_complexity)] // meters + leftover header/height/status needles
     #[tokio::test]
     async fn block_raw_summary_status_and_mempool_routes() {
         use bitcoin::consensus::encode::deserialize;
@@ -1506,6 +1364,28 @@ mod tests {
         let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "[]");
+
+        let (st, body) = http_get(addr, "/block-height/1").await;
+        assert_eq!(st, 200, "block-height body={body}");
+        assert_eq!(body, block_hash_hex(&hashes[1]));
+        let (st, _) = http_get(addr, "/block-height/99").await;
+        assert_eq!(st, 404);
+
+        let hash_disp = block_hash_hex(&hashes[1]);
+        let (st, body) = http_get(addr, &format!("/block/{hash_disp}/header")).await;
+        assert_eq!(st, 200, "header body len={}", body.len());
+        assert_eq!(body.len(), 160);
+        let wire = q.wire_header_at_height(Height(1)).unwrap();
+        let expected = encode_header_hex(&wire).unwrap();
+        assert_eq!(body, expected);
+        let miss = "ff".repeat(32);
+        let (st, _) = http_get(addr, &format!("/block/{miss}/header")).await;
+        assert_eq!(st, 404);
+
+        let (fk, _) = q.get_tx_by_txid(&coinbase_txids[0]).unwrap().unwrap();
+        let st_json = tx_status_json(&q, fk).unwrap();
+        assert_eq!(st_json["confirmed"], true);
+        assert_eq!(st_json["block_height"], 0);
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
