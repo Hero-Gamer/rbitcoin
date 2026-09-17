@@ -1646,10 +1646,7 @@ fn fill_stamp_spent_hole_from_write_tls() {
     let id = fks[0].get().expect("fk");
     let ident = st.idents.get(&id).expect("ident");
     assert_eq!(ident.spent, None, "IBD stamp must not loc-by-fk");
-    assert_eq!(
-        q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(q.confirm_stats().fill_missing_n.load(Ordering::Relaxed), 0);
 
     q.set_lookup_started_hi(Some(133_433));
     q.note_write_create_loc(&fks, &loc, 360);
@@ -1825,10 +1822,7 @@ fn pin_creates_only_ibd_skeleton_miss_is_lookup_stage_miss() {
     let err = pin_for_wire_batch(&q, Some(&plan), &mut stamp, &[], &[], None)
         .expect_err("creates-only without range is lookup miss");
     let msg = format!("{err}");
-    assert!(
-        msg.contains("lookup stage miss"),
-        "unexpected err: {msg}"
-    );
+    assert!(msg.contains("lookup stage miss"), "unexpected err: {msg}");
     assert!(
         q.store().spent_range_batch_fks().is_empty(),
         "pin must not loc-by-fk to rescue a lookup miss"

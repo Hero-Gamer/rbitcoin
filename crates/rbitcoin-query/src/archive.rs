@@ -2194,10 +2194,7 @@ mod tests {
             "IBD stamp must not loc-by-fk for creates-only"
         );
         assert_eq!(plan.external_parents.get(&1).and_then(|p| p.spent), None);
-        assert_eq!(
-            q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(q.confirm_stats().fill_missing_n.load(Ordering::Relaxed), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
