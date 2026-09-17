@@ -988,6 +988,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    #[test]
+    fn stamp_does_not_bind_carried_fk_when_store_hash_differs() {
+        use crate::accept_and_connect_block;
+        use crate::regtest_pad::mine_empty_regtest;
+        use std::sync::atomic::Ordering;
+
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let genesis_fk = q
+            .get_header_by_hash(&genesis.block_hash().to_byte_array())
+            .unwrap()
+            .unwrap()
+            .0;
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let hash = b1.block_hash().to_byte_array();
+        let n_headers = q.store().headers.count();
+        let inflight = rbitcoin_query::InFlight::new();
+        let pipe = WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: &inflight,
+            skeleton: None,
+            carried_need: Vec::new(),
+            carried_header_fks: vec![genesis_fk],
+            carried_header_hashes: vec![hash],
+        };
+        let items = [(Height(1), Arc::new(b1), None)];
+        let _ = q
+            .confirm_stats()
+            .phase_prep_header_skip_n
+            .swap(0, Ordering::Relaxed);
+        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe))
+            .expect("dummy BQ fk still ensures");
+        assert_eq!(
+            q.confirm_stats()
+                .phase_prep_header_skip_n
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(q.store().headers.count() > n_headers);
+        assert_ne!(stamped.metas[0].header_fk, genesis_fk);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn stamp_rejects_carried_header_length_mismatch() {
+        use crate::accept_and_connect_block;
+        use crate::regtest_pad::mine_empty_regtest;
+
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let hash = b1.block_hash().to_byte_array();
+        let inflight = rbitcoin_query::InFlight::new();
+        let pipe = WireLoadPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+            in_flight: &inflight,
+            skeleton: None,
+            carried_need: Vec::new(),
+            carried_header_fks: vec![rbitcoin_primitives::Fk(1), rbitcoin_primitives::Fk(1)],
+            carried_header_hashes: vec![hash],
+        };
+        let items = [(Height(1), Arc::new(b1), None)];
+        match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe)) {
+            Err(ConsensusError::Store(StoreError::Corrupt("invariant: carried header length"))) => {
+            }
+            Err(e) => panic!("expected carried header length, got {e}"),
+            Ok(_) => panic!("expected carried header length, got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     fn empty_header_rec() -> HeaderRecord {
         HeaderRecord {
             prev_fk: rbitcoin_primitives::Fk::NULL,
