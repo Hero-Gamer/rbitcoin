@@ -81,9 +81,6 @@ fn apply_archive_plan(
     if plan.is_empty() {
         return Ok(ns);
     }
-    let blocks: Vec<&Block> = batch.wire_blocks.iter().map(|b| b.as_ref()).collect();
-    plan.fill_packed_ins_from_blocks(&blocks)
-        .map_err(ConsensusError::from)?;
     let t_take = Instant::now();
     let planned_fks = plan.planned_fks.clone();
     let packed_pins: Vec<rbitcoin_query::CreatePin> =

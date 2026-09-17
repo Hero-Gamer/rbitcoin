@@ -49,7 +49,7 @@ wire / body-queue
   → load / pin (BatchParents outs by known txout range only;
             IO: txout.body — NEVER head / loc / txid.body / inwit)
   → scripts (pure CPU — NEVER any store IO)
-  → Class A commit (if ArchiveWritePlan present; encode ins from Arc<Block> + SpendEdges)
+  → Class A commit (if ArchiveWritePlan present; encode plan packed ins filled at stamp)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
@@ -65,9 +65,11 @@ puts parent P on the load-batch skeleton, load stamp of a child spending P has
 **zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
 move `plan_batch` onto lookup.
 
-IBD stamp does not build `TxApply` / packed ins (`archive_plan_batch_from_wire`).
-SpendEdges + CreatePin survive freeze. Write encodes ins and Class A outs from
-`Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
+IBD stamp does not build `TxApply`. Packed ins are filled from the same plan
+edge walk (`archive_plan_batch_from_wire`). Empty ins at Class A commit is
+`Corrupt("invariant: packed ins empty at write")` — write does not refill from
+wire. SpendEdges + CreatePin survive freeze. Write encodes Class A
+outs from `Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
 the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 
 | Stage | Allowed IO | Forbidden |
@@ -78,10 +80,10 @@ the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 
 | Stage | Invariant | Soft path allowed? |
 |-------|-----------|--------------------|
-| Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (same-wave in-flight outs skip loc, miss OK; later-wave InFlight takes loc from the same `CreatePin` Arc write set at Class A, or skeleton TipOnly loc). Disk loc-by-fk only if pin loc is still unset | Missing → hard Err at stamp / pin contract. **No** `finish_archive_plan` `fill_missing` after stamp loc. Live InFlight pin + disk miss → leave spent unset (write fill / late `set_loc`); not `create.loc.count()` after the miss |
+| Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (same-wave in-flight outs skip loc, miss OK; later-wave InFlight takes loc from the same `CreatePin` Arc write set at Class A, or skeleton TipOnly loc). IBD (`skeleton = Some`) never loc-by-fk: pin loc unset leaves spent unset for write TLS. plan=None leftover still `fill_missing_parent_ranges` | Missing → hard Err at stamp / pin contract. **No** `finish_archive_plan` `fill_missing` after stamp loc. **No** IBD load `create.loc` |
 | Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (**engine fault**: requeue once, then halt IBD; never blacklist). Identity without loc range → `Corrupt("invariant: loc range missing after identity")`, not a miss |
 | io_uring harvest | TLS session fail-closed ([`io-modality.md`](./io-modality.md)) | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Ring-unavailable still pread-fallback |
-| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO). Later-wave InFlight loc comes from the CreatePin Arc (Class A `set_loc`); stamp disk loc-by-fk only if pin loc is still unset (miss is write fill, not a loc hole) | **No** loc cold outs on load; **no** `inwit` on pin |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO). Later-wave InFlight loc comes from the CreatePin Arc (Class A `set_loc`) | **No** loc cold outs on load; **no** `inwit` on pin; **no** IBD loc-by-fk |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup stamped archived parents; same-batch from append RAM loc; just-written from write-thread loc packs kept until write of the last height whose TipOnly had started at note (`lookup_started_hi`; `keep_until` never bumped; fill of that write already ran). Later-wave InFlight takes CreatePin loc set at Class A. Missing abs → `invariant:` | **No** write `create.loc` read |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |
@@ -162,13 +164,13 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `pin_for_wire_incomplete_outs_is_invariant_error` | `pin_for_wire_batch` incomplete outs → cold miss |
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
-| `write_ensure_stamps_spent_range_after_load_pin` / `pin_and_ensure_journey` / `fill_same_batch_abs_from_append_loc_ram` / `fill_just_written_survives_until_last_started_write` | load pin copies lookup spent range; missing stamp is Corrupt; same-batch abs from append RAM; just-written loc until write of last started height (no write loc pread) |
-| `fill_missing_parent_ranges_stamps_spent_idx_for_archived` / `inflight_hit_adopts_skeleton_loc` / `inflight_hit_skeleton_miss_fills_loc_by_fk` / `plan_inflight_skeleton_miss_fills_loc_by_fk` / `inflight_loc_batch_miss_on_live_pin_is_not_hole` / `inflight_loc_batch_miss_adopts_late_pin_loc` | lookup stamp carries spent range for TipOnly leftover; InFlight identity still takes skeleton loc; TipOnly miss still fills loc by fk; live pin + disk miss is not a loc hole |
+| `write_ensure_stamps_spent_range_after_load_pin` / `pin_and_ensure_journey` / `fill_same_batch_abs_from_append_loc_ram` / `fill_just_written_survives_until_last_started_write` / `fill_stamp_spent_hole_from_write_tls` / `pin_and_ensure_from_pin_loc_without_tls` | load pin copies lookup spent range; missing stamp is Corrupt; same-batch abs from append RAM; just-written loc until write of last started height; stamp spent hole filled by write TLS; pin loc after TLS prune (no write loc pread) |
+| `fill_missing_parent_ranges_stamps_spent_idx_for_archived` / `inflight_hit_adopts_skeleton_loc` / `inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc` / `plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc` / `inflight_hit_uses_pin_loc_without_disk` | leftover TipOnly still loc-fills archived spent; InFlight takes skeleton loc; IBD skeleton miss leaves spent unset (no loc-by-fk); pin loc binds without disk |
 | `spend_abs_jobs_unique_and_missing_is_corrupt` | pin arithmetic abs list; missing → Corrupt |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
 | `already_archived_schema13_pin_identity_tip_follow` | archive then `confirm_wire_run` plan=None + rapid tip accept |
 | `store_start_states_lookup_load_confirm` | S0 new Class A + S1 plan=None via lookup→load |
-| `plan_inflight_creates_only_fills_parent_body_range` | creates-only in_flight still stamps body_range for load denserels |
+| `plan_inflight_creates_only_fills_parent_body_range` / `plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill` / `pin_creates_only_ibd_skeleton_miss_is_lookup_stage_miss` | leftover creates-only still stamps body_range; IBD skeleton miss does not loc-fill; pin of that miss is lookup stage miss |
 | `optimistic_assemble_unstamped_parent_is_invariant` | Optimistic assemble: pin miss is lookup invariant, not head recover |
 | `parent_pin_stamp_take_from_plan_moves_maps` | S0 `take_from_plan` leaves `resolved` empty (no txid→fk invert) |
 | `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
