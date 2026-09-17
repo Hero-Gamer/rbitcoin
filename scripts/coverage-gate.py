@@ -2,7 +2,7 @@
 """Pass iff production LCOV is at least FLOOR_PCT (unrounded LH*100 >= LF*floor).
 
 llvm-cov hit counts jitter tens of lines on the same tree; a never-falls
-ratchet against master is not a stable gate. 91% is a fixed floor.
+ratchet against master is not a stable gate. 92% is a fixed floor.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
-FLOOR_PCT = 91
+FLOOR_PCT = 92
 
 
 def pct_display(lh: int, lf: int) -> str:

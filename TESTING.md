@@ -149,7 +149,7 @@ reads it; rustup users export it). Override coverage dir:
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 91%** (unrounded `LH*100 >= LF*91`). No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
+| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 92%** (unrounded `LH*100 >= LF*92`). No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
 Test modules (`*_tests.rs`, `/tests/`, `testutil.rs`, crate `rbitcoin-test`)
@@ -222,7 +222,7 @@ to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 2. Identify high-miss production files (largest `LF − LH`).
 3. Add or extend a **scenario** in `rbitcoin-test` or a unit test next to the
    shipped path that drives the real entry point.
-4. Re-run `./scripts/coverage.sh` until the ratio is **≥ 91%**.
+4. Re-run `./scripts/coverage.sh` until the ratio is **≥ 92%**.
 
 ## Structural lints, CRAP, Miri
 
@@ -235,7 +235,7 @@ complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
 |------|------------|----|
 | **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Required job `ast-grep` |
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). `--fail-above --threshold 30`; `.cargo-crap.toml` allowlists today's production CRAP>30 functions (remove a name when it scores ≤30). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`. No `--fail-regression` (llvm-cov coverage % jitters per function) |
-| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 91% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
+| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 92% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
