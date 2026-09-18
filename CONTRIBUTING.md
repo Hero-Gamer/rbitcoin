@@ -243,8 +243,9 @@ failed without digging into a monolithic job log.
 PR, commit per plan step, and open **one PR** per plan. They do **not** run
 the full workspace suite or coverage locally by default — they poll these
 Actions jobs to green. After merge they delete the local **and** remote topic
-branch and keep the session worktree. See [`AGENTS.md`](./AGENTS.md)
-(worktree + PR) and [`docs/how-we-plan.md`](./docs/how-we-plan.md).
+branch and keep the session worktree. Start at [`docs/ORIENT.md`](./docs/ORIENT.md).
+Ship commands: [`.agents/skills/ship-pr/SKILL.md`](./.agents/skills/ship-pr/SKILL.md).
+Planning: [`docs/how-we-plan.md`](./docs/how-we-plan.md).
 
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):
 

@@ -58,8 +58,8 @@ at an explicit rank with **Q-63+**.
 | **—** | Retired algo-review micro-opts | Reopen a named Q-id only with a mainnet profile that names the cost |
 | **—** | Headerless SH extent interiors | Uniform 4 KiB page records; ~0.2% density; schema bump |
 | **—** | Restore `rbtc-script-coord-*` | `ibd-confirm` publishes waves. No coordinator threads |
-| **—** | Flatten purpose-built io_uring machines | [`io-modality.md`](./io-modality.md): fix the machine |
-| **—** | Process pin FIFO / CreateResidency / ContigPark / archive sticky | Pins are plan/batch only. IBD is body-queue → lookup → load |
+| **—** | Flatten purpose-built io_uring machines | [`io-modality.md`](./io-modality.md): fix the machine; do not replace it with generic batched `pread`/`pwrite` without asking |
+| **—** | Large process-resident body, pin, or archive caches (FIFO, LRU, or sticky residency). Examples: process pin FIFO, CreateResidency, ContigPark, archive sticky | Pins are plan/batch only. IBD is body-queue → lookup → load |
 | **—** | `rbitcoin-bench` in default-members / musl / required CI | Optional host A/B. Not a packaging or coverage gate |
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Primitives only |
 | **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 92% |
@@ -122,8 +122,9 @@ checklist.
   (heap `fuse8=0`); SH BDZ3 occupancy is the same class (prefix map;
   `mphf_occ=` supers); BDZ `g` is FdOnly. Optional `sp_tweaks` leftover
   regenerate is not a Class A wipe.
-- **Meters:** instance `ConfirmStats` / session IO stats. No process-global
-  confirm meters, no TLS `test_take_*` probes.
+- **Meters:** instance `ConfirmStats` / session IO stats. Tests assert shipped
+  behavior via those stats or on-disk state, not thread-local hot-path IO
+  probes (example: `test_take_*`). No process-global confirm meters.
 - **Crate graph:** unused `pub` is forbidden; fuzz lives in `fuzz/`.
   Clippy: no workspace `allow` list ([`code-shape.md`](./code-shape.md)).
 - **Findings:** crashes → `docs/external_findings/` + named regression.

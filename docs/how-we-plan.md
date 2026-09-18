@@ -1,10 +1,11 @@
 # How we plan (agile / XP-style)
 
 This project plans and executes work as a sequence of **small vertical slices**,
-each sized for one **Red → Green → Refactor** cycle (see [AGENTS.md](../AGENTS.md)
-TDD section). Plans have **more steps** than a typical “phase 1 / phase 2”
-design doc; each step should leave the tree greener and the suite a little
-stronger.
+each sized for one **Red → Green → Refactor** turn. This file owns that
+cycle ([The cycle](#the-cycle-red--green--refactor)); [`AGENTS.md`](../AGENTS.md)
+keeps the one-line hard rule. Plans have **more steps** than a typical
+“phase 1 / phase 2” design doc; each step should leave the production path
+simpler and the suite a sharper pin.
 
 Influences: Extreme Programming (stories, planning game, small releases,
 TDD, continuous refactoring), INVEST stories, vertical slicing, YAGNI / simple
@@ -54,9 +55,10 @@ Not: “Refactor confirm_run,” “Add cache,” “Clean up store.”
 ### Tasks / plan steps (how we execute)
 
 A **plan step** is the unit an agent (or human) executes in one focused pass:
+one turn of [the cycle](#the-cycle-red--green--refactor).
 
 ```text
-Red (1–few failing tests) → Green (surgical code) → Refactor (integrate, still green)
+Red (1–few failing tests) → Green (surgical code) → Refactor (production and tests, still green)
 ```
 
 | Step is the right size when… | Step is too big when… |
@@ -155,7 +157,7 @@ two tiny ones). Do not stuff a full design into a single turn.
 
 ## Test strategy inside the plan
 
-Aligned with AGENTS.md TDD + suite speed:
+Aligned with [the cycle](#the-cycle-red--green--refactor) and suite speed:
 
 | Prefer for Red | When |
 |----------------|------|
@@ -181,30 +183,94 @@ as the inner loop ([`core-functional.md`](./core-functional.md)).
 
 ### Mid-plan gates vs plan-end gates
 
-Worktree, local tests, push URL, poll CI, musl-after-merge, after-merge
-cleanup: [`AGENTS.md`](../AGENTS.md). Suite speed and fixture size:
-[`TESTING.md`](../TESTING.md). A PR that cannot merge (`CONFLICTING` /
-`DIRTY` / behind master) **does not run test CI** — rebase, then poll
-(AGENTS.md **Mergeable first**). Fail-fast poll: [`AGENTS.md`](../AGENTS.md)
-(`./scripts/pr-checks-watch.sh --interest <job>` — do not `gh pr checks --watch`
-past a red job of interest).
+Worktree, local tests, push URL, poll CI, after-merge cleanup:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+Suite speed and fixture size: [`TESTING.md`](../TESTING.md). A PR that cannot
+merge (`CONFLICTING` / `DIRTY` / behind master) **does not run test CI** —
+rebase, then poll. Fail-fast poll:
+`./scripts/pr-checks-watch.sh --interest <job>` — do not `gh pr checks --watch`
+past a red job of interest.
 
 Do not call the plan done on a red PR. A plan that multiplies multi-second
 full-store opens is a bad plan even if slices are “vertical.”
 
 ---
 
-## Simple design under continuous refactor
+## The cycle: Red → Green → Refactor
 
-After Green, Refactor toward XP simple design (Beck):
+One step is one turn of the loop. The loop is what makes quality compound:
+Red pins behavior, so Green is safe to be crude; the pin makes Refactor safe;
+Refactor leaves the production path simpler and the suite sharper, so the
+next Red is easier to name and the next Green is smaller. Skip a phase and
+the loop degrades. No Red is coding to logs. No Refactor is one-offs that
+accrete. No **test** refactor is a slow suite full of brittle twins.
 
-1. Passes all tests  
-2. Reveals intention (names, stages, roles)  
-3. No duplication (one owner for the concept)  
-4. Fewest elements  
+### Red: name the contract
 
-YAGNI: do not add abstraction for a story two steps ahead. If the next step
-needs it, that step’s Red will force it — under green tests from prior steps.
+- One to a few failing tests. No production edit yet.
+- The test drives the **shipped** entry point and asserts an observable
+  (return value, store after reopen, peer / RPC / log line). It fails with the
+  same class of error the bug would produce, not a compile error.
+- Prefer extending a default [catalog](../TESTING.md#scenario-catalog) journey.
+  A unit belongs next to a pure helper. One pin per contract.
+- Watch it fail once. A test that never failed proves nothing.
+
+### Green: smallest change that passes
+
+- Surgical. Crude is allowed: a duplicated line, a hardcoded value, a one-off
+  branch. Reach green fast so Refactor happens under a passing suite.
+- Do not design ahead. YAGNI: if a later step needs the abstraction, that
+  step’s Red will force it, under green tests from this one.
+- Keep `--lib` compiling: wrap the old API, switch one caller, checkpoint
+  ([Keep the tree compiling](#keep-the-tree-compiling)).
+
+### Refactor: production **and** tests, under green
+
+This is where quality is made. Refactor changes structure, not behavior: the
+same tests pass before and after, minus duplicates you deleted. If you need a
+new assert to feel safe, that is the next step’s Red, not a silent change now.
+
+Target is XP simple design (Beck), in this order:
+
+1. Passes all tests
+2. Reveals intention (names, stage structs, named dispatch;
+   [`code-shape.md`](./code-shape.md))
+3. No duplication (one owner per concept; one production path)
+4. Fewest elements (drop the flag, parameter, or branch the tests now prove
+   unnecessary)
+
+Production moves: fold the one-off into the real shape; delete the dual path;
+move the helper to the crate that owns the concept; drop a `pub` nobody
+imports.
+
+Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
+
+- Lift guts asserts up to the journey once the journey hits the same shipped
+  path, then delete the twin unit.
+- Delete tests that pin implementation shape rather than behavior; they only
+  fight the next refactor.
+- Replace a `*_for_test` hook or hot-path probe with an instance stat or an
+  on-disk assert, then delete the hook.
+- Fold duplicate fixtures into the shared `testutil`; shrink N to the smallest
+  that still hits the branch.
+- Sharpen asserts (exact error string, state after reopen) so the pin is
+  stronger with fewer tests.
+
+Combinations that come up:
+
+| After Green | Refactor move |
+|-------------|---------------|
+| A unit drove a private helper; the journey now covers that path | Move the assert to the journey, delete the unit, inline or `pub(crate)` the helper |
+| Green added a second branch beside the old one | Collapse to one path and delete the old; the same test still passes |
+| Green needed a test-only hook on production | Assert the session/table stat or file state instead; delete the hook |
+| A new scenario re-mines a pad the journey already has | Reuse that journey’s pad; one open per binary |
+| Refactor exposed a missing pin | Name it as the next step’s Red |
+
+### Done means the loop closed
+
+A step is done when Red was seen failing, Green passes it, and Refactor left
+the suite green with fewer or sharper tests and a simpler production path.
+“Compiles” is not done. “Green but the one-off is still there” is not done.
 
 ---
 
@@ -249,6 +315,7 @@ Each step is independently green and shippable.
 | “Mega-PR” step list | More steps, smaller greens |
 | Spike disguised as implement | Named spike + follow-on story |
 | Green without refactor forever | Refactor phase required in the step template |
+| Refactor touches production only | Fold twin tests into the journey, delete hooks, share fixtures in the same phase |
 | Plan ignores test runtime | Explicit unit vs scenario choice per step |
 | Core functional as the default-CI Red | In-tree catalog journey; Core stays nightly |
 | Step done = “code compiles” | Step done = Red→Green→Refactor verify checklist |
@@ -271,8 +338,8 @@ not use it as the edit cycle.
 | `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
 
 `--tests` / multi-crate check is **Verify** at the end of a slice, not the
-inner loop. Full text of the cargo table: [`AGENTS.md`](../AGENTS.md)
-(Local tests).
+inner loop. Full cargo table:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
 ---
 
@@ -295,6 +362,8 @@ Before closing a step:
 - [ ] Red was observed failing once  
 - [ ] Green makes that test pass  
 - [ ] Refactor left all related tests green  
+- [ ] Refactor touched the tests too: twins folded into the journey, hooks deleted, fixtures shared  
+- [ ] Production one-offs from Green are gone (one path, one owner)  
 - [ ] No known red left for “later in the plan”  
 
 Before closing a **plan**:
@@ -312,4 +381,5 @@ Before closing a **plan**:
 - Extreme Programming: planning game, stories, small releases, TDD, refactoring  
 - Bill Wake — **INVEST** user stories  
 - Vertical story slicing (value through the stack, not layer-by-layer)  
-- Project: [AGENTS.md](../AGENTS.md) (TDD, worktree + PR)
+- Project: [AGENTS.md](../AGENTS.md) (change discipline) and
+  [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) (worktree + PR)

@@ -4,9 +4,9 @@ How we cut, tag, and publish `vX.Y.Z`. Operator snapshots (musl / Windows /
 Darwin) are [`.github/workflows/release.yml`](../.github/workflows/release.yml)
 on the tag. Byte-identity of those binaries:
 [`reproducible-builds.md`](./reproducible-builds.md). This file owns the
-**git / PR / branch** process and is the agent playbook (linked from
-[`AGENTS.md`](../AGENTS.md)). Do not keep a second copy under a harness
-skill directory.
+**git / PR / branch** process and is the only release playbook.
+[`.agents/skills/release/SKILL.md`](../.agents/skills/release/SKILL.md) points
+here. Do not copy this playbook into that skill.
 
 ---
 
@@ -121,8 +121,9 @@ Unlabeled non-ship PRs keep cargo gates only (detect=`dev`,
 
 ## Playbooks
 
-Worktree + HTTPS push + poll: [`AGENTS.md`](../AGENTS.md). Do not commit
-the bump on `master`. Do not merge a red PR.
+Worktree + HTTPS push + poll:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+Do not commit the bump on `master`. Do not merge a red PR.
 
 ### Minor (`do a minor release`)
 
