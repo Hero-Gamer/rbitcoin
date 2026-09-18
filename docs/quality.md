@@ -29,9 +29,7 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Local packages: RPC `submitpackage`, Esplora `POST /txs/package`, Electrum 1.6 `broadcast_package`. `protocol_max` is **1.6**; 1.7 `scriptpubkey.*` still missing. |
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
-| 5 | **Q-54** | ast-grep named-cap rules | One rule per easy-to-delete cap from [`ibd-memory.md`](./ibd-memory.md): `pending_blocks` 128, `held_bodies` 320, `MAX_SERVE_BLOCKS` 16, `follow_live` vs `max_outbound`. Each has `lint/ast-grep/fixtures/{good,bad}/`. Today **four** structural rules, **zero** cap rules. |
-| 6 | **Q-56** | Miri islands beyond primitives | `cfg(miri)` tests for FFI-free helpers (scriptnum, pack integers) that do not pull secp/store. Never workspace miri. Nightly `miri.yml` is still primitives-only (**Q-53**). |
-| 7 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
+| 5 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-68**.
@@ -65,6 +63,8 @@ at an explicit rank with **Q-63+**.
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Primitives only |
 | **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 92% |
 | **—** | ast-grep as a second clippy | Structural RSS/task-leak *shapes* only |
+| **Q-54** | ast-grep named-cap rules | Caps live in [`ibd-memory.md`](./ibd-memory.md) and production evict. Pinning `const = 128` is a second clippy. **Q-51** already owns shapes. |
+| **Q-56** | Miri islands beyond primitives | **Q-53** already Miri's primitives. Extra islands need an **R-10** peel of interpreter/store or a dual-path copy. Workspace miri already Won't-fix. |
 
 Coverage theater (chasing 100% lines), rewriting secp/rust-bitcoin/tokio
 “to reduce deps”, Core-complete RPC, and explorer-search APIs are also

@@ -2,7 +2,7 @@ id: detached-tokio-spawn
 language: rust
 severity: error
 message: Discarded tokio::spawn leaks a task; bind, JoinSet, or abort the JoinHandle.
-note: Allowed drops — msg_decode spawn_decode_then_with_err (Q-54), node SIGINT handler, rbitcoin-bench.
+note: Allowed drops — msg_decode spawn_decode_then_with_err, node SIGINT handler, rbitcoin-bench.
 rule:
   all:
     - any:

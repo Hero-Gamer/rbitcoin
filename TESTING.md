@@ -228,8 +228,9 @@ to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 
 These do **not** measure operator RSS ([`docs/ibd-memory.md`](./docs/ibd-memory.md)
 owns caps). They catch the *shapes* of unbounded heap / leaked tasks, untested
-complexity, and UB in pure code. Roadmap: [`docs/quality.md`](./docs/quality.md)
-**Q-51–Q-56**.
+complexity, and UB in pure code. Landed: **Q-51–Q-53**. Named-cap ast-grep and
+extra Miri islands are Won't-fix (**Q-54**, **Q-56**). Owner:
+[`docs/quality.md`](./docs/quality.md).
 
 | Tool | How to run | CI |
 |------|------------|----|

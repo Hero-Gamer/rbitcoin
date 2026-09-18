@@ -32,6 +32,11 @@ before 1.0).
 
 ### Changed
 
+- **Q-54 / Q-56 Won't-fix:** ast-grep named-cap rules and extra Miri
+  islands were leftover from the 2026-08-25 lint program. Caps stay in
+  [`docs/ibd-memory.md`](docs/ibd-memory.md); nightly Miri stays
+  primitives-only (**Q-53**). Pinning `const = 128` is a second clippy.
+
 - **Coverage LCOV floor 92%:** production `LH*100 >= LF*92` (was 91%). Master
   has held ~92.0–92.2% since 2026-09-16. Still no never-falls ratchet.
 
