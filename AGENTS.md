@@ -56,12 +56,11 @@ No production code change without a test that fails first. Docs, comments,
 and formatting need no tests. Do not open a mainnet datadir in the agent VM.
 Perf A/B is operator-host only.
 
-Red is a failing test only. Green is the smallest change that passes; a
-one-off may exist until Refactor. Refactor folds that one-off in while the
-suite is still green. Do not delete a large type and chase `dead_code`
-across crates: wrap the old API, switch one caller, delete the leftover in
-Refactor. Checkpoint when `--lib` is green.
-Planning: [`docs/how-we-plan.md`](docs/how-we-plan.md).
+One step is one Red → Green → Refactor turn. Refactor reshapes production
+**and** tests under a green suite: fold the one-off, delete the dual path,
+lift twin units into the journey, remove test hooks. Keep `--lib` compiling
+across the turn (wrap the old API, switch one caller, checkpoint).
+Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (The cycle).
 
 One production implementation at the lowest crate that owns the concept.
 Tests assert shipped behavior, not repo text
