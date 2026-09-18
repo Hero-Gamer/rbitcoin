@@ -1,0 +1,19 @@
+id: held-bodies-cap
+language: rust
+severity: error
+message: "HeldBodies::CAP must be 320 - see docs/ibd-memory.md Q-54"
+rule:
+  all:
+    - pattern: |
+        impl HeldBodies {
+          $$$
+          const CAP: $T = $VAL;
+          $$$
+        }
+    - not:
+        pattern: |
+          impl HeldBodies {
+            $$$
+            const CAP: $T = 320;
+            $$$
+          }

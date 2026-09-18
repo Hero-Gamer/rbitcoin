@@ -1,0 +1,9 @@
+id: serve-blocks-cap
+language: rust
+severity: error
+message: "MAX_SERVE_BLOCKS must be 16 - see docs/ibd-memory.md Q-54"
+rule:
+  all:
+    - pattern: "const MAX_SERVE_BLOCKS: $T = $VAL;"
+    - not:
+        pattern: "const MAX_SERVE_BLOCKS: $T = 16;"
