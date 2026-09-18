@@ -1,0 +1,9 @@
+id: follow-live-vs-max-outbound
+language: rust
+severity: error
+message: "stale_follow_needs_room must be follow_live >= max_outbound.max(1) - see docs/ibd-memory.md:61 Q-54"
+rule:
+  all:
+    - pattern: "fn stale_follow_needs_room($$$) -> bool { $$$ }"
+    - not:
+        pattern: "fn stale_follow_needs_room($$$) -> bool { $$$ $A >= $B.max(1) $$$ }"
