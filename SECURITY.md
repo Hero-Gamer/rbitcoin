@@ -6,9 +6,10 @@ and similar infrastructure—not a desktop GUI or end-user wallet.
 
 Until **1.0**, treat mainnet deployment as **early production / high-scrutiny**:
 on-disk format and APIs can still change (named refuse/wipe, not a silent
-wipe), and there is **no** long-term support SLA. **0.7.x** is the supported
-published line until 0.8 or 1.0. Occupied **0.6.x** stores refuse (wipe +
-IBD). Run signet first, then mainnet with monitoring. See
+wipe), and there is **no** long-term support SLA. In-tree is **0.7.99**
+(pre-0.8.0). **0.7.x** tags (0.7.0) are the supported published
+line until 0.8 or 1.0. Occupied **0.6.x** stores refuse (wipe + IBD).
+Run signet first, then mainnet with monitoring. See
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md)
 and [`OPERATOR.md`](./OPERATOR.md).
 
@@ -16,6 +17,7 @@ and [`OPERATOR.md`](./OPERATOR.md).
 
 | Version | Support |
 |---------|---------|
+| **0.7.99** (in-tree) | Untagged master toward **0.8.0**. Report against the git commit (and binary digest if you built musl static). |
 | **0.7.x** | Supported **published** line (0.7.0). Security-relevant fixes land here until **0.8** or **1.0**. No LTS. Report against the tag. |
 | **0.6.x** | Previous published line (0.6.0 / 0.6.1). Report against the tag. |
 | **0.5.x** | Previous published line (0.5.1 / 0.5.2). Report against the tag. |

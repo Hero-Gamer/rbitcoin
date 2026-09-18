@@ -9,9 +9,10 @@ index via `--sh-index`, default off; not a graphical block-explorer stack) — b
 around a **relational archive (Class A/B/C)** and a **pure-Rust
 consensus/script** path.
 
-> **0.7.0** is the current **named published** 0.x line (GitHub Release:
-> Linux musl + Windows CRT-static + Darwin aarch64). Patch line is **`v0.7.x`**.
-> Occupied **0.6.x** stores **refuse** — wipe the datadir and redo IBD.
+> **0.7.99** is the in-tree version (pre-**0.8.0**). Last published GitHub
+> Release tag is **0.7.0** (patch line **`v0.7.x`**: Linux musl + Windows
+> CRT-static + Darwin aarch64). Occupied **0.6.x** stores **refuse** — wipe
+> the datadir and redo IBD.
 > **Not 1.0:** schema can still refuse a named wipe ([`SCHEMA.md`](./SCHEMA.md),
 > [`OPERATOR.md`](./OPERATOR.md));
 > default mainnet **`--milestone 840000` skips historical script/sig checks**
@@ -23,7 +24,7 @@ consensus/script** path.
 | | |
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
-| **Version** | **0.7.0** — [`CHANGELOG.md`](./CHANGELOG.md) |
+| **Version** | **0.7.99** (pre-0.8.0) — [`CHANGELOG.md`](./CHANGELOG.md) |
 | **Platform** | **Linux musl** is the operator path. Windows / Darwin are published snapshots (no IoRing; Darwin not notarized) |
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.7.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
