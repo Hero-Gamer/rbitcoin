@@ -28,8 +28,9 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation. Labeled `test_runner` prints **72** (**66** inventory `run` / **201** skip; 19 `rpc-missing`, 17 `core-log`, 68 `no-wallet`; Core expands transport twins and `wallet_txn_*` flags). COMPAT leftovers are `rpc-dialect`, not `rpc-missing`. `run` must hit node production (not only shim argv / dummy `blk*.dat` / Core decode dialect). Next inventory `run`: recover to 71. `mempool_accept` stays skip (`policy-libre`). Unlabeled PRs stay cargo-only. Owner: [`core-functional.md`](./core-functional.md). |
 | 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Local packages: RPC `submitpackage`, Esplora `POST /txs/package`, Electrum 1.6 `broadcast_package`. `protocol_max` is **1.6**; 1.7 `scriptpubkey.*` still missing. |
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
-| 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. |
-| 5 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
+| 4 | **Q-56** | Miri islands: peel scriptnum + pack ints | Shipped `scriptnum` (encode/decode/is_minimal, width 4 and 5) and pack integers (CompactSize + ULEB128) live in `rbitcoin-primitives`. Interpreter/store wrap errors and delete local copies; mempool CompactSize uses the same owner. `cfg(miri)` extra loops on those fns (non-minimal, width 5, 5/9-byte CompactSize, ULEB truncated/overflow). Nightly `miri.yml` stays primitives-only (**Q-53**). Never `--workspace`. Forks that Miri a parallel copy do not close this. |
+| 5 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. Higher-row seam this cycle: **Q-56** (the four scriptnum helpers + store pack-ints, not the opcode `match`). |
+| 6 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-68**.
@@ -64,7 +65,6 @@ at an explicit rank with **Q-63+**.
 | **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 92% |
 | **—** | ast-grep as a second clippy | Structural RSS/task-leak *shapes* only |
 | **Q-54** | ast-grep named-cap rules | Caps live in [`ibd-memory.md`](./ibd-memory.md) and production evict. Pinning `const = 128` is a second clippy. **Q-51** already owns shapes. |
-| **Q-56** | Miri islands beyond primitives | **Q-53** already Miri's primitives. Extra islands need an **R-10** peel of interpreter/store or a dual-path copy. Workspace miri already Won't-fix. |
 
 Coverage theater (chasing 100% lines), rewriting secp/rust-bitcoin/tokio
 “to reduce deps”, Core-complete RPC, and explorer-search APIs are also
