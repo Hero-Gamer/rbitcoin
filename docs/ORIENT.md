@@ -16,8 +16,7 @@ Facts stay in the owner files in [`README.md`](./README.md). This page only rout
 `rbitcoin-cli` is the RPC client (primitives only).
 `rbitcoin-test` and `rbitcoin-bench` are harnesses, not the product graph.
 
-Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file exists
-([`.agents/skills/read-crate-agents/SKILL.md`](../.agents/skills/read-crate-agents/SKILL.md)).
+Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file exists.
 
 ## Read first
 

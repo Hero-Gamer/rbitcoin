@@ -181,13 +181,13 @@ as the inner loop ([`core-functional.md`](./core-functional.md)).
 
 ### Mid-plan gates vs plan-end gates
 
-Worktree, local tests, push URL, poll CI, musl-after-merge, after-merge
-cleanup: [`AGENTS.md`](../AGENTS.md). Suite speed and fixture size:
-[`TESTING.md`](../TESTING.md). A PR that cannot merge (`CONFLICTING` /
-`DIRTY` / behind master) **does not run test CI** — rebase, then poll
-(AGENTS.md **Mergeable first**). Fail-fast poll: [`AGENTS.md`](../AGENTS.md)
-(`./scripts/pr-checks-watch.sh --interest <job>` — do not `gh pr checks --watch`
-past a red job of interest).
+Worktree, local tests, push URL, poll CI, after-merge cleanup:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+Suite speed and fixture size: [`TESTING.md`](../TESTING.md). A PR that cannot
+merge (`CONFLICTING` / `DIRTY` / behind master) **does not run test CI** —
+rebase, then poll. Fail-fast poll:
+`./scripts/pr-checks-watch.sh --interest <job>` — do not `gh pr checks --watch`
+past a red job of interest.
 
 Do not call the plan done on a red PR. A plan that multiplies multi-second
 full-store opens is a bad plan even if slices are “vertical.”
@@ -271,8 +271,8 @@ not use it as the edit cycle.
 | `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
 
 `--tests` / multi-crate check is **Verify** at the end of a slice, not the
-inner loop. Full text of the cargo table: [`AGENTS.md`](../AGENTS.md)
-(Local tests).
+inner loop. Full cargo table:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
 ---
 
@@ -312,4 +312,5 @@ Before closing a **plan**:
 - Extreme Programming: planning game, stories, small releases, TDD, refactoring  
 - Bill Wake — **INVEST** user stories  
 - Vertical story slicing (value through the stack, not layer-by-layer)  
-- Project: [AGENTS.md](../AGENTS.md) (TDD, worktree + PR)
+- Project: [AGENTS.md](../AGENTS.md) (change discipline) and
+  [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) (worktree + PR)

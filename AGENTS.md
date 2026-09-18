@@ -20,7 +20,11 @@ Comments that restate what, why, or weird are a smell. Prefer names, types,
 and structure. Keep `//` only for an invariant, protocol rule, `SAFETY`, or
 library quirk. Crate and public rustdoc (`//!` / `///`) is not this rule.
 Full text: [`CONTRIBUTING.md`](CONTRIBUTING.md) principle 7.
-Control flow and composition: principle 10 and [`docs/code-shape.md`](docs/code-shape.md).
+
+Prefer composition (has-a) over inheritance; avoid tall trees. Build
+immutable structures once, then compose them. If a map needs extra fields,
+wrap it on read rather than mutating members in place.
+Control flow: principle 10 and [`docs/code-shape.md`](docs/code-shape.md).
 
 ## Store and IBD
 
