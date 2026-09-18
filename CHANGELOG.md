@@ -11,6 +11,9 @@ before 1.0).
 
 ### Added
 
+- **Q-56 Miri islands beyond primitives:** `scriptnum` (encode/decode/is_minimal) + `CompactSize` + `ULEB128` peeled into `rbitcoin-primitives` (FFI-free, 0 deps). Adds `cfg(miri)` islands (1000-range scriptnum, 0..10000 compact) so `cargo +nightly miri test -p rbitcoin-primitives` works. Never `--workspace` miri. R-10 peel allowed.
+
+
 - **Wallet-protocol leftovers:** Electrum **1.6** `blockchain.transaction.broadcast_package`
   (local `accept_package`) and `mempool.get_info`; `protocol_max` **1.6** with
   1.6 `block.headers` as a list. Electrum **1.7** `blockchain.outpoint.*`.
