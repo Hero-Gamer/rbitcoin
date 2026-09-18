@@ -22,12 +22,17 @@ Releases (tag / `vX.Y.x` / `.99`): [`releases.md`](./releases.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
 quality backlog).
 
+Agent task router (not a second fact index): [`ORIENT.md`](./ORIENT.md).
+Process playbooks: [`.agents/skills/`](../.agents/skills/). Do not copy them
+into `AGENTS.md`.
+
 ---
 
 ## `docs/` (this directory)
 
 | Doc | Owns |
 |-----|------|
+| [`ORIENT.md`](./ORIENT.md) | Agent task router: crate graph and read-first links. Not a second index of facts. |
 | [`architecture.md`](./architecture.md) | Why this node is different (Core / Fulcrum contrasts). No stage-IO table copy. |
 | [`concurrency.md`](./concurrency.md) | Writer roles, publish order, body-queue, pins. Links invariants for leftover union. |
 | [`invariants.md`](./invariants.md) | Confirm stage IO (the **only** copy), leftover union, store start states S0–S4, no silent fallbacks. |
