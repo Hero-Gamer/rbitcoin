@@ -5,16 +5,17 @@
 Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
 IBD, tip follow, block/tx relay (tip mode), optional **Core-class JSON-RPC**, and
 in-process **Electrum + optional Esplora REST for wallet clients** (scripthash
-index via `--shindex`, default off; not a graphical block-explorer stack) — built
+index via `--sh-index`, default off; not a graphical block-explorer stack) — built
 around a **relational archive (Class A/B/C)** and a **pure-Rust
 consensus/script** path.
 
-> **0.6.99** is the in-tree version (pre-**0.7.0**). Last published GitHub
-> Release tag is **0.6.1** (patch line **`v0.6.x`**: Linux musl + Windows
-> CRT-static + Darwin aarch64). **Not 1.0:** schema can still refuse a named
-> wipe ([`SCHEMA.md`](./SCHEMA.md), [`OPERATOR.md`](./OPERATOR.md));
+> **0.7.0** is the current **named published** 0.x line (GitHub Release:
+> Linux musl + Windows CRT-static + Darwin aarch64). Patch line is **`v0.7.x`**.
+> Occupied **0.6.x** stores **refuse** — wipe the datadir and redo IBD.
+> **Not 1.0:** schema can still refuse a named wipe ([`SCHEMA.md`](./SCHEMA.md),
+> [`OPERATOR.md`](./OPERATOR.md));
 > default mainnet **`--milestone 840000` skips historical script/sig checks**
-> (`--milestone 0` is full scripts); Electrum/Esplora need **`--shindex`**
+> (`--milestone 0` is full scripts); Electrum/Esplora need **`--sh-index`**
 > (default off) after tip. Run **signet first**, then mainnet with monitoring.
 > Report security issues privately: [`SECURITY.md`](./SECURITY.md). Runbook:
 > [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
@@ -22,9 +23,9 @@ consensus/script** path.
 | | |
 |--|--|
 | **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
-| **Version** | **0.6.99** (pre-0.7.0) — [`CHANGELOG.md`](./CHANGELOG.md) |
+| **Version** | **0.7.0** — [`CHANGELOG.md`](./CHANGELOG.md) |
 | **Platform** | **Linux musl** is the operator path. Windows / Darwin are published snapshots (no IoRing; Darwin not notarized) |
-| **Security** | [`SECURITY.md`](./SECURITY.md) — **0.6.x** supported published line; no LTS until 1.0 |
+| **Security** | [`SECURITY.md`](./SECURITY.md) — **0.7.x** supported published line; no LTS until 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
 | **Coverage** | Live production-file LCOV (badge; last green `master` `coverage` job). Every PR **must not drop** that ratio. Highest published line coverage among bitcoin full nodes — [`TESTING.md`](./TESTING.md) |
@@ -36,7 +37,7 @@ backends are **external indexers** of another node. rbitcoin does neither:
 **no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
 - **~200 GiB** hot pin/annotate set (schema 17); **~700 GiB** with cold `inwit` —
-  census in [`SCHEMA.md`](./SCHEMA.md), `--shindex` costs in [`OPERATOR.md`](./OPERATOR.md)
+  census in [`SCHEMA.md`](./SCHEMA.md), `--sh-index` costs in [`OPERATOR.md`](./OPERATOR.md)
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
 - **Modest RAM** during sync — no multi‑GiB `dbcache` pause
 - **Pure-Rust** consensus/scripts (**no** `libbitcoinconsensus`)
@@ -50,7 +51,7 @@ Product surface: [`COMPAT.md`](./COMPAT.md). RPC subset: [`docs/rpc.md`](./docs/
 
 Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash,
 Electrum, Esplora REST, libre mempool) for the **server-side / wallet-client
-backend** role. **0.6 mainnet** is early production / high-scrutiny — not a
+backend** role. **0.7 mainnet** is early production / high-scrutiny — not a
 Core or Fulcrum replacement, not a soak badge. Run **signet first**, then
 mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). First hour on
 regtest (mine → Electrum → Esplora): [`OPERATOR.md`](./OPERATOR.md#first-hour-regtest).

@@ -1,13 +1,13 @@
 # Experimental mainnet runbook
 
-**Status:** **0.6.99** (pre-0.7.0) is lab-to-operator: **early production / high-scrutiny**,
+**Status:** **0.7.0** is lab-to-operator: **early production / high-scrutiny**,
 not a soak-certified badge. **Not** 1.0. **Not** a Bitcoin Core or Fulcrum
 replacement. Default `--milestone 840000` skips historical script/sig checks.
 Schema can still refuse a named index wipe ([`SCHEMA.md`](../SCHEMA.md)).
 Design overview: [`architecture.md`](./architecture.md).
 
 This node can perform multi-peer IBD, tip follow, Electrum (post-tip,
-`--shindex`), and Libre-class mempool participation. Treat consensus and ops
+`--sh-index`), and Libre-class mempool participation. Treat consensus and ops
 as **under active hardening**. Completing any particular full mainnet IBD is
 an **operator-side** job and is **not** a packaging gate — resume catch-up on
 the same datadir until tip, then run tip follow with monitoring before
@@ -136,7 +136,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB**; **scripts verified on accept** |
 | Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=14`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=14 · scriptq=4 · writeq=14 |
-| Not Core/Fulcrum | No production SLA; 0.6.99 is high-scrutiny 0.x; schema unstable until 1.0; reindex on incompatible layout changes |
+| Not Core/Fulcrum | No production SLA; 0.7.0 is high-scrutiny 0.x; schema unstable until 1.0; occupied 0.6.x stores refuse (wipe + IBD) |
 
 ## Related docs
 
