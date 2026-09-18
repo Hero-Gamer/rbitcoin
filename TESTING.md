@@ -496,7 +496,3 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/core-functional/init-submodule.sh
 ./scripts/core-functional/sync-core-fixtures.sh --check
 ```
-
-## Fault injectors
-
-Optional `integration-testing` cargo feature on crates that need crash points (e.g. mid-finalize). Off by default in release builds used for production packaging; **on** in CI test builds when needed for coverage.
