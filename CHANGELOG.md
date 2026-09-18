@@ -9,6 +9,44 @@ before 1.0).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-18
+
+Named published **0.7** line. **Not 1.0.** Patch branch is `v0.7.x`. Schema 24
+is still bumpable (named refuse/wipe, no silent wipe). Occupied **0.6.x**
+(schema 20) stores **refuse** — wipe the datadir and redo IBD. Default mainnet
+`--milestone 840000` skips historical script/sig checks (`--milestone 0` is
+full scripts). `--sh-index` default off. BIP324 v2-only. GitHub Release: Linux
+musl (operator) + Windows CRT-static PE + Darwin aarch64.
+
+### Highlights
+
+- **Wipe 0.6.x stores:** schema **24** refuses occupied schema-20 Class A
+  (`wipe datadir and redo IBD`). Do not open a populated 0.6.x datadir in
+  place. Empty 0.6 indexes rewrite `meta`.
+- **Faster IBD:** loc rides the InFlight pin (load never loc-by-fk); body-queue
+  `header_fk` skips header ensure; tip+1 hole racing by drain time; sequential
+  `header.body` size/weight; BIP30 same-txid across a load wave.
+- **Smaller store:** schema 22 `create.loc` + `inwit.loc` (no three Class A
+  `*.idx`); compact txout amounts; sealed fuse8 + SH occupancy mmap (heap
+  `fuse8=` / `mphf_occ=` only).
+- **Mempool persist:** packed schema 2 — 5 s dirty tail, one-record DEAD
+  `pwrite`, no full `tx.body` rewrite on block strip. Leftover schema 1
+  converts on open.
+- **Frigate silent payments:** Electrum `blockchain.silentpayments.subscribe`
+  (session scan key) plus `--sp-tweaks` / `silentpayments.unsubscribe`.
+- **Wallet protocols:** Electrum **1.6** (`broadcast_package`, `mempool.get_info`,
+  `outpoint.*`) and **1.7** leftovers; cheap Esplora `/blocks` from stored
+  size/weight (schema 24).
+- **Operator CLI / RPC:** kebab-only (`--sh-index`, `--sp-tweaks`,
+  `--rpc-listen`); TCP auth is Bearer `{datadir}/rpc.token` (no `--rpcuser` /
+  `.cookie`).
+- **Testing:** catalog journeys absorb leftover twins; Core functional `run` is
+  production-only; live P2P IBD in default CI; production LCOV floor **92%**.
+- **CRAP:** required `coverage` runs `cargo crap --fail-above 30` with a chewed
+  allowlist (P2P / IBD / RPC / store extracts).
+- **Windows:** positional IO on IOCP handles no longer heap-corrupts on
+  seal-roll / query smoke.
+
 ### Added
 
 - **Wallet-protocol leftovers:** Electrum **1.6** `blockchain.transaction.broadcast_package`

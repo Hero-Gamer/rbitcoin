@@ -35,8 +35,9 @@ and inserts an empty `### Highlights`. The ship PR **writes those bullets**
 platform blurb + Highlights + a pointer at CHANGELOG. `release.yml` calls
 that script. Do not dump Unreleased into the GitHub Release.
 
-Existing line: **`v0.6.x`** (latest tag `v0.6.1`). Next minor from
-today’s `0.6.99` is **0.7.0**, then **`v0.7.x`**, then master **0.7.99**.
+Existing line: **`v0.7.x`** (this ship is **0.7.0**). Previous published line
+is **`v0.6.x`** (tags `v0.6.0`–`v0.6.1`). After merge, master becomes
+**0.7.99** toward **0.8.0**.
 
 ---
 
