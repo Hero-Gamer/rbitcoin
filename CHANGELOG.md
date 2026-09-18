@@ -32,6 +32,12 @@ before 1.0).
 
 ### Changed
 
+- **Q-54 Won't-fix:** ast-grep named-cap rules. Caps stay in
+  [`docs/ibd-memory.md`](docs/ibd-memory.md) and production evict.
+  Pinning `const = 128` is a second clippy. **Q-51** already owns
+  shapes. **Q-56** stays Open: peel shipped scriptnum + pack-ints into
+  primitives so Miri runs the functions confirm/store call.
+
 - **Coverage LCOV floor 92%:** production `LH*100 >= LF*92` (was 91%). Master
   has held ~92.0–92.2% since 2026-09-16. Still no never-falls ratchet.
 
