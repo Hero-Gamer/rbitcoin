@@ -62,7 +62,7 @@ jobs:
       # Required before CodeQL init for Rust: extractor needs rustup + cargo.
       - name: Install Rust toolchain
         if: matrix.language == 'rust'
-        uses: dtolnay/rust-toolchain@1.95.0 # nixpkgs/crane rustc pin — not Dependabot
+        uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
