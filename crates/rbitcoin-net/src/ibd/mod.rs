@@ -110,7 +110,7 @@ pub fn rehydrate_block_queue_residue(hub: &ChainHub) -> Result<usize, String> {
 
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
-/// Max concurrent getdata peers for one tip-hole hash.
+/// Max concurrent getdata peers for **tip+1** (later contiguous holes get 1).
 ///
 /// Tip+1 freezes confirm while densify can run ahead; race enough peers so a
 /// single slow peer cannot pin hole=1 for minutes (mainnet: tip stuck with
