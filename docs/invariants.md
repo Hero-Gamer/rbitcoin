@@ -20,7 +20,10 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 | **Format migrate** | Occupied 22 rewrites `create.loc.ovf` 12 B→16 B; occupied 23 rewrites `header.body` 88 B→96 B; `meta` to live `SCHEMA_VERSION`. Leftover fuse8 v1 / flat idx / Shared SH body / Paged pack8 **refuse** | Soft migrate (tmp+rename) or explicit wipe/rebuild |
 | **API / product** | RPC body from store; Electrum mempool after chain; compact → getdata | Keep |
 
-**Killed dual paths (do not reintroduce):** soft spentness recovery for wrong/missing
+**One path.** Do not reintroduce a silent colder alternate when lookup or load
+was supposed to guarantee the fact. Test-only adapters stay in `*_testutil`;
+do not grow production APIs around fixture shapes.
+**Killed dual paths (examples, not a name list to police):** soft spentness recovery for wrong/missing
 pin identity; unpinned wire-corrected create_fk spentness; load-stage `txid.body`
 identity fill after lookup promised stamp; `ColdPinMode` Allow/Forbid cold denserels
 split on load (load is range **outs** only); denserels-as-spender-abs (schema 22

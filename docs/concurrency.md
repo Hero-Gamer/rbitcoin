@@ -82,7 +82,7 @@ spend annotations.
 
 | Mechanism | What it replaces |
 |-----------|------------------|
-| Capacity grow (`TableFile`) | No map epochs; fallocate/`set_len` only; readers use published HWM (Acquire) |
+| Capacity grow (`TableFile`) | Grow with fallocate/`set_len` and a published HWM. Do not introduce remap-epoch schemes (retired example: map epochs). Readers use the published HWM (Acquire) |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
 | `tx.head` insert | **Sole writer**: page-coalesced `pwrite` + `published_len` Release (no CAS, no CPU fence). Role exclusivity — not multi-inserter safe |

@@ -91,10 +91,12 @@ drains as confirm dequeues. Bound queue size by **not requesting**, not by
 is allowed to finish them. While `hole=` is open, assign issues **no new**
 densify (existing in-flight requests may complete).
 
-Historical regression (do not reintroduce): bounded arch_job Full-drop and
-reader-side decode-permit wait before the next frame made peers look dead while
-TCP buffers filled. Dual-track `ArchiveJob` + ContigPark charge/release is
-**retired** — do not reintroduce a second Class A path for unknown-height bodies.
+Do not add a second Class A path, or a large process-resident archive cache
+(FIFO, LRU, or sticky residency), for unknown-height bodies.
+Historical regression (example, do not reintroduce the names as a design):
+bounded arch_job Full-drop and reader-side decode-permit wait before the next
+frame made peers look dead while TCP buffers filled. Dual-track `ArchiveJob` +
+ContigPark charge/release is **retired**.
 
 ## Process RSS vs true leak
 
