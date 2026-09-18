@@ -65,6 +65,7 @@ into `AGENTS.md`.
 | [`OPERATOR.md`](../OPERATOR.md) | Day-to-day ops, flags. |
 | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Getting started (rustup; Linux / macOS / Windows) + human+agent principles + checklist. |
 | [`AGENTS.md`](../AGENTS.md) | Harness-injected agent contract (hard rules + pointers; not a second design book). |
+| `crates/*/AGENTS.md` | Crate index: neighbors, read-first owners, verify command. Owns no facts. |
 | [`COMPAT.md`](../COMPAT.md) | Product surface. |
 | [`SECURITY.md`](../SECURITY.md) | Vulnerability reporting. |
 | [`CHANGELOG.md`](../CHANGELOG.md) | Release notes. |

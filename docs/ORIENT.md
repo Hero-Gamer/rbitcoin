@@ -38,6 +38,6 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 
 ## Ask first
 
-- Replacing a purpose-built IO machine with generic batched `pread` / `pwrite`.
-- Any on-disk change that could wipe or silently rewrite an operator datadir. Soft-migrate, bump, or refuse — never a silent wipe.
-- Expanding who is trusted beyond the boundary in [`../SECURITY.md`](../SECURITY.md).
+Hard stops are the Store and IBD bullets in [`../AGENTS.md`](../AGENTS.md).
+Also ask before expanding who is trusted beyond the boundary in
+[`../SECURITY.md`](../SECURITY.md).
