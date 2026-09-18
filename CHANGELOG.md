@@ -32,6 +32,14 @@ before 1.0).
 
 ### Changed
 
+- **IBD tip-hole race at large blocks:** only **tip+1** gets the 4-peer race;
+  later contiguous fetch holes get one racer until the prefix is in hand.
+  Racers rank by expected drain time (`(queue+1)/EWMA`), not inflight count, so
+  a fast peer with leftover densify beats an idle slow peer. An owner whose
+  FIFO is still on other getdata is dropped from the hole hash (ticks are not
+  progress on that hash) so an empty/faster peer can race. Mainnet ~912k sat
+  `hole=1` with `conf blks=0` while BQ grew far bodies.
+
 - **Q-54 Won't-fix:** ast-grep named-cap rules. Caps stay in
   [`docs/ibd-memory.md`](docs/ibd-memory.md) and production evict.
   Pinning `const = 128` is a second clippy. **Q-51** already owns

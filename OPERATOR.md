@@ -514,10 +514,12 @@ Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / pe
 **Tip hole / peer hygiene:** `hole=` on the progress line is the fetch gap from
 tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken
 onto loadq). Peer speed is one EWMA of all received bytes while that peer has
-block getdata in flight. Tip-batch getdata races up to 4 peers (shortest inflight
-queue, then higher EWMA). A hole owner with no qualifying rx is dropped from
-that hash when a sibling is pulling; an aged solo owner is dropped when
-another peer exists (densify ticks are not progress on this hash). When
+block getdata in flight. Tip+1 getdata races up to 4 peers ranked by expected
+drain time (`(queue+1)/EWMA`), not by inflight count. Later contiguous holes
+in that gap get one racer until tip+1 is in hand. A hole owner still serving
+other getdata (densify FIFO) is dropped from that hash so a peer that can start
+the hole can race; a hole owner with no qualifying rx is dropped when a sibling
+is pulling; an aged solo owner is dropped when another peer exists. When
 `hole=` is 0, at most one extra racer is added on the first later gap in the
 32-window, and only if that owner is missing, aged ≥30s, or ≤ pack-median/4.
 Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
@@ -1204,8 +1206,8 @@ On a typical home uplink use **8**. That is also the floor on a tight link:
 more peers will not raise a saturated wire and can make `relative-slow` peel a
 mixed pack. A quiet `relative-slow` log on a uniformly slow line is intended
 (cluster gate). `--connect` a known-fast peer if you have one. While `hole=` is
-open, densify issues no new far getdata and tip-hole races prefer short queues
-— that is recovery on a slow line, not a reason to raise outbound.
+open, densify issues no new far getdata and tip+1 races the peers that will
+drain first — that is recovery on a slow line, not a reason to raise outbound.
 
 ## Consensus notes (historical mainnet)
 
