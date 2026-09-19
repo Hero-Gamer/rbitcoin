@@ -1438,6 +1438,89 @@ fn features_hosts_json(config: &ElectrumConfig) -> Value {
     }
 }
 
+fn broadcast_raw_tx(
+    params: &Value,
+    config: &ElectrumConfig,
+    mempool: Option<&MempoolHub>,
+) -> Result<Value, String> {
+    let raw_hex = param_str(params, 0)?;
+    if raw_hex.len() > config.max_broadcast_hex {
+        return Err(format!(
+            "transaction hex too large (max {} chars)",
+            config.max_broadcast_hex
+        ));
+    }
+    let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
+    if raw.len() > 4_000_000 {
+        return Err("transaction too large".into());
+    }
+    let tx: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
+    let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
+    let r = mp
+        .accept_tx(&tx)
+        .map_err(|e| format!("broadcast reject: {e}"))?;
+    mp.mark_local_origin(r.txid);
+    Ok(json!(format!("{}", r.txid)))
+}
+
+fn broadcast_package(
+    params: &Value,
+    config: &ElectrumConfig,
+    mempool: Option<&MempoolHub>,
+) -> Result<Value, String> {
+    let arr = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
+    let verbose = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut txs = Vec::with_capacity(arr.len());
+    let mut total_hex = 0usize;
+    for h in arr {
+        let raw_hex = h
+            .as_str()
+            .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
+        total_hex = total_hex.saturating_add(raw_hex.len());
+        if total_hex > config.max_broadcast_hex {
+            return Err("package hex too large".into());
+        }
+        let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
+        if raw.len() > 4_000_000 {
+            return Err("transaction too large".into());
+        }
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
+        txs.push(tx);
+    }
+    let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
+    let accepted = mp
+        .accept_package(&txs)
+        .map_err(|e| format!("broadcast_package reject: {e}"))?;
+    for r in &accepted {
+        mp.mark_local_origin(r.txid);
+    }
+    if verbose {
+        let mut tx_results = serde_json::Map::new();
+        for r in &accepted {
+            tx_results.insert(
+                r.txid.to_string(),
+                json!({"txid": r.txid.to_string(), "allowed": true}),
+            );
+        }
+        Ok(json!({
+            "package_msg": "success",
+            "tx-results": tx_results,
+        }))
+    } else {
+        Ok(json!("success"))
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 fn dispatch_pinned(
     method: &str,
@@ -1727,81 +1810,8 @@ fn dispatch_pinned(
                 "pos": proof.pos,
             }))
         }
-        "blockchain.transaction.broadcast" => {
-            let raw_hex = param_str(params, 0)?;
-            if raw_hex.len() > config.max_broadcast_hex {
-                return Err(format!(
-                    "transaction hex too large (max {} chars)",
-                    config.max_broadcast_hex
-                ));
-            }
-            let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
-            // Consensus max block weight is 4M; reject absurd raw sizes early.
-            if raw.len() > 4_000_000 {
-                return Err("transaction too large".into());
-            }
-            let tx: bitcoin::Transaction =
-                bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
-            let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-            let r = mp
-                .accept_tx(&tx)
-                .map_err(|e| format!("broadcast reject: {e}"))?;
-            mp.mark_local_origin(r.txid);
-            let _ = chain.network;
-            Ok(json!(format!("{}", r.txid)))
-        }
-        "blockchain.transaction.broadcast_package" => {
-            let arr = params
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
-            let verbose = params
-                .as_array()
-                .and_then(|a| a.get(1))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let mut txs = Vec::with_capacity(arr.len());
-            let mut total_hex = 0usize;
-            for h in arr {
-                let raw_hex = h
-                    .as_str()
-                    .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
-                total_hex = total_hex.saturating_add(raw_hex.len());
-                if total_hex > config.max_broadcast_hex {
-                    return Err("package hex too large".into());
-                }
-                let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
-                if raw.len() > 4_000_000 {
-                    return Err("transaction too large".into());
-                }
-                let tx: bitcoin::Transaction =
-                    bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
-                txs.push(tx);
-            }
-            let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-            let accepted = mp
-                .accept_package(&txs)
-                .map_err(|e| format!("broadcast_package reject: {e}"))?;
-            for r in &accepted {
-                mp.mark_local_origin(r.txid);
-            }
-            if verbose {
-                let mut tx_results = serde_json::Map::new();
-                for r in &accepted {
-                    tx_results.insert(
-                        r.txid.to_string(),
-                        json!({"txid": r.txid.to_string(), "allowed": true}),
-                    );
-                }
-                Ok(json!({
-                    "package_msg": "success",
-                    "tx-results": tx_results,
-                }))
-            } else {
-                Ok(json!("success"))
-            }
-        }
+        "blockchain.transaction.broadcast" => broadcast_raw_tx(params, config, mempool),
+        "blockchain.transaction.broadcast_package" => broadcast_package(params, config, mempool),
         "mempool.get_info" => {
             let min = MempoolHub::relay_fee_btc_per_kb();
             let unbroadcast = mempool.map(|m| m.unbroadcast_count()).unwrap_or(0);
