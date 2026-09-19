@@ -609,7 +609,9 @@ warning and continues without inhibit.
 **Peers file:** `{datadir}/peers` stores discovered addresses and **PeerFlags**
 (connected / fast / slow / incompatible / last-fail) between runs. Loaded at
 start (before seeds), updated after IBD and on shutdown. Seeds are merged in
-without clearing known flags.
+without clearing known flags. New writes are `rbitcoin-peers-v2` (IPv4, IPv6,
+and Tor v3 `.onion:port` tokens). `rbitcoin-peers-v1` IPv4/IPv6 files still
+load.
 
 **Index modes:** Direct vs Tip: [`docs/concurrency.md`](docs/concurrency.md).
 IBD finishes Class A + `tx.head` + spend annotations **before** tip; tip entry

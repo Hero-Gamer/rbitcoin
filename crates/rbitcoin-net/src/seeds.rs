@@ -690,6 +690,7 @@ impl AddrMan {
 
     /// On-disk format magic line (text, one peer per line).
     pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
+    pub const PEERS_FILE_MAGIC_V2: &'static str = "rbitcoin-peers-v2";
 
     /// Load peers + flags from `path`. Missing file → empty book (not an error).
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -707,14 +708,15 @@ impl AddrMan {
                 continue;
             }
             if !saw_magic {
-                if line != Self::PEERS_FILE_MAGIC {
+                if line != Self::PEERS_FILE_MAGIC && line != Self::PEERS_FILE_MAGIC_V2 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "peers file {}:{}: expected magic `{}`",
+                            "peers file {}:{}: expected magic `{}` or `{}`",
                             path.display(),
                             lineno + 1,
-                            Self::PEERS_FILE_MAGIC
+                            Self::PEERS_FILE_MAGIC,
+                            Self::PEERS_FILE_MAGIC_V2
                         ),
                     ));
                 }
@@ -726,7 +728,7 @@ impl AddrMan {
                 continue;
             };
             let flags_s = parts.next().unwrap_or("0");
-            let addr: SocketAddr = addr_s.parse().map_err(|e| {
+            let addr: NetAddr = addr_s.parse().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -762,7 +764,7 @@ impl AddrMan {
                     )
                 })?
             };
-            am.add_with_flags(addr, PeerFlags(flags_u));
+            am.add_with_flags_addr(addr, PeerFlags(flags_u));
         }
         if !saw_magic && am.is_empty() {
             // Empty or comment-only without magic — treat as empty book.
@@ -781,16 +783,13 @@ impl AddrMan {
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
-            writeln!(f, "{}", Self::PEERS_FILE_MAGIC)?;
+            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V2)?;
             writeln!(
                 f,
                 "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
             )?;
             for e in self.entries() {
-                let Some(addr) = e.addr.socket_addr() else {
-                    continue;
-                };
-                writeln!(f, "{} 0x{:02x}", addr, e.flags.0)?;
+                writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
             }
             f.sync_all()?;
         }
@@ -1475,6 +1474,59 @@ mod tests {
         am.save(&nested).unwrap();
         assert!(nested.is_file());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_onion() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-onion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let onion: NetAddr = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+        let mut am = AddrMan::new();
+        am.add_addr(onion);
+        am.add(addr(1));
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == onion),
+            "onion must persist, got {:?}",
+            loaded.entries()
+        );
+        assert!(loaded.entry(&addr(1)).is_some());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("rbitcoin-peers-v2"),
+            "new writes use v2, got {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_v1_ipv4_still_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        std::fs::write(&path, format!("rbitcoin-peers-v1\n{} 0x01\n", addr(4))).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(loaded.entry(&addr(4)).is_some());
+        assert!(loaded.flags(&addr(4)).has_connected());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
