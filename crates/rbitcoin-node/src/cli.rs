@@ -781,6 +781,53 @@ mod tests {
     }
 
     #[test]
+    fn connect_onion_and_ipv4() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("connect", "1.2.3.4:8333").unwrap();
+        c.apply_kv(
+            "connect",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        )
+        .unwrap();
+        assert_eq!(c.listen.connect.len(), 2);
+        assert_eq!(c.listen.connect[0], "1.2.3.4:8333".parse().unwrap());
+        assert!(matches!(
+            c.listen.connect[1],
+            rbitcoin_net::NetAddr::Onion { port: 8333, .. }
+        ));
+        let err = NodeConfig::default()
+            .apply_kv("connect", "short.onion:8333")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connect") || msg.contains("onion") || msg.contains("bad"),
+            "{msg}"
+        );
+        let mut s = NodeConfig::default();
+        s.apply_kv(
+            "seed_node",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        )
+        .unwrap();
+        assert_eq!(
+            s.listen.seednodes,
+            vec!["pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333".to_string()]
+        );
+        assert!(NodeConfig::default()
+            .apply_kv("seed_node", "short.onion:8333")
+            .is_err());
+        let n = ready_config([
+            "rbitcoin-node",
+            "--connect",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        ]);
+        assert!(matches!(
+            n.listen.connect[0],
+            rbitcoin_net::NetAddr::Onion { port: 8333, .. }
+        ));
+    }
+
+    #[test]
     fn no_discover_conf() {
         let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
         assert!(NodeConfig::default().listen.discover);

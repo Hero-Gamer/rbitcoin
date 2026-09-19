@@ -85,7 +85,7 @@ pub struct ListenOpts {
     pub p2p_extra: Vec<SocketAddr>,
     pub electrum: Option<SocketAddr>,
     pub esplora: Option<EsploraListen>,
-    pub connect: Vec<SocketAddr>,
+    pub connect: Vec<rbitcoin_net::NetAddr>,
     pub seednodes: Vec<String>,
     pub use_seeds: bool,
     pub max_outbound: u32,
@@ -701,6 +701,11 @@ impl NodeConfig {
             }
             "seed_node" => {
                 if !val.is_empty() {
+                    if val.to_ascii_lowercase().contains(".onion") {
+                        let _: rbitcoin_net::NetAddr = val
+                            .parse()
+                            .map_err(|e| NodeError::Config(format!("conf seed_node: {e}")))?;
+                    }
                     self.listen.seednodes.push(val.to_string());
                 }
             }

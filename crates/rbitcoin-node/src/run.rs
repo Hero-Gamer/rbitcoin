@@ -400,7 +400,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     addrman.set_asmap(asmap.clone());
     node.peers.set_asmap(asmap);
     for c in &config.listen.connect {
-        addrman.add(*c);
+        addrman.add_addr(*c);
     }
     if should_resolve_default_seeds(&config) {
         info!(
@@ -1646,13 +1646,17 @@ pub(crate) fn load_asmap(datadir: &Path, configured: Option<&Path>) -> Option<Ar
 
 /// `--connect` is operator-pinned: no netgroup filter. Otherwise rank + diversity.
 pub(crate) fn follow_dial_targets(
-    connect: &[SocketAddr],
+    connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
     max: usize,
     occupied: &[SocketAddr],
 ) -> Vec<SocketAddr> {
     if !connect.is_empty() {
-        connect.to_vec()
+        connect
+            .iter()
+            .copied()
+            .filter_map(rbitcoin_net::NetAddr::socket_addr)
+            .collect()
     } else {
         book.take_outbound_occupied(max, occupied)
     }
@@ -1749,12 +1753,16 @@ mod tests {
         let mut am = AddrMan::new();
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 1)), 8333));
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 0, 1)), 8333));
-        let connect = vec![SocketAddr::new(
+        let connect = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8333,
+        ))];
+        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
+        let want = vec![SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8333,
         )];
-        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
-        assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), connect);
+        assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
     }
 
     #[test]
