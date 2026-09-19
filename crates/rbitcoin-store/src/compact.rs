@@ -5,120 +5,40 @@
 //! sequence, empty script/witness).
 
 use crate::error::StoreError;
+use rbitcoin_primitives::PackError;
 
-/// Byte length of a Bitcoin CompactSize encoding of `n` (no write).
+fn pack_err(e: PackError) -> StoreError {
+    StoreError::Corrupt(e.0)
+}
+
 #[inline]
 pub fn compact_size_len(n: u64) -> usize {
-    if n < 253 {
-        1
-    } else if n <= u16::MAX as u64 {
-        3
-    } else if n <= u32::MAX as u64 {
-        5
-    } else {
-        9
-    }
+    rbitcoin_primitives::compact_size_len(n)
 }
 
-/// Write Bitcoin CompactSize (unsigned).
 pub fn write_compact_size(out: &mut Vec<u8>, n: u64) {
-    if n < 253 {
-        out.push(n as u8);
-    } else if n <= u16::MAX as u64 {
-        out.push(253);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= u32::MAX as u64 {
-        out.push(254);
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        out.push(255);
-        out.extend_from_slice(&n.to_le_bytes());
-    }
+    rbitcoin_primitives::write_compact_size(out, n)
 }
 
-/// Read CompactSize; returns (value, bytes_consumed).
 pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), StoreError> {
-    if buf.is_empty() {
-        return Err(StoreError::Corrupt("compact size empty"));
-    }
-    match buf[0] {
-        n @ 0..=252 => Ok((u64::from(n), 1)),
-        253 => {
-            if buf.len() < 3 {
-                return Err(StoreError::Corrupt("compact size u16 truncated"));
-            }
-            let v = u16::from_le_bytes([buf[1], buf[2]]);
-            Ok((u64::from(v), 3))
-        }
-        254 => {
-            if buf.len() < 5 {
-                return Err(StoreError::Corrupt("compact size u32 truncated"));
-            }
-            let v = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-            Ok((u64::from(v), 5))
-        }
-        255 => {
-            if buf.len() < 9 {
-                return Err(StoreError::Corrupt("compact size u64 truncated"));
-            }
-            let v = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-            Ok((v, 9))
-        }
-    }
+    rbitcoin_primitives::read_compact_size(buf).map_err(pack_err)
 }
 
-/// Byte length of an unsigned LEB128 encoding of `n` (no write).
 #[inline]
-pub fn uleb128_len(mut n: u64) -> usize {
-    let mut len = 1usize;
-    while n >= 0x80 {
-        n >>= 7;
-        len += 1;
-    }
-    len
+pub fn uleb128_len(n: u64) -> usize {
+    rbitcoin_primitives::uleb128_len(n)
 }
 
-/// Unsigned LEB128 into `dst`. Returns bytes written.
-pub fn write_uleb128_into(dst: &mut [u8], mut n: u64) -> Result<usize, StoreError> {
-    let mut i = 0usize;
-    loop {
-        if i >= dst.len() {
-            return Err(StoreError::Corrupt("uleb128 dest short"));
-        }
-        let mut b = (n & 0x7f) as u8;
-        n >>= 7;
-        if n != 0 {
-            b |= 0x80;
-        }
-        dst[i] = b;
-        i += 1;
-        if n == 0 {
-            return Ok(i);
-        }
-    }
+pub fn write_uleb128_into(dst: &mut [u8], n: u64) -> Result<usize, StoreError> {
+    rbitcoin_primitives::write_uleb128_into(dst, n).map_err(pack_err)
 }
 
-/// Unsigned LEB128 (7-bit groups, MSB continuation).
 pub fn write_uleb128(out: &mut Vec<u8>, n: u64) {
-    let mut tmp = [0u8; 10];
-    let used = write_uleb128_into(&mut tmp, n).expect("10-byte stack holds any u64 uleb128");
-    out.extend_from_slice(&tmp[..used]);
+    rbitcoin_primitives::write_uleb128(out, n)
 }
 
 pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
-    let mut result = 0u64;
-    let mut shift = 0u32;
-    for (i, &b) in buf.iter().enumerate() {
-        if shift >= 64 {
-            return Err(StoreError::Corrupt("uleb128 overflow"));
-        }
-        result |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Ok((result, i + 1));
-        }
-        shift += 7;
-    }
-    Err(StoreError::Corrupt("uleb128 truncated"))
+    rbitcoin_primitives::read_uleb128(buf).map_err(pack_err)
 }
 
 /// Trailing decimal zeros stripped from a satoshi amount, capped at 9.

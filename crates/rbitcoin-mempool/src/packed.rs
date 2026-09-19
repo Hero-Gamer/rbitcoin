@@ -271,48 +271,11 @@ fn take_arr<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], Memp
 }
 
 fn write_compact_size(out: &mut Vec<u8>, n: u64) {
-    if n < 253 {
-        out.push(n as u8);
-    } else if n <= u16::MAX as u64 {
-        out.push(253);
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= u32::MAX as u64 {
-        out.push(254);
-        out.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        out.push(255);
-        out.extend_from_slice(&n.to_le_bytes());
-    }
+    rbitcoin_primitives::write_compact_size(out, n)
 }
 
 fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), MempoolError> {
-    if buf.is_empty() {
-        return Err(MempoolError::Corrupt("compact size empty"));
-    }
-    match buf[0] {
-        n @ 0..=252 => Ok((u64::from(n), 1)),
-        253 => {
-            if buf.len() < 3 {
-                return Err(MempoolError::Corrupt("compact size u16 truncated"));
-            }
-            let v = u16::from_le_bytes([buf[1], buf[2]]);
-            Ok((u64::from(v), 3))
-        }
-        254 => {
-            if buf.len() < 5 {
-                return Err(MempoolError::Corrupt("compact size u32 truncated"));
-            }
-            let v = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-            Ok((u64::from(v), 5))
-        }
-        255 => {
-            if buf.len() < 9 {
-                return Err(MempoolError::Corrupt("compact size u64 truncated"));
-            }
-            let v = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-            Ok((v, 9))
-        }
-    }
+    rbitcoin_primitives::read_compact_size(buf).map_err(|e| MempoolError::Corrupt(e.0))
 }
 
 #[cfg(test)]

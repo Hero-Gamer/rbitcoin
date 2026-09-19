@@ -263,38 +263,10 @@ fn parse_signet_solution(solution: &[u8]) -> Result<(ScriptBuf, Witness), Consen
 }
 
 fn read_compact_size(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
-    if rdr.is_empty() {
-        return Err(ConsensusError::BadBlock("signet: compact size"));
-    }
-    let first = rdr[0];
-    *rdr = &rdr[1..];
-    match first {
-        n @ 0..=252 => Ok(n as u64),
-        253 => {
-            if rdr.len() < 2 {
-                return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u16::from_le_bytes([rdr[0], rdr[1]]) as u64;
-            *rdr = &rdr[2..];
-            Ok(v)
-        }
-        254 => {
-            if rdr.len() < 4 {
-                return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u32::from_le_bytes(rdr[..4].try_into().unwrap()) as u64;
-            *rdr = &rdr[4..];
-            Ok(v)
-        }
-        255 => {
-            if rdr.len() < 8 {
-                return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u64::from_le_bytes(rdr[..8].try_into().unwrap());
-            *rdr = &rdr[8..];
-            Ok(v)
-        }
-    }
+    let (v, n) = rbitcoin_primitives::read_compact_size(rdr)
+        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))?;
+    *rdr = &rdr[n..];
+    Ok(v)
 }
 
 fn read_script(rdr: &mut &[u8]) -> Result<ScriptBuf, ConsensusError> {
