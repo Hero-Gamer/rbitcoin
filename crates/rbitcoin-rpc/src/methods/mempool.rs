@@ -609,9 +609,18 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
     let mut out = Vec::new();
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        if tx_confirmed_on_active_chain(ctx, &tx)? {
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "txn-already-known",
+            }));
+            continue;
+        }
         match mp.test_accept(&tx) {
             Ok(r) => {
-                let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
                     out.push(json!({
                         "txid": txid,
@@ -630,7 +639,6 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
                 }));
             }
             Err(e) => {
-                let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
                 let mut row = json!({
                     "txid": txid,
                     "wtxid": wtxid,
@@ -645,6 +653,19 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
         }
     }
     Ok(json!(out))
+}
+
+fn tx_confirmed_on_active_chain(ctx: &RpcContext, tx: &Transaction) -> Result<bool, Value> {
+    let txid = tx.compute_txid().to_byte_array();
+    match ctx.query.tx_fk_by_txid_tip(&txid) {
+        Ok(None) => Ok(false),
+        Ok(Some(fk)) => ctx
+            .query
+            .store()
+            .is_confirmed_strong(fk)
+            .map_err(|e| rpc_error(ERR_MISC, format!("query failed: {e}"))),
+        Err(e) => Err(rpc_error(ERR_MISC, format!("query failed: {e}"))),
+    }
 }
 
 /// Core `ParseConfirmTarget`: integer in `1..=1008`.
