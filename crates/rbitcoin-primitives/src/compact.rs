@@ -218,6 +218,12 @@ mod tests {
         u64b.extend_from_slice(&u64::MAX.to_le_bytes());
         let (v, n) = read_compact_size(&u64b).unwrap();
         assert_eq!((v, n), (u64::MAX, 9));
+        // Non-canonical prefixes still decode (shipped; not Core's reject).
+        assert_eq!(read_compact_size(&[253, 1, 0]).unwrap(), (1, 3));
+        assert_eq!(read_compact_size(&[254, 1, 0, 0, 0]).unwrap(), (1, 5));
+        let mut ncan64 = vec![255u8];
+        ncan64.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(read_compact_size(&ncan64).unwrap(), (1, 9));
     }
 
     #[cfg(miri)]
@@ -239,6 +245,12 @@ mod tests {
         let mut over = vec![0x80u8; 10];
         over.push(0x01);
         assert!(read_uleb128(&over).is_err());
+
+        assert_eq!(read_compact_size(&[253, 252, 0]).unwrap().0, 252);
+        assert_eq!(read_compact_size(&[254, 253, 0, 0, 0]).unwrap().0, 253);
+        let mut ncan64 = vec![255u8];
+        ncan64.extend_from_slice(&(u32::MAX as u64).to_le_bytes());
+        assert_eq!(read_compact_size(&ncan64).unwrap().0, u32::MAX as u64);
     }
 
     #[test]
