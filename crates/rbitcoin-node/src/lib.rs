@@ -7,6 +7,7 @@ mod inhibit;
 mod lock;
 mod regtest_rpc;
 mod run;
+mod tor_control;
 
 pub use cli::cli_main;
 pub use config::{DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, RpcOpts};
