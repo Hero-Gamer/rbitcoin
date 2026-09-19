@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::asmap::AsMap;
-use crate::netaddr::NetAddr;
+use crate::netaddr::{addr_allowed, NetAddr, OnlyNet};
 use crate::netgroup::{netgroup, select_diverse};
 
 /// Skip a recently dialed addr while any other candidate remains.
@@ -298,6 +298,7 @@ pub struct AddrMan {
     by_addr: HashMap<NetAddr, PeerFlags>,
     asmap: Option<Arc<AsMap>>,
     last_attempt: HashMap<NetAddr, Instant>,
+    only_net: Vec<OnlyNet>,
 }
 
 impl AddrMan {
@@ -327,11 +328,56 @@ impl AddrMan {
         self.sort_order_ipv4_first();
     }
 
+    pub fn set_only_net(&mut self, only: Vec<OnlyNet>) {
+        self.only_net = only;
+    }
+
+    fn allowed(&self, addr: NetAddr) -> bool {
+        addr_allowed(addr, &self.only_net)
+    }
+
+    /// Like [`Self::take_dial_candidates`] plus onion rows when `--only-net` allows them.
+    pub fn take_dial_candidates_net(
+        &self,
+        max: usize,
+        exclude: &HashSet<NetAddr>,
+        occupied: &[SocketAddr],
+    ) -> Vec<NetAddr> {
+        let ip_ex: HashSet<SocketAddr> = exclude
+            .iter()
+            .copied()
+            .filter_map(NetAddr::socket_addr)
+            .collect();
+        let mut out: Vec<NetAddr> = self
+            .take_dial_candidates(max, &ip_ex, occupied)
+            .into_iter()
+            .map(NetAddr::Ip)
+            .collect();
+        if out.len() >= max {
+            return out;
+        }
+        for &a in &self.order {
+            if out.len() >= max {
+                break;
+            }
+            if !matches!(a, NetAddr::Onion { .. }) || !self.allowed(a) || exclude.contains(&a) {
+                continue;
+            }
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
     pub fn add(&mut self, addr: SocketAddr) {
         self.add_addr(NetAddr::Ip(addr));
     }
 
     pub fn add_addr(&mut self, addr: NetAddr) {
+        if !self.allowed(addr) {
+            return;
+        }
         if self.by_addr.contains_key(&addr) {
             return;
         }
@@ -369,6 +415,9 @@ impl AddrMan {
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, cap: usize) -> bool {
+        if !self.allowed(addr) {
+            return false;
+        }
         if self.by_addr.contains_key(&addr) || cap == 0 {
             return false;
         }
@@ -600,6 +649,9 @@ impl AddrMan {
             .iter()
             .copied()
             .filter_map(|a| {
+                if !self.allowed(a) {
+                    return None;
+                }
                 let sock = a.socket_addr()?;
                 if exclude.contains(&sock) {
                     return None;
@@ -1528,5 +1580,19 @@ mod tests {
         assert!(loaded.entry(&addr(4)).is_some());
         assert!(loaded.flags(&addr(4)).has_connected());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_net_onion_filters_ipv4_candidates() {
+        let onion: NetAddr = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+        let mut am = AddrMan::new();
+        am.add(addr(1));
+        am.add_addr(onion);
+        am.set_only_net(vec![OnlyNet::Onion]);
+        let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![onion]);
+        assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
     }
 }

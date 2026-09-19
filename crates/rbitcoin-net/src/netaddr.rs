@@ -11,6 +11,38 @@ const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const ONION_VERSION: u8 = 3;
 const ONION_NAME_LEN: usize = 56;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnlyNet {
+    Ipv4,
+    Ipv6,
+    Onion,
+}
+
+impl OnlyNet {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ipv4" => Ok(Self::Ipv4),
+            "ipv6" => Ok(Self::Ipv6),
+            "onion" => Ok(Self::Onion),
+            "i2p" | "cjdns" => Err(format!("unknown network {s} (not yet implemented)")),
+            other => Err(format!("unknown network {other}")),
+        }
+    }
+
+    pub fn matches_addr(self, addr: NetAddr) -> bool {
+        match (self, addr) {
+            (Self::Ipv4, NetAddr::Ip(s)) => s.is_ipv4(),
+            (Self::Ipv6, NetAddr::Ip(s)) => s.is_ipv6(),
+            (Self::Onion, NetAddr::Onion { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+pub fn addr_allowed(addr: NetAddr, only: &[OnlyNet]) -> bool {
+    only.is_empty() || only.iter().any(|n| n.matches_addr(addr))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NetAddr {
     Ip(SocketAddr),

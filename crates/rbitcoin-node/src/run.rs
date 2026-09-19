@@ -398,6 +398,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
     let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
     addrman.set_asmap(asmap.clone());
+    addrman.set_only_net(config.listen.only_net.clone());
     node.peers.set_asmap(asmap);
     for c in &config.listen.connect {
         addrman.add_addr(*c);

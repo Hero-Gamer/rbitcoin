@@ -293,7 +293,7 @@ fn operator_usage() -> String {
         "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
-    [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] \\\n\
+    [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
@@ -825,6 +825,32 @@ mod tests {
             n.listen.connect[0],
             rbitcoin_net::NetAddr::Onion { port: 8333, .. }
         ));
+    }
+
+    #[test]
+    fn only_net_onion_without_proxy_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "onion").unwrap();
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SOCKS") && msg.contains("only-net"), "{msg}");
+        c.apply_kv("proxy", "127.0.0.1:9050").unwrap();
+        c.validate().unwrap();
+        assert!(NodeConfig::default().apply_kv("only_net", "i2p").is_err());
+        let ok = ready_config([
+            "rbitcoin-node",
+            "--only-net",
+            "onion",
+            "--proxy",
+            "127.0.0.1:9050",
+        ]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::Onion]);
+        let h = operator_usage();
+        assert!(h.contains("--only-net"), "help must list kebab --only-net");
+        assert!(
+            !h.contains("--onlynet"),
+            "help must not advertise concatenated --onlynet"
+        );
     }
 
     #[test]

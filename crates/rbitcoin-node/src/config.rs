@@ -101,6 +101,8 @@ pub struct ListenOpts {
     pub proxy_randomize: bool,
     /// Core `-discover` (default on). Off: no self-announce / localaddresses.
     pub discover: bool,
+    /// Empty = all networks. Repeatable `--only-net`.
+    pub only_net: Vec<rbitcoin_net::OnlyNet>,
 }
 
 impl Default for ListenOpts {
@@ -122,6 +124,7 @@ impl Default for ListenOpts {
             onion: None,
             proxy_randomize: true,
             discover: true,
+            only_net: Vec::new(),
         }
     }
 }
@@ -488,6 +491,18 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
+        if self
+            .listen
+            .only_net
+            .iter()
+            .any(|n| *n == rbitcoin_net::OnlyNet::Onion)
+            && self.listen.proxy.is_none()
+            && self.listen.onion.is_none()
+        {
+            return Err(NodeError::Config(
+                "only-net=onion requires SOCKS (--proxy or --onion)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -682,6 +697,12 @@ impl NodeConfig {
             }
             "no_discover" => {
                 self.listen.discover = !is_conf_true(val);
+            }
+            "only_net" => {
+                self.listen.only_net.push(
+                    rbitcoin_net::OnlyNet::parse(val)
+                        .map_err(|e| NodeError::Config(format!("conf only_net: {e}")))?,
+                );
             }
             "connect" => {
                 self.listen.connect.push(
