@@ -8,7 +8,7 @@ stem ([`SCHEMA.md`](../../SCHEMA.md)), while still:
 
 1. Confirming new blocks (IBD and tip write `inwit` first, drop later).
 2. Reorging within the kept window.
-3. Serving the last **288** blocks on P2P (BIP159 **`NODE_NETWORK_LIMITED`**).
+3. Serving the last **288 heights** on P2P (BIP159 **`NODE_NETWORK_LIMITED`**).
 4. Serving wallet **scripthash / UTXO / status / outspend / vout** paths that
    only need `txout` + `spent` + `txid.body` + headers.
 
@@ -16,8 +16,11 @@ This is **not** Core `-prune` of entire `blk*.dat` files. We keep headers,
 `txout`, `spent`, `txid.body`, SH, tweaks. We drop old **inputs and
 witnesses**.
 
-**Layout:** a **rolling 288-block inwit stem** (append a segment, unlink the
+**Layout:** a **rolling 288-height inwit stem** (append a segment, unlink the
 oldest). Not `FALLOC_FL_PUNCH_HOLE` on the genesis-length `inwit.body`.
+Orphan / stale / side-branch blocks at kept heights mean **more than 288
+inwit blocks** on disk — the pin is 288 **heights** behind tip, not 288
+records.
 
 **JSON vs wire:** serve **honest partial objects** (vout/status/txids we still
 have). Refuse **wire** (hex/raw/P2P block/tx) rather than invent vin, fee,
@@ -33,7 +36,10 @@ BIP159 / Core:
 | `NODE_NETWORK_LIMITED` | 1024 (bit 10) | I can serve at least the **last 288 blocks** (~2 days at 10 m). |
 
 They are alternatives: a pruned Core node advertises `NETWORK_LIMITED|WITNESS`,
-**not** `NETWORK`. 288 is `MIN_BLOCKS_TO_KEEP`. A different constant,
+**not** `NETWORK`. 288 is `MIN_BLOCKS_TO_KEEP` on the **active chain**. Our
+store window is the same 288 **heights** behind tip; orphan / stale blocks
+at those heights are extra inwit, not a reason to drop below 288 heights.
+A different constant,
 [`NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` = 144](../../crates/rbitcoin-net/src/peer.rs),
 is only for **outbound selection** (do not IBD-deep from a limited peer). Do
 **not** use 144 as our keep window.
@@ -70,24 +76,37 @@ production layout.**
 
 ### Contract: append tail, unlink head
 
-Keep ≥ **288** connected heights of inwit as a **small rolling log**:
+Keep ≥ **288 connected heights** of inwit as a **small rolling log**
+(watermark is height, not a count of inwit blocks):
 
 - Confirm still encodes full inwit on the Class A write thread and **appends**
   to the current segment (fallocate grow + pwrite + publish HWM — same
   `TableFile` discipline as today).
-- When a segment’s **last** height is `≤ pruneheight`, **unlink** the file
+- When **every** height in a segment is `≤ pruneheight`, **unlink** the file
   (background; not the confirm hot path). The OS drops the inode and TRIMs
   the whole object. One create, one sequential write, one unlink per dropped
-  segment.
+  segment. A stale sibling at a still-kept height keeps the file.
 - Window size on disk: ~486 GiB / ~900k blocks × 288 ≈ **150–400 MiB** of
-  inwit (witness era toward the high end). A few files, not a sparse 486 GiB
-  stem.
+  inwit on a linear chain (witness era toward the high end). Orphans at kept
+  heights add more (see below). A few files, not a sparse 486 GiB stem.
+
+**288 heights ≠ 288 inwit blocks.** `pruneheight` is
+`tip.saturating_sub(288 + buffer)` — a **height**. BIP159 / reorg need inwit
+for every create whose **connected height** is `> pruneheight`. A reorg
+leaves the disconnected (orphan / stale / side-branch) block’s inwit in
+Class A until that *height* falls out of the window. Two blocks at the same
+kept height are two inwit payloads. The rolling stem therefore often holds
+**more than 288 blocks of inwit** in order to keep **288 heights** behind
+tip. Do **not** unlink because “we already have 288 inwit blocks” while a
+kept height still has a stale sibling. Do not size the window by counting
+active-chain blocks only.
 
 **Segment grain (pin in SCHEMA, not both):** size-capped sealed files
 (**64 MiB** target, or the current height if a single block is larger), not
-one inode per height (288 is fine for the kernel; fewer files is less open/
-stat noise on reconstruct of a whole block). Unlink only when **every**
-height in the file is `≤ pruneheight` (may hold up to ~64 MiB extra).
+one inode per height (288 main-chain heights is fine for the kernel; fewer
+files is less open/stat noise on reconstruct of a whole block). Unlink only
+when **every** height in the file is `≤ pruneheight`, including orphan
+heights in that file (may hold up to ~64 MiB extra).
 
 **Loc:** SCHEMA bump. Global monotone abs into one `inwit.body` cannot
 survive unlink of the prefix. Below watermark: loc **sentinel** (not a live
@@ -95,14 +114,17 @@ span) so `get_tx_full` is `QueryError::Pruned` rather than `Corrupt`. Kept
 window: loc is **segment id + local off** (or height → segment map + per-file
 loc). Unexpected hole **inside** the window → `Corrupt("invariant: …")`.
 
-**Enable on an existing archive:** sequential **copy the last 288 heights**
-from the old `inwit.body` into the rolling stem (~200 MiB read), then
-**unlink** the genesis-length file. Do not punch it. Refuse leftover
-single-stem `inwit.body` without the new sidecar/schema (same commit as the
-format code).
+**Enable on an existing archive:** sequential **copy every inwit whose
+height is `> pruneheight`** (active chain **and** orphans in that height
+window) from the old `inwit.body` into the rolling stem, then **unlink** the
+genesis-length file. Do not punch it. A linear-chain copy is ~200 MiB; extra
+stale blocks in the window add more. Refuse leftover single-stem
+`inwit.body` without the new sidecar/schema (same commit as the format
+code).
 
 **Prune-from-genesis / IBD:** write only the rolling stem; never grow a
-historical body. Peak inwit bytes ≈ window + one in-flight segment.
+historical body. Peak inwit bytes ≈ height window (plus orphan inwit at
+those heights) + one in-flight segment.
 
 **`--datadir-cold`:** rolling files live with today’s cold inwit, not the hot
 txout/spent dir.
@@ -136,9 +158,11 @@ vout-only object that still claims to be `transaction.get`.
 - **No silent wipe.** Durable `pruneheight` in store meta / sidecar. Same
   commit as the format code ([`SCHEMA.md`](../../SCHEMA.md) bump **or** a
   named sidecar with refuse-on-mismatch).
-- Keep **≥ 288** connected blocks of inwit (`tip - pruneheight >= 288`, plus
-  a small reorg buffer — Core keeps extra; pin **288 min**, extra is operator
-  `--prune-buffer` default 0 or 144).
+- Keep **≥ 288 heights** of inwit (`tip - pruneheight >= 288`, plus a small
+  reorg buffer — Core keeps extra; pin **288 min heights**, extra is operator
+  `--prune-buffer` default 0 or 144). The **number of inwit blocks** in that
+  window is **≥ 288** and **greater** when orphan / stale blocks share those
+  heights. Watermark and unlink are by height, not by block count.
 - Reorg that would disconnect **at or below** `pruneheight` → fail closed
   (Core: cannot reorg pruned). Do not invent undo from `spent` alone.
 - Confirm/IBD still **writes** full inwit. Drop is a background unlink after
@@ -162,7 +186,7 @@ Heights **above** the watermark behave as today. Below: table.
 
 ### P2P
 
-| Path | Pruned height | Kept window (last ≥288) |
+| Path | Pruned height | Kept window (last ≥288 **heights**) |
 |------|---------------|-------------------------|
 | `getdata` `MSG_WITNESS_BLOCK` / `MSG_BLOCK` / `MSG_CMPCT_BLOCK` | `notfound` (same as missing) | Reconstruct and serve as today ([`encode_served_witness_block`](../../crates/rbitcoin-net/src/peer.rs)) |
 | `getblocktxn` | n/a (tip compact only) | Serve if the block is still in the window / cache |
@@ -250,18 +274,22 @@ Heights **above** the watermark behave as today. Below: table.
 ### Step 2 — Durable pruneheight + rolling inwit segments
 
 - **Contract:** `--prune-inwit` / conf (default **off**). When on, after tip
-  connect, watermark = `tip.saturating_sub(288 + buffer)`. SCHEMA bump:
-  inwit is a rolling segment dir (64 MiB sealed files under cold inwit), loc
-  is window-relative, below-watermark sentinel. Walker **unlinks** segments
-  wholly `≤ pruneheight`. Kill-safe: watermark advances only after those
-  unlinks. Reopen restores watermark + open segments. Leftover genesis-length
-  `inwit.body` without the new layout → refuse (OPERATOR: copy-tail then
-  unlink on first pruned open, or refuse and tell the operator). Confirm
-  appends only to the live segment.
+  connect, watermark = `tip.saturating_sub(288 + buffer)` (**height**, not
+  a count of inwit blocks). SCHEMA bump: inwit is a rolling segment dir
+  (64 MiB sealed files under cold inwit), loc is window-relative,
+  below-watermark sentinel. Walker **unlinks** segments wholly `≤ pruneheight`
+  (every height in the file, including orphans). Kill-safe: watermark
+  advances only after those unlinks. Reopen restores watermark + open
+  segments. Leftover genesis-length `inwit.body` without the new layout →
+  refuse (OPERATOR: copy-tail then unlink on first pruned open, or refuse
+  and tell the operator). Confirm appends only to the live segment. A kept
+  height with an orphan sibling keeps **both** inwit payloads.
 - **Red:** `prune_watermark_survives_reopen`;
   `unlink_segment_below_watermark_then_pruned`;
   `kept_window_inwit_still_reconstructs`;
-  `prune_during_ibd_does_not_grow_historical_inwit_stem`.
+  `prune_during_ibd_does_not_grow_historical_inwit_stem`;
+  `kept_288_heights_retains_orphan_inwit` — reorg at a kept height; both
+  blocks reconstruct; inwit block count **>** the height window.
 - **Green:** store meta/sidecar; background unlink (not confirm hot path).
 - **Refactor:** no second inwit encoding; no punch path on this table.
 - **Verify:** `cargo test -p rbitcoin-store prune_inwit_` ;
@@ -283,7 +311,8 @@ Heights **above** the watermark behave as today. Below: table.
 - **Contract:** pruned process: `local_service_flags()` =
   `NETWORK_LIMITED|WITNESS|P2P_V2`. Unpruned unchanged (`NETWORK|…`).
   `getdata` for a block with height `<= pruneheight` → `notfound`. Last 288
-  still reconstruct-serve. RPC `getnetworkinfo.localservicesnames` matches.
+  **heights** still reconstruct-serve (including orphan hashes still in that
+  height window). RPC `getnetworkinfo.localservicesnames` matches.
   DNS **seed query** still uses `NETWORK|WITNESS|P2P_V2` (find archive
   peers for IBD).
 - **Red:** flip
@@ -319,7 +348,8 @@ Heights **above** the watermark behave as today. Below: table.
 
 ### Step 6 — OPERATOR / COMPAT / SCHEMA / rpc.md + NixOS module
 
-- **Contract:** OPERATOR `--prune-inwit`, 288 window, NETWORK_LIMITED,
+- **Contract:** OPERATOR `--prune-inwit`, 288-**height** window (orphan
+  inwit can make the block count larger), NETWORK_LIMITED,
   rolling cold inwit (unlink, not punch), cannot reorg through pruneheight,
   archive convert = copy tail + unlink old stem. COMPAT prune row.
   `getblockchaininfo` fields. SCHEMA/sidecar bytes. Partial Esplora JSON.
@@ -335,9 +365,10 @@ Heights **above** the watermark behave as today. Below: table.
 
 ## Test budget
 
-Tiny `/tmp` chains (keep window 2–4 in tests, production 288). No mainnet
-open. One P2P notfound + reconstruct-serve of a kept tip. Unlink tests on
-all OS (not Linux-only punch).
+Tiny `/tmp` chains (keep window 2–4 **heights** in tests, production 288
+heights; include one orphan so inwit block count exceeds the height window).
+No mainnet open. One P2P notfound + reconstruct-serve of a kept tip. Unlink
+tests on all OS (not Linux-only punch).
 
 ## Risks / follow-ups
 
