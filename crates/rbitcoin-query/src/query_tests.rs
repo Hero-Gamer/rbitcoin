@@ -2589,6 +2589,48 @@ fn reconstruct_archived_contiguous_skips_get_tx_full() {
 }
 
 #[test]
+fn reconstruct_pruned_returns_pruned_not_corrupt() {
+    let (dir, q) = temp_query("reconstruct-pruned");
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    let mut hashes = Vec::new();
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent_hash);
+        parent_hash = Some(header.hash);
+        hashes.push(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    q.set_pruneheight(Some(Height(0)));
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    let fks0 = q.block_tx_fks(Height(0)).unwrap();
+    assert!(
+        !q.inwit_available(fks0[0]).unwrap(),
+        "height 0 must be at/below watermark"
+    );
+    let err = q.reconstruct_archived_block(&hashes[0]).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { height: 0 }),
+        "below watermark must be Pruned, not {err:?}"
+    );
+    let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.witness_block_bytes_by_hash(&hashes[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.tx_wire_bytes(fks0[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.reconstruct_tx(fks0[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    assert_eq!(q.block_txids(Height(0)).unwrap().len(), 1);
+    assert!(q.tx_output_at_fk(fks0[0], 0).is_ok());
+    let kept = q.reconstruct_archived_block(&hashes[1]).unwrap().unwrap();
+    assert_eq!(kept.txdata.len(), 1);
+    let fks1 = q.block_tx_fks(Height(1)).unwrap();
+    assert!(q.inwit_available(fks1[0]).unwrap());
+    assert!(q.tx_wire_bytes(fks1[0]).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn reconstruct_span_batches_foreign_parent_txids() {
     let (dir, q) = temp_query("reconstruct-parent-batch");
     let (h0, ta0) = coinbase_block(0, Fk::NULL, None);

@@ -319,6 +319,8 @@ pub struct Query {
     confirm_stats: Arc<ConfirmStats>,
     /// Tip height of last in-process io_uring recover (`u32::MAX` = none).
     uring_recover_tip: AtomicU32,
+    /// Highest height whose inwit was dropped (`u32::MAX` = prune off).
+    pruneheight: AtomicU32,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -418,6 +420,7 @@ impl Query {
             disconnect_gen: AtomicU64::new(0),
             confirm_stats: Arc::new(ConfirmStats::default()),
             uring_recover_tip: AtomicU32::new(u32::MAX),
+            pruneheight: AtomicU32::new(u32::MAX),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -434,6 +437,47 @@ impl Query {
     #[inline]
     pub fn confirm_stats_arc(&self) -> Arc<ConfirmStats> {
         Arc::clone(&self.confirm_stats)
+    }
+
+    /// Durable-later watermark: creates at this height and below have no inwit.
+    pub fn pruneheight(&self) -> Option<Height> {
+        match self.pruneheight.load(AtomicOrdering::Acquire) {
+            u32::MAX => None,
+            h => Some(Height(h)),
+        }
+    }
+
+    pub fn set_pruneheight(&self, height: Option<Height>) {
+        let v = height.map(|h| h.0).unwrap_or(u32::MAX);
+        self.pruneheight.store(v, AtomicOrdering::Release);
+    }
+
+    /// `false` when this create's connected height is at/below [`Self::pruneheight`].
+    pub fn inwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
+        let Some(ph) = self.pruneheight() else {
+            return Ok(true);
+        };
+        match self.store.tx_height_get(fk)? {
+            None => Ok(true),
+            Some(h) => Ok(h > ph.0),
+        }
+    }
+
+    fn require_inwit_at(&self, height: Height) -> Result<(), QueryError> {
+        if let Some(ph) = self.pruneheight() {
+            if height.0 <= ph.0 {
+                return Err(StoreError::Pruned { height: height.0 });
+            }
+        }
+        Ok(())
+    }
+
+    fn require_inwit_fk(&self, fk: Fk) -> Result<(), QueryError> {
+        if self.inwit_available(fk)? {
+            return Ok(());
+        }
+        let height = self.store.tx_height_get(fk)?.unwrap_or(0);
+        Err(StoreError::Pruned { height })
     }
 
     /// After `head_insert_many` returned these fks (inclusive max).
@@ -1248,6 +1292,7 @@ impl Query {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
         }
+        self.require_inwit_fk(create_fk)?;
         let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
         inputs.get(i as usize).cloned().ok_or(StoreError::NotFound)
     }

@@ -31,6 +31,10 @@ pub enum StoreError {
     Stale(&'static str),
     /// Request refused (DoS cap) — not on-disk corruption.
     Rejected(&'static str),
+    /// Class A inwit dropped at/below the prune watermark. Not corruption.
+    Pruned {
+        height: u32,
+    },
 }
 
 impl StoreError {
@@ -83,6 +87,7 @@ impl fmt::Display for StoreError {
             StoreError::Layout(m) => write!(f, "{m}"),
             StoreError::Stale(m) => write!(f, "{m}"),
             StoreError::Rejected(m) => f.write_str(m),
+            StoreError::Pruned { height } => write!(f, "pruned data at height {height}"),
         }
     }
 }
@@ -132,6 +137,7 @@ mod tests {
             StoreError::Layout("inwit is on a cold datadir".into()),
             StoreError::Stale("chain view moved"),
             StoreError::Rejected("scripthash join exceeds --max-sh-creates"),
+            StoreError::Pruned { height: 12 },
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
         assert_eq!(texts[0], "invalid store magic");
@@ -148,6 +154,7 @@ mod tests {
         assert_eq!(texts[10], "inwit is on a cold datadir");
         assert_eq!(texts[11], "chain view moved");
         assert_eq!(texts[12], "scripthash join exceeds --max-sh-creates");
+        assert_eq!(texts[13], "pruned data at height 12");
         for e in &arms {
             assert!(e.source().is_none());
         }

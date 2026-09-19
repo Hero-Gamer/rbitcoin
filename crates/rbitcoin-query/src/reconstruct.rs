@@ -9,6 +9,7 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        self.require_inwit_fk(fk)?;
         let t0 = Instant::now();
         crate::note_confirm(&self.confirm_stats().wf_body_store, 1);
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
@@ -242,6 +243,9 @@ impl Query {
         &self,
         tx_fks: &[Fk],
     ) -> Result<Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>, QueryError> {
+        if let Some(&fk) = tx_fks.first() {
+            self.require_inwit_fk(fk)?;
+        }
         let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
         if let Some((first, last)) = Self::contiguous_fk_run(tx_fks) {
             let mut rows = self.store.get_tx_full_span(first, last)?;
@@ -270,6 +274,9 @@ impl Query {
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, QueryError> {
+        if let Some(h) = self.height_of_hash(hash)? {
+            self.require_inwit_at(h)?;
+        }
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
@@ -296,6 +303,9 @@ impl Query {
 
     pub fn reconstruct_archived_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
         self.note_reconstruct_archived();
+        if let Some(h) = self.height_of_hash(hash)? {
+            self.require_inwit_at(h)?;
+        }
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
@@ -368,6 +378,7 @@ impl Query {
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.
     pub fn reconstruct_block_at_height(&self, height: Height) -> Result<Block, QueryError> {
+        self.require_inwit_at(height)?;
         let (_fk, rec) = self.header_at_height(height)?.ok_or(StoreError::NotFound)?;
         let tx_fks = self.block_tx_fks(height)?;
         let block = self.reconstruct_archived_block_from_parts_cached(rec.clone(), tx_fks, None)?;
