@@ -39,8 +39,6 @@ before 1.0).
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
 - **Per-slice local CI:** each plan step runs the workspace suite after Green
   and the other required gates except coverage after Refactor, then commits
-- **Per-slice local CI:** each plan step runs the workspace suite after Green
-  and the other required gates except coverage after Refactor, then commits
   before the next slice. Same *commands* as CI, not the GitHub Actions `env:`.
   Coverage and native `windows` / `macos` stay GitHub Actions. See
   [`docs/how-we-plan.md`](docs/how-we-plan.md).
@@ -54,23 +52,6 @@ before 1.0).
   tx-JSON snapshot. Core RPC for that stack is unix `{datadir}/rpc.sock`
   plus the documented mempool `socketPath` patch, not cookie/Basic.
   Address-prefix stays 404. Surface: [`COMPAT.md`](COMPAT.md).
-
-- **`getnetworkhashps` matches Core:** chainwork delta over min/max header
-  time in the lookup window; `nblocks<=0` uses the difficulty retarget
-  length. Not dummy 2-work-per-block. [`docs/rpc.md`](docs/rpc.md).
-
-- **Esplora `?after_txid=`:** GET `/address|scripthash/…/txs` and `/txs/summary`
-  skip through a known txid (mempool then chain). Unknown or unparseable →
-  **422** `after_txid not found`.
-
-- **Esplora multi-script POST:** `POST /addresses|scripthashes/txs` and
-  `/txs/summary` merge unique scripts (max 300; over → **422**).
-
-- **Esplora broadcast test:** `GET /broadcast?tx=` admits like `POST /tx`.
-  `POST /txs/test` is dry-run `test_accept` with electrs `maxfeerate` BTC/kvB.
-
-- **Esplora tx JSON `sigops`:** BIP16+BIP141 cost via `tx_sigop_cost` (same as
-  Core `GetTransactionSigOpCost`).
 
 ## [0.7.0] — 2026-09-18
 
