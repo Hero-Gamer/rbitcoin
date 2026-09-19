@@ -48,7 +48,7 @@ pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
-pub use netaddr::{addr_allowed, NetAddr, OnlyNet};
+pub use netaddr::{addr_allowed, is_cjdns_ip, NetAddr, OnlyNet};
 pub use netgroup::netgroup;
 pub use peer::{
     drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,

@@ -4,7 +4,7 @@ use crate::error::NetError;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use sha3::{Digest, Sha3_256};
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -19,6 +19,7 @@ pub enum OnlyNet {
     Ipv6,
     Onion,
     I2p,
+    Cjdns,
 }
 
 impl OnlyNet {
@@ -28,7 +29,7 @@ impl OnlyNet {
             "ipv6" => Ok(Self::Ipv6),
             "onion" => Ok(Self::Onion),
             "i2p" => Ok(Self::I2p),
-            "cjdns" => Err(format!("unknown network {s} (not yet implemented)")),
+            "cjdns" => Ok(Self::Cjdns),
             other => Err(format!("unknown network {other}")),
         }
     }
@@ -39,6 +40,7 @@ impl OnlyNet {
             (Self::Ipv6, NetAddr::Ip(s)) => s.is_ipv6(),
             (Self::Onion, NetAddr::Onion { .. }) => true,
             (Self::I2p, NetAddr::I2p { .. }) => true,
+            (Self::Cjdns, NetAddr::Cjdns { .. }) => true,
             _ => false,
         }
     }
@@ -53,6 +55,12 @@ pub enum NetAddr {
     Ip(SocketAddr),
     Onion { pk: [u8; 32], port: u16 },
     I2p { dest: [u8; 32], port: u16 },
+    Cjdns { ip: Ipv6Addr, port: u16 },
+}
+
+/// BIP155 / Core: CJDNS overlay is `fc00::/8`, not RFC4193 `fc00::/7`.
+pub fn is_cjdns_ip(ip: Ipv6Addr) -> bool {
+    ip.octets()[0] == 0xfc
 }
 
 impl fmt::Display for NetAddr {
@@ -65,6 +73,7 @@ impl fmt::Display for NetAddr {
             NetAddr::I2p { dest, port } => {
                 write!(f, "{}{I2P_SUFFIX}:{port}", encode_i2p_name(&dest))
             }
+            NetAddr::Cjdns { ip, port } => write!(f, "{}", SocketAddr::from((ip, port))),
         }
     }
 }
@@ -83,13 +92,17 @@ impl NetAddr {
             return None;
         }
         match &msg.addr {
-            AddrV2::Ipv4(_) | AddrV2::Ipv6(_) => msg.socket_addr().ok().map(NetAddr::Ip),
+            AddrV2::Ipv4(_) | AddrV2::Ipv6(_) => msg.socket_addr().ok().map(NetAddr::from_socket),
             AddrV2::TorV3(pk) => Some(NetAddr::Onion {
                 pk: *pk,
                 port: msg.port,
             }),
             AddrV2::I2p(dest) => Some(NetAddr::I2p {
                 dest: *dest,
+                port: msg.port,
+            }),
+            AddrV2::Cjdns(ip) if is_cjdns_ip(*ip) => Some(NetAddr::Cjdns {
+                ip: *ip,
                 port: msg.port,
             }),
             AddrV2::TorV2(_) | AddrV2::Cjdns(_) | AddrV2::Unknown(_, _) => None,
@@ -104,12 +117,24 @@ impl NetAddr {
             },
             NetAddr::Onion { pk, .. } => AddrV2::TorV3(pk),
             NetAddr::I2p { dest, .. } => AddrV2::I2p(dest),
+            NetAddr::Cjdns { ip, .. } => AddrV2::Cjdns(ip),
+        }
+    }
+
+    pub fn from_socket(s: SocketAddr) -> Self {
+        match s.ip() {
+            IpAddr::V6(v) if is_cjdns_ip(v) => NetAddr::Cjdns {
+                ip: v,
+                port: s.port(),
+            },
+            _ => NetAddr::Ip(s),
         }
     }
 
     pub fn socket_addr(self) -> Option<SocketAddr> {
         match self {
             NetAddr::Ip(s) => Some(s),
+            NetAddr::Cjdns { ip, port } => Some(SocketAddr::from((ip, port))),
             NetAddr::Onion { .. } | NetAddr::I2p { .. } => None,
         }
     }
@@ -117,6 +142,7 @@ impl NetAddr {
     pub fn is_ipv6(self) -> bool {
         match self {
             NetAddr::Ip(s) => s.is_ipv6(),
+            NetAddr::Cjdns { .. } => true,
             NetAddr::Onion { .. } | NetAddr::I2p { .. } => false,
         }
     }
@@ -124,13 +150,16 @@ impl NetAddr {
     pub fn port(self) -> u16 {
         match self {
             NetAddr::Ip(s) => s.port(),
-            NetAddr::Onion { port, .. } | NetAddr::I2p { port, .. } => port,
+            NetAddr::Onion { port, .. }
+            | NetAddr::I2p { port, .. }
+            | NetAddr::Cjdns { port, .. } => port,
         }
     }
 
     pub fn host_str(self) -> String {
         match self {
             NetAddr::Ip(s) => s.ip().to_string(),
+            NetAddr::Cjdns { ip, .. } => ip.to_string(),
             NetAddr::Onion { pk, .. } => format!("{}.onion", encode_onion_name(&pk)),
             NetAddr::I2p { dest, .. } => format!("{}{I2P_SUFFIX}", encode_i2p_name(&dest)),
         }
@@ -142,6 +171,7 @@ impl NetAddr {
             NetAddr::Ip(_) => "ipv6",
             NetAddr::Onion { .. } => "onion",
             NetAddr::I2p { .. } => "i2p",
+            NetAddr::Cjdns { .. } => "cjdns",
         }
     }
 }
@@ -167,7 +197,7 @@ fn parse_net_addr(s: &str) -> Result<NetAddr, NetError> {
         return Ok(NetAddr::Onion { pk, port });
     }
     s.parse()
-        .map(NetAddr::Ip)
+        .map(NetAddr::from_socket)
         .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
 }
 
@@ -325,7 +355,7 @@ fn b32_decode(s: &str) -> Option<[u8; 35]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn netaddr_onion_parse_roundtrip() {
@@ -345,7 +375,9 @@ mod tests {
                 );
                 assert_eq!(port, 8333);
             }
-            NetAddr::Ip(_) | NetAddr::I2p { .. } => panic!("expected onion"),
+            NetAddr::Ip(_) | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } => {
+                panic!("expected onion")
+            }
         }
         assert!(
             "qg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
@@ -399,5 +431,38 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p:1"
         );
         assert!("short.b32.i2p:1".parse::<NetAddr>().is_err());
+    }
+
+    #[test]
+    fn netaddr_cjdns_addrv2_roundtrip() {
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let msg = AddrV2Message {
+            time: 1,
+            services: bitcoin::p2p::ServiceFlags::NETWORK,
+            addr: AddrV2::Cjdns(ip),
+            port: 8333,
+        };
+        let a = NetAddr::from_addrv2(&msg).expect("cjdns addrv2");
+        assert_eq!(a, NetAddr::Cjdns { ip, port: 8333 });
+        assert_eq!(a.to_addrv2(), AddrV2::Cjdns(ip));
+        assert_eq!(a.network_label(), "cjdns");
+        assert_eq!(a.port(), 8333);
+        assert_eq!(a.socket_addr(), Some(SocketAddr::from((ip, 8333))));
+        let parsed: NetAddr = a.to_string().parse().unwrap();
+        assert_eq!(parsed, a);
+        assert!(OnlyNet::Cjdns.matches_addr(a));
+        assert!(!OnlyNet::Ipv6.matches_addr(a));
+    }
+
+    #[test]
+    fn cjdns_rejects_global_unicast() {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let msg = AddrV2Message {
+            time: 1,
+            services: bitcoin::p2p::ServiceFlags::NETWORK,
+            addr: AddrV2::Cjdns(ip),
+            port: 8333,
+        };
+        assert!(NetAddr::from_addrv2(&msg).is_none());
     }
 }

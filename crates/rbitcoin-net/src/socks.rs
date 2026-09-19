@@ -159,6 +159,9 @@ impl Dialer {
             crate::NetAddr::I2p { .. } => {
                 Err(NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
             }
+            crate::NetAddr::Cjdns { ip, port } => {
+                Ok(TcpStream::connect(SocketAddr::from((ip, port))).await?)
+            }
         }
     }
 
@@ -175,6 +178,9 @@ impl Dialer {
             }
             crate::NetAddr::I2p { .. } => {
                 crate::i2p_sam::stream_connect_installed(&addr.host_str()).await
+            }
+            crate::NetAddr::Cjdns { ip, port } => {
+                Ok(TcpStream::connect(SocketAddr::from((ip, port))).await?)
             }
         }
     }

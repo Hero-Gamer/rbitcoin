@@ -299,6 +299,7 @@ pub struct AddrMan {
     asmap: Option<Arc<AsMap>>,
     last_attempt: HashMap<NetAddr, Instant>,
     only_net: Vec<OnlyNet>,
+    cjdns_reachable: bool,
 }
 
 impl AddrMan {
@@ -332,8 +333,19 @@ impl AddrMan {
         self.only_net = only;
     }
 
+    pub fn set_cjdns_reachable(&mut self, on: bool) {
+        self.cjdns_reachable = on;
+    }
+
     fn allowed(&self, addr: NetAddr) -> bool {
         addr_allowed(addr, &self.only_net)
+    }
+
+    fn dialable(&self, addr: NetAddr) -> bool {
+        if matches!(addr, NetAddr::Cjdns { .. }) && !self.cjdns_reachable {
+            return false;
+        }
+        self.allowed(addr)
     }
 
     /// Like [`Self::take_dial_candidates`] plus onion rows when `--only-net` allows them.
@@ -351,7 +363,7 @@ impl AddrMan {
         let mut out: Vec<NetAddr> = self
             .take_dial_candidates(max, &ip_ex, occupied)
             .into_iter()
-            .map(NetAddr::Ip)
+            .map(NetAddr::from_socket)
             .collect();
         if out.len() >= max {
             return out;
@@ -361,7 +373,7 @@ impl AddrMan {
                 break;
             }
             if !matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. })
-                || !self.allowed(a)
+                || !self.dialable(a)
                 || exclude.contains(&a)
             {
                 continue;
@@ -374,7 +386,7 @@ impl AddrMan {
     }
 
     pub fn add(&mut self, addr: SocketAddr) {
-        self.add_addr(NetAddr::Ip(addr));
+        self.add_addr(NetAddr::from_socket(addr));
     }
 
     pub fn add_addr(&mut self, addr: NetAddr) {
@@ -395,7 +407,7 @@ impl AddrMan {
     ///
     /// Uncapped so `load` can keep tried-first then trim. `merge_from` trims.
     pub fn add_with_flags(&mut self, addr: SocketAddr, flags: PeerFlags) {
-        self.add_with_flags_addr(NetAddr::Ip(addr), flags);
+        self.add_with_flags_addr(NetAddr::from_socket(addr), flags);
     }
 
     pub fn add_with_flags_addr(&mut self, addr: NetAddr, flags: PeerFlags) {
@@ -414,7 +426,7 @@ impl AddrMan {
     /// over-cap book (`add` exceed), and a full book of only tried addrs
     /// return false. Never exceeds `cap`.
     pub fn add_learned(&mut self, addr: SocketAddr, cap: usize) -> bool {
-        self.add_learned_addr(NetAddr::Ip(addr), cap)
+        self.add_learned_addr(NetAddr::from_socket(addr), cap)
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, cap: usize) -> bool {
@@ -523,7 +535,7 @@ impl AddrMan {
     }
 
     pub fn flags(&self, addr: &SocketAddr) -> PeerFlags {
-        self.flags_of(&NetAddr::Ip(*addr))
+        self.flags_of(&NetAddr::from_socket(*addr))
     }
 
     fn flags_of(&self, addr: &NetAddr) -> PeerFlags {
@@ -534,7 +546,7 @@ impl AddrMan {
     }
 
     pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
-        self.entry_of(&NetAddr::Ip(*addr))
+        self.entry_of(&NetAddr::from_socket(*addr))
     }
 
     fn entry_of(&self, addr: &NetAddr) -> Option<PeerEntry> {
@@ -553,7 +565,8 @@ impl AddrMan {
 
     /// Successful BIP324 handshake.
     pub fn note_connected(&mut self, addr: SocketAddr) {
-        self.note_connected_addr(NetAddr::Ip(addr));
+    pub fn note_connected(&mut self, addr: SocketAddr) {
+        self.note_connected_addr(NetAddr::from_socket(addr));
     }
 
     pub fn note_connected_addr(&mut self, addr: NetAddr) {
@@ -571,7 +584,7 @@ impl AddrMan {
     }
 
     pub(crate) fn note_attempt_at(&mut self, addr: SocketAddr, when: Instant) {
-        self.last_attempt.insert(NetAddr::Ip(addr), when);
+        self.last_attempt.insert(NetAddr::from_socket(addr), when);
     }
 
     pub fn note_attempt_addr(&mut self, addr: NetAddr) {
@@ -580,13 +593,13 @@ impl AddrMan {
 
     fn recently_attempted(&self, addr: SocketAddr, now: Instant) -> bool {
         self.last_attempt
-            .get(&NetAddr::Ip(addr))
+            .get(&NetAddr::from_socket(addr))
             .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
     }
 
     /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
     pub fn note_connect_failed(&mut self, addr: SocketAddr, incompatible: bool) {
-        self.note_connect_failed_addr(NetAddr::Ip(addr), incompatible);
+        self.note_connect_failed_addr(NetAddr::from_socket(addr), incompatible);
     }
 
     pub fn note_connect_failed_addr(&mut self, addr: NetAddr, incompatible: bool) {
@@ -604,7 +617,7 @@ impl AddrMan {
     /// Throughput / latency sample from an active session.
     pub fn note_speed(&mut self, addr: SocketAddr, latency_ms: u64, bytes_per_sec: u64) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.apply_speed_sample(latency_ms, bytes_per_sec);
         }
@@ -614,7 +627,7 @@ impl AddrMan {
     /// would otherwise leave a prior FAST bit and keep `dial_tier` 0).
     pub fn note_ibd_slow(&mut self, addr: SocketAddr) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.insert(PeerFlags::SLOW);
             f.remove(PeerFlags::FAST);
@@ -664,7 +677,7 @@ impl AddrMan {
             .iter()
             .copied()
             .filter_map(|a| {
-                if !self.allowed(a) {
+                if !self.dialable(a) {
                     return None;
                 }
                 let sock = a.socket_addr()?;
@@ -1654,5 +1667,78 @@ mod tests {
         let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
         assert_eq!(got, vec![i2p]);
         assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn cjdns_not_dialed_when_unreachable() {
+        use std::net::Ipv6Addr;
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let cjdns = NetAddr::Cjdns { ip, port: 8333 };
+        let sock = SocketAddr::from((ip, 8333));
+        let mut am = AddrMan::new();
+        am.add_addr(cjdns);
+        am.add(addr(1));
+        assert!(am
+            .take_dial_candidates(8, &HashSet::new(), &[])
+            .contains(&addr(1)));
+        assert!(
+            !am.take_dial_candidates(8, &HashSet::new(), &[])
+                .contains(&sock),
+            "fc00 must not dial without --cjdns-reachable"
+        );
+        am.set_cjdns_reachable(true);
+        am.add_addr(cjdns);
+        let got = am.take_dial_candidates(8, &HashSet::new(), &[]);
+        assert!(
+            got.contains(&sock),
+            "reachable cjdns must dial, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn only_net_cjdns_filters_ipv4() {
+        use std::net::Ipv6Addr;
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let cjdns = NetAddr::Cjdns { ip, port: 8333 };
+        let sock = SocketAddr::from((ip, 8333));
+        let mut am = AddrMan::new();
+        am.set_cjdns_reachable(true);
+        am.add(addr(1));
+        am.add_addr(cjdns);
+        am.set_only_net(vec![OnlyNet::Cjdns]);
+        let got = am.take_dial_candidates(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![sock]);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_cjdns() {
+        use std::net::Ipv6Addr;
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-cjdns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let cjdns = NetAddr::Cjdns {
+            ip: Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7),
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.set_cjdns_reachable(true);
+        am.add_addr(cjdns);
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == cjdns),
+            "cjdns must persist, got {:?}",
+            loaded.entries()
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("fc00:"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25,6 +25,7 @@ pub(crate) fn isolated_broadcast_targets(am: &AddrMan, max: usize) -> Vec<NetAdd
             NetAddr::Onion { .. } => onions.push(e.addr),
             NetAddr::Ip(_) => ips.push(e.addr),
             NetAddr::I2p { .. } => {}
+            NetAddr::Cjdns { .. } => {}
         }
     }
     let mut out = Vec::new();

@@ -1144,6 +1144,7 @@ pub struct PeerHub {
     discover: AtomicBool,
     /// Clearnet P2P bind (not onion-only loopback). Needed to gossip `--external-ip`.
     clearnet_listen: AtomicBool,
+    cjdns_reachable: AtomicBool,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
     /// Tip-mode mempool for Core `EraseForPeer` on disconnect.
     mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
@@ -1190,10 +1191,18 @@ fn addr_sample_seed(bind: SocketAddr, now: u64) -> u64 {
     s
 }
 
-fn ip_is_advertisable(ip: &IpAddr) -> bool {
+fn ip_is_advertisable(ip: &IpAddr, cjdns_reachable: bool) -> bool {
     match ip {
         IpAddr::V4(v) => !(v.is_unspecified() || v.is_loopback() || v.is_private()),
-        IpAddr::V6(v) => !(v.is_unspecified() || v.is_loopback()),
+        IpAddr::V6(v) => {
+            if v.is_unspecified() || v.is_loopback() {
+                return false;
+            }
+            if crate::netaddr::is_cjdns_ip(*v) {
+                return cjdns_reachable;
+            }
+            true
+        }
     }
 }
 
@@ -1222,6 +1231,7 @@ impl PeerHub {
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             clearnet_listen: AtomicBool::new(true),
+            cjdns_reachable: AtomicBool::new(false),
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
@@ -1301,6 +1311,10 @@ impl PeerHub {
         self.clearnet_listen.store(on, Ordering::Relaxed);
     }
 
+    pub fn set_cjdns_reachable(&self, on: bool) {
+        self.cjdns_reachable.store(on, Ordering::Relaxed);
+    }
+
     pub fn set_listen_port(&self, port: u16) {
         self.listen_port.store(port, Ordering::Relaxed);
     }
@@ -1359,7 +1373,8 @@ impl PeerHub {
             return None;
         }
         let g = self.external_ips.lock().unwrap_or_else(|e| e.into_inner());
-        let ip = g.iter().copied().find(ip_is_advertisable)?;
+        let cjdns = self.cjdns_reachable.load(Ordering::Relaxed);
+        let ip = g.iter().copied().find(|ip| ip_is_advertisable(ip, cjdns))?;
         Some(SocketAddr::new(ip, port))
     }
 
@@ -3281,5 +3296,47 @@ mod tests {
             "I2P must stay in the book, got {:?}",
             book.entries()
         );
+    }
+
+    #[test]
+    fn learn_addrv2_keeps_cjdns() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+        use std::net::Ipv6Addr;
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        hub.learn_addrv2(&[AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Cjdns(ip),
+            port: 8333,
+        }]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let want = crate::NetAddr::Cjdns { ip, port: 8333 };
+        assert!(
+            book.entries().iter().any(|e| e.addr == want),
+            "CJDNS must stay in the book, got {:?}",
+            book.entries()
+        );
+    }
+
+    #[test]
+    fn fc00_not_advertisable_without_cjdns_reachable() {
+        use std::net::Ipv6Addr;
+        let hub = PeerHub::new();
+        hub.set_discover(true);
+        hub.set_clearnet_listen(true);
+        hub.set_listen_port(8333);
+        hub.set_external_ips(vec![IpAddr::V6(Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7))]);
+        assert!(hub.advertise_local_socket().is_none());
+        hub.set_cjdns_reachable(true);
+        let sock = hub.advertise_local_socket().expect("cjdns listen");
+        assert_eq!(
+            sock.ip(),
+            IpAddr::V6(Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7))
+        );
+        assert_eq!(sock.port(), 8333);
     }
 }
