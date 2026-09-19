@@ -100,8 +100,9 @@ impl FeeSnapshot {
     }
 }
 
-/// Published live-mempool txs (txid-sorted). Request path Arc-loads; admit
-/// only sets dirty. Esplora fills [`MempoolTxSnapEntry::json`] once per entry.
+/// Published live-mempool txs (txid-sorted). Lazy: unix `/internal` mempool-tx
+/// pages Arc-load; admit only sets dirty. Esplora fills [`MempoolTxSnapEntry::json`]
+/// once per entry. `GET /mempool` uses the fee snapshot, not this.
 #[derive(Debug)]
 pub struct MempoolTxSnapshot {
     entries: Vec<MempoolTxSnapEntry>,
