@@ -62,6 +62,7 @@ pub use seeds::{
 };
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
 pub use service::P2PNode;
+pub use socks::Dialer;
 pub use tx_relay::{
     ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample, MempoolTxSnapEntry,
     MempoolTxSnapshot,
