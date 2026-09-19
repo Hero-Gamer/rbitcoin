@@ -443,6 +443,14 @@ mempool_size_mb=100
 (system `tor`, not Arti). DNS seeds are not resolved locally on that path —
 pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
+`--proxy` or `--onion` also turns on **isolated local-tx broadcast**:
+`sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
+`POST /tx` (and packages) are not INV'd on standing peers. After mempool
+accept the node opens a short-lived SOCKS circuit (fresh isolation
+credentials), BIP324-handshakes one or two AddrMan peers (onion first),
+sends `tx`, and disconnects. This is **not** Dandelion++. If that
+one-shot fails, the tx stays in the mempool and is still not INV'd;
+confirmation can still arrive in a block.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
 `--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`) filters dial and learn;
 onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start

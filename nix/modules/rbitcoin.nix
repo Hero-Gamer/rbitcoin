@@ -220,7 +220,7 @@ in
       type = types.nullOr types.str;
       default = null;
       example = "127.0.0.1:9050";
-      description = "SOCKS5 proxy HOST:PORT for all P2P outbound.";
+      description = "SOCKS5 proxy HOST:PORT for all P2P outbound. Also enables isolated local-tx broadcast (new SOCKS circuit after sendraw / Electrum / Esplora submit; not Dandelion++). Standing peers do not INV those txs.";
     };
 
     onionProxy = mkOption {
