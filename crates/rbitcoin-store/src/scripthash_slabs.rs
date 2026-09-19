@@ -5,11 +5,10 @@
 //! the fk stream is shared by slab payloads and megakey pages
 //! ([`encode_fk_delta_stream_into`]).
 
-use crate::compact::{read_uleb128, write_uleb128_into};
 use crate::error::StoreError;
 use crate::scripthash_layout::{slab_bytes, slab_cap, SH_INLINE_CAP, SH_MAX_SLAB_CLASS};
 use crate::scripthash_pages::SH_FLAG_BIT;
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{read_uleb128, write_uleb128_into, Fk};
 
 /// First fk count that freezes into a megakey page chain (class 6 cap + 1).
 pub const SH_MEGAKEY_MIN_FKS: u32 = 257;
@@ -249,7 +248,7 @@ mod tests {
         assert!(encode_stream(&[1, SH_FLAG_BIT | 2]).is_err());
         assert!(decode_stream(&[0x00], 1).is_err());
         let mut flagged = Vec::new();
-        crate::compact::write_uleb128(&mut flagged, SH_FLAG_BIT);
+        rbitcoin_primitives::write_uleb128(&mut flagged, SH_FLAG_BIT);
         assert!(decode_stream(&flagged, 1).is_err());
         assert!(decode_stream(&[0x01, 0x00], 2).is_err());
         assert!(decode_slab(&[0]).is_err());

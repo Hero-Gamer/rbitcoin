@@ -23,6 +23,13 @@ before 1.0).
 
 ### Changed
 
+- **Q-56:** shipped scriptnum (encode/decode/is_minimal, width 4 and 5) and
+  pack-ints (CompactSize + ULEB128) live in `rbitcoin-primitives`. Interpreter,
+  store, and mempool call those fns directly (`From` maps crate errors). Signet
+  walks CompactSize with `read_compact_size_from` and decodes the default
+  challenge with primitives hex. `cfg(miri)` extra loops on those fns. Nightly
+  `miri.yml` stays primitives-only (**Q-53**).
+
 - **Workspace version 0.7.99:** in-tree toward 0.8.0.
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
 
@@ -103,8 +110,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
 - **Q-54 Won't-fix:** ast-grep named-cap rules. Caps stay in
   [`docs/ibd-memory.md`](docs/ibd-memory.md) and production evict.
   Pinning `const = 128` is a second clippy. **Q-51** already owns
-  shapes. **Q-56** stays Open: peel shipped scriptnum + pack-ints into
-  primitives so Miri runs the functions confirm/store call.
+  shapes.
 
 - **Coverage LCOV floor 92%:** production `LH*100 >= LF*92` (was 91%). Master
   has held ~92.0–92.2% since 2026-09-16. Still no never-falls ratchet.

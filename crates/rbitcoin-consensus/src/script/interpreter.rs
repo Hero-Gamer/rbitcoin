@@ -23,6 +23,7 @@ use bitcoin::{Amount, Sequence, Transaction, TxOut};
 
 use super::crypto;
 use crate::error::ConsensusError;
+use rbitcoin_primitives::{scriptnum_decode, scriptnum_decode_width, scriptnum_encode};
 
 /// Stack element cap (main + alt).
 const MAX_STACK_SIZE: usize = 1000;
@@ -1502,28 +1503,6 @@ fn bool_encode(b: bool) -> Vec<u8> {
     }
 }
 
-fn scriptnum_encode(mut n: i64) -> Vec<u8> {
-    if n == 0 {
-        return vec![];
-    }
-    let neg = n < 0;
-    if neg {
-        n = -n;
-    }
-    let mut out = Vec::new();
-    while n > 0 {
-        out.push((n & 0xff) as u8);
-        n >>= 8;
-    }
-    if out.last().map(|b| b & 0x80 != 0).unwrap_or(false) {
-        out.push(if neg { 0x80 } else { 0x00 });
-    } else if neg {
-        let last = out.last_mut().unwrap();
-        *last |= 0x80;
-    }
-    out
-}
-
 /// Data must use the shortest opcode form.
 fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
     if data.is_empty() {
@@ -1543,52 +1522,6 @@ fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
     }
     if data.len() <= 65535 {
         return opcode == 0x4d;
-    }
-    true
-}
-
-/// Decode a script number with Core's general 4-byte limit (arithmetic).
-fn scriptnum_decode(v: &[u8], require_minimal: bool) -> Result<i64, ConsensusError> {
-    scriptnum_decode_width(v, 4, require_minimal)
-}
-
-/// Decode a script number with explicit max byte length.
-/// CLTV/CSV use `max_len = 5` so full u32 locktime/sequence ranges encode as
-/// positive script numbers (5-byte width).
-fn scriptnum_decode_width(
-    v: &[u8],
-    max_len: usize,
-    require_minimal: bool,
-) -> Result<i64, ConsensusError> {
-    if v.len() > max_len {
-        return Err(ConsensusError::Script("scriptnum overflow".into()));
-    }
-    if require_minimal && !scriptnum_is_minimal(v) {
-        return Err(ConsensusError::Script("SCRIPTNUM".into()));
-    }
-    if v.is_empty() {
-        return Ok(0);
-    }
-    let mut result: i64 = 0;
-    for (i, &b) in v.iter().enumerate() {
-        result |= (b as i64) << (8 * i);
-    }
-    if v.last().unwrap() & 0x80 != 0 {
-        result &= !(0x80i64 << (8 * (v.len() - 1)));
-        result = -result;
-    }
-    Ok(result)
-}
-
-/// Minimal script-integer encoding (no extra leading zero bytes).
-fn scriptnum_is_minimal(vch: &[u8]) -> bool {
-    if vch.is_empty() {
-        return true;
-    }
-    // If the most-significant-byte (excluding sign bit) is zero, not minimal —
-    // unless the second-most-significant-byte has the high bit set (±255 edge).
-    if vch[vch.len() - 1] & 0x7f == 0 && (vch.len() <= 1 || (vch[vch.len() - 2] & 0x80) == 0) {
-        return false;
     }
     true
 }
@@ -2283,7 +2216,10 @@ mod success_and_disabled_tests {
     #[test]
     fn cltv_and_csv_negative_zero_is_not_negative() {
         // 0x80 is scriptnum negative-zero → 0, not < 0.
-        assert_eq!(scriptnum_decode_width(&[0x80], 5, false).unwrap(), 0);
+        assert_eq!(
+            rbitcoin_primitives::scriptnum_decode_width(&[0x80], 5, false).unwrap(),
+            0
+        );
 
         // eval() uses nLockTime=0 and final nSequence (Core script_tests template).
         // CLTV(0) then fails final-sequence / unsatisfied — never "negative".
@@ -2449,6 +2385,7 @@ mod minimal_data_tests {
 
     #[test]
     fn scriptnum_minimal_encoding() {
+        use rbitcoin_primitives::scriptnum_is_minimal;
         assert!(scriptnum_is_minimal(&[]));
         assert!(!scriptnum_is_minimal(&[0x00])); // zero pad
         assert!(!scriptnum_is_minimal(&[0x80])); // negative zero

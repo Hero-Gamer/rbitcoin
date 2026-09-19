@@ -3,12 +3,12 @@
 use super::*;
 use crate::compact::{
     classify_script, decode_script_kind_v17, encode_script_kind_v17, expand_script_kind,
-    write_uleb128, SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
+    SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
     SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
     SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
 };
 use crate::hashhead::{HeadOpenOpts, HeadScale};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{read_uleb128, write_compact_size, write_uleb128, Fk, TableKind};
 use std::path::Path;
 
 fn tempfile_dir(name: &str) -> std::path::PathBuf {
@@ -1575,7 +1575,6 @@ fn input_flags_roundtrip() {
 
 #[test]
 fn input_rejects_legacy_local_prev() {
-    use crate::compact::write_compact_size;
     // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
     let flags = input_flags::RESERVED4
         | input_flags::SEQ_FINAL
@@ -1667,7 +1666,7 @@ fn output_messy_546_keeps_zero_exp() {
     let rec = OutputRecord::unspent(546, vec![0x51]);
     let enc = rec.encode();
     assert_eq!(enc[0] >> 4, 0);
-    let (v, n) = crate::compact::read_uleb128(&enc[1..]).unwrap();
+    let (v, n) = read_uleb128(&enc[1..]).unwrap();
     assert_eq!(v, 546);
     assert_eq!(n + 1, enc.len());
     assert_eq!(OutputRecord::decode(&enc).unwrap().value, 546);
@@ -3403,7 +3402,7 @@ fn script_kind_v17_op_return_single_push() {
     let mut script = vec![0x6a, data.len() as u8];
     script.extend_from_slice(&data);
     let mut disk = Vec::new();
-    crate::compact::write_compact_size(&mut disk, data.len() as u64);
+    write_compact_size(&mut disk, data.len() as u64);
     disk.extend_from_slice(&data);
     assert_kind_roundtrip(&script, SCRIPT_KIND_V17_OP_RETURN_PUSH, &data, &disk);
 }
@@ -3426,7 +3425,7 @@ fn script_kind_v17_p2pkh_lookalike_stays_raw() {
     let enc_kind = encode_script_kind_v17(&script, &mut buf);
     assert_eq!(enc_kind, SCRIPT_KIND_V17_RAW);
     let mut expect = Vec::new();
-    crate::compact::write_compact_size(&mut expect, script.len() as u64);
+    write_compact_size(&mut expect, script.len() as u64);
     expect.extend_from_slice(&script);
     assert_eq!(buf, expect);
     let (got, n) = decode_script_kind_v17(enc_kind, &buf).unwrap();

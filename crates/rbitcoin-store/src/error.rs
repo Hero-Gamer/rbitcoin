@@ -1,3 +1,4 @@
+use rbitcoin_primitives::PackError;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -95,6 +96,12 @@ impl std::error::Error for StoreError {
     }
 }
 
+impl From<PackError> for StoreError {
+    fn from(e: PackError) -> Self {
+        StoreError::Corrupt(e.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +187,11 @@ mod tests {
             source: io::Error::other("disk"),
         }
         .is_uring_session_fault());
+    }
+
+    #[test]
+    fn pack_error_is_corrupt() {
+        let e: StoreError = PackError("compact size empty").into();
+        assert!(matches!(e, StoreError::Corrupt("compact size empty")));
     }
 }

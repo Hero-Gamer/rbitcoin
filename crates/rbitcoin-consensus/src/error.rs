@@ -1,3 +1,4 @@
+use rbitcoin_primitives::ScriptNumError;
 use rbitcoin_store::StoreError;
 use std::fmt;
 
@@ -42,6 +43,12 @@ impl std::error::Error for ConsensusError {
             ConsensusError::Store(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<ScriptNumError> for ConsensusError {
+    fn from(e: ScriptNumError) -> Self {
+        ConsensusError::Script(e.to_string())
     }
 }
 
@@ -161,6 +168,10 @@ mod tests {
             ConsensusError::from(StoreError::Cancelled("stop")),
             ConsensusError::Cancelled
         ));
+        assert_eq!(
+            ConsensusError::from(ScriptNumError::Overflow).to_string(),
+            "script verification failed: scriptnum overflow"
+        );
     }
 
     #[test]

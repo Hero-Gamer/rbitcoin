@@ -1,3 +1,4 @@
+use rbitcoin_primitives::PackError;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
@@ -45,6 +46,12 @@ impl MempoolError {
     }
 }
 
+impl From<PackError> for MempoolError {
+    fn from(e: PackError) -> Self {
+        MempoolError::Corrupt(e.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +79,11 @@ mod tests {
         let full = MempoolError::Full;
         assert_eq!(format!("{full}"), "mempool full (no free slots)");
         assert!(full.source().is_none());
+
+        let from_pack: MempoolError = PackError("compact size empty").into();
+        assert!(matches!(
+            from_pack,
+            MempoolError::Corrupt("compact size empty")
+        ));
     }
 }

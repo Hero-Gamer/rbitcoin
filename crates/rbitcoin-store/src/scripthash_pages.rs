@@ -21,11 +21,10 @@
 //! Chain is **singly linked** first → … → last. Pack8 paged/extent stores the
 //! last-page off; the last page header holds first-page / extent_base.
 
-use crate::compact::{read_uleb128, uleb128_len, write_uleb128_into};
 use crate::error::StoreError;
 use crate::scripthash_layout::SH_ENTRY_LEN;
 use crate::scripthash_slabs::{decode_fk_delta_stream_into, encode_fk_delta_stream_into};
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{read_uleb128, uleb128_len, write_uleb128_into, Fk};
 
 /// Disk page size for SH FK chains (aligned allocations).
 pub const SH_PAGE_SIZE: usize = 4096;
@@ -872,7 +871,7 @@ mod tests {
         page[SH_PAGE_OFF_FKS] = 0;
         assert!(sh_page_entries(&page).is_err());
         let mut stream = Vec::new();
-        crate::compact::write_uleb128(&mut stream, SH_FLAG_BIT | 9);
+        rbitcoin_primitives::write_uleb128(&mut stream, SH_FLAG_BIT | 9);
         page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + stream.len()].copy_from_slice(&stream);
         assert!(sh_page_entries(&page).is_err());
     }
@@ -886,7 +885,7 @@ mod tests {
         page[SH_PAGE_OFF_FKS] = 0;
         assert!(sh_page_last_fk(&page).is_err());
         let mut flagged = Vec::new();
-        crate::compact::write_uleb128(&mut flagged, SH_FLAG_BIT | 42);
+        rbitcoin_primitives::write_uleb128(&mut flagged, SH_FLAG_BIT | 42);
         page[SH_PAGE_OFF_FKS..SH_PAGE_OFF_FKS + flagged.len()].copy_from_slice(&flagged);
         assert!(sh_page_last_fk(&page).is_err());
         sh_page_init_empty(&mut page);
