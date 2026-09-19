@@ -34,6 +34,7 @@ pkgs.testers.runNixOSTest {
         rpc.enable = true;
         tor.control = "127.0.0.1:9051";
         i2p.sam = "127.0.0.1:7656";
+        cjdns.reachable = true;
         extraArgs = [
           "--max-outbound"
           "4"
@@ -76,6 +77,7 @@ pkgs.testers.runNixOSTest {
     machine.succeed("grep -Fx -- '127.0.0.1:9051' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '--listen-onion' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '--i2p-sam' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--cjdns-reachable' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '127.0.0.1:7656' /var/lib/rbitcoin-test/args")
     machine.succeed("systemctl show -p After rbitcoin.service | grep -F tor.service")
     machine.succeed("systemctl show -p After rbitcoin.service | grep -F i2pd.service")

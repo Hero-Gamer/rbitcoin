@@ -41,6 +41,7 @@ let
 
   needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService || cfg.esplora.hiddenService || cfg.p2p.listenOnion;
   needI2pSam = cfg.i2p.sam != null;
+  needCjdns = cfg.cjdns.reachable;
   torControlAddr =
     if cfg.tor.control != null then
       cfg.tor.control
@@ -96,6 +97,7 @@ let
   ++ optional needI2pSam "--i2p-sam"
   ++ optional needI2pSam cfg.i2p.sam
   ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
+  ++ optional cfg.cjdns.reachable "--cjdns-reachable"
   ++ optional cfg.esplora.hiddenService "--esplora-onion"
   ++ cfg.extraArgs;
 in
@@ -213,7 +215,15 @@ in
       acceptIncoming = mkOption {
         type = types.bool;
         default = false;
-        description = "STREAM FORWARD to the P2P bind. Requires i2p.sam and p2p.listen. Persists {dataDir}/i2p/p2p.priv.";
+        description = "STREAM FORWARD to the P2P bind. Requires i2p.sam and (p2p.listen or p2p.listenOnion). Persists {dataDir}/i2p/p2p.priv.";
+      };
+    };
+
+    cjdns = {
+      reachable = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires this. After/Wants cjdns.service. No in-process router.";
       };
     };
 
@@ -376,8 +386,12 @@ in
         message = "services.rbitcoin.i2p.acceptIncoming requires i2p.sam";
       }
       {
-        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.listen;
-        message = "services.rbitcoin.i2p.acceptIncoming requires p2p.listen (STREAM FORWARD needs a P2P bind)";
+        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.listen || cfg.p2p.listenOnion;
+        message = "services.rbitcoin.i2p.acceptIncoming requires p2p.listen or p2p.listenOnion (STREAM FORWARD needs a P2P bind)";
+      }
+      {
+        assertion = !(builtins.elem "cjdns" cfg.onlyNet) || cfg.cjdns.reachable;
+        message = "services.rbitcoin.onlyNet cjdns requires cjdns.reachable";
       }
     ];
 
@@ -411,12 +425,14 @@ in
         "network-online.target"
       ]
       ++ optional needTorControl "tor.service"
-      ++ optional needI2pSam "i2pd.service";
+      ++ optional needI2pSam "i2pd.service"
+      ++ optional needCjdns "cjdns.service";
       after = [
         "network-online.target"
       ]
       ++ optional needTorControl "tor.service"
-      ++ optional needI2pSam "i2pd.service";
+      ++ optional needI2pSam "i2pd.service"
+      ++ optional needCjdns "cjdns.service";
       environment = cfg.environment;
 
       serviceConfig = {

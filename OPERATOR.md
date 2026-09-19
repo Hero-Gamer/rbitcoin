@@ -369,7 +369,8 @@ Clean smoke:
 | `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no clearnet P2P socket |
 | `--listen-onion` | `listen_onion=` | **off** — loopback P2P + `ADD_ONION` (`{datadir}/onion/p2p.priv`); needs `--tor-control` and `--max-inbound` > 0 |
 | `--no-discover` | `no_discover=` | discover **on**; flag off = no home-IP self-announce; P2P/wallet onions still listed |
-| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` (`cjdns` later) |
+| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` / `cjdns` |
+| `--cjdns-reachable` | `cjdns_reachable=` | **off** — `fc00::/8` is unroutable until set; `--only-net=cjdns` requires it |
 | `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port`, Tor v3 `.onion:port`, or `{52}.b32.i2p:port` |
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
 | `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
@@ -453,7 +454,7 @@ sends `tx`, and disconnects. This is **not** Dandelion++. If that
 one-shot fails, the tx stays in the mempool and is still not INV'd;
 confirmation can still arrive in a block.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
-`--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`) filters dial and learn;
+`--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`/`cjdns`) filters dial and learn;
 onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
 error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
 (v1 IPv4/IPv6 still loads).
@@ -488,9 +489,17 @@ error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
 `--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
 creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
 `STREAM FORWARD`s to the P2P bind. With `--listen=0` that is a start error
-naming `--listen` (overlay incoming still needs a loopback P2P accept). NixOS:
+unless `--listen-onion` provides a loopback accept. NixOS:
 `services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
 `i2pd.service` when SAM is set. Do not start i2pd from this module.
+
+`--cjdns-reachable` treats BIP155 `fc00::/8` as the kernel CJDNS overlay: dial
+with ordinary TCP (OS routing), advertise a `--listen` on that IPv6, keep
+tagged rows in `peers` v2. Off (default): do not dial CJDNS; do not treat
+`fc00::/8` as advertisable. `--only-net=cjdns` without the flag is a start
+error. `--listen [fc00:…]:port` binds that address when the OS has it; no
+cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
+`After`/`Wants` `cjdns.service`. Do not start a cjdns router from this module.
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large

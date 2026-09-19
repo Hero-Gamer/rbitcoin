@@ -43,6 +43,7 @@ let
             sam = "127.0.0.1:7656";
             acceptIncoming = true;
           };
+          cjdns.reachable = true;
           p2p = {
             address = "127.0.0.1";
             openFirewall = true;
@@ -112,6 +113,7 @@ assert defaultCfg.electrum.hiddenService == false;
 assert defaultCfg.esplora.hiddenService == false;
 assert defaultCfg.i2p.sam == null;
 assert defaultCfg.i2p.acceptIncoming == false;
+assert defaultCfg.cjdns.reachable == false;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -145,10 +147,13 @@ assert builtins.match ".*--tor-control-cookie /run/tor/control.authcookie.*" exe
 assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;
 assert builtins.match ".*--i2p-accept-incoming.*" execStart != null;
 assert builtins.match ".*--listen-onion.*" execStart != null;
+assert builtins.match ".*--cjdns-reachable.*" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
 assert builtins.elem "i2pd.service" service.after;
 assert builtins.elem "i2pd.service" service.wants;
+assert builtins.elem "cjdns.service" service.after;
+assert builtins.elem "cjdns.service" service.wants;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
