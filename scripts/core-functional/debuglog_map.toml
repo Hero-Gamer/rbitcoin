@@ -129,7 +129,7 @@ emit = ['received: tx']
 
 [[rule]]
 match = 'txrelay: park '
-emit = ['was not accepted']
+emit = ['was not accepted', 'missingorspent']
 
 [[rule]]
 match = 'Error: peer-timeout must be a positive integer\.'

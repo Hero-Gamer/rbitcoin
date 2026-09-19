@@ -77,9 +77,9 @@ run "future tip maps to Core InitError needle" \
   "Store tip time is more than two hours ahead of the node clock. Check the clock (or --mock-time). Wipe the datadir and redo IBD only if you are sure the clock is correct." \
   "The block database contains a block which appears to be from the future."
 
-run "parked orphan DEBUG maps to Core was-not-accepted needle" \
-  "2026-01-01T00:00:00Z DEBUG txrelay: park 1111111111111111111111111111111111111111111111111111111111111111" \
-  "was not accepted"
+run "parked orphan DEBUG maps to Core was-not-accepted and missingorspent" \
+  "2026-01-01T00:00:00Z DEBUG txrelay: park 1111111111111111111111111111111111111111111111111111111111111111 missingorspent" \
+  $'was not accepted\nmissingorspent'
 
 run "CLI InitError maps peer-timeout to Core peertimeout" \
   "Error: peer-timeout must be a positive integer." \

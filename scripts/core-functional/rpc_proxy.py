@@ -59,7 +59,7 @@ def core_btc_kvb_to_sat_vb(value: Any) -> int:
         raise RpcError(-8, "Amount out of range")
     if btc >= 1:
         raise RpcError(-8, _CORE_MAXFEERATE_MSG)
-    return int(round(btc * 100_000))
+    return int(btc * 100_000)
 
 
 def named_param_index(method: str, key: str) -> int | None:

@@ -426,6 +426,20 @@ impl ActiveMempool {
         self.graph.len()
     }
 
+    pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
+        let min_r = self.min_relay_sat_kvb;
+        if self
+            .graph
+            .total_weight()
+            .saturating_add(policy::MAX_STANDARD_TX_WEIGHT)
+            > self.max_weight
+        {
+            min_r.saturating_add(policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB)
+        } else {
+            min_r
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.store.generation()
     }
@@ -734,9 +748,13 @@ impl ActiveMempool {
         let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
-        let min_relay = min_relay.unwrap_or(self.min_relay_sat_kvb);
+        let floor = self.mempool_min_fee_sat_kvb();
+        let min_relay = min_relay.unwrap_or(floor);
         match policy::check_libre_admission_at(tx, admit_fee, weight, min_relay) {
             PolicyResult::Standard => {}
+            PolicyResult::NonStandard("min relay fee") if floor > self.min_relay_sat_kvb => {
+                return Err(AcceptError::Policy("mempool min fee"));
+            }
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
         }
 
@@ -769,14 +787,16 @@ impl ActiveMempool {
             return AcceptError::Duplicate(txid);
         }
         if let Some(parked) = self.orphanage.missing_of(&txid).cloned() {
-            if let Some(peer) = from {
-                self.orphanage.add_announcer(&txid, peer);
+            if self.orphanage.contains_wtxid(&tx.compute_wtxid()) {
+                if let Some(peer) = from {
+                    self.orphanage.add_announcer(&txid, peer);
+                }
+                return AcceptError::Orphaned {
+                    txid,
+                    missing: parked,
+                    fresh: false,
+                };
             }
-            return AcceptError::Orphaned {
-                txid,
-                missing: parked,
-                fresh: false,
-            };
         }
         if missing.is_empty() {
             return AcceptError::MissingPrevout(tx.input[0].previous_output);
@@ -1138,6 +1158,21 @@ impl ActiveMempool {
         Ok(())
     }
 
+    /// Core `IsChildWithParents`: last tx spends every other package member.
+    pub fn package_is_child_with_direct_parents(txs: &[Transaction]) -> bool {
+        if txs.len() < 2 {
+            return false;
+        }
+        let spent: BTreeSet<Txid> = txs[txs.len() - 1]
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .collect();
+        txs[..txs.len() - 1]
+            .iter()
+            .all(|tx| spent.contains(&tx.compute_txid()))
+    }
+
     /// Last tx is a child; every other member is an in-package ancestor of it.
     fn package_is_child_with_parents(txs: &[Transaction]) -> bool {
         if txs.len() < 2 {
@@ -1389,7 +1424,11 @@ impl ActiveMempool {
             AcceptError::InputsDuplicate | AcceptError::Coinbase => {
                 Some(AcceptFailureRecord::Invalid(tx.compute_txid()))
             }
-            AcceptError::Script(_) if !tx_has_witness(tx) => {
+            AcceptError::Script(s)
+                if !tx_has_witness(tx)
+                    && !s.contains("WITNESS_UNEXPECTED")
+                    && !s.contains("empty witness") =>
+            {
                 Some(AcceptFailureRecord::Invalid(tx.compute_txid()))
             }
             AcceptError::Policy("min relay fee") => Some(AcceptFailureRecord::Extra),
@@ -3055,6 +3094,42 @@ mod tests {
         assert!(matches!(err, AcceptError::MissingPrevout(_)), "got {err}");
         assert_eq!(mp.orphan_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn witness_unexpected_script_is_not_txid_invalid() {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([9; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let stripped = AcceptError::Script(
+            "script verification failed: p2tr empty witness txid=00 vin=0".into(),
+        );
+        assert!(
+            ActiveMempool::accept_failure_record(&tx, &stripped).is_none(),
+            "stripped-witness fail must not poison txid"
+        );
+        let bad_sig = AcceptError::Script("script verification failed: SIG_DER".into());
+        assert!(
+            matches!(
+                ActiveMempool::accept_failure_record(&tx, &bad_sig),
+                Some(AcceptFailureRecord::Invalid(_))
+            ),
+            "non-witness script fail still poisons txid"
+        );
     }
 
     /// A parent rejected as invalid must not leave its children parked forever.

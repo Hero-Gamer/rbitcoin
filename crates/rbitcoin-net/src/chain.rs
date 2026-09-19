@@ -234,6 +234,15 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
+fn accept_err_is_temporary_time(e: &NetError) -> bool {
+    match e {
+        NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
+            s.contains("time-too-new") || s.contains("time-too-old")
+        }
+        _ => false,
+    }
+}
+
 /// Default tip recency window (24h).
 pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 
@@ -1017,8 +1026,9 @@ impl ChainHub {
             .failing_block_hash()
             .map(BlockHash::from_byte_array)
             .unwrap_or(offered);
-        if accept_err_is_mutated(e) {
+        if accept_err_is_mutated(e) || accept_err_is_temporary_time(e) {
             self.drop_held(hash);
+            self.forget_asked_block(&hash);
             return;
         }
         if e.failing_block_hash().is_some() {
@@ -1940,6 +1950,9 @@ impl ChainHub {
     }
 
     fn precious_block_inner(&self, hash: BlockHash) -> Result<(), NetError> {
+        if self.is_block_invalid(&hash) {
+            return Ok(());
+        }
         let branch = self.assemble_side_branch(hash);
         if branch.is_none() && !self.is_connected(&hash) {
             return Err(NetError::Consensus("Block not found".into()));
@@ -3508,6 +3521,38 @@ mod tests {
     }
 
     #[test]
+    fn time_too_new_does_not_cache_block_failed() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let now = 1_700_000_000u32;
+        hub.clock.set_mock(i64::from(now));
+        let far = now + 2 * 3600 + 1;
+        let b = mine(gen, far, 1);
+        hub.note_asked_block(b.block_hash());
+        let err = hub
+            .accept_received_block(b.clone())
+            .expect_err("header more than two hours ahead of mock");
+        let msg = match &err {
+            NetError::Consensus(s) => s.as_str(),
+            other => panic!("expected Consensus time-too-new, got {other:?}"),
+        };
+        assert!(
+            msg.contains("time-too-new") || msg.contains("future"),
+            "got {msg}"
+        );
+        assert!(
+            !hub.is_block_invalid(&b.block_hash()),
+            "time-too-new must not cache BLOCK_FAILED; the same block is valid after mocktime"
+        );
+        assert!(
+            !hub.already_have_or_asked_block(&b.block_hash()),
+            "time-too-new must forget asked_blocks so a later getdata can retry"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn generate_to_script_drains_sh_writebehind() {
         use bitcoin::ScriptBuf;
         use rbitcoin_store::script_hash;
@@ -4405,16 +4450,17 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), main[2].block_hash());
 
         hub.invalidate_block(eq[2].block_hash()).unwrap();
-        let err = hub.precious_block(eq[2].block_hash()).unwrap_err();
-        assert!(
-            err.to_string().to_ascii_lowercase().contains("invalid"),
-            "{err}"
+        hub.precious_block(eq[2].block_hash()).unwrap();
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            main[2].block_hash(),
+            "precious of an invalidated hash is a no-op"
         );
         hub.reconsider_block(eq[2].block_hash()).unwrap();
         assert_eq!(
             hub.tip_hash().unwrap(),
             main[2].block_hash(),
-            "failed precious must not leave a preference reconsider would honor"
+            "no-op precious must not leave a preference reconsider would honor"
         );
         hub.precious_block(eq[2].block_hash()).unwrap();
         assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
@@ -5430,6 +5476,7 @@ mod tests {
             mutated.header.merkle_root
         );
 
+        hub.note_asked_block(honest.block_hash());
         let err = hub
             .accept_received_block(mutated)
             .expect_err("mutated merkle must reject");
@@ -5452,6 +5499,10 @@ mod tests {
         assert!(
             !hub.is_block_invalid(&honest.block_hash()),
             "BLOCK_MUTATED must not cache the header hash as BLOCK_FAILED"
+        );
+        assert!(
+            !hub.already_have_or_asked_block(&honest.block_hash()),
+            "mutated reject must forget asked_blocks so the honest body can be getdata'd again"
         );
         assert_eq!(hub.tip_hash(), Some(stale.block_hash()));
 

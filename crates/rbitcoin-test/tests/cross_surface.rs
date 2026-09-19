@@ -955,10 +955,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let miss_hex = rbitcoin_primitives::hex_encode(&miss_raw);
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[miss_hex]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
-    assert_eq!(
-        tma["result"][0]["reject-reason"], "bad-txns-inputs-missingorspent",
-        "{tma}"
-    );
+    assert_eq!(tma["result"][0]["reject-reason"], "missing-inputs", "{tma}");
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
     let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());
@@ -1606,12 +1603,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         capped["result"]["package_msg"], "transaction failed",
         "{capped}"
     );
-    let cap_err = capped["result"]["tx-results"]
+    let cap_errs: Vec<&str> = capped["result"]["tx-results"]
         .as_object()
-        .and_then(|m| m.values().next())
-        .and_then(|v| v["error"].as_str())
-        .unwrap_or("");
-    assert_eq!(cap_err, "max-fee-exceeded", "{capped}");
+        .map(|m| m.values().filter_map(|v| v["error"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(cap_errs.contains(&"max feerate exceeded"), "{capped}");
 
     let ok = jsonrpc(rpc_addr, "submitpackage", json!([pkg_hexes.clone()])).await;
     assert_eq!(ok["result"]["package_msg"], "success", "{ok}");
@@ -1669,7 +1665,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     .await;
     let n26_msg = n26["error"]["message"].as_str().unwrap_or("");
     assert!(
-        n26_msg.contains("package too large"),
+        n26_msg.contains("between 1 and 25"),
         "RPC 26-tx package: {n26}"
     );
     let fat = jsonrpc(

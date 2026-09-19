@@ -17,7 +17,7 @@ use rbitcoin_mempool::{
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -288,6 +288,11 @@ fn package_rpc_retry(e: &AcceptError) -> bool {
 }
 
 fn is_hard_recent_reject(e: &AcceptError) -> bool {
+    if let AcceptError::Script(s) = e {
+        if s.contains("WITNESS_UNEXPECTED") || s.contains("empty witness") {
+            return false;
+        }
+    }
     !matches!(
         e,
         AcceptError::Duplicate(_)
@@ -416,10 +421,22 @@ pub struct MempoolPerfSample {
 
 /// Core default `-mempoolexpiry` (336 hours) in seconds.
 const DEFAULT_MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
-/// Do not re-GETDATA the same missing parent from a park for this long.
-const PARENT_GETDATA_TTL: Duration = Duration::from_secs(60);
-/// Cap unique parent GETDATA items issued from one park.
+/// Core `NONPREF_PEER_TX_DELAY` (inbound / non-preferred).
+pub(crate) const NONPREF_PEER_TX_DELAY_SECS: u64 = 2;
+/// Core `TXID_RELAY_DELAY` (parent GETDATA is by txid, not wtxid).
+pub(crate) const TXID_RELAY_DELAY_SECS: u64 = 2;
+/// Core `GETDATA_TX_INTERVAL` (in-flight parent request expiry).
+pub(crate) const GETDATA_TX_INTERVAL_SECS: u64 = 60;
+/// Cap unique parent GETDATA items issued from one flush.
 const MAX_PARENTS_PER_PARK: usize = 16;
+
+struct ParentAnn {
+    peer: u64,
+    preferred: bool,
+    reqtime: u64,
+    requested_until: Option<u64>,
+    failed: bool,
+}
 /// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
 const RECENT_CONFIRMED_CAP: usize = 65_536;
 
@@ -577,8 +594,8 @@ pub struct MempoolHub {
     min_live_accept_at: AtomicU64,
     /// Cached tip MTP for accept (`{header_fk, ctx}`).
     tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
-    /// Missing parent txids we already GETDATA'd after a park (TTL).
-    parent_asked: Mutex<HashMap<Txid, Instant>>,
+    /// TxRequestTracker-shaped missing-parent GETDATA (txid hash → announcers).
+    parent_req: Mutex<HashMap<[u8; 32], Vec<ParentAnn>>>,
 }
 
 impl MempoolHub {
@@ -685,7 +702,7 @@ impl MempoolHub {
             age_inv: Mutex::new(BTreeMap::new()),
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
-            parent_asked: Mutex::new(HashMap::new()),
+            parent_req: Mutex::new(HashMap::new()),
         };
         {
             let mut u = hub.unbroadcast.lock().unwrap();
@@ -1612,10 +1629,31 @@ impl MempoolHub {
             Ok(p) => p,
             Err(e) => {
                 if let AcceptError::Orphaned { missing, .. } = &e {
-                    if let Some(r) = self.admit_1p1c(tx, utxo, missing) {
+                    if missing
+                        .iter()
+                        .any(|p| self.try_recent_reject(&Wtxid::from_byte_array(p.to_byte_array())))
+                    {
+                        self.note_recent_reject(tx.compute_wtxid());
+                        self.note_recent_reject(Wtxid::from_byte_array(
+                            tx.compute_txid().to_byte_array(),
+                        ));
                         let us = t0.elapsed().as_micros() as u64;
-                        self.meter_accept_wall(us, true);
-                        return Ok(r);
+                        self.meter_accept_stages(lock_us, stages);
+                        return self.finish_accept_err(
+                            us,
+                            AcceptError::Orphaned {
+                                txid: tx.compute_txid(),
+                                missing: BTreeSet::new(),
+                                fresh: false,
+                            },
+                        );
+                    }
+                    if from.is_none() {
+                        if let Some(r) = self.admit_1p1c(tx, utxo, missing) {
+                            let us = t0.elapsed().as_micros() as u64;
+                            self.meter_accept_wall(us, true);
+                            return Ok(r);
+                        }
                     }
                     let parked = {
                         let mut g = self.lock_write();
@@ -2113,6 +2151,11 @@ impl MempoolHub {
         ActiveMempool::check_package_shape(txs)
     }
 
+    /// Core `IsChildWithParents` (submitpackage topology).
+    pub fn package_is_child_with_direct_parents(txs: &[Transaction]) -> bool {
+        ActiveMempool::package_is_child_with_direct_parents(txs)
+    }
+
     /// Core ancestor package size cap (count, not weight).
     pub fn max_package_count() -> usize {
         MAX_PACKAGE_COUNT
@@ -2313,32 +2356,25 @@ impl MempoolHub {
     }
 
     pub fn add_orphan_announcer(&self, txid: &Txid, peer: u64) -> bool {
-        if self
-            .inner
-            .try_read()
-            .ok()
-            .is_none_or(|g| !g.orphanage.contains(txid))
-        {
-            return false;
+        if let Some(r) = self.orphan_write(|g| g.orphanage.add_announcer(txid, peer)) {
+            return r;
         }
+        let _g = crate::reactor::BlockingRegion::enter();
         self.orphan_write(|g| g.orphanage.add_announcer(txid, peer))
             .unwrap_or(false)
     }
 
     pub fn add_orphan_announcer_wtxid(&self, wtxid: &Wtxid, peer: u64) -> bool {
-        if self
-            .inner
-            .try_read()
-            .ok()
-            .is_none_or(|g| !g.orphanage.contains_wtxid(wtxid))
-        {
-            return false;
+        if let Some(r) = self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer)) {
+            return r;
         }
+        let _g = crate::reactor::BlockingRegion::enter();
         self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer))
             .unwrap_or(false)
     }
 
     pub fn erase_orphans_for_peer(&self, peer: u64) {
+        self.forget_parent_anns_for_peer(peer);
         let skip = self
             .inner
             .try_read()
@@ -2361,34 +2397,202 @@ impl MempoolHub {
         Some(f(&mut self.lock_write()))
     }
 
-    /// Unique missing parents not already held and not asked within TTL.
-    pub fn take_parent_getdata<'a>(
-        &self,
-        missing: impl IntoIterator<Item = &'a Txid>,
-    ) -> Vec<Txid> {
-        self.take_parent_getdata_at(missing, Instant::now())
+    fn parent_already_have(&self, txid: &Txid) -> bool {
+        if let Ok(g) = self.inner.try_read() {
+            if g.graph.contains(txid) {
+                return true;
+            }
+            if g.orphanage.contains(txid) {
+                if let Some(w) = g.orphanage.wtxid_of(txid) {
+                    if w.to_byte_array() == txid.to_byte_array() {
+                        return true;
+                    }
+                }
+            }
+        }
+        if self
+            .recent_confirmed
+            .try_lock()
+            .ok()
+            .is_some_and(|r| r.contains_txid(txid))
+        {
+            return true;
+        }
+        self.try_recent_reject(&Wtxid::from_byte_array(txid.to_byte_array()))
     }
 
-    pub(crate) fn take_parent_getdata_at<'a>(
+    pub(crate) fn orphan_getdata_parents(&self, tx: &Transaction) -> BTreeSet<Txid> {
+        let mut out = BTreeSet::new();
+        for inp in &tx.input {
+            let p = inp.previous_output.txid;
+            if self.parent_already_have(&p) {
+                continue;
+            }
+            out.insert(p);
+        }
+        out
+    }
+
+    pub(crate) fn try_orphan_missing(&self, txid: &Txid) -> Option<BTreeSet<Txid>> {
+        self.inner
+            .try_read()
+            .ok()?
+            .orphanage
+            .missing_of(txid)
+            .cloned()
+    }
+
+    pub(crate) fn try_orphan_tx_wtxid(&self, wtxid: &Wtxid) -> Option<Transaction> {
+        self.inner
+            .try_read()
+            .ok()?
+            .orphanage
+            .tx_by_wtxid(wtxid)
+            .cloned()
+    }
+
+    pub(crate) fn schedule_orphan_parents(
         &self,
-        missing: impl IntoIterator<Item = &'a Txid>,
-        now: Instant,
-    ) -> Vec<Txid> {
-        let mut asked = self.parent_asked.lock().unwrap();
-        asked.retain(|_, t| now.saturating_duration_since(*t) < PARENT_GETDATA_TTL);
-        let mut out = Vec::new();
+        missing: &BTreeSet<Txid>,
+        peer: u64,
+        inbound: bool,
+        now: u64,
+    ) {
+        let delay = TXID_RELAY_DELAY_SECS
+            + if inbound {
+                NONPREF_PEER_TX_DELAY_SECS
+            } else {
+                0
+            };
+        let reqtime = now.saturating_add(delay);
+        let preferred = !inbound;
+        let mut g = self.parent_req.lock().unwrap();
         for p in missing {
-            if self.try_contains(p) {
+            if self.parent_already_have(p) {
                 continue;
             }
-            if asked.contains_key(p) {
+            let anns = g.entry(p.to_byte_array()).or_default();
+            if anns.iter().any(|a| a.peer == peer) {
                 continue;
             }
-            asked.insert(*p, now);
-            out.push(*p);
-            if out.len() >= MAX_PARENTS_PER_PARK {
-                break;
+            anns.push(ParentAnn {
+                peer,
+                preferred,
+                reqtime,
+                requested_until: None,
+                failed: false,
+            });
+        }
+    }
+
+    pub(crate) fn note_inv_tx_requested(&self, peer: u64, hash: [u8; 32], inbound: bool, now: u64) {
+        let mut g = self.parent_req.lock().unwrap();
+        let anns = g.entry(hash).or_default();
+        if let Some(a) = anns.iter_mut().find(|a| a.peer == peer) {
+            if a.requested_until.is_none() && !a.failed {
+                a.requested_until = Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS));
             }
+            return;
+        }
+        anns.push(ParentAnn {
+            peer,
+            preferred: !inbound,
+            reqtime: now,
+            requested_until: Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS)),
+            failed: false,
+        });
+    }
+
+    pub(crate) fn forget_parent_anns_for_peer(&self, peer: u64) {
+        let mut g = self.parent_req.lock().unwrap();
+        g.retain(|_, anns| {
+            anns.retain(|a| a.peer != peer);
+            !anns.is_empty()
+        });
+    }
+
+    pub(crate) fn announcer_peers_for(&self, txid: &Txid, wtxid: &Wtxid) -> Vec<u64> {
+        let g = self.parent_req.lock().unwrap();
+        let mut peers = Vec::new();
+        for hash in [txid.to_byte_array(), wtxid.to_byte_array()] {
+            if let Some(anns) = g.get(&hash) {
+                for a in anns {
+                    if !a.failed && !peers.contains(&a.peer) {
+                        peers.push(a.peer);
+                    }
+                }
+            }
+        }
+        peers
+    }
+
+    pub(crate) fn resolve_tx_request(&self, txid: &Txid, wtxid: &Wtxid, admitted: bool) {
+        let mut g = self.parent_req.lock().unwrap();
+        for hash in [txid.to_byte_array(), wtxid.to_byte_array()] {
+            if admitted {
+                g.remove(&hash);
+                continue;
+            }
+            let Some(anns) = g.get_mut(&hash) else {
+                continue;
+            };
+            for a in anns.iter_mut() {
+                if a.requested_until.is_some() {
+                    a.requested_until = None;
+                    a.failed = true;
+                }
+            }
+            if anns.iter().all(|a| a.failed) {
+                g.remove(&hash);
+            }
+        }
+    }
+
+    pub(crate) fn take_due_parent_getdata(&self, peer: u64, now: u64) -> Vec<Txid> {
+        let mut g = self.parent_req.lock().unwrap();
+        let hashes: Vec<[u8; 32]> = g.keys().copied().collect();
+        let mut out = Vec::new();
+        let mut drop_keys = Vec::new();
+        for hash in hashes {
+            let Some(anns) = g.get_mut(&hash) else {
+                continue;
+            };
+            for a in anns.iter_mut() {
+                if let Some(exp) = a.requested_until {
+                    if exp <= now {
+                        a.requested_until = None;
+                        a.failed = true;
+                    }
+                }
+            }
+            if anns.iter().all(|a| a.failed) {
+                drop_keys.push(hash);
+                continue;
+            }
+            let txid = Txid::from_byte_array(hash);
+            if self.parent_already_have(&txid) {
+                drop_keys.push(hash);
+                continue;
+            }
+            if anns.iter().any(|a| a.requested_until.is_some()) {
+                continue;
+            }
+            let has_pref = anns
+                .iter()
+                .any(|a| a.preferred && !a.failed && a.reqtime <= now);
+            let chosen = anns.iter_mut().find(|a| {
+                !a.failed && a.reqtime <= now && a.peer == peer && (!has_pref || a.preferred)
+            });
+            if let Some(a) = chosen {
+                a.requested_until = Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS));
+                out.push(txid);
+                if out.len() >= MAX_PARENTS_PER_PARK {
+                    break;
+                }
+            }
+        }
+        for k in drop_keys {
+            g.remove(&k);
         }
         out
     }
@@ -2586,6 +2790,10 @@ impl MempoolHub {
     /// Weight budget used for chunk eviction (WU). RPC `maxmempool`.
     pub fn max_weight(&self) -> u64 {
         self.lock_read().max_weight
+    }
+
+    pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
+        self.lock_read().mempool_min_fee_sat_kvb()
     }
 
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
@@ -2807,6 +3015,31 @@ impl MempoolHub {
         let mut set = g.graph.descendant_set(txid)?;
         set.remove(txid);
         Some(set.into_iter().collect())
+    }
+
+    pub fn wtxid_of(&self, txid: &Txid) -> Option<bitcoin::Wtxid> {
+        self.lock_read().graph.get(txid).map(|e| e.wtxid)
+    }
+
+    /// True if `txs` plus in-mempool parents would exceed cluster count/size.
+    pub fn package_would_exceed_cluster(&self, txs: &[bitcoin::Transaction]) -> bool {
+        if txs.is_empty() {
+            return false;
+        }
+        let pkg: std::collections::HashSet<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let g = self.lock_read();
+        let mut parents = std::collections::BTreeSet::new();
+        let mut extra_w = 0u64;
+        for tx in txs {
+            extra_w = extra_w.saturating_add(tx.weight().to_wu());
+            for inp in &tx.input {
+                let pid = inp.previous_output.txid;
+                if !pkg.contains(&pid) && g.graph.contains(&pid) {
+                    parents.insert(pid);
+                }
+            }
+        }
+        g.graph.cluster_would_exceed(&parents, txs.len(), extra_w)
     }
 
     /// Direct in-mempool parents and children (`depends` / `spentby`).
@@ -4383,24 +4616,107 @@ mod tests {
     }
 
     #[test]
-    fn take_parent_getdata_dedupes_caps_and_expires() {
+    fn take_due_parent_getdata_waits_inbound_txid_delay() {
         let dir = tmp();
         let store_dir = tmp();
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
-        let mut missing = Vec::new();
+        let mut missing = BTreeSet::new();
         for i in 0u8..20 {
-            missing.push(Txid::from_byte_array([i + 1; 32]));
+            missing.insert(Txid::from_byte_array([i + 1; 32]));
         }
-        let t0 = Instant::now();
-        let first = hub.take_parent_getdata_at(&missing, t0);
+        let t0 = 1_000u64;
+        hub.schedule_orphan_parents(&missing, 1, true, t0);
+        assert!(
+            hub.take_due_parent_getdata(1, t0 + NONPREF_PEER_TX_DELAY_SECS)
+                .is_empty(),
+            "inbound must wait TXID_RELAY past NONPREF"
+        );
+        let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
+        let first = hub.take_due_parent_getdata(1, due);
         assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
-        let rest = hub.take_parent_getdata_at(&missing, t0);
+        let rest = hub.take_due_parent_getdata(1, due);
         assert_eq!(rest.len(), 4, "cap leftover still asked once");
-        let again = hub.take_parent_getdata_at(&missing, t0);
-        assert!(again.is_empty(), "already-asked must not re-ask");
-        let later = hub.take_parent_getdata_at(&missing, t0 + PARENT_GETDATA_TTL);
-        assert_eq!(later.len(), MAX_PARENTS_PER_PARK, "TTL expiry re-asks");
+        assert!(
+            hub.take_due_parent_getdata(1, due).is_empty(),
+            "in-flight must not re-ask"
+        );
+        let expired = due + GETDATA_TX_INTERVAL_SECS;
+        assert!(
+            hub.take_due_parent_getdata(1, expired).is_empty(),
+            "same peer is not retried after interval"
+        );
+        hub.schedule_orphan_parents(&missing, 2, true, expired);
+        let other = hub.take_due_parent_getdata(
+            2,
+            expired + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS,
+        );
+        assert_eq!(other.len(), MAX_PARENTS_PER_PARK, "other peer after expiry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn resolve_tx_request_lets_other_peer_fetch_after_reject() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0x44; 32];
+        let txid = Txid::from_byte_array(hash);
+        let wtxid = Wtxid::from_byte_array(hash);
+        hub.note_inv_tx_requested(1, hash, true, 1_000);
+        let missing = BTreeSet::from([txid]);
+        hub.schedule_orphan_parents(&missing, 2, true, 1_000);
+        let due = 1_000 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
+        assert!(
+            hub.take_due_parent_getdata(2, due).is_empty(),
+            "in-flight INV GETDATA must block other peer"
+        );
+        hub.resolve_tx_request(&txid, &wtxid, false);
+        hub.schedule_orphan_parents(&missing, 2, true, due);
+        let got = hub
+            .take_due_parent_getdata(2, due + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS);
+        assert_eq!(got, vec![txid]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn p2p_orphan_of_min_relay_parent_is_parked_not_1p1c() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(matches!(
+            hub.accept_tx(&parent),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let err = hub.accept_tx_from(&child, Some(7));
+        assert!(
+            matches!(err, Err(AcceptError::Orphaned { .. })),
+            "P2P child of min-relay parent must orphan, got {err:?}"
+        );
+        assert!(!hub.contains(&child.compute_txid()));
+        assert_eq!(hub.orphan_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -4558,6 +4874,88 @@ mod tests {
         assert!(
             !hub.try_recent_reject(&coinbase.compute_wtxid()),
             "tip connect must forget recent_rejects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn child_of_txid_rejected_parent_is_not_parked() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x6a; 110_000]));
+        assert!(matches!(
+            hub.accept_tx(&parent),
+            Err(AcceptError::Policy("tx weight"))
+        ));
+        assert_eq!(
+            parent.compute_txid().to_byte_array(),
+            parent.compute_wtxid().to_byte_array()
+        );
+        assert!(hub.try_recent_reject(&parent.compute_wtxid()));
+        let other = Txid::from_byte_array([0x33; 32]);
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: other,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(40),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child_err = hub.accept_tx(&child);
+        assert!(
+            matches!(child_err, Err(AcceptError::Orphaned { .. })),
+            "missing inputs still orphaned, got {child_err:?}"
+        );
+        assert_eq!(
+            hub.orphan_count(),
+            0,
+            "known-invalid parent must not park child"
+        );
+        let grandchild = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: child.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(30),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let _ = hub.accept_tx(&grandchild);
+        assert_eq!(
+            hub.orphan_count(),
+            0,
+            "child of rejected parent must poison descendants"
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);

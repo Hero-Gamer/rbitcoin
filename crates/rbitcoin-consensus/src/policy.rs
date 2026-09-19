@@ -10,6 +10,7 @@
 //! min relay, **no dust limit** (1-sat OK; 0-value spendable is dust), full
 //! RBF, Libre annex.
 
+use bitcoin::transaction::Version;
 use bitcoin::Transaction;
 
 /// Minimum relay feerate: **0.1 sat/vB** = 100 sat/kvB.
@@ -135,6 +136,15 @@ pub fn check_libre_admission_at(
     if tx.is_coinbase() {
         return PolicyResult::NonStandard("coinbase");
     }
+    if tx.version != Version::ONE && tx.version != Version::TWO {
+        return PolicyResult::NonStandard("version");
+    }
+    if tx.output.iter().any(|o| {
+        let spk = o.script_pubkey.as_bytes();
+        spk.len() > 10_000 && spk.first() != Some(&0x6a)
+    }) {
+        return PolicyResult::NonStandard("scriptpubkey");
+    }
     if tx.input.is_empty() {
         return PolicyResult::NonStandard("no inputs");
     }
@@ -169,6 +179,46 @@ mod tests {
         assert_eq!(fee_rate_sat_per_kvb(100, 4000), 100);
         assert!(meets_min_relay_fee_at(1, 4000, 0));
         assert!(!meets_min_relay_fee_at(1, 4000, 100));
+    }
+
+    #[test]
+    fn nonstandard_version_is_version() {
+        let mut tx = bare_tx(1);
+        tx.version = Version::non_standard(0xffff_ffffu32 as i32);
+        let weight = tx.weight().to_wu();
+        assert_eq!(
+            check_libre_admission_at(&tx, 50_000, weight, 0),
+            PolicyResult::NonStandard("version")
+        );
+        tx.version = Version::ONE;
+        assert_eq!(
+            check_libre_admission_at(&tx, 50_000, weight, 0),
+            PolicyResult::Standard
+        );
+    }
+
+    #[test]
+    fn oversized_spk_is_scriptpubkey() {
+        let mut tx = bare_tx(1);
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 10_001]);
+        let weight = tx.weight().to_wu();
+        assert_eq!(
+            check_libre_admission_at(&tx, 50_000, weight, 0),
+            PolicyResult::NonStandard("scriptpubkey")
+        );
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 10_000]);
+        assert_eq!(
+            check_libre_admission_at(&tx, 50_000, weight, 0),
+            PolicyResult::Standard
+        );
+        let mut opreturn = vec![0x6a];
+        opreturn.extend(std::iter::repeat_n(0x01, 10_001));
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(opreturn);
+        let weight = tx.weight().to_wu();
+        assert_eq!(
+            check_libre_admission_at(&tx, 50_000, weight, 0),
+            PolicyResult::Standard
+        );
     }
 
     #[test]

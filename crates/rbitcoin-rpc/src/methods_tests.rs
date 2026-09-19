@@ -1406,6 +1406,208 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn getmempoolentry_vsize_ceils_weight() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::policy::get_virtual_size;
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+
+    let (ctx, dir) = ctx_empty();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(
+        &ctx.query,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &ctx.query,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        102,
+        1,
+    );
+    let mp = ctx.mempool.as_ref().expect("mempool");
+    mp.set_relay_enabled(true);
+    let wit_script = ScriptBuf::from_bytes(vec![0x51]);
+    let p2wsh = ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(wit_script.as_bytes()));
+    let fund = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: p2wsh,
+        }],
+    };
+    mp.accept_tx(&fund).expect("fund");
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: fund.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[wit_script.to_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    mp.accept_tx(&spend).expect("p2wsh spend");
+    let weight = spend.weight().to_wu();
+    assert_ne!(
+        weight % 4,
+        0,
+        "witness remainder distinguishes floor vs ceil"
+    );
+    let want = get_virtual_size(weight);
+    let fund_v = get_virtual_size(fund.weight().to_wu());
+    let hex = hash_hex_display(&spend.compute_txid().to_byte_array());
+    let entry = dispatch(&ctx, "getmempoolentry", vec![json!(hex.clone())]).unwrap();
+    assert_eq!(entry["vsize"], want);
+    assert_eq!(entry["ancestorsize"], fund_v + want);
+    assert_eq!(entry["descendantsize"], want);
+    assert_ne!(entry["vsize"], weight / 4);
+    let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
+    assert_eq!(verbose[&hex]["vsize"], want);
+    assert_eq!(
+        entry, verbose[&hex],
+        "getmempoolentry must match verbose getrawmempool (including wtxid)"
+    );
+    let ids = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
+    let arr = ids.as_array().expect("txid array");
+    let mut sorted = arr.clone();
+    sorted.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(
+        arr, &sorted,
+        "non-verbose getrawmempool is display-hex sorted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_package_cluster_limit_is_package_error() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+
+    let (ctx, dir) = ctx_empty();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(
+        &ctx.query,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &ctx.query,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        102,
+        1,
+    );
+    let mp = ctx.mempool.as_ref().expect("mempool");
+    mp.set_relay_enabled(true);
+    mp.set_cluster_limits(Some(2), None);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    mp.accept_tx(&parent).expect("parent");
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    let grand = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: child.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 3_000),
+            script_pubkey: spk,
+        }],
+    };
+    let res = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([serialize_hex(&child), serialize_hex(&grand)])],
+    )
+    .unwrap();
+    let arr = res.as_array().expect("package result");
+    assert_eq!(arr.len(), 2);
+    for row in arr {
+        let err = row["package-error"].as_str().expect("package-error");
+        assert!(err.contains("too-large-cluster"), "got {row}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct TestMiner(Arc<rbitcoin_net::ChainHub>);
 
 impl RpcRegtest for TestMiner {
@@ -1441,6 +1643,10 @@ impl RpcRegtest for TestMiner {
 }
 
 fn ctx_regtest_hub() -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    ctx_regtest_hub_with_weight(300_000_000)
+}
+
+fn ctx_regtest_hub_with_weight(max_wu: u64) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     use rbitcoin_consensus::{ChainParams, Milestone};
     let dir = TempDir::labeled("rpc-gen").expect("temp dir");
     let hub = Arc::new(rbitcoin_net::ChainHub::new(
@@ -1449,8 +1655,7 @@ fn ctx_regtest_hub() -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
         Milestone::NONE,
     ));
     hub.ensure_genesis().unwrap();
-    let mp =
-        MempoolHub::open_with_weight(dir.join("mempool"), hub.query.clone(), 300_000_000).unwrap();
+    let mp = MempoolHub::open_with_weight(dir.join("mempool"), hub.query.clone(), max_wu).unwrap();
     mp.set_relay_enabled(true);
     let ctx = RpcContext {
         query: hub.query.clone(),
@@ -1986,7 +2191,7 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
         .and_then(|m| m.values().next())
         .and_then(|v| v["error"].as_str())
         .unwrap_or("");
-    assert_eq!(fee_err, "max-fee-exceeded", "{pkg_fee}");
+    assert_eq!(fee_err, "max feerate exceeded", "{pkg_fee}");
     use bitcoin::consensus::encode::serialize;
     let modest_again = hex_encode(serialize(&modest));
     let again = dispatch(&ctx, "submitpackage", vec![json!([modest_again])]).unwrap();
@@ -2003,8 +2208,8 @@ fn sendrawtransaction_maxfeerate_default_rejects_huge_fee() {
         "{again}"
     );
     assert!(
-        row.get("vsize").is_none() && row.get("fees").is_none(),
-        "already-known package row is txid-only: {again}"
+        row.get("vsize").is_some() && row["fees"].get("base").is_some(),
+        "{again}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2071,14 +2276,15 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
         "amount−1 sat must reject: {short}"
     );
     pin_maxburn_json_shapes(&ctx, &hex);
-    let pkg = dispatch(&ctx, "submitpackage", vec![json!([hex.clone()])]).unwrap();
-    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
-    let err = pkg["tx-results"]
-        .as_object()
-        .and_then(|m| m.values().next())
-        .and_then(|v| v["error"].as_str())
-        .unwrap_or("");
-    assert!(err.contains("maxburnamount"), "{pkg}");
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([hex.clone()])]).unwrap_err();
+    assert_eq!(pkg["code"], ERR_VERIFY_ERROR, "{pkg}");
+    assert!(
+        pkg["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("maxburnamount"),
+        "{pkg}"
+    );
     ctx.mempool
         .as_ref()
         .unwrap()
@@ -2223,6 +2429,349 @@ fn submitpackage_child_fail_keeps_parent() {
             .is_some(),
         "child must be the failed member, got {pkg}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submitpackage_multigen_chain_is_topology_disallowed() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: parent.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let grandchild = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: child.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: child.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let grand_hex = hex_encode(serialize(&grandchild));
+    let e = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex.clone(), child_hex.clone(), grand_hex])],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
+    assert_eq!(e["message"], "package topology disallowed", "{e}");
+    let ok = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
+    assert_eq!(ok["package_msg"], "success", "{ok}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_package_missing_inputs_blanks_earlier() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ok_hex, ok_tx) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let garbage = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0u8; 32]),
+                vout: 5,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let garbage_hex = hex_encode(serialize(&garbage));
+    let row = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([ok_hex, garbage_hex])],
+    )
+    .unwrap();
+    assert_eq!(row.as_array().map(|a| a.len()), Some(2), "{row}");
+    assert_eq!(
+        row[0]["txid"],
+        json!(hash_hex_display(&ok_tx.compute_txid().to_byte_array())),
+        "{row}"
+    );
+    assert!(
+        row[0].get("allowed").is_none() && row[0].get("package-error").is_none(),
+        "earlier package tx is id-only after missing-inputs abort: {row}"
+    );
+    assert_eq!(row[1]["allowed"], json!(false), "{row}");
+    assert_eq!(row[1]["reject-reason"], json!("missing-inputs"), "{row}");
+    assert_eq!(ctx.mempool.as_ref().unwrap().live_count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_unsorted_chain_is_package_not_sorted() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: parent.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let row = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([child_hex, parent_hex])],
+    )
+    .unwrap();
+    assert_eq!(row.as_array().map(|a| a.len()), Some(2), "{row}");
+    assert_eq!(
+        row[0]["package-error"],
+        json!("package-not-sorted"),
+        "{row}"
+    );
+    assert_eq!(
+        row[1]["package-error"],
+        json!("package-not-sorted"),
+        "{row}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_and_submitpackage_conflict_in_package() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (a_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let b = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.input[0].previous_output.txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let b_hex = hex_encode(serialize(&b));
+    let tma = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([a_hex.clone(), b_hex.clone()])],
+    )
+    .unwrap();
+    assert_eq!(
+        tma[0]["package-error"],
+        json!("conflict-in-package"),
+        "{tma}"
+    );
+    assert_eq!(
+        tma[1]["package-error"],
+        json!("conflict-in-package"),
+        "{tma}"
+    );
+    let sub = dispatch(&ctx, "submitpackage", vec![json!([a_hex, b_hex])]).unwrap();
+    assert_eq!(sub["package_msg"], json!("conflict-in-package"), "{sub}");
+    for v in sub["tx-results"].as_object().unwrap().values() {
+        assert_eq!(v["error"], json!("package-not-validated"), "{sub}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submitpackage_parent_minfee_child_maxfeerate_reports_both() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub_with_weight(1_000);
+    let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+    let minrelay = info["minrelaytxfee"].as_f64().unwrap();
+    let minfee = info["mempoolminfee"].as_f64().unwrap();
+    assert!(
+        minfee > minrelay,
+        "tiny weight cap must raise mempoolminfee: {info}"
+    );
+    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let cb = generated_coinbase_value(&ctx, 1);
+    let probe = spend_generated_coinbase(&ctx, 1, cb - 1, ScriptBuf::from_bytes(vec![0x51])).1;
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(probe.weight().to_wu());
+    let minrelay_fee = vsize.div_ceil(10);
+    let (parent_hex, parent) = spend_generated_coinbase(
+        &ctx,
+        1,
+        cb - minrelay_fee,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let pkg = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let parent_w = hash_hex_display(&parent.compute_wtxid().to_byte_array());
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    let parent_err = pkg["tx-results"][&parent_w]["error"].as_str().unwrap_or("");
+    assert!(
+        parent_err.contains("mempool min fee not met"),
+        "parent must stay individual min-fee fail, got {pkg}"
+    );
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("max feerate exceeded"),
+        "in-package child maxfeerate, not missing-inputs: {pkg}"
+    );
+    assert!(!ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&parent.compute_txid()));
+    assert!(!ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submitpackage_oversized_spk_is_scriptpubkey() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![b'a'; 10_001]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, child_hex]), json!(0), json!(1_000)],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let parent_w = hash_hex_display(&parent.compute_wtxid().to_byte_array());
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    assert!(
+        pkg["tx-results"][&parent_w].get("error").is_none(),
+        "parent must admit: {pkg}"
+    );
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("scriptpubkey"),
+        "{pkg}"
+    );
+    assert!(ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&parent.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4383,7 +4932,7 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
 }
 
 #[test]
-fn testmempoolaccept_missing_inputs_is_missingorspent() {
+fn testmempoolaccept_missing_inputs_is_missing_inputs() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::script::ScriptBuf;
@@ -4411,22 +4960,14 @@ fn testmempoolaccept_missing_inputs_is_missingorspent() {
     let hex = hex_encode(serialize(&tx));
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 0);
 
     ctx.mempool.as_ref().unwrap().accept_tx(&tx).unwrap_err();
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4813,7 +5354,7 @@ fn sendraw_testmempoolaccept_submitpackage_junk_hex_is_tx_decode_failed() {
     ] {
         let e = dispatch(&ctx, method, params).unwrap_err();
         assert_eq!(e["code"], ERR_DESERIALIZATION, "{method}: {e}");
-        assert_eq!(e["message"], json!("TX decode failed"), "{method}: {e}");
+        assert_eq!(e["message"], json!("TX decode failed:"), "{method}: {e}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

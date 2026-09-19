@@ -464,9 +464,7 @@ reason = "core-log"
 
 [[test]]
 name = "mempool_package_limits.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: accept_package limits"
+status = "run"
 
 [[test]]
 name = "mempool_package_rbf.py"
@@ -476,9 +474,7 @@ analog = "follow-up: package RBF"
 
 [[test]]
 name = "mempool_packages.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: accept_package"
+status = "run"
 
 [[test]]
 name = "mempool_persist.py"
@@ -668,9 +664,7 @@ status = "run"
 
 [[test]]
 name = "p2p_invalid_block.py"
-status = "skip"
-reason = "v1-only"
-analog = "official: --v1transport add_p2p_connection magic-bytes mismatch (p2p_invalid_block.py:44); v2 later: bad-txns-inputs-duplicate missing (got consensus double spend in block) (p2p_invalid_block.py:98)"
+status = "run"
 
 [[test]]
 name = "p2p_invalid_locator.py"
@@ -729,8 +723,7 @@ analog = "follow-up: opportunistic 1p1c"
 
 [[test]]
 name = "p2p_orphan_handling.py"
-status = "skip"
-reason = "core-log"
+status = "run"
 
 [[test]]
 name = "p2p_outbound_eviction.py"
@@ -930,9 +923,7 @@ status = "run"
 
 [[test]]
 name = "rpc_packages.py"
-status = "skip"
-reason = "rpc-dialect"
-analog = "follow-up: submitpackage"
+status = "run"
 
 [[test]]
 name = "rpc_preciousblock.py"

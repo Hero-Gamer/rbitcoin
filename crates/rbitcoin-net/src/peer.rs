@@ -1140,6 +1140,7 @@ async fn on_heartbeat(
     }
     maybe_expire_pending_cmpct(hub, follow, session, out_tx, std::time::Instant::now())?;
     queue_due_tx_invs(hub, s, &follow.from_this_peer, out_tx);
+    queue_due_parent_getdata(hub, s, out_tx);
     let _ = maybe_queue_local_addr(hub, s, out_tx);
     let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     match crate::peers::PendingSendCmpct::from_u8(s.pending_sendcmpct.swap(0, Ordering::Relaxed)) {
@@ -1378,6 +1379,7 @@ fn on_inv_flush(
         if let Some(s) = session {
             s.request_tx_inv();
             queue_due_tx_invs(hub, s, &follow.from_this_peer, out_tx);
+            queue_due_parent_getdata(hub, s, out_tx);
             let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
         }
     }
@@ -1997,6 +1999,7 @@ pub fn flush_tx_invs(hub: &ChainHub, peers: &crate::peers::PeerHub) {
         s.request_tx_inv();
         if let Some(out) = s.writer() {
             queue_due_tx_invs(hub, s.as_ref(), &CappedSet::new(), &out);
+            queue_due_parent_getdata(hub, s.as_ref(), &out);
         }
     }
 }
@@ -2408,6 +2411,7 @@ fn on_ping(
 ) -> Result<(), NetError> {
     if let Some(s) = session {
         queue_due_tx_invs(hub, s, &follow.from_this_peer, out_tx);
+        queue_due_parent_getdata(hub, s, out_tx);
         let _ = maybe_queue_local_addr(hub, s, out_tx);
         // Noban headers-timeout reset: Core re-issues getheaders in the
         // same SendMessages turn; hook the ping so the official test
@@ -2784,55 +2788,26 @@ fn on_inv(
                     s.note_block_from_peer(*h);
                     s.note_best_known(*h);
                 }
-                if !hub.is_connected(h) {
-                    if !hub.knows_header(h) && !follow.pending_headers.contains_key(h) {
-                        if session.is_none_or(|s| {
-                            s.peer_hub()
-                                .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
-                        }) {
-                            need_headers = true;
-                        }
-                    } else {
-                        // Have a header: do not getdata from inv. Bodies
-                        // come from header-announcement direct fetch
-                        // (BIP130) or a getheaders reply. Inv of a
-                        // known hash from a second peer (p2p_sendheaders
-                        // inv_node) must not steal or duplicate getdata.
-                    }
+                if on_inv_block_needs_headers(hub, follow, session, h) {
+                    need_headers = true;
                 }
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(txid.to_string());
                 }
-                if relay {
-                    if let Some(mp) = hub.mempool() {
-                        if mp.try_contains(txid) {
-                            if let Some(s) = session {
-                                let _ = mp.add_orphan_announcer(txid, s.id);
-                            }
-                        } else {
-                            want.push(Inventory::WitnessTransaction(*txid));
-                            inv_tx_n = inv_tx_n.saturating_add(1);
-                        }
-                    }
+                if let Some(inv) = on_inv_txid(hub, session, relay, txid) {
+                    want.push(inv);
+                    inv_tx_n = inv_tx_n.saturating_add(1);
                 }
             }
             Inventory::WTx(wtxid) => {
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(wtxid.to_string());
                 }
-                if relay {
-                    if let Some(mp) = hub.mempool() {
-                        if mp.try_contains_wtxid(wtxid) {
-                            if let Some(s) = session {
-                                let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
-                            }
-                        } else {
-                            want.push(Inventory::WTx(*wtxid));
-                            inv_tx_n = inv_tx_n.saturating_add(1);
-                        }
-                    }
+                if let Some(inv) = on_inv_wtxid(hub, session, relay, wtxid) {
+                    want.push(inv);
+                    inv_tx_n = inv_tx_n.saturating_add(1);
                 }
             }
             _ => {}
@@ -2869,6 +2844,72 @@ fn on_inv(
         queue_out(out_tx, NetworkMessage::GetData(want))?;
     }
     Ok(())
+}
+
+fn on_inv_block_needs_headers(
+    hub: &ChainHub,
+    follow: &PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    h: &bitcoin::BlockHash,
+) -> bool {
+    if hub.is_connected(h) {
+        return false;
+    }
+    if hub.knows_header(h) || follow.pending_headers.contains_key(h) {
+        return false;
+    }
+    session.is_none_or(|s| {
+        s.peer_hub()
+            .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
+    })
+}
+
+fn on_inv_txid(
+    hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    relay: bool,
+    txid: &bitcoin::Txid,
+) -> Option<Inventory> {
+    if !relay {
+        return None;
+    }
+    let mp = hub.mempool()?;
+    let in_orphan = mp.try_orphan_missing(txid).is_some();
+    if mp.try_contains(txid) && !in_orphan {
+        if let Some(s) = session {
+            let _ = mp.add_orphan_announcer(txid, s.id);
+        }
+        return None;
+    }
+    if let Some(s) = session {
+        mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now());
+    }
+    Some(Inventory::WitnessTransaction(*txid))
+}
+
+fn on_inv_wtxid(
+    hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    relay: bool,
+    wtxid: &bitcoin::Wtxid,
+) -> Option<Inventory> {
+    if !relay {
+        return None;
+    }
+    let mp = hub.mempool()?;
+    if !mp.try_contains_wtxid(wtxid) {
+        if let Some(s) = session {
+            mp.note_inv_tx_requested(s.id, wtxid.to_byte_array(), s.inbound, s.clock_now());
+        }
+        return Some(Inventory::WTx(*wtxid));
+    }
+    let s = session?;
+    let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
+    if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
+        let missing = mp.orphan_getdata_parents(&tx);
+        mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    }
+    None
 }
 
 fn on_headers(
@@ -3519,29 +3560,57 @@ fn tx_accept_log(e: &rbitcoin_mempool::AcceptError) -> TxAcceptLog<'_> {
     }
 }
 
-fn queue_orphan_parent_getdata(
+fn schedule_orphan_parent_getdata(
     mp: &crate::tx_relay::MempoolHub,
-    missing: &BTreeSet<bitcoin::Txid>,
+    tx: &Transaction,
+    session: Option<&crate::peers::LivePeer>,
+    extra_from: &[u64],
+) {
+    let Some(s) = session else {
+        return;
+    };
+    let missing = mp.orphan_getdata_parents(tx);
+    let now = s.clock_now();
+    mp.schedule_orphan_parents(&missing, s.id, s.inbound, now);
+    let Some(ph) = s.peer_hub() else {
+        return;
+    };
+    for id in extra_from {
+        if *id == s.id {
+            continue;
+        }
+        if let Some(p) = ph.live_peers().into_iter().find(|p| p.id == *id) {
+            mp.schedule_orphan_parents(&missing, p.id, p.inbound, now);
+        }
+    }
+}
+
+fn queue_due_parent_getdata(
+    hub: &ChainHub,
+    session: &crate::peers::LivePeer,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
-) -> Result<(), NetError> {
-    let want = mp.take_parent_getdata(missing);
+) {
+    let Some(mp) = hub.mempool() else {
+        return;
+    };
+    let want = mp.take_due_parent_getdata(session.id, session.clock_now());
     if want.is_empty() {
-        return Ok(());
+        return;
     }
     mp.note_getdata_tx(want.len() as u64);
-    queue_out(
+    let _ = queue_out(
         out_tx,
         NetworkMessage::GetData(
             want.into_iter()
                 .map(Inventory::WitnessTransaction)
                 .collect(),
         ),
-    )
+    );
 }
 
 async fn on_tx(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    _out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     tx: &Transaction,
@@ -3564,6 +3633,7 @@ async fn on_tx(
             let wtxid = tx.compute_wtxid();
             follow.from_this_peer.insert(txid, FROM_THIS_PEER_CAP);
             if mp.try_recent_reject(&wtxid) {
+                mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
             }
@@ -3572,6 +3642,7 @@ async fn on_tx(
                 .await
             {
                 Ok(r) => {
+                    mp.resolve_tx_request(&txid, &wtxid, true);
                     if let Some(s) = session {
                         s.note_last_transaction();
                     }
@@ -3592,29 +3663,48 @@ async fn on_tx(
                         }
                     }
                 }
-                Err(e) => match tx_accept_log(&e) {
-                    TxAcceptLog::Silent => {
-                        if let rbitcoin_mempool::AcceptError::Duplicate(tid) = &e {
-                            maybe_force_relay_duplicate(hub, session, tx, *tid);
+                Err(e) => {
+                    let extra_from = matches!(
+                        tx_accept_log(&e),
+                        TxAcceptLog::Park(_) | TxAcceptLog::ParentFetch(_)
+                    )
+                    .then(|| mp.announcer_peers_for(&txid, &wtxid))
+                    .unwrap_or_default();
+                    mp.resolve_tx_request(&txid, &wtxid, false);
+                    match tx_accept_log(&e) {
+                        TxAcceptLog::Silent => {
+                            if let rbitcoin_mempool::AcceptError::Duplicate(tid) = &e {
+                                maybe_force_relay_duplicate(hub, session, tx, *tid);
+                            }
+                        }
+                        TxAcceptLog::Park(_missing) => {
+                            rbitcoin_log::debug!("txrelay: park {txid} missingorspent");
+                            for p in &extra_from {
+                                let _ = mp.add_orphan_announcer(&txid, *p);
+                            }
+                            if mp.try_orphan_missing(&txid).is_some() {
+                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
+                            }
+                        }
+                        TxAcceptLog::ParentFetch(_missing) => {
+                            for p in &extra_from {
+                                let _ = mp.add_orphan_announcer(&txid, *p);
+                            }
+                            if mp.try_orphan_missing(&txid).is_some() {
+                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
+                            }
+                        }
+                        TxAcceptLog::Reject => {
+                            let id = session.map(|s| s.id).unwrap_or(0);
+                            rbitcoin_log::info!(
+                                "{txid} (wtxid={}) from peer={id} was not accepted: {}",
+                                tx.compute_wtxid(),
+                                e.mempool_reject_reason()
+                            );
+                            rbitcoin_log::debug!("txrelay: reject {txid}: {e}");
                         }
                     }
-                    TxAcceptLog::Park(missing) => {
-                        rbitcoin_log::debug!("txrelay: park {txid}");
-                        queue_orphan_parent_getdata(mp, missing, out_tx)?;
-                    }
-                    TxAcceptLog::ParentFetch(missing) => {
-                        queue_orphan_parent_getdata(mp, missing, out_tx)?;
-                    }
-                    TxAcceptLog::Reject => {
-                        let id = session.map(|s| s.id).unwrap_or(0);
-                        rbitcoin_log::info!(
-                            "{txid} (wtxid={}) from peer={id} was not accepted: {}",
-                            tx.compute_wtxid(),
-                            e.mempool_reject_reason()
-                        );
-                        rbitcoin_log::debug!("txrelay: reject {txid}: {e}");
-                    }
-                },
+                }
             }
         }
     }

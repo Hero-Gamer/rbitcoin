@@ -100,6 +100,7 @@ pub fn block_reject_reason(err: &ConsensusError) -> String {
             "bad-blk-length".into()
         }
         ConsensusError::BadBlock("first tx not coinbase") => "bad-cb-missing".into(),
+        ConsensusError::BadBlock("coinbase excess value") => "bad-cb-amount".into(),
         ConsensusError::BadBlock("coinbase not first") => "bad-txns-duplicate".into(),
         ConsensusError::BadBlock("duplicate txid") => "bad-txns-duplicate".into(),
         ConsensusError::BadBlock("merkle root mismatch") => "bad-txnmrklroot".into(),
@@ -240,6 +241,10 @@ mod tests {
         assert_eq!(
             block_reject_reason(&ConsensusError::BadBlock("first tx not coinbase")),
             "bad-cb-missing"
+        );
+        assert_eq!(
+            block_reject_reason(&ConsensusError::BadBlock("coinbase excess value")),
+            "bad-cb-amount"
         );
         assert_eq!(
             block_reject_reason(&ConsensusError::BadHeader("incorrect proof of work bits")),

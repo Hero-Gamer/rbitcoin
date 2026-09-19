@@ -347,14 +347,14 @@ impl TxGraph {
     pub fn graph_stats(&self, txid: &Txid) -> Option<MempoolGraphStats> {
         let anc = self.ancestor_set(txid)?;
         let desc = self.descendant_set(txid)?;
-        let (a_fee, a_w) = self.set_fee_weight(&anc);
-        let (d_fee, d_w) = self.set_fee_weight(&desc);
+        let (a_fee, _) = self.set_fee_weight(&anc);
+        let (d_fee, _) = self.set_fee_weight(&desc);
         Some(MempoolGraphStats {
             ancestorcount: anc.len() as u64,
-            ancestorsize: a_w / 4,
+            ancestorsize: self.set_vsize(&anc),
             ancestorfees: a_fee,
             descendantcount: desc.len() as u64,
-            descendantsize: d_w / 4,
+            descendantsize: self.set_vsize(&desc),
             descendantfees: d_fee,
         })
     }
@@ -367,17 +367,17 @@ impl TxGraph {
     ) -> Option<(MempoolGraphStats, i64, i64)> {
         let anc = self.ancestor_set(txid)?;
         let desc = self.descendant_set(txid)?;
-        let (a_fee, a_w) = self.set_fee_weight(&anc);
-        let (d_fee, d_w) = self.set_fee_weight(&desc);
+        let (a_fee, _) = self.set_fee_weight(&anc);
+        let (d_fee, _) = self.set_fee_weight(&desc);
         let a_mod = self.set_modified_fee(&anc, &delta);
         let d_mod = self.set_modified_fee(&desc, &delta);
         Some((
             MempoolGraphStats {
                 ancestorcount: anc.len() as u64,
-                ancestorsize: a_w / 4,
+                ancestorsize: self.set_vsize(&anc),
                 ancestorfees: a_fee,
                 descendantcount: desc.len() as u64,
-                descendantsize: d_w / 4,
+                descendantsize: self.set_vsize(&desc),
                 descendantfees: d_fee,
             },
             a_mod,
@@ -423,6 +423,16 @@ impl TxGraph {
             }
         }
         (fee, w)
+    }
+
+    fn set_vsize(&self, set: &BTreeSet<Txid>) -> u64 {
+        let mut n = 0u64;
+        for t in set {
+            if let Some(e) = self.entries.get(t) {
+                n = n.saturating_add(rbitcoin_consensus::policy::get_virtual_size(e.weight));
+            }
+        }
+        n
     }
 
     /// Insert entry and wire parent/child edges. Does **not** enforce cluster limits
@@ -1271,6 +1281,29 @@ mod tests {
         // Hot child pulls the cheap parent into one chunk (CPFP).
         assert_eq!(c.chunks.len(), 1);
         assert_eq!(c.chunks[0].txids, vec![pid, cid]);
+    }
+
+    #[test]
+    fn graph_stats_size_sums_per_tx_virtual_size() {
+        use rbitcoin_consensus::policy::get_virtual_size;
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let mut pe = entry_for(&parent, 500, 0);
+        pe.weight = 1;
+        let pid = pe.txid;
+        g.insert(pe, &parent);
+        let child = make_tx(Some((pid, 0)), 1, 3);
+        let mut ce = entry_for(&child, 5000, 1);
+        ce.weight = 5;
+        let cid = ce.txid;
+        g.insert(ce, &child);
+        let ps = g.graph_stats(&pid).unwrap();
+        let cs = g.graph_stats(&cid).unwrap();
+        assert_eq!(ps.ancestorsize, get_virtual_size(1));
+        assert_eq!(ps.descendantsize, get_virtual_size(1) + get_virtual_size(5));
+        assert_eq!(cs.ancestorsize, get_virtual_size(1) + get_virtual_size(5));
+        assert_eq!(cs.descendantsize, get_virtual_size(5));
+        assert_ne!(ps.descendantsize, (1 + 5) / 4);
     }
 
     #[test]

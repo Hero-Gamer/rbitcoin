@@ -87,6 +87,15 @@ impl Orphanage {
         self.by_wtxid.contains_key(wtxid)
     }
 
+    pub fn wtxid_of(&self, txid: &Txid) -> Option<Wtxid> {
+        self.by_txid.get(txid).map(|e| e.wtxid)
+    }
+
+    pub fn tx_by_wtxid(&self, wtxid: &Wtxid) -> Option<&Transaction> {
+        let txid = self.by_wtxid.get(wtxid)?;
+        self.by_txid.get(txid).map(|e| &e.tx)
+    }
+
     pub fn missing_of(&self, txid: &Txid) -> Option<&BTreeSet<Txid>> {
         self.by_txid.get(txid).map(|e| &e.missing)
     }
@@ -106,13 +115,16 @@ impl Orphanage {
             return false;
         }
         let txid = tx.compute_txid();
-        if self.by_txid.contains_key(&txid) {
-            if let Some(peer) = from {
-                self.add_announcer(&txid, peer);
-            }
-            return false;
-        }
         let wtxid = tx.compute_wtxid();
+        if let Some(e) = self.by_txid.get(&txid) {
+            if e.wtxid == wtxid {
+                if let Some(peer) = from {
+                    self.add_announcer(&txid, peer);
+                }
+                return false;
+            }
+            self.remove_txid(&txid);
+        }
         let weight = tx.weight().to_wu();
         if weight > MAX_ORPHAN_TX_WEIGHT {
             return false;
@@ -153,12 +165,43 @@ impl Orphanage {
         true
     }
 
-    fn evict_oldest(&mut self) -> bool {
-        let Some(txid) = self.fifo.pop_front() else {
+    fn peer_orphan_weight(&self, peer: u64) -> u64 {
+        self.by_txid
+            .values()
+            .filter(|e| e.announcers.contains(&peer))
+            .map(|e| e.weight)
+            .sum()
+    }
+
+    fn announcers_within_reserve(&self, txid: &Txid) -> bool {
+        let Some(e) = self.by_txid.get(txid) else {
             return false;
         };
-        self.remove_txid(&txid);
-        true
+        if e.announcers.is_empty() {
+            return false;
+        }
+        e.announcers
+            .iter()
+            .any(|p| self.peer_orphan_weight(*p) <= ORPHAN_RESERVED_WEIGHT_PER_PEER)
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let mut skipped = VecDeque::new();
+        while let Some(txid) = self.fifo.pop_front() {
+            if !self.by_txid.contains_key(&txid) {
+                continue;
+            }
+            if self.announcers_within_reserve(&txid) {
+                skipped.push_back(txid);
+                continue;
+            }
+            self.remove_txid(&txid);
+            skipped.append(&mut self.fifo);
+            self.fifo = skipped;
+            return true;
+        }
+        self.fifo = skipped;
+        false
     }
 
     fn remove_txid(&mut self, txid: &Txid) {

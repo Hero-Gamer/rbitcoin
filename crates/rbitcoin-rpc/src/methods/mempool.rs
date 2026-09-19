@@ -28,7 +28,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
     let mut bytes = 0u64;
     let mut total_fee = 0u64;
     for (_, fee, weight) in &live {
-        bytes += weight / 4;
+        bytes += rbitcoin_consensus::policy::get_virtual_size(*weight);
         total_fee += fee;
     }
     let (orphan_size, orphan_wu) = mp.orphan_stats();
@@ -39,7 +39,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "usage": bytes,
         "total_fee": (total_fee as f64) / 100_000_000.0,
         "maxmempool": mp.max_weight(),
-        "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
+        "mempoolminfee": sat_btc_json(mp.mempool_min_fee_sat_kvb() as i64),
         "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
         "incrementalrelayfee": MempoolHub::relay_fee_btc_per_kb(),
         "relay_enabled": mp.relay_enabled(),
@@ -55,8 +55,16 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
 
 /// Exact 8-decimal BTC JSON number (Core `ValueFromAmount`). Avoids f64 drift
 /// against `Decimal` comparisons in the functional suite.
-/// Exact 8-decimal BTC JSON number (Core `ValueFromAmount`). Avoids f64 drift
-/// against `Decimal` comparisons in the functional suite.
+fn accept_fees_json(fee_sat: u64, weight: u64, wtxid: &str) -> Value {
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
+    let sat_kvb = fee_sat.saturating_mul(1000).checked_div(vsize).unwrap_or(0);
+    json!({
+        "base": sat_btc_json(fee_sat as i64),
+        "effective-feerate": sat_btc_json(sat_kvb as i64),
+        "effective-includes": [wtxid],
+    })
+}
+
 pub(crate) fn sat_btc_json(sat: i64) -> Value {
     let sign = if sat < 0 { "-" } else { "" };
     let abs = sat.unsigned_abs();
@@ -67,7 +75,7 @@ pub(crate) fn sat_btc_json(sat: i64) -> Value {
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
-    let vsize = weight / 4;
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
     let delta = mp.fee_delta(txid);
     let modified = (fee as i64).saturating_add(delta);
     let (ac, asz, afee, dc, dsz, dfee, a_mod, d_mod, chunk_fee, chunk_w) =
@@ -99,9 +107,14 @@ pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight:
         ),
         None => (Vec::new(), Vec::new()),
     };
+    let wtxid = mp
+        .wtxid_of(txid)
+        .map(|w| hash_hex_display(&w.to_byte_array()))
+        .unwrap_or_default();
     json!({
         "vsize": vsize,
         "weight": weight,
+        "wtxid": wtxid,
         "fee": sat_btc_json(fee as i64),
         // Top-level `modifiedfee` stays the base fee (same pattern as
         // ancestorfees/descendantfees). Real modified value is `fees.modified`.
@@ -143,10 +156,11 @@ pub(crate) fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     };
     let live = mp.list_live_meta();
     if !verbose {
-        let ids: Vec<String> = live
+        let mut ids: Vec<String> = live
             .iter()
             .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
             .collect();
+        ids.sort();
         if want_seq {
             return Ok(json!({
                 "txids": ids,
@@ -175,15 +189,7 @@ pub(crate) fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let wtxid = mp
-            .get_tx(&tid)
-            .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
-            .unwrap_or_default();
-        let mut entry = mempool_graph_json(mp, &tid, fee, weight);
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("wtxid".into(), json!(wtxid));
-        }
-        return Ok(entry);
+        return Ok(mempool_graph_json(mp, &tid, fee, weight));
     }
     Err(rpc_error(
         ERR_INVALID_ADDRESS_OR_KEY,
@@ -431,6 +437,37 @@ fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_vb: u64) -
     }
 }
 
+fn prevout_value_sat_in_package(
+    ctx: &RpcContext,
+    op: &OutPoint,
+    package: &[Transaction],
+) -> Option<u64> {
+    for tx in package {
+        if tx.compute_txid() == op.txid {
+            return tx.output.get(op.vout as usize).map(|o| o.value.to_sat());
+        }
+    }
+    prevout_value_sat(ctx, op)
+}
+
+fn package_tx_fee_exceeds_max(
+    ctx: &RpcContext,
+    tx: &Transaction,
+    package: &[Transaction],
+    max_sat_vb: u64,
+) -> bool {
+    match fold_tx_fee_sat(
+        tx.input
+            .iter()
+            .map(|inp| prevout_value_sat_in_package(ctx, &inp.previous_output, package)),
+        tx_output_sum_sat(tx),
+    ) {
+        TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_vb),
+        TxFeeLook::Overflow => max_sat_vb != 0,
+        TxFeeLook::MissingPrevout => false,
+    }
+}
+
 /// RPC-submit `maxburnamount` (BTC). Omitted → 0. Sum of unspendable output values vs cap.
 fn opt_maxburn_sat(params: &RpcParams, index: usize) -> Result<u64, Value> {
     match params.get(index, "maxburnamount") {
@@ -520,8 +557,8 @@ pub(crate) fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     if s == "coinbase" {
         return "bad-txns-is-coinbase".into();
     }
-    if s.starts_with("missing prevout") {
-        return "bad-txns-inputs-missingorspent".into();
+    if s.starts_with("missing prevout") || s.starts_with("orphaned ") {
+        return "missing-inputs".into();
     }
     if s.starts_with("duplicate ") {
         return "txn-already-in-mempool".into();
@@ -544,6 +581,9 @@ pub(crate) fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     if s == "min relay fee" {
         return "min relay fee not met".into();
     }
+    if s == "mempool min fee" {
+        return "mempool min fee not met".into();
+    }
     if let Some(rest) = s.strip_prefix("script: ") {
         let rest = rest
             .strip_prefix("script verification failed: ")
@@ -554,7 +594,6 @@ pub(crate) fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     s.to_string()
 }
 
-/// Core `reject-details` for mempool rejects.
 /// Core `reject-details` for mempool rejects.
 pub(crate) fn accept_reject_details(
     e: &impl std::fmt::Display,
@@ -596,16 +635,120 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtx hex required"))?;
         decoded.push(decode_tx_hex(hex)?);
     }
+    if let Some(rows) = testmempoolaccept_package_precheck(mp, &decoded) {
+        return Ok(rows);
+    }
+    if decoded.len() >= 2 {
+        return Ok(testmempoolaccept_package_rows(mp, &decoded, max_feerate));
+    }
+    testmempoolaccept_single_rows(ctx, mp, decoded, max_feerate)
+}
+
+fn testmempoolaccept_package_precheck(mp: &MempoolHub, decoded: &[Transaction]) -> Option<Value> {
     let mut ids = std::collections::HashSet::new();
     if decoded.iter().any(|tx| !ids.insert(tx.compute_txid())) {
-        let tx = &decoded[0];
-        return Ok(json!([{
-            "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
-            "wtxid": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
-            "allowed": false,
-            "package-error": "package-contains-duplicates",
-        }]));
+        return Some(package_error_rows(decoded, "package-contains-duplicates"));
     }
+    if decoded.len() < 2 {
+        return None;
+    }
+    if package_has_conflicts(decoded) {
+        return Some(package_error_rows(decoded, "conflict-in-package"));
+    }
+    if let Err(rbitcoin_net::AcceptError::PackageNotTopo) = MempoolHub::check_package_shape(decoded)
+    {
+        return Some(package_error_rows(decoded, "package-not-sorted"));
+    }
+    if mp.package_would_exceed_cluster(decoded) {
+        return Some(package_error_rows(decoded, "too-large-cluster"));
+    }
+    None
+}
+
+fn testmempoolaccept_package_rows(
+    mp: &MempoolHub,
+    decoded: &[Transaction],
+    max_feerate: u64,
+) -> Value {
+    let mut added = Vec::new();
+    let mut out = Vec::new();
+    let mut aborted = false;
+    for tx in decoded {
+        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        if aborted {
+            out.push(json!({ "txid": txid, "wtxid": wtxid }));
+            continue;
+        }
+        if tx
+            .input
+            .iter()
+            .any(|i| mp.spending_txid(&i.previous_output).is_some())
+        {
+            blank_package_prefix(&mut out);
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "bip125-replacement-disallowed",
+                "reject-details": "bip125-replacement-disallowed",
+            }));
+            aborted = true;
+            continue;
+        }
+        match mp.accept_tx(tx) {
+            Ok(r) => {
+                added.push(r.txid);
+                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
+                    blank_package_prefix(&mut out);
+                    out.push(json!({
+                        "txid": txid,
+                        "wtxid": wtxid,
+                        "allowed": false,
+                        "reject-reason": "max-fee-exceeded",
+                    }));
+                    aborted = true;
+                } else {
+                    out.push(json!({
+                        "txid": txid,
+                        "wtxid": wtxid,
+                        "allowed": true,
+                        "vsize": rbitcoin_consensus::policy::get_virtual_size(r.weight),
+                        "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
+                    }));
+                }
+            }
+            Err(e) => {
+                let reason = accept_reject_reason(&e);
+                if package_eval_aborts(&reason) {
+                    blank_package_prefix(&mut out);
+                    aborted = true;
+                }
+                let mut row = json!({
+                    "txid": txid,
+                    "wtxid": wtxid,
+                    "allowed": false,
+                    "reject-reason": reason,
+                });
+                if let Some(details) = accept_reject_details(&e, tx) {
+                    row["reject-details"] = json!(details);
+                }
+                out.push(row);
+            }
+        }
+    }
+    if !added.is_empty() {
+        mp.remove_for_block(&added);
+    }
+    json!(out)
+}
+
+fn testmempoolaccept_single_rows(
+    ctx: &RpcContext,
+    mp: &MempoolHub,
+    decoded: Vec<Transaction>,
+    max_feerate: u64,
+) -> Result<Value, Value> {
     let mut out = Vec::new();
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
@@ -634,8 +777,8 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": true,
-                    "vsize": r.weight / 4,
-                    "fees": { "base": sat_btc_json(r.fee_sat as i64) },
+                    "vsize": rbitcoin_consensus::policy::get_virtual_size(r.weight),
+                    "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
                 }));
             }
             Err(e) => {
@@ -653,6 +796,46 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
         }
     }
     Ok(json!(out))
+}
+
+fn package_eval_aborts(reason: &str) -> bool {
+    matches!(
+        reason,
+        "missing-inputs" | "max-fee-exceeded" | "bip125-replacement-disallowed"
+    )
+}
+
+fn blank_package_prefix(out: &mut [Value]) {
+    for row in out.iter_mut() {
+        let txid = row["txid"].clone();
+        let wtxid = row["wtxid"].clone();
+        *row = json!({ "txid": txid, "wtxid": wtxid });
+    }
+}
+
+fn package_has_conflicts(txs: &[Transaction]) -> bool {
+    let mut spent = std::collections::HashSet::new();
+    for tx in txs {
+        for inp in &tx.input {
+            if !spent.insert(inp.previous_output) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn package_error_rows(txs: &[Transaction], msg: &str) -> Value {
+    json!(txs
+        .iter()
+        .map(|tx| {
+            json!({
+                "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                "wtxid": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+                "package-error": msg,
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 fn tx_confirmed_on_active_chain(ctx: &RpcContext, tx: &Transaction) -> Result<bool, Value> {
@@ -999,8 +1182,14 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             "mempool relay disabled (still in IBD or tip not ready)",
         ));
     }
-    if arr.len() > MempoolHub::max_package_count() {
-        return Err(rpc_error(ERR_INVALID_PARAMS, "package too large"));
+    if arr.is_empty() || arr.len() > MempoolHub::max_package_count() {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!(
+                "Array must contain between 1 and {} transactions.",
+                MempoolHub::max_package_count()
+            ),
+        ));
     }
     let mut txs = Vec::with_capacity(arr.len());
     for v in arr {
@@ -1012,92 +1201,166 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     if let Err(e) = MempoolHub::check_package_shape(&txs) {
         return Err(rpc_error(ERR_INVALID_PARAMS, e.to_string()));
     }
+    if package_has_conflicts(&txs) {
+        return Ok(submitpackage_conflict_result(&txs));
+    }
+    if txs.len() > 1 && !MempoolHub::package_is_child_with_direct_parents(&txs) {
+        return Err(rpc_error(ERR_VERIFY_ERROR, "package topology disallowed"));
+    }
+    if let Some(failed) = submitpackage_fee_burn_precheck(ctx, &txs, max_feerate, max_burn)? {
+        return Ok(failed);
+    }
+    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate))
+}
+
+fn submitpackage_conflict_result(txs: &[Transaction]) -> Value {
     let mut tx_results = serde_json::Map::new();
-    let mut replaced = Vec::new();
+    for tx in txs {
+        tx_results.insert(
+            hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+            json!({
+                "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                "error": "package-not-validated",
+            }),
+        );
+    }
+    json!({
+        "package_msg": "conflict-in-package",
+        "tx-results": tx_results,
+        "replaced-transactions": [],
+    })
+}
+
+fn submitpackage_fee_burn_precheck(
+    ctx: &RpcContext,
+    txs: &[Transaction],
+    max_feerate: u64,
+    max_burn: u64,
+) -> Result<Option<Value>, Value> {
+    let mut tx_results = serde_json::Map::new();
     let mut pre_fail = false;
-    for tx in &txs {
+    for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
         if burn_exceeds_max(tx, max_burn) {
+            return Err(rpc_error(ERR_VERIFY_ERROR, MAX_BURN_MSG));
+        }
+        if rpc_tx_fee_exceeds_max(ctx, tx, max_feerate) {
             pre_fail = true;
             tx_results.insert(
                 wtxid,
                 json!({
                     "txid": txid,
-                    "error": MAX_BURN_MSG,
-                }),
-            );
-        } else if rpc_tx_fee_exceeds_max(ctx, tx, max_feerate) {
-            pre_fail = true;
-            tx_results.insert(
-                wtxid,
-                json!({
-                    "txid": txid,
-                    "error": "max-fee-exceeded",
+                    "error": "max feerate exceeded",
                 }),
             );
         }
     }
-    if pre_fail {
-        return Ok(json!({
-            "package_msg": "transaction failed",
-            "tx-results": tx_results,
-            "replaced-transactions": replaced,
-        }));
+    if !pre_fail {
+        return Ok(None);
     }
+    for tx in txs {
+        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        tx_results.entry(wtxid).or_insert_with(|| {
+            json!({
+                "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                "error": "bad-txns-inputs-missingorspent",
+            })
+        });
+    }
+    Ok(Some(json!({
+        "package_msg": "transaction failed",
+        "tx-results": tx_results,
+        "replaced-transactions": [],
+    })))
+}
+
+fn submitpackage_admit(
+    ctx: &RpcContext,
+    mp: &MempoolHub,
+    txs: &[Transaction],
+    max_feerate: u64,
+) -> Value {
+    let mut tx_results = serde_json::Map::new();
+    let mut replaced = Vec::new();
     let mut to_admit = Vec::new();
-    for tx in &txs {
+    for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
         let txid_s = hash_hex_display(&tx.compute_txid().to_byte_array());
-        if mp.contains(&tx.compute_txid()) {
-            tx_results.insert(wtxid, json!({ "txid": txid_s }));
-        } else {
+        if !mp.contains(&tx.compute_txid()) {
             to_admit.push(tx.clone());
+            continue;
+        }
+        if let Some((fee, weight)) = mp.get_live_meta(&tx.compute_txid()) {
+            tx_results.insert(
+                wtxid,
+                json!({
+                    "txid": txid_s,
+                    "vsize": rbitcoin_consensus::policy::get_virtual_size(weight),
+                    "fees": { "base": sat_btc_json(fee as i64) },
+                }),
+            );
+        } else {
+            tx_results.insert(wtxid, json!({ "txid": txid_s }));
         }
     }
-    if !to_admit.is_empty() {
-        let mut any_fail = false;
-        for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
-            match res {
-                Ok(ok) => {
-                    mp.note_unbroadcast(ok.txid);
-                    for old in &ok.replaced {
-                        replaced.push(hash_hex_display(&old.to_byte_array()));
-                    }
-                    tx_results.insert(
-                        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
-                        json!({
-                            "txid": hash_hex_display(&ok.txid.to_byte_array()),
-                            "vsize": ok.weight / 4,
-                            "fees": { "base": sat_btc_json(ok.fee_sat as i64) },
-                        }),
-                    );
+    let mut any_fail = false;
+    for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
+        match res {
+            Ok(ok) => {
+                mp.note_unbroadcast(ok.txid);
+                for old in &ok.replaced {
+                    replaced.push(hash_hex_display(&old.to_byte_array()));
                 }
-                Err(e) => {
-                    any_fail = true;
-                    tx_results.insert(
-                        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
-                        json!({
-                            "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
-                            "error": accept_reject_reason(&e),
-                        }),
-                    );
-                }
+                let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+                tx_results.insert(
+                    wtxid.clone(),
+                    json!({
+                        "txid": hash_hex_display(&ok.txid.to_byte_array()),
+                        "vsize": rbitcoin_consensus::policy::get_virtual_size(ok.weight),
+                        "fees": accept_fees_json(ok.fee_sat, ok.weight, &wtxid),
+                    }),
+                );
+            }
+            Err(e) => {
+                any_fail = true;
+                tx_results.insert(
+                    hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+                    json!({
+                        "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                        "error": submitpackage_member_error(ctx, tx, txs, max_feerate, &e),
+                    }),
+                );
             }
         }
-        if any_fail {
-            return Ok(json!({
-                "package_msg": "transaction failed",
-                "tx-results": tx_results,
-                "replaced-transactions": replaced,
-            }));
-        }
     }
-    Ok(json!({
-        "package_msg": "success",
+    let package_msg = if any_fail {
+        "transaction failed"
+    } else {
+        "success"
+    };
+    json!({
+        "package_msg": package_msg,
         "tx-results": tx_results,
         "replaced-transactions": replaced,
-    }))
+    })
+}
+
+fn submitpackage_member_error(
+    ctx: &RpcContext,
+    tx: &Transaction,
+    package: &[Transaction],
+    max_feerate: u64,
+    e: &impl std::fmt::Display,
+) -> String {
+    let mapped = accept_reject_reason(e);
+    if mapped != "missing-inputs" {
+        return mapped;
+    }
+    if package_tx_fee_exceeds_max(ctx, tx, package, max_feerate) {
+        return "max feerate exceeded".into();
+    }
+    "bad-txns-inputs-missingorspent".into()
 }
 
 pub(crate) fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

@@ -23,6 +23,36 @@ before 1.0).
 
 ### Changed
 
+- **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
+  `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
+  `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is
+  display-hex sorted.
+
+- **Core functional `p2p_invalid_block.py`:** inventory `run` (v2 twin only).
+  Coinbase excess is `bad-cb-amount`. Mutated / time-too-new rejects forget
+  `asked_blocks` and do not cache `BLOCK_FAILED`.
+
+- **Core functional `mempool_package_limits.py`:** inventory `run`.
+  `testmempoolaccept` of a multi-tx package reports `package-error:
+  too-large-cluster` when the package plus in-mempool parents would exceed
+  cluster limits, and otherwise evaluates later package txs against earlier
+  ones.
+
+- **Core functional `p2p_orphan_handling.py`:** inventory `run`. Orphan
+  parent GETDATA follows inbound NONPREF+TXID delay, skips parents that
+  arrived or are known-invalid, prefers outbound announcers, and maps
+  `missingorspent`. `testmempoolaccept` missing prevouts are `missing-inputs`.
+
+- **Core functional `rpc_packages.py`:** inventory `run`. `submitpackage`
+  is still sequential `accept_tx` (not Core AcceptPackage). Child-with-parents
+  topology, `conflict-in-package`, abort-class blank rows, and in-package
+  maxfeerate on a missing-inputs remainder match the official script.
+  Libre admission rejects nVersion outside 1/2 (`version`) and non-OP_RETURN
+  scripts over 10 000 bytes (`scriptpubkey`). `mempoolminfee` rises when live
+  weight plus `MAX_STANDARD_TX_WEIGHT` exceeds the cap. The harness maps
+  Core `-maxmempool=N` onto a 4× weight budget so `fill_mempool` evicts like
+  Core 5 MB RAM.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays

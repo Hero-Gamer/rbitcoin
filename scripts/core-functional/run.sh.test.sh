@@ -149,6 +149,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+TESTS_IB="$WORKDIR/tests-ib"
+mkdir -p "$TESTS_IB"
+printf '# fake\n' >"$TESTS_IB/p2p_invalid_block.py"
+INV_IB="$WORKDIR/inv-ib.toml"
+cat >"$INV_IB" <<'EOF'
+pin = "v31.1"
+core_commit = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+
+[[test]]
+name = "p2p_invalid_block.py"
+status = "run"
+EOF
+DRY_IB="$("$RUN" --dry-run --inventory "$INV_IB" --tests-dir "$TESTS_IB" \
+  --config-out "$WORKDIR/config-ib.ini" p2p_invalid_block.py 2>/dev/null || true)"
+if [[ "$DRY_IB" == *p2p_invalid_block.py*v2transport* && "$DRY_IB" != *v1transport* ]]; then
+  echo "ok - p2p_invalid_block dry-run is v2 twin only"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - p2p_invalid_block dry-run is v2 twin only (got: $DRY_IB)"
+  FAIL=$((FAIL + 1))
+fi
+
 # --- dry-run of a run name: v2transport + name ---
 DRY_OUT="$("$RUN" --dry-run --inventory "$INV" --tests-dir "$TESTS" \
   --config-out "$WORKDIR/config.ini" feature_help.py 2>/dev/null || true)"

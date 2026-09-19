@@ -74,7 +74,7 @@ fi
 # Core ALL_SCRIPTS lists some names as `foo.py --v1transport` and
 # `foo.py --v2transport`. test_runner startswith-matches `foo.py` to both.
 # We are BIP324 v2-only: pass the v2 token when the basename is one of those.
-V2_ONLY_TWIN=(p2p_timeouts.py p2p_leak_tx.py)
+V2_ONLY_TWIN=(p2p_timeouts.py p2p_leak_tx.py p2p_invalid_block.py)
 NORM=()
 for n in "${SELECTED[@]+"${SELECTED[@]}"}"; do
   base="$(basename "$n")"
