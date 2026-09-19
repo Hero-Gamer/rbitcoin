@@ -310,7 +310,7 @@ fn operator_usage() -> String {
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
-    [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--smoke] [--inhibit-suspend]\n\n\
+    [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest.\n\
 Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
@@ -329,6 +329,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
   --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
   --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
+  --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -388,6 +389,7 @@ fn is_bool_key(key: &str) -> bool {
             | "no_listen"
             | "no_discover"
             | "listen_onion"
+            | "cjdns_reachable"
             | "proxy_randomize"
             | "i2p_accept_incoming"
             | "inhibit_suspend"
@@ -589,6 +591,7 @@ mod tests {
             "--no-listen",
             "--no-discover",
             "--listen-onion",
+            "--cjdns-reachable",
             "--tor-control",
             "--tor-control-cookie",
             "--tor-control-password",
@@ -626,6 +629,7 @@ mod tests {
             "--nolisten",
             "--nodiscover",
             "--listenonion",
+            "--cjdnsreachable",
             "--torcontrol",
             "--i2psam",
         ] {
@@ -841,6 +845,27 @@ mod tests {
     }
 
     #[test]
+    fn listen_cjdns_addr_parses() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("listen", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
+        match c.listen.p2p {
+            crate::config::P2pListen::Socket(a) => {
+                assert!(a.is_ipv6(), "{a}");
+                assert_eq!(a.port(), 8333);
+                let ip = match a.ip() {
+                    std::net::IpAddr::V6(v) => v,
+                    other => panic!("expected v6, got {other}"),
+                };
+                assert!(rbitcoin_net::is_cjdns_ip(ip), "{ip}");
+            }
+            other => panic!("expected socket listen, got {other:?}"),
+        }
+        let off = ready_config(["rbitcoin-node", "--no-listen"]);
+        assert_eq!(off.listen.p2p, crate::config::P2pListen::Off);
+        assert!(off.listen.p2p_bind_addr(Network::Regtest).is_none());
+    }
+
+    #[test]
     fn connect_onion_and_ipv4() {
         let mut c = NodeConfig::default();
         c.apply_kv("connect", "1.2.3.4:8333").unwrap();
@@ -899,7 +924,13 @@ mod tests {
         let mut i2p_ok = NodeConfig::default();
         i2p_ok.apply_kv("only_net", "i2p").unwrap();
         assert_eq!(i2p_ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
-        assert!(NodeConfig::default().apply_kv("only_net", "cjdns").is_err());
+        let mut cjdns = NodeConfig::default();
+        cjdns.apply_kv("only_net", "cjdns").unwrap();
+        assert_eq!(cjdns.listen.only_net, vec![rbitcoin_net::OnlyNet::Cjdns]);
+        let err = cjdns.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        cjdns.apply_kv("cjdns_reachable", "1").unwrap();
+        cjdns.validate().unwrap();
         let ok = ready_config([
             "rbitcoin-node",
             "--only-net",
@@ -1077,6 +1108,20 @@ mod tests {
         let ok = ready_config(["rbitcoin-node", "--only-net", "i2p", "--i2p-sam"]);
         assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
         assert_eq!(ok.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_net_cjdns_without_reachable_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "cjdns").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        c.apply_kv("cjdns_reachable", "1").unwrap();
+        c.validate().unwrap();
+        let ok = ready_config(["rbitcoin-node", "--only-net", "cjdns", "--cjdns-reachable"]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::Cjdns]);
+        assert!(ok.listen.cjdns_reachable);
+        ok.validate().unwrap();
     }
 
     #[test]

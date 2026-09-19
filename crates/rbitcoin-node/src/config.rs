@@ -109,6 +109,8 @@ pub struct ListenOpts {
     pub i2p_accept_incoming: bool,
     /// Loopback P2P accept + Tor `ADD_ONION` (`--listen-onion`).
     pub listen_onion: bool,
+    /// Kernel CJDNS overlay (`fc00::/8`) is routable (`--cjdns-reachable`).
+    pub cjdns_reachable: bool,
 }
 
 impl Default for ListenOpts {
@@ -134,6 +136,7 @@ impl Default for ListenOpts {
             i2p_sam: None,
             i2p_accept_incoming: false,
             listen_onion: false,
+            cjdns_reachable: false,
         }
     }
 }
@@ -557,6 +560,24 @@ impl NodeConfig {
                 "only-net=i2p requires SAM (--i2p-sam)".into(),
             ));
         }
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::Cjdns)
+            && !self.listen.cjdns_reachable
+        {
+            return Err(NodeError::Config(
+                "only-net=cjdns requires --cjdns-reachable".into(),
+            ));
+        }
+        if self
+            .listen
+            .connect
+            .iter()
+            .any(|a| matches!(a, rbitcoin_net::NetAddr::Cjdns { .. }))
+            && !self.listen.cjdns_reachable
+        {
+            return Err(NodeError::Config(
+                "connect to a CJDNS address requires --cjdns-reachable".into(),
+            ));
+        }
         if self.listen.i2p_accept_incoming {
             if self.listen.i2p_sam.is_none() {
                 return Err(NodeError::Config(
@@ -827,6 +848,10 @@ impl NodeConfig {
             "listen_onion" => {
                 self.listen.listen_onion = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf listen_onion: {e}")))?;
+            }
+            "cjdns_reachable" => {
+                self.listen.cjdns_reachable = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf cjdns_reachable: {e}")))?;
             }
             "proxy_randomize" => {
                 self.listen.proxy_randomize = parse_conf_bool(val)
