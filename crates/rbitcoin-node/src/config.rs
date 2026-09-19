@@ -84,6 +84,12 @@ pub struct ListenOpts {
     pub max_inbound_explicit: bool,
     pub external_ips: Vec<std::net::IpAddr>,
     pub peer_timeout_secs: Option<u64>,
+    /// SOCKS5 for all P2P outbound (`--proxy`).
+    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 for onion destinations (`--onion`); stored until plan 02.
+    pub onion: Option<SocketAddr>,
+    /// Fresh SOCKS USERPASS per peer (Core `-proxyrandomize`; default on).
+    pub proxy_randomize: bool,
 }
 
 impl Default for ListenOpts {
@@ -101,6 +107,21 @@ impl Default for ListenOpts {
             max_inbound_explicit: false,
             external_ips: Vec::new(),
             peer_timeout_secs: None,
+            proxy: None,
+            onion: None,
+            proxy_randomize: true,
+        }
+    }
+}
+
+impl ListenOpts {
+    pub fn dialer(&self) -> rbitcoin_net::Dialer {
+        match self.proxy {
+            None => rbitcoin_net::Dialer::Direct,
+            Some(proxy) => rbitcoin_net::Dialer::Socks {
+                proxy,
+                randomize: self.proxy_randomize,
+            },
         }
     }
 }
@@ -635,6 +656,16 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
                 );
             }
+            "proxy" => {
+                self.listen.proxy = Some(parse_required_socket(val, "proxy")?);
+            }
+            "onion" => {
+                self.listen.onion = Some(parse_required_socket(val, "onion")?);
+            }
+            "proxy_randomize" => {
+                self.listen.proxy_randomize = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf proxy_randomize: {e}")))?;
+            }
             "seed_node" => {
                 if !val.is_empty() {
                     self.listen.seednodes.push(val.to_string());
@@ -961,6 +992,14 @@ pub(crate) fn parse_signet_challenge(value: &str) -> Result<ScriptBuf, String> {
     Vec::<u8>::from_hex(value)
         .map(ScriptBuf::from_bytes)
         .map_err(|e| format!("must be hexadecimal: {e}"))
+}
+
+fn parse_required_socket(val: &str, key: &str) -> Result<SocketAddr, NodeError> {
+    if val.is_empty() {
+        return Err(NodeError::Config(format!("conf {key}: empty")));
+    }
+    val.parse()
+        .map_err(|e| NodeError::Config(format!("conf {key}: {e}")))
 }
 
 fn is_conf_true(val: &str) -> bool {
