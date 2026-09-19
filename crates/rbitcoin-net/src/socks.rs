@@ -128,6 +128,20 @@ impl Dialer {
             Dialer::Socks { proxy, .. } => dial_isolated(*proxy, target).await,
         }
     }
+
+    pub async fn connect_net(&self, addr: crate::NetAddr) -> Result<TcpStream, NetError> {
+        match addr {
+            crate::NetAddr::Ip(s) => self.connect(s).await,
+            crate::NetAddr::Onion { port, .. } => {
+                if matches!(self, Dialer::Direct) {
+                    return Err(NetError::Encode(
+                        "onion dial requires SOCKS (--proxy or --onion)".into(),
+                    ));
+                }
+                self.connect_domain(&addr.host_str(), port).await
+            }
+        }
+    }
 }
 
 async fn socks5_connect_dest(
@@ -682,5 +696,33 @@ mod tests {
         .await
         .unwrap();
         inbound.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_onion_uses_socks_domain_connect() {
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let server = tokio::spawn(accept_domain_connect(
+            listener,
+            b"pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+            8333,
+        ));
+        Dialer::Socks {
+            proxy,
+            randomize: false,
+        }
+        .connect_net(onion)
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert!(
+            Dialer::Direct.connect_net(onion).await.is_err(),
+            "onion must not TcpStream::connect / local DNS"
+        );
     }
 }

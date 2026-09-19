@@ -160,7 +160,7 @@ pub(crate) async fn spawn_peer(
     sinks: PeerEventSinks,
     dialer: crate::socks::Dialer,
 ) -> Result<PeerSlot, NetError> {
-    let stream = dialer.connect(addr).await?;
+    let stream = dialer.connect_net(crate::NetAddr::Ip(addr)).await?;
     let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
     let (ver, reader, writer, _wire, _tcp_shutdown) = connect_and_handshake_timed(

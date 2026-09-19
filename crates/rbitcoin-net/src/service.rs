@@ -547,7 +547,7 @@ async fn prepare_outbound_session(
 ) -> Result<PreparedOutbound, NetError> {
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
     let stream = match &peer {
-        DialTarget::Socket(addr) => dialer.connect(*addr).await?,
+        DialTarget::Socket(addr) => dialer.connect_net(crate::NetAddr::Ip(*addr)).await?,
         DialTarget::Domain { host, port } => dialer.connect_domain(host, *port).await?,
     };
     let peer_hint = peer.peer_hint();
@@ -654,7 +654,7 @@ async fn run_outbound_session_with_abort(
                 return Err(NetError::Encode("feeler requires ip:port target".into()))
             }
         };
-        let stream = dialer.connect(peer_addr).await?;
+        let stream = dialer.connect_net(crate::NetAddr::Ip(peer_addr)).await?;
         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
         return crate::peer::run_feeler(stream, magic, local, peer_addr, height, &user_agent).await;
     }
