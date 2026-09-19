@@ -1,6 +1,7 @@
 //! BIP155-capable peer identity: clearnet [`SocketAddr`] and Tor v3 onion.
 
 use crate::error::NetError;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use sha3::{Digest, Sha3_256};
 use std::fmt;
 use std::net::SocketAddr;
@@ -32,6 +33,58 @@ impl FromStr for NetAddr {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         parse_net_addr(s)
+    }
+}
+
+impl NetAddr {
+    pub fn from_addrv2(msg: &AddrV2Message) -> Option<Self> {
+        if msg.port == 0 {
+            return None;
+        }
+        match &msg.addr {
+            AddrV2::Ipv4(_) | AddrV2::Ipv6(_) => msg.socket_addr().ok().map(NetAddr::Ip),
+            AddrV2::TorV3(pk) => Some(NetAddr::Onion {
+                pk: *pk,
+                port: msg.port,
+            }),
+            AddrV2::TorV2(_) | AddrV2::I2p(_) | AddrV2::Cjdns(_) | AddrV2::Unknown(_, _) => None,
+        }
+    }
+
+    pub fn socket_addr(self) -> Option<SocketAddr> {
+        match self {
+            NetAddr::Ip(s) => Some(s),
+            NetAddr::Onion { .. } => None,
+        }
+    }
+
+    pub fn is_ipv6(self) -> bool {
+        match self {
+            NetAddr::Ip(s) => s.is_ipv6(),
+            NetAddr::Onion { .. } => false,
+        }
+    }
+
+    pub fn port(self) -> u16 {
+        match self {
+            NetAddr::Ip(s) => s.port(),
+            NetAddr::Onion { port, .. } => port,
+        }
+    }
+
+    pub fn host_str(self) -> String {
+        match self {
+            NetAddr::Ip(s) => s.ip().to_string(),
+            NetAddr::Onion { pk, .. } => format!("{}.onion", encode_onion_name(&pk)),
+        }
+    }
+
+    pub fn network_label(self) -> &'static str {
+        match self {
+            NetAddr::Ip(s) if s.is_ipv4() => "ipv4",
+            NetAddr::Ip(_) => "ipv6",
+            NetAddr::Onion { .. } => "onion",
+        }
     }
 }
 

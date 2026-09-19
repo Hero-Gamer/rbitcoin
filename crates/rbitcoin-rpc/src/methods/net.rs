@@ -290,10 +290,7 @@ pub(crate) fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<V
         .map(|d| d.as_secs())
         .unwrap_or(0);
     for e in g.entries() {
-        let net = match e.addr.ip() {
-            std::net::IpAddr::V4(_) => "ipv4",
-            std::net::IpAddr::V6(_) => "ipv6",
-        };
+        let net = e.addr.network_label();
         if let Some(want) = network {
             if want != net {
                 continue;
@@ -302,7 +299,7 @@ pub(crate) fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<V
         out.push(json!({
             "time": now,
             "services": rbitcoin_net::local_service_flags().to_u64(),
-            "address": e.addr.ip().to_string(),
+            "address": e.addr.host_str(),
             "port": e.addr.port(),
             "network": net,
         }));

@@ -1255,7 +1255,7 @@ impl PeerHub {
         *self.addrman.lock().unwrap_or_else(|e| e.into_inner()) = Some(am);
     }
 
-    /// Learn IPv4/IPv6 rows from BIP155 `addrv2` (`p2p_addrv2_relay.py`).
+    /// Learn IPv4/IPv6/Tor v3 rows from BIP155 `addrv2` (`p2p_addrv2_relay.py`).
     pub fn learn_addrv2(&self, list: &[bitcoin::p2p::address::AddrV2Message]) {
         let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
         let Some(am) = g.as_ref() else {
@@ -1263,8 +1263,8 @@ impl PeerHub {
         };
         let mut book = am.lock().unwrap_or_else(|e| e.into_inner());
         for a in list {
-            if let Ok(sock) = a.socket_addr() {
-                book.add_learned(sock, crate::seeds::MAX_ADDR_MAN);
+            if let Some(addr) = crate::NetAddr::from_addrv2(a) {
+                book.add_learned_addr(addr, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }
@@ -1299,7 +1299,11 @@ impl PeerHub {
             let g = am.lock().unwrap_or_else(|e| e.into_inner());
             g.entries()
         };
-        let n = entries.len();
+        let addrs: Vec<SocketAddr> = entries
+            .iter()
+            .filter_map(|e| e.addr.socket_addr())
+            .collect();
+        let n = addrs.len();
         let pct_cap = (n * crate::peer::MAX_PCT_ADDR_TO_SEND / 100).max(1);
         let cap = crate::peer::MAX_ADDR_TO_SEND.min(pct_cap).min(n);
         if cap == 0 {
@@ -1315,7 +1319,7 @@ impl PeerHub {
         let services = crate::peer::local_service_flags();
         let mut out = Vec::with_capacity(cap);
         for &i in idxs.iter().take(cap) {
-            let addr = entries[i].addr;
+            let addr = addrs[i];
             out.push((
                 now as u32,
                 bitcoin::p2p::address::Address::new(&addr, services),
@@ -2987,5 +2991,55 @@ mod tests {
             addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
         assert_eq!(expired.len(), 1000);
         assert_ne!(a, expired);
+    }
+
+    #[test]
+    fn learn_addrv2_keeps_tor_v3() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+        use std::net::Ipv4Addr;
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let pk = [
+            0x79, 0xbc, 0xc6, 0x25, 0x18, 0x4b, 0x05, 0x19, 0x49, 0x75, 0xc2, 0x8b, 0x66, 0xb6,
+            0x6b, 0x04, 0x69, 0xf7, 0xf6, 0x55, 0x6f, 0xb1, 0xac, 0x31, 0x89, 0xa7, 0x9b, 0x40,
+            0xdd, 0xa3, 0x2f, 0x1f,
+        ];
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        hub.learn_addrv2(&[
+            AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+                addr: AddrV2::TorV3(pk),
+                port: 8333,
+            },
+            AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+                addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+                port: 18444,
+            },
+            AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NETWORK,
+                addr: AddrV2::I2p([0u8; 32]),
+                port: 1,
+            },
+        ]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let ents = book.entries();
+        assert!(
+            ents.iter().any(|e| e.addr == onion),
+            "Tor v3 must stay in the book, got {ents:?}"
+        );
+        assert!(ents
+            .iter()
+            .any(|e| e.addr
+                == crate::NetAddr::Ip(SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 18444)))));
+        assert_eq!(ents.len(), 2, "I2P is not stored until plan 04");
     }
 }

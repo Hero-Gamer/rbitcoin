@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::asmap::AsMap;
+use crate::netaddr::NetAddr;
 use crate::netgroup::{netgroup, select_diverse};
 
 /// Skip a recently dialed addr while any other candidate remains.
@@ -276,7 +277,7 @@ impl PeerFlags {
 /// One remembered peer address + flags.
 #[derive(Clone, Debug)]
 pub struct PeerEntry {
-    pub addr: SocketAddr,
+    pub addr: NetAddr,
     pub flags: PeerFlags,
 }
 
@@ -293,10 +294,10 @@ pub const MAX_ADDR_MAN: usize = 8192;
 #[derive(Debug, Default, Clone)]
 pub struct AddrMan {
     /// Insertion-order keys (IPv4 preferred on inject).
-    order: Vec<SocketAddr>,
-    by_addr: HashMap<SocketAddr, PeerFlags>,
+    order: Vec<NetAddr>,
+    by_addr: HashMap<NetAddr, PeerFlags>,
     asmap: Option<Arc<AsMap>>,
-    last_attempt: HashMap<SocketAddr, Instant>,
+    last_attempt: HashMap<NetAddr, Instant>,
 }
 
 impl AddrMan {
@@ -327,6 +328,10 @@ impl AddrMan {
     }
 
     pub fn add(&mut self, addr: SocketAddr) {
+        self.add_addr(NetAddr::Ip(addr));
+    }
+
+    pub fn add_addr(&mut self, addr: NetAddr) {
         if self.by_addr.contains_key(&addr) {
             return;
         }
@@ -341,6 +346,10 @@ impl AddrMan {
     ///
     /// Uncapped so `load` can keep tried-first then trim. `merge_from` trims.
     pub fn add_with_flags(&mut self, addr: SocketAddr, flags: PeerFlags) {
+        self.add_with_flags_addr(NetAddr::Ip(addr), flags);
+    }
+
+    pub fn add_with_flags_addr(&mut self, addr: NetAddr, flags: PeerFlags) {
         if let Some(f) = self.by_addr.get_mut(&addr) {
             // Union: remember the best information we have.
             f.0 |= flags.0;
@@ -356,6 +365,10 @@ impl AddrMan {
     /// over-cap book (`add` exceed), and a full book of only tried addrs
     /// return false. Never exceeds `cap`.
     pub fn add_learned(&mut self, addr: SocketAddr, cap: usize) -> bool {
+        self.add_learned_addr(NetAddr::Ip(addr), cap)
+    }
+
+    pub fn add_learned_addr(&mut self, addr: NetAddr, cap: usize) -> bool {
         if self.by_addr.contains_key(&addr) || cap == 0 {
             return false;
         }
@@ -370,7 +383,7 @@ impl AddrMan {
         true
     }
 
-    fn evict_one(&mut self, addr: SocketAddr) {
+    fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
         self.last_attempt.remove(&addr);
         self.order.retain(|a| *a != addr);
@@ -381,7 +394,7 @@ impl AddrMan {
             .order
             .iter()
             .copied()
-            .find(|a| !self.flags(a).has_connected());
+            .find(|a| !self.flags_of(a).has_connected());
         let Some(addr) = victim else {
             return false;
         };
@@ -394,12 +407,12 @@ impl AddrMan {
             .order
             .iter()
             .copied()
-            .find(|a| self.flags(a).is_incompatible())
+            .find(|a| self.flags_of(a).is_incompatible())
             .or_else(|| {
                 self.order
                     .iter()
                     .copied()
-                    .find(|a| self.flags(a).failed_last_connect())
+                    .find(|a| self.flags_of(a).failed_last_connect())
             });
         if let Some(addr) = victim {
             self.evict_one(addr);
@@ -412,20 +425,20 @@ impl AddrMan {
         if self.order.len() <= cap {
             return;
         }
-        let mut keep: Vec<SocketAddr> = self
+        let mut keep: Vec<NetAddr> = self
             .order
             .iter()
             .copied()
-            .filter(|a| self.flags(a).has_connected())
+            .filter(|a| self.flags_of(a).has_connected())
             .collect();
         keep.extend(
             self.order
                 .iter()
                 .copied()
-                .filter(|a| !self.flags(a).has_connected()),
+                .filter(|a| !self.flags_of(a).has_connected()),
         );
         keep.truncate(cap);
-        let keep_set: HashSet<SocketAddr> = keep.iter().copied().collect();
+        let keep_set: HashSet<NetAddr> = keep.iter().copied().collect();
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
@@ -437,7 +450,7 @@ impl AddrMan {
     /// This path is not load: trim after the union.
     pub fn merge_from(&mut self, other: &AddrMan) {
         for e in other.entries() {
-            self.add_with_flags(e.addr, e.flags);
+            self.add_with_flags_addr(e.addr, e.flags);
         }
         self.trim_to_cap(MAX_ADDR_MAN);
         self.sort_order_ipv4_first();
@@ -449,11 +462,19 @@ impl AddrMan {
         self.order.sort_by_key(|a| a.is_ipv6());
     }
 
-    pub fn peers(&self) -> &[SocketAddr] {
-        &self.order
+    pub fn peers(&self) -> Vec<SocketAddr> {
+        self.order
+            .iter()
+            .copied()
+            .filter_map(NetAddr::socket_addr)
+            .collect()
     }
 
     pub fn flags(&self, addr: &SocketAddr) -> PeerFlags {
+        self.flags_of(&NetAddr::Ip(*addr))
+    }
+
+    fn flags_of(&self, addr: &NetAddr) -> PeerFlags {
         self.by_addr
             .get(addr)
             .copied()
@@ -461,6 +482,10 @@ impl AddrMan {
     }
 
     pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
+        self.entry_of(&NetAddr::Ip(*addr))
+    }
+
+    fn entry_of(&self, addr: &NetAddr) -> Option<PeerEntry> {
         self.by_addr
             .get(addr)
             .map(|&flags| PeerEntry { addr: *addr, flags })
@@ -477,7 +502,7 @@ impl AddrMan {
     /// Successful BIP324 handshake.
     pub fn note_connected(&mut self, addr: SocketAddr) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
             f.remove(PeerFlags::INCOMPATIBLE);
@@ -490,19 +515,19 @@ impl AddrMan {
     }
 
     pub(crate) fn note_attempt_at(&mut self, addr: SocketAddr, when: Instant) {
-        self.last_attempt.insert(addr, when);
+        self.last_attempt.insert(NetAddr::Ip(addr), when);
     }
 
     fn recently_attempted(&self, addr: SocketAddr, now: Instant) -> bool {
         self.last_attempt
-            .get(&addr)
+            .get(&NetAddr::Ip(addr))
             .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
     }
 
     /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
     pub fn note_connect_failed(&mut self, addr: SocketAddr, incompatible: bool) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
             if incompatible {
                 f.insert(PeerFlags::INCOMPATIBLE);
                 f.remove(PeerFlags::FAILED_LAST_CONNECT);
@@ -515,7 +540,7 @@ impl AddrMan {
     /// Throughput / latency sample from an active session.
     pub fn note_speed(&mut self, addr: SocketAddr, latency_ms: u64, bytes_per_sec: u64) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.apply_speed_sample(latency_ms, bytes_per_sec);
         }
@@ -525,7 +550,7 @@ impl AddrMan {
     /// would otherwise leave a prior FAST bit and keep `dial_tier` 0).
     pub fn note_ibd_slow(&mut self, addr: SocketAddr) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.insert(PeerFlags::SLOW);
             f.remove(PeerFlags::FAST);
@@ -573,10 +598,14 @@ impl AddrMan {
         let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
             .iter()
-            .filter(|a| !exclude.contains(*a))
-            .map(|&a| {
-                let f = self.flags(&a);
-                (f.dial_tier(), a.is_ipv6(), f.is_incompatible(), a)
+            .copied()
+            .filter_map(|a| {
+                let sock = a.socket_addr()?;
+                if exclude.contains(&sock) {
+                    return None;
+                }
+                let f = self.flags_of(&a);
+                Some((f.dial_tier(), sock.is_ipv6(), f.is_incompatible(), sock))
             })
             .collect();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -656,7 +685,7 @@ impl AddrMan {
 
     /// Snapshot of all entries (for tests / diagnostics).
     pub fn entries(&self) -> Vec<PeerEntry> {
-        self.order.iter().filter_map(|a| self.entry(a)).collect()
+        self.order.iter().filter_map(|a| self.entry_of(a)).collect()
     }
 
     /// On-disk format magic line (text, one peer per line).
@@ -758,7 +787,10 @@ impl AddrMan {
                 "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
             )?;
             for e in self.entries() {
-                writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
+                let Some(addr) = e.addr.socket_addr() else {
+                    continue;
+                };
+                writeln!(f, "{} 0x{:02x}", addr, e.flags.0)?;
             }
             f.sync_all()?;
         }
