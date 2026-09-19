@@ -955,10 +955,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let miss_hex = rbitcoin_primitives::hex_encode(&miss_raw);
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[miss_hex]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
-    assert_eq!(
-        tma["result"][0]["reject-reason"], "bad-txns-inputs-missingorspent",
-        "{tma}"
-    );
+    assert_eq!(tma["result"][0]["reject-reason"], "missing-inputs", "{tma}");
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
     let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());

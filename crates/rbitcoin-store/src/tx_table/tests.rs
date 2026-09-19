@@ -3112,11 +3112,11 @@ fn rebuild_opts_are_per_table() {
     let dir_a = tempfile_dir("rebuild-opts-a");
     let dir_b = tempfile_dir("rebuild-opts-b");
     let a = create_tiny_rebuild(&dir_a, 6, 3);
-    let b = create_tiny(&dir_b);
+    let b = create_tiny_rebuild(&dir_b, 7, 4);
     assert_eq!(a.rebuild_workers(), 3);
     assert_eq!(a.rebuild_seal_bits(), 6);
-    assert_ne!(b.rebuild_workers(), 3);
-    assert_ne!(b.rebuild_seal_bits(), 6);
+    assert_eq!(b.rebuild_workers(), 4);
+    assert_eq!(b.rebuild_seal_bits(), 7);
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }

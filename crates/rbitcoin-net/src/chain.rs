@@ -1950,6 +1950,9 @@ impl ChainHub {
     }
 
     fn precious_block_inner(&self, hash: BlockHash) -> Result<(), NetError> {
+        if self.is_block_invalid(&hash) {
+            return Ok(());
+        }
         let branch = self.assemble_side_branch(hash);
         if branch.is_none() && !self.is_connected(&hash) {
             return Err(NetError::Consensus("Block not found".into()));
@@ -4447,16 +4450,17 @@ mod tests {
         assert_eq!(hub.tip_hash().unwrap(), main[2].block_hash());
 
         hub.invalidate_block(eq[2].block_hash()).unwrap();
-        let err = hub.precious_block(eq[2].block_hash()).unwrap_err();
-        assert!(
-            err.to_string().to_ascii_lowercase().contains("invalid"),
-            "{err}"
+        hub.precious_block(eq[2].block_hash()).unwrap();
+        assert_eq!(
+            hub.tip_hash().unwrap(),
+            main[2].block_hash(),
+            "precious of an invalidated hash is a no-op"
         );
         hub.reconsider_block(eq[2].block_hash()).unwrap();
         assert_eq!(
             hub.tip_hash().unwrap(),
             main[2].block_hash(),
-            "failed precious must not leave a preference reconsider would honor"
+            "no-op precious must not leave a preference reconsider would honor"
         );
         hub.precious_block(eq[2].block_hash()).unwrap();
         assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());

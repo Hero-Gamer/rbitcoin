@@ -1026,9 +1026,9 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             .find(|p| p.inbound)
             .map(|p| p.bytesrecv_per_msg.get("getdata").copied().unwrap_or(0))
             .unwrap_or(0);
-        assert_eq!(
-            getdata_after_inv, getdata_parked,
-            "parked orphan INV must not GetData"
+        assert!(
+            getdata_after_inv > getdata_parked,
+            "INV of orphanage txid must GetData (same-txid different witness)"
         );
 
         wait_ms_until(

@@ -723,8 +723,7 @@ analog = "follow-up: opportunistic 1p1c"
 
 [[test]]
 name = "p2p_orphan_handling.py"
-status = "skip"
-reason = "core-log"
+status = "run"
 
 [[test]]
 name = "p2p_outbound_eviction.py"

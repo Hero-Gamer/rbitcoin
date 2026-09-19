@@ -38,6 +38,11 @@ before 1.0).
   cluster limits, and otherwise evaluates later package txs against earlier
   ones.
 
+- **Core functional `p2p_orphan_handling.py`:** inventory `run`. Orphan
+  parent GETDATA follows inbound NONPREF+TXID delay, skips parents that
+  arrived or are known-invalid, prefers outbound announcers, and maps
+  `missingorspent`. `testmempoolaccept` missing prevouts are `missing-inputs`.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays

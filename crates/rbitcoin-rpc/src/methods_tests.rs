@@ -4585,7 +4585,7 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
 }
 
 #[test]
-fn testmempoolaccept_missing_inputs_is_missingorspent() {
+fn testmempoolaccept_missing_inputs_is_missing_inputs() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::script::ScriptBuf;
@@ -4613,22 +4613,14 @@ fn testmempoolaccept_missing_inputs_is_missingorspent() {
     let hex = hex_encode(serialize(&tx));
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 0);
 
     ctx.mempool.as_ref().unwrap().accept_tx(&tx).unwrap_err();
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");
-    assert_eq!(
-        row[0]["reject-reason"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{row}"
-    );
+    assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }

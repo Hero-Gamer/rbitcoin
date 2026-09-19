@@ -3734,24 +3734,219 @@ fn parked_orphan_on_tokio_worker_getdatas_parent() {
             )
             .await
             .unwrap();
-            let gd = out_rx.try_recv().expect("parent GetData").expect_msg();
+            let immediate = out_rx.try_recv();
             let _ = std::fs::remove_dir_all(dir);
-            (name, gd)
+            (name, immediate)
         });
-        let (name, gd) = join.await.expect("park on tokio-rt-worker must not panic");
+        let (name, immediate) = join.await.expect("park on tokio-rt-worker must not panic");
         assert!(
             name.starts_with("tokio-rt-worker"),
             "spawned task must run on a tokio worker, got {name:?}"
         );
-        match gd {
-            NetworkMessage::GetData(v) => {
-                assert!(
-                    v.contains(&Inventory::WitnessTransaction(parent_txid)),
-                    "expected parent getdata, got {v:?}"
-                );
-            }
-            other => panic!("expected GetData, got {other:?}"),
+        assert!(
+            immediate.is_err(),
+            "parent GETDATA is mocktime-scheduled, not same-tick"
+        );
+    });
+}
+
+/// Core `p2p_orphan_handling.py` `test_arrival_timing_orphan`: inbound parent
+/// GETDATA waits NONPREF+TXID (4s) and skips a parent that entered the mempool.
+#[test]
+fn parked_orphan_parent_getdata_waits_txid_relay_delay() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message::RawNetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_primitives::Height;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::runtime::Builder;
+
+    fn frame_for(msg: NetworkMessage) -> FramedMessage {
+        let magic = Magic::from(Network::Regtest);
+        let raw = RawNetworkMessage::new(magic, msg);
+        let full = serialize(&raw);
+        let command: [u8; 12] = full[4..16].try_into().unwrap();
+        FramedMessage {
+            magic,
+            command,
+            payload: full[24..].to_vec(),
         }
+    }
+
+    fn drain_getdata(out_rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<Inventory> {
+        let mut inv = Vec::new();
+        while let Ok(p) = out_rx.try_recv() {
+            if let NetworkMessage::GetData(v) = p.expect_msg() {
+                inv.extend(v);
+            }
+        }
+        inv
+    }
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("orphan-parent-delay");
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(mp).is_ok());
+
+        let t0 = 1_700_000_000u64;
+        let peers = crate::peers::PeerHub::new();
+        peers.set_mock_now(t0);
+        hub.mempool().unwrap().note_mock_now(t0);
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let spy = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let parent_arrives = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let parent_missing = bitcoin::Txid::from_byte_array([0x22; 32]);
+        let orphan = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: parent_arrives.compute_txid(),
+                        vout: 10,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: parent_missing,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState {
+            wants_headers: false,
+            wtxid_relay: true,
+            send_cmpct: false,
+            cmpct_version: 2u32,
+            pending_headers: HashMap::new(),
+            pending_blocks: PendingBlocks::new(),
+            pending_cmpct: HashMap::new(),
+            from_this_peer: CappedSet::new(),
+            requested_blocks: HashSet::new(),
+            ban_score: 0u32,
+        };
+        handle_peer_frame(
+            frame_for(NetworkMessage::Tx(orphan)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(spy.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            drain_getdata(&mut out_rx).is_empty(),
+            "inbound must not GETDATA orphan parents before NONPREF+TXID"
+        );
+
+        handle_peer_frame(
+            frame_for(NetworkMessage::Ping(1)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(spy.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            drain_getdata(&mut out_rx).is_empty(),
+            "ping at park time must not GETDATA parents"
+        );
+
+        peers.set_mock_now(t0 + 2);
+        hub.mempool().unwrap().note_mock_now(t0 + 2);
+        handle_peer_frame(
+            frame_for(NetworkMessage::Ping(2)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(spy.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            drain_getdata(&mut out_rx).is_empty(),
+            "NONPREF alone must not GETDATA by txid"
+        );
+
+        hub.mempool()
+            .unwrap()
+            .accept_tx(&parent_arrives)
+            .expect("parent arrives");
+        peers.set_mock_now(t0 + 4);
+        hub.mempool().unwrap().note_mock_now(t0 + 4);
+        handle_peer_frame(
+            frame_for(NetworkMessage::Ping(3)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(spy.as_ref()),
+        )
+        .await
+        .unwrap();
+        let gd = drain_getdata(&mut out_rx);
+        assert_eq!(
+            gd,
+            vec![Inventory::WitnessTransaction(parent_missing)],
+            "after NONPREF+TXID request only still-missing parent by txid, got {gd:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     });
 }
 
