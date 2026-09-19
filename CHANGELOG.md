@@ -28,6 +28,10 @@ before 1.0).
   `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is
   display-hex sorted.
 
+- **Core functional `p2p_invalid_block.py`:** inventory `run` (v2 twin only).
+  Coinbase excess is `bad-cb-amount`. Mutated / time-too-new rejects forget
+  `asked_blocks` and do not cache `BLOCK_FAILED`.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays
