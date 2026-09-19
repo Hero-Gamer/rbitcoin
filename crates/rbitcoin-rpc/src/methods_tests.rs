@@ -1507,6 +1507,107 @@ fn getmempoolentry_vsize_ceils_weight() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn testmempoolaccept_package_cluster_limit_is_package_error() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+
+    let (ctx, dir) = ctx_empty();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(
+        &ctx.query,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &ctx.query,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        102,
+        1,
+    );
+    let mp = ctx.mempool.as_ref().expect("mempool");
+    mp.set_relay_enabled(true);
+    mp.set_cluster_limits(Some(2), None);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    mp.accept_tx(&parent).expect("parent");
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    let grand = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: child.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 3_000),
+            script_pubkey: spk,
+        }],
+    };
+    let res = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([serialize_hex(&child), serialize_hex(&grand)])],
+    )
+    .unwrap();
+    let arr = res.as_array().expect("package result");
+    assert_eq!(arr.len(), 2);
+    for row in arr {
+        let err = row["package-error"].as_str().expect("package-error");
+        assert!(err.contains("too-large-cluster"), "got {row}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct TestMiner(Arc<rbitcoin_net::ChainHub>);
 
 impl RpcRegtest for TestMiner {

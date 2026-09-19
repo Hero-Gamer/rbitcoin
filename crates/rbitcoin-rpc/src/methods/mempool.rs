@@ -604,6 +604,64 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
             "package-error": "package-contains-duplicates",
         }]));
     }
+    if decoded.len() >= 2 && mp.package_would_exceed_cluster(&decoded) {
+        let out: Vec<Value> = decoded
+            .iter()
+            .map(|tx| {
+                json!({
+                    "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                    "wtxid": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+                    "package-error": "too-large-cluster",
+                })
+            })
+            .collect();
+        return Ok(json!(out));
+    }
+    if decoded.len() >= 2 {
+        let mut added = Vec::new();
+        let mut out = Vec::new();
+        for tx in &decoded {
+            let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+            let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+            match mp.accept_tx(tx) {
+                Ok(r) => {
+                    added.push(r.txid);
+                    if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
+                        out.push(json!({
+                            "txid": txid,
+                            "wtxid": wtxid,
+                            "allowed": false,
+                            "reject-reason": "max-fee-exceeded",
+                        }));
+                    } else {
+                        out.push(json!({
+                            "txid": txid,
+                            "wtxid": wtxid,
+                            "allowed": true,
+                            "vsize": rbitcoin_consensus::policy::get_virtual_size(r.weight),
+                            "fees": { "base": sat_btc_json(r.fee_sat as i64) },
+                        }));
+                    }
+                }
+                Err(e) => {
+                    let mut row = json!({
+                        "txid": txid,
+                        "wtxid": wtxid,
+                        "allowed": false,
+                        "reject-reason": accept_reject_reason(&e),
+                    });
+                    if let Some(details) = accept_reject_details(&e, tx) {
+                        row["reject-details"] = json!(details);
+                    }
+                    out.push(row);
+                }
+            }
+        }
+        if !added.is_empty() {
+            mp.remove_for_block(&added);
+        }
+        return Ok(json!(out));
+    }
     let mut out = Vec::new();
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());

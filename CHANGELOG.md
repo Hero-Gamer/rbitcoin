@@ -32,6 +32,12 @@ before 1.0).
   Coinbase excess is `bad-cb-amount`. Mutated / time-too-new rejects forget
   `asked_blocks` and do not cache `BLOCK_FAILED`.
 
+- **Core functional `mempool_package_limits.py`:** inventory `run`.
+  `testmempoolaccept` of a multi-tx package reports `package-error:
+  too-large-cluster` when the package plus in-mempool parents would exceed
+  cluster limits, and otherwise evaluates later package txs against earlier
+  ones.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays

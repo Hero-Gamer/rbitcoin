@@ -2813,6 +2813,27 @@ impl MempoolHub {
         self.lock_read().graph.get(txid).map(|e| e.wtxid)
     }
 
+    /// True if `txs` plus in-mempool parents would exceed cluster count/size.
+    pub fn package_would_exceed_cluster(&self, txs: &[bitcoin::Transaction]) -> bool {
+        if txs.is_empty() {
+            return false;
+        }
+        let pkg: std::collections::HashSet<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let g = self.lock_read();
+        let mut parents = std::collections::BTreeSet::new();
+        let mut extra_w = 0u64;
+        for tx in txs {
+            extra_w = extra_w.saturating_add(tx.weight().to_wu());
+            for inp in &tx.input {
+                let pid = inp.previous_output.txid;
+                if !pkg.contains(&pid) && g.graph.contains(&pid) {
+                    parents.insert(pid);
+                }
+            }
+        }
+        g.graph.cluster_would_exceed(&parents, txs.len(), extra_w)
+    }
+
     /// Direct in-mempool parents and children (`depends` / `spentby`).
     pub fn depends_spentby(&self, txid: &Txid) -> Option<(Vec<Txid>, Vec<Txid>)> {
         let g = self.lock_read();

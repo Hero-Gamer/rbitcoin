@@ -464,9 +464,7 @@ reason = "core-log"
 
 [[test]]
 name = "mempool_package_limits.py"
-status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: accept_package limits"
+status = "run"
 
 [[test]]
 name = "mempool_package_rbf.py"
