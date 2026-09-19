@@ -615,8 +615,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    let electrum_onion = Arc::new(OnceLock::<(String, u16)>::new());
-    let (electrum_handles, electrum_bridge) = start_electrum_if_ready(
+    let (electrum_handles, electrum_bridge, electrum_onion) = start_electrum_if_ready(
         sh_tip_ready,
         config.listen.electrum,
         config.sptweaks_dust,
@@ -624,7 +623,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &node.hub,
         &params,
         &mempool,
-        Arc::clone(&electrum_onion),
     )
     .await;
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
@@ -1319,13 +1317,17 @@ async fn start_electrum_if_ready(
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
-    onion_tcp: Arc<OnceLock<(String, u16)>>,
-) -> (Vec<ElectrumHandle>, Option<tokio::task::JoinHandle<()>>) {
+) -> (
+    Vec<ElectrumHandle>,
+    Option<tokio::task::JoinHandle<()>>,
+    Arc<OnceLock<(String, u16)>>,
+) {
+    let onion_tcp = Arc::new(OnceLock::new());
     let Some(addr) = addr else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, onion_tcp);
     };
     if !sh_tip_ready || shutdown.requested() {
-        return (Vec::new(), None);
+        return (Vec::new(), None, onion_tcp);
     }
     let q = hub.query.clone();
     let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
@@ -1338,7 +1340,7 @@ async fn start_electrum_if_ready(
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
     ecfg.tweaks_min_dust = tweaks_min_dust;
-    ecfg.onion_tcp = onion_tcp;
+    ecfg.onion_tcp = Arc::clone(&onion_tcp);
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
@@ -1356,11 +1358,11 @@ async fn start_electrum_if_ready(
                 "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
                 h.local_addr, max_conn, max_line, idle_secs
             );
-            (vec![h], Some(bridge))
+            (vec![h], Some(bridge), onion_tcp)
         }
         Err(e) => {
             warn!("electrum TCP start warning: {e}");
-            (Vec::new(), Some(bridge))
+            (Vec::new(), Some(bridge), onion_tcp)
         }
     }
 }

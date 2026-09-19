@@ -1431,6 +1431,13 @@ fn sh_at_view<T>(
     live_fn(query, sh_join)
 }
 
+fn features_hosts_json(config: &ElectrumConfig) -> Value {
+    match config.onion_tcp.get() {
+        Some((host, port)) => json!({ host: { "tcp_port": port } }),
+        None => json!({}),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 fn dispatch_pinned(
     method: &str,
@@ -1455,30 +1462,24 @@ fn dispatch_pinned(
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(config.banner)),
         "server.donation_address" => Ok(json!(config.donation_address)),
-        "server.features" => {
-            let hosts = match config.onion_tcp.get() {
-                Some((host, port)) => json!({ host: { "tcp_port": port } }),
-                None => json!({}),
-            };
-            Ok(json!({
-                "genesis_hash": config.genesis_hash_hex,
-                "hosts": hosts,
-                "protocol_max": PROTOCOL_MAX,
-                "protocol_min": PROTOCOL_MIN,
-                "server_version": SERVER_VERSION,
-                "hash_function": "sha256",
-                "pruning": null,
-                // Cake gates SP on version[0] containing "electrs", then probes the
-                // tweaks method — not features. Other clients (and future Cake) can
-                // still see SP here without a dummy RPC. Cake electrs does not
-                // implement server.features.
-                "silent_payments": [0],
-                "tweaks": true,
-                "chain_tip": true,
-                "asof": true,
-                "asof_protocol": PROTOCOL_ASOF,
-            }))
-        }
+        "server.features" => Ok(json!({
+            "genesis_hash": config.genesis_hash_hex,
+            "hosts": features_hosts_json(config),
+            "protocol_max": PROTOCOL_MAX,
+            "protocol_min": PROTOCOL_MIN,
+            "server_version": SERVER_VERSION,
+            "hash_function": "sha256",
+            "pruning": null,
+            // Cake gates SP on version[0] containing "electrs", then probes the
+            // tweaks method — not features. Other clients (and future Cake) can
+            // still see SP here without a dummy RPC. Cake electrs does not
+            // implement server.features.
+            "silent_payments": [0],
+            "tweaks": true,
+            "chain_tip": true,
+            "asof": true,
+            "asof_protocol": PROTOCOL_ASOF,
+        })),
         "blockchain.headers.subscribe" => {
             *header_sub = true;
             tip_header_obj(query)
