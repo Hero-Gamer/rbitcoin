@@ -142,6 +142,6 @@ the fake proxy. Do not add a live-Tor scenario.
 
 ## Risks / follow-ups
 
-IPv6 ATYP=4 needed for `--onlynet=ipv6` through Tor (still this PR if cheap;
+IPv6 ATYP=4 needed for `--only-net=ipv6` through Tor (still this PR if cheap;
 else a step in 02). Onion hostnames need 02. Plan 06 must not fork a second
 SOCKS client.

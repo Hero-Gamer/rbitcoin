@@ -1,4 +1,4 @@
-# 07 — P2P onion inbound (`listenonion`)
+# 07 — P2P onion inbound (`--listen-onion`)
 
 ## Goal
 

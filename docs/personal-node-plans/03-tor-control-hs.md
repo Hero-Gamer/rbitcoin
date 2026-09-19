@@ -9,7 +9,7 @@ Log the `….onion:port`. Set Electrum `server.features.hosts` for that onion
 (`tcp_port`, no `ssl_port`). RPC unix socket stays off the onion.
 
 Plans [05](./05-wallet-onion.md) (Esplora) and [07](./07-p2p-onion-inbound.md)
-(P2P listenonion) reuse this helper.
+(P2P `--listen-onion`) reuse this helper.
 
 ## Constraints
 
@@ -26,7 +26,7 @@ Plans [05](./05-wallet-onion.md) (Esplora) and [07](./07-p2p-onion-inbound.md)
 
 ## Out of scope
 
-Esplora onion (05). P2P listenonion (07). TLS. SOCKS (00) is independent
+Esplora onion (05). P2P `--listen-onion` (07). TLS. SOCKS (00) is independent
 (outbound); HS inbound does not use SOCKS.
 
 ## Steps

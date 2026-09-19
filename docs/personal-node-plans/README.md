@@ -36,6 +36,10 @@ A node on CGNAT / no forwarded TCP still:
   mainnet. **No** live Tor, I2P, or cjdns router in CI.
 - Prefer zero new crates (hand-rolled SOCKS5, control protocol, SAM). Any crate
   must pass `cargo deny` (musl operator binary).
+- Operator CLI is kebab (`--only-net`, `--i2p-sam`, `--cjdns-reachable`,
+  `--listen-onion`). Conf is snake_case (`only_net=`). Core concatenated names
+  (`-onlynet`, `-i2psam`, `-cjdnsreachable`, `-listenonion`) stay the functional
+  shim only — do not advertise them on `rbitcoin-node`.
 - Named `ibd: perf` timer only if lookup / load / scripts / write (or a sidecar
   the write thread joins) grows — unlikely here.
 - One product PR per numbered file. Each step is one cycle turn, committed
@@ -92,8 +96,8 @@ SOCKS cannot create a hidden service. Wallet and P2P reachability without a
 forwarded TCP port is Tor control `ADD_ONION` (03 / 05 / 07), I2P SAM STREAM
 FORWARD (04 / 05), or CJDNS overlay bind (08).
 
-P2P onion inbound does **not** need Arti. It is Core `-listenonion`: `ADD_ONION`
-to a loopback P2P accept socket.
+P2P onion inbound does **not** need Arti. It is Core `-listenonion` (operator
+`--listen-onion`): `ADD_ONION` to a loopback P2P accept socket.
 
 ## File map (product PR order)
 
@@ -105,13 +109,13 @@ any PR. **07** can land as soon as **01 + 03** exist. **08** can land as soon as
 |------|--------|
 | [00-socks-proxy.md](./00-socks-proxy.md) | `--proxy` / `--onion` SOCKS5, remote DNS, stream isolation |
 | [01-listen-off.md](./01-listen-off.md) | `--listen=0`, `--max-inbound 0`, no self-announce / discover |
-| [02-onion-addrman.md](./02-onion-addrman.md) | `NetAddr` + onion persist + `--onlynet` + SOCKS dial of `.onion` |
+| [02-onion-addrman.md](./02-onion-addrman.md) | `NetAddr` + onion persist + `--only-net` + SOCKS dial of `.onion` |
 | [03-tor-control-hs.md](./03-tor-control-hs.md) | Control AUTH + `ADD_ONION` helper; Electrum hidden service |
-| [04-i2p.md](./04-i2p.md) | I2P SAM v3, `--onlynet=i2p`, optional incoming |
+| [04-i2p.md](./04-i2p.md) | I2P SAM v3, `--only-net=i2p`, optional incoming |
 | [05-wallet-onion.md](./05-wallet-onion.md) | Esplora onion HS; Electrum `features.hosts`; I2P wallet forward if cheap |
 | [06-ephemeral-tor-broadcast.md](./06-ephemeral-tor-broadcast.md) | Isolated SOCKS one-shot for locally submitted txs |
-| [07-p2p-onion-inbound.md](./07-p2p-onion-inbound.md) | P2P `listenonion`: ADD_ONION → loopback BIP324 accept |
-| [08-cjdns.md](./08-cjdns.md) | BIP155 CJDNS, `--cjdnsreachable`, `--onlynet=cjdns` |
+| [07-p2p-onion-inbound.md](./07-p2p-onion-inbound.md) | P2P `--listen-onion`: ADD_ONION → loopback BIP324 accept |
+| [08-cjdns.md](./08-cjdns.md) | BIP155 CJDNS, `--cjdns-reachable`, `--only-net=cjdns` |
 | [09-inwit-prune.md](./09-inwit-prune.md) | Rolling 288-block `inwit` (unlink, not punch); BIP159 `NETWORK_LIMITED`; partial Esplora JSON, refuse wire |
 
 NixOS first-class options (same PR as the flags). Label **`nixos-module-runtime`**
@@ -121,7 +125,7 @@ when the row says runtime:
 |------|---------------------|---------------|
 | 00 | `proxy`, `onionProxy`, `proxyRandomize` (default true) | only if `After=tor` |
 | 01 | `p2p.listen` (default true), `p2p.maxInbound` | if listen-off changes VM `ExecStart` |
-| 02 | `onlynet` | eval |
+| 02 | `onlyNet` | eval |
 | 03 | `tor.control`, cookie, `electrum.hiddenService`; `After=tor.service` | **yes** |
 | 04 | `i2p.sam`, `i2p.acceptIncoming`; `After=i2pd.service` | **yes** |
 | 05 | `esplora.hiddenService` (reuse 03 control) | eval unless new systemd deps |

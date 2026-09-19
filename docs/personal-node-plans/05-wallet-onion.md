@@ -26,7 +26,7 @@ onions. Operator fallback (document only): `torrc` `HiddenServicePort`.
 
 ## Out of scope
 
-In-binary TLS (rejected). SH allowlist. `--personal`. P2P listenonion (07).
+In-binary TLS (rejected). SH allowlist. `--personal`. P2P `--listen-onion` (07).
 
 ## Steps
 
