@@ -516,6 +516,35 @@ where
     out
 }
 
+fn mempool_txs_touching_watched(
+    query: &Query,
+    mp: &MempoolHub,
+    network: Network,
+    watched: &HashMap<[u8; 32], String>,
+) -> HashMap<String, Vec<Value>> {
+    let mut seen = HashSet::new();
+    let mut bag = Vec::new();
+    for sh in watched.keys() {
+        for item in mp.scripthash_mempool(sh) {
+            let txid = Txid::from_byte_array(item.txid);
+            if !seen.insert(txid) {
+                continue;
+            }
+            let Some(tx) = mp.get_tx(&txid) else {
+                continue;
+            };
+            bag.push((txid, tx, Some(item.fee)));
+        }
+    }
+    txs_touching_watched(
+        query,
+        mp,
+        network,
+        watched,
+        bag.iter().map(|(id, tx, fee)| (*id, tx, *fee)),
+    )
+}
+
 fn unique_tx_jsons(by_addr: &HashMap<String, Vec<Value>>) -> Vec<Value> {
     let mut seen = HashSet::new();
     let mut txs = Vec::new();
@@ -584,16 +613,7 @@ async fn add_addresses(
     let network = st.network;
     let by_addr = match tokio::task::spawn_blocking(move || {
         let _g = rbitcoin_net::BlockingRegion::enter();
-        let snap = mp.mempool_tx_snapshot();
-        txs_touching_watched(
-            query.as_ref(),
-            mp.as_ref(),
-            network,
-            &added,
-            snap.entries()
-                .iter()
-                .map(|e| (e.txid, e.tx.as_ref(), Some(e.fee_sat as i64))),
-        )
+        mempool_txs_touching_watched(query.as_ref(), mp.as_ref(), network, &added)
     })
     .await
     {
