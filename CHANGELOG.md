@@ -37,7 +37,6 @@ before 1.0).
 
 - **Workspace version 0.7.99:** in-tree toward 0.8.0.
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
-
 - **Per-slice local CI:** each plan step runs the workspace suite after Green
   and the other required gates except coverage after Refactor, then commits
   before the next slice. Same *commands* as CI, not the GitHub Actions `env:`.
