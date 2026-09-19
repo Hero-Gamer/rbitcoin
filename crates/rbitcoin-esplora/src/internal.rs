@@ -57,6 +57,7 @@ fn parse_txid_array(body: &[u8]) -> Result<Vec<[u8; 32]>, Response> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn cache_json_str(
     slot: &std::sync::OnceLock<Box<str>>,
     build: impl FnOnce() -> Result<String, ()>,
@@ -73,6 +74,7 @@ fn cache_json_str(
     }
 }
 
+#[cfg(unix)]
 fn join_cached_objects(parts: &[Option<&str>]) -> String {
     let mut body = String::from("[");
     let mut first = true;
@@ -422,6 +424,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    #[cfg(unix)]
     #[test]
     fn join_cached_objects_skips_none() {
         assert_eq!(
@@ -431,6 +434,7 @@ mod tests {
         assert_eq!(join_cached_objects(&[None, None]), "[]");
     }
 
+    #[cfg(unix)]
     #[test]
     fn cache_json_str_does_not_store_empty_on_err() {
         let slot = std::sync::OnceLock::<Box<str>>::new();
