@@ -15,6 +15,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Actions only. rust-cache restores dep rlibs (not workspace crates) and
+  # strips incremental artifacts before persist; it also sets this so rustc
+  # does not write throwaway dep-graphs.
   CARGO_INCREMENTAL: "0"
 
 # Pin rustc to the nix-shell / crane baseline so fmt/clippy do not drift with

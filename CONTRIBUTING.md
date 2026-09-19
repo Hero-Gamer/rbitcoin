@@ -234,10 +234,10 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
 
 ## Workflow
 
-Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
-checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
-`ast-grep`, `test`, `windows`, `macos`, `coverage`, `nixos-module-eval`) so a
-red run shows which gate failed without digging into a monolithic job log.
+Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
+(`fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`, `macos`,
+`coverage`, `nixos-module-eval`) so a red run shows which gate failed without
+digging into a monolithic job log.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.
 

@@ -65,6 +65,8 @@ git fetch origin --prune
 ## Local tests
 
 From `nix-shell` (CI pins rustc 1.95.0). `CARGO_TARGET_DIR=target/dev`.
+Same **commands** as the required jobs, not the GitHub Actions `env:`
+(leave `CARGO_INCREMENTAL` unset; that is [`ci.yml`](../../../.github/workflows/ci.yml) only).
 When to run which command:
 [`docs/how-we-plan.md`](../../../docs/how-we-plan.md) (The cycle).
 Suite and budgets: [`TESTING.md`](../../../TESTING.md).
