@@ -368,7 +368,8 @@ Clean smoke:
 | `--listen ADDR` | `listen=` | bind later default port |
 | `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no P2P socket (outbound-only) |
 | `--no-discover` | `no_discover=` | discover **on**; flag off = no self-announce / `localaddresses` |
-| `--connect ADDR` | `connect=` (repeatable) | seeds |
+| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` (`i2p`/`cjdns` later) |
+| `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port` or Tor v3 `.onion:port` |
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
 | `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
 | `--proxy-randomize[=0\|1]` | `proxy_randomize=` | **on** — fresh SOCKS username per peer (Tor circuit isolation) |
@@ -437,6 +438,10 @@ mempool_size_mb=100
 pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
+`--only-net onion` (repeatable with `ipv4`/`ipv6`) filters dial and learn;
+onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
+error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
+(v1 IPv4/IPv6 still loads).
 
 `--listen=0` / `--no-listen` starts without a P2P TCP bind (no ISP port
 forward). `--max-inbound 0` refuses inbound slots. `--no-discover` does not

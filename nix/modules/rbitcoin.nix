@@ -77,6 +77,7 @@ let
   ++ optional (cfg.onionProxy != null) "--onion"
   ++ optional (cfg.onionProxy != null) cfg.onionProxy
   ++ optional (!cfg.proxyRandomize) "--proxy-randomize=0"
+  ++ lib.concatMap (n: [ "--only-net" n ]) cfg.onlyNet
   ++ cfg.extraArgs;
 in
 {
@@ -184,6 +185,16 @@ in
       type = types.bool;
       default = true;
       description = "Fresh SOCKS username per peer so Tor isolates circuits.";
+    };
+
+    onlyNet = mkOption {
+      type = types.listOf (types.enum [
+        "ipv4"
+        "ipv6"
+        "onion"
+      ]);
+      default = [ ];
+      description = "Restrict P2P to these networks. onion requires proxy or onionProxy.";
     };
 
     p2p = {

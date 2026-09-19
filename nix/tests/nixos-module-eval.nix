@@ -31,6 +31,7 @@ let
           proxy = "127.0.0.1:9050";
           onionProxy = "127.0.0.1:9050";
           proxyRandomize = true;
+          onlyNet = [ "onion" ];
           p2p = {
             address = "127.0.0.1";
             openFirewall = true;
@@ -89,6 +90,7 @@ assert defaultCfg.rpc.port == 8332;
 assert defaultCfg.proxy == null;
 assert defaultCfg.onionProxy == null;
 assert defaultCfg.proxyRandomize == true;
+assert defaultCfg.onlyNet == [ ];
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -114,6 +116,7 @@ assert builtins.match ".*--log-level debug.*" execStart != null;
 assert builtins.match ".*--max-outbound 8.*" execStart != null;
 assert builtins.match ".*--proxy 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--onion 127.0.0.1:9050.*" execStart != null;
+assert builtins.match ".*--only-net onion.*" execStart != null;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
