@@ -1,0 +1,50 @@
+# NixOS module VM test. Not a required PR check.
+# Default PRs run nixos-module-eval only (ci.yml). This job builds
+# checks.x86_64-linux.nixos-module-runtime (qemu). Same check runs on
+# GitHub Release tags (release.yml).
+#
+# Triggers: PRs labeled `nixos-module-runtime`, and workflow_dispatch.
+name: nixos-module-runtime
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+
+concurrency:
+  group: nixos-module-runtime-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  nixos-module-runtime:
+    name: nixos-module-runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'nixos-module-runtime')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            max-jobs = auto
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nixos-module-runtime-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nixos-module-runtime-${{ runner.os }}-
+          gc-max-store-size-linux: 4G
+
+      - name: Test NixOS module service
+        run: timeout 20m nix build .#checks.x86_64-linux.nixos-module-runtime --no-link
