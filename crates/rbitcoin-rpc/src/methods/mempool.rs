@@ -608,7 +608,26 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
     }
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+        let raw_txid = tx.compute_txid();
+        let txid_bytes = raw_txid.to_byte_array();
+        let txid = hash_hex_display(&txid_bytes);
+        let wtxid_str = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+
+        // #628: active-chain confirmed -> txn-already-known (reorg-safe)
+        let confirmed_active = match ctx.query.tx_fk_by_txid_tip(&txid_bytes) {
+            Ok(Some(fk)) => ctx.query.store().is_confirmed_strong(fk).unwrap_or(false),
+            _ => false,
+        };
+        if confirmed_active {
+            out.push(serde_json::json!({
+                "txid": txid,
+                "wtxid": wtxid_str,
+                "allowed": false,
+                "reject-reason": "txn-already-known",
+            }));
+            continue;
+        }
+
         match mp.test_accept(&tx) {
             Ok(r) => {
                 let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
