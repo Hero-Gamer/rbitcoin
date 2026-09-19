@@ -4670,3 +4670,75 @@ fn dispatch_wrong_json_types_are_param_errors() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sendraw_testmempoolaccept_submitpackage_junk_hex_is_tx_decode_failed() {
+    let (ctx, dir) = ctx_empty();
+    for (method, params) in [
+        ("sendrawtransaction", vec![json!("ff00baar")]),
+        ("testmempoolaccept", vec![json!(["ff00baar"])]),
+        ("submitpackage", vec![json!(["ff00baar"])]),
+        ("sendrawtransaction", vec![json!("00")]),
+    ] {
+        let e = dispatch(&ctx, method, params).unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION, "{method}: {e}");
+        assert_eq!(e["message"], json!("TX decode failed"), "{method}: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn testmempoolaccept_active_known_vs_mempool_vs_archive() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let keep = generated_coinbase_value(&ctx, 1) - 1000;
+    let (hex, _) = spend_generated_coinbase(
+        &ctx,
+        1,
+        keep,
+        bitcoin::script::ScriptBuf::from_bytes(vec![0x51]),
+    );
+
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap();
+    let live = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex.clone()]), json!(0)],
+    )
+    .unwrap();
+    assert_eq!(live[0]["allowed"], json!(false), "{live}");
+    assert_eq!(
+        live[0]["reject-reason"],
+        json!("txn-already-in-mempool"),
+        "{live}"
+    );
+
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let mined = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex.clone()]), json!(0)],
+    )
+    .unwrap();
+    assert_eq!(mined[0]["allowed"], json!(false), "{mined}");
+    assert_eq!(
+        mined[0]["reject-reason"],
+        json!("txn-already-known"),
+        "{mined}"
+    );
+
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    let archived = dispatch(&ctx, "testmempoolaccept", vec![json!([hex]), json!(0)]).unwrap();
+    assert_eq!(archived[0]["allowed"], json!(true), "{archived}");
+    assert_ne!(
+        archived[0]
+            .get("reject-reason")
+            .cloned()
+            .unwrap_or(json!(null)),
+        json!("txn-already-known"),
+        "{archived}"
+    );
+    dispatch(&ctx, "reconsiderblock", vec![tip]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

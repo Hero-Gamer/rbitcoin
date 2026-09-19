@@ -1172,8 +1172,8 @@ pub(crate) fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value,
 }
 
 pub(crate) fn decode_tx_hex(hex: &str) -> Result<Transaction, Value> {
-    let b = hex_decode(hex).map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    deserialize(&b).map_err(|e| rpc_error(ERR_INVALID_PARAMS, format!("tx decode: {e}")))
+    let b = hex_decode(hex).map_err(|_| rpc_error(ERR_DESERIALIZATION, "TX decode failed"))?;
+    deserialize(&b).map_err(|_| rpc_error(ERR_DESERIALIZATION, "TX decode failed"))
 }
 
 pub(crate) fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -> Value {
