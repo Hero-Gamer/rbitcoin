@@ -9,6 +9,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
+pub const DEFAULT_CONTROL_PORT: u16 = 9051;
+pub const DEFAULT_COOKIE_PATH: &str = "/run/tor/control.authcookie";
+
+pub fn default_control_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], DEFAULT_CONTROL_PORT))
+}
+
 #[derive(Clone, Debug)]
 pub enum TorAuth {
     Cookie(PathBuf),
@@ -33,6 +40,25 @@ impl TorControl {
         ctl.authenticate(&auth).await?;
         ctl.command("GETINFO version").await?;
         Ok(ctl)
+    }
+
+    pub async fn connect_if_configured(
+        addr: Option<SocketAddr>,
+        cookie: Option<&Path>,
+        password: Option<&str>,
+    ) -> Result<Option<Self>, NodeError> {
+        let Some(addr) = addr else {
+            return Ok(None);
+        };
+        let auth = match password {
+            Some(p) if !p.is_empty() => TorAuth::Password(p.to_string()),
+            _ => TorAuth::Cookie(
+                cookie
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_COOKIE_PATH)),
+            ),
+        };
+        Ok(Some(Self::connect_and_auth(addr, auth).await?))
     }
 
     async fn authenticate(&mut self, auth: &TorAuth) -> Result<String, NodeError> {
@@ -405,5 +431,29 @@ mod tests {
         );
         let _ = std::fs::remove_file(&cookie_path);
         let _ = std::fs::remove_dir_all(key_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn tor_control_auth_fail_is_start_error() {
+        let cookie = vec![0xaa];
+        let (addr, _) = fake_control(Some(cookie.clone()), None).await;
+        let bad = tmp_cookie(&[0x00]);
+        let err =
+            match TorControl::connect_if_configured(Some(addr), Some(bad.as_path()), None).await {
+                Err(e) => e,
+                Ok(_) => panic!("bad cookie must fail start"),
+            };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("515")
+                || msg.contains("Authentication failed")
+                || msg.contains("tor control"),
+            "{msg}"
+        );
+        let none = TorControl::connect_if_configured(None, None, None)
+            .await
+            .unwrap();
+        assert!(none.is_none());
+        let _ = std::fs::remove_file(&bad);
     }
 }

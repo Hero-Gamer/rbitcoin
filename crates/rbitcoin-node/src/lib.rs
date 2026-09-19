@@ -10,6 +10,6 @@ mod run;
 mod tor_control;
 
 pub use cli::cli_main;
-pub use config::{DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, RpcOpts};
+pub use config::{DatadirOpts, ListenOpts, MempoolOpts, NodeConfig, RpcOpts, TorControlOpts};
 pub use error::NodeError;
 pub use run::{run_node, run_p2p, NodeHandle};

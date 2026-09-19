@@ -355,6 +355,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
+    let _tor_ctl = crate::tor_control::TorControl::connect_if_configured(
+        config.tor.control,
+        config.tor.cookie.as_deref(),
+        config.tor.password.as_deref(),
+    )
+    .await?;
+    if _tor_ctl.is_some() {
+        info!(
+            "tor control authenticated on {}",
+            config
+                .tor
+                .control
+                .expect("control addr set when session exists")
+        );
+    }
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
         Some(spawn_sh_writebehind(

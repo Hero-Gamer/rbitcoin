@@ -175,6 +175,24 @@ impl Default for MempoolOpts {
     }
 }
 
+/// System tor control port (cookie or password AUTH).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TorControlOpts {
+    pub control: Option<SocketAddr>,
+    pub cookie: Option<PathBuf>,
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for TorControlOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorControlOpts")
+            .field("control", &self.control)
+            .field("cookie", &self.cookie)
+            .field("password", &self.password.as_ref().map(|_| "****"))
+            .finish()
+    }
+}
+
 /// JSON-RPC listen and auth.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RpcOpts {
@@ -203,6 +221,7 @@ pub struct NodeConfig {
     pub listen: ListenOpts,
     pub mempool: MempoolOpts,
     pub rpc: RpcOpts,
+    pub tor: TorControlOpts,
     pub network: Network,
     /// Custom BIP325 challenge. `None` selects the default global Signet.
     pub signet_challenge: Option<ScriptBuf>,
@@ -286,6 +305,7 @@ impl Default for NodeConfig {
             listen: ListenOpts::default(),
             mempool: MempoolOpts::default(),
             rpc: RpcOpts::default(),
+            tor: TorControlOpts::default(),
             network: Network::Mainnet,
             signet_challenge: None,
             signet_block_time: None,
@@ -711,6 +731,24 @@ impl NodeConfig {
             }
             "onion" => {
                 self.listen.onion = Some(parse_required_socket(val, "onion")?);
+            }
+            "tor_control" => {
+                self.tor.control = Some(if val.is_empty() {
+                    crate::tor_control::default_control_addr()
+                } else {
+                    parse_required_socket(val, "tor_control")?
+                });
+            }
+            "tor_control_cookie" => {
+                if val.is_empty() {
+                    return Err(NodeError::Config(
+                        "conf tor_control_cookie requires a path".into(),
+                    ));
+                }
+                self.tor.cookie = Some(PathBuf::from(val));
+            }
+            "tor_control_password" => {
+                self.tor.password = Some(val.to_string());
             }
             "proxy_randomize" => {
                 self.listen.proxy_randomize = parse_conf_bool(val)

@@ -294,6 +294,7 @@ fn operator_usage() -> String {
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
+    [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
@@ -321,6 +322,9 @@ Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
   --proxy HOST:PORT SOCKS5 for all P2P outbound; --onion HOST:PORT SOCKS for onion (02).\n\
   --proxy-randomize (default on) uses a fresh SOCKS username per peer (Tor circuit isolation).\n\
+  --tor-control [HOST:PORT] talks to system tor (default 127.0.0.1:9051). Cookie or password AUTH;\n\
+  failed AUTH is a start error. Unset: no control connection.\n\
+  --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -387,7 +391,10 @@ fn is_bool_key(key: &str) -> bool {
 }
 
 fn is_optional_addr_key(key: &str) -> bool {
-    matches!(key, "rpc_listen" | "electrum_listen" | "esplora_listen")
+    matches!(
+        key,
+        "rpc_listen" | "electrum_listen" | "esplora_listen" | "tor_control"
+    )
 }
 
 fn looks_like_flag(s: &str) -> bool {
@@ -571,6 +578,9 @@ mod tests {
             "--proxy-randomize",
             "--no-listen",
             "--no-discover",
+            "--tor-control",
+            "--tor-control-cookie",
+            "--tor-control-password",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
@@ -602,6 +612,7 @@ mod tests {
             "--whitelist-forcerelay",
             "--nolisten",
             "--nodiscover",
+            "--torcontrol",
         ] {
             assert!(!h.contains(concat), "help must not advertise {concat}");
         }
@@ -851,6 +862,36 @@ mod tests {
             !h.contains("--onlynet"),
             "help must not advertise concatenated --onlynet"
         );
+    }
+
+    #[test]
+    fn tor_control_cli_defaults() {
+        let omitted = ready_config(["rbitcoin-node", "--tor-control"]);
+        assert_eq!(omitted.tor.control, Some("127.0.0.1:9051".parse().unwrap()));
+        assert!(omitted.tor.cookie.is_none());
+        assert!(omitted.tor.password.is_none());
+        let explicit = ready_config(["rbitcoin-node", "--tor-control", "10.0.0.5:9151"]);
+        assert_eq!(explicit.tor.control, Some("10.0.0.5:9151".parse().unwrap()));
+        let cookie = ready_config([
+            "rbitcoin-node",
+            "--tor-control",
+            "--tor-control-cookie",
+            "/tmp/rbtc-tor-cookie",
+        ]);
+        assert_eq!(
+            cookie.tor.cookie.as_deref(),
+            Some(std::path::Path::new("/tmp/rbtc-tor-cookie"))
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("tor_control", "").unwrap();
+        conf.apply_kv("tor_control_password", "pw").unwrap();
+        assert_eq!(conf.tor.control, Some("127.0.0.1:9051".parse().unwrap()));
+        assert_eq!(conf.tor.password.as_deref(), Some("pw"));
+        let h = operator_usage();
+        assert!(h.contains("--tor-control"));
+        assert!(h.contains("--tor-control-cookie"));
+        assert!(h.contains("--tor-control-password"));
+        assert!(!h.contains("--torcontrol"));
     }
 
     #[test]
