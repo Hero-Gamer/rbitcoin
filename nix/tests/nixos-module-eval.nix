@@ -31,10 +31,17 @@ let
           proxy = "127.0.0.1:9050";
           onionProxy = "127.0.0.1:9050";
           proxyRandomize = true;
-          onlyNet = [ "onion" ];
+          onlyNet = [
+            "onion"
+            "i2p"
+          ];
           tor = {
             control = "127.0.0.1:9051";
             controlCookie = "/run/tor/control.authcookie";
+          };
+          i2p = {
+            sam = "127.0.0.1:7656";
+            acceptIncoming = true;
           };
           p2p = {
             address = "127.0.0.1";
@@ -99,6 +106,8 @@ assert defaultCfg.onlyNet == [ ];
 assert defaultCfg.tor.control == null;
 assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
+assert defaultCfg.i2p.sam == null;
+assert defaultCfg.i2p.acceptIncoming == false;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -125,10 +134,15 @@ assert builtins.match ".*--max-outbound 8.*" execStart != null;
 assert builtins.match ".*--proxy 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--onion 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--only-net onion.*" execStart != null;
+assert builtins.match ".*--only-net i2p.*" execStart != null;
 assert builtins.match ".*--tor-control 127.0.0.1:9051.*" execStart != null;
 assert builtins.match ".*--tor-control-cookie /run/tor/control.authcookie.*" execStart != null;
+assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;
+assert builtins.match ".*--i2p-accept-incoming.*" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
+assert builtins.elem "i2pd.service" service.after;
+assert builtins.elem "i2pd.service" service.wants;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;

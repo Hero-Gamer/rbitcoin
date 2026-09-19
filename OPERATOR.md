@@ -368,14 +368,16 @@ Clean smoke:
 | `--listen ADDR` | `listen=` | bind later default port |
 | `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no P2P socket (outbound-only) |
 | `--no-discover` | `no_discover=` | discover **on**; flag off = no self-announce / `localaddresses` |
-| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` (`i2p`/`cjdns` later) |
-| `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port` or Tor v3 `.onion:port` |
+| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` (`cjdns` later) |
+| `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port`, Tor v3 `.onion:port`, or `{52}.b32.i2p:port` |
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
 | `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
 | `--proxy-randomize[=0\|1]` | `proxy_randomize=` | **on** — fresh SOCKS username per peer (Tor circuit isolation) |
 | `--tor-control [HOST:PORT]` | `tor_control=` | unset — no control connection; omit ADDR → `127.0.0.1:9051` |
 | `--tor-control-cookie PATH` | `tor_control_cookie=` | `/run/tor/control.authcookie` when `--tor-control` is set and password is unset |
 | `--tor-control-password PASS` | `tor_control_password=` | unset — cookie AUTH unless set |
+| `--i2p-sam [HOST:PORT]` | `i2p_sam=` | unset — no SAM; omit ADDR → `127.0.0.1:7656` |
+| `--i2p-accept-incoming` | `i2p_accept_incoming=` | **off** — persist `{datadir}/i2p/p2p.priv` and STREAM FORWARD to the P2P bind |
 | `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
 | `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
@@ -441,7 +443,7 @@ mempool_size_mb=100
 pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
-`--only-net onion` (repeatable with `ipv4`/`ipv6`) filters dial and learn;
+`--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`) filters dial and learn;
 onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
 error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
 (v1 IPv4/IPv6 still loads).
@@ -459,6 +461,16 @@ socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
 `{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. JSON-RPC stays off
 the onion (`rpc.sock` / `--rpc-listen` only). Cookie path differs by distro;
 pass `--tor-control-cookie` rather than globbing.
+
+`--i2p-sam [HOST:PORT]` talks to **system i2pd** SAM v3 (not SOCKS, not Arti).
+Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
+error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
+`--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
+creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
+`STREAM FORWARD`s to the P2P bind. With `--listen=0` that is a start error
+naming `--listen` (overlay incoming still needs a loopback P2P accept). NixOS:
+`services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
+`i2pd.service` when SAM is set. Do not start i2pd from this module.
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large

@@ -40,6 +40,7 @@ let
       "${address}:${toString port}";
 
   needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService;
+  needI2pSam = cfg.i2p.sam != null;
   torControlAddr =
     if cfg.tor.control != null then
       cfg.tor.control
@@ -91,6 +92,9 @@ let
   ++ optional (torControlAddr != null) torControlAddr
   ++ optional (cfg.tor.controlCookie != null) "--tor-control-cookie"
   ++ optional (cfg.tor.controlCookie != null) (toString cfg.tor.controlCookie)
+  ++ optional needI2pSam "--i2p-sam"
+  ++ optional needI2pSam cfg.i2p.sam
+  ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
   ++ cfg.extraArgs;
 in
 {
@@ -196,6 +200,21 @@ in
       };
     };
 
+    i2p = {
+      sam = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:7656";
+        description = "I2P SAM v3 HOST:PORT (system i2pd). Unset skips SAM.";
+      };
+
+      acceptIncoming = mkOption {
+        type = types.bool;
+        default = false;
+        description = "STREAM FORWARD to the P2P bind. Requires i2p.sam and p2p.listen. Persists {dataDir}/i2p/p2p.priv.";
+      };
+    };
+
     proxy = mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -221,9 +240,10 @@ in
         "ipv4"
         "ipv6"
         "onion"
+        "i2p"
       ]);
       default = [ ];
-      description = "Restrict P2P to these networks. onion requires proxy or onionProxy.";
+      description = "Restrict P2P to these networks. onion requires proxy or onionProxy; i2p requires i2p.sam.";
     };
 
     p2p = {
@@ -337,6 +357,14 @@ in
         assertion = cfg.coldDataDir == null || cfg.coldDataDir != cfg.dataDir;
         message = "services.rbitcoin.coldDataDir must differ from dataDir";
       }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.i2p.sam != null;
+        message = "services.rbitcoin.i2p.acceptIncoming requires i2p.sam";
+      }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.listen;
+        message = "services.rbitcoin.i2p.acceptIncoming requires p2p.listen (STREAM FORWARD needs a P2P bind)";
+      }
     ];
 
     users.groups.${cfg.group} = { };
@@ -365,8 +393,16 @@ in
       description = "rbitcoin full node";
       documentation = [ "https://github.com/reardencode/rbitcoin/blob/master/OPERATOR.md" ];
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ] ++ optional needTorControl "tor.service";
-      after = [ "network-online.target" ] ++ optional needTorControl "tor.service";
+      wants = [
+        "network-online.target"
+      ]
+      ++ optional needTorControl "tor.service"
+      ++ optional needI2pSam "i2pd.service";
+      after = [
+        "network-online.target"
+      ]
+      ++ optional needTorControl "tor.service"
+      ++ optional needI2pSam "i2pd.service";
       environment = cfg.environment;
 
       serviceConfig = {
