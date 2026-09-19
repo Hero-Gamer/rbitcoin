@@ -36,6 +36,7 @@ pub use compact::{
 };
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use i2p_sam::I2pSam;
 pub use ibd::{
     format_tip_perf_sizes, read_proc_rss, rehydrate_block_queue_residue, IbdConfig, ProcRss,
     TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,

@@ -360,7 +360,10 @@ impl AddrMan {
             if out.len() >= max {
                 break;
             }
-            if !matches!(a, NetAddr::Onion { .. }) || !self.allowed(a) || exclude.contains(&a) {
+            if !matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. })
+                || !self.allowed(a)
+                || exclude.contains(&a)
+            {
                 continue;
             }
             if !out.contains(&a) {
@@ -1623,6 +1626,21 @@ mod tests {
         am.set_only_net(vec![OnlyNet::Onion]);
         let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
         assert_eq!(got, vec![onion]);
+        assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn only_net_i2p_filters_ipv4_candidates() {
+        let i2p = NetAddr::I2p {
+            dest: [0x11u8; 32],
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.add(addr(1));
+        am.add_addr(i2p);
+        am.set_only_net(vec![OnlyNet::I2p]);
+        let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![i2p]);
         assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
     }
 }

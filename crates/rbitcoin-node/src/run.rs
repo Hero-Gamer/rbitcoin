@@ -370,6 +370,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .expect("control addr set when session exists")
         );
     }
+    let _i2p_sam = if let Some(addr) = config.listen.i2p_sam {
+        let s = rbitcoin_net::I2pSam::connect(addr)
+            .await
+            .map_err(|e| NodeError::Init(format!("i2p sam {addr}: {e}")))?;
+        info!("i2p SAM session on {addr}");
+        Some(s)
+    } else {
+        None
+    };
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
         Some(spawn_sh_writebehind(

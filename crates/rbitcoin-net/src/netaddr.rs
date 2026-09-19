@@ -18,6 +18,7 @@ pub enum OnlyNet {
     Ipv4,
     Ipv6,
     Onion,
+    I2p,
 }
 
 impl OnlyNet {
@@ -26,7 +27,8 @@ impl OnlyNet {
             "ipv4" => Ok(Self::Ipv4),
             "ipv6" => Ok(Self::Ipv6),
             "onion" => Ok(Self::Onion),
-            "i2p" | "cjdns" => Err(format!("unknown network {s} (not yet implemented)")),
+            "i2p" => Ok(Self::I2p),
+            "cjdns" => Err(format!("unknown network {s} (not yet implemented)")),
             other => Err(format!("unknown network {other}")),
         }
     }
@@ -36,6 +38,7 @@ impl OnlyNet {
             (Self::Ipv4, NetAddr::Ip(s)) => s.is_ipv4(),
             (Self::Ipv6, NetAddr::Ip(s)) => s.is_ipv6(),
             (Self::Onion, NetAddr::Onion { .. }) => true,
+            (Self::I2p, NetAddr::I2p { .. }) => true,
             _ => false,
         }
     }

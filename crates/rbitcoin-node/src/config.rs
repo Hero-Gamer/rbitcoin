@@ -103,6 +103,8 @@ pub struct ListenOpts {
     pub discover: bool,
     /// Empty = all networks. Repeatable `--only-net`.
     pub only_net: Vec<rbitcoin_net::OnlyNet>,
+    /// SAM v3 TCP port (`--i2p-sam`).
+    pub i2p_sam: Option<SocketAddr>,
 }
 
 impl Default for ListenOpts {
@@ -125,6 +127,7 @@ impl Default for ListenOpts {
             proxy_randomize: true,
             discover: true,
             only_net: Vec::new(),
+            i2p_sam: None,
         }
     }
 }
@@ -519,6 +522,13 @@ impl NodeConfig {
                 "only-net=onion requires SOCKS (--proxy or --onion)".into(),
             ));
         }
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::I2p)
+            && self.listen.i2p_sam.is_none()
+        {
+            return Err(NodeError::Config(
+                "only-net=i2p requires SAM (--i2p-sam)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -749,6 +759,13 @@ impl NodeConfig {
             }
             "tor_control_password" => {
                 self.tor.password = Some(val.to_string());
+            }
+            "i2p_sam" => {
+                self.listen.i2p_sam = Some(if val.is_empty() {
+                    SocketAddr::from(([127, 0, 0, 1], 7656))
+                } else {
+                    parse_required_socket(val, "i2p_sam")?
+                });
             }
             "proxy_randomize" => {
                 self.listen.proxy_randomize = parse_conf_bool(val)

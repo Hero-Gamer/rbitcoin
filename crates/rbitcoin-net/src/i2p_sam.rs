@@ -174,4 +174,24 @@ mod tests {
             "{msg}"
         );
     }
+
+    #[tokio::test]
+    async fn dial_i2p_uses_sam() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let addr = fake_sam(true, Arc::clone(&log)).await;
+        let sam = I2pSam::connect(addr).await.unwrap();
+        let peer = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 8333,
+        };
+        sam.stream_connect(&peer.host_str()).await.unwrap();
+        let got = log.lock().unwrap().clone();
+        assert!(got.iter().any(|g| g.contains(&peer.host_str())), "{got:?}");
+        let err = match crate::socks::Dialer::Direct.connect_net(peer).await {
+            Err(e) => e,
+            Ok(_) => panic!("Direct must not dial I2P"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("SAM") || msg.contains("i2p"), "{msg}");
+    }
 }

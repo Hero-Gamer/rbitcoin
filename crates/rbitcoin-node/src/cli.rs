@@ -295,6 +295,7 @@ fn operator_usage() -> String {
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
+    [--i2p-sam [HOST:PORT]] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
@@ -325,6 +326,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --tor-control [HOST:PORT] talks to system tor (default 127.0.0.1:9051). Cookie or password AUTH;\n\
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
+  --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -393,7 +395,7 @@ fn is_bool_key(key: &str) -> bool {
 fn is_optional_addr_key(key: &str) -> bool {
     matches!(
         key,
-        "rpc_listen" | "electrum_listen" | "esplora_listen" | "tor_control"
+        "rpc_listen" | "electrum_listen" | "esplora_listen" | "tor_control" | "i2p_sam"
     )
 }
 
@@ -581,6 +583,7 @@ mod tests {
             "--tor-control",
             "--tor-control-cookie",
             "--tor-control-password",
+            "--i2p-sam",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
@@ -613,6 +616,7 @@ mod tests {
             "--nolisten",
             "--nodiscover",
             "--torcontrol",
+            "--i2psam",
         ] {
             assert!(!h.contains(concat), "help must not advertise {concat}");
         }
@@ -847,7 +851,10 @@ mod tests {
         assert!(msg.contains("SOCKS") && msg.contains("only-net"), "{msg}");
         c.apply_kv("proxy", "127.0.0.1:9050").unwrap();
         c.validate().unwrap();
-        assert!(NodeConfig::default().apply_kv("only_net", "i2p").is_err());
+        let mut i2p_ok = NodeConfig::default();
+        i2p_ok.apply_kv("only_net", "i2p").unwrap();
+        assert_eq!(i2p_ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
+        assert!(NodeConfig::default().apply_kv("only_net", "cjdns").is_err());
         let ok = ready_config([
             "rbitcoin-node",
             "--only-net",
@@ -892,6 +899,37 @@ mod tests {
         assert!(h.contains("--tor-control-cookie"));
         assert!(h.contains("--tor-control-password"));
         assert!(!h.contains("--torcontrol"));
+    }
+
+    #[test]
+    fn i2p_sam_cli() {
+        let omitted = ready_config(["rbitcoin-node", "--i2p-sam"]);
+        assert_eq!(
+            omitted.listen.i2p_sam,
+            Some("127.0.0.1:7656".parse().unwrap())
+        );
+        let explicit = ready_config(["rbitcoin-node", "--i2p-sam", "127.0.0.1:7656"]);
+        assert_eq!(
+            explicit.listen.i2p_sam,
+            Some("127.0.0.1:7656".parse().unwrap())
+        );
+        let h = operator_usage();
+        assert!(h.contains("--i2p-sam"));
+        assert!(!h.contains("--i2psam"));
+    }
+
+    #[test]
+    fn only_net_i2p_without_sam_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "i2p").unwrap();
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SAM") && msg.contains("i2p"), "{msg}");
+        c.apply_kv("i2p_sam", "").unwrap();
+        c.validate().unwrap();
+        let ok = ready_config(["rbitcoin-node", "--only-net", "i2p", "--i2p-sam"]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
+        assert_eq!(ok.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
     }
 
     #[test]
