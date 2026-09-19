@@ -615,8 +615,13 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
 
         // #628: active-chain confirmed -> txn-already-known (reorg-safe)
         let confirmed_active = match ctx.query.tx_fk_by_txid_tip(&txid_bytes) {
-            Ok(Some(fk)) => ctx.query.store().is_confirmed_strong(fk).unwrap_or(false),
-            _ => false,
+            Ok(Some(fk)) => ctx
+                .query
+                .store()
+                .is_confirmed_strong(fk)
+                .map_err(|e| rpc_error(ERR_MISC, format!("query failed: {e}")))?,
+            Ok(None) => false,
+            Err(e) => return Err(rpc_error(ERR_MISC, format!("query failed: {e}"))),
         };
         if confirmed_active {
             out.push(serde_json::json!({
