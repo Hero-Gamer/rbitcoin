@@ -253,7 +253,7 @@ listed; **payloads use Esplora REST shapes**.
 | Message | Behavior |
 |---------|----------|
 | `{ "action": "want", "data": ["blocks"] }` | Subscribe tip pushes |
-| `{ "action": "want", "data": ["stats"] }` | Immediate `{ "mempoolInfo", "fees" }` (same JSON as `GET /mempool` and `GET /fees/recommended`); re-push on announce/tip when the tx snapshot Arc changes or 1 s fee-snapshot age elapses. Combine with `blocks` |
+| `{ "action": "want", "data": ["stats"] }` | Immediate `{ "mempoolInfo", "fees" }` (same JSON as `GET /mempool` and `GET /fees/recommended`); re-push on announce/tip when fee-snapshot `computed_at` changes or 1 s age elapses. Combine with `blocks` |
 | empty want / no `blocks` / no `stats` | Clear those subscriptions |
 | `{ "action": "ping" }` | `{ "pong": true }` |
 | `{ "action": "init" }` | `{ "block": { "height", "id", "timestamp" } }` from the current tip (not Node's 8-block blob) |

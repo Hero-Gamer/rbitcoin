@@ -1082,6 +1082,11 @@ Blockstream Esplora `API.md`); surface: [`COMPAT.md`](./COMPAT.md).
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 Leave `--max-sh-creates` at **0** (unlimited join) for explorer backends.
 
+TCP Esplora does not keep a mempool of `Arc<Transaction>`. `GET /mempool` loads
+the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-tx
+pages lazy-build one published body snapshot (JSON `OnceLock` per live tx after
+the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](docs/ibd-memory.md).
+
 ### mempool.space
 
 Stock mempool Node + MariaDB + frontend. nginx **`/api/`** → this Esplora

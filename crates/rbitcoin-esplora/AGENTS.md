@@ -24,8 +24,8 @@ need `--sh-index`.
 ## Rules here
 
 - Address-prefix and Liquid stay 404. Do not add `/api/v1/` catalogue routes.
-- Last-1 GET + last-bulk POST (16 MiB) `sh_join` per `X-Rbitcoin-Client` (unix/loopback). Unbounded process LRU stays **X-M3**. Sticky joins stay Electrum TCP.
-- Wallet WS (`/v1/ws`, `/ws`): ping/init/stop, track-address snapshot + RBF `address-removed-transactions`, `want: stats` from hub snapshots. Node `/api/v1/ws` stays out.
+- Last-1 GET + last-bulk POST (16 MiB packed, including last_sh) `sh_join` per `X-Rbitcoin-Client` (unix/loopback). Unbounded process LRU stays **X-M3**. Sticky joins stay Electrum TCP.
+- Wallet WS (`/v1/ws`, `/ws`): ping/init/stop, track-address snapshot via `scripthash_mempool`, RBF `address-removed-transactions`, `want: stats` from the fee snapshot. Node `/api/v1/ws` stays out.
 - Do not grow a `*_for_test` backdoor. Tests drive the shipped route.
 
 ## Verify
