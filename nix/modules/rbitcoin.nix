@@ -39,12 +39,12 @@ let
     else
       "${address}:${toString port}";
 
-  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService || cfg.esplora.hiddenService;
+  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService || cfg.esplora.hiddenService || cfg.p2p.listenOnion;
   needI2pSam = cfg.i2p.sam != null;
   torControlAddr =
     if cfg.tor.control != null then
       cfg.tor.control
-    else if cfg.electrum.hiddenService || cfg.esplora.hiddenService then
+    else if cfg.electrum.hiddenService || cfg.esplora.hiddenService || cfg.p2p.listenOnion then
       "127.0.0.1:9051"
     else
       null;
@@ -72,6 +72,7 @@ let
   ++ optional (cfg.p2p.maxInbound != 125) "--max-inbound"
   ++ optional (cfg.p2p.maxInbound != 125) (toString cfg.p2p.maxInbound)
   ++ optional (!cfg.p2p.discover) "--no-discover"
+  ++ optional cfg.p2p.listenOnion "--listen-onion"
   ++ optional (cfg.coldDataDir != null) "--datadir-cold"
   ++ optional (cfg.coldDataDir != null) cfg.coldDataDir
   ++ optional cfg.rpc.enable "--rpc-listen"
@@ -276,6 +277,12 @@ in
         type = types.bool;
         default = true;
         description = "Advertise local addresses to peers. Off with --no-discover.";
+      };
+
+      listenOnion = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for the P2P port. Binds 127.0.0.1 even with p2p.listen = false. Requires tor.control (implied 127.0.0.1:9051) and maxInbound > 0. Gossip the onion, not a home IPv4, when discover is off.";
       };
 
       openFirewall = mkOption {

@@ -366,8 +366,9 @@ Clean smoke:
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
 | `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
 | `--listen ADDR` | `listen=` | bind later default port |
-| `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no P2P socket (outbound-only) |
-| `--no-discover` | `no_discover=` | discover **on**; flag off = no self-announce / `localaddresses` |
+| `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no clearnet P2P socket |
+| `--listen-onion` | `listen_onion=` | **off** — loopback P2P + `ADD_ONION` (`{datadir}/onion/p2p.priv`); needs `--tor-control` and `--max-inbound` > 0 |
+| `--no-discover` | `no_discover=` | discover **on**; flag off = no home-IP self-announce; P2P/wallet onions still listed |
 | `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` (`cjdns` later) |
 | `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port`, Tor v3 `.onion:port`, or `{52}.b32.i2p:port` |
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
@@ -458,7 +459,13 @@ error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
 (v1 IPv4/IPv6 still loads).
 
 `--listen=0` / `--no-listen` starts without a P2P TCP bind (no ISP port
-forward). `--max-inbound 0` refuses inbound slots. `--no-discover` does not
+forward). `--listen-onion` still binds **127.0.0.1** (ephemeral port) and
+`ADD_ONION`s the network default P2P port (8333 / signet 38333 / …) to
+that loopback (`{datadir}/onion/p2p.priv`, 0600). Needs `--tor-control`
+and `--max-inbound` > 0. `--no-discover` still gossips that onion via
+`addrv2` and lists it in `getnetworkinfo.localaddresses`; it does not
+gossip `--external-ip`. `--max-inbound 0` refuses `--listen-onion`.
+`--max-inbound 0` refuses inbound slots. `--no-discover` does not
 self-announce even when `--external-ip` is set. A later onion inbound bind
 does not require a public clearnet listen.
 

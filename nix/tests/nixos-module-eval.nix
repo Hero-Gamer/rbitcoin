@@ -46,6 +46,7 @@ let
           p2p = {
             address = "127.0.0.1";
             openFirewall = true;
+            listenOnion = true;
           };
           rpc.enable = true;
           electrum = {
@@ -99,6 +100,7 @@ assert defaultCfg.p2p.port == 8333;
 assert defaultCfg.p2p.listen == true;
 assert defaultCfg.p2p.maxInbound == 125;
 assert defaultCfg.p2p.discover == true;
+assert defaultCfg.p2p.listenOnion == false;
 assert defaultCfg.rpc.port == 8332;
 assert defaultCfg.proxy == null;
 assert defaultCfg.onionProxy == null;
@@ -142,6 +144,7 @@ assert builtins.match ".*--tor-control 127.0.0.1:9051.*" execStart != null;
 assert builtins.match ".*--tor-control-cookie /run/tor/control.authcookie.*" execStart != null;
 assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;
 assert builtins.match ".*--i2p-accept-incoming.*" execStart != null;
+assert builtins.match ".*--listen-onion.*" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
 assert builtins.elem "i2pd.service" service.after;
