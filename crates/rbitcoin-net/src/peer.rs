@@ -2788,81 +2788,26 @@ fn on_inv(
                     s.note_block_from_peer(*h);
                     s.note_best_known(*h);
                 }
-                if !hub.is_connected(h) {
-                    if !hub.knows_header(h) && !follow.pending_headers.contains_key(h) {
-                        if session.is_none_or(|s| {
-                            s.peer_hub()
-                                .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
-                        }) {
-                            need_headers = true;
-                        }
-                    } else {
-                        // Have a header: do not getdata from inv. Bodies
-                        // come from header-announcement direct fetch
-                        // (BIP130) or a getheaders reply. Inv of a
-                        // known hash from a second peer (p2p_sendheaders
-                        // inv_node) must not steal or duplicate getdata.
-                    }
+                if on_inv_block_needs_headers(hub, follow, session, h) {
+                    need_headers = true;
                 }
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(txid.to_string());
                 }
-                if relay {
-                    if let Some(mp) = hub.mempool() {
-                        let in_orphan = mp.try_orphan_missing(txid).is_some();
-                        if mp.try_contains(txid) && !in_orphan {
-                            if let Some(s) = session {
-                                let _ = mp.add_orphan_announcer(txid, s.id);
-                            }
-                        } else {
-                            want.push(Inventory::WitnessTransaction(*txid));
-                            inv_tx_n = inv_tx_n.saturating_add(1);
-                            if let Some(s) = session {
-                                mp.note_inv_tx_requested(
-                                    s.id,
-                                    txid.to_byte_array(),
-                                    s.inbound,
-                                    s.clock_now(),
-                                );
-                            }
-                        }
-                    }
+                if let Some(inv) = on_inv_txid(hub, session, relay, txid) {
+                    want.push(inv);
+                    inv_tx_n = inv_tx_n.saturating_add(1);
                 }
             }
             Inventory::WTx(wtxid) => {
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(wtxid.to_string());
                 }
-                if relay {
-                    if let Some(mp) = hub.mempool() {
-                        if mp.try_contains_wtxid(wtxid) {
-                            if let Some(s) = session {
-                                let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
-                                if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
-                                    let missing = mp.orphan_getdata_parents(&tx);
-                                    mp.schedule_orphan_parents(
-                                        &missing,
-                                        s.id,
-                                        s.inbound,
-                                        s.clock_now(),
-                                    );
-                                }
-                            }
-                        } else {
-                            want.push(Inventory::WTx(*wtxid));
-                            inv_tx_n = inv_tx_n.saturating_add(1);
-                            if let Some(s) = session {
-                                mp.note_inv_tx_requested(
-                                    s.id,
-                                    wtxid.to_byte_array(),
-                                    s.inbound,
-                                    s.clock_now(),
-                                );
-                            }
-                        }
-                    }
+                if let Some(inv) = on_inv_wtxid(hub, session, relay, wtxid) {
+                    want.push(inv);
+                    inv_tx_n = inv_tx_n.saturating_add(1);
                 }
             }
             _ => {}
@@ -2899,6 +2844,72 @@ fn on_inv(
         queue_out(out_tx, NetworkMessage::GetData(want))?;
     }
     Ok(())
+}
+
+fn on_inv_block_needs_headers(
+    hub: &ChainHub,
+    follow: &PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    h: &bitcoin::BlockHash,
+) -> bool {
+    if hub.is_connected(h) {
+        return false;
+    }
+    if hub.knows_header(h) || follow.pending_headers.contains_key(h) {
+        return false;
+    }
+    session.is_none_or(|s| {
+        s.peer_hub()
+            .is_some_and(|ph| ph.should_getheaders_for_inv(s, *h))
+    })
+}
+
+fn on_inv_txid(
+    hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    relay: bool,
+    txid: &bitcoin::Txid,
+) -> Option<Inventory> {
+    if !relay {
+        return None;
+    }
+    let mp = hub.mempool()?;
+    let in_orphan = mp.try_orphan_missing(txid).is_some();
+    if mp.try_contains(txid) && !in_orphan {
+        if let Some(s) = session {
+            let _ = mp.add_orphan_announcer(txid, s.id);
+        }
+        return None;
+    }
+    if let Some(s) = session {
+        mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now());
+    }
+    Some(Inventory::WitnessTransaction(*txid))
+}
+
+fn on_inv_wtxid(
+    hub: &ChainHub,
+    session: Option<&crate::peers::LivePeer>,
+    relay: bool,
+    wtxid: &bitcoin::Wtxid,
+) -> Option<Inventory> {
+    if !relay {
+        return None;
+    }
+    let mp = hub.mempool()?;
+    if !mp.try_contains_wtxid(wtxid) {
+        if let Some(s) = session {
+            mp.note_inv_tx_requested(s.id, wtxid.to_byte_array(), s.inbound, s.clock_now());
+        }
+        return Some(Inventory::WTx(*wtxid));
+    }
+    let s = session?;
+    let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
+    if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
+        let missing = mp.orphan_getdata_parents(&tx);
+        mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    }
+    None
 }
 
 fn on_headers(
