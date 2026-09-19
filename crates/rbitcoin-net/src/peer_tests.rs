@@ -5601,6 +5601,59 @@ fn no_discover_suppresses_self_announce() {
 }
 
 #[test]
+fn self_announce_onion_not_external_ip() {
+    use crate::peers::{PeerConnType, PeerHub};
+    use bitcoin::p2p::address::{AddrV2, Address};
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = hub.register(addr, addr, &ver, false, PeerConnType::OutboundFullRelay);
+    peer.set_wants_addrv2();
+    let onion: crate::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:18444"
+            .parse()
+            .unwrap();
+    hub.set_p2p_onion(onion.host_str(), onion.port());
+    hub.set_discover(false);
+    hub.set_clearnet_listen(false);
+    hub.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
+    hub.set_listen_port(18445);
+    assert!(hub.advertise_local_socket().is_none());
+    match peer.take_self_announce_msg().expect("onion announce") {
+        NetworkMessage::AddrV2(v) => {
+            assert_eq!(v.len(), 1, "{v:?}");
+            assert!(matches!(v[0].addr, AddrV2::TorV3(_)));
+            assert_eq!(v[0].port, 18444);
+        }
+        other => panic!("expected AddrV2 onion, got {other:?}"),
+    }
+    let rows = hub.rpc_local_addresses();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].0.ends_with(".onion"));
+    assert_eq!(rows[0].1, 18444);
+    hub.set_discover(true);
+    assert!(
+        hub.advertise_local_socket().is_none(),
+        "onion-only loopback must not gossip --external-ip"
+    );
+}
+
+#[test]
 fn redundant_verack_is_ignored_and_logged() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;

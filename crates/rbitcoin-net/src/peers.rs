@@ -1,7 +1,7 @@
 //! Live P2P session table for RPC (`getpeerinfo` / `addnode` / `disconnectnode`).
 
 use crate::error::NetError;
-use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
@@ -443,25 +443,56 @@ impl LivePeer {
         ) {
             return None;
         }
-        let sock = self.take_local_addr_due(self.clock_now())?;
-        rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(sock, self.id));
-        let now = self.clock_now() as u32;
-        Some(if self.wants_addrv2() {
-            NetworkMessage::AddrV2(vec![AddrV2Message {
-                time: now,
-                services: crate::peer::local_service_flags(),
-                addr: match sock.ip() {
-                    IpAddr::V4(v) => AddrV2::Ipv4(v),
-                    IpAddr::V6(v) => AddrV2::Ipv6(v),
-                },
-                port: sock.port(),
-            }])
+        let hub = self.owner.upgrade()?;
+        let onion = hub.p2p_onion();
+        let sock = hub.advertise_local_socket();
+        if onion.is_none() && sock.is_none() {
+            return None;
+        }
+        const DAY: u64 = 24 * 60 * 60;
+        let now = self.clock_now();
+        let prev = self.next_local_addr_send.load(Ordering::Relaxed);
+        if prev != 0 && now < prev {
+            return None;
+        }
+        let next = now.saturating_add(DAY).max(1);
+        self.next_local_addr_send
+            .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        let services = crate::peer::local_service_flags();
+        let t = now as u32;
+        if self.wants_addrv2() {
+            let mut v = Vec::new();
+            if let Some(addr) = onion {
+                rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(addr, self.id));
+                v.push(AddrV2Message {
+                    time: t,
+                    services,
+                    addr: addr.to_addrv2(),
+                    port: addr.port(),
+                });
+            }
+            if let Some(sock) = sock {
+                rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(sock, self.id));
+                v.push(AddrV2Message {
+                    time: t,
+                    services,
+                    addr: crate::NetAddr::Ip(sock).to_addrv2(),
+                    port: sock.port(),
+                });
+            }
+            if v.is_empty() {
+                return None;
+            }
+            Some(NetworkMessage::AddrV2(v))
         } else {
-            NetworkMessage::Addr(vec![(
-                now,
-                Address::new(&sock, crate::peer::local_service_flags()),
-            )])
-        })
+            let sock = sock?;
+            rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(sock, self.id));
+            Some(NetworkMessage::Addr(vec![(
+                t,
+                Address::new(&sock, services),
+            )]))
+        }
     }
 
     pub fn queue_self_announce_if_due(&self) {
@@ -1106,10 +1137,13 @@ pub struct PeerHub {
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
     external_ips: Mutex<Vec<IpAddr>>,
     wallet_onions: Mutex<Vec<(String, u16)>>,
+    p2p_onion: Mutex<Option<(String, u16)>>,
     /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
     discover: AtomicBool,
+    /// Clearnet P2P bind (not onion-only loopback). Needed to gossip `--external-ip`.
+    clearnet_listen: AtomicBool,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
     /// Tip-mode mempool for Core `EraseForPeer` on disconnect.
     mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
@@ -1184,8 +1218,10 @@ impl PeerHub {
             peer_timeout_secs: AtomicU64::new(60),
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
+            p2p_onion: Mutex::new(None),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
+            clearnet_listen: AtomicBool::new(true),
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
@@ -1248,6 +1284,23 @@ impl PeerHub {
             .push((host, port));
     }
 
+    pub fn set_p2p_onion(&self, host: String, port: u16) {
+        *self.p2p_onion.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, port));
+    }
+
+    pub fn p2p_onion(&self) -> Option<crate::NetAddr> {
+        let (host, port) = self
+            .p2p_onion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        format!("{host}:{port}").parse().ok()
+    }
+
+    pub fn set_clearnet_listen(&self, on: bool) {
+        self.clearnet_listen.store(on, Ordering::Relaxed);
+    }
+
     pub fn set_listen_port(&self, port: u16) {
         self.listen_port.store(port, Ordering::Relaxed);
     }
@@ -1267,6 +1320,14 @@ impl PeerHub {
             .cloned()
             .map(|(address, port)| (address, port, LOCAL_MANUAL))
             .collect();
+        if let Some((host, port)) = self
+            .p2p_onion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            rows.push((host, port, LOCAL_MANUAL));
+        }
         if !self.discover.load(Ordering::Relaxed) {
             return rows;
         }
@@ -1288,6 +1349,9 @@ impl PeerHub {
 
     pub fn advertise_local_socket(&self) -> Option<SocketAddr> {
         if !self.discover.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !self.clearnet_listen.load(Ordering::Relaxed) {
             return None;
         }
         let port = self.listen_port.load(Ordering::Relaxed);

@@ -183,7 +183,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
     apply_startup_index_mode(&handle.query, &config, params.taproot_height())?;
-    let bind = config.listen.p2p_bind_addr(config.network);
+    let bind = config.listen.start_p2p_bind(config.network);
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
     let run_started = Instant::now();
@@ -320,8 +320,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers.set_peer_timeout_secs(secs);
     }
     node.peers.set_discover(config.listen.discover);
-    if let Some(addr) = bind {
-        node.peers.set_listen_port(addr.port());
+    node.peers
+        .set_clearnet_listen(!matches!(config.listen.p2p, crate::config::P2pListen::Off));
+    if node.local_addr.port() != 0 {
+        node.peers.set_listen_port(node.local_addr.port());
     }
     if !config.listen.external_ips.is_empty() {
         node.peers
@@ -372,6 +374,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .control
                 .expect("control addr set when session exists")
         );
+    }
+    if config.listen.listen_onion {
+        let ctl = tor_ctl
+            .as_mut()
+            .expect("validate requires --tor-control with --listen-onion");
+        let virt = config.network.default_p2p_port();
+        let hs = ctl
+            .add_p2p_onion(config.datadir.path(), node.local_addr, virt)
+            .await?;
+        info!("p2p onion {}.onion:{}", hs.service_id, virt);
+        node.peers
+            .set_p2p_onion(format!("{}.onion", hs.service_id), virt);
     }
     let mut i2p_sam = if let Some(addr) = config.listen.i2p_sam {
         let s = if config.listen.i2p_accept_incoming {

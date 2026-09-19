@@ -4,7 +4,7 @@ use crate::error::NetError;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use sha3::{Digest, Sha3_256};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -93,6 +93,17 @@ impl NetAddr {
                 port: msg.port,
             }),
             AddrV2::TorV2(_) | AddrV2::Cjdns(_) | AddrV2::Unknown(_, _) => None,
+        }
+    }
+
+    pub fn to_addrv2(self) -> AddrV2 {
+        match self {
+            NetAddr::Ip(s) => match s.ip() {
+                IpAddr::V4(v4) => AddrV2::Ipv4(v4),
+                IpAddr::V6(v6) => AddrV2::Ipv6(v6),
+            },
+            NetAddr::Onion { pk, .. } => AddrV2::TorV3(pk),
+            NetAddr::I2p { dest, .. } => AddrV2::I2p(dest),
         }
     }
 
@@ -372,6 +383,7 @@ mod tests {
         };
         let a = NetAddr::from_addrv2(&msg).expect("i2p addrv2");
         assert_eq!(a, NetAddr::I2p { dest, port: 8333 });
+        assert_eq!(a.to_addrv2(), AddrV2::I2p(dest));
         let s = a.to_string();
         assert!(s.ends_with(".b32.i2p:8333"), "{s}");
         assert_eq!(s.parse::<NetAddr>().unwrap(), a);
