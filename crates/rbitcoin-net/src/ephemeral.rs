@@ -79,6 +79,29 @@ pub(crate) async fn send_tx_isolated_timed(
     Ok(())
 }
 
+async fn isolated_broadcast_known_tx(
+    dialer: &Dialer,
+    addrman: &Mutex<AddrMan>,
+    magic: Magic,
+    user_agent: &str,
+    txid: bitcoin::Txid,
+    tx: Transaction,
+) {
+    let targets = {
+        let am = addrman.lock().unwrap_or_else(|e| e.into_inner());
+        isolated_broadcast_targets(&am, ISOLATED_BROADCAST_PEERS)
+    };
+    if targets.is_empty() {
+        rbitcoin_log::warn!("isolated broadcast {txid}: no AddrMan targets");
+        return;
+    }
+    for t in targets {
+        if let Err(e) = send_tx_isolated(dialer, t, magic, tx.clone(), user_agent).await {
+            rbitcoin_log::warn!("isolated broadcast {txid} to {t}: {e}");
+        }
+    }
+}
+
 pub fn spawn_isolated_broadcast_loop(
     mp: Arc<MempoolHub>,
     dialer: Dialer,
@@ -91,27 +114,11 @@ pub fn spawn_isolated_broadcast_loop(
     }
     let mut rx = mp.subscribe_isolated();
     tokio::spawn(async move {
-        loop {
-            let txid = match rx.recv().await {
-                Ok(t) => t,
-                Err(_) => break,
-            };
+        while let Ok(txid) = rx.recv().await {
             let Some(tx) = mp.get_tx(&txid) else {
                 continue;
             };
-            let targets = {
-                let am = addrman.lock().unwrap_or_else(|e| e.into_inner());
-                isolated_broadcast_targets(&am, ISOLATED_BROADCAST_PEERS)
-            };
-            if targets.is_empty() {
-                rbitcoin_log::warn!("isolated broadcast {txid}: no AddrMan targets");
-                continue;
-            }
-            for t in targets {
-                if let Err(e) = send_tx_isolated(&dialer, t, magic, tx.clone(), &user_agent).await {
-                    rbitcoin_log::warn!("isolated broadcast {txid} to {t}: {e}");
-                }
-            }
+            isolated_broadcast_known_tx(&dialer, &addrman, magic, &user_agent, txid, tx).await;
         }
     })
 }
@@ -129,6 +136,7 @@ mod tests {
     use bitcoin::{Amount, Transaction, TxOut};
     use bitcoin::{ScriptBuf, Sequence, TxIn, Witness};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -384,5 +392,105 @@ mod tests {
             "failed isolated send must not fall back to standing INV"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_broadcast_loop_idle_when_not_isolated() {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-idle");
+        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        let am = Arc::new(Mutex::new(AddrMan::new()));
+        spawn_isolated_broadcast_loop(
+            mp,
+            Dialer::Direct,
+            am,
+            Magic::REGTEST,
+            "/rbitcoin:test/".into(),
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_broadcast_loop_skips_unknown_txid() {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-skip");
+        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_isolated_broadcast(true);
+        let am = Arc::new(Mutex::new(AddrMan::new()));
+        let h = spawn_isolated_broadcast_loop(
+            mp.clone(),
+            Dialer::Direct,
+            am,
+            Magic::REGTEST,
+            "/rbitcoin:test/".into(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        mp.mark_local_origin(dummy_tx().compute_txid());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_broadcast_known_tx_no_addrman_targets() {
+        let tx = dummy_tx();
+        isolated_broadcast_known_tx(
+            &Dialer::Direct,
+            &Mutex::new(AddrMan::new()),
+            Magic::REGTEST,
+            "/rbitcoin:test/",
+            tx.compute_txid(),
+            tx,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_broadcast_known_tx_one_shot() {
+        let bitcoin_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = bitcoin_l.local_addr().unwrap();
+        let inbound = tokio::spawn(async move {
+            let (stream, from) = bitcoin_l.accept().await.unwrap();
+            let (_ver, mut reader, _writer, _wire, _tcp) = connect_and_handshake_timed(
+                Duration::from_secs(5),
+                stream,
+                Magic::REGTEST,
+                peer_addr,
+                from,
+                0,
+                true,
+                "/rbitcoin:test/",
+                HandshakePolicy::plain(),
+            )
+            .await
+            .unwrap();
+            let frame = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_v2_frame(&mut reader, Magic::REGTEST),
+            )
+            .await
+            .expect("tx frame")
+            .expect("tx decrypt");
+            let msg = decode_framed_offload(frame).await.unwrap();
+            assert!(
+                matches!(msg.payload(), NetworkMessage::Tx(_)),
+                "expected tx, got {:?}",
+                msg.payload()
+            );
+            true
+        });
+        let mut am = AddrMan::new();
+        am.add(peer_addr);
+        let tx = dummy_tx();
+        isolated_broadcast_known_tx(
+            &Dialer::Direct,
+            &Mutex::new(am),
+            Magic::REGTEST,
+            "/rbitcoin:test/",
+            tx.compute_txid(),
+            tx,
+        )
+        .await;
+        assert!(inbound.await.unwrap(), "one-shot reached the peer");
     }
 }
