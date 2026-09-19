@@ -1311,7 +1311,8 @@ fn tx_announce_should_queue(
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
 ) -> bool {
-    tx_announce_peer_ok(session, mp, txid)
+    !mp.skip_standing_inv(txid)
+        && tx_announce_peer_ok(session, mp, txid)
         && mp.try_contains(txid)
         && (mp.relay_enabled() || mp.is_unbroadcast(txid))
         && !tx_announce_below_feefilter(session, mp, txid)
@@ -2010,6 +2011,9 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
     let Some(mp) = hub.mempool() else {
         return;
     };
+    if mp.skip_standing_inv(&txid) {
+        return;
+    }
     let Some(tx) = mp.try_get_tx(&txid) else {
         return;
     };
@@ -2092,6 +2096,9 @@ fn tx_inv_candidate_ok(
     clock_due: bool,
     inbound_age_gate: bool,
 ) -> bool {
+    if mp.skip_standing_inv(&txid) {
+        return false;
+    }
     if from_this_peer.contains_key(&txid) {
         return false;
     }

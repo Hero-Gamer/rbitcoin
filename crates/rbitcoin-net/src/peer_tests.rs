@@ -1413,6 +1413,98 @@ fn force_announce_txid_skips_then_invs_full_relay() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn local_origin_not_inv_on_standing_peer() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_primitives::Height;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("local-origin-inv");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .expect("pad");
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    mp.set_isolated_broadcast(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let cb0 = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .compute_txid();
+    let cb1 = hub
+        .query
+        .reconstruct_block_at_height(Height(2))
+        .unwrap()
+        .txdata[0]
+        .compute_txid();
+    let spend = |cb: bitcoin::Txid, fee: u64| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: cb, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_9999_0000 - fee),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let local = spend(cb0, 0);
+    let p2p = spend(cb1, 1_000);
+    hub.mempool().unwrap().accept_tx(&local).expect("local");
+    hub.mempool()
+        .unwrap()
+        .mark_local_origin(local.compute_txid());
+    hub.mempool().unwrap().accept_tx(&p2p).expect("p2p");
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let peers = crate::peers::PeerHub::new();
+    let sess = peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    sess.attach_out(tx);
+    crate::force_announce_txid(&hub, &peers, local.compute_txid());
+    assert!(
+        rx.try_recv().is_err(),
+        "isolated local-origin must not INV standing peers"
+    );
+    crate::force_announce_txid(&hub, &peers, p2p.compute_txid());
+    match rx.try_recv().expect("p2p origin INV").expect_msg() {
+        NetworkMessage::Inv(v) => {
+            assert_eq!(v, vec![Inventory::WTx(p2p.compute_wtxid())]);
+        }
+        other => panic!("expected WTx inv, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// When relay is on, unbroadcast must not skip the inbound 30s INV gate
 /// (`mempool_reorg.py:71`).
 #[test]

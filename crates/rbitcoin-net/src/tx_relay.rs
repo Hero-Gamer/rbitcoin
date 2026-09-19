@@ -563,6 +563,7 @@ pub struct MempoolHub {
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
     local_origin: Mutex<HashSet<Txid>>,
+    isolated_broadcast: AtomicBool,
     /// Wtxids re-admitted from a disconnected block. Core serves these
     /// even if this peer has not been INV'd yet (`mempool_reorg`).
     reorg_servable: Mutex<HashSet<Wtxid>>,
@@ -687,6 +688,7 @@ impl MempoolHub {
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
             local_origin: Mutex::new(HashSet::new()),
+            isolated_broadcast: AtomicBool::new(false),
             reorg_servable: Mutex::new(HashSet::new()),
             relay_seq: Mutex::new(HashMap::new()),
             wtxid_by_txid: Mutex::new(HashMap::new()),
@@ -3155,6 +3157,18 @@ impl MempoolHub {
 
     pub fn is_local_origin(&self, txid: &Txid) -> bool {
         self.local_origin.lock().unwrap().contains(txid)
+    }
+
+    pub fn set_isolated_broadcast(&self, on: bool) {
+        self.isolated_broadcast.store(on, Ordering::Relaxed);
+    }
+
+    pub fn isolated_broadcast(&self) -> bool {
+        self.isolated_broadcast.load(Ordering::Relaxed)
+    }
+
+    pub fn skip_standing_inv(&self, txid: &Txid) -> bool {
+        self.isolated_broadcast() && self.is_local_origin(txid)
     }
 
     /// Peer getdata served this txid — it is no longer unbroadcast.

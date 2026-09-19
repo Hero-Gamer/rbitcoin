@@ -312,6 +312,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .map_err(|e| NodeError::Config(format!("mempool open join: {e}")))?
     .map_err(NodeError::Config)?;
     node.peers.attach_mempool(&mempool);
+    if config.listen.proxy.is_some() || config.listen.onion.is_some() {
+        mempool.set_isolated_broadcast(true);
+    }
     node.peers.set_net_perms(table.clone());
     if let Some(secs) = config.listen.peer_timeout_secs {
         node.peers.set_peer_timeout_secs(secs);
