@@ -171,6 +171,7 @@ until it passes — do not use that CI job as the inner loop
 | Prefer synthetic `/tmp` fixtures; no agent-VM mainnet open | |
 | Hot-path Contract includes the cost model | [`CONTRIBUTING.md`](../CONTRIBUTING.md) principle 9 |
 | After Refactor, same tests still pass; only drop **duplicate** tests | |
+| Core-facing RPC / P2P / Electrum / Esplora: name the contract; read [`COMPAT.md`](../COMPAT.md) first | Do not “fix” an intentional divergence; do not mix unrelated dialect work |
 
 Suite speed and fixture size: [`TESTING.md`](../TESTING.md). Worktree, push,
 and poll: [ship-pr](../.agents/skills/ship-pr/SKILL.md). A conflicted or

@@ -43,6 +43,11 @@ before 1.0).
   before the next slice. Coverage and native `windows` / `macos` stay GitHub
   Actions. See [`docs/how-we-plan.md`](docs/how-we-plan.md).
 
+- **Agent routing:** Core-facing work reads [`COMPAT.md`](COMPAT.md) first
+  (do not “fix” an intentional divergence). Extracts **move** the owner
+  implementation after listing callers; they do not copy it.
+  See [`docs/ORIENT.md`](docs/ORIENT.md) and [`docs/code-shape.md`](docs/code-shape.md).
+
 ## [0.7.0] — 2026-09-18
 
 Named published **0.7** line. **Not 1.0.** Patch branch is `v0.7.x`. Schema 24
