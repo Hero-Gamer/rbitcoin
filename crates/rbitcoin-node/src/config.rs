@@ -545,6 +545,11 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
+        self.validate_only_net()?;
+        self.validate_hidden_inbound()
+    }
+
+    fn validate_only_net(&self) -> Result<(), NodeError> {
         if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::Onion)
             && self.listen.proxy.is_none()
             && self.listen.onion.is_none()
@@ -578,6 +583,10 @@ impl NodeConfig {
                 "connect to a CJDNS address requires --cjdns-reachable".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_hidden_inbound(&self) -> Result<(), NodeError> {
         if self.listen.i2p_accept_incoming {
             if self.listen.i2p_sam.is_none() {
                 return Err(NodeError::Config(

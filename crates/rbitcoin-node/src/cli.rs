@@ -1125,6 +1125,20 @@ mod tests {
     }
 
     #[test]
+    fn cjdns_connect_without_reachable_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("connect", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
+        assert!(matches!(
+            c.listen.connect[0],
+            rbitcoin_net::NetAddr::Cjdns { .. }
+        ));
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        c.apply_kv("cjdns_reachable", "1").unwrap();
+        c.validate().unwrap();
+    }
+
+    #[test]
     fn no_discover_conf() {
         let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
         assert!(NodeConfig::default().listen.discover);
