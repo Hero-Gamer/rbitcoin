@@ -24,9 +24,6 @@ allow = [
   "dispatch_pinned",
   "eval_script",
   "ibd_cancellable",
-  "on_inv",
   "pread_batch_on_session_inner",
   "run_p2p",
-  "submitpackage",
-  "testmempoolaccept",
 ]
