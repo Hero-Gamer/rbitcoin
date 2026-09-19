@@ -673,6 +673,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &mempool,
     )
     .await;
+    if config.esplora_onion {
+        if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
+            let hs = ctl
+                .add_esplora_onion(config.datadir.path(), h.local_addr)
+                .await?;
+            info!(
+                "esplora onion http://{}.onion:{} (/ws same port)",
+                hs.service_id,
+                h.local_addr.port()
+            );
+        }
+    }
 
     let mut rpc_handle: Option<RpcHandle> = None;
     if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {

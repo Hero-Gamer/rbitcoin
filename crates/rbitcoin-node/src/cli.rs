@@ -296,7 +296,7 @@ fn operator_usage() -> String {
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
-    [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
+    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
@@ -335,6 +335,7 @@ Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
+  --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
@@ -376,6 +377,7 @@ fn is_bool_key(key: &str) -> bool {
         "sh_index"
             | "sp_tweaks"
             | "esplora_block_template"
+            | "esplora_onion"
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"
@@ -574,6 +576,8 @@ mod tests {
             "--sh-index",
             "--sp-tweaks",
             "--sp-tweaks-dust",
+            "--esplora-block-template",
+            "--esplora-onion",
             "--rpc",
             "--rpc-listen",
             "--rpc-token-file",
@@ -1136,6 +1140,9 @@ mod tests {
         assert!(gbt_eq.esplora_block_template);
         let off = ready_config(["rbitcoin-node", "--esplora-block-template=0"]);
         assert!(!off.esplora_block_template);
+        assert!(NodeConfig::default().esplora_onion);
+        let onion_off = ready_config(["rbitcoin-node", "--esplora-onion=0"]);
+        assert!(!onion_off.esplora_onion);
     }
 
     #[test]
