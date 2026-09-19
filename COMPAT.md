@@ -11,8 +11,7 @@ contrasts: [`docs/architecture.md`](./docs/architecture.md). Lab mainnet:
 
 A Core, Electrum, or Esplora difference that looks like a bug is often
 **intentional**. Read this file before changing shipped behavior. Name the
-contract (this file and [`docs/rpc.md`](./docs/rpc.md)); do not mix unrelated
-dialect work into the same step.
+row you are changing; do not mix unrelated dialect work into the same step.
 
 ## Active product track
 

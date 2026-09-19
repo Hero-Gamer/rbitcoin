@@ -54,7 +54,7 @@ do not restate them here.
 
 Behavior-preserving moves still follow Red → Green → Refactor
 ([`how-we-plan.md`](./how-we-plan.md)). This is a **move**, not a second
-implementation (Miri peels included):
+implementation:
 
 1. Find the existing production implementations and every caller.
 2. Choose the crate that owns the concept (rule 6).
@@ -64,7 +64,8 @@ implementation (Miri peels included):
 5. Delete the old path, the unused flag, and restating comments.
 
 Do not invent a failing test for a pure move that is already pinned.
-Do not copy the helper into a test-friendly crate and leave the original.
+Do not copy the helper into a test-friendly crate and leave the original
+(Miri peels included).
 
 ---
 

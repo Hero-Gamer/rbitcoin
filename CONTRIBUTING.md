@@ -290,7 +290,6 @@ IO; they do not package zips. GitHub Releases:
       pure helper). No twin for the same reject. Core functional is not the
       PR pin ([`TESTING.md`](./TESTING.md)).
 - [ ] Core-facing RPC / P2P / Electrum / Esplora: [`COMPAT.md`](./COMPAT.md)
-      was checked; an intentional divergence was not “fixed.”
 - [ ] No new silent dead branches
 - [ ] No unused crate-root `pub` / `pub use` (principle 11). Tests drive
       shipped functions, not `#[cfg(test)]` wrappers or `*_for_test`

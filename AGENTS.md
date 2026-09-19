@@ -62,13 +62,8 @@ step. Keep `--lib` compiling (wrap the old API, switch one caller). Owner:
 [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
 
 One production implementation at the lowest crate that owns the concept.
-Before extracting a helper, find the existing implementations and callers,
-then **move** (switch callers, delete the old path). Do not copy into a
-second crate and leave the original. [`docs/code-shape.md`](docs/code-shape.md).
-
-A Core-facing RPC, P2P, Electrum, or Esplora change: read
-[`COMPAT.md`](COMPAT.md) first. Name the contract. Do not “fix” an
-intentional divergence.
+Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
+RPC / P2P / Electrum / Esplora: [`COMPAT.md`](COMPAT.md).
 
 Tests assert shipped behavior, not repo text
 ([`CONTRIBUTING.md`](CONTRIBUTING.md) principle 8). Budgets, no `*_for_test`
