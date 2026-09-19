@@ -12,7 +12,7 @@ use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::{
     rehydrate_block_queue_residue, run_feeler_timed, select_inbound_eviction, IbdConfig,
-    InboundEvictCandidate, NetError, P2PNode,
+    InboundEvictCandidate, NetAddr, NetError, P2PNode,
 };
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -2311,7 +2311,7 @@ async fn node_run_p2p_short() {
             .with_network(Network::Regtest)
             .with_p2p_listen("127.0.0.1:0".parse().unwrap())
             .with_tiny_heads();
-        cfg.listen.connect = vec![seed_addr];
+        cfg.listen.connect = vec![NetAddr::Ip(seed_addr)];
         cfg.listen.use_seeds = false;
         cfg.listen.electrum = Some(electrum_addr);
         cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));

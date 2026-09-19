@@ -491,11 +491,7 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
-        if self
-            .listen
-            .only_net
-            .iter()
-            .any(|n| *n == rbitcoin_net::OnlyNet::Onion)
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::Onion)
             && self.listen.proxy.is_none()
             && self.listen.onion.is_none()
         {
