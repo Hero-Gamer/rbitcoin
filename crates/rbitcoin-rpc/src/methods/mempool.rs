@@ -28,7 +28,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
     let mut bytes = 0u64;
     let mut total_fee = 0u64;
     for (_, fee, weight) in &live {
-        bytes += weight / 4;
+        bytes += rbitcoin_consensus::policy::get_virtual_size(*weight);
         total_fee += fee;
     }
     let (orphan_size, orphan_wu) = mp.orphan_stats();
@@ -67,7 +67,7 @@ pub(crate) fn sat_btc_json(sat: i64) -> Value {
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
-    let vsize = weight / 4;
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
     let delta = mp.fee_delta(txid);
     let modified = (fee as i64).saturating_add(delta);
     let (ac, asz, afee, dc, dsz, dfee, a_mod, d_mod, chunk_fee, chunk_w) =
@@ -99,9 +99,14 @@ pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight:
         ),
         None => (Vec::new(), Vec::new()),
     };
+    let wtxid = mp
+        .wtxid_of(txid)
+        .map(|w| hash_hex_display(&w.to_byte_array()))
+        .unwrap_or_default();
     json!({
         "vsize": vsize,
         "weight": weight,
+        "wtxid": wtxid,
         "fee": sat_btc_json(fee as i64),
         // Top-level `modifiedfee` stays the base fee (same pattern as
         // ancestorfees/descendantfees). Real modified value is `fees.modified`.
@@ -143,10 +148,11 @@ pub(crate) fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     };
     let live = mp.list_live_meta();
     if !verbose {
-        let ids: Vec<String> = live
+        let mut ids: Vec<String> = live
             .iter()
             .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
             .collect();
+        ids.sort();
         if want_seq {
             return Ok(json!({
                 "txids": ids,
@@ -175,15 +181,7 @@ pub(crate) fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     let tid = Txid::from_byte_array(want);
     if let Some((fee, weight)) = mp.get_live_meta(&tid) {
-        let wtxid = mp
-            .get_tx(&tid)
-            .map(|tx| hash_hex_display(&tx.compute_wtxid().to_byte_array()))
-            .unwrap_or_default();
-        let mut entry = mempool_graph_json(mp, &tid, fee, weight);
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("wtxid".into(), json!(wtxid));
-        }
-        return Ok(entry);
+        return Ok(mempool_graph_json(mp, &tid, fee, weight));
     }
     Err(rpc_error(
         ERR_INVALID_ADDRESS_OR_KEY,
@@ -634,7 +632,7 @@ pub(crate) fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": true,
-                    "vsize": r.weight / 4,
+                    "vsize": rbitcoin_consensus::policy::get_virtual_size(r.weight),
                     "fees": { "base": sat_btc_json(r.fee_sat as i64) },
                 }));
             }
@@ -1068,7 +1066,7 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
                         hash_hex_display(&tx.compute_wtxid().to_byte_array()),
                         json!({
                             "txid": hash_hex_display(&ok.txid.to_byte_array()),
-                            "vsize": ok.weight / 4,
+                            "vsize": rbitcoin_consensus::policy::get_virtual_size(ok.weight),
                             "fees": { "base": sat_btc_json(ok.fee_sat as i64) },
                         }),
                     );

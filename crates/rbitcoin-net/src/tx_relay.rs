@@ -2809,6 +2809,10 @@ impl MempoolHub {
         Some(set.into_iter().collect())
     }
 
+    pub fn wtxid_of(&self, txid: &Txid) -> Option<bitcoin::Wtxid> {
+        self.lock_read().graph.get(txid).map(|e| e.wtxid)
+    }
+
     /// Direct in-mempool parents and children (`depends` / `spentby`).
     pub fn depends_spentby(&self, txid: &Txid) -> Option<(Vec<Txid>, Vec<Txid>)> {
         let g = self.lock_read();

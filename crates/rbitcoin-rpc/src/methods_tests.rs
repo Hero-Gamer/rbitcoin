@@ -1406,6 +1406,107 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn getmempoolentry_vsize_ceils_weight() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::policy::get_virtual_size;
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+
+    let (ctx, dir) = ctx_empty();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(
+        &ctx.query,
+        &params,
+        Height::GENESIS,
+        &genesis,
+        Milestone::NONE,
+    )
+    .unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &ctx.query,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        102,
+        1,
+    );
+    let mp = ctx.mempool.as_ref().expect("mempool");
+    mp.set_relay_enabled(true);
+    let wit_script = ScriptBuf::from_bytes(vec![0x51]);
+    let p2wsh = ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(wit_script.as_bytes()));
+    let fund = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: p2wsh,
+        }],
+    };
+    mp.accept_tx(&fund).expect("fund");
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: fund.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[wit_script.to_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    mp.accept_tx(&spend).expect("p2wsh spend");
+    let weight = spend.weight().to_wu();
+    assert_ne!(
+        weight % 4,
+        0,
+        "witness remainder distinguishes floor vs ceil"
+    );
+    let want = get_virtual_size(weight);
+    let fund_v = get_virtual_size(fund.weight().to_wu());
+    let hex = hash_hex_display(&spend.compute_txid().to_byte_array());
+    let entry = dispatch(&ctx, "getmempoolentry", vec![json!(hex.clone())]).unwrap();
+    assert_eq!(entry["vsize"], want);
+    assert_eq!(entry["ancestorsize"], fund_v + want);
+    assert_eq!(entry["descendantsize"], want);
+    assert_ne!(entry["vsize"], weight / 4);
+    let verbose = dispatch(&ctx, "getrawmempool", vec![json!(true)]).unwrap();
+    assert_eq!(verbose[&hex]["vsize"], want);
+    assert_eq!(
+        entry, verbose[&hex],
+        "getmempoolentry must match verbose getrawmempool (including wtxid)"
+    );
+    let ids = dispatch(&ctx, "getrawmempool", vec![]).unwrap();
+    let arr = ids.as_array().expect("txid array");
+    let mut sorted = arr.clone();
+    sorted.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    assert_eq!(
+        arr, &sorted,
+        "non-verbose getrawmempool is display-hex sorted"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct TestMiner(Arc<rbitcoin_net::ChainHub>);
 
 impl RpcRegtest for TestMiner {

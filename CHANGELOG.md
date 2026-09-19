@@ -23,6 +23,11 @@ before 1.0).
 
 ### Changed
 
+- **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
+  `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
+  `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is
+  display-hex sorted.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays
