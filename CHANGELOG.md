@@ -16,6 +16,11 @@ before 1.0).
   Core `testmempoolaccept(['ff00baar'])`. String `rawtxs='ff00baar'` stays
   `-32602 rawtxs array required` (inventory skip).
 
+- **`testmempoolaccept` confirmed spend is `txn-already-known`:**
+  Active-chain lookup (`tx_fk_by_txid_tip` + `is_confirmed_strong`) before
+  `test_accept`. Live mempool dups stay `txn-already-in-mempool`;
+  archive-only after `invalidateblock` is not already-known.
+
 ### Changed
 
 - **Workspace version 0.7.99:** in-tree toward 0.8.0.
