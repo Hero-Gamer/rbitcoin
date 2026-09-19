@@ -4726,6 +4726,7 @@ fn testmempoolaccept_628_reorged_archive_not_already_known() {
         vec![json!([hex.clone()]), json!(0)],
     )
     .unwrap();
+    assert_eq!(res[0]["allowed"], json!(true), "{res}");
     assert_ne!(
         res[0]["reject-reason"],
         json!("txn-already-known"),
