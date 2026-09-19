@@ -13,7 +13,7 @@ use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
 use futures_util::{SinkExt, StreamExt};
-use rbitcoin_net::{MempoolAnnounce, MempoolHub, MempoolTxSnapshot, TipEvent};
+use rbitcoin_net::{MempoolAnnounce, MempoolHub, TipEvent};
 use rbitcoin_primitives::{display_hash_hex, Height};
 use rbitcoin_query::Query;
 use rbitcoin_store::script_hash;
@@ -165,7 +165,7 @@ struct ConnState {
     txids: HashSet<Txid>,
     /// Last pushed confirmed flag per tracked txid.
     last_confirmed: HashMap<Txid, bool>,
-    last_stats_snap: Option<Arc<MempoolTxSnapshot>>,
+    last_stats_at: Option<Instant>,
     last_stats_push: Option<Instant>,
 }
 
@@ -177,7 +177,7 @@ impl ConnState {
             addresses: HashMap::new(),
             txids: HashSet::new(),
             last_confirmed: HashMap::new(),
-            last_stats_snap: None,
+            last_stats_at: None,
             last_stats_push: None,
         }
     }
@@ -284,7 +284,7 @@ async fn send_error(
     send_json(sink, &json!({ "error": msg })).await
 }
 
-/// Match fee-snapshot max age: re-push stats at most this often when the tx Arc is unchanged.
+/// Match fee-snapshot max age: re-push stats at most this often when `computed_at` is unchanged.
 const STATS_PUSH_MIN_AGE: Duration = Duration::from_secs(1);
 
 fn stats_frame(mp: Option<&MempoolHub>) -> Value {
@@ -304,22 +304,18 @@ async fn push_stats(
         return Ok(());
     }
     let mp = st.mempool.as_deref();
-    let snap = mp.map(|m| m.mempool_tx_snapshot());
+    let epoch = mp.map(|m| m.fee_snapshot_computed_at());
     if !force {
-        let same_snap = match (&conn.last_stats_snap, &snap) {
-            (Some(prev), Some(cur)) => Arc::ptr_eq(prev, cur),
-            (None, None) => true,
-            _ => false,
-        };
+        let same_epoch = conn.last_stats_at == epoch;
         let fresh = conn
             .last_stats_push
             .is_some_and(|t| t.elapsed() < STATS_PUSH_MIN_AGE);
-        if same_snap && fresh {
+        if same_epoch && fresh {
             return Ok(());
         }
     }
     send_json(sink, &stats_frame(mp)).await?;
-    conn.last_stats_snap = snap;
+    conn.last_stats_at = epoch;
     conn.last_stats_push = Some(Instant::now());
     Ok(())
 }

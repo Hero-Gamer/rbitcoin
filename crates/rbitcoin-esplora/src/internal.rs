@@ -615,14 +615,10 @@ mod tests {
         let pad = pad_hub("mempool-info-snap", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         pad.hub.accept_tx(&a).unwrap();
-        let snap = pad.hub.mempool_tx_snapshot();
-        let expect_count = snap.entries().len() as u64;
-        let expect_fee: u64 = snap.entries().iter().map(|e| e.fee_sat).sum();
-        let expect_vsize: u64 = snap
-            .entries()
-            .iter()
-            .map(|e| e.weight.saturating_add(3) / 4)
-            .sum();
+        let live = pad.hub.list_live_meta();
+        let expect_count = live.len() as u64;
+        let expect_fee: u64 = live.iter().map(|(_, f, _)| *f).sum();
+        let expect_vsize: u64 = live.iter().map(|(_, _, w)| w.saturating_add(3) / 4).sum();
         assert!(expect_count >= 1);
         assert!(expect_fee > 0);
         assert!(expect_vsize > 0);

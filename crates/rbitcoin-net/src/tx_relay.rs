@@ -61,6 +61,12 @@ struct FeeSnapshot {
     by_depth_btc_per_kb: HashMap<u32, f64>,
     /// Best-first mining chunks from the last refresh (histogram / frontier).
     chunks: Vec<Chunk>,
+    /// Live tx count from the same graph read as [`Self::chunks`].
+    count: usize,
+    /// Σ `(weight + 3) / 4` over live entries (GET `/mempool` `vsize`).
+    vsize: u64,
+    /// Σ `fee_sat` over live entries.
+    total_fee: u64,
     computed_at: Instant,
 }
 
@@ -69,6 +75,9 @@ impl FeeSnapshot {
         Self {
             by_depth_btc_per_kb: HashMap::new(),
             chunks: Vec::new(),
+            count: 0,
+            vsize: 0,
+            total_fee: 0,
             computed_at: now,
         }
     }
@@ -1928,9 +1937,18 @@ impl MempoolHub {
     /// One graph linearize under short read lock, then pure math off-lock → publish.
     fn refresh_fee_snapshot(&self) {
         let t0 = Instant::now();
-        let chunks = {
+        let (chunks, count, vsize, total_fee) = {
             let g = self.lock_read();
-            g.graph.mining_chunks_best_first()
+            let chunks = g.graph.mining_chunks_best_first();
+            let mut count = 0usize;
+            let mut vsize = 0u64;
+            let mut total_fee = 0u64;
+            for (_, e) in g.graph.iter() {
+                count += 1;
+                total_fee = total_fee.saturating_add(e.fee_sat);
+                vsize = vsize.saturating_add(e.weight.saturating_add(3) / 4);
+            }
+            (chunks, count, vsize, total_fee)
         };
 
         let now = Instant::now();
@@ -1980,6 +1998,9 @@ impl MempoolHub {
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
             by_depth_btc_per_kb: by_depth,
             chunks,
+            count,
+            vsize,
+            total_fee,
             computed_at: t0,
         }));
         self.fee_dirty.store(false, Ordering::Release);
@@ -2052,6 +2073,22 @@ impl MempoolHub {
     pub fn mempool_tx_snapshot(&self) -> Arc<MempoolTxSnapshot> {
         self.maybe_refresh_tx_snapshot();
         self.tx_snapshot.load_full()
+    }
+
+    /// Live count / vsize / total_fee from the published fee snapshot (GET `/mempool`).
+    ///
+    /// Request path is one Arc load after the existing fee-engine singleflight.
+    /// Does not clone bodies or walk the live graph.
+    pub fn mempool_live_totals(&self) -> (usize, u64, u64) {
+        self.maybe_refresh_fee_snapshot();
+        let snap = self.fee_snapshot.load();
+        (snap.count, snap.vsize, snap.total_fee)
+    }
+
+    /// Fee-snapshot generation for WS `want: stats` coalesce (not the tx-body Arc).
+    pub fn fee_snapshot_computed_at(&self) -> Instant {
+        self.maybe_refresh_fee_snapshot();
+        self.fee_snapshot.load().computed_at
     }
 
     fn finish_accept_err(&self, us: u64, e: AcceptError) -> Result<AcceptResult, AcceptError> {
@@ -4801,6 +4838,49 @@ mod tests {
         let _ = hub.fee_histogram();
         let _ = hub.fee_histogram();
         assert_eq!(hub.take_chunks_rebuilds(), 0);
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Fee-snapshot refresh publishes live count/vsize/total_fee (GET /mempool).
+    #[test]
+    fn fee_snapshot_live_totals_match_list_live_meta() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let q = Arc::new(q);
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let a = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        hub.accept_tx(&a).expect("admit");
+        let live = hub.list_live_meta();
+        let expect_count = live.len();
+        let expect_fee: u64 = live.iter().map(|(_, f, _)| *f).sum();
+        let expect_vsize: u64 = live.iter().map(|(_, _, w)| w.saturating_add(3) / 4).sum();
+        let (count, vsize, total_fee) = hub.mempool_live_totals();
+        assert_eq!(count, expect_count);
+        assert_eq!(vsize, expect_vsize);
+        assert_eq!(total_fee, expect_fee);
+        assert!(expect_count >= 1);
+        assert!(expect_fee > 0);
+        let _ = hub.take_chunks_rebuilds();
+        let _ = hub.fee_histogram();
+        assert_eq!(hub.take_chunks_rebuilds(), 0, "totals share fee refresh");
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
