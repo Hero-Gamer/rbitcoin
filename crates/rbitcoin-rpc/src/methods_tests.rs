@@ -4670,3 +4670,66 @@ fn dispatch_wrong_json_types_are_param_errors() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// #628: active-chain vs mempool distinction - shipped JSON asserts
+#[test]
+fn testmempoolaccept_628_confirmed_is_already_known() {
+    let (ctx, _dir, hub) = ctx_regtest_hub();
+    let miner = TestMiner(hub);
+    for _ in 0..101 {
+        miner
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+    }
+    let (hex, tx) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 100) - 1000);
+    miner
+        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![tx])
+        .unwrap();
+    let res = dispatch(&ctx, "testmempoolaccept", vec![json!([hex]), json!(0)]).unwrap();
+    assert_eq!(res[0]["allowed"], json!(false));
+    assert_eq!(res[0]["reject-reason"], json!("txn-already-known"));
+}
+#[test]
+fn testmempoolaccept_628_mempool_duplicate_is_already_in_mempool() {
+    let (ctx2, _dir2, hub) = ctx_regtest_hub();
+    let miner = TestMiner(hub);
+    for _ in 0..101 {
+        miner
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+    }
+    let (hex, tx) = mature_coinbase_spend_hex(&ctx2, generated_coinbase_value(&ctx2, 100) - 1000);
+    let mp = ctx2.mempool.as_ref().unwrap();
+    let _ = mp.accept_tx_from(&tx, None).unwrap();
+    let res = dispatch(&ctx2, "testmempoolaccept", vec![json!([hex]), json!(0)]).unwrap();
+    assert_eq!(res[0]["allowed"], json!(false));
+    assert_eq!(res[0]["reject-reason"], json!("txn-already-in-mempool"));
+}
+#[test]
+fn testmempoolaccept_628_reorged_archive_not_already_known() {
+    let (ctx, _dir, hub) = ctx_regtest_hub();
+    let miner = TestMiner(hub);
+    for _ in 0..101 {
+        miner
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+    }
+    let (hex, tx) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 100) - 1000);
+    miner
+        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![tx])
+        .unwrap();
+    let tip_hash = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    let _ = dispatch(&ctx, "invalidateblock", vec![tip_hash.clone()]).unwrap();
+    let res = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([hex.clone()]), json!(0)],
+    )
+    .unwrap();
+    assert_ne!(
+        res[0]["reject-reason"],
+        json!("txn-already-known"),
+        "archive-only must not be known"
+    );
+    let _ = dispatch(&ctx, "reconsiderblock", vec![tip_hash]).unwrap();
+}
