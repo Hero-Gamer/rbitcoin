@@ -105,6 +105,8 @@ pub struct ListenOpts {
     pub only_net: Vec<rbitcoin_net::OnlyNet>,
     /// SAM v3 TCP port (`--i2p-sam`).
     pub i2p_sam: Option<SocketAddr>,
+    /// Persistent SAM destination + STREAM FORWARD to the P2P bind (`--i2p-accept-incoming`).
+    pub i2p_accept_incoming: bool,
 }
 
 impl Default for ListenOpts {
@@ -128,6 +130,7 @@ impl Default for ListenOpts {
             discover: true,
             only_net: Vec::new(),
             i2p_sam: None,
+            i2p_accept_incoming: false,
         }
     }
 }
@@ -529,6 +532,19 @@ impl NodeConfig {
                 "only-net=i2p requires SAM (--i2p-sam)".into(),
             ));
         }
+        if self.listen.i2p_accept_incoming {
+            if self.listen.i2p_sam.is_none() {
+                return Err(NodeError::Config(
+                    "i2p-accept-incoming requires SAM (--i2p-sam)".into(),
+                ));
+            }
+            if matches!(self.listen.p2p, P2pListen::Off) {
+                return Err(NodeError::Config(
+                    "i2p-accept-incoming needs a P2P listener (--listen); --listen=0 has no loopback to STREAM FORWARD"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -766,6 +782,10 @@ impl NodeConfig {
                 } else {
                     parse_required_socket(val, "i2p_sam")?
                 });
+            }
+            "i2p_accept_incoming" => {
+                self.listen.i2p_accept_incoming = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf i2p_accept_incoming: {e}")))?;
             }
             "proxy_randomize" => {
                 self.listen.proxy_randomize = parse_conf_bool(val)

@@ -1,7 +1,9 @@
-//! I2P SAM v3 STREAM CONNECT (system router, not SOCKS).
+//! I2P SAM v3 STREAM CONNECT / FORWARD (system router, not SOCKS).
 
 use crate::error::NetError;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -9,29 +11,80 @@ pub struct I2pSam {
     sam_addr: SocketAddr,
     session_id: String,
     _control: TcpStream,
+    _forward: Option<TcpStream>,
 }
 
 impl I2pSam {
     pub async fn connect(sam_addr: SocketAddr) -> Result<Self, NetError> {
+        Self::connect_session(sam_addr, None).await
+    }
+
+    pub async fn connect_persistent(
+        sam_addr: SocketAddr,
+        dest_path: &Path,
+    ) -> Result<Self, NetError> {
+        let stored = match std::fs::read_to_string(dest_path) {
+            Ok(s) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(NetError::Encode(format!(
+                    "i2p dest {}: {e}",
+                    dest_path.display()
+                )));
+            }
+        };
+        let (sam, dest) = Self::connect_session_dest(sam_addr, stored.as_deref()).await?;
+        if stored.is_none() {
+            write_dest_file(dest_path, &dest)?;
+        }
+        Ok(sam)
+    }
+
+    async fn connect_session(sam_addr: SocketAddr, dest: Option<&str>) -> Result<Self, NetError> {
+        let (sam, _) = Self::connect_session_dest(sam_addr, dest).await?;
+        Ok(sam)
+    }
+
+    async fn connect_session_dest(
+        sam_addr: SocketAddr,
+        dest: Option<&str>,
+    ) -> Result<(Self, String), NetError> {
         let mut control = TcpStream::connect(sam_addr)
             .await
             .map_err(|e| NetError::Encode(format!("i2p sam connect {sam_addr}: {e}")))?;
         hello(&mut control).await?;
         let session_id = fresh_session_id();
+        let dest_arg = dest.unwrap_or("TRANSIENT");
         write_line(
             &mut control,
-            &format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION=TRANSIENT"),
+            &format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg}"),
         )
         .await?;
         let reply = read_line(&mut control).await?;
         if !reply.to_ascii_uppercase().contains("RESULT=OK") {
             return Err(NetError::Encode(format!("i2p sam session: {reply}")));
         }
-        Ok(Self {
-            sam_addr,
-            session_id,
-            _control: control,
-        })
+        let destination = sam_kv(&reply, "DESTINATION")
+            .ok_or_else(|| {
+                NetError::Encode(format!("i2p sam session missing DESTINATION: {reply}"))
+            })?
+            .to_string();
+        Ok((
+            Self {
+                sam_addr,
+                session_id,
+                _control: control,
+                _forward: None,
+            },
+            destination,
+        ))
     }
 
     pub async fn stream_connect(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
@@ -53,6 +106,55 @@ impl I2pSam {
         }
         Ok(s)
     }
+
+    pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
+        let mut s = TcpStream::connect(self.sam_addr)
+            .await
+            .map_err(|e| NetError::Encode(format!("i2p sam forward connect: {e}")))?;
+        hello(&mut s).await?;
+        write_line(
+            &mut s,
+            &format!("STREAM FORWARD ID={} PORT={port}", self.session_id),
+        )
+        .await?;
+        let reply = read_line(&mut s).await?;
+        if !reply.to_ascii_uppercase().contains("RESULT=OK") {
+            return Err(NetError::Encode(format!("i2p sam forward: {reply}")));
+        }
+        self._forward = Some(s);
+        Ok(())
+    }
+}
+
+fn sam_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    line.split_whitespace().find_map(|tok| {
+        if tok.len() >= prefix.len() && tok[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            Some(&tok[prefix.len()..])
+        } else {
+            None
+        }
+    })
+}
+
+fn write_dest_file(path: &Path, dest: &str) -> Result<(), NetError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| NetError::Encode(format!("i2p dest dir {}: {e}", parent.display())))?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| NetError::Encode(format!("i2p dest {}: {e}", path.display())))?;
+    writeln!(f, "{dest}")
+        .map_err(|e| NetError::Encode(format!("i2p dest {}: {e}", path.display())))?;
+    Ok(())
 }
 
 fn fresh_session_id() -> String {
@@ -104,7 +206,10 @@ async fn read_line(s: &mut TcpStream) -> Result<String, NetError> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
+
+    const FAKE_DEST: &str = "fakeprivdest";
 
     async fn fake_sam(ok_hello: bool, dest_log: Arc<Mutex<Vec<String>>>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -132,10 +237,23 @@ mod tests {
                                 break;
                             }
                         } else if up.starts_with("SESSION CREATE") {
-                            let _ = write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=fake")
-                                .await;
-                        } else if let Some(rest) = line.strip_prefix("STREAM CONNECT ") {
-                            log.lock().unwrap().push(rest.to_string());
+                            log.lock().unwrap().push(line.clone());
+                            let dest = sam_kv(&line, "DESTINATION").unwrap_or("TRANSIENT");
+                            let reply_dest = if dest.eq_ignore_ascii_case("TRANSIENT") {
+                                FAKE_DEST
+                            } else {
+                                dest
+                            };
+                            let _ = write_line(
+                                &mut s,
+                                &format!("SESSION STATUS RESULT=OK DESTINATION={reply_dest}"),
+                            )
+                            .await;
+                        } else if up.starts_with("STREAM FORWARD") {
+                            log.lock().unwrap().push(line.clone());
+                            let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                        } else if up.starts_with("STREAM CONNECT") {
+                            log.lock().unwrap().push(line.clone());
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                             break;
                         } else {
@@ -148,6 +266,15 @@ mod tests {
         addr
     }
 
+    fn stream_lines(log: &Arc<Mutex<Vec<String>>>, prefix: &str) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.to_ascii_uppercase().starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
     #[tokio::test]
     async fn i2p_sam_stream_connect_fake() {
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -156,7 +283,7 @@ mod tests {
         let dest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p";
         sam.stream_connect(dest).await.unwrap();
         sam.stream_connect(dest).await.unwrap();
-        let got = log.lock().unwrap().clone();
+        let got = stream_lines(&log, "STREAM CONNECT");
         assert_eq!(got.len(), 2, "{got:?}");
         for g in &got {
             assert!(g.contains(dest), "{g}");
@@ -185,7 +312,7 @@ mod tests {
             port: 8333,
         };
         sam.stream_connect(&peer.host_str()).await.unwrap();
-        let got = log.lock().unwrap().clone();
+        let got = stream_lines(&log, "STREAM CONNECT");
         assert!(got.iter().any(|g| g.contains(&peer.host_str())), "{got:?}");
         let err = match crate::socks::Dialer::Direct.connect_net(peer).await {
             Err(e) => e,
@@ -193,5 +320,50 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("SAM") || msg.contains("i2p"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn i2p_accept_incoming_forwards_to_loopback() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let addr = fake_sam(true, Arc::clone(&log)).await;
+        let dir = std::env::temp_dir().join(format!(
+            "rbtc-i2p-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest_path = dir.join("i2p").join("p2p.priv");
+        let mut sam = I2pSam::connect_persistent(addr, &dest_path).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        let stored = std::fs::read_to_string(&dest_path).unwrap();
+        assert_eq!(stored.trim(), FAKE_DEST);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let fw = stream_lines(&log, "STREAM FORWARD");
+        assert_eq!(fw.len(), 1, "{fw:?}");
+        assert!(fw[0].contains("PORT=18444"), "{}", fw[0]);
+        assert!(fw[0].contains("ID=rbtc"), "{}", fw[0]);
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert!(
+            creates.iter().any(|c| c.contains("DESTINATION=TRANSIENT")),
+            "{creates:?}"
+        );
+
+        let mut sam2 = I2pSam::connect_persistent(addr, &dest_path).await.unwrap();
+        sam2.stream_forward(18444).await.unwrap();
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert!(
+            creates
+                .iter()
+                .any(|c| c.contains(&format!("DESTINATION={FAKE_DEST}"))),
+            "{creates:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

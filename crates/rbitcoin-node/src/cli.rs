@@ -295,7 +295,7 @@ fn operator_usage() -> String {
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
-    [--i2p-sam [HOST:PORT]] \\\n\
+    [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
@@ -327,6 +327,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   failed AUTH is a start error. Unset: no control connection.\n\
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -384,6 +385,7 @@ fn is_bool_key(key: &str) -> bool {
             | "no_listen"
             | "no_discover"
             | "proxy_randomize"
+            | "i2p_accept_incoming"
             | "inhibit_suspend"
             | "trusted"
             | "always_relay"
@@ -584,6 +586,7 @@ mod tests {
             "--tor-control-cookie",
             "--tor-control-password",
             "--i2p-sam",
+            "--i2p-accept-incoming",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
@@ -916,6 +919,108 @@ mod tests {
         let h = operator_usage();
         assert!(h.contains("--i2p-sam"));
         assert!(!h.contains("--i2psam"));
+        assert!(h.contains("--i2p-accept-incoming"));
+        assert!(!h.contains("--i2pacceptincoming"));
+    }
+
+    #[test]
+    fn i2p_accept_incoming_cli() {
+        let c = ready_config(["rbitcoin-node", "--i2p-sam", "--i2p-accept-incoming"]);
+        assert!(c.listen.i2p_accept_incoming);
+        assert_eq!(c.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("i2p_sam", "").unwrap();
+        conf.apply_kv("i2p_accept_incoming", "1").unwrap();
+        conf.validate().unwrap();
+        assert!(conf.listen.i2p_accept_incoming);
+    }
+
+    #[test]
+    fn i2p_accept_incoming_without_listen_is_config_error() {
+        let c = ready_config([
+            "rbitcoin-node",
+            "--no-listen",
+            "--i2p-sam",
+            "--i2p-accept-incoming",
+        ]);
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--listen") && msg.contains("i2p"), "{msg}");
+        let mut no_sam = NodeConfig::default();
+        no_sam.apply_kv("i2p_accept_incoming", "1").unwrap();
+        let err = no_sam.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SAM") && msg.contains("i2p"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn i2p_accept_incoming_forwards_to_loopback() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn write_line(s: &mut TcpStream, line: &str) {
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.write_all(b"\n").await.unwrap();
+            s.flush().await.unwrap();
+        }
+        async fn read_line(s: &mut TcpStream) -> Option<String> {
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log_acc = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = Arc::clone(&log_acc);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(line) = read_line(&mut s).await else {
+                            break;
+                        };
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("HELLO VERSION") {
+                            write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
+                        } else if up.starts_with("SESSION CREATE") {
+                            write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=fakeprivdest")
+                                .await;
+                        } else if up.starts_with("STREAM FORWARD") {
+                            log.lock().unwrap().push(line);
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                        } else if up.starts_with("STREAM CONNECT") {
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = tmp_datadir();
+        let dest_path = dir.join("i2p").join("p2p.priv");
+        let mut sam = rbitcoin_net::I2pSam::connect_persistent(addr, &dest_path)
+            .await
+            .unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&dest_path).unwrap().trim(),
+            "fakeprivdest"
+        );
+        let fw = log.lock().unwrap().clone();
+        assert_eq!(fw.len(), 1, "{fw:?}");
+        assert!(fw[0].contains("PORT=18444"), "{}", fw[0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
