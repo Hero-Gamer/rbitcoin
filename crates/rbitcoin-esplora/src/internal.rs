@@ -1,10 +1,14 @@
 //! mempool/electrs `/internal/*` bulk REST and `/mempool/txids/page`.
 
 use crate::handlers::{outspend_json, spawn_join};
-use crate::server::{block_hash_hex, not_found, parse_hash32, pin_or_reject, store_err, AppState};
+#[cfg(unix)]
+use crate::server::not_found;
+use crate::server::{block_hash_hex, parse_hash32, pin_or_reject, store_err, AppState};
+#[cfg(unix)]
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
 };
+#[cfg(unix)]
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::StatusCode;
@@ -12,8 +16,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
+#[cfg(unix)]
 use rbitcoin_net::{MempoolHub, MempoolTxSnapEntry};
 use rbitcoin_query::ChainViewKind;
+#[cfg(unix)]
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -33,6 +39,7 @@ fn bad_request(msg: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, msg).into_response()
 }
 
+#[cfg(unix)]
 #[allow(clippy::result_large_err)] // axum Response
 fn parse_txid_array(body: &[u8]) -> Result<Vec<[u8; 32]>, Response> {
     let v: Value = serde_json::from_slice(body).map_err(|_| bad_request("invalid json"))?;
@@ -83,6 +90,7 @@ fn join_cached_objects(parts: &[Option<&str>]) -> String {
     body
 }
 
+#[cfg(unix)]
 fn entry_json_str<'a>(
     st: &AppState,
     mp: &MempoolHub,
@@ -101,11 +109,13 @@ fn entry_json_str<'a>(
     })
 }
 
+#[cfg(unix)]
 fn entry_json(st: &AppState, mp: &MempoolHub, e: &MempoolTxSnapEntry) -> Option<Value> {
     let raw = entry_json_str(st, mp, e)?;
     serde_json::from_str(raw).ok()
 }
 
+#[cfg(unix)]
 fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
     if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(id) {
         return build_tx_json(&st.query, fk, st.network).ok();
@@ -113,6 +123,7 @@ fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
     mempool_tx_json(st, id)
 }
 
+#[cfg(unix)]
 fn mempool_tx_json(st: &AppState, id: &[u8; 32]) -> Option<Value> {
     let mp = st.mempool.as_ref()?;
     let tid = Txid::from_byte_array(*id);
@@ -124,6 +135,7 @@ fn mempool_tx_json(st: &AppState, id: &[u8; 32]) -> Option<Value> {
     build_tx_json_from_tx(&st.query, &tx, st.network, fee, Some(mp)).ok()
 }
 
+#[cfg(unix)]
 pub async fn post_internal_txs(State(st): State<AppState>, body: Bytes) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
@@ -144,6 +156,7 @@ pub async fn post_internal_txs(State(st): State<AppState>, body: Bytes) -> Respo
     .await
 }
 
+#[cfg(unix)]
 pub async fn post_internal_mempool_txs(State(st): State<AppState>, body: Bytes) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
@@ -164,6 +177,7 @@ pub async fn post_internal_mempool_txs(State(st): State<AppState>, body: Bytes) 
     .await
 }
 
+#[cfg(unix)]
 fn mempool_tx_page(st: &AppState, last: Option<&Txid>, max: usize) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
         return Json(Value::Array(Vec::new())).into_response();
@@ -183,6 +197,7 @@ fn mempool_tx_page(st: &AppState, last: Option<&Txid>, max: usize) -> Response {
         .into_response()
 }
 
+#[cfg(unix)]
 pub async fn get_internal_mempool_txs(
     State(st): State<AppState>,
     AxumQuery(q): AxumQuery<MaxTxs>,
@@ -191,10 +206,12 @@ pub async fn get_internal_mempool_txs(
     spawn_join(move || mempool_tx_page(&st, None, max)).await
 }
 
+#[cfg(unix)]
 pub async fn get_internal_mempool_txs_all(State(st): State<AppState>) -> Response {
     spawn_join(move || mempool_tx_page(&st, None, usize::MAX)).await
 }
 
+#[cfg(unix)]
 pub async fn get_internal_mempool_txs_cursor(
     State(st): State<AppState>,
     Path(last): Path<String>,
@@ -240,6 +257,7 @@ pub async fn get_mempool_txids_page_cursor(
     spawn_join(move || Json(mempool_txid_page(&st, Some(&last), max)).into_response()).await
 }
 
+#[cfg(unix)]
 pub async fn get_internal_block_txs(
     State(st): State<AppState>,
     Path(hash_hex): Path<String>,
@@ -324,10 +342,12 @@ pub(crate) fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>)
     Json(out).into_response()
 }
 
+#[cfg(unix)]
 pub(crate) fn outspends_for_txids(st: &AppState, ids: Vec<[u8; 32]>) -> Response {
     outspends_for_txid_opts(st, ids.into_iter().map(Some).collect())
 }
 
+#[cfg(unix)]
 pub async fn post_outspends_by_txid(State(st): State<AppState>, body: Bytes) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
@@ -342,6 +362,7 @@ pub async fn post_outspends_by_txid(State(st): State<AppState>, body: Bytes) -> 
     .await
 }
 
+#[cfg(unix)]
 pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes) -> Response {
     if body.len() > st.max_body {
         return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();

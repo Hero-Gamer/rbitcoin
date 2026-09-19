@@ -794,7 +794,7 @@ pub async fn run_esplora(
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).
-    let mut rest = Router::new()
+    let rest = Router::new()
         .route("/block-template", get(handlers::block_template))
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
@@ -896,11 +896,11 @@ pub async fn run_esplora(
         .route("/fees/recommended", get(handlers::fees_recommended))
         .route("/v1/fees/recommended", get(handlers::fees_recommended));
     #[cfg(unix)]
-    {
-        if matches!(config.listen, EsploraListen::Unix(_)) {
-            rest = rest.merge(internal_routes());
-        }
-    }
+    let rest = if matches!(config.listen, EsploraListen::Unix(_)) {
+        rest.merge(internal_routes())
+    } else {
+        rest
+    };
     let rest = rest
         .fallback(fallback_404)
         // Outer → inner: concurrency → body → timeout → meter → chain-view stamp.
