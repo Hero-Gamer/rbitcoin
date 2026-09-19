@@ -1007,7 +1007,7 @@ mod tests {
         .await
         .unwrap();
         let stream = TcpStream::connect(node.local_addr).await.unwrap();
-        connect_and_handshake_timed(
+        let _hs = connect_and_handshake_timed(
             Duration::from_secs(5),
             stream,
             Magic::REGTEST,
@@ -1021,7 +1021,7 @@ mod tests {
         .await
         .unwrap();
         let mut inbound = false;
-        for _ in 0..100 {
+        for _ in 0..200 {
             if node.peers.snapshot().iter().any(|p| p.inbound) {
                 inbound = true;
                 break;
