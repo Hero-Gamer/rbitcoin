@@ -230,7 +230,7 @@ to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 These do **not** measure operator RSS ([`docs/ibd-memory.md`](./docs/ibd-memory.md)
 owns caps). They catch the *shapes* of unbounded heap / leaked tasks, untested
 complexity, and UB in pure code. Landed: **Q-51–Q-53**. Named-cap ast-grep is
-Won't-fix (**Q-54**). **Q-56** is a peel of shipped scriptnum + pack-ints into
+Won't-fix (**Q-54**). **Q-56** Completed: shipped scriptnum + pack-ints live in
 primitives so Miri runs those functions. Owner: [`docs/quality.md`](./docs/quality.md).
 
 | Tool | How to run | CI |
