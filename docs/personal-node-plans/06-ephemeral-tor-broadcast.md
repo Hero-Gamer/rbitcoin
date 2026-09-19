@@ -55,7 +55,7 @@ Dandelion++. Changing libre admission. Broadcasting other peers’ txs.
   set. Other mempool txs still relay as today (unless `--blocks-only`).
 - **Red:** `cargo test -p rbitcoin-net local_origin_not_inv_on_standing_peer`
   — two live sessions: submit locally; standing peer records **no** INV/tx
-  for that txid; a P2P-originated tx still INVs (unless blocksonly).
+  for that txid; a P2P-originated tx still INVs (unless `--blocks-only`).
 - **Green:** announce filter in tx relay
   ([`tx_relay.rs`](../../crates/rbitcoin-net/src/tx_relay.rs) / peer out
   queue).

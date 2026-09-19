@@ -1,9 +1,9 @@
-# 02 — Onion AddrMan, `--onlynet`, SOCKS dial of `.onion`
+# 02 — Onion AddrMan, `--only-net`, SOCKS dial of `.onion`
 
 ## Goal
 
 The peer book stores BIP155 Tor v3 addresses, persists them, and dials them
-through the SOCKS client from [00](./00-socks-proxy.md). `--onlynet=onion`
+through the SOCKS client from [00](./00-socks-proxy.md). `--only-net=onion`
 (repeatable with ipv4/ipv6) filters the dial set. `--connect` /
 `--seed-node` accept `….onion:port`.
 
@@ -19,11 +19,11 @@ through the SOCKS client from [00](./00-socks-proxy.md). `--onlynet=onion`
 - Leave `NetAddr` extension points for `I2p` ([04](./04-i2p.md)) and `Cjdns`
   ([08](./08-cjdns.md)); do not implement those dials here.
 - Onion dial **requires** SOCKS (`--proxy` or `--onion`). Fail start if
-  `--onlynet=onion` and neither is set.
+  `--only-net=onion` and neither is set.
 
 ## Out of scope
 
-I2P, CJDNS, Tor control, listenonion, wallet onions.
+I2P, CJDNS, Tor control, `--listen-onion`, wallet onions.
 
 ## Steps
 
@@ -92,27 +92,27 @@ I2P, CJDNS, Tor control, listenonion, wallet onions.
 - **Verify:** `cargo test -p rbitcoin-node connect_onion`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 6 — `--onlynet` and start fail without SOCKS
+### Step 6 — `--only-net` and start fail without SOCKS
 
-- **Contract:** `--onlynet=ipv4|ipv6|onion` repeatable. Dial/learn skip other
-  networks. `--onlynet=onion` without `--proxy` and without `--onion` is
-  `NodeError::Config` naming SOCKS. `--onlynet=i2p` / `cjdns` unknown until
+- **Contract:** `--only-net=ipv4|ipv6|onion` repeatable. Dial/learn skip other
+  networks. `--only-net=onion` without `--proxy` and without `--onion` is
+  `NodeError::Config` naming SOCKS. `--only-net=i2p` / `cjdns` unknown until
   04/08 (error: unknown network).
-- **Red:** `onlynet_onion_filters_ipv4_candidates`;
-  `onlynet_onion_without_proxy_is_config_error`.
-- **Green:** `apply_kv` `onlynet=`; filter in AddrMan take + DNS/fixed seed
+- **Red:** `only_net_onion_filters_ipv4_candidates`;
+  `only_net_onion_without_proxy_is_config_error`.
+- **Green:** `apply_kv` `only_net=`; filter in AddrMan take + DNS/fixed seed
   inject.
 - **Refactor:** single `OnlyNet` set on listen opts.
-- **Verify:** `cargo test -p rbitcoin-node onlynet_` ;
-  `cargo test -p rbitcoin-net onlynet_`
+- **Verify:** `cargo test -p rbitcoin-node only_net_` ;
+  `cargo test -p rbitcoin-net only_net_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ### Step 7 — OPERATOR + NixOS module
 
-- **Contract:** document `--onlynet`, onion `--connect`, peers v2, SOCKS
-  required for onion. Module: `services.rbitcoin.onlynet` list; eval asserts
-  `--onlynet onion` when set. SOCKS still comes from 00’s `proxy`.
-- **Red:** eval assert for `--onlynet`.
+- **Contract:** document `--only-net`, onion `--connect`, peers v2, SOCKS
+  required for onion. Module: `services.rbitcoin.onlyNet` list; eval asserts
+  `--only-net onion` when set. SOCKS still comes from 00’s `proxy`.
+- **Red:** eval assert for `--only-net`.
 - **Green:** module + eval + OPERATOR P2P section.
 - **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
   grep OPERATOR.

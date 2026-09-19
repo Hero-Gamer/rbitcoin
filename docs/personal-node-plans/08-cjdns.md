@@ -3,20 +3,21 @@
 ## Goal
 
 Reach and be reached by BIP155 CJDNS peers on the **kernel IPv6 overlay**
-(`fc00::/8`) without Arti, SOCKS, or SAM. Core-shaped `--cjdnsreachable`:
-without it, CJDNS addrs are unroutable (do not dial; do not treat `fc00::/8`
-as advertisable). `--onlynet=cjdns`. Inbound is `--listen` on the host’s
-cjdns IPv6 — no ISP TCP forward; the overlay delivers.
+(`fc00::/8`) without Arti, SOCKS, or SAM. Core-shaped `-cjdnsreachable`
+(operator `--cjdns-reachable`): without it, CJDNS addrs are unroutable (do
+not dial; do not treat `fc00::/8` as advertisable). `--only-net=cjdns`.
+Inbound is `--listen` on the host’s cjdns IPv6 — no ISP TCP forward; the
+overlay delivers.
 
 ## Constraints
 
-- Depends on **02** (`NetAddr` + `--onlynet` + peers v2). Independent of
+- Depends on **02** (`NetAddr` + `--only-net` + peers v2). Independent of
   Tor/I2P.
 - No live cjdns router in CI. Do not auto-detect a TUN.
 - Dial: `TcpStream::connect` to that IPv6 (OS routing).
 - [`ip_is_advertisable`](../../crates/rbitcoin-net/src/peers.rs) today:
   IPv6 only rejects unspecified/loopback — ULA `fc00::/8` may already look
-  advertisable. Pin: **off** unless `--cjdnsreachable`.
+  advertisable. Pin: **off** unless `--cjdns-reachable`.
 - If `--listen=0`, cjdns inbound is off unless an explicit
   `--listen <cjdns-ip>:port`.
 
@@ -34,35 +35,35 @@ Tor, I2P, UPnP, embedding a cjdns daemon.
   `cjdns_rejects_global_unicast`.
 - **Green:** extend `NetAddr`; `learn_addrv2` arm.
 - **Refactor:** do not store CJDNS as a bare `SocketAddr` without a tag if
-  `--onlynet` cannot distinguish it from IPv6.
+  `--only-net` cannot distinguish it from IPv6.
 - **Verify:** `cargo test -p rbitcoin-net netaddr_cjdns` ;
   `cargo test -p rbitcoin-net learn_addrv2`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 2 — `--cjdnsreachable` gates dial and advertise
+### Step 2 — `--cjdns-reachable` gates dial and advertise
 
 - **Contract:** flag default **off**. Off: do not dial CJDNS `NetAddr`;
   `ip_is_advertisable` / announce skip `fc00::/8`. On: dial via
   `TcpStream::connect`; `fc00::/8` may appear in localaddresses if we
   `--listen` on one.
 - **Red:** `cjdns_not_dialed_when_unreachable`;
-  `fc00_not_advertisable_without_cjdnsreachable`.
+  `fc00_not_advertisable_without_cjdns_reachable`.
 - **Green:** hub/listen flag; Dialer IPv6 vs Cjdns arm (direct connect
   both, filter before dial).
 - **Refactor:** keep one TCP connect path for IP and CJDNS.
 - **Verify:** `cargo test -p rbitcoin-net cjdns_reachable_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 3 — `--onlynet=cjdns` CLI
+### Step 3 — `--only-net=cjdns` CLI
 
-- **Contract:** `--onlynet=cjdns` is valid. Implies we only dial CJDNS
-  (need `--cjdnsreachable` or treat onlynet=cjdns as enabling reachable —
-  **pin: onlynet=cjdns without cjdnsreachable is Config error**, same
+- **Contract:** `--only-net=cjdns` is valid. Implies we only dial CJDNS
+  (need `--cjdns-reachable` or treat `--only-net=cjdns` as enabling reachable —
+  **pin: `--only-net=cjdns` without `--cjdns-reachable` is Config error**, same
   honesty as onion-without-SOCKS).
-- **Red:** `onlynet_cjdns_without_reachable_is_config_error`;
-  `onlynet_cjdns_filters_ipv4`.
-- **Green:** `onlynet` parser from 02; node validate.
-- **Verify:** `cargo test -p rbitcoin-node onlynet_cjdns`
+- **Red:** `only_net_cjdns_without_reachable_is_config_error`;
+  `only_net_cjdns_filters_ipv4`.
+- **Green:** `only_net` parser from 02; node validate.
+- **Verify:** `cargo test -p rbitcoin-node only_net_cjdns`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ### Step 4 — Listen on a CJDNS address
@@ -83,12 +84,12 @@ Tor, I2P, UPnP, embedding a cjdns daemon.
 
 ### Step 5 — OPERATOR + NixOS module
 
-- **Contract:** `--cjdnsreachable`, `--onlynet=cjdns`, listen on cjdns
+- **Contract:** `--cjdns-reachable`, `--only-net=cjdns`, listen on cjdns
   IPv6, no ISP forward, no daemon in-process, no CI router. Module:
   `cjdns.reachable`; P2P bind on the cjdns address when set;
   `After`/`Wants` `cjdns.service`. Eval asserts argv. Extend runtime test;
   label **`nixos-module-runtime`**. Do not start a cjdns TUN in CI.
-- **Red:** eval assert for `--cjdnsreachable`.
+- **Red:** eval assert for `--cjdns-reachable`.
 - **Green:** module + eval + runtime test + OPERATOR.
 - **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
   grep cjdns. Poll `--interest nixos-module-runtime`.
