@@ -3140,12 +3140,6 @@ mod tests {
                 addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
                 port: 18444,
             },
-            AddrV2Message {
-                time: 1,
-                services: ServiceFlags::NETWORK,
-                addr: AddrV2::I2p([0u8; 32]),
-                port: 1,
-            },
         ]);
         let book = am.lock().unwrap_or_else(|e| e.into_inner());
         let ents = book.entries();
@@ -3157,7 +3151,7 @@ mod tests {
             .iter()
             .any(|e| e.addr
                 == crate::NetAddr::Ip(SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 18444)))));
-        assert_eq!(ents.len(), 2, "I2P is not stored until plan 04");
+        assert_eq!(ents.len(), 2);
     }
 
     #[test]

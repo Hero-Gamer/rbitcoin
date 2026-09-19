@@ -140,6 +140,9 @@ impl Dialer {
                 }
                 self.connect_domain(&addr.host_str(), port).await
             }
+            crate::NetAddr::I2p { .. } => {
+                Err(NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
+            }
         }
     }
 }

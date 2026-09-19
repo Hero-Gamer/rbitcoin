@@ -10,6 +10,8 @@ use std::str::FromStr;
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const ONION_VERSION: u8 = 3;
 const ONION_NAME_LEN: usize = 56;
+const I2P_B32_LEN: usize = 52;
+const I2P_SUFFIX: &str = ".b32.i2p";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnlyNet {
@@ -47,6 +49,7 @@ pub fn addr_allowed(addr: NetAddr, only: &[OnlyNet]) -> bool {
 pub enum NetAddr {
     Ip(SocketAddr),
     Onion { pk: [u8; 32], port: u16 },
+    I2p { dest: [u8; 32], port: u16 },
 }
 
 impl fmt::Display for NetAddr {
@@ -55,6 +58,9 @@ impl fmt::Display for NetAddr {
             NetAddr::Ip(addr) => write!(f, "{addr}"),
             NetAddr::Onion { pk, port } => {
                 write!(f, "{}.onion:{port}", encode_onion_name(&pk))
+            }
+            NetAddr::I2p { dest, port } => {
+                write!(f, "{}{I2P_SUFFIX}:{port}", encode_i2p_name(&dest))
             }
         }
     }
@@ -79,28 +85,32 @@ impl NetAddr {
                 pk: *pk,
                 port: msg.port,
             }),
-            AddrV2::TorV2(_) | AddrV2::I2p(_) | AddrV2::Cjdns(_) | AddrV2::Unknown(_, _) => None,
+            AddrV2::I2p(dest) => Some(NetAddr::I2p {
+                dest: *dest,
+                port: msg.port,
+            }),
+            AddrV2::TorV2(_) | AddrV2::Cjdns(_) | AddrV2::Unknown(_, _) => None,
         }
     }
 
     pub fn socket_addr(self) -> Option<SocketAddr> {
         match self {
             NetAddr::Ip(s) => Some(s),
-            NetAddr::Onion { .. } => None,
+            NetAddr::Onion { .. } | NetAddr::I2p { .. } => None,
         }
     }
 
     pub fn is_ipv6(self) -> bool {
         match self {
             NetAddr::Ip(s) => s.is_ipv6(),
-            NetAddr::Onion { .. } => false,
+            NetAddr::Onion { .. } | NetAddr::I2p { .. } => false,
         }
     }
 
     pub fn port(self) -> u16 {
         match self {
             NetAddr::Ip(s) => s.port(),
-            NetAddr::Onion { port, .. } => port,
+            NetAddr::Onion { port, .. } | NetAddr::I2p { port, .. } => port,
         }
     }
 
@@ -108,6 +118,7 @@ impl NetAddr {
         match self {
             NetAddr::Ip(s) => s.ip().to_string(),
             NetAddr::Onion { pk, .. } => format!("{}.onion", encode_onion_name(&pk)),
+            NetAddr::I2p { dest, .. } => format!("{}{I2P_SUFFIX}", encode_i2p_name(&dest)),
         }
     }
 
@@ -116,6 +127,7 @@ impl NetAddr {
             NetAddr::Ip(s) if s.is_ipv4() => "ipv4",
             NetAddr::Ip(_) => "ipv6",
             NetAddr::Onion { .. } => "onion",
+            NetAddr::I2p { .. } => "i2p",
         }
     }
 }
@@ -124,6 +136,14 @@ fn parse_net_addr(s: &str) -> Result<NetAddr, NetError> {
     let Some((host, port_s)) = s.rsplit_once(':') else {
         return Err(NetError::Encode(format!("bad peer address {s}")));
     };
+    if let Some(name) = strip_i2p_suffix(host) {
+        let port: u16 = port_s
+            .parse()
+            .map_err(|_| NetError::Encode(format!("bad i2p port {s}")))?;
+        let dest = decode_i2p_name(name)
+            .ok_or_else(|| NetError::Encode(format!("bad i2p address {s}")))?;
+        return Ok(NetAddr::I2p { dest, port });
+    }
     if let Some(name) = strip_onion_suffix(host) {
         let port: u16 = port_s
             .parse()
@@ -135,6 +155,68 @@ fn parse_net_addr(s: &str) -> Result<NetAddr, NetError> {
     s.parse()
         .map(NetAddr::Ip)
         .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
+}
+
+fn strip_i2p_suffix(host: &str) -> Option<&str> {
+    let b = host.as_bytes();
+    let suf = I2P_SUFFIX.as_bytes();
+    if b.len() <= suf.len() {
+        return None;
+    }
+    if !b[b.len() - suf.len()..].eq_ignore_ascii_case(suf) {
+        return None;
+    }
+    Some(&host[..host.len() - suf.len()])
+}
+
+fn encode_i2p_name(dest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(I2P_B32_LEN);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in dest {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(B32[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(B32[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+fn decode_i2p_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != I2P_B32_LEN {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    let mut n = 0usize;
+    for c in name.bytes() {
+        let v = match c {
+            b'a'..=b'z' => c - b'a',
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => 26 + (c - b'2'),
+            _ => return None,
+        };
+        acc = (acc << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            if n >= 32 {
+                return None;
+            }
+            out[n] = (acc >> bits) as u8;
+            n += 1;
+        }
+    }
+    if n != 32 {
+        return None;
+    }
+    Some(out)
 }
 
 fn strip_onion_suffix(host: &str) -> Option<&str> {
@@ -249,7 +331,7 @@ mod tests {
                 );
                 assert_eq!(port, 8333);
             }
-            NetAddr::Ip(_) => panic!("expected onion"),
+            NetAddr::Ip(_) | NetAddr::I2p { .. } => panic!("expected onion"),
         }
         assert!(
             "qg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
@@ -274,5 +356,33 @@ mod tests {
             NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333))
         );
         assert_eq!(a.to_string(), s);
+    }
+
+    #[test]
+    fn netaddr_i2p_addrv2_roundtrip() {
+        let dest = [0x11u8; 32];
+        let msg = AddrV2Message {
+            time: 1,
+            services: bitcoin::p2p::ServiceFlags::NETWORK,
+            addr: AddrV2::I2p(dest),
+            port: 8333,
+        };
+        let a = NetAddr::from_addrv2(&msg).expect("i2p addrv2");
+        assert_eq!(a, NetAddr::I2p { dest, port: 8333 });
+        let s = a.to_string();
+        assert!(s.ends_with(".b32.i2p:8333"), "{s}");
+        assert_eq!(s.parse::<NetAddr>().unwrap(), a);
+        assert_eq!(a.network_label(), "i2p");
+        assert_eq!(a.port(), 8333);
+        assert!(a.socket_addr().is_none());
+        let zeros = NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 1,
+        };
+        assert_eq!(
+            zeros.to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p:1"
+        );
+        assert!("short.b32.i2p:1".parse::<NetAddr>().is_err());
     }
 }
