@@ -2631,6 +2631,27 @@ fn reconstruct_pruned_returns_pruned_not_corrupt() {
 }
 
 #[test]
+fn reorg_through_pruneheight_refuses() {
+    let (dir, q) = temp_query("reorg-pruneheight");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let prev = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev, Some(hash0));
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
+    q.set_pruneheight(Some(Height(0)));
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let err = q.disconnect_tip().unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { height: 0 }),
+        "disconnect at/below pruneheight must be Pruned, got {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn reconstruct_span_batches_foreign_parent_txids() {
     let (dir, q) = temp_query("reconstruct-parent-batch");
     let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
