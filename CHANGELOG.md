@@ -39,6 +39,8 @@ before 1.0).
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
 - **Per-slice local CI:** each plan step runs the workspace suite after Green
   and the other required gates except coverage after Refactor, then commits
+- **Per-slice local CI:** each plan step runs the workspace suite after Green
+  and the other required gates except coverage after Refactor, then commits
   before the next slice. Same *commands* as CI, not the GitHub Actions `env:`.
   Coverage and native `windows` / `macos` stay GitHub Actions. See
   [`docs/how-we-plan.md`](docs/how-we-plan.md).
@@ -46,6 +48,12 @@ before 1.0).
 - **Agent routing:** Core-facing work starts at [`COMPAT.md`](COMPAT.md).
   Extracts move (not copy): [`docs/code-shape.md`](docs/code-shape.md).
   Suite/clippy logs stay out of the session: [`docs/how-we-plan.md`](docs/how-we-plan.md).
+
+- **0.8 electrs HTTP drop-in:** Esplora serves mempool/electrs
+  `/internal/*` bulk REST, unix-domain listen, and a published mempool
+  tx-JSON snapshot. Core RPC for that stack is unix `{datadir}/rpc.sock`
+  plus the documented mempool `socketPath` patch, not cookie/Basic.
+  Address-prefix stays 404. Surface: [`COMPAT.md`](COMPAT.md).
 
 ## [0.7.0] — 2026-09-18
 
