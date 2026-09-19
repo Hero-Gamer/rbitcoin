@@ -1,6 +1,7 @@
 # Nightly Miri for rbitcoin-primitives only (Q-53).
 # Not a required PR check. Product rustc stays 1.95; this job uses nightly
 # only to drive Miri. Never cargo miri test --workspace.
+# Primitives includes scriptnum, pack-ints, and create.loc SIMD (Q-68).
 #
 # Operator may need to push this workflow file (GitHub App often cannot).
 

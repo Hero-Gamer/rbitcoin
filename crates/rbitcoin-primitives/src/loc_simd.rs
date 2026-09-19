@@ -1,0 +1,250 @@
+//! create.loc window SIMD: deinterleave `(stride, n_out)` pairs and inclusive `u8 << 3`.
+
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn deinterleave_pairs_u8x8_scalar(buf: &[u8; 16]) -> ([u8; 8], [u8; 8], bool) {
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    let mut has_zero = false;
+    for k in 0..8 {
+        st[k] = buf[k * 2];
+        no[k] = buf[k * 2 + 1];
+        if st[k] == 0 || no[k] == 0 {
+            has_zero = true;
+        }
+    }
+    (st, no, has_zero)
+}
+
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn inclusive_u8x8_times_8_scalar(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
+    let mut tx = [0u32; 8];
+    let mut sp = [0u32; 8];
+    let mut t = 0u32;
+    let mut s = 0u32;
+    for k in 0..8 {
+        t = t.saturating_add(u32::from(st[k]) << 3);
+        s = s.saturating_add(u32::from(no[k]) << 3);
+        tx[k] = t;
+        sp[k] = s;
+    }
+    (tx, sp)
+}
+
+/// Split 16 interleaved `(stride, n_out)` bytes. `true` if any lane is 0 (overflow slot).
+pub fn deinterleave_pairs_u8x8(buf: [u8; 16]) -> ([u8; 8], [u8; 8], bool) {
+    #[cfg(target_arch = "x86_64")]
+    let out = unsafe { sse2_deinterleave_pairs_u8x8(buf.as_ptr()) };
+    #[cfg(target_arch = "aarch64")]
+    let out = unsafe { neon_deinterleave_pairs_u8x8(buf.as_ptr()) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let out = deinterleave_pairs_u8x8_scalar(&buf);
+    out
+}
+
+/// Inclusive prefix of eight `u8 << 3` values (create.loc stride-8 window; fits u32).
+pub fn inclusive_u8x8_times_8(st: &[u8; 8], no: &[u8; 8]) -> ([u32; 8], [u32; 8]) {
+    #[cfg(target_arch = "x86_64")]
+    let out = unsafe {
+        (
+            sse2_u8x8_times_8_inclusive(st.as_ptr()),
+            sse2_u8x8_times_8_inclusive(no.as_ptr()),
+        )
+    };
+    #[cfg(target_arch = "aarch64")]
+    let out = unsafe {
+        (
+            neon_u8x8_times_8_inclusive(st.as_ptr()),
+            neon_u8x8_times_8_inclusive(no.as_ptr()),
+        )
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let out = inclusive_u8x8_times_8_scalar(st, no);
+    out
+}
+
+/// # Safety
+/// `p` must be readable for 16 bytes.
+#[cfg(target_arch = "x86_64")]
+unsafe fn sse2_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool) {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+        _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16, _mm_storel_epi64,
+    };
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let has_zero = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) != 0;
+    let mask = _mm_set1_epi16(0x00FF);
+    let st16 = _mm_and_si128(v, mask);
+    let no16 = _mm_srli_epi16(v, 8);
+    let z = _mm_setzero_si128();
+    let st8 = _mm_packus_epi16(st16, z);
+    let no8 = _mm_packus_epi16(no16, z);
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    _mm_storel_epi64(st.as_mut_ptr() as *mut __m128i, st8);
+    _mm_storel_epi64(no.as_mut_ptr() as *mut __m128i, no8);
+    (st, no, has_zero)
+}
+
+/// # Safety
+/// `p` must be readable for 16 bytes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn neon_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool) {
+    use std::arch::aarch64::{vceq_u8, vdup_n_u8, vld2_u8, vmaxv_u8, vst1_u8};
+    let v = vld2_u8(p);
+    let z = vdup_n_u8(0);
+    let has_zero = vmaxv_u8(vceq_u8(v.0, z)) != 0 || vmaxv_u8(vceq_u8(v.1, z)) != 0;
+    let mut st = [0u8; 8];
+    let mut no = [0u8; 8];
+    vst1_u8(st.as_mut_ptr(), v.0);
+    vst1_u8(no.as_mut_ptr(), v.1);
+    (st, no, has_zero)
+}
+
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sse2_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_extract_epi32, _mm_loadl_epi64, _mm_set1_epi32,
+        _mm_setzero_si128, _mm_slli_epi32, _mm_slli_si128, _mm_storeu_si128, _mm_unpackhi_epi16,
+        _mm_unpacklo_epi16, _mm_unpacklo_epi8,
+    };
+    let prefix4 = |v: __m128i| {
+        let s = _mm_add_epi32(v, _mm_slli_si128(v, 4));
+        _mm_add_epi32(s, _mm_slli_si128(s, 8))
+    };
+    let v = _mm_loadl_epi64(p as *const __m128i);
+    let z = _mm_setzero_si128();
+    let w = _mm_unpacklo_epi8(v, z);
+    let lo = prefix4(_mm_slli_epi32(_mm_unpacklo_epi16(w, z), 3));
+    let hi = prefix4(_mm_slli_epi32(_mm_unpackhi_epi16(w, z), 3));
+    let lo_sum = _mm_extract_epi32(lo, 3);
+    let hi = _mm_add_epi32(hi, _mm_set1_epi32(lo_sum));
+    let mut out = [0u32; 8];
+    _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, lo);
+    _mm_storeu_si128(out.as_mut_ptr().add(4) as *mut __m128i, hi);
+    out
+}
+
+/// # Safety
+/// `p` must be readable for 8 bytes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
+    use std::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vdupq_n_u32, vextq_u32, vget_high_u16, vget_low_u16, vgetq_lane_u32,
+        vld1_u8, vmovl_u16, vmovl_u8, vshlq_n_u32, vst1q_u32,
+    };
+    let prefix4 = |v: uint32x4_t| {
+        let z = vdupq_n_u32(0);
+        let s = vaddq_u32(v, vextq_u32(z, v, 3));
+        vaddq_u32(s, vextq_u32(z, s, 2))
+    };
+    let v = vld1_u8(p);
+    let v16 = vmovl_u8(v);
+    let lo = prefix4(vshlq_n_u32(vmovl_u16(vget_low_u16(v16)), 3));
+    let hi = prefix4(vshlq_n_u32(vmovl_u16(vget_high_u16(v16)), 3));
+    let hi = vaddq_u32(hi, vdupq_n_u32(vgetq_lane_u32(lo, 3)));
+    let mut out = [0u32; 8];
+    vst1q_u32(out.as_mut_ptr(), lo);
+    vst1q_u32(out.as_mut_ptr().add(4), hi);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interleave(st: [u8; 8], no: [u8; 8]) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        for i in 0..8 {
+            buf[i * 2] = st[i];
+            buf[i * 2 + 1] = no[i];
+        }
+        buf
+    }
+
+    #[test]
+    fn deinterleave_pairs_lanes_and_zero_in_same_load() {
+        let mut buf = [0u8; 16];
+        for i in 0..8 {
+            buf[i * 2] = (i as u8) + 1;
+            buf[i * 2 + 1] = (i as u8) + 2;
+        }
+        let (st, no, z) = deinterleave_pairs_u8x8(buf);
+        assert_eq!(st, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(no, [2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(!z);
+        buf[0] = 0;
+        assert!(deinterleave_pairs_u8x8(buf).2);
+        buf[0] = 1;
+        buf[15] = 0;
+        assert!(deinterleave_pairs_u8x8(buf).2);
+    }
+
+    #[test]
+    fn inclusive_u8x8_times_8_matches_shift_sum() {
+        let p = [255u8, 1, 0, 8, 255, 9, 2, 3];
+        let mut expect = [0u32; 8];
+        let mut acc = 0u32;
+        for (i, b) in p.iter().enumerate() {
+            acc += u32::from(*b) << 3;
+            expect[i] = acc;
+        }
+        let (tx, sp) = inclusive_u8x8_times_8(&p, &p);
+        assert_eq!(tx, expect);
+        assert_eq!(sp, expect);
+        assert_eq!(inclusive_u8x8_times_8_scalar(&p, &p), (expect, expect));
+    }
+
+    #[test]
+    fn simd_matches_scalar() {
+        let cases: [[u8; 16]; 4] = [
+            [0; 16],
+            [255; 16],
+            interleave([1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]),
+            {
+                let mut buf = [0u8; 16];
+                buf[0] = 0;
+                buf[15] = 255;
+                buf
+            },
+        ];
+        for buf in cases {
+            assert_eq!(
+                deinterleave_pairs_u8x8(buf),
+                deinterleave_pairs_u8x8_scalar(&buf)
+            );
+            let (st, no, _) = deinterleave_pairs_u8x8_scalar(&buf);
+            assert_eq!(
+                inclusive_u8x8_times_8(&st, &no),
+                inclusive_u8x8_times_8_scalar(&st, &no)
+            );
+        }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    fn miri_loc_simd_vectors() {
+        let mut seed = 0x9e37_79b9u32;
+        for _ in 0..32 {
+            let mut buf = [0u8; 16];
+            for b in &mut buf {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (seed >> 24) as u8;
+            }
+            assert_eq!(
+                deinterleave_pairs_u8x8(buf),
+                deinterleave_pairs_u8x8_scalar(&buf)
+            );
+            let (st, no, _) = deinterleave_pairs_u8x8_scalar(&buf);
+            assert_eq!(
+                inclusive_u8x8_times_8(&st, &no),
+                inclusive_u8x8_times_8_scalar(&st, &no)
+            );
+        }
+    }
+}

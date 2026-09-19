@@ -23,6 +23,11 @@ before 1.0).
 
 ### Changed
 
+- **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
+  `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
+  oracle. Store calls those fns directly. Nightly `miri.yml` stays
+  primitives-only (**Q-53**).
+
 - **Q-56:** shipped scriptnum (encode/decode/is_minimal, width 4 and 5) and
   pack-ints (CompactSize + ULEB128) live in `rbitcoin-primitives`. Interpreter,
   store, and mempool call those fns directly (`From` maps crate errors). Signet
