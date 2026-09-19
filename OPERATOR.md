@@ -393,6 +393,7 @@ Clean smoke:
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
 | `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine). Address/scripthash methods need `--sh-index` |
+| `--esplora-onion[=0\|1]` | `esplora_onion=` | **on** — `ADD_ONION` for Esplora when `--tor-control` is set |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
@@ -458,9 +459,13 @@ ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
 socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
 `127.0.0.1:<bound>` and logs `….onion:port`. The private key is
 `{datadir}/onion/electrum.priv` (0600). `server.features.hosts` is
-`{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. JSON-RPC stays off
-the onion (`rpc.sock` / `--rpc-listen` only). Cookie path differs by distro;
-pass `--tor-control-cookie` rather than globbing.
+`{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. With
+`--esplora-listen`, the same control port `ADD_ONION`s Esplora (`{datadir}/onion/esplora.priv`);
+REST and `/ws` share that TCP port (`http://….onion:<port>`). `--esplora-onion=0`
+skips Esplora HS. `getnetworkinfo.localaddresses` lists those onion hostnames
+even with `--no-discover`. Sparrow: `tcp://<id>.onion:50001` (plain TCP; no
+in-binary TLS). JSON-RPC stays off the onion (`rpc.sock` / `--rpc-listen` only).
+Cookie path differs by distro; pass `--tor-control-cookie` rather than globbing.
 
 `--i2p-sam [HOST:PORT]` talks to **system i2pd** SAM v3 (not SOCKS, not Arti).
 Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start

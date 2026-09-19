@@ -39,12 +39,12 @@ let
     else
       "${address}:${toString port}";
 
-  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService;
+  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService || cfg.esplora.hiddenService;
   needI2pSam = cfg.i2p.sam != null;
   torControlAddr =
     if cfg.tor.control != null then
       cfg.tor.control
-    else if cfg.electrum.hiddenService then
+    else if cfg.electrum.hiddenService || cfg.esplora.hiddenService then
       "127.0.0.1:9051"
     else
       null;
@@ -95,6 +95,7 @@ let
   ++ optional needI2pSam "--i2p-sam"
   ++ optional needI2pSam cfg.i2p.sam
   ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
+  ++ optional cfg.esplora.hiddenService "--esplora-onion"
   ++ cfg.extraArgs;
 in
 {
@@ -347,6 +348,12 @@ in
         type = types.bool;
         default = false;
         description = "Open the Esplora listen port in the NixOS firewall.";
+      };
+
+      hiddenService = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for Esplora when --esplora-listen is on. Implies tor.control 127.0.0.1:9051 if unset. REST and /ws share the TCP port.";
       };
     };
   };

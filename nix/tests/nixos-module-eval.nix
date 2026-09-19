@@ -56,6 +56,7 @@ let
           esplora = {
             enable = true;
             openFirewall = true;
+            hiddenService = true;
           };
         };
       }
@@ -106,6 +107,7 @@ assert defaultCfg.onlyNet == [ ];
 assert defaultCfg.tor.control == null;
 assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
+assert defaultCfg.esplora.hiddenService == false;
 assert defaultCfg.i2p.sam == null;
 assert defaultCfg.i2p.acceptIncoming == false;
 assert cfg.services.rbitcoin.p2p.port == 18444;
@@ -127,6 +129,7 @@ assert builtins.match ".*--listen 127.0.0.1:18444.*" execStart != null;
 assert builtins.match ".*--rpc-listen 127.0.0.1:18443.*" execStart != null;
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
+assert builtins.match ".*--esplora-onion.*" execStart != null;
 assert builtins.match ".*--shindex.*" execStart != null;
 assert builtins.match ".*--sptweaks.*" execStart != null;
 assert builtins.match ".*--log-level debug.*" execStart != null;
