@@ -953,4 +953,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(linked, "outbound-only follower must handshake the seeder");
     }
+
+    #[tokio::test]
+    async fn listen_onion_binds_loopback_when_nolisten() {
+        let _live = live_p2p_lock().await;
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-listen-onion-bind-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let node = P2PNode::start_with_dialer(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(onion)/".into(),
+            crate::DEFAULT_MAX_INBOUND,
+            crate::socks::Dialer::Direct,
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.local_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(node.local_addr.port(), 0);
+        node.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listen_onion_loopback_inbound_handshake() {
+        use crate::peer::{connect_and_handshake_timed, HandshakePolicy};
+        use bitcoin::p2p::Magic;
+        use tokio::net::TcpStream;
+
+        let _live = live_p2p_lock().await;
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-listen-onion-hs-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let node = P2PNode::start_with_dialer(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(onion)/".into(),
+            crate::DEFAULT_MAX_INBOUND,
+            crate::socks::Dialer::Direct,
+        )
+        .await
+        .unwrap();
+        let stream = TcpStream::connect(node.local_addr).await.unwrap();
+        connect_and_handshake_timed(
+            Duration::from_secs(5),
+            stream,
+            Magic::REGTEST,
+            node.local_addr,
+            node.local_addr,
+            0,
+            false,
+            "/rbitcoin:test/",
+            HandshakePolicy::plain(),
+        )
+        .await
+        .unwrap();
+        let mut inbound = false;
+        for _ in 0..100 {
+            if node.peers.snapshot().iter().any(|p| p.inbound) {
+                inbound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        node.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            inbound,
+            "loopback client must show as inbound in getpeerinfo"
+        );
+    }
 }

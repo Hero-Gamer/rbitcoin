@@ -107,6 +107,8 @@ pub struct ListenOpts {
     pub i2p_sam: Option<SocketAddr>,
     /// Persistent SAM destination + STREAM FORWARD to the P2P bind (`--i2p-accept-incoming`).
     pub i2p_accept_incoming: bool,
+    /// Loopback P2P accept + Tor `ADD_ONION` (`--listen-onion`).
+    pub listen_onion: bool,
 }
 
 impl Default for ListenOpts {
@@ -131,6 +133,7 @@ impl Default for ListenOpts {
             only_net: Vec::new(),
             i2p_sam: None,
             i2p_accept_incoming: false,
+            listen_onion: false,
         }
     }
 }
@@ -159,6 +162,18 @@ impl ListenOpts {
             ))),
             P2pListen::Socket(a) => Some(a),
         }
+    }
+
+    /// Clearnet bind, or a loopback ephemeral port when `--listen-onion` is on
+    /// with `--no-listen`.
+    pub fn start_p2p_bind(&self, network: Network) -> Option<SocketAddr> {
+        if let Some(a) = self.p2p_bind_addr(network) {
+            return Some(a);
+        }
+        if self.listen_onion {
+            return Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+        }
+        None
     }
 }
 
@@ -548,10 +563,22 @@ impl NodeConfig {
                     "i2p-accept-incoming requires SAM (--i2p-sam)".into(),
                 ));
             }
-            if matches!(self.listen.p2p, P2pListen::Off) {
+            if matches!(self.listen.p2p, P2pListen::Off) && !self.listen.listen_onion {
                 return Err(NodeError::Config(
                     "i2p-accept-incoming needs a P2P listener (--listen); --listen=0 has no loopback to STREAM FORWARD"
                         .into(),
+                ));
+            }
+        }
+        if self.listen.listen_onion {
+            if self.listen.max_inbound == 0 {
+                return Err(NodeError::Config(
+                    "listen-onion requires --max-inbound greater than 0".into(),
+                ));
+            }
+            if self.tor.control.is_none() {
+                return Err(NodeError::Config(
+                    "listen-onion requires --tor-control".into(),
                 ));
             }
         }
@@ -796,6 +823,10 @@ impl NodeConfig {
             "i2p_accept_incoming" => {
                 self.listen.i2p_accept_incoming = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf i2p_accept_incoming: {e}")))?;
+            }
+            "listen_onion" => {
+                self.listen.listen_onion = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf listen_onion: {e}")))?;
             }
             "proxy_randomize" => {
                 self.listen.proxy_randomize = parse_conf_bool(val)

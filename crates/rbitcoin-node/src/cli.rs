@@ -310,7 +310,7 @@ fn operator_usage() -> String {
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
-    [--no-seeds] [--no-listen] [--no-discover] [--smoke] [--inhibit-suspend]\n\n\
+    [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest.\n\
 Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
@@ -328,6 +328,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
   --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
+  --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -386,6 +387,7 @@ fn is_bool_key(key: &str) -> bool {
             | "no_seeds"
             | "no_listen"
             | "no_discover"
+            | "listen_onion"
             | "proxy_randomize"
             | "i2p_accept_incoming"
             | "inhibit_suspend"
@@ -586,6 +588,7 @@ mod tests {
             "--proxy-randomize",
             "--no-listen",
             "--no-discover",
+            "--listen-onion",
             "--tor-control",
             "--tor-control-cookie",
             "--tor-control-password",
@@ -622,6 +625,7 @@ mod tests {
             "--whitelist-forcerelay",
             "--nolisten",
             "--nodiscover",
+            "--listenonion",
             "--torcontrol",
             "--i2psam",
         ] {
@@ -800,6 +804,40 @@ mod tests {
             !h.contains("--nolisten"),
             "help must not advertise concatenated --nolisten"
         );
+    }
+
+    #[test]
+    fn listen_onion_binds_loopback_when_nolisten() {
+        let c = ready_config(["rbitcoin-node", "--no-listen", "--listen-onion"]);
+        assert!(c.listen.listen_onion);
+        assert_eq!(c.listen.p2p, crate::config::P2pListen::Off);
+        assert!(c.listen.p2p_bind_addr(Network::Regtest).is_none());
+        assert_eq!(
+            c.listen.start_p2p_bind(Network::Regtest),
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("listen_onion", "1").unwrap();
+        assert!(conf.listen.listen_onion);
+    }
+
+    #[test]
+    fn listen_onion_refused_when_max_inbound_zero() {
+        let c = ready_config([
+            "rbitcoin-node",
+            "--listen-onion",
+            "--max-inbound",
+            "0",
+            "--tor-control",
+        ]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("listen-onion") && err.contains("max-inbound"),
+            "{err}"
+        );
+        let no_tor = ready_config(["rbitcoin-node", "--listen-onion"]);
+        let err = no_tor.validate().unwrap_err().to_string();
+        assert!(err.contains("tor-control"), "{err}");
     }
 
     #[test]
