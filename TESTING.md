@@ -231,7 +231,9 @@ These do **not** measure operator RSS ([`docs/ibd-memory.md`](./docs/ibd-memory.
 owns caps). They catch the *shapes* of unbounded heap / leaked tasks, untested
 complexity, and UB in pure code. Landed: **Q-51–Q-53**. Named-cap ast-grep is
 Won't-fix (**Q-54**). **Q-56** Completed: shipped scriptnum + pack-ints live in
-primitives so Miri runs those functions. Owner: [`docs/quality.md`](./docs/quality.md).
+primitives so Miri runs those functions. **Q-68** Completed: create.loc SIMD
+deinterleave / inclusive `u8 << 3` live in primitives (scalar oracle; SIMD
+matches scalar in default tests). Owner: [`docs/quality.md`](./docs/quality.md).
 
 | Tool | How to run | CI |
 |------|------------|----|

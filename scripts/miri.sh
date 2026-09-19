@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Nightly Miri for rbitcoin-primitives only (Q-53). rust-toolchain.toml
 # pins 1.95; Miri needs nightly. Never --workspace (store io_uring, net,
-# secp FFI). Callers inherit RUSTUP_TOOLCHAIN if already set.
+# secp FFI). Crate includes scriptnum, pack-ints, and create.loc SIMD.
+# Callers inherit RUSTUP_TOOLCHAIN if already set.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

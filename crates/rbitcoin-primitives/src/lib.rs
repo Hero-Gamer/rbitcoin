@@ -5,6 +5,7 @@
 
 mod compact;
 mod hex;
+mod loc_simd;
 mod median_time;
 mod script_sigops;
 mod scriptnum;
@@ -17,6 +18,7 @@ pub use hex::{
     decode as hex_decode, display_hash_hex, encode as hex_encode, parse_display_hash32,
     DisplayHashError, HexError,
 };
+pub use loc_simd::{deinterleave_pairs_u8x8, inclusive_u8x8_times_8};
 pub use median_time::median_time_past_times;
 pub use script_sigops::script_sigop_count;
 pub use scriptnum::{
