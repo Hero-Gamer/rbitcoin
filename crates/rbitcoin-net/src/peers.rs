@@ -1289,7 +1289,7 @@ impl PeerHub {
         *self.addrman.lock().unwrap_or_else(|e| e.into_inner()) = Some(am);
     }
 
-    /// Learn IPv4/IPv6/Tor v3 rows from BIP155 `addrv2` (`p2p_addrv2_relay.py`).
+    /// Learn IPv4/IPv6/Tor v3/I2P rows from BIP155 `addrv2`.
     pub fn learn_addrv2(&self, list: &[bitcoin::p2p::address::AddrV2Message]) {
         let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
         let Some(am) = g.as_ref() else {
@@ -3166,5 +3166,28 @@ mod tests {
         let hint = t.version_socket();
         assert!(hint.ip().is_unspecified(), "{hint}");
         assert_eq!(hint.port(), 8333);
+    }
+
+    #[test]
+    fn learn_addrv2_keeps_i2p() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let dest = [0x11u8; 32];
+        hub.learn_addrv2(&[AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::I2p(dest),
+            port: 8333,
+        }]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let want = crate::NetAddr::I2p { dest, port: 8333 };
+        assert!(
+            book.entries().iter().any(|e| e.addr == want),
+            "I2P must stay in the book, got {:?}",
+            book.entries()
+        );
     }
 }

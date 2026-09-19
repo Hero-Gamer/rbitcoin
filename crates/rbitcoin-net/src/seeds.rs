@@ -1564,6 +1564,36 @@ mod tests {
     }
 
     #[test]
+    fn peers_file_roundtrip_i2p() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-i2p-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let i2p = NetAddr::I2p {
+            dest: [0x11u8; 32],
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.add_addr(i2p);
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == i2p),
+            "i2p must persist, got {:?}",
+            loaded.entries()
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains(".b32.i2p:8333"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn peers_file_v1_ipv4_still_loads() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-peers-v1-{}-{}",
