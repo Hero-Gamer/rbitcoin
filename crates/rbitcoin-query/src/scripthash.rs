@@ -318,6 +318,27 @@ impl ShJoinSlot {
                 .saturating_add(o.spenders.len().saturating_mul(48))
         })
     }
+
+    /// Fixture: one out whose packed size is `64 + 80 + n×8`.
+    pub(crate) fn with_spender_fk_count(n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            scripthash: [0xab; 32],
+            tip_hash: [0xcd; 32],
+            joined: vec![ShJoinedOut {
+                out: ScriptHashOutpoint {
+                    scripthash: [0xab; 32],
+                    create_tx_fk: Fk::NULL,
+                    vout: 0,
+                    txid: [0; 32],
+                    value: 0,
+                    create_height: 0,
+                },
+                spent: false,
+                spender_fks: vec![Fk::NULL; n],
+                spenders: Vec::new(),
+            }],
+        })
+    }
 }
 
 /// Which identity sidefiles this SH join must fill.

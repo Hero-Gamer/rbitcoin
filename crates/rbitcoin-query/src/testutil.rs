@@ -5,10 +5,11 @@
 
 pub use rbitcoin_store::testutil::TempDir;
 
-use crate::{Query, QueryError, TxApply};
+use crate::{Query, QueryError, ShJoinSlot, TxApply};
 use bitcoin::hashes::Hash;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::HeaderRecord;
+use std::sync::Arc;
 
 /// Tiny-head query in a drop-cleaning directory (not Mainnet GiB heads).
 pub fn tiny_query() -> (TempDir, Query) {
@@ -109,4 +110,11 @@ impl FixtureChain for Query {
         self.apply_sh_pending()?;
         Ok(fk)
     }
+}
+
+/// SH join whose packed size exceeds Esplora's 16 MiB last-1 + last-bulk cap.
+pub fn sh_join_slot_over_16mib() -> Arc<ShJoinSlot> {
+    const CAP: usize = 16 * 1024 * 1024;
+    let n = (CAP - 144) / 8 + 1;
+    ShJoinSlot::with_spender_fk_count(n)
 }

@@ -517,7 +517,13 @@ fn sweep_clients(map: &mut HashMap<String, ClientJoins>, now: Instant) {
 }
 
 fn cap_bulk(c: &mut ClientJoins) {
-    let mut bytes: usize = c.last_bulk.values().map(|s| s.packed_bytes()).sum();
+    let last_sh_bytes = c
+        .last_sh
+        .as_ref()
+        .map(|(_, s)| s.packed_bytes())
+        .unwrap_or(0);
+    let mut bytes: usize =
+        last_sh_bytes.saturating_add(c.last_bulk.values().map(|s| s.packed_bytes()).sum());
     while bytes > JOIN_BULK_CAP && !c.last_bulk.is_empty() {
         let victim = c
             .last_bulk
@@ -530,6 +536,16 @@ fn cap_bulk(c: &mut ClientJoins) {
         c.last_bulk.remove(&k);
         bytes = bytes.saturating_sub(sz);
     }
+}
+
+fn retain_join_budget(c: &mut ClientJoins) {
+    if c.last_sh
+        .as_ref()
+        .is_some_and(|(_, s)| s.packed_bytes() > JOIN_BULK_CAP)
+    {
+        c.last_sh = None;
+    }
+    cap_bulk(c);
 }
 
 pub(crate) fn client_id_from(
@@ -598,6 +614,7 @@ impl AppState {
                     if let Some(c) = g.clients.get_mut(id) {
                         c.last_sh = Some((*sh, s));
                         c.last_req = Instant::now();
+                        retain_join_budget(c);
                     }
                 }
                 return r;
@@ -627,6 +644,7 @@ impl AppState {
                     if let Some(c) = g.clients.get_mut(id) {
                         c.last_sh = Some((*sh, s));
                         c.last_req = Instant::now();
+                        retain_join_budget(c);
                     }
                 }
                 return r;
@@ -653,6 +671,7 @@ impl AppState {
                 if let Some(s) = slot {
                     c.last_sh = Some((*sh, s));
                 }
+                retain_join_budget(c);
             }
         }
         r
@@ -1525,6 +1544,26 @@ mod tests {
         holder.join().expect("holder");
         overlap.join().expect("overlap");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_sh_join_drops_last_sh_over_bulk_cap() {
+        let (_dir, q) = temp_query("join-oversize-last-sh");
+        let cache = Arc::new(Mutex::new(JoinCache::default()));
+        let st = join_only_state(Arc::new(q), Arc::clone(&cache));
+        let sh = [0x33u8; 32];
+        let slot = rbitcoin_query::testutil::sh_join_slot_over_16mib();
+        assert!(
+            slot.packed_bytes() > JOIN_BULK_CAP,
+            "fixture must exceed 16 MiB packed"
+        );
+        st.with_sh_join(Some("c1"), &sh, |s| {
+            *s = Some(Arc::clone(&slot));
+        });
+        assert!(
+            cache.lock().unwrap().last_sh_key("c1").is_none(),
+            "oversize last-1 is used then not retained"
+        );
     }
 
     #[cfg(unix)]
