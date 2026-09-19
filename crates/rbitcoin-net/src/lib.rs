@@ -5,6 +5,7 @@ mod cache;
 mod chain;
 mod codec;
 mod compact;
+mod ephemeral;
 mod error;
 mod eviction;
 mod i2p_sam;
@@ -34,6 +35,7 @@ pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     CmpctPeerFrame,
 };
+pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
 pub use i2p_sam::I2pSam;

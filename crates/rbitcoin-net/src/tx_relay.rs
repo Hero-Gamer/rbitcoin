@@ -564,6 +564,7 @@ pub struct MempoolHub {
     unbroadcast: Mutex<HashSet<Txid>>,
     local_origin: Mutex<HashSet<Txid>>,
     isolated_broadcast: AtomicBool,
+    isolated_kick: broadcast::Sender<Txid>,
     /// Wtxids re-admitted from a disconnected block. Core serves these
     /// even if this peer has not been INV'd yet (`mempool_reorg`).
     reorg_servable: Mutex<HashSet<Wtxid>>,
@@ -637,6 +638,7 @@ impl MempoolHub {
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
+        let (isolated_kick, _) = broadcast::channel(32);
         let unbroadcast = if persist {
             load_unbroadcast_file(&dir_buf)
         } else {
@@ -689,6 +691,7 @@ impl MempoolHub {
             unbroadcast: Mutex::new(unbroadcast),
             local_origin: Mutex::new(HashSet::new()),
             isolated_broadcast: AtomicBool::new(false),
+            isolated_kick,
             reorg_servable: Mutex::new(HashSet::new()),
             relay_seq: Mutex::new(HashMap::new()),
             wtxid_by_txid: Mutex::new(HashMap::new()),
@@ -3153,6 +3156,13 @@ impl MempoolHub {
 
     pub fn mark_local_origin(&self, txid: Txid) {
         self.local_origin.lock().unwrap().insert(txid);
+        if self.isolated_broadcast() {
+            let _ = self.isolated_kick.send(txid);
+        }
+    }
+
+    pub(crate) fn subscribe_isolated(&self) -> broadcast::Receiver<Txid> {
+        self.isolated_kick.subscribe()
     }
 
     pub fn is_local_origin(&self, txid: &Txid) -> bool {
@@ -4223,6 +4233,13 @@ mod tests {
         hub.mark_local_origin(local);
         assert!(hub.is_local_origin(&local));
         assert!(!hub.is_local_origin(&wire));
+        assert!(
+            !hub.skip_standing_inv(&local),
+            "without --proxy/--onion, local-origin still uses standing INV"
+        );
+        hub.set_isolated_broadcast(true);
+        assert!(hub.skip_standing_inv(&local));
+        assert!(!hub.skip_standing_inv(&wire));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store);
     }

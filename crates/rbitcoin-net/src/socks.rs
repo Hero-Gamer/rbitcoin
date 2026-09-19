@@ -56,6 +56,15 @@ pub(crate) async fn dial_isolated(
     socks5_connect(proxy, target, Some(&creds)).await
 }
 
+pub(crate) async fn dial_isolated_domain(
+    proxy: SocketAddr,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, NetError> {
+    let creds = ProxyCreds::fresh();
+    socks5_connect_domain(proxy, host, port, Some(&creds)).await
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Dialer {
     #[default]
@@ -130,6 +139,26 @@ impl Dialer {
         match self {
             Dialer::Direct => self.connect(target).await,
             Dialer::Socks { proxy, .. } => dial_isolated(*proxy, target).await,
+        }
+    }
+
+    pub(crate) async fn connect_isolated_net(
+        &self,
+        addr: crate::NetAddr,
+    ) -> Result<TcpStream, NetError> {
+        match addr {
+            crate::NetAddr::Ip(s) => self.connect_isolated(s).await,
+            crate::NetAddr::Onion { port, .. } => match self {
+                Dialer::Direct => Err(NetError::Encode(
+                    "onion dial requires SOCKS (--proxy or --onion)".into(),
+                )),
+                Dialer::Socks { proxy, .. } => {
+                    dial_isolated_domain(*proxy, &addr.host_str(), port).await
+                }
+            },
+            crate::NetAddr::I2p { .. } => {
+                Err(NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
+            }
         }
     }
 

@@ -471,6 +471,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
+    if mempool.isolated_broadcast() {
+        let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
+            Arc::clone(&mempool),
+            config.listen.isolated_dialer(),
+            std::sync::Arc::clone(&shared_peers),
+            node.magic(),
+            node.user_agent().to_string(),
+        );
+    }
 
     let max_out = config.listen.max_outbound.max(1) as usize;
     let candidate_n = max_out.saturating_mul(2).clamp(16, 48);

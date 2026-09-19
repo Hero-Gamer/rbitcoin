@@ -143,6 +143,16 @@ impl ListenOpts {
         }
     }
 
+    pub fn isolated_dialer(&self) -> rbitcoin_net::Dialer {
+        match self.proxy.or(self.onion) {
+            Some(proxy) => rbitcoin_net::Dialer::Socks {
+                proxy,
+                randomize: true,
+            },
+            None => rbitcoin_net::Dialer::Direct,
+        }
+    }
+
     pub fn p2p_bind_addr(&self, network: Network) -> Option<SocketAddr> {
         match self.p2p {
             P2pListen::Off => None,

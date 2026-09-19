@@ -239,6 +239,14 @@ impl P2PNode {
         self.dialer.clone()
     }
 
+    pub fn magic(&self) -> Magic {
+        self.magic
+    }
+
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
     /// Bind an additional listen socket (Core multi-`-bind`).
     pub async fn add_listen(&mut self, listen: SocketAddr) -> Result<SocketAddr, NetError> {
         let listener = TcpListener::bind(listen).await?;
