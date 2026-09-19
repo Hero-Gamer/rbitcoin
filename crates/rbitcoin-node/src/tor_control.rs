@@ -130,6 +130,17 @@ impl TorControl {
         }
         Ok(hs)
     }
+
+    pub async fn add_electrum_onion(
+        &mut self,
+        datadir: &Path,
+        bound: SocketAddr,
+    ) -> Result<HiddenService, NodeError> {
+        let key_path = datadir.join("onion").join("electrum.priv");
+        let virt = bound.port();
+        let target = SocketAddr::from(([127, 0, 0, 1], virt));
+        self.add_onion_persistent(&key_path, virt, target).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,5 +466,36 @@ mod tests {
             .unwrap();
         assert!(none.is_none());
         let _ = std::fs::remove_file(&bad);
+    }
+
+    #[tokio::test]
+    async fn electrum_hidden_service_add_onion_when_listening() {
+        let cookie = vec![0x55, 0x66];
+        let (addr, log) = fake_control(Some(cookie.clone()), None).await;
+        let cookie_path = tmp_cookie(&cookie);
+        let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "rbtc-tor-electrum-hs-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bound: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let hs = ctl.add_electrum_onion(&dir, bound).await.unwrap();
+        assert_eq!(hs.service_id, FAKE_SID);
+        let cmds = log.lock().unwrap().clone();
+        let onion = cmds
+            .iter()
+            .find(|c| c.starts_with("ADD_ONION "))
+            .cloned()
+            .expect("ADD_ONION");
+        assert!(onion.contains("Port=50001,127.0.0.1:50001"), "{onion}");
+        assert!(std::path::Path::new(&dir.join("onion").join("electrum.priv")).is_file());
+        let _ = std::fs::remove_file(&cookie_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

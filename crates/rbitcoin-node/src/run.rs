@@ -355,13 +355,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
-    let _tor_ctl = crate::tor_control::TorControl::connect_if_configured(
+    let mut tor_ctl = crate::tor_control::TorControl::connect_if_configured(
         config.tor.control,
         config.tor.cookie.as_deref(),
         config.tor.password.as_deref(),
     )
     .await?;
-    if _tor_ctl.is_some() {
+    if tor_ctl.is_some() {
         info!(
             "tor control authenticated on {}",
             config
@@ -625,6 +625,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &mempool,
     )
     .await;
+    if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
+        let hs = ctl
+            .add_electrum_onion(config.datadir.path(), h.local_addr)
+            .await?;
+        info!(
+            "electrum onion {}.onion:{}",
+            hs.service_id,
+            h.local_addr.port()
+        );
+    }
     let (esplora_handles, esplora_tip_bridge) = start_esplora_if_ready(
         sh_tip_ready,
         config.listen.esplora.clone(),
