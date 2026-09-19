@@ -81,6 +81,7 @@ FORWARD_FLAGS = frozenset(
         "blockmintxfee",
         "rpcworkqueue",
         "checkblocks",
+        "maxmempool",
     }
 )
 
@@ -182,6 +183,7 @@ CORE_TO_NODE = {
     "whitelistrelay": "net-permission-relay",
     "whitelistforcerelay": "net-permission-force-relay",
     "checkblocks": "check-blocks",
+    "maxmempool": "mempool-size-mb",
 }
 
 
@@ -197,6 +199,16 @@ def node_args(key: str, val: str | None) -> list[str]:
         return [f"--max-inbound={n}"]
     if key == "uacomment":
         return [f"--ua-comment={val or ''}"]
+    if key == "maxmempool":
+        # Core -maxmempool is RAM megabytes; node budget is weight.
+        # Non-witness WU/bytes = 4, so fill_mempool's ~65k vB txs fit like Core 5MB.
+        if val is None:
+            return ["--mempool-size-mb"]
+        try:
+            n = int(val)
+        except ValueError:
+            return [f"--mempool-size-mb={val}"]
+        return [f"--mempool-size-mb={n * 4}"]
     name = CORE_TO_NODE.get(key, key)
     if val is None:
         return [f"--{name}"]

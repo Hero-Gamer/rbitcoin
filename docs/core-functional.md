@@ -152,7 +152,6 @@ lists as done, but whose official script still fails on dialect, stay
 | `rpc_blockchain.py` | `rpc-dialect` | `time`/`mediantime` shipped; prune / muhash later |
 | `rpc_gettxspendingprevout.py` | `rpc-dialect` | method shipped; field/error zoo |
 | `rpc_help.py` | `rpc-dialect` | `help` shipped; Core categories / converthelp |
-| `rpc_packages.py` | `rpc-dialect` | `submitpackage` shipped; script field zoo |
 | `rpc_rawtransaction.py` | `rpc-dialect` | Class A always indexes; remaining type-check needles |
 | `rpc_decodescript.py` | `rpc-dialect` | node decode subset; no p2sh/segwit wrap, `desc`, Core asm |
 | `rpc_validateaddress.py` | `rpc-dialect` | node happy-path subset (`isvalid` only) |
@@ -186,7 +185,7 @@ merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ([`TESTING.md`](../TESTING.md)). Label harness PRs and every version-bump
 ship PR (see [`releases.md`](./releases.md)). The `release-extra` job on
 that workflow fails when a ship PR did not get a green `core-functional`.
-The `core-functional` job is **30 minutes** (76 `test_runner` jobs: 70
+The `core-functional` job is **30 minutes** (77 `test_runner` jobs: 71
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
 When that job is red, the inner loop is **local**, not another CI wait.

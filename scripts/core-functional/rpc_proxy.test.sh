@@ -25,6 +25,7 @@ from rpc_proxy import (
 assert core_btc_kvb_to_sat_vb(0) == 0
 assert core_btc_kvb_to_sat_vb(0.1) == 10_000
 assert core_btc_kvb_to_sat_vb("0.10") == 10_000
+assert core_btc_kvb_to_sat_vb(0.00099999) == 99
 try:
     core_btc_kvb_to_sat_vb(1)
     raise SystemExit("expected -8 for 1 BTC/kvB")

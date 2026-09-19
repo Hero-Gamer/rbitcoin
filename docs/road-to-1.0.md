@@ -10,7 +10,7 @@ Day-to-day ranked work stays in [`quality.md`](./quality.md).
 Electrum/Esplora need `--sh-index` (default off). BIP324 v2-only. Install is
 a GitHub Release (Linux musl; Windows/Darwin snapshots). Nightly
 differential fuzz vs Core v31.1 is continuous (**Q-30**). Core functional
-inventory is **70** `run` / **197** `skip` (**Q-41**). Findings **001–023**
+inventory is **71** `run` / **196** `skip` (**Q-41**). Findings **001–023**
 are fixed.
 
 1.0 is the first **frozen-format, support-windowed** line. Not a Bitcoin

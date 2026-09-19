@@ -43,6 +43,16 @@ before 1.0).
   arrived or are known-invalid, prefers outbound announcers, and maps
   `missingorspent`. `testmempoolaccept` missing prevouts are `missing-inputs`.
 
+- **Core functional `rpc_packages.py`:** inventory `run`. `submitpackage`
+  is still sequential `accept_tx` (not Core AcceptPackage). Child-with-parents
+  topology, `conflict-in-package`, abort-class blank rows, and in-package
+  maxfeerate on a missing-inputs remainder match the official script.
+  Libre admission rejects nVersion outside 1/2 (`version`) and non-OP_RETURN
+  scripts over 10 000 bytes (`scriptpubkey`). `mempoolminfee` rises when live
+  weight plus `MAX_STANDARD_TX_WEIGHT` exceeds the cap. The harness maps
+  Core `-maxmempool=N` onto a 4× weight budget so `fill_mempool` evicts like
+  Core 5 MB RAM.
+
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar
   oracle. Store calls those fns directly. Nightly `miri.yml` stays

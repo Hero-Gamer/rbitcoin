@@ -426,6 +426,20 @@ impl ActiveMempool {
         self.graph.len()
     }
 
+    pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
+        let min_r = self.min_relay_sat_kvb;
+        if self
+            .graph
+            .total_weight()
+            .saturating_add(policy::MAX_STANDARD_TX_WEIGHT)
+            > self.max_weight
+        {
+            min_r.saturating_add(policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB)
+        } else {
+            min_r
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.store.generation()
     }
@@ -734,9 +748,13 @@ impl ActiveMempool {
         let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
-        let min_relay = min_relay.unwrap_or(self.min_relay_sat_kvb);
+        let floor = self.mempool_min_fee_sat_kvb();
+        let min_relay = min_relay.unwrap_or(floor);
         match policy::check_libre_admission_at(tx, admit_fee, weight, min_relay) {
             PolicyResult::Standard => {}
+            PolicyResult::NonStandard("min relay fee") if floor > self.min_relay_sat_kvb => {
+                return Err(AcceptError::Policy("mempool min fee"));
+            }
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
         }
 
@@ -1138,6 +1156,21 @@ impl ActiveMempool {
             }
         }
         Ok(())
+    }
+
+    /// Core `IsChildWithParents`: last tx spends every other package member.
+    pub fn package_is_child_with_direct_parents(txs: &[Transaction]) -> bool {
+        if txs.len() < 2 {
+            return false;
+        }
+        let spent: BTreeSet<Txid> = txs[txs.len() - 1]
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .collect();
+        txs[..txs.len() - 1]
+            .iter()
+            .all(|tx| spent.contains(&tx.compute_txid()))
     }
 
     /// Last tx is a child; every other member is an in-package ancestor of it.

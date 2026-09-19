@@ -2151,6 +2151,11 @@ impl MempoolHub {
         ActiveMempool::check_package_shape(txs)
     }
 
+    /// Core `IsChildWithParents` (submitpackage topology).
+    pub fn package_is_child_with_direct_parents(txs: &[Transaction]) -> bool {
+        ActiveMempool::package_is_child_with_direct_parents(txs)
+    }
+
     /// Core ancestor package size cap (count, not weight).
     pub fn max_package_count() -> usize {
         MAX_PACKAGE_COUNT
@@ -2785,6 +2790,10 @@ impl MempoolHub {
     /// Weight budget used for chunk eviction (WU). RPC `maxmempool`.
     pub fn max_weight(&self) -> u64 {
         self.lock_read().max_weight
+    }
+
+    pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
+        self.lock_read().mempool_min_fee_sat_kvb()
     }
 
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
