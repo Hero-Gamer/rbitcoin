@@ -18,6 +18,7 @@ update that file — do not paste a parallel spec.
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
+Home-node (no clearnet listen ports): [`personal-node-plans/`](./personal-node-plans/).
 Releases (tag / `vX.Y.x` / `.99`): [`releases.md`](./releases.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
 quality backlog).
@@ -46,6 +47,7 @@ into `AGENTS.md`.
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
 | [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract. |
+| [`personal-node-plans/`](./personal-node-plans/) | Home-node implementation plan group (SOCKS, overlays, wallet onions, ephemeral broadcast, inwit prune / `NETWORK_LIMITED`). Live flags stay OPERATOR/COMPAT when a slice ships. Do not copy step lists into quality.md until scheduled. |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |
 | [`code-shape.md`](./code-shape.md) | Control flow, types, naming, composition (CONTRIBUTING principle 10). Named extracts: quality.md **Q-61** (Completed). Clippy: no workspace `allow` list; leftover lints are site-local with a reason. |
 | [`quality.md`](./quality.md) | Living quality roadmap (Open + Won't-fix + Parked + Protect). |
