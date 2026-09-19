@@ -37,7 +37,6 @@ before 1.0).
 
 - **Workspace version 0.7.99:** in-tree toward 0.8.0.
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
-
 - **Per-slice local CI:** each plan step runs the workspace suite after Green
   and the other required gates except coverage after Refactor, then commits
   before the next slice. Same *commands* as CI, not the GitHub Actions `env:`.
@@ -47,6 +46,45 @@ before 1.0).
 - **Agent routing:** Core-facing work starts at [`COMPAT.md`](COMPAT.md).
   Extracts move (not copy): [`docs/code-shape.md`](docs/code-shape.md).
   Suite/clippy logs stay out of the session: [`docs/how-we-plan.md`](docs/how-we-plan.md).
+
+- **0.8 electrs HTTP drop-in:** `/internal/*` is **unix listen only** (TCP
+  GET/POST `/internal` → 404). `GET /mempool` count/vsize/total_fee come from
+  the fee snapshot (no body clones). Unix `/internal` mempool-tx pages still
+  lazy-build a published tx-body snapshot (≤ one extra live-pool of
+  `Arc<Transaction>` + JSON `OnceLock`; dirty/singleflight; not FIFO/LRU).
+  Core RPC for that stack is unix `{datadir}/rpc.sock` plus the documented
+  mempool `socketPath` patch, not cookie/Basic. Address-prefix stays 404.
+  Surface: [`COMPAT.md`](COMPAT.md).
+
+- **`getnetworkhashps` matches Core:** chainwork delta over min/max header
+  time in the lookup window; `nblocks<=0` uses the difficulty retarget
+  length. Not dummy 2-work-per-block. [`docs/rpc.md`](docs/rpc.md).
+
+- **Esplora `?after_txid=`:** GET `/address|scripthash/…/txs` and `/txs/summary`
+  skip through a known txid (mempool then chain). Unknown or unparseable →
+  **422** `after_txid not found`.
+
+- **Esplora multi-script POST:** `POST /addresses|scripthashes/txs` and
+  `/txs/summary` merge unique scripts (max 300; over → **422**).
+
+- **Esplora broadcast test:** `GET /broadcast?tx=` admits like `POST /tx`.
+  `POST /txs/test` is dry-run `test_accept` with electrs `maxfeerate` BTC/kvB.
+
+- **Esplora tx JSON `sigops`:** BIP16+BIP141 cost via `tx_sigop_cost` (same as
+  Core `GetTransactionSigOpCost`).
+
+- **Esplora HTTP SH join:** last-1 GET + last-bulk POST share 16 MiB packed/client
+  (oversize last-1 is used for that request and not retained). Keyed by
+  `X-Rbitcoin-Client` (unix listen or TCP loopback; 30s idle; 256 clients).
+  Public TCP ignores the header. Not an 8-script LRU and not a >5s process
+  whale cache.
+
+- **Esplora wallet WebSocket:** `{ "action": "ping"|"init" }`, `track-*: "stop"`,
+  subscribe snapshots via `scripthash_mempool` (not a full tx-body scan), RBF
+  `address-removed-transactions`, and `want: stats` (`mempoolInfo` + `fees`
+  from the fee snapshot). Public URL `wss://host/api/ws`; mempool Node keeps
+  `/api/v1/ws`. REST and WS upgrade send
+  `X-Powered-By: rbitcoin-esplora/<version>-<hex>`.
 
 ## [0.7.0] — 2026-09-18
 
