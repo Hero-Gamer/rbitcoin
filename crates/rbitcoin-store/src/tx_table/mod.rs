@@ -1,14 +1,13 @@
 use crate::address_head::HeadLayout;
 use crate::compact::{
     amount_exp_mantissa, decode_output_amount, decode_script_kind_v17, encode_script_kind_v17,
-    input_flags, output_flags, read_compact_size, read_uleb128, script_kind_v17_disk_used,
-    split_output_flags, write_compact_size, write_uleb128,
+    input_flags, output_flags, script_kind_v17_disk_used, split_output_flags,
 };
 use crate::error::StoreError;
 use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{read_uleb128, write_uleb128, Fk, TableKind};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -329,8 +328,10 @@ impl OutputRecord {
     /// Exact on-wire length matching [`Self::encode_into`].
     #[inline]
     pub fn encoded_len_exact(&self) -> usize {
-        use crate::compact::{classify_script, compact_size_len, uleb128_len};
-        use crate::compact::{SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_RAW};
+        use crate::compact::{
+            classify_script, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_RAW,
+        };
+        use rbitcoin_primitives::{compact_size_len, uleb128_len};
         if self.value < 0 {
             return 0;
         }

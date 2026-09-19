@@ -3,7 +3,7 @@
 //! Peer enqueue stamps this so IBD lookup can pack/hold waves from the BQ
 //! index. Invalid / truncated payloads yield `0`.
 
-use crate::compact::read_compact_size;
+use rbitcoin_primitives::read_compact_size;
 
 const HEADER_LEN: usize = 80;
 
@@ -117,7 +117,7 @@ mod tests {
 
     fn compact(n: u64) -> Vec<u8> {
         let mut o = Vec::new();
-        crate::compact::write_compact_size(&mut o, n);
+        rbitcoin_primitives::write_compact_size(&mut o, n);
         o
     }
 

@@ -23,7 +23,7 @@ use bitcoin::{Amount, Sequence, Transaction, TxOut};
 
 use super::crypto;
 use crate::error::ConsensusError;
-use rbitcoin_primitives::ScriptNumError;
+use rbitcoin_primitives::{scriptnum_decode, scriptnum_decode_width, scriptnum_encode};
 
 /// Stack element cap (main + alt).
 const MAX_STACK_SIZE: usize = 1000;
@@ -1503,10 +1503,6 @@ fn bool_encode(b: bool) -> Vec<u8> {
     }
 }
 
-fn scriptnum_encode(n: i64) -> Vec<u8> {
-    rbitcoin_primitives::scriptnum_encode(n)
-}
-
 /// Data must use the shortest opcode form.
 fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
     if data.is_empty() {
@@ -1528,22 +1524,6 @@ fn check_minimal_push(data: &[u8], opcode: u8) -> bool {
         return opcode == 0x4d;
     }
     true
-}
-
-fn scriptnum_err(e: ScriptNumError) -> ConsensusError {
-    ConsensusError::Script(e.to_string())
-}
-
-fn scriptnum_decode(v: &[u8], require_minimal: bool) -> Result<i64, ConsensusError> {
-    rbitcoin_primitives::scriptnum_decode(v, require_minimal).map_err(scriptnum_err)
-}
-
-fn scriptnum_decode_width(
-    v: &[u8],
-    max_len: usize,
-    require_minimal: bool,
-) -> Result<i64, ConsensusError> {
-    rbitcoin_primitives::scriptnum_decode_width(v, max_len, require_minimal).map_err(scriptnum_err)
 }
 
 fn bin_arith(
@@ -2236,7 +2216,10 @@ mod success_and_disabled_tests {
     #[test]
     fn cltv_and_csv_negative_zero_is_not_negative() {
         // 0x80 is scriptnum negative-zero → 0, not < 0.
-        assert_eq!(scriptnum_decode_width(&[0x80], 5, false).unwrap(), 0);
+        assert_eq!(
+            rbitcoin_primitives::scriptnum_decode_width(&[0x80], 5, false).unwrap(),
+            0
+        );
 
         // eval() uses nLockTime=0 and final nSequence (Core script_tests template).
         // CLTV(0) then fails final-sequence / unsatisfied — never "negative".

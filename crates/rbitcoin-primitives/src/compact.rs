@@ -122,6 +122,12 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), PackError> {
     Err(PackError("uleb128 truncated"))
 }
 
+pub fn read_compact_size_from(rdr: &mut &[u8]) -> Result<u64, PackError> {
+    let (v, n) = read_compact_size(rdr)?;
+    *rdr = &rdr[n..];
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +239,15 @@ mod tests {
         let mut over = vec![0x80u8; 10];
         over.push(0x01);
         assert!(read_uleb128(&over).is_err());
+    }
+
+    #[test]
+    fn read_compact_size_from_advances_the_slice() {
+        let mut rdr: &[u8] = &[1u8, 252, 253, 0x04, 0x01];
+        assert_eq!(read_compact_size_from(&mut rdr).unwrap(), 1);
+        assert_eq!(read_compact_size_from(&mut rdr).unwrap(), 252);
+        assert_eq!(read_compact_size_from(&mut rdr).unwrap(), 260);
+        assert!(rdr.is_empty());
+        assert!(read_compact_size_from(&mut rdr).is_err());
     }
 }

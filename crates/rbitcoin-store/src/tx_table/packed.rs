@@ -1,6 +1,7 @@
 //! Packed tx body encode/decode (schema Class A payload).
 
 use super::*;
+use rbitcoin_primitives::{read_compact_size, write_compact_size};
 
 /// Encode a per-tx output run (concat of compact outputs; count is loc `n_out`).
 pub(super) fn encode_output_run_secret(
@@ -348,7 +349,7 @@ impl InputRecord {
     /// Exact on-wire length matching [`Self::encode_into`] (for denserels layout).
     #[inline]
     pub fn encoded_len_exact(&self) -> usize {
-        use crate::compact::compact_size_len;
+        use rbitcoin_primitives::compact_size_len;
         let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
         let mut n = 1usize;
         if !null_prev {
@@ -481,9 +482,9 @@ pub(super) fn xor_script_kind_v17_payload(
     secret: &crate::store_secret::StoreSecret,
 ) {
     use crate::compact::{
-        read_compact_size, SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH,
-        SCRIPT_KIND_V17_OP_TRUE, SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH,
-        SCRIPT_KIND_V17_P2TR, SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
+        SCRIPT_KIND_V17_EMPTY, SCRIPT_KIND_V17_OP_RETURN_PUSH, SCRIPT_KIND_V17_OP_TRUE,
+        SCRIPT_KIND_V17_P2A, SCRIPT_KIND_V17_P2PKH, SCRIPT_KIND_V17_P2SH, SCRIPT_KIND_V17_P2TR,
+        SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
     };
     match kind {
         SCRIPT_KIND_V17_EMPTY | SCRIPT_KIND_V17_OP_TRUE | SCRIPT_KIND_V17_P2A => {}
@@ -950,7 +951,8 @@ pub struct HeadResizeSizeSnapshot {
 #[cfg(test)]
 mod scan_p2tr_tests {
     use super::*;
-    use crate::compact::{amount_exp_mantissa, write_uleb128, SCRIPT_KIND_V17_P2TR};
+    use crate::compact::{amount_exp_mantissa, SCRIPT_KIND_V17_P2TR};
+    use rbitcoin_primitives::write_uleb128;
 
     fn packed_p2tr_body(value: u64) -> Vec<u8> {
         let meta = TxRecord {

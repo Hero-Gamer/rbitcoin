@@ -1,45 +1,10 @@
-//! Compact integer and flag encoding for schema v2+ records.
+//! Class A amount exponent and script-kind flags.
 //!
-//! Bitcoin-style CompactSize for lengths/counts; LEB128 for large positive
-//! magnitudes when useful. Flags collapse common constant cases (final
-//! sequence, empty script/witness).
+//! CompactSize / ULEB128 live in `rbitcoin-primitives`. Flags collapse common
+//! constant cases (final sequence, empty script/witness).
 
 use crate::error::StoreError;
-use rbitcoin_primitives::PackError;
-
-fn pack_err(e: PackError) -> StoreError {
-    StoreError::Corrupt(e.0)
-}
-
-#[inline]
-pub fn compact_size_len(n: u64) -> usize {
-    rbitcoin_primitives::compact_size_len(n)
-}
-
-pub fn write_compact_size(out: &mut Vec<u8>, n: u64) {
-    rbitcoin_primitives::write_compact_size(out, n)
-}
-
-pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), StoreError> {
-    rbitcoin_primitives::read_compact_size(buf).map_err(pack_err)
-}
-
-#[inline]
-pub fn uleb128_len(n: u64) -> usize {
-    rbitcoin_primitives::uleb128_len(n)
-}
-
-pub fn write_uleb128_into(dst: &mut [u8], n: u64) -> Result<usize, StoreError> {
-    rbitcoin_primitives::write_uleb128_into(dst, n).map_err(pack_err)
-}
-
-pub fn write_uleb128(out: &mut Vec<u8>, n: u64) {
-    rbitcoin_primitives::write_uleb128(out, n)
-}
-
-pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
-    rbitcoin_primitives::read_uleb128(buf).map_err(pack_err)
-}
+use rbitcoin_primitives::{read_compact_size, read_uleb128, write_compact_size};
 
 /// Trailing decimal zeros stripped from a satoshi amount, capped at 9.
 /// Nibble values 10–15 are Corrupt (soft-extend), not extra exponent.
@@ -377,28 +342,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_size_roundtrip() {
-        for n in [0u64, 1, 252, 253, 1000, u32::MAX as u64, u64::MAX] {
-            let mut buf = Vec::new();
-            write_compact_size(&mut buf, n);
-            let (v, used) = read_compact_size(&buf).unwrap();
-            assert_eq!(v, n);
-            assert_eq!(used, buf.len());
-            assert_eq!(compact_size_len(n), buf.len());
-        }
-        assert_eq!(compact_size_len(252), 1);
-        assert_eq!(compact_size_len(253), 3);
-        assert_eq!(compact_size_len(u16::MAX as u64), 3);
-        assert_eq!(compact_size_len(u16::MAX as u64 + 1), 5);
-        assert_eq!(compact_size_len(u32::MAX as u64), 5);
-        assert_eq!(compact_size_len(u32::MAX as u64 + 1), 9);
-        assert_eq!(uleb128_len(0), 1);
-        assert_eq!(uleb128_len(127), 1);
-        assert_eq!(uleb128_len(128), 2);
-        assert!(uleb128_len(u64::MAX) >= 9);
-    }
-
-    #[test]
     fn amount_exp_mantissa_strips_trailing_tens() {
         assert_eq!(amount_exp_mantissa(0), (0, 0));
         assert_eq!(amount_exp_mantissa(546), (0, 546));
@@ -434,68 +377,5 @@ mod tests {
         assert!(scale_amount_exp(1, 10).is_err());
         assert!(scale_amount_exp(3, 0).is_err());
         assert_eq!(scale_amount_exp(0, 0).unwrap(), 0);
-    }
-
-    #[test]
-    fn uleb_roundtrip() {
-        for n in [0u64, 1, 127, 128, 255, 300, u32::MAX as u64, u64::MAX >> 1] {
-            let mut buf = Vec::new();
-            write_uleb128(&mut buf, n);
-            let (v, used) = read_uleb128(&buf).unwrap();
-            assert_eq!(v, n);
-            assert_eq!(used, buf.len());
-        }
-    }
-
-    #[test]
-    fn write_uleb128_into_matches_vec() {
-        for n in [0u64, 127, 128, 255, 300, u32::MAX as u64, u64::MAX] {
-            let mut vec = Vec::new();
-            write_uleb128(&mut vec, n);
-            let mut dst = [0u8; 16];
-            let used = write_uleb128_into(&mut dst, n).unwrap();
-            assert_eq!(used, vec.len());
-            assert_eq!(used, uleb128_len(n));
-            assert_eq!(&dst[..used], vec.as_slice());
-        }
-        assert!(matches!(
-            write_uleb128_into(&mut [0u8; 1], 128),
-            Err(StoreError::Corrupt(_))
-        ));
-    }
-
-    #[test]
-    fn compact_and_uleb_error_paths() {
-        assert!(matches!(
-            read_compact_size(&[]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            read_compact_size(&[253, 1]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            read_compact_size(&[254, 1, 2, 3]),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            read_compact_size(&[255, 1, 2, 3, 4, 5, 6, 7]),
-            Err(StoreError::Corrupt(_))
-        ));
-        // truncated multi-byte uleb128
-        assert!(matches!(read_uleb128(&[0x80]), Err(StoreError::Corrupt(_))));
-        // overflow: more than 10 continuation groups
-        let mut over = vec![0x80u8; 10];
-        over.push(0x01);
-        assert!(matches!(read_uleb128(&over), Err(StoreError::Corrupt(_))));
-        // happy truncated-size boundaries still parse when full
-        let (v, n) = read_compact_size(&[253, 0, 1]).unwrap();
-        assert_eq!((v, n), (256, 3));
-        let (v, n) = read_compact_size(&[254, 0, 0, 1, 0]).unwrap();
-        assert_eq!((v, n), (1 << 16, 5));
-        let mut u64b = vec![255u8];
-        u64b.extend_from_slice(&u64::MAX.to_le_bytes());
-        let (v, n) = read_compact_size(&u64b).unwrap();
-        assert_eq!((v, n), (u64::MAX, 9));
     }
 }

@@ -8,7 +8,7 @@
 use crate::error::MempoolError;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, Wtxid};
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{read_compact_size, write_compact_size, Fk};
 use rbitcoin_store::OutputRecord;
 
 const VIN_SEQ_FINAL: u8 = 1 << 0;
@@ -268,14 +268,6 @@ fn take_arr<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], Memp
     let arr = buf[*off..end].try_into().unwrap();
     *off = end;
     Ok(arr)
-}
-
-fn write_compact_size(out: &mut Vec<u8>, n: u64) {
-    rbitcoin_primitives::write_compact_size(out, n)
-}
-
-fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), MempoolError> {
-    rbitcoin_primitives::read_compact_size(buf).map_err(|e| MempoolError::Corrupt(e.0))
 }
 
 #[cfg(test)]

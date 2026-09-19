@@ -21,9 +21,12 @@ const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
 ///
 /// `OP_1 <pubkey1> <pubkey2> OP_2 OP_CHECKMULTISIG` (1-of-2).
 pub fn default_signet_challenge() -> ScriptBuf {
-    ScriptBuf::from_bytes(hex_decode(
-        "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
-    ))
+    ScriptBuf::from_bytes(
+        rbitcoin_primitives::hex_decode(
+            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
+        )
+        .expect("hex"),
+    )
 }
 
 /// Derive the four P2P message-start bytes for a BIP325 challenge.
@@ -35,13 +38,6 @@ pub fn signet_magic(challenge: &Script) -> [u8; 4] {
     sha256d::Hash::hash(&encoded).to_byte_array()[..4]
         .try_into()
         .expect("four-byte digest prefix")
-}
-
-fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-        .collect()
 }
 
 /// Validate BIP325 signet block solution against `challenge`.
@@ -262,15 +258,9 @@ fn parse_signet_solution(solution: &[u8]) -> Result<(ScriptBuf, Witness), Consen
     Ok((script_sig, witness))
 }
 
-fn read_compact_size(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
-    let (v, n) = rbitcoin_primitives::read_compact_size(rdr)
-        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))?;
-    *rdr = &rdr[n..];
-    Ok(v)
-}
-
 fn read_script(rdr: &mut &[u8]) -> Result<ScriptBuf, ConsensusError> {
-    let n = read_compact_size(rdr)? as usize;
+    let n = rbitcoin_primitives::read_compact_size_from(rdr)
+        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))? as usize;
     if rdr.len() < n {
         return Err(ConsensusError::BadBlock("signet: scriptSig short"));
     }
@@ -280,10 +270,13 @@ fn read_script(rdr: &mut &[u8]) -> Result<ScriptBuf, ConsensusError> {
 }
 
 fn read_witness_stack(rdr: &mut &[u8]) -> Result<Witness, ConsensusError> {
-    let count = read_compact_size(rdr)? as usize;
+    let count = rbitcoin_primitives::read_compact_size_from(rdr)
+        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))? as usize;
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        let n = read_compact_size(rdr)? as usize;
+        let n = rbitcoin_primitives::read_compact_size_from(rdr)
+            .map_err(|_| ConsensusError::BadBlock("signet: compact size"))?
+            as usize;
         if rdr.len() < n {
             return Err(ConsensusError::BadBlock("signet: witness short"));
         }
@@ -538,27 +531,30 @@ mod tests {
 
     #[test]
     fn compact_size_and_solution_parse_errors() {
-        assert_eq!(read_compact_size(&mut (&[0u8][..])).unwrap(), 0);
-        assert_eq!(read_compact_size(&mut (&[252u8][..])).unwrap(), 252);
+        use rbitcoin_primitives::read_compact_size_from;
+        assert_eq!(read_compact_size_from(&mut (&[0u8][..])).unwrap(), 0);
+        assert_eq!(read_compact_size_from(&mut (&[252u8][..])).unwrap(), 252);
         // 253 + u16 LE
         let mut r = &[253u8, 0x01, 0x00][..];
-        assert_eq!(read_compact_size(&mut r).unwrap(), 1);
+        assert_eq!(read_compact_size_from(&mut r).unwrap(), 1);
         // 254 + u32
         let mut r = &[254u8, 0x02, 0x00, 0x00, 0x00][..];
-        assert_eq!(read_compact_size(&mut r).unwrap(), 2);
+        assert_eq!(read_compact_size_from(&mut r).unwrap(), 2);
         // 255 + u64
         let mut r = &[255u8, 0x03, 0, 0, 0, 0, 0, 0, 0][..];
-        assert_eq!(read_compact_size(&mut r).unwrap(), 3);
+        assert_eq!(read_compact_size_from(&mut r).unwrap(), 3);
 
-        assert!(read_compact_size(&mut (&[][..])).is_err());
-        assert!(read_compact_size(&mut (&[253u8][..])).is_err());
-        assert!(read_compact_size(&mut (&[254u8, 0][..])).is_err());
-        assert!(read_compact_size(&mut (&[255u8, 0, 0, 0][..])).is_err());
+        assert!(read_compact_size_from(&mut (&[][..])).is_err());
+        assert!(read_compact_size_from(&mut (&[253u8][..])).is_err());
+        assert!(read_compact_size_from(&mut (&[254u8, 0][..])).is_err());
+        assert!(read_compact_size_from(&mut (&[255u8, 0, 0, 0][..])).is_err());
 
         // Empty solution: scriptSig compact 0 + witness count 0.
         let (ss, wit) = parse_signet_solution(&[0x00, 0x00]).unwrap();
         assert!(ss.is_empty());
         assert_eq!(wit.len(), 0);
+        // Truncated CompactSize in the solution.
+        assert!(parse_signet_solution(&[253]).is_err());
         // Extraneous tail.
         assert!(parse_signet_solution(&[0x00, 0x00, 0xff]).is_err());
         // Short script.

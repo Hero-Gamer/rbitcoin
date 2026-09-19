@@ -10,8 +10,8 @@ mod script_sigops;
 mod scriptnum;
 
 pub use compact::{
-    compact_size_len, read_compact_size, read_uleb128, uleb128_len, write_compact_size,
-    write_uleb128, write_uleb128_into, PackError,
+    compact_size_len, read_compact_size, read_compact_size_from, read_uleb128, uleb128_len,
+    write_compact_size, write_uleb128, write_uleb128_into, PackError,
 };
 pub use hex::{
     decode as hex_decode, display_hash_hex, encode as hex_encode, parse_display_hash32,

@@ -4,7 +4,6 @@
 //! paged / extent). Body slabs pack ULEB128 fk deltas; vouts expanded from
 //! Class A at query.
 
-use crate::compact::uleb128_len;
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
@@ -35,7 +34,7 @@ use crate::scripthash_slabs::{
 use crate::scripthash_sorted_head::SortedHead;
 use crate::sorted_run::{list_materialize_claims, list_runs};
 use bitcoin_hashes::{sha256, Hash};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{uleb128_len, Fk, TableKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
