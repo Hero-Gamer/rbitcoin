@@ -53,6 +53,11 @@ before 1.0).
   plus the documented mempool `socketPath` patch, not cookie/Basic.
   Address-prefix stays 404. Surface: [`COMPAT.md`](COMPAT.md).
 
+- **Esplora HTTP SH join:** last-1 GET + last-bulk POST (16 MiB packed/client)
+  keyed by `X-Rbitcoin-Client` (unix listen or TCP loopback; 30s idle; 256
+  clients). Public TCP ignores the header. Not an 8-script LRU and not a >5s
+  process whale cache.
+
 ## [0.7.0] — 2026-09-18
 
 Named published **0.7** line. **Not 1.0.** Patch branch is `v0.7.x`. Schema 24
