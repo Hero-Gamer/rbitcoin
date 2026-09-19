@@ -488,6 +488,7 @@ async fn accept_client_ping_and_shutdown() {
     assert_eq!(features["chain_tip"], json!(true));
     assert_eq!(features["asof"], json!(true));
     assert_eq!(features["asof_protocol"], PROTOCOL_ASOF);
+    assert_eq!(features["hosts"], json!({}));
 
     let probe = electrum_tcp_rpc(
         &mut stream,
@@ -1950,6 +1951,56 @@ fn broadcast_hex_cap_enforced() {
     )
     .unwrap_err();
     assert!(pkg_err.contains("too large"), "{pkg_err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn features_hosts_onion_tcp() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let empty = dispatch(
+        "server.features",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert_eq!(empty["hosts"], json!({}));
+    cfg.onion_tcp
+        .set((
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(),
+            50001,
+        ))
+        .unwrap();
+    let got = dispatch(
+        "server.features",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert_eq!(
+        got["hosts"],
+        json!({
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion": { "tcp_port": 50001 }
+        })
+    );
+    assert!(got["hosts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|v| v.get("ssl_port").is_none()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

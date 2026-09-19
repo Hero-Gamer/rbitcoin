@@ -19,7 +19,7 @@ use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
 
@@ -615,6 +615,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
+    let electrum_onion = Arc::new(OnceLock::<(String, u16)>::new());
     let (electrum_handles, electrum_bridge) = start_electrum_if_ready(
         sh_tip_ready,
         config.listen.electrum,
@@ -623,6 +624,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &node.hub,
         &params,
         &mempool,
+        Arc::clone(&electrum_onion),
     )
     .await;
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
@@ -634,6 +636,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             hs.service_id,
             h.local_addr.port()
         );
+        let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
     }
     let (esplora_handles, esplora_tip_bridge) = start_esplora_if_ready(
         sh_tip_ready,
@@ -1316,6 +1319,7 @@ async fn start_electrum_if_ready(
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
+    onion_tcp: Arc<OnceLock<(String, u16)>>,
 ) -> (Vec<ElectrumHandle>, Option<tokio::task::JoinHandle<()>>) {
     let Some(addr) = addr else {
         return (Vec::new(), None);
@@ -1334,6 +1338,7 @@ async fn start_electrum_if_ready(
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
     ecfg.tweaks_min_dust = tweaks_min_dust;
+    ecfg.onion_tcp = onion_tcp;
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();

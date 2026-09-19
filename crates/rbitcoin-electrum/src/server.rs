@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -133,6 +133,8 @@ pub struct ElectrumConfig {
     /// Omit served P2TR outs with `value <=` this (sats). `0` serves all.
     /// Default [`crate::tweaks::DEFAULT_TWEAKS_MIN_DUST`].
     pub tweaks_min_dust: u64,
+    /// Tor v3 hostname + TCP port for `server.features.hosts` (empty until set).
+    pub onion_tcp: Arc<OnceLock<(String, u16)>>,
 }
 
 impl ElectrumConfig {
@@ -149,6 +151,7 @@ impl ElectrumConfig {
             max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
             tweaks_chunk: crate::tweaks::SUBSCRIBE_CHUNK,
             tweaks_min_dust: crate::tweaks::DEFAULT_TWEAKS_MIN_DUST,
+            onion_tcp: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1452,24 +1455,30 @@ fn dispatch_pinned(
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!(config.banner)),
         "server.donation_address" => Ok(json!(config.donation_address)),
-        "server.features" => Ok(json!({
-            "genesis_hash": config.genesis_hash_hex,
-            "hosts": {},
-            "protocol_max": PROTOCOL_MAX,
-            "protocol_min": PROTOCOL_MIN,
-            "server_version": SERVER_VERSION,
-            "hash_function": "sha256",
-            "pruning": null,
-            // Cake gates SP on version[0] containing "electrs", then probes the
-            // tweaks method — not features. Other clients (and future Cake) can
-            // still see SP here without a dummy RPC. Cake electrs does not
-            // implement server.features.
-            "silent_payments": [0],
-            "tweaks": true,
-            "chain_tip": true,
-            "asof": true,
-            "asof_protocol": PROTOCOL_ASOF,
-        })),
+        "server.features" => {
+            let hosts = match config.onion_tcp.get() {
+                Some((host, port)) => json!({ host: { "tcp_port": port } }),
+                None => json!({}),
+            };
+            Ok(json!({
+                "genesis_hash": config.genesis_hash_hex,
+                "hosts": hosts,
+                "protocol_max": PROTOCOL_MAX,
+                "protocol_min": PROTOCOL_MIN,
+                "server_version": SERVER_VERSION,
+                "hash_function": "sha256",
+                "pruning": null,
+                // Cake gates SP on version[0] containing "electrs", then probes the
+                // tweaks method — not features. Other clients (and future Cake) can
+                // still see SP here without a dummy RPC. Cake electrs does not
+                // implement server.features.
+                "silent_payments": [0],
+                "tweaks": true,
+                "chain_tip": true,
+                "asof": true,
+                "asof_protocol": PROTOCOL_ASOF,
+            }))
+        }
         "blockchain.headers.subscribe" => {
             *header_sub = true;
             tip_header_obj(query)
