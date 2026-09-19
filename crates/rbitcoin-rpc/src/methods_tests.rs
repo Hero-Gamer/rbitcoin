@@ -4223,6 +4223,34 @@ fn getnetworkinfo_localaddresses_from_externalip() {
 }
 
 #[test]
+fn getnetworkinfo_includes_electrum_onion() {
+    use rbitcoin_net::PeerHub;
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_discover(false);
+    hub.set_wallet_onion(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion".into(),
+        50001,
+    );
+    hub.set_wallet_onion(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabce.onion".into(),
+        3000,
+    );
+    ctx.peers = Some(hub);
+    let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let addrs = info["localaddresses"].as_array().expect("array");
+    assert_eq!(addrs.len(), 2, "{info}");
+    assert_eq!(
+        addrs[0]["address"],
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion"
+    );
+    assert_eq!(addrs[0]["port"], 50001);
+    assert_eq!(addrs[1]["port"], 3000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn getpeerinfo_lists_registered_session() {
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_network::VersionMessage;

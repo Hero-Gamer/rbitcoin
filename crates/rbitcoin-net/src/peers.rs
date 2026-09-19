@@ -1105,6 +1105,7 @@ pub struct PeerHub {
     peer_timeout_secs: AtomicU64,
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
     external_ips: Mutex<Vec<IpAddr>>,
+    wallet_onions: Mutex<Vec<(String, u16)>>,
     /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
@@ -1182,6 +1183,7 @@ impl PeerHub {
             addr_response_cache: Mutex::new(HashMap::new()),
             peer_timeout_secs: AtomicU64::new(60),
             external_ips: Mutex::new(Vec::new()),
+            wallet_onions: Mutex::new(Vec::new()),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             asmap: Mutex::new(None),
@@ -1239,6 +1241,13 @@ impl PeerHub {
         *self.external_ips.lock().unwrap_or_else(|e| e.into_inner()) = ips;
     }
 
+    pub fn set_wallet_onion(&self, host: String, port: u16) {
+        self.wallet_onions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((host, port));
+    }
+
     pub fn set_listen_port(&self, port: u16) {
         self.listen_port.store(port, Ordering::Relaxed);
     }
@@ -1250,21 +1259,31 @@ impl PeerHub {
     /// `getnetworkinfo.localaddresses` rows for operator-advertised IPs.
     pub fn rpc_local_addresses(&self) -> Vec<(String, u16, i32)> {
         const LOCAL_MANUAL: i32 = 4;
+        let mut rows: Vec<(String, u16, i32)> = self
+            .wallet_onions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .map(|(address, port)| (address, port, LOCAL_MANUAL))
+            .collect();
         if !self.discover.load(Ordering::Relaxed) {
-            return Vec::new();
+            return rows;
         }
         let port = self.listen_port.load(Ordering::Relaxed);
         if port == 0 {
-            return Vec::new();
+            return rows;
         }
         let ips = self
             .external_ips
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        ips.into_iter()
-            .map(|ip| (ip.to_string(), port, LOCAL_MANUAL))
-            .collect()
+        rows.extend(
+            ips.into_iter()
+                .map(|ip| (ip.to_string(), port, LOCAL_MANUAL)),
+        );
+        rows
     }
 
     pub fn advertise_local_socket(&self) -> Option<SocketAddr> {

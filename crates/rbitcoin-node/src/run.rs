@@ -662,6 +662,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             h.local_addr.port()
         );
         let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
+        node.peers
+            .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
     }
     let (esplora_handles, esplora_tip_bridge) = start_esplora_if_ready(
         sh_tip_ready,
@@ -683,6 +685,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 hs.service_id,
                 h.local_addr.port()
             );
+            node.peers
+                .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
         }
     }
 
