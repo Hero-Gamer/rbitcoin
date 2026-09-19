@@ -32,6 +32,10 @@ let
           onionProxy = "127.0.0.1:9050";
           proxyRandomize = true;
           onlyNet = [ "onion" ];
+          tor = {
+            control = "127.0.0.1:9051";
+            controlCookie = "/run/tor/control.authcookie";
+          };
           p2p = {
             address = "127.0.0.1";
             openFirewall = true;
@@ -40,6 +44,7 @@ let
           electrum = {
             enable = true;
             openFirewall = true;
+            hiddenService = true;
           };
           esplora = {
             enable = true;
@@ -91,6 +96,9 @@ assert defaultCfg.proxy == null;
 assert defaultCfg.onionProxy == null;
 assert defaultCfg.proxyRandomize == true;
 assert defaultCfg.onlyNet == [ ];
+assert defaultCfg.tor.control == null;
+assert defaultCfg.tor.controlCookie == null;
+assert defaultCfg.electrum.hiddenService == false;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -117,6 +125,10 @@ assert builtins.match ".*--max-outbound 8.*" execStart != null;
 assert builtins.match ".*--proxy 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--onion 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--only-net onion.*" execStart != null;
+assert builtins.match ".*--tor-control 127.0.0.1:9051.*" execStart != null;
+assert builtins.match ".*--tor-control-cookie /run/tor/control.authcookie.*" execStart != null;
+assert builtins.elem "tor.service" service.after;
+assert builtins.elem "tor.service" service.wants;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;

@@ -39,6 +39,15 @@ let
     else
       "${address}:${toString port}";
 
+  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService;
+  torControlAddr =
+    if cfg.tor.control != null then
+      cfg.tor.control
+    else if cfg.electrum.hiddenService then
+      "127.0.0.1:9051"
+    else
+      null;
+
   command = [
     "${cfg.package}/bin/rbitcoin-node"
     "--datadir"
@@ -78,6 +87,10 @@ let
   ++ optional (cfg.onionProxy != null) cfg.onionProxy
   ++ optional (!cfg.proxyRandomize) "--proxy-randomize=0"
   ++ lib.concatMap (n: [ "--only-net" n ]) cfg.onlyNet
+  ++ optional (torControlAddr != null) "--tor-control"
+  ++ optional (torControlAddr != null) torControlAddr
+  ++ optional (cfg.tor.controlCookie != null) "--tor-control-cookie"
+  ++ optional (cfg.tor.controlCookie != null) (toString cfg.tor.controlCookie)
   ++ cfg.extraArgs;
 in
 {
@@ -165,6 +178,22 @@ in
       type = types.listOf types.str;
       default = [ ];
       description = "Additional command-line arguments appended after module-managed arguments.";
+    };
+
+    tor = {
+      control = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9051";
+        description = "System tor control HOST:PORT. Unset skips the control connection.";
+      };
+
+      controlCookie = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/tor/control.authcookie";
+        description = "Tor control cookie file. Default in the node is /run/tor/control.authcookie when --tor-control is set.";
+      };
     };
 
     proxy = mkOption {
@@ -271,6 +300,12 @@ in
         default = false;
         description = "Open the Electrum listen port in the NixOS firewall.";
       };
+
+      hiddenService = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for Electrum when --electrum-listen is on. Implies tor.control 127.0.0.1:9051 if unset.";
+      };
     };
 
     esplora = {
@@ -330,8 +365,8 @@ in
       description = "rbitcoin full node";
       documentation = [ "https://github.com/reardencode/rbitcoin/blob/master/OPERATOR.md" ];
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ] ++ optional needTorControl "tor.service";
+      after = [ "network-online.target" ] ++ optional needTorControl "tor.service";
       environment = cfg.environment;
 
       serviceConfig = {
@@ -347,6 +382,9 @@ in
         ProtectHome = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ cfg.dataDir ] ++ optional (cfg.coldDataDir != null) cfg.coldDataDir;
+      }
+      // lib.optionalAttrs (cfg.tor.controlCookie != null) {
+        SupplementaryGroups = [ "tor" ];
       };
     };
 

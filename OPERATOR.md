@@ -373,6 +373,9 @@ Clean smoke:
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
 | `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
 | `--proxy-randomize[=0\|1]` | `proxy_randomize=` | **on** — fresh SOCKS username per peer (Tor circuit isolation) |
+| `--tor-control [HOST:PORT]` | `tor_control=` | unset — no control connection; omit ADDR → `127.0.0.1:9051` |
+| `--tor-control-cookie PATH` | `tor_control_cookie=` | `/run/tor/control.authcookie` when `--tor-control` is set and password is unset |
+| `--tor-control-password PASS` | `tor_control_password=` | unset — cookie AUTH unless set |
 | `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
 | `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
@@ -447,6 +450,15 @@ error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
 forward). `--max-inbound 0` refuses inbound slots. `--no-discover` does not
 self-announce even when `--external-ip` is set. A later onion inbound bind
 does not require a public clearnet listen.
+
+`--tor-control [HOST:PORT]` talks to **system tor** (cookie or password). Omit
+ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
+socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
+`127.0.0.1:<bound>` and logs `….onion:port`. The private key is
+`{datadir}/onion/electrum.priv` (0600). `server.features.hosts` is
+`{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. JSON-RPC stays off
+the onion (`rpc.sock` / `--rpc-listen` only). Cookie path differs by distro;
+pass `--tor-control-cookie` rather than globbing.
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
