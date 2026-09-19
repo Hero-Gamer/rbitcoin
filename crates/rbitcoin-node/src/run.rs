@@ -689,6 +689,34 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
         }
     }
+    let mut i2p_wallet = Vec::new();
+    if config.listen.i2p_accept_incoming {
+        if let Some(addr) = config.listen.i2p_sam {
+            if let Some(h) = electrum_handles.first() {
+                i2p_wallet.push(
+                    start_i2p_named_forward(
+                        addr,
+                        config.datadir.path(),
+                        "electrum",
+                        h.local_addr.port(),
+                    )
+                    .await?,
+                );
+            }
+            if let Some(h) = esplora_handles.first() {
+                i2p_wallet.push(
+                    start_i2p_named_forward(
+                        addr,
+                        config.datadir.path(),
+                        "esplora",
+                        h.local_addr.port(),
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+    let _i2p_wallet = i2p_wallet;
 
     let mut rpc_handle: Option<RpcHandle> = None;
     if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {
@@ -1350,6 +1378,23 @@ fn electrum_tip_notify(ev: TipEvent) -> Option<TipNotify> {
             None
         },
     })
+}
+
+async fn start_i2p_named_forward(
+    sam_addr: SocketAddr,
+    datadir: &Path,
+    name: &str,
+    port: u16,
+) -> Result<rbitcoin_net::I2pSam, NodeError> {
+    let dest = datadir.join("i2p").join(format!("{name}.priv"));
+    let mut sam = rbitcoin_net::I2pSam::connect_persistent(sam_addr, &dest)
+        .await
+        .map_err(|e| NodeError::Init(format!("i2p {name} session: {e}")))?;
+    sam.stream_forward(port)
+        .await
+        .map_err(|e| NodeError::Init(format!("i2p {name} STREAM FORWARD {port}: {e}")))?;
+    info!("i2p {name} STREAM FORWARD to 127.0.0.1:{port}");
+    Ok(sam)
 }
 
 async fn start_electrum_if_ready(
@@ -2629,6 +2674,81 @@ mod tests {
         // Bind fail is non-fatal warn; run should still complete.
         result.unwrap().expect("run_p2p despite electrum fail");
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn electrum_i2p_forward_when_sam_incoming() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn write_line(s: &mut TcpStream, line: &str) {
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.write_all(b"\n").await.unwrap();
+            s.flush().await.unwrap();
+        }
+        async fn read_line(s: &mut TcpStream) -> Option<String> {
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log_acc = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = Arc::clone(&log_acc);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(line) = read_line(&mut s).await else {
+                            break;
+                        };
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("HELLO VERSION") {
+                            write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
+                        } else if up.starts_with("SESSION CREATE") {
+                            write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=walletfake")
+                                .await;
+                        } else if up.starts_with("STREAM FORWARD") {
+                            log.lock().unwrap().push(line);
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbtc-i2p-wallet-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sam = start_i2p_named_forward(addr, &dir, "electrum", 50001)
+            .await
+            .unwrap();
+        drop(sam);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("i2p").join("electrum.priv"))
+                .unwrap()
+                .trim(),
+            "walletfake"
+        );
+        let fw = log.lock().unwrap().clone();
+        assert_eq!(fw.len(), 1, "{fw:?}");
+        assert!(fw[0].contains("PORT=50001"), "{}", fw[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
