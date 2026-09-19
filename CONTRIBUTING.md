@@ -240,12 +240,11 @@ checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
 failed without digging into a monolithic job log.
 
 **Agents** implement in **one git worktree per session**, a topic branch per
-PR, commit per plan step, and open **one PR** per plan. Each step runs
-Red → Green → workspace suite → Refactor → local CI except coverage, then
-commits before the next step ([`docs/how-we-plan.md`](./docs/how-we-plan.md)).
-Coverage and native `windows` / `macos` stay GitHub Actions; poll those to
-green. After merge they delete the local **and** remote topic branch and keep
-the session worktree. Start at [`docs/ORIENT.md`](./docs/ORIENT.md).
+PR, and **one PR** per plan. Each plan step follows
+[`docs/how-we-plan.md`](./docs/how-we-plan.md) and is committed only after
+local CI except coverage. Coverage and native `windows` / `macos` stay
+GitHub Actions. After merge they delete the topic branch and keep the
+session worktree. Start at [`docs/ORIENT.md`](./docs/ORIENT.md).
 Ship commands: [`.agents/skills/ship-pr/SKILL.md`](./.agents/skills/ship-pr/SKILL.md).
 
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):
@@ -280,8 +279,6 @@ IO; they do not package zips. GitHub Releases:
 
 - Small, reviewable commits with complete sentences in the message body.
 - Production code and its covering scenarios land together.
-- A plan step commits only after local CI except coverage
-  ([`docs/how-we-plan.md`](./docs/how-we-plan.md)).
 - Do **not** commit live `datadir-*/`, operator `*.log` dumps, secrets, or keys
   (see `.gitignore`).
 
