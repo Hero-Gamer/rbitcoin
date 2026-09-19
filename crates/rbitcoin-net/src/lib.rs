@@ -11,6 +11,7 @@ mod ibd;
 mod most_work;
 mod msg_decode;
 mod net_permissions;
+mod netaddr;
 mod netgroup;
 mod peer;
 mod peer_dos;
@@ -43,6 +44,7 @@ pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
+pub use netaddr::NetAddr;
 pub use netgroup::netgroup;
 pub use peer::{
     drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,

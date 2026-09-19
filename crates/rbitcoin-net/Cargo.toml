@@ -19,6 +19,7 @@ bip324 = { workspace = true }
 tokio = { workspace = true }
 arc-swap = { workspace = true }
 getrandom = "0.4"
+sha3 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # POLLRDHUP: peer FIN with unread bytes still in the receive buffer.
