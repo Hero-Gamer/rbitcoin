@@ -62,7 +62,8 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   inbound frame size limit, and per-connection address/tx track caps
   (defaults 64/64 KiB/64/64). Excess connections and oversize
   lines/bodies/frames fail closed without hanging accept. Esplora is
-  opt-in (`--esplora-listen`). Edge TLS, multi-tenant metering, and API keys
+  opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
+  listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
   mislead a **wallet** backend are in scope.

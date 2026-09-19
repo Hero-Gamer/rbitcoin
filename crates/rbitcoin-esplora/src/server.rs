@@ -691,6 +691,38 @@ impl AppState {
     }
 }
 
+/// electrs `/internal/*` bulk REST. Merged only on unix listen.
+#[cfg(unix)]
+fn internal_routes() -> Router<AppState> {
+    Router::new()
+        .route("/internal/txs", post(crate::internal::post_internal_txs))
+        .route(
+            "/internal/mempool/txs/all",
+            get(crate::internal::get_internal_mempool_txs_all),
+        )
+        .route(
+            "/internal/mempool/txs",
+            get(crate::internal::get_internal_mempool_txs)
+                .post(crate::internal::post_internal_mempool_txs),
+        )
+        .route(
+            "/internal/mempool/txs/{last}",
+            get(crate::internal::get_internal_mempool_txs_cursor),
+        )
+        .route(
+            "/internal/block/{hash}/txs",
+            get(crate::internal::get_internal_block_txs),
+        )
+        .route(
+            "/internal/txs/outspends/by-txid",
+            post(crate::internal::post_outspends_by_txid),
+        )
+        .route(
+            "/internal/txs/outspends/by-outpoint",
+            post(crate::internal::post_outspends_by_outpoint),
+        )
+}
+
 /// Start Esplora **plain HTTP** (+ wallet WebSocket) on `config.listen`.
 ///
 /// TLS is external (reverse proxy). App [`ServeLimits`] always apply to REST
@@ -743,7 +775,7 @@ pub async fn run_esplora(
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).
-    let rest = Router::new()
+    let mut rest = Router::new()
         .route("/block-template", get(handlers::block_template))
         .route("/blocks/tip/height", get(tip_height))
         .route("/blocks/tip/hash", get(tip_hash))
@@ -843,33 +875,14 @@ pub async fn run_esplora(
         .route("/mempool/recent", get(handlers::mempool_recent))
         .route("/fee-estimates", get(handlers::fee_estimates))
         .route("/fees/recommended", get(handlers::fees_recommended))
-        .route("/v1/fees/recommended", get(handlers::fees_recommended))
-        .route("/internal/txs", post(crate::internal::post_internal_txs))
-        .route(
-            "/internal/mempool/txs/all",
-            get(crate::internal::get_internal_mempool_txs_all),
-        )
-        .route(
-            "/internal/mempool/txs",
-            get(crate::internal::get_internal_mempool_txs)
-                .post(crate::internal::post_internal_mempool_txs),
-        )
-        .route(
-            "/internal/mempool/txs/{last}",
-            get(crate::internal::get_internal_mempool_txs_cursor),
-        )
-        .route(
-            "/internal/block/{hash}/txs",
-            get(crate::internal::get_internal_block_txs),
-        )
-        .route(
-            "/internal/txs/outspends/by-txid",
-            post(crate::internal::post_outspends_by_txid),
-        )
-        .route(
-            "/internal/txs/outspends/by-outpoint",
-            post(crate::internal::post_outspends_by_outpoint),
-        )
+        .route("/v1/fees/recommended", get(handlers::fees_recommended));
+    #[cfg(unix)]
+    {
+        if matches!(config.listen, EsploraListen::Unix(_)) {
+            rest = rest.merge(internal_routes());
+        }
+    }
+    let rest = rest
         .fallback(fallback_404)
         // Outer → inner: concurrency → body → timeout → meter → chain-view stamp.
         .layer(middleware::from_fn_with_state(
@@ -1528,6 +1541,28 @@ mod tests {
         let (st, body) = http_get_unix(&sock, "/blocks/tip/height").await;
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "0");
+        let (st, body) = http_get_unix(&sock, "/internal/mempool/txs").await;
+        assert_eq!(st, 200, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tcp_internal_routes_are_404() {
+        let (dir, q) = temp_query("esplora-tcp-internal-404");
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::new(q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+        let (st, body) = http_get(addr, "/internal/mempool/txs").await;
+        assert_eq!(st, 404, "TCP GET /internal/mempool/txs: {body}");
+        let (st, body) = http_post(addr, "/internal/txs", b"[]").await;
+        assert_eq!(st, 404, "TCP POST /internal/txs: {body}");
+        let (st, body) = http_get(addr, "/blocks/tip/height").await;
+        assert_eq!(st, 200, "{body}");
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

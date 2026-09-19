@@ -1056,8 +1056,9 @@ no confirmed item. Esplora `oldest_tx`/`newest_tx` are from the returned
 
 Blockstream-**compatible** **plain HTTP** API for **wallet clients** and
 **mempool/electrs HTTP drop-in** (exact address/scripthash, tx/block by id,
-broadcast, `/internal/*`). nginx `/api/` can retire electrs
-([`COMPAT.md`](./COMPAT.md)). Same internet-facing model as Electrum: app DoS
+broadcast). `/internal/*` is **unix listen only** (mempool Node
+`ESPLORA.UNIX_SOCKET_PATH` → `--esplora-listen /path.sock`). nginx `/api/`
+can retire electrs ([`COMPAT.md`](./COMPAT.md)). Same internet-facing model as Electrum: app DoS
 limits always on; terminate TLS at a reverse proxy.
 
 **Requires `--sh-index`.** Without it the node refuses to start.
@@ -1085,11 +1086,12 @@ Leave `--max-sh-creates` at **0** (unlimited join) for explorer backends.
 
 Stock mempool Node + MariaDB + frontend. nginx **`/api/`** → this Esplora
 (TCP or unix); **`/api/v1/`** → their process (`:8999`). Set
-`MEMPOOL.BACKEND=esplora`. Esplora: `--esplora-listen 127.0.0.1:3000` or a
-unix path (`/run/rbitcoin/esplora.sock`, mode **0660**; dummy `Host: api` is
-fine). Core RPC is `{datadir}/rpc.sock` plus the `bitcoin-client`
-`socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic. Requires
-`--sh-index`. Leave `--max-sh-creates` at 0.
+`MEMPOOL.BACKEND=esplora`. Point Node `ESPLORA.UNIX_SOCKET_PATH` at
+`--esplora-listen /run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api`
+is fine) so `/internal/*` is available. TCP `--esplora-listen host:port` is
+public REST+WS only (no `/internal`). Core RPC is `{datadir}/rpc.sock` plus the
+`bitcoin-client` `socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic.
+Requires `--sh-index`. Leave `--max-sh-creates` at 0.
 
 ## Core-class JSON-RPC
 
@@ -1138,7 +1140,7 @@ const client = axios.create({
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](./COMPAT.md)); complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`, `/fees/recommended`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
-| Unknown / non-goal | **404** (address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. **0.8** `/internal/*`: [`COMPAT.md`](./COMPAT.md) |
+| Unknown / non-goal | **404** (address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](./COMPAT.md) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.  
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
@@ -1159,6 +1161,9 @@ location /api/v1/ {
   proxy_set_header Host $host;
   proxy_read_timeout 3600s;
 }
+location ^~ /api/internal/ {
+  return 404;
+}
 location /api/ {
   proxy_pass http://127.0.0.1:3000/;
   proxy_http_version 1.1;
@@ -1173,15 +1178,16 @@ location /api/ {
 `/api/v1/` is mempool's Node (MariaDB catalogue), including **`/api/v1/ws`**.
 `/api/` is rbitcoin Esplora (electrs HTTP), including wallet **`/api/ws`**
 (`--esplora-listen` `/v1/ws` + `/ws`). Register the `/api/v1/` location
-**first** so Node keeps the explorer firehose. Unix Esplora:
-`proxy_pass http://unix:/run/rbitcoin/esplora.sock:`. Caddy: `reverse_proxy`
-with default HTTP/1.1 upgrade support to the same listen. `X-Rbitcoin-Client
-$connection` is how last-1 GET and last-bulk POST joins stick to one nginx
-connection; omit it on a public TCP expose. HTTP/1.1 browsers open several
-`$connection` ids (each GET can miss last-1); terminate **HTTP/2** on this
-location so one tab maps to one connection. Every Esplora REST response and
-the WS upgrade includes `X-Powered-By: rbitcoin-esplora/<version>-<hex>`
-(mempool failover regex).
+**first** so Node keeps the explorer firehose. Deny `/api/internal/` at nginx
+even when Esplora is a unix sock (`proxy_pass` would otherwise forward it).
+Unix Esplora: `proxy_pass http://unix:/run/rbitcoin/esplora.sock:`. Caddy:
+`reverse_proxy` with default HTTP/1.1 upgrade support to the same listen.
+`X-Rbitcoin-Client $connection` is how last-1 GET and last-bulk POST joins
+stick to one nginx connection; omit it on a public TCP expose. HTTP/1.1
+browsers open several `$connection` ids (each GET can miss last-1); terminate
+**HTTP/2** on this location so one tab maps to one connection. Every Esplora
+REST response and the WS upgrade includes
+`X-Powered-By: rbitcoin-esplora/<version>-<hex>` (mempool failover regex).
 
 ## Signet lab
 

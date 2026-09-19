@@ -523,49 +523,110 @@ mod tests {
         }
     }
 
+    fn parse_http(buf: &[u8]) -> (u16, String) {
+        let text = String::from_utf8_lossy(buf).into_owned();
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (status, body)
+    }
+
+    #[cfg(unix)]
+    async fn http_get_unix(sock: &std::path::Path, path: &str) -> (u16, String) {
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(sock).await.expect("unix connect");
+        let req = format!("GET {path} HTTP/1.1\r\nHost: api\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
+    }
+
+    #[cfg(unix)]
+    async fn http_post_unix(sock: &std::path::Path, path: &str, body: &[u8]) -> (u16, String) {
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(sock).await.expect("unix connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: api\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
+    }
+
+    #[cfg(unix)]
+    async fn run_unix(
+        dir: &std::path::Path,
+        q: Arc<Query>,
+        mp: Option<Arc<MempoolHub>>,
+    ) -> (crate::server::EsploraHandle, std::path::PathBuf) {
+        use crate::server::EsploraListen;
+        let sock = dir.join("esplora.sock");
+        let cfg = EsploraConfig::with_listen(
+            EsploraListen::Unix(sock.clone()),
+            bitcoin::Network::Regtest,
+        );
+        let handle = run_esplora(cfg, q, mp, None).await.unwrap();
+        (handle, sock)
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_txs() {
         let pad = pad_hub("internal-txs", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         pad.hub.accept_tx(&a).unwrap();
-        let cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
-            .await
-            .unwrap();
-        let addr = handle.local_addr;
+        let (handle, sock) = run_unix(
+            pad.dir.as_ref(),
+            Arc::clone(&pad.q),
+            Some(Arc::clone(&pad.hub)),
+        )
+        .await;
         let conf = pad.cbs[1].to_string();
         let mem = a.compute_txid().to_string();
         let unknown = "00".repeat(32);
         let body = serde_json::to_vec(&json!([conf, mem, unknown])).unwrap();
-        let (st, resp) = http_post(addr, "/internal/txs", &body).await;
+        let (st, resp) = http_post_unix(&sock, "/internal/txs", &body).await;
         assert_eq!(st, 200, "{resp}");
         let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
         assert_eq!(arr.len(), 2, "{resp}");
-        let (st, resp) = http_post(addr, "/internal/txs", br#"["zz"]"#).await;
+        let (st, resp) = http_post_unix(&sock, "/internal/txs", br#"["zz"]"#).await;
         assert_eq!(st, 400, "{resp}");
-        let (st, resp) = http_post(addr, "/internal/txs", b"[]").await;
+        let (st, resp) = http_post_unix(&sock, "/internal/txs", b"[]").await;
         assert_eq!(st, 200, "{resp}");
         assert_eq!(resp, "[]");
         handle.shutdown().await;
         let _ = pad.dir;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_mempool_txs_post() {
         let pad = pad_hub("internal-mp-post", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         pad.hub.accept_tx(&a).unwrap();
-        let cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
-            .await
-            .unwrap();
-        let addr = handle.local_addr;
+        let (handle, sock) = run_unix(
+            pad.dir.as_ref(),
+            Arc::clone(&pad.q),
+            Some(Arc::clone(&pad.hub)),
+        )
+        .await;
         let conf = pad.cbs[1].to_string();
         let mem = a.compute_txid().to_string();
         let body = serde_json::to_vec(&json!([conf, mem])).unwrap();
-        let (st, resp) = http_post(addr, "/internal/mempool/txs", &body).await;
+        let (st, resp) = http_post_unix(&sock, "/internal/mempool/txs", &body).await;
         assert_eq!(st, 200, "{resp}");
         let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
         assert_eq!(arr.len(), 1, "confirmed omitted: {resp}");
@@ -573,6 +634,7 @@ mod tests {
         let _ = pad.dir;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_mempool_txs_page() {
         let pad = pad_hub("internal-mp-page", 4);
@@ -581,28 +643,30 @@ mod tests {
             let t = spend_true(pad.cbs[i], 1_000 + i as u64, spk.clone());
             pad.hub.accept_tx(&t).unwrap();
         }
-        let cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
-            .await
-            .unwrap();
-        let addr = handle.local_addr;
-        let (st, all) = http_get(addr, "/internal/mempool/txs/all").await;
+        let (handle, sock) = run_unix(
+            pad.dir.as_ref(),
+            Arc::clone(&pad.q),
+            Some(Arc::clone(&pad.hub)),
+        )
+        .await;
+        let (st, all) = http_get_unix(&sock, "/internal/mempool/txs/all").await;
         assert_eq!(st, 200, "{all}");
         let all_arr: Vec<Value> = serde_json::from_str(&all).unwrap();
         assert_eq!(all_arr.len(), 3);
-        let (st, p1) = http_get(addr, "/internal/mempool/txs?max_txs=2").await;
+        let (st, p1) = http_get_unix(&sock, "/internal/mempool/txs?max_txs=2").await;
         assert_eq!(st, 200, "{p1}");
         let a1: Vec<Value> = serde_json::from_str(&p1).unwrap();
         assert_eq!(a1.len(), 2);
         assert!(a1.iter().all(|v| v.get("txid").is_some()), "{p1}");
         let last = a1[1]["txid"].as_str().unwrap();
-        let (st, p2) = http_get(addr, &format!("/internal/mempool/txs/{last}?max_txs=2")).await;
+        let (st, p2) =
+            http_get_unix(&sock, &format!("/internal/mempool/txs/{last}?max_txs=2")).await;
         assert_eq!(st, 200, "{p2}");
         let a2: Vec<Value> = serde_json::from_str(&p2).unwrap();
         assert_eq!(a2.len(), 1);
         let last2 = a2[0]["txid"].as_str().unwrap();
-        let (st, p3) = http_get(addr, &format!("/internal/mempool/txs/{last2}?max_txs=2")).await;
+        let (st, p3) =
+            http_get_unix(&sock, &format!("/internal/mempool/txs/{last2}?max_txs=2")).await;
         assert_eq!(st, 200, "{p3}");
         let a3: Vec<Value> = serde_json::from_str(&p3).unwrap();
         assert!(a3.is_empty(), "{p3}");
@@ -673,51 +737,49 @@ mod tests {
         let _ = pad.dir;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_block_txs() {
         let pad = pad_hub("internal-block-txs", 1);
-        let cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), None, None)
-            .await
-            .unwrap();
-        let addr = handle.local_addr;
+        let (handle, sock) = run_unix(pad.dir.as_ref(), Arc::clone(&pad.q), None).await;
         let g = pad.genesis.to_string();
-        let (st, body) = http_get(addr, &format!("/internal/block/{g}/txs")).await;
+        let (st, body) = http_get_unix(&sock, &format!("/internal/block/{g}/txs")).await;
         assert_eq!(st, 200, "{body}");
         let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
         assert_eq!(arr.len(), 1, "genesis coinbase");
         assert_eq!(arr[0]["vin"][0]["is_coinbase"], true);
-        let (st, ids) = http_get(addr, &format!("/block/{g}/txids")).await;
+        let (st, ids) = http_get_unix(&sock, &format!("/block/{g}/txids")).await;
         assert_eq!(st, 200, "{ids}");
         let txids: Vec<String> = serde_json::from_str(&ids).unwrap();
         assert_eq!(arr.len(), txids.len());
         assert_eq!(arr[0]["txid"].as_str(), Some(txids[0].as_str()));
-        let (st, pubp) = http_get(addr, &format!("/block/{g}/txs")).await;
+        let (st, pubp) = http_get_unix(&sock, &format!("/block/{g}/txs")).await;
         assert_eq!(st, 200, "{pubp}");
         let pub_arr: Vec<Value> = serde_json::from_str(&pubp).unwrap();
         assert_eq!(pub_arr.len(), 1);
-        let (st, miss) = http_get(addr, &format!("/internal/block/{}/txs", "11".repeat(32))).await;
+        let (st, miss) =
+            http_get_unix(&sock, &format!("/internal/block/{}/txs", "11".repeat(32))).await;
         assert_eq!(st, 404, "{miss}");
         handle.shutdown().await;
         let _ = pad.dir;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_outspends() {
         let pad = pad_hub("internal-outspends", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         pad.hub.accept_tx(&a).unwrap();
-        let cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
-            .await
-            .unwrap();
-        let addr = handle.local_addr;
+        let (handle, sock) = run_unix(
+            pad.dir.as_ref(),
+            Arc::clone(&pad.q),
+            Some(Arc::clone(&pad.hub)),
+        )
+        .await;
         let spent = pad.cbs[0].to_string();
         let unknown = "ff".repeat(32);
         let body = serde_json::to_vec(&json!([spent, unknown])).unwrap();
-        let (st, resp) = http_post(addr, "/internal/txs/outspends/by-txid", &body).await;
+        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
         assert_eq!(st, 200, "{resp}");
         let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
         assert_eq!(arr.len(), 2, "same-length slots");
@@ -726,7 +788,7 @@ mod tests {
         assert_eq!(arr[1], json!([]));
         let op = format!("{}:0", spent);
         let body = serde_json::to_vec(&json!([op, "bad"])).unwrap();
-        let (st, resp) = http_post(addr, "/internal/txs/outspends/by-outpoint", &body).await;
+        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-outpoint", &body).await;
         assert_eq!(st, 200, "{resp}");
         let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
         assert_eq!(arr.len(), 2);

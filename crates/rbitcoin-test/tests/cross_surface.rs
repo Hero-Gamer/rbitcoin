@@ -161,50 +161,28 @@ async fn pin_address_prefix_404(esplora_addr: SocketAddr) {
     assert_eq!(st, 404, "address-prefix stays 404: {body}");
 }
 
-async fn pin_internal_mempool_txs(esplora_addr: SocketAddr, live_txid: &str) {
+async fn pin_internal_mempool_txs(esplora_addr: SocketAddr) {
     let (st, body) = http_get(esplora_addr, "/internal/mempool/txs?max_txs=10000").await;
-    assert_eq!(st, 200, "GET /internal/mempool/txs: {body}");
-    let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
-    assert!(
-        arr.iter().any(|t| t["txid"] == live_txid),
-        "internal mempool dump missing {live_txid}: {body}"
-    );
-    let payload = json!([live_txid, "ff".repeat(32)]).to_string();
+    assert_eq!(st, 404, "TCP GET /internal/mempool/txs: {body}");
+    let payload = json!(["aa".repeat(32)]).to_string();
     let (st, body) = http_post_json(esplora_addr, "/internal/mempool/txs", &payload).await;
-    assert_eq!(st, 200, "POST /internal/mempool/txs: {body}");
-    let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
-    assert_eq!(arr.len(), 1, "unknown mempool id omitted: {body}");
-    assert_eq!(arr[0]["txid"], live_txid, "{body}");
+    assert_eq!(st, 404, "TCP POST /internal/mempool/txs: {body}");
 }
 
-async fn pin_internal_block_txs_and_outspends(
-    esplora_addr: SocketAddr,
-    block_hash: &str,
-    n_tx: usize,
-    spent_txid: &str,
-) {
+async fn pin_internal_block_txs_and_outspends(esplora_addr: SocketAddr, block_hash: &str) {
     let (st, body) = http_get(esplora_addr, &format!("/internal/block/{block_hash}/txs")).await;
-    assert_eq!(st, 200, "GET /internal/block/…/txs: {body}");
-    let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        arr.len(),
-        n_tx,
-        "internal block txs is the full list: {body}"
-    );
+    assert_eq!(st, 404, "TCP GET /internal/block/…/txs: {body}");
     let (st, pub_body) = http_get(esplora_addr, &format!("/block/{block_hash}/txs")).await;
     assert_eq!(st, 200, "public /txs page: {pub_body}");
     let pub_arr: Vec<Value> = serde_json::from_str(&pub_body).unwrap();
     assert_eq!(pub_arr.len(), 25, "public /txs stays 25/page: {pub_body}");
-    let unknown = "ff".repeat(32);
-    let payload = json!([spent_txid, unknown]).to_string();
-    let (st, body) =
-        http_post_json(esplora_addr, "/internal/txs/outspends/by-txid", &payload).await;
-    assert_eq!(st, 200, "POST outspends/by-txid: {body}");
-    let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
-    assert_eq!(arr.len(), 2, "same-length outspend slots: {body}");
-    assert_eq!(arr[0][0]["spent"], true, "{body}");
-    assert!(arr[0][0].get("vin").is_some(), "{body}");
-    assert_eq!(arr[1], json!([]), "unknown tx keeps [] slot: {body}");
+    let (st, body) = http_post_json(
+        esplora_addr,
+        "/internal/txs/outspends/by-txid",
+        &json!(["aa".repeat(32)]).to_string(),
+    )
+    .await;
+    assert_eq!(st, 404, "TCP POST /internal/txs/outspends/by-txid: {body}");
 }
 
 async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
@@ -1440,7 +1418,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
             .any(|v| v.as_str() == Some(pkg_parent_txid.as_str())),
         "mempool/txids missing package parent: {body}"
     );
-    pin_internal_mempool_txs(esplora_addr, &pkg_parent_txid).await;
+    pin_internal_mempool_txs(esplora_addr).await;
     let (st, body) = http_get(esplora_addr, "/mempool/recent").await;
     assert_eq!(st, 200, "GET /mempool/recent: {body}");
     let recent: Value = serde_json::from_str(&body).unwrap();
@@ -1518,7 +1496,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     );
     pin_esplora_blocks_summaries(esplora_addr, 107, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
-    pin_internal_block_txs_and_outspends(esplora_addr, new_hash, txs.len(), &cb_hex).await;
+    pin_internal_block_txs_and_outspends(esplora_addr, new_hash).await;
     assert!(
         txs[0]["vin"][0].get("txid").is_some(),
         "verbosity 2 coinbase vin: {blk}"
