@@ -8,9 +8,9 @@ description: >-
 
 # Ship a pull request
 
-One session worktree, one topic branch per plan, many small commits, required
-checks green. A plan is not done until those checks are green. Do not merge
-unless asked.
+One session worktree, one topic branch per plan, many small commits (each
+already passed local CI except coverage), required checks green. A plan is
+not done until those checks are green. Do not merge unless asked.
 
 Owner facts for tests and coverage stay in [`TESTING.md`](../../../TESTING.md).
 Do not copy them here.
@@ -65,18 +65,39 @@ git fetch origin --prune
 ## Local tests
 
 From `nix-shell` (CI pins rustc 1.95.0). `CARGO_TARGET_DIR=target/dev`.
+Slice cycle: [`docs/how-we-plan.md`](../../../docs/how-we-plan.md).
 Suite and budgets: [`TESTING.md`](../../../TESTING.md).
 
 | When | Run |
 |------|-----|
-| Each plan step | Targeted `cargo test -p <crate> …`. `cargo fmt --all` if dirty |
-| Compile inner loop | `cargo check -p <crate> --lib`. Not `--tests` after every edit |
-| Before push | `cargo clippy --workspace --all-targets -- -D warnings` |
+| Inner loop (Red / Green) | Targeted `cargo test -p <crate> …`. `cargo check -p <crate> --lib`. Not `--tests` after every edit |
+| After Green | `cargo test --workspace` |
+| After Refactor, before commit | Local CI except coverage (below) |
 | Core functional CI red | [core-functional skill](../core-functional/SKILL.md) |
-| Not by default | `cargo test --workspace`, `./scripts/coverage.sh`, `nix build .#rbitcoin-musl` |
+| Never local | `./scripts/coverage.sh`, `nix build .#rbitcoin-musl`, host IBD |
+
+Local CI except coverage:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
+./scripts/ast-grep.sh
+cargo test --workspace
+./scripts/ci-os-smoke.sh
+```
+
+If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
+`nix build .#checks.x86_64-linux.nixos-module-eval --no-link`.
+
+If Refactor is empty, do not run the workspace suite twice: the post-Green
+suite plus fmt / deny / clippy / ast-grep / smoke is enough. Pure docs,
+comments, or formatting skip Red / Green / the workspace suite; still run
+fmt if rustfmt would touch the tree.
 
 Do not wait out a host IBD or a coverage run in the agent VM. Coverage is a
-GitHub Actions gate. Clippy is not.
+GitHub Actions gate. Native `windows` / `macos` still run on Actions;
+`ci-os-smoke.sh` is the local stand-in.
 
 Do not delete a large type and chase `dead_code` across crates. Wrap the old
 API, switch one caller, delete the leftover in Refactor.
