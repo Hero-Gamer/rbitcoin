@@ -14,6 +14,11 @@ before 1.0).
 - **Workspace version 0.7.99:** in-tree toward 0.8.0.
   Published GitHub Releases remain 0.7.0; `v0.7.x` is the patch branch.
 
+- **Per-slice local CI:** each plan step runs the workspace suite after Green
+  and the other required gates except coverage after Refactor, then commits
+  before the next slice. Coverage and native `windows` / `macos` stay GitHub
+  Actions. See [`docs/how-we-plan.md`](docs/how-we-plan.md).
+
 ## [0.7.0] — 2026-09-18
 
 Named published **0.7** line. **Not 1.0.** Patch branch is `v0.7.x`. Schema 24

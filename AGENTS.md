@@ -56,11 +56,12 @@ No production code change without a test that fails first. Docs, comments,
 and formatting need no tests. Do not open a mainnet datadir in the agent VM.
 Perf A/B is operator-host only.
 
-One step is one Red → Green → Refactor turn. Refactor reshapes production
-**and** tests under a green suite: fold the one-off, delete the dual path,
-lift twin units into the journey, remove test hooks. Keep `--lib` compiling
-across the turn (wrap the old API, switch one caller, checkpoint).
-Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (The cycle).
+One step is one Red → Green → Refactor turn: Red test, Green, workspace
+suite, Refactor, local CI except coverage, then **commit** before the next
+slice. Refactor reshapes production **and** tests under a green suite: fold
+the one-off, delete the dual path, lift twin units into the journey, remove
+test hooks. Keep `--lib` compiling across the turn (wrap the old API, switch
+one caller). Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (The cycle).
 
 One production implementation at the lowest crate that owns the concept.
 Tests assert shipped behavior, not repo text
@@ -75,12 +76,14 @@ Do not leave dead code or silence `dead_code`. A RAM or CPU trade is named
 ([`CONTRIBUTING.md`](CONTRIBUTING.md) principle 9).
 
 One logical change per commit. The message says what and why. Not WIP, misc,
-or a drive-by rename mixed with behavior. Green then refactor may be two
-commits.
+or a drive-by rename mixed with behavior. One commit per slice after the
+cycle. A plan-end holistic refactor is a later commit.
 
 Inner loop: targeted `cargo test -p <crate>` and
-`cargo check -p <crate> --lib`. Clippy before push. Do not run the workspace
-suite, coverage, or a host IBD by default. [`TESTING.md`](TESTING.md).
+`cargo check -p <crate> --lib`. Each slice runs the workspace suite and the
+other local CI gates except coverage before commit. Do not run coverage or a
+host IBD. Commands:
+[`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
 
 Before the first edit under `crates/<name>/`, read `crates/<name>/AGENTS.md`
 when it exists.

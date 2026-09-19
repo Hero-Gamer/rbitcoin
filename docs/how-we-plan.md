@@ -1,11 +1,14 @@
 # How we plan (agile / XP-style)
 
 This project plans and executes work as a sequence of **small vertical slices**,
-each sized for one **Red → Green → Refactor** turn. This file owns that
-cycle ([The cycle](#the-cycle-red--green--refactor)); [`AGENTS.md`](../AGENTS.md)
-keeps the one-line hard rule. Plans have **more steps** than a typical
-“phase 1 / phase 2” design doc; each step should leave the production path
-simpler and the suite a sharper pin.
+each sized for one **Red → Green → Refactor** turn that is **committed** only
+after the workspace suite and the other local CI gates except coverage are
+green. This file owns that cycle
+([The cycle](#the-cycle-red--green--refactor)); [`AGENTS.md`](../AGENTS.md)
+keeps the one-line hard rule. Commands:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+Plans have **more steps** than a typical “phase 1 / phase 2” design doc;
+each step should leave the production path simpler and the suite a sharper pin.
 
 Influences: Extreme Programming (stories, planning game, small releases,
 TDD, continuous refactoring), INVEST stories, vertical slicing, YAGNI / simple
@@ -22,6 +25,7 @@ design. Adapted for a consensus + IBD codebase and agent-driven execution.
 | One-off patches left after green | Explicit **Refactor** phase under green suite |
 | Slow suite from giant dual tests | Slice size + test budget per step |
 | Horizontal “do all store then all net” | Vertical slice through the real entry |
+| Plan-end CI churn (fmt, clippy, deny, dead_code, cross-crate) | Each slice runs local CI except coverage and **commits** before the next |
 
 Quality compounds: every step adds a pin; refactor keeps design coherent;
 small slices reduce risk of half-landed protocol changes.
@@ -58,7 +62,7 @@ A **plan step** is the unit an agent (or human) executes in one focused pass:
 one turn of [the cycle](#the-cycle-red--green--refactor).
 
 ```text
-Red (1–few failing tests) → Green (surgical code) → Refactor (production and tests, still green)
+Red → Green → workspace suite → Refactor → local CI except coverage → commit
 ```
 
 | Step is the right size when… | Step is too big when… |
@@ -105,8 +109,8 @@ Steps (ordered; each step is a vertical slice)
     Red: <tests to add/extend; crate; unit vs scenario>
     Green: <shipped entry points / modules expected>
     Refactor: <how to fold; what one-offs to delete>
-    Verify: <cargo test -p … filters>
-    Done when: <checklist>
+    Verify: <cargo test -p … filters; then workspace suite + local CI except coverage>
+    Done when: <checklist including committed>
 Test budget: keep new tests fast; prefer unit when scenario cost >> value
 Risks / follow-ups
 ```
@@ -120,8 +124,8 @@ Risks / follow-ups
 - **Red:** `cargo test -p <crate> <filter>` — assert …
 - **Green:** touch … (smallest path)
 - **Refactor:** extract … / move to … / delete …
-- **Verify:** …
-- **Done when:** [ ] red seen  [ ] green  [ ] refactor green  [ ] related tests pass
+- **Verify:** targeted `cargo test -p …`; then workspace suite and local CI except coverage
+- **Done when:** [ ] red seen  [ ] green  [ ] workspace suite  [ ] refactor  [ ] local CI except coverage  [ ] committed
 ```
 
 ### Ordering steps
@@ -180,10 +184,9 @@ as the inner loop ([`core-functional.md`](./core-functional.md)).
 | Prefer synthetic `/tmp` fixtures; no agent-VM mainnet open | |
 | Hot-path Contract includes the cost model | [`CONTRIBUTING.md`](../CONTRIBUTING.md) principle 9 |
 | After Refactor, same tests still pass; only drop **duplicate** tests | |
+| Each slice commits only after local CI except coverage | Commands: [ship-pr](../.agents/skills/ship-pr/SKILL.md) |
 
-### Mid-plan gates vs plan-end gates
-
-Worktree, local tests, push URL, poll CI, after-merge cleanup:
+Worktree, push URL, poll CI, after-merge cleanup:
 [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 Suite speed and fixture size: [`TESTING.md`](../TESTING.md). A PR that cannot
 merge (`CONFLICTING` / `DIRTY` / behind master) **does not run test CI** —
@@ -193,17 +196,47 @@ past a red job of interest.
 
 Do not call the plan done on a red PR. A plan that multiplies multi-second
 full-store opens is a bad plan even if slices are “vertical.”
+Do not save fmt / clippy / deny / the workspace suite for the first GitHub
+run at plan end — that is the churn this cycle exists to avoid.
 
 ---
 
 ## The cycle: Red → Green → Refactor
 
-One step is one turn of the loop. The loop is what makes quality compound:
-Red pins behavior, so Green is safe to be crude; the pin makes Refactor safe;
-Refactor leaves the production path simpler and the suite sharper, so the
-next Red is easier to name and the next Green is smaller. Skip a phase and
-the loop degrades. No Red is coding to logs. No Refactor is one-offs that
-accrete. No **test** refactor is a slow suite full of brittle twins.
+One step is one turn of the loop, **committed before the next step starts**.
+The loop is what makes quality compound: Red pins behavior, so Green is safe
+to be crude; the pin makes Refactor safe; Refactor leaves the production path
+simpler and the suite sharper, so the next Red is easier to name and the next
+Green is smaller. Skip a phase and the loop degrades. No Red is coding to
+logs. No Refactor is one-offs that accrete. No **test** refactor is a slow
+suite full of brittle twins. Landing several slices and then fighting CI is
+the same skip: the gates never ran under a small diff.
+
+```text
+for each plan step:
+  1. Red      new test; targeted run; see red. No production edit yet.
+  2. Green    smallest production change; targeted run; see green.
+  3. Suite    cargo test --workspace; confirm green.
+  4. Refactor fold one-offs; production and tests; still green.
+  5. Gates    local CI except coverage (commands in ship-pr).
+  6. Commit   then the next step.
+
+after the last step (optional):
+  holistic refactor → local CI except coverage → commit
+  then push and poll GitHub (coverage + native windows/macos stay Actions)
+```
+
+The **inner loop** (edits inside Red and Green) stays targeted:
+`cargo test -p <crate> …` and `cargo check -p <crate> --lib`. Do not
+`cargo check --tests` after every edit. The workspace suite is step 3 and
+part of step 5, not the compile cycle.
+
+Pure docs, comments, or formatting skip Red / Green / the workspace suite.
+Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
+gates if the slice also changed Rust, scripts, or lint.
+
+If Refactor is empty, do not run the workspace suite twice: step 3 plus
+fmt / deny / clippy / ast-grep / `ci-os-smoke.sh` is enough.
 
 ### Red: name the contract
 
@@ -221,8 +254,8 @@ accrete. No **test** refactor is a slow suite full of brittle twins.
   branch. Reach green fast so Refactor happens under a passing suite.
 - Do not design ahead. YAGNI: if a later step needs the abstraction, that
   step’s Red will force it, under green tests from this one.
-- Keep `--lib` compiling: wrap the old API, switch one caller, checkpoint
-  ([Keep the tree compiling](#keep-the-tree-compiling)).
+- Keep `--lib` compiling: wrap the old API, switch one caller
+  ([Keep the tree compiling](#keep-the-tree-compiling)). Do not commit yet.
 
 ### Refactor: production **and** tests, under green
 
@@ -266,11 +299,33 @@ Combinations that come up:
 | A new scenario re-mines a pad the journey already has | Reuse that journey’s pad; one open per binary |
 | Refactor exposed a missing pin | Name it as the next step’s Red |
 
+### Suite, gates, commit
+
+After Green, run `cargo test --workspace` so Refactor starts from a known-green
+tree, not only the new pin. After Refactor, run **local CI except coverage**
+and **commit** that slice. Commands live in
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md)
+(Local tests). Coverage (`./scripts/coverage.sh`) and a host IBD are never
+local. Native `windows` / `macos` still run on GitHub Actions;
+`./scripts/ci-os-smoke.sh` is the local stand-in. `nixos-module-eval` only
+when the slice changed `flake.nix`, `nix/`, or the NixOS module.
+
+Do not start the next slice on an uncommitted tree. One commit per slice
+(Green + Refactor together). A later **holistic** refactor — cross-slice
+cleanup that would have been YAGNI mid-plan — is a separate commit after
+another local-CI-except-coverage run.
+
+Push may wait until several slices are committed; each commit must already
+have passed those gates. Then poll GitHub. Coverage is the remaining required
+job that is not run locally.
+
 ### Done means the loop closed
 
-A step is done when Red was seen failing, Green passes it, and Refactor left
-the suite green with fewer or sharper tests and a simpler production path.
-“Compiles” is not done. “Green but the one-off is still there” is not done.
+A step is done when Red was seen failing, Green passes it, the workspace
+suite is green, Refactor left production simpler and tests sharper, local CI
+except coverage is green, and that slice is **committed**. “Compiles” is not
+done. “Green but the one-off is still there” is not done. “All slices in one
+dirty tree, CI at the end” is not done.
 
 ---
 
@@ -284,7 +339,7 @@ period-start is only on ConfirmParentCache (not confirmed).
 - **Red:** unit in `confirm_run` driving `expected_bits_extending` with plan-only first@2016.  
 - **Green:** confirmed-or-plan timestamp in that fn.  
 - **Refactor:** shared header-at-height-for-pow helper if a second caller needs it (optional same step if small).  
-- **Verify:** `cargo test -p rbitcoin-consensus expected_bits_extending`.
+- **Verify:** `cargo test -p rbitcoin-consensus expected_bits_extending`; then workspace suite and local CI except coverage; commit.
 
 ### Bad step
 
@@ -302,7 +357,8 @@ Feature: “lookup stamps body_range for load denserels.”
 | 3 | plan=None path stamps parent pin from archived Class A |
 | 4 | Soft-requeue policy: store invariants permanent (tests only on reject map) |
 
-Each step is independently green and shippable.
+Each step is independently green, locally gated except coverage, committed,
+and shippable.
 
 ---
 
@@ -318,9 +374,10 @@ Each step is independently green and shippable.
 | Refactor touches production only | Fold twin tests into the journey, delete hooks, share fixtures in the same phase |
 | Plan ignores test runtime | Explicit unit vs scenario choice per step |
 | Core functional as the default-CI Red | In-tree catalog journey; Core stays nightly |
-| Step done = “code compiles” | Step done = Red→Green→Refactor verify checklist |
+| Step done = “code compiles” | Step done = Red→Green→Refactor, workspace suite, local CI except coverage, commit |
+| Several slices uncommitted; first GitHub run is the fmt/clippy/suite gate | Each slice commits only after those gates |
 | Delete a large type/module then `cargo check --tests` until the workspace builds | Keep-compiling facade (below) |
-| Inner loop = `cargo check --tests` (or several crates `--tests`) after every edit | `--lib` until that crate’s lib is green; `--tests` once as Verify |
+| Inner loop = `cargo check --tests` (or several crates `--tests`) after every edit | `--lib` until that crate’s lib is green; workspace suite after Green and as Gates |
 
 ### Keep the tree compiling
 
@@ -334,11 +391,11 @@ not use it as the edit cycle.
 |----|--------|
 | New type + its unit tests green, **then** a thin wrap on the old API | Delete the old module in the same dirty tree as all callers |
 | Switch **one** caller crate per step; `--lib` stays green | One uncommitted tree spanning store + confirm + query + net + docs |
-| Checkpoint commit when `--lib` is green | Hours of WIP so a crash loses the only compiling snapshot |
+| Keep `--lib` compiling throughout; commit after local CI except coverage | Hours of un-gated WIP, or a slice commit that has not passed those gates |
 | `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
 
-`--tests` / multi-crate check is **Verify** at the end of a slice, not the
-inner loop. Full cargo table:
+`--tests` / multi-crate check and `cargo test --workspace` are **after Green
+and as Gates**, not the inner loop. Full cargo table:
 [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
 ---
@@ -361,16 +418,20 @@ Before closing a step:
 
 - [ ] Red was observed failing once  
 - [ ] Green makes that test pass  
+- [ ] `cargo test --workspace` is green (after Green, before Refactor)  
 - [ ] Refactor left all related tests green  
 - [ ] Refactor touched the tests too: twins folded into the journey, hooks deleted, fixtures shared  
 - [ ] Production one-offs from Green are gone (one path, one owner)  
+- [ ] Local CI except coverage is green  
+- [ ] The slice is committed  
 - [ ] No known red left for “later in the plan”  
 
 Before closing a **plan**:
 
+- [ ] Optional holistic refactor ran local CI except coverage and was committed  
 - [ ] Work landed on a session-worktree topic branch (not local `master`)  
 - [ ] One PR contains the plan’s commits  
-- [ ] Required GitHub Actions checks on that PR are green  
+- [ ] Required GitHub Actions checks on that PR are green (including coverage)  
 - [ ] After merge: topic branch deleted locally and on `origin`; session worktree kept until the session ends 
 
 
