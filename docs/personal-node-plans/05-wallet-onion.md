@@ -74,15 +74,19 @@ In-binary TLS (rejected). SH allowlist. `--personal`. P2P listenonion (07).
 - **Verify:** `cargo test -p rbitcoin-node i2p_wallet_` or omit.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed, or skipped in the PR body because 04 has no STREAM FORWARD helper
 
-### Step 4 — OPERATOR / COMPAT
+### Step 4 — OPERATOR / COMPAT + NixOS module
 
 - **Contract:** OPERATOR: Electrum + Esplora onion URLs, Sparrow
   `tcp://….onion:port`, no nginx required for onion. COMPAT Electrum TLS
   row remains reverse-proxy for **clearnet**; onion is plain TCP. Do not
-  close Q-63 (TLS still parked).
-- **Red:** none.
-- **Green:** OPERATOR + COMPAT one-liner if hosts/onions are user-visible.
-- **Verify:** grep onion.
+  close Q-63 (TLS still parked). Module: `esplora.hiddenService` reusing 03
+  tor control. Eval asserts the Esplora ADD_ONION-related argv. Runtime
+  label only if new systemd deps land here (prefer 03).
+- **Red:** eval assert for esplora hidden-service flag.
+- **Green:** module + eval + OPERATOR + COMPAT one-liner if hosts/onions are
+  user-visible.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep onion.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

@@ -84,13 +84,17 @@ Wallet onions (03/05). I2P incoming (04). CJDNS (08). Clearnet UPnP.
   `cargo test -p rbitcoin-rpc getnetworkinfo_localaddresses`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 5 — OPERATOR
+### Step 5 — OPERATOR + NixOS module
 
 - **Contract:** `--listen-onion`, interaction with `--no-listen` and
-  `--max-inbound`, onion in `getnetworkinfo`, no Arti.
-- **Red:** none.
-- **Green:** OPERATOR P2P.
-- **Verify:** grep `--listen-onion`.
+  `--max-inbound`, onion in `getnetworkinfo`, no Arti. Module:
+  `p2p.listenOnion`; compose with `p2p.listen = false`. `After`/`Wants`
+  `tor.service` (same control as 03). Eval asserts argv. Extend runtime
+  test; label **`nixos-module-runtime`**.
+- **Red:** eval assert for listen-onion argv.
+- **Green:** module + eval + runtime test + OPERATOR P2P.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep `--listen-onion`. Poll `--interest nixos-module-runtime`.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

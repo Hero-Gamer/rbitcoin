@@ -89,14 +89,19 @@ Onion AddrMan (02). Tor control (03). Loopback onion bind (07). CJDNS bind
   `cargo test -p rbitcoin-rpc getnetworkinfo_localaddresses`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 5 — OPERATOR
+### Step 5 — OPERATOR + NixOS module
 
 - **Contract:** OPERATOR CLI table: `--no-listen` / `--listen=0`,
   `--max-inbound 0`, `--no-discover`. Note that 07 will add loopback onion
-  bind without clearnet listen.
-- **Red:** none (docs).
-- **Green:** OPERATOR.
-- **Verify:** grep flags.
+  bind without clearnet listen. Module: `p2p.listen` (default true; false
+  omits a public `--listen` / passes the product listen-off flag) and
+  `p2p.maxInbound`. `p2p.openFirewall` must not open a port when listen is
+  off. Eval asserts the argv. Label **`nixos-module-runtime`** if the VM
+  `ExecStart` for the default test node changes.
+- **Red:** eval assert for listen-off argv.
+- **Green:** module + eval + OPERATOR.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep flags.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

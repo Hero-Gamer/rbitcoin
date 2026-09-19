@@ -117,14 +117,22 @@ I2P SAM (04). Ephemeral broadcast policy (06) — only the dial seam.
   `cargo test -p rbitcoin-net dns_seeds_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 7 — OPERATOR row
+### Step 7 — OPERATOR + NixOS module
 
 - **Contract:** [`OPERATOR.md`](../../OPERATOR.md) CLI table documents
   `--proxy`, `--onion`, `--proxy-randomize` (default on). No COMPAT change.
-- **Red:** none (docs).
-- **Green:** OPERATOR table + short “P2P via system Tor SOCKS” paragraph.
-- **Refactor:** n/a
-- **Verify:** grep the flag names in OPERATOR.md.
+  First-class `services.rbitcoin.proxy` / `onionProxy` / `proxyRandomize`
+  (default true) in [`nix/modules/rbitcoin.nix`](../../nix/modules/rbitcoin.nix)
+  — not `extraArgs`. [`nixos-module-eval.nix`](../../nix/tests/nixos-module-eval.nix)
+  asserts those flags in `ExecStart`. Do not enable `services.tor` in the
+  eval fixture.
+- **Red:** eval assert for `--proxy` (fails until the option exists).
+  OPERATOR is docs.
+- **Green:** option + eval + OPERATOR table + short “P2P via system Tor SOCKS”
+  paragraph.
+- **Refactor:** `extraArgs` still appends after module-managed args.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep the flag names in OPERATOR.md.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

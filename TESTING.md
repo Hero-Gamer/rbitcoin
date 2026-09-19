@@ -477,8 +477,10 @@ The nightly job (`.github/workflows/core-functional.yml` →
 newer Bitcoin Core release exists than the inventory pin. Label
 **`core-functional`** on harness PRs and on **ship** version-bump PRs
 ([`docs/releases.md`](docs/releases.md)). It is **not** a required PR check,
-including on PRs that touch net or RPC (too slow). Unlabeled PRs keep the
-default cargo jobs. Default `cargo test` does **not** invoke Core’s Python
+including on PRs that touch net or RPC (too slow). Label
+**`nixos-module-runtime`** to run the NixOS module qemu test; every PR still
+runs `nixos-module-eval`. Unlabeled PRs keep the default cargo jobs plus
+eval. Default `cargo test` does **not** invoke Core’s Python
 suite. A red labeled run is reproduced locally with
 `./scripts/core-functional/run.sh <failing.py>` until that script passes
 ([`docs/core-functional.md`](docs/core-functional.md)); do not push-and-wait

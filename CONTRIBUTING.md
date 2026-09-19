@@ -236,8 +236,10 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
 
 Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
 checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
-`ast-grep`, `test`, `windows`, `macos`, `coverage`) so a red run shows which gate
-failed without digging into a monolithic job log.
+`ast-grep`, `test`, `windows`, `macos`, `coverage`, `nixos-module-eval`) so a
+red run shows which gate failed without digging into a monolithic job log.
+Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
+eval). That job is not required.
 
 **Agents** implement in **one git worktree per session**, a topic branch per
 PR, and **one PR** per plan. Each plan step follows

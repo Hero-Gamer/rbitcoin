@@ -103,8 +103,9 @@ Cargo.toml). Those PRs run Core functional even without a label.
 
 | Check | Who |
 |-------|-----|
-| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `coverage` | Every PR (`ci.yml`) |
+| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `coverage` `nixos-module-eval` | Every PR (`ci.yml`) |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**, label **`release`**, **or** ship version |
+| `nixos-module-runtime` | Label **`nixos-module-runtime`**, `workflow_dispatch`, **or** GitHub Release tags (`release.yml`). Not required. |
 | `release-extra` | Every PR. **Fails** if the PR is ship and `core-functional` is not success |
 
 Label ship PRs **`release`** and **`core-functional`**. The detect job is

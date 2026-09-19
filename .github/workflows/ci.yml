@@ -22,6 +22,7 @@ env:
 #
 # Jobs are split so each gate is its own required check on the PR/push UI:
 #   fmt + deny + clippy + ast-grep + test + nixos-module-eval + windows + macos in parallel;
+#   nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
 #   coverage waits for fmt/clippy/test.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #

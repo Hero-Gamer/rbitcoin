@@ -44,6 +44,15 @@ A node on CGNAT / no forwarded TCP still:
   [ship-pr](../../.agents/skills/ship-pr/SKILL.md)). Coverage and native
   `windows` / `macos` stay GitHub Actions. Optional holistic refactor after
   the last step, then push and poll.
+- Each product PR updates [`nix/modules/rbitcoin.nix`](../../nix/modules/rbitcoin.nix)
+  with **first-class options** for that slice (not `extraArgs` as the only
+  path) and pins argv in
+  [`nix/tests/nixos-module-eval.nix`](../../nix/tests/nixos-module-eval.nix).
+  Eval is required CI. When systemd `After`/`Wants`, users/groups, firewall,
+  or the VM start argv change, extend
+  [`nixos-module-runtime.nix`](../../nix/tests/nixos-module-runtime.nix)
+  and label the PR **`nixos-module-runtime`**. Do not start live Tor / i2pd /
+  cjdns in those tests.
 
 ## Out of this group
 
@@ -104,6 +113,22 @@ any PR. **07** can land as soon as **01 + 03** exist. **08** can land as soon as
 | [07-p2p-onion-inbound.md](./07-p2p-onion-inbound.md) | P2P `listenonion`: ADD_ONION → loopback BIP324 accept |
 | [08-cjdns.md](./08-cjdns.md) | BIP155 CJDNS, `--cjdnsreachable`, `--onlynet=cjdns` |
 | [09-inwit-prune.md](./09-inwit-prune.md) | Rolling 288-block `inwit` (unlink, not punch); BIP159 `NETWORK_LIMITED`; partial Esplora JSON, refuse wire |
+
+NixOS first-class options (same PR as the flags). Label **`nixos-module-runtime`**
+when the row says runtime:
+
+| File | `services.rbitcoin` | Runtime label |
+|------|---------------------|---------------|
+| 00 | `proxy`, `onionProxy`, `proxyRandomize` (default true) | only if `After=tor` |
+| 01 | `p2p.listen` (default true), `p2p.maxInbound` | if listen-off changes VM `ExecStart` |
+| 02 | `onlynet` | eval |
+| 03 | `tor.control`, cookie, `electrum.hiddenService`; `After=tor.service` | **yes** |
+| 04 | `i2p.sam`, `i2p.acceptIncoming`; `After=i2pd.service` | **yes** |
+| 05 | `esplora.hiddenService` (reuse 03 control) | eval unless new systemd deps |
+| 06 | none if `--proxy` already implies isolated broadcast; document on `proxy` | eval |
+| 07 | `p2p.listenOnion`; compose with `p2p.listen = false` | **yes** |
+| 08 | `cjdns.reachable`; listen on cjdns; `After=cjdns.service` | **yes** |
+| 09 | `pruneInwit` (cold dir already exists) | eval |
 
 ## Follow-ups (not scheduled here)
 

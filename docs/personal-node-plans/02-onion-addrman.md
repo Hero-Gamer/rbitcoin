@@ -107,13 +107,15 @@ I2P, CJDNS, Tor control, listenonion, wallet onions.
   `cargo test -p rbitcoin-net onlynet_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 7 — OPERATOR
+### Step 7 — OPERATOR + NixOS module
 
 - **Contract:** document `--onlynet`, onion `--connect`, peers v2, SOCKS
-  required for onion.
-- **Red:** none.
-- **Green:** OPERATOR P2P section.
-- **Verify:** grep.
+  required for onion. Module: `services.rbitcoin.onlynet` list; eval asserts
+  `--onlynet onion` when set. SOCKS still comes from 00’s `proxy`.
+- **Red:** eval assert for `--onlynet`.
+- **Green:** module + eval + OPERATOR P2P section.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep OPERATOR.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

@@ -103,13 +103,15 @@ Dandelion++. Changing libre admission. Broadcasting other peers’ txs.
 - **Verify:** `cargo test -p rbitcoin-electrum` / `rbitcoin-esplora` filters
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 6 — OPERATOR
+### Step 6 — OPERATOR + NixOS module
 
 - **Contract:** document that `--proxy` implies isolated local broadcast;
-  not Dandelion++; failures stay in mempool without P2P INV.
-- **Red:** none.
-- **Green:** OPERATOR.
-- **Verify:** grep.
+  not Dandelion++; failures stay in mempool without P2P INV. NixOS: no extra
+  option if 00’s `proxy` already implies this; document it on that option.
+  If a separate disable flag ships, it is first-class (not `extraArgs`).
+- **Red:** none unless a new flag exists (then eval assert).
+- **Green:** OPERATOR; module description or option as needed.
+- **Verify:** grep OPERATOR; eval if a new flag exists.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

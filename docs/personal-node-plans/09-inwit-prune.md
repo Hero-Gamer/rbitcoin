@@ -317,16 +317,20 @@ Heights **above** the watermark behave as today. Below: table.
   `cargo test -p rbitcoin-esplora pruned_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 6 — OPERATOR / COMPAT / SCHEMA / rpc.md
+### Step 6 — OPERATOR / COMPAT / SCHEMA / rpc.md + NixOS module
 
 - **Contract:** OPERATOR `--prune-inwit`, 288 window, NETWORK_LIMITED,
   rolling cold inwit (unlink, not punch), cannot reorg through pruneheight,
   archive convert = copy tail + unlink old stem. COMPAT prune row.
   `getblockchaininfo` fields. SCHEMA/sidecar bytes. Partial Esplora JSON.
-  Do not copy this file into quality.md until scheduled.
-- **Red:** none (docs).
-- **Green:** those owners.
-- **Verify:** grep `NETWORK_LIMITED`, `prune-inwit`, `inwit` segment.
+  Do not copy this file into quality.md until scheduled. Module:
+  `pruneInwit` (and buffer if the CLI has one); `coldDataDir` already
+  exists. Eval asserts `--prune-inwit`. Runtime label only if tmpfiles /
+  `ReadWritePaths` change.
+- **Red:** eval assert for `--prune-inwit`.
+- **Green:** module + eval + those doc owners.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep `NETWORK_LIMITED`, `prune-inwit`, `inwit` segment.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

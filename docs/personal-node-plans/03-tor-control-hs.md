@@ -98,15 +98,19 @@ Esplora onion (05). P2P listenonion (07). TLS. SOCKS (00) is independent
 - **Verify:** `cargo test -p rbitcoin-electrum features_hosts_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 6 — OPERATOR
+### Step 6 — OPERATOR + NixOS module
 
 - **Contract:** how to point at system tor control/cookie; Electrum onion
   log line; RPC not on onion. COMPAT Electrum TLS row stays “external” /
-  plain TCP (no Q-63 close).
-- **Red:** none.
-- **Green:** OPERATOR; optional one-line COMPAT hosts note if features
-  change is user-visible.
-- **Verify:** grep `--tor-control`.
+  plain TCP (no Q-63 close). Module: `tor.control`, cookie path,
+  `electrum.hiddenService`. When control is set: systemd `After`/`Wants`
+  `tor.service`, cookie `SupplementaryGroups` as needed. Eval asserts argv.
+  Extend `nixos-module-runtime.nix` for After=tor (fake node still; do not
+  start Tor). Label the PR **`nixos-module-runtime`**.
+- **Red:** eval assert for `--tor-control` (or the product flag name).
+- **Green:** module + eval + runtime test + OPERATOR.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep `--tor-control`. Poll `--interest nixos-module-runtime`.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

@@ -219,8 +219,11 @@ fmt / deny / clippy / ast-grep / `ci-os-smoke.sh` is enough.
 Coverage (`./scripts/coverage.sh`) and a host IBD are never local. Native
 `windows` / `macos` still run on GitHub Actions; `./scripts/ci-os-smoke.sh`
 is the local stand-in. `nixos-module-eval` only when the slice changed
-`flake.nix`, `nix/`, or the NixOS module. Push may wait until several slices
-are committed; each commit must already have passed those gates.
+`flake.nix`, `nix/`, or the NixOS module. The qemu VM test
+(`nixos-module-runtime`) is GitHub Actions on label **`nixos-module-runtime`**
+and on Release tags — not local, not a required PR check. Push may wait until
+several slices are committed; each commit must already have passed those
+gates.
 
 A step is not done because it compiles, because the one-off is still there,
 or because “CI at the end will catch it.”

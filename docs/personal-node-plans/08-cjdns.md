@@ -81,13 +81,17 @@ Tor, I2P, UPnP, embedding a cjdns daemon.
 - **Verify:** `cargo test -p rbitcoin-node listen_cjdns`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 5 — OPERATOR
+### Step 5 — OPERATOR + NixOS module
 
 - **Contract:** `--cjdnsreachable`, `--onlynet=cjdns`, listen on cjdns
-  IPv6, no ISP forward, no daemon in-process, no CI router.
-- **Red:** none.
-- **Green:** OPERATOR.
-- **Verify:** grep cjdns.
+  IPv6, no ISP forward, no daemon in-process, no CI router. Module:
+  `cjdns.reachable`; P2P bind on the cjdns address when set;
+  `After`/`Wants` `cjdns.service`. Eval asserts argv. Extend runtime test;
+  label **`nixos-module-runtime`**. Do not start a cjdns TUN in CI.
+- **Red:** eval assert for `--cjdnsreachable`.
+- **Green:** module + eval + runtime test + OPERATOR.
+- **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
+  grep cjdns. Poll `--interest nixos-module-runtime`.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget

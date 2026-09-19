@@ -89,7 +89,10 @@ cargo test --workspace
 ```
 
 If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
-`nix build .#checks.x86_64-linux.nixos-module-eval --no-link`.
+`nix build .#checks.x86_64-linux.nixos-module-eval --no-link`. Label the PR
+`nixos-module-runtime` when systemd deps, users/groups, firewall, or the VM
+start argv changed — that runs `nixos-module-runtime` (qemu). Do not wait
+out the VM test locally.
 
 Coverage and native `windows` / `macos` stay GitHub Actions;
 `ci-os-smoke.sh` is the local stand-in. Do not wait out a host IBD or a
@@ -104,6 +107,9 @@ not operator zips.
 
 Label `core-functional` when the PR touches that harness, and on every ship
 version-bump PR. Do not label ordinary net or RPC PRs.
+Label `nixos-module-runtime` when the NixOS module VM test should run (not
+eval). Poll with `--interest nixos-module-runtime`. It is not a required
+check.
 
 `origin` fetch is HTTPS. This VM has no GitHub App SSH key. Bot push uses an
 explicit HTTPS URL. Do not `git push origin`. No `-u` (that retargets the
