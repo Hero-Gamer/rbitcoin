@@ -109,6 +109,9 @@ Override dev dir only when intentional: `CARGO_TARGET_DIR=…` (Nix shell
 reads it; rustup users export it). Override coverage dir:
 `CARGO_TARGET_DIR_COV=… ./scripts/coverage.sh`.
 
+Cargo incremental stays on in `target/dev`. Stale objects: `cargo clean -p
+<crate>` or wipe the silo.
+
 **Default vs heavy tiers**
 
 | Tier | Command | Contents |

@@ -234,10 +234,10 @@ That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
 
 ## Workflow
 
-Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Required
-checks are **separate jobs** on every push/PR (`fmt`, `deny`, `clippy`,
-`ast-grep`, `test`, `windows`, `macos`, `coverage`, `nixos-module-eval`) so a
-red run shows which gate failed without digging into a monolithic job log.
+Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
+(`fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`, `macos`,
+`coverage`, `nixos-module-eval`) so a red run shows which gate failed without
+digging into a monolithic job log.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.
 
@@ -289,6 +289,7 @@ IO; they do not package zips. GitHub Releases:
 - [ ] Behavior covered by a catalog journey (or a justified unit next to a
       pure helper). No twin for the same reject. Core functional is not the
       PR pin ([`TESTING.md`](./TESTING.md)).
+- [ ] Core-facing RPC / P2P / Electrum / Esplora: [`COMPAT.md`](./COMPAT.md)
 - [ ] No new silent dead branches
 - [ ] No unused crate-root `pub` / `pub use` (principle 11). Tests drive
       shipped functions, not `#[cfg(test)]` wrappers or `*_for_test`

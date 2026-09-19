@@ -40,8 +40,13 @@ before 1.0).
 
 - **Per-slice local CI:** each plan step runs the workspace suite after Green
   and the other required gates except coverage after Refactor, then commits
-  before the next slice. Coverage and native `windows` / `macos` stay GitHub
-  Actions. See [`docs/how-we-plan.md`](docs/how-we-plan.md).
+  before the next slice. Same *commands* as CI, not the GitHub Actions `env:`.
+  Coverage and native `windows` / `macos` stay GitHub Actions. See
+  [`docs/how-we-plan.md`](docs/how-we-plan.md).
+
+- **Agent routing:** Core-facing work starts at [`COMPAT.md`](COMPAT.md).
+  Extracts move (not copy): [`docs/code-shape.md`](docs/code-shape.md).
+  Suite/clippy logs stay out of the session: [`docs/how-we-plan.md`](docs/how-we-plan.md).
 
 ## [0.7.0] — 2026-09-18
 
