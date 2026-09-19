@@ -1422,6 +1422,8 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(local_hex_tx)]).unwrap();
     let local_hex = hash_hex_display(&local.compute_txid().to_byte_array());
     assert_eq!(sent, json!(local_hex.clone()));
+    assert!(mp.is_local_origin(&local.compute_txid()));
+    assert!(!mp.is_local_origin(&parent.compute_txid()));
 
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(info["unbroadcastcount"], 1);

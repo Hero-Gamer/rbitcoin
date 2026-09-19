@@ -1723,6 +1723,7 @@ async fn admit_broadcast(st: AppState, tx: bitcoin::Transaction) -> Response {
     };
     match mp.accept_tx_async(tx).await {
         Ok(r) => {
+            mp.mark_local_origin(r.txid);
             let tid = r.txid.to_byte_array();
             plain_ok(block_hash_hex(&tid))
         }
@@ -1959,6 +1960,9 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
     }
     match mp.accept_package_async(txs).await {
         Ok(results) => {
+            for r in &results {
+                mp.mark_local_origin(r.txid);
+            }
             let txids: Vec<String> = results
                 .iter()
                 .map(|r| block_hash_hex(&r.txid.to_byte_array()))

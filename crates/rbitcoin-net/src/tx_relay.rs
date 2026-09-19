@@ -562,6 +562,7 @@ pub struct MempoolHub {
     dir: PathBuf,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
+    local_origin: Mutex<HashSet<Txid>>,
     /// Wtxids re-admitted from a disconnected block. Core serves these
     /// even if this peer has not been INV'd yet (`mempool_reorg`).
     reorg_servable: Mutex<HashSet<Wtxid>>,
@@ -685,6 +686,7 @@ impl MempoolHub {
             meter_get_coin_create_mtp: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
+            local_origin: Mutex::new(HashSet::new()),
             reorg_servable: Mutex::new(HashSet::new()),
             relay_seq: Mutex::new(HashMap::new()),
             wtxid_by_txid: Mutex::new(HashMap::new()),
@@ -3147,6 +3149,14 @@ impl MempoolHub {
         persist_unbroadcast_file(&self.dir, &u);
     }
 
+    pub fn mark_local_origin(&self, txid: Txid) {
+        self.local_origin.lock().unwrap().insert(txid);
+    }
+
+    pub fn is_local_origin(&self, txid: &Txid) -> bool {
+        self.local_origin.lock().unwrap().contains(txid)
+    }
+
     /// Peer getdata served this txid — it is no longer unbroadcast.
     pub fn mark_broadcast(&self, txid: &Txid) {
         let mut u = self.unbroadcast.lock().unwrap();
@@ -4185,6 +4195,22 @@ mod tests {
                 "p2p: Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
             )
         );
+    }
+
+    #[test]
+    fn local_origin_rpc_not_p2p() {
+        let dir = tmp();
+        let store = tmp();
+        let q = Arc::new(Query::open_or_create_tiny(&store).unwrap());
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        let local = Txid::from_byte_array([0x11; 32]);
+        let wire = Txid::from_byte_array([0x22; 32]);
+        assert!(!hub.is_local_origin(&local));
+        hub.mark_local_origin(local);
+        assert!(hub.is_local_origin(&local));
+        assert!(!hub.is_local_origin(&wire));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[test]
