@@ -4670,3 +4670,19 @@ fn dispatch_wrong_json_types_are_param_errors() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sendraw_testmempoolaccept_submitpackage_junk_hex_is_tx_decode_failed() {
+    let (ctx, dir) = ctx_empty();
+    for (method, params) in [
+        ("sendrawtransaction", vec![json!("ff00baar")]),
+        ("testmempoolaccept", vec![json!(["ff00baar"])]),
+        ("submitpackage", vec![json!(["ff00baar"])]),
+        ("sendrawtransaction", vec![json!("00")]),
+    ] {
+        let e = dispatch(&ctx, method, params).unwrap_err();
+        assert_eq!(e["code"], ERR_DESERIALIZATION, "{method}: {e}");
+        assert_eq!(e["message"], json!("TX decode failed"), "{method}: {e}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
