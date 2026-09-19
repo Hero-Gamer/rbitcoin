@@ -7,6 +7,7 @@ mod codec;
 mod compact;
 mod error;
 mod eviction;
+mod i2p_sam;
 mod ibd;
 mod most_work;
 mod msg_decode;
