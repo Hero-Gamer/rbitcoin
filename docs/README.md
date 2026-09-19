@@ -45,7 +45,7 @@ into `AGENTS.md`.
 | [`rpc.md`](./rpc.md) | Core-class JSON-RPC subset. |
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
-| [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract; per-slice local CI except coverage before commit. |
+| [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract. |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |
 | [`code-shape.md`](./code-shape.md) | Control flow, types, naming, composition (CONTRIBUTING principle 10). Named extracts: quality.md **Q-61** (Completed). Clippy: no workspace `allow` list; leftover lints are site-local with a reason. |
 | [`quality.md`](./quality.md) | Living quality roadmap (Open + Won't-fix + Parked + Protect). |

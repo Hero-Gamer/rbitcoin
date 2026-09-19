@@ -68,8 +68,7 @@ Shared Tiny on-disk fixtures live in `rbitcoin_store::testutil` (`TempDir`, `tin
 | **fuse8 v1 on open** | Leftover v1 fuse **refuses**; wipe `store/tx.head` (Class A kept). Current writes are v2. |
 
 `cargo check -p rbitcoin-store --tests` (and stacking `--tests` on query /
-consensus / net) is a **fat** rustc unit. Agents: that is after Green and as
-Gates, not the inner loop. Inner loop and keep-compiling facade:
+consensus / net) is a **fat** rustc unit — not the inner loop.
 [`docs/how-we-plan.md`](docs/how-we-plan.md) (Keep the tree compiling).
 
 Host forensics and `cargo bench` one-offs are **not** in the default compile
@@ -114,7 +113,7 @@ reads it; rustup users export it). Override coverage dir:
 
 | Tier | Command | Contents |
 |------|---------|----------|
-| **Default** (CI / human local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + live P2P (8-block `two_node`, restart reconstruct, dead-peer, hop serve, dual live seeders, post-IBD tip follow, getheaders gap fill, product `run_p2p --connect`) + hub reorgs. Agents use targeted `-p` tests as the inner loop, then this suite after Green and as local CI except coverage before each slice commit ([`docs/how-we-plan.md`](docs/how-we-plan.md)). Coverage stays a PR job. |
+| **Default** (CI / local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + live P2P (8-block `two_node`, restart reconstruct, dead-peer, hop serve, dual live seeders, post-IBD tip follow, getheaders gap fill, product `run_p2p --connect`) + hub reorgs. When agents run this suite: [`docs/how-we-plan.md`](docs/how-we-plan.md). Coverage stays a PR job. |
 
 ### Suite speed budgets (default tier)
 

@@ -65,7 +65,8 @@ git fetch origin --prune
 ## Local tests
 
 From `nix-shell` (CI pins rustc 1.95.0). `CARGO_TARGET_DIR=target/dev`.
-Slice cycle: [`docs/how-we-plan.md`](../../../docs/how-we-plan.md).
+When to run which command:
+[`docs/how-we-plan.md`](../../../docs/how-we-plan.md) (The cycle).
 Suite and budgets: [`TESTING.md`](../../../TESTING.md).
 
 | When | Run |
@@ -90,18 +91,9 @@ cargo test --workspace
 If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
 `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`.
 
-If Refactor is empty, do not run the workspace suite twice: the post-Green
-suite plus fmt / deny / clippy / ast-grep / smoke is enough. Pure docs,
-comments, or formatting skip Red / Green / the workspace suite; still run
-fmt if rustfmt would touch the tree.
-
-Do not wait out a host IBD or a coverage run in the agent VM. Coverage is a
-GitHub Actions gate. Native `windows` / `macos` still run on Actions;
-`ci-os-smoke.sh` is the local stand-in.
-
-Do not delete a large type and chase `dead_code` across crates. Wrap the old
-API, switch one caller, delete the leftover in Refactor.
-[`docs/how-we-plan.md`](../../../docs/how-we-plan.md).
+Coverage and native `windows` / `macos` stay GitHub Actions;
+`ci-os-smoke.sh` is the local stand-in. Do not wait out a host IBD or a
+coverage run in the agent VM.
 
 ## Push and poll
 
