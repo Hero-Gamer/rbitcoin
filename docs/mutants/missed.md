@@ -1,6 +1,6 @@
 # Mutants Baseline
 
-> Generated: 2026-05-13 · Runner: M4 mini · consensus 9h (2518 tested) · primitives 16m (292 tested)
+> Generated: 2026-09-20 16:14 ET · Runner: M4 mini · consensus 2026-09-19 night → 2026-09-20 morning (9h, 2518 tested) · primitives 2026-09-20 ~15:00 ET (16m, 292 tested)
 
 | Crate | Tested | Missed | Timeout | Details |
 | :--- | ---: | ---: | ---: | :--- |
