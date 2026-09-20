@@ -1090,13 +1090,36 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](d
 ### mempool.space
 
 Stock mempool Node + MariaDB + frontend. nginx **`/api/`** → this Esplora
-(TCP or unix); **`/api/v1/`** → their process (`:8999`). Set
-`MEMPOOL.BACKEND=esplora`. Point Node `ESPLORA.UNIX_SOCKET_PATH` at
-`--esplora-listen /run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api`
-is fine) so `/internal/*` is available. TCP `--esplora-listen host:port` is
-public REST+WS only (no `/internal`). Core RPC is `{datadir}/rpc.sock` plus the
-`bitcoin-client` `socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic.
-Requires `--sh-index`. Leave `--max-sh-creates` at 0.
+(unix); **`/api/v1/`** → their process (`:8999`). Set `MEMPOOL.BACKEND=esplora`.
+Point Node `ESPLORA.UNIX_SOCKET_PATH` at `--esplora-listen
+/run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api` is fine) so
+`/internal/*` is available. Put the sock in `/run/rbitcoin` (**0750**,
+rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
+tree is `0700`. TCP `--esplora-listen host:port` is public REST+WS only (no
+`/internal`). Core RPC is `{datadir}/rpc.sock` plus the `bitcoin-client`
+`socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic. Requires
+`--sh-index`. Leave `--max-sh-creates` at 0.
+
+```bash
+sudo mkdir -p /run/rbitcoin
+sudo chown "$(id -un)":nginx /run/rbitcoin
+sudo chmod 0750 /run/rbitcoin
+
+./target/release/rbitcoin-node \
+  --datadir ./datadir-mainnet \
+  --network mainnet \
+  --sh-index \
+  --rpc \
+  --esplora-listen /run/rbitcoin/esplora.sock \
+  --log-level info
+```
+
+Same UID as rbitcoin for mempool Node (`rpc.sock` is **0600**). First start
+must import `pools-v2.json` or every block is **Unknown**: `npm run start
+--update-pools` (needs GitHub, or point `POOLS_JSON_URL` /
+`POOLS_JSON_TREE_URL` at a local mirror). `SELECT COUNT(*) FROM pools` is
+hundreds when that worked. Predicted blocks wait on Node’s first mempool
+sync + rust-gbt; they are empty until `/internal/mempool/txs` has filled.
 
 ## Core-class JSON-RPC
 
@@ -1157,38 +1180,105 @@ WebSocket extras (defaults): max 64 concurrent `/v1/ws` sockets, 64 KiB client
 
 ### Reverse proxy (TLS + WebSocket upgrade)
 
-Terminate TLS and forward REST **and** WebSocket to the same upstream. Example nginx:
+Terminate TLS and forward REST **and** WebSocket to the same upstream.
+`/api/v1/` is mempool's Node (MariaDB catalogue), including **`/api/v1/ws`**.
+`/api/` is rbitcoin Esplora (electrs HTTP), including wallet **`/api/ws`**
+(`--esplora-listen` `/v1/ws` + `/ws`). Register `/api/v1/` **first**. Deny
+`/api/internal/` at nginx even when Esplora is a unix sock.
+
+**Slash rules (these 404/502 if wrong):**
+
+- Node `proxy_pass` has **no** trailing slash. Their routes are
+  `/api/v1/mining/…` and `/api/v1/ws`. `http://127.0.0.1:8999/` strips the
+  prefix and Express 404s (`Cannot GET /mining/pool/…`).
+- Unix Esplora URI after the sock **is** `/`.  
+  `http://unix:/run/rbitcoin/esplora.sock:/` replaces `/api/` with `/` so
+  Esplora sees `/blocks/tip/height`. A colon with nothing after it leaves
+  `/api/…` on the request → Esplora **404**. Direct
+  `curl --unix-socket … http://api/blocks/tip/height` can still be 200.
+
+Local mempool.space (NixOS; browse `http://127.0.0.1:8080`). `virtualHosts."localhost"`
+so `Host: localhost` matches. Frontend `proxyPass` uses `localhost:4200` (not
+`127.0.0.1`) when `ng serve` bound `::1` only. Unix `proxy_pass` stays in
+`extraConfig` so NixOS does not rewrite the sock URL.
+
+```nix
+services.nginx = {
+  enable = true;
+  recommendedProxySettings = true;
+  virtualHosts."localhost" = {
+    listen = [{ addr = "127.0.0.1"; port = 8080; }];
+    extraConfig = ''
+      proxy_http_version 1.1;
+      proxy_read_timeout 3600s;
+    '';
+    locations."/api/v1/" = {
+      proxyPass = "http://127.0.0.1:8999";
+      extraConfig = ''
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+      '';
+    };
+    locations."^~ /api/internal/" = {
+      extraConfig = "return 404;";
+    };
+    locations."/api/" = {
+      extraConfig = ''
+        proxy_pass http://unix:/run/rbitcoin/esplora.sock:/;
+        proxy_set_header Host api;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Rbitcoin-Client $connection;
+      '';
+    };
+    locations."/" = {
+      proxyPass = "http://localhost:4200";
+      extraConfig = ''
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+      '';
+    };
+  };
+};
+```
+
+Equivalent nginx (public TLS or TCP Esplora on `:3000` — keep the same slashes):
 
 ```nginx
 location /api/v1/ {
-  proxy_pass http://127.0.0.1:8999/;
+  proxy_pass http://127.0.0.1:8999;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
   proxy_read_timeout 3600s;
 }
 location ^~ /api/internal/ {
   return 404;
 }
 location /api/ {
-  proxy_pass http://127.0.0.1:3000/;
+  proxy_pass http://unix:/run/rbitcoin/esplora.sock:/;
+  # TCP Esplora: proxy_pass http://127.0.0.1:3000/;
   proxy_http_version 1.1;
   proxy_set_header Upgrade $http_upgrade;
   proxy_set_header Connection "upgrade";
-  proxy_set_header Host $host;
+  proxy_set_header Host api;
   proxy_set_header X-Rbitcoin-Client $connection;
   proxy_read_timeout 3600s;
 }
 ```
 
-`/api/v1/` is mempool's Node (MariaDB catalogue), including **`/api/v1/ws`**.
-`/api/` is rbitcoin Esplora (electrs HTTP), including wallet **`/api/ws`**
-(`--esplora-listen` `/v1/ws` + `/ws`). Register the `/api/v1/` location
-**first** so Node keeps the explorer firehose. Deny `/api/internal/` at nginx
-even when Esplora is a unix sock (`proxy_pass` would otherwise forward it).
-Unix Esplora: `proxy_pass http://unix:/run/rbitcoin/esplora.sock:`. Caddy:
-`reverse_proxy` with default HTTP/1.1 upgrade support to the same listen.
-`X-Rbitcoin-Client $connection` is how last-1 GET and last-bulk POST joins
-stick to one nginx connection; omit it on a public TCP expose. HTTP/1.1
+Probe (200 + a height, `X-Powered-By: rbitcoin-esplora/…`):
+
+```bash
+curl -sS -D- http://127.0.0.1:8080/api/blocks/tip/height | head
+```
+
+Caddy: `reverse_proxy` with default HTTP/1.1 upgrade support to the same
+listen. `X-Rbitcoin-Client $connection` is how last-1 GET and last-bulk POST
+joins stick to one nginx connection; omit it on a public TCP expose. HTTP/1.1
 browsers open several `$connection` ids (each GET can miss last-1); terminate
 **HTTP/2** on this location so one tab maps to one connection. Every Esplora
 REST response and the WS upgrade includes
