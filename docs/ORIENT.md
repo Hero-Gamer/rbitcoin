@@ -30,7 +30,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | Which head file (tx / header / scripthash) | [`heads.md`](./heads.md) |
 | Crash, tip-as-commit, kill-9 | [`crash-recovery.md`](./crash-recovery.md) |
 | Tests, budgets, coverage, fixtures | [`../TESTING.md`](../TESTING.md) |
-| Multi-step plan | [`how-we-plan.md`](./how-we-plan.md) |
+| Multi-step plan | [`how-we-plan.md`](./how-we-plan.md) (includes Agent RAM log redirect) |
 | Intentional Core / Electrum / Esplora differences | [`../COMPAT.md`](../COMPAT.md) |
 | JSON-RPC surface | [`rpc.md`](./rpc.md) |
 | Open, push, or poll a PR | [`../.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) |

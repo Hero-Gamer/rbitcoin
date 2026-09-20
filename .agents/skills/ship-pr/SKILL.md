@@ -73,30 +73,48 @@ Suite and budgets: [`TESTING.md`](../../../TESTING.md).
 
 | When | Run |
 |------|-----|
-| Inner loop (Red / Green) | Targeted `cargo test -p <crate> …`. `cargo check -p <crate> --lib`. Not `--tests` after every edit |
-| After Green | `cargo test --workspace` |
+| Inner loop (Red / Green) | Targeted `cargo test -p <crate> … -- --quiet` (redirect). `cargo check -p <crate> --lib` (redirect). Not `--tests` after every edit |
+| After Green | `cargo test --workspace --quiet` (redirect; same shape as below) |
 | After Refactor, before commit | Local CI except coverage (below) |
 | Core functional CI red | [core-functional skill](../core-functional/SKILL.md) |
 | Never local | `./scripts/coverage.sh`, `nix build .#rbitcoin-musl`, host IBD |
 
-Local CI except coverage:
+Redirect stdout and stderr to a file under `/tmp`; print `EXIT:$ec`; on
+failure search then tail at most ~80 lines. Do not load the log file
+wholesale. Owner: [`docs/how-we-plan.md`](../../../docs/how-we-plan.md)
+(Agent RAM).
+
+Local CI except coverage (same redirect shape as how-we-plan Agent RAM):
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check
-./scripts/ast-grep.sh
-cargo test --workspace
-./scripts/ci-os-smoke.sh
+log=$(mktemp /tmp/rbtc-agent-XXXXXX.log)
+run() {
+  set +e
+  "$@" >"$log" 2>&1
+  ec=$?
+  set -e
+  echo EXIT:$ec
+  if [ "$ec" -ne 0 ]; then
+    rg -n 'FAILED|^error:|error\[' "$log" | head -n 40
+    echo '--- tail ---'
+    tail -n 80 "$log"
+    return "$ec"
+  fi
+}
+set -e
+run cargo fmt --all -- --check
+run cargo clippy --workspace --all-targets -- -D warnings
+run cargo deny check
+run ./scripts/ast-grep.sh
+run cargo test --workspace --quiet
+run ./scripts/ci-os-smoke.sh
 ```
 
 If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
-`nix build .#checks.x86_64-linux.nixos-module-eval --no-link`. Label the PR
-`nixos-module-runtime` when systemd deps, users/groups, firewall, or the VM
-start argv changed — that runs `nixos-module-runtime` (qemu). Do not wait
-out the VM test locally.
-
-Agent logs: [`how-we-plan.md`](../../../docs/how-we-plan.md) (Agent RAM).
+`nix build .#checks.x86_64-linux.nixos-module-eval --no-link` (same
+redirect). Label the PR `nixos-module-runtime` when systemd deps,
+users/groups, firewall, or the VM start argv changed — that runs
+`nixos-module-runtime` (qemu). Do not wait out the VM test locally.
 
 Coverage and native `windows` / `macos` stay GitHub Actions;
 `ci-os-smoke.sh` is the local stand-in. Do not wait out a host IBD or a

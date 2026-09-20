@@ -61,6 +61,12 @@ step. Keep `--lib` compiling (wrap the old API, switch one caller). Owner:
 [`docs/how-we-plan.md`](docs/how-we-plan.md). Commands:
 [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
 
+**Agent RAM:** never load `cargo test`, clippy, deny, or rustc stdout into
+the session. Redirect stdout and stderr to a file under `/tmp`; read the
+exit code, failure names (`test … FAILED`, lint ids, first rustc error),
+and at most ~80 lines of tail. `--quiet` is enough to confirm green.
+Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (Agent RAM).
+
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
 RPC / P2P / Electrum / Esplora: [`COMPAT.md`](COMPAT.md).
