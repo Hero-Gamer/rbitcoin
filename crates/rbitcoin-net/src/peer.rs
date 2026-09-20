@@ -208,7 +208,16 @@ fn stash_pending_block(pending: &mut PendingBlocks, hash: BlockHash, block: bitc
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
-    crate::seeds::required_seed_services()
+    local_service_flags_pruned(false)
+}
+
+/// BIP159: a pruned node offers `NETWORK_LIMITED`, not `NETWORK`.
+pub fn local_service_flags_pruned(pruned: bool) -> ServiceFlags {
+    if pruned {
+        ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
+    } else {
+        crate::seeds::required_seed_services()
+    }
 }
 
 /// NETWORK_LIMITED is enough when the tip is shallower than this (~24h at 10m).
@@ -811,7 +820,8 @@ async fn application_handshake(
     user_agent: &str,
     policy: HandshakePolicy<'_>,
 ) -> Result<VersionMessage, NetError> {
-    let services = local_service_flags();
+    let pruned = policy.peers.map(|p| p.is_pruned()).unwrap_or(false);
+    let services = local_service_flags_pruned(pruned);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -4627,6 +4637,7 @@ fn block_for_peer(
     }
     match query.reconstruct_block_by_hash(&hash.to_byte_array()) {
         Ok(b) => Ok(b),
+        Err(rbitcoin_store::StoreError::Pruned { .. }) => Ok(None),
         Err(e) => Err(NetError::Consensus(e.to_string())),
     }
 }
@@ -4665,6 +4676,7 @@ fn encode_served_witness_block(
             Ok(Some(contents))
         }
         Ok(None) => Ok(None),
+        Err(rbitcoin_store::StoreError::Pruned { .. }) => Ok(None),
         Err(e) => Err(NetError::Consensus(e.to_string())),
     }
 }

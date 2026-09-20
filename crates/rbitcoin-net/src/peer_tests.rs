@@ -226,6 +226,16 @@ fn local_service_flags_include_network_witness_v2() {
 }
 
 #[test]
+fn local_service_flags_pruned_are_limited_not_network() {
+    let f = local_service_flags_pruned(true);
+    assert!(f.has(ServiceFlags::NETWORK_LIMITED));
+    assert!(!f.has(ServiceFlags::NETWORK));
+    assert!(f.has(ServiceFlags::WITNESS));
+    assert!(f.has(ServiceFlags::P2P_V2));
+    assert_eq!(local_service_flags_pruned(false), local_service_flags());
+}
+
+#[test]
 fn rand_nonce_changes() {
     let a = rand_nonce();
     let b = rand_nonce();
