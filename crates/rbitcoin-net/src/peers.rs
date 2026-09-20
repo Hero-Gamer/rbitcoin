@@ -1901,25 +1901,22 @@ impl PeerHub {
         self.addnode_net(crate::NetAddr::Ip(addr), cmd)
     }
 
+    fn dial_manual_net(&self, addr: &crate::NetAddr) -> Result<(), String> {
+        match addr {
+            crate::NetAddr::Ip(ip) => self.dial(*ip, PeerConnType::Manual),
+            _ => self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual),
+        }
+    }
+
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
         match cmd {
-            "onetry" => match addr {
-                crate::NetAddr::Ip(ip) => self.dial(ip, PeerConnType::Manual),
-                crate::NetAddr::Onion { .. } => {
-                    self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual)
-                }
-            },
+            "onetry" => self.dial_manual_net(&addr),
             "add" => {
                 self.added
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(addr);
-                let _ = match addr {
-                    crate::NetAddr::Ip(ip) => self.dial(ip, PeerConnType::Manual),
-                    crate::NetAddr::Onion { .. } => {
-                        self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual)
-                    }
-                };
+                let _ = self.dial_manual_net(&addr);
                 Ok(())
             }
             "remove" => {
