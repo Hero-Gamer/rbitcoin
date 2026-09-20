@@ -31,6 +31,7 @@ Musl install: [`OPERATOR.md`](../OPERATOR.md) (Build). Binary:
 ./target/release/rbitcoin-node \
   --datadir ./datadir-signet \
   --network signet \
+  --sh-index \
   --listen 127.0.0.1:38333 \
   --electrum-listen 127.0.0.1:50001 \
   --log-level info
