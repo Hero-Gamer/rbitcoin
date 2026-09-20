@@ -74,7 +74,6 @@ mod tests {
         assert_eq!(script_sigop_count(&[0x4c, 2, 0xac, 0xac, 0xac], true), 1); // PUSHDATA1 2 [ac,ac] + ac => 1
     }
 
-
     use super::*;
 
     #[test]
