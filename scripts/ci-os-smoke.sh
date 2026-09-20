@@ -18,7 +18,6 @@ STORE_PLATFORM_FILTERS=(
   io_backend::tests
   uring_session::tests::default_kind_follows_os
   uring_session::tests::pool_
-  io_session_iocp
   fuse8_filter::tests::no_false_negatives_and_roundtrip
   segmented_head::tests::insert_roll_seal_lookup_roundtrip
   bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram
@@ -30,6 +29,10 @@ QUERY_PLATFORM_FILTERS=(
   connect_chain_query_surface
   spend_edge_and_confirm_idempotent_path
 )
+# create.loc SSE2 / NEON vs the scalar golden. Linux CI is x86_64 and runs the
+# full workspace suite, so this is appended per-platform below: the Windows
+# smoke is the SSE2 pin, the Darwin smoke the aarch64 NEON pin.
+PRIMITIVES_PLATFORM_FILTERS=()
 # Windows OVERLAPPED + concurrent grow can `pread short` and abort the
 # process (STATUS_STACK_BUFFER_OVERRUN). Same-thread fuse roundtrip, seal
 # roll, and query confirm still run. CI_OS_SMOKE_UNAME overrides uname
@@ -38,10 +41,12 @@ STORE_PLATFORM_SKIPS=()
 case "${CI_OS_SMOKE_UNAME:-$(uname -s)}" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT*)
     STORE_PLATFORM_SKIPS+=(concurrent_readers_during_append_and_grow)
-    STORE_PLATFORM_FILTERS+=(create_loc::tests::prefix_sum)
+    # `mod io_session_iocp` is #[cfg(windows)] — the tests do not exist elsewhere.
+    STORE_PLATFORM_FILTERS+=(io_session_iocp)
+    PRIMITIVES_PLATFORM_FILTERS+=(loc_simd::tests)
     ;;
   Darwin*)
-    STORE_PLATFORM_FILTERS+=(create_loc::tests::prefix_sum)
+    PRIMITIVES_PLATFORM_FILTERS+=(loc_simd::tests)
     ;;
 esac
 
@@ -49,6 +54,7 @@ if [[ "${CI_OS_SMOKE_DRY_RUN:-}" == "1" ]]; then
   echo "smoke=store-platform+query-confirm+node-smoke"
   echo "filters=${STORE_PLATFORM_FILTERS[*]}"
   echo "query=${QUERY_PLATFORM_FILTERS[*]}"
+  echo "primitives=${PRIMITIVES_PLATFORM_FILTERS[*]:-}"
   echo "skip=${STORE_PLATFORM_SKIPS[*]:-}"
   exit 0
 fi
@@ -58,12 +64,29 @@ for s in ${STORE_PLATFORM_SKIPS[@]+"${STORE_PLATFORM_SKIPS[@]}"}; do
   skip_args+=(--skip "$s")
 done
 
+# A filter that matches nothing is a stale filter, not a pass: libtest reports
+# "running 0 tests" and exits 0, so the gate would silently shrink on a rename.
+assert_filter_matches() {
+  local pkg="$1" f="$2"
+  if ! cargo test -q -p "$pkg" --lib -- --list "$f" | grep -q ': test'; then
+    echo "ci-os-smoke: stale filter '$f' matches no test in $pkg" >&2
+    exit 1
+  fi
+}
+
 for f in "${STORE_PLATFORM_FILTERS[@]}"; do
+  assert_filter_matches rbitcoin-store "$f"
   cargo test -p rbitcoin-store --lib -- "$f" ${skip_args[@]+"${skip_args[@]}"}
 done
 
 for f in "${QUERY_PLATFORM_FILTERS[@]}"; do
+  assert_filter_matches rbitcoin-query "$f"
   cargo test -p rbitcoin-query --lib -- "$f"
+done
+
+for f in ${PRIMITIVES_PLATFORM_FILTERS[@]+"${PRIMITIVES_PLATFORM_FILTERS[@]}"}; do
+  assert_filter_matches rbitcoin-primitives "$f"
+  cargo test -p rbitcoin-primitives --lib -- "$f"
 done
 
 cargo build -p rbitcoin-node -p rbitcoin-cli
