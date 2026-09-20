@@ -17,12 +17,23 @@
       crane,
     }:
     let
-      # Systems we expose packages for (native builds when host matches).
+      # Release packages + checks. Linux only, deliberately: the Nix path exists
+      # to produce fully static musl binaries, and Apple forbids a static
+      # libSystem link, so a Darwin `nix build` is store-rpath (not portable).
+      # Darwin/Windows ship from GHA instead — docs/reproducible-builds.md
+      # § Windows / Darwin snapshots.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
+      # Dev shells only pin *tool* versions; they build nothing that ships, so
+      # the static-link constraint above does not apply to them. Darwin is a
+      # required PR gate (ci.yml `macos`) over real Darwin-only store code
+      # (pool session, bulk_io, sorted_run), so those contributors get the same
+      # pinned rustc / LLVM / ast-grep as Linux.
+      devSystems = systems ++ [ "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      forAllDevSystems = nixpkgs.lib.genAttrs devSystems;
 
       mkRbitcoin =
         pkgs:
@@ -81,7 +92,7 @@
       );
 
       # Dev shell uses the **same pinned** nixpkgs (not floating <nixpkgs>).
-      devShells = forAllSystems (
+      devShells = forAllDevSystems (
         system:
         let
           pkgs = import nixpkgs {

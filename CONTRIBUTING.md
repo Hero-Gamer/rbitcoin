@@ -72,7 +72,7 @@ IO on Windows and Darwin.
 | `cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` | yes | yes | yes |
 | `cargo test --workspace` (required `test` job) | yes | usually (see `flock` below) | use **WSL2** (Ubuntu + rustup inside the distro). Native CI does **not** run the full workspace suite |
 | `./scripts/coverage.sh` / `cargo deny` / `./scripts/ast-grep.sh` | yes (install extras below, or Nix) | possible; not the CI host | not the supported path |
-| `nix develop` / `nix-shell` | optional pin (below) | flake `devShells` are **Linux-only** (`x86_64-linux`, `aarch64-linux`) | no |
+| `nix develop` / `nix-shell` | optional pin (below) | optional pin (below) — `aarch64-darwin` | no |
 
 **macOS Intel vs Apple Silicon:** rustup installs a native toolchain. CI `macos` is
 `macos-14` (aarch64). You can develop on either; Release Darwin zips are **aarch64
@@ -131,11 +131,11 @@ Not needed to compile or `--smoke`. CI installs prebuilts; locally:
 | **ast-grep** | [ast-grep.github.io](https://ast-grep.github.io) (or Nix) then `./scripts/ast-grep.sh` | `ast-grep` |
 | **cargo-llvm-cov** | `cargo install cargo-llvm-cov --locked` + `rustup component add llvm-tools-preview` then `./scripts/coverage.sh` | `coverage` |
 
-### Optional Nix (Linux)
+### Optional Nix (Linux / macOS)
 
-[`flake.nix`](./flake.nix) `devShells` exist only for **Linux**. They pin rustc
-to the same `flake.lock` as musl release builds and set `CARGO_TARGET_DIR=target/dev`
-plus `RUSTFLAGS=-Dwarnings`:
+[`flake.nix`](./flake.nix) `devShells` cover `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. They pin rustc to the same `flake.lock` as musl release builds
+and set `CARGO_TARGET_DIR=target/dev` plus `RUSTFLAGS=-Dwarnings`:
 
 ```bash
 nix develop   # or nix-shell — both read flake.lock, not floating <nixpkgs>
@@ -143,6 +143,11 @@ nix develop   # or nix-shell — both read flake.lock, not floating <nixpkgs>
 
 That is **not** the operator binary (`nix build .#rbitcoin-musl`). Details:
 [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
+
+**Release `packages` stay Linux-only** (`nix build` has no `aarch64-darwin`
+attribute). The dev shell pins tool versions and builds nothing that ships, so
+the static-musl constraint that excludes Darwin from `packages` does not apply
+to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
 
 ## Principles
 

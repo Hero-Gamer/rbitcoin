@@ -93,6 +93,11 @@ Windows operator binary the same way:
 Staging for Releases: `scripts/stage-native-artifacts.sh`. Not byte-identical
 with the musl package. Windows IoRing is not supported.
 
+**This limits `packages` and `checks`, not `devShells`.** The flake exposes a
+dev shell for `aarch64-darwin` (`flake.nix` → `devSystems`) because it only pins
+tool versions — nothing it produces is shipped, so the static-link constraint
+never applies. `nix build` still has no Darwin attribute, by design.
+
 ### GitHub Release (`v*.*.*` tags)
 
 Cut, merge, tag, `vX.Y.x`, and the `.99` bump:
