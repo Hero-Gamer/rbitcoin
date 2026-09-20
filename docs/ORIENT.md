@@ -32,6 +32,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | Tests, budgets, coverage, fixtures | [`../TESTING.md`](../TESTING.md) |
 | Multi-step plan (Red → Green → Refactor) | [`how-we-plan.md`](./how-we-plan.md) |
 | cargo / clippy / deny / rustc logs (do not load into the session) | [`how-we-plan.md`](./how-we-plan.md) (Agent RAM) |
+| Agent VM disk (one worktree, shared `CARGO_TARGET_DIR`) | [`../TESTING.md`](../TESTING.md) (Agent VM disk) |
 | Intentional Core / Electrum / Esplora differences | [`../COMPAT.md`](../COMPAT.md) |
 | JSON-RPC surface | [`rpc.md`](./rpc.md) |
 | Open, push, or poll a PR | [`../.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) (one worktree; never `git remote set-url origin`; HTTPS push; fail-fast `pr-checks-watch.sh`) |
