@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Orphan parent GETDATA flush cap is 100:** Core
+  `MAX_PEER_TX_REQUEST_IN_FLIGHT`. A 25-tx ancestor package's missing
+  parents fit one GetData (was 16).
+
 - **create.loc SIMD is SSE2-only:** inclusive `u8 << 3` extracts the low
   prefix carry with `_mm_cvtsi128_si32(_mm_srli_si128(_, 12))`.
   `_mm_extract_epi32` is SSE4.1; nightly Miri rejected it (`unavailable

@@ -428,7 +428,8 @@ pub(crate) const TXID_RELAY_DELAY_SECS: u64 = 2;
 /// Core `GETDATA_TX_INTERVAL` (in-flight parent request expiry).
 pub(crate) const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Cap unique parent GETDATA items issued from one flush.
-const MAX_PARENTS_PER_PARK: usize = 16;
+/// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
+const MAX_PARENTS_PER_PARK: usize = 100;
 
 struct ParentAnn {
     peer: u64,
@@ -4616,6 +4617,54 @@ mod tests {
     }
 
     #[test]
+    fn take_due_parent_getdata_one_flush_covers_max_ancestor_package() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let mut missing = BTreeSet::new();
+        for i in 0u8..24 {
+            missing.insert(Txid::from_byte_array([i + 1; 32]));
+        }
+        let t0 = 1_000u64;
+        hub.schedule_orphan_parents(&missing, 1, true, t0);
+        let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
+        let first = hub.take_due_parent_getdata(1, due);
+        assert_eq!(
+            first.len(),
+            24,
+            "24-orphan ancestor package must be one GetData"
+        );
+        assert!(hub.take_due_parent_getdata(1, due).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn take_due_parent_getdata_caps_per_flush() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let mut missing = BTreeSet::new();
+        for i in 0u16..120 {
+            let mut h = [0u8; 32];
+            h[0] = (i >> 8) as u8;
+            h[1] = i as u8;
+            missing.insert(Txid::from_byte_array(h));
+        }
+        let t0 = 1_000u64;
+        hub.schedule_orphan_parents(&missing, 1, true, t0);
+        let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
+        let first = hub.take_due_parent_getdata(1, due);
+        assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
+        let rest = hub.take_due_parent_getdata(1, due);
+        assert_eq!(rest.len(), 20);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn take_due_parent_getdata_waits_inbound_txid_delay() {
         let dir = tmp();
         let store_dir = tmp();
@@ -4634,9 +4683,7 @@ mod tests {
         );
         let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
         let first = hub.take_due_parent_getdata(1, due);
-        assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
-        let rest = hub.take_due_parent_getdata(1, due);
-        assert_eq!(rest.len(), 4, "cap leftover still asked once");
+        assert_eq!(first.len(), 20);
         assert!(
             hub.take_due_parent_getdata(1, due).is_empty(),
             "in-flight must not re-ask"
@@ -4651,7 +4698,7 @@ mod tests {
             2,
             expired + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS,
         );
-        assert_eq!(other.len(), MAX_PARENTS_PER_PARK, "other peer after expiry");
+        assert_eq!(other.len(), 20, "other peer after expiry");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
