@@ -256,9 +256,9 @@ A sequence of gates can wrap that body in a `run` function (one call per
 command). Do not paste a second copy into ship-pr; that file lists the
 commands and links here.
 
-**Agent disk:** one session worktree, `CARGO_TARGET_DIR=/tmp/rbtc-target/dev`
-before `nix-shell`, no cargo in the Cursor checkout. Owner (table, ENOSPC,
-lock): [`TESTING.md`](../TESTING.md) (Agent VM disk). Commands:
+**Agent disk:** `rearden-grok[bot]` follows
+[`rearden-vm-HOST.md`](../rearden-vm-HOST.md). Other identities: ignore
+that file. Commands:
 [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
 Pure docs, comments, or formatting skip Red, Green, and the workspace suite.

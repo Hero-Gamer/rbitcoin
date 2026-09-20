@@ -122,7 +122,7 @@
               export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
               export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
               # Host gnu debug (fmt/clippy/test). Coverage → target/cov; musl → nix/crane.
-              # Agent VM: export CARGO_TARGET_DIR=/tmp/rbtc-target/dev first (TESTING.md).
+              # Override CARGO_TARGET_DIR before this hook to share a silo; default is $PWD/target/dev.
               if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
                 export CARGO_TARGET_DIR="$PWD/target/dev"
               fi
