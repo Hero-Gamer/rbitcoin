@@ -1015,6 +1015,11 @@ impl Query {
                 "tx put_full_batch fk mismatch (plan not committed in order)",
             ));
         }
+        if self.prune_inwit() {
+            let ins: Vec<Vec<rbitcoin_store::InputRecord>> =
+                plan.packed.iter().map(|(_, v)| v.clone()).collect();
+            self.note_appended_inwit_inputs(&got_tx_fks, &ins);
+        }
         for ((pin, _), pair) in plan.packed.iter().zip(loc.iter()) {
             pin.set_loc(*pair);
         }

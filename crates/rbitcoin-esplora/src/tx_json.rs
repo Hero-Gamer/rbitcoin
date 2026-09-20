@@ -185,7 +185,6 @@ fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Va
         "txid": block_hash_hex(&txid),
         "version": tx.version,
         "locktime": tx.locktime,
-        "vin": [],
         "vout": vout,
         "status": status,
         "pruned": true,

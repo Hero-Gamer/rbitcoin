@@ -297,7 +297,7 @@ fn operator_usage() -> String {
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
-    [--sh-index] [--prune-inwit] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--sh-index] [--prune-inwit] [--prune-inwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -335,7 +335,8 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
-  --prune-inwit drops Class A inwit below tip-288 heights and advertises NETWORK_LIMITED.\n\
+  --prune-inwit refuse inwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED (does not unlink inwit.body yet).\n\
+  --prune-inwit-ram-threshold-bytes N RAM cap for prune+IBD witness window (default 268435456).\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
@@ -995,13 +996,22 @@ mod tests {
 
     #[test]
     fn prune_inwit_is_kebab() {
-        let on = ready_config(["rbitcoin-node", "--prune-inwit"]);
+        let on = ready_config([
+            "rbitcoin-node",
+            "--prune-inwit",
+            "--prune-inwit-ram-threshold-bytes=4096",
+        ]);
         assert!(on.prune_inwit);
+        assert_eq!(on.prune_inwit_ram_threshold_bytes, 4096);
         let mut conf = NodeConfig::default();
         conf.apply_kv("prune_inwit", "1").unwrap();
+        conf.apply_kv("prune_inwit_ram_threshold_bytes", "8192")
+            .unwrap();
         assert!(conf.prune_inwit);
+        assert_eq!(conf.prune_inwit_ram_threshold_bytes, 8192);
         let h = operator_usage();
         assert!(h.contains("--prune-inwit"));
+        assert!(h.contains("--prune-inwit-ram-threshold-bytes"));
         assert!(!h.contains("--pruneinwit"));
         assert_exit(
             cli_main(["rbitcoin-node", "--pruneinwit"]),

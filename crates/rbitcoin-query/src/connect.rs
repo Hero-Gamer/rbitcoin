@@ -80,7 +80,8 @@ impl Query {
         let mut abs_edges: Vec<(u64, Fk, u32, Fk, u32)> = Vec::new();
         for item in items {
             for &spend_fk in &item.tx_fks {
-                let (_tx, ins, _outs) = self.store.get_tx_full(spend_fk)?;
+                let tx = self.get_tx(spend_fk)?;
+                let ins = self.tx_input_run_class_a(spend_fk, &tx)?;
                 for (vin, inp) in ins.into_iter().enumerate() {
                     if inp.is_coinbase() {
                         continue;
@@ -249,6 +250,11 @@ impl Query {
             let _ = self.ensure_height_by_hash_index(tip);
         }
         self.apply_prune_inwit_tip()?;
+        if self.prune_inwit() {
+            for item in items {
+                self.note_inwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+            }
+        }
 
         Ok(out)
     }
@@ -667,7 +673,12 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+        let inputs = if let Some(v) = self.inwit_cached_inputs(create_fk, tx.input_count)? {
+            v
+        } else {
+            let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+            inputs
+        };
         if inputs.len() as u32 != tx.input_count {
             return Err(StoreError::Corrupt("packed input count mismatch"));
         }

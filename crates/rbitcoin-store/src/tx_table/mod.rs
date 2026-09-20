@@ -4,7 +4,6 @@ use crate::compact::{
     input_flags, output_flags, script_kind_v17_disk_used, split_output_flags,
 };
 use crate::error::StoreError;
-use crate::file::FILE_HEADER_LEN;
 use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
@@ -414,6 +413,7 @@ pub struct TxTable {
     pending_head: pending_head::PendingHeadInserts,
     rebuild_seal_bits: u32,
     rebuild_workers: usize,
+    prune_inwit_mode: std::sync::atomic::AtomicBool,
 }
 
 /// Structural-meta backend from env hierarchy.
@@ -501,6 +501,7 @@ impl TxTable {
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
+            prune_inwit_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -553,6 +554,7 @@ impl TxTable {
         inwit_dir: &Path,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
+        let prune_inwit_mode = false;
         if dir.join("tx.body").exists()
             && !dir.join("txout.body").exists()
             && class_a_body_occupied(dir, "tx")
@@ -585,7 +587,7 @@ impl TxTable {
             crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")?
         };
         let loc_count = create_loc.count();
-        if inwit_loc.count() != loc_count {
+        if !prune_inwit_mode && inwit_loc.count() != loc_count {
             return Err(StoreError::Corrupt("invariant: inwit.loc count"));
         }
         let body = if had_txout {
@@ -593,14 +595,19 @@ impl TxTable {
         } else {
             VarTable::create_body_only(dir, "txout", TableKind::TxOut)?
         };
-        if had_txout && loc_count > 0 && (!had_inwit || !had_spent) {
+        if had_txout && loc_count > 0 && (!had_spent || (!had_inwit && !prune_inwit_mode)) {
             return Err(StoreError::Corrupt(
                 "schema 15 Class A missing inwit/spent for existing txout creates; wipe + IBD \
                  (or --datadir-cold if inwit is on a cold volume)",
             ));
         }
         let inwit = if had_inwit {
-            VarTable::open_body_only(inwit_dir, "inwit", TableKind::Inwit, loc_count)?
+            let in_count = if prune_inwit_mode {
+                inwit_loc.count()
+            } else {
+                loc_count
+            };
+            VarTable::open_body_only(inwit_dir, "inwit", TableKind::Inwit, in_count)?
         } else {
             VarTable::create_body_only(inwit_dir, "inwit", TableKind::Inwit)?
         };
@@ -617,8 +624,12 @@ impl TxTable {
         let n_loc = create_loc.count();
         let n_txids = txids.count();
         let n_inwit_loc = inwit_loc.count();
-        if n_txids != n_loc || n_inwit_loc != n_loc {
-            let n = n_loc.min(n_txids).min(n_inwit_loc);
+        if n_txids != n_loc || (!prune_inwit_mode && n_inwit_loc != n_loc) {
+            let n = if prune_inwit_mode {
+                n_loc.min(n_txids)
+            } else {
+                n_loc.min(n_txids).min(n_inwit_loc)
+            };
             rbitcoin_log::warn!(
                 "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
                  txid.body={n_txids} — truncating to {n}"
@@ -633,32 +644,43 @@ impl TxTable {
                     .next()
                     .flatten()
                     .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
-                let ir = inwit_loc
-                    .range_batch(&[Fk(n)])?
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or(StoreError::Corrupt(
-                        "invariant: inwit.loc range for truncate",
-                    ))?;
+                let in_end = if prune_inwit_mode {
+                    crate::file::FILE_HEADER_LEN as u64
+                } else {
+                    let ir = inwit_loc
+                        .range_batch(&[Fk(n)])?
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .ok_or(StoreError::Corrupt(
+                            "invariant: inwit.loc range for truncate",
+                        ))?;
+                    ir.0.saturating_add(ir.1)
+                };
                 (
                     p.txout.0.saturating_add(p.txout.1),
                     p.spent.0.saturating_add(p.spent.1),
-                    ir.0.saturating_add(ir.1),
+                    in_end,
                 )
             };
             create_loc.truncate_to_count(n)?;
-            inwit_loc.truncate_to_count(n)?;
+            if !prune_inwit_mode {
+                inwit_loc.truncate_to_count(n)?;
+            }
             body.truncate_body_to(n, tx_end)?;
             spent.truncate_body_to(n, sp_end)?;
-            inwit.truncate_body_to(n, in_end)?;
+            if !prune_inwit_mode {
+                inwit.truncate_body_to(n, in_end)?;
+            }
             if n_txids > n {
                 txids.truncate_to_count(n)?;
             }
-            if body.count() != txids.count()
-                || create_loc.count() != txids.count()
-                || inwit_loc.count() != txids.count()
-            {
+            if body.count() != txids.count() || create_loc.count() != txids.count() {
+                return Err(StoreError::Corrupt(
+                    "Class A stem counts still mismatch after repair (reindex required)",
+                ));
+            }
+            if !prune_inwit_mode && inwit_loc.count() != txids.count() {
                 return Err(StoreError::Corrupt(
                     "Class A stem counts still mismatch after repair (reindex required)",
                 ));
@@ -738,6 +760,7 @@ impl TxTable {
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
+            prune_inwit_mode: std::sync::atomic::AtomicBool::new(prune_inwit_mode),
         };
         if need_rebuild {
             let bits = t.head_bits();
@@ -777,6 +800,22 @@ impl TxTable {
             t.seal_unsealed_nontail_from_body()?;
         }
         Ok(t)
+    }
+
+    pub fn prune_inwit_mode(&self) -> bool {
+        self.prune_inwit_mode
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn set_prune_inwit_mode(&self, on: bool) {
+        self.prune_inwit_mode
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn clear_durable_inwit(&self) -> Result<(), StoreError> {
+        self.inwit_loc.truncate_to_count(0)?;
+        self.inwit
+            .truncate_body_to(0, crate::file::FILE_HEADER_LEN as u64)
     }
 
     /// Seal unsealed non-tails from Class A (crash/restart). Keys are not retained.
@@ -960,6 +999,9 @@ impl TxTable {
         &self,
         jobs: &mut [crate::IdxBodyJob],
     ) -> Result<(), StoreError> {
+        if self.prune_inwit_mode() {
+            return Ok(());
+        }
         let mut need = Vec::new();
         let mut slots = Vec::new();
         for (i, j) in jobs.iter().enumerate() {
@@ -1026,6 +1068,9 @@ impl TxTable {
     ///
     /// Used by load: discover parents without full parse into RAM.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
+        if self.prune_inwit_mode() {
+            return Err(StoreError::NotFound);
+        }
         let mut tx = self.get(fk)?;
         let inwit = {
             let ir = self
@@ -1228,54 +1273,15 @@ impl TxTable {
 
     /// `inwit.body` range for one create.
     pub fn inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        if self.prune_inwit_mode() {
+            return Err(StoreError::NotFound);
+        }
         self.inwit_loc
             .range_batch(&[fk])?
             .into_iter()
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)
-    }
-
-    /// Reclaim pruned witness bytes by rewriting `inwit.body` in-place and
-    /// replacing pruned rows with a fixed 8-byte aligned stub.
-    ///
-    /// `keep[i]` corresponds to `Fk(i+1)`: `true` keeps the original inwit
-    /// payload, `false` writes an 8-byte stub.
-    pub fn reclaim_pruned_inwit(&self, keep: &[bool]) -> Result<(u64, u64), StoreError> {
-        const PRUNED_STUB: [u8; 8] = [0u8; 8];
-        let count = self.inwit_loc.count();
-        if keep.len() != count as usize {
-            return Err(StoreError::Corrupt("invariant: prune keep/count mismatch"));
-        }
-        if count == 0 {
-            let end = self.inwit.body_logical_len();
-            return Ok((end, end));
-        }
-        let before = self.inwit.body_logical_len();
-        let mut starts = Vec::with_capacity(count as usize);
-        let mut lens = Vec::with_capacity(count as usize);
-        let mut write_at = FILE_HEADER_LEN as u64;
-        for id in 1..=count {
-            let fk = Fk(id);
-            let (old_off, old_len) = self.inwit_range(fk)?;
-            starts.push(write_at);
-            if keep[(id - 1) as usize] {
-                self.inwit.with_bytes_at(old_off, old_len, |raw| {
-                    self.inwit.write_body_abs(write_at, raw)?;
-                    Ok(())
-                })?;
-                lens.push(old_len);
-                write_at = write_at.saturating_add(old_len);
-            } else {
-                self.inwit.write_body_abs(write_at, &PRUNED_STUB)?;
-                lens.push(PRUNED_STUB.len() as u64);
-                write_at = write_at.saturating_add(PRUNED_STUB.len() as u64);
-            }
-        }
-        self.inwit_loc.truncate_to_count(0)?;
-        self.inwit_loc.append(&starts, &lens)?;
-        self.inwit.truncate_body_to(count, write_at)?;
-        Ok((before, write_at))
     }
 
     pub fn spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
@@ -1606,6 +1612,9 @@ impl TxTable {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        if self.prune_inwit_mode() {
+            return Err(StoreError::NotFound);
+        }
         let pair = self
             .create_loc_range_batch(&[fk])?
             .into_iter()
@@ -1633,6 +1642,9 @@ impl TxTable {
     /// Contiguous create_fks `first..=last`: one libc span each of `txout.body`
     /// and `inwit.body`, plus `txid.body` range. Not the confirm uring pipeline.
     pub fn get_full_span(&self, first: u64, last: u64) -> Result<Vec<PackedTx>, StoreError> {
+        if self.prune_inwit_mode() {
+            return Err(StoreError::NotFound);
+        }
         if first == 0 {
             return Err(StoreError::InvalidFk);
         }
@@ -1802,7 +1814,7 @@ impl TxTable {
             .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
             .sum();
         let base = self.body.count();
-        if self.inwit.count() != base || self.spent.count() != base {
+        if (!self.prune_inwit_mode() && self.inwit.count() != base) || self.spent.count() != base {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
@@ -1869,7 +1881,7 @@ impl TxTable {
             .map(|(pin, _ins)| 16 + spent_record_len(pin.packed_n_out()) as usize)
             .sum();
         let base = self.body.count();
-        if self.inwit.count() != base || self.spent.count() != base {
+        if (!self.prune_inwit_mode() && self.inwit.count() != base) || self.spent.count() != base {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         for (i, (pin, _)) in items.iter().enumerate() {
@@ -1940,17 +1952,9 @@ impl TxTable {
         let Some(p_out) = self.body.prepare_batch_encode(n, est_out, encode_out)? else {
             return Ok((Vec::new(), Vec::new()));
         };
-        let Some(p_in) = self.inwit.prepare_batch_encode(n, est_inwit, encode_in)? else {
-            return Err(StoreError::Corrupt("Class A inwit prepare empty"));
-        };
         let Some(p_sp) = self.spent.prepare_batch_encode(n, est_spent, encode_sp)? else {
             return Err(StoreError::Corrupt("Class A spent prepare empty"));
         };
-        crate::var_table::write_prepared_bodies_one_wave(&[
-            (&self.body, &p_out),
-            (&self.inwit, &p_in),
-            (&self.spent, &p_sp),
-        ])?;
         let tx_lens = p_out.aligned_lens();
         let mut recs = Vec::with_capacity(n);
         let mut loc = Vec::with_capacity(n);
@@ -1968,6 +1972,31 @@ impl TxTable {
                 n_out: n_outs[i],
             });
         }
+
+        if self.prune_inwit_mode() {
+            crate::var_table::write_prepared_bodies_one_wave(&[
+                (&self.body, &p_out),
+                (&self.spent, &p_sp),
+            ])?;
+            self.create_loc.append(&recs)?;
+            let fks = self.body.finish_prepared(p_out)?;
+            let fks_sp = self.spent.finish_prepared(p_sp)?;
+            if fks != fks_sp {
+                return Err(StoreError::Corrupt(
+                    "Class A append fk mismatch across stems",
+                ));
+            }
+            return Ok((fks, loc));
+        }
+
+        let Some(p_in) = self.inwit.prepare_batch_encode(n, est_inwit, encode_in)? else {
+            return Err(StoreError::Corrupt("Class A inwit prepare empty"));
+        };
+        crate::var_table::write_prepared_bodies_one_wave(&[
+            (&self.body, &p_out),
+            (&self.inwit, &p_in),
+            (&self.spent, &p_sp),
+        ])?;
         self.create_loc.append(&recs)?;
         self.inwit_loc.append(&p_in.starts, &p_in.aligned_lens())?;
         let fks = self.body.finish_prepared(p_out)?;

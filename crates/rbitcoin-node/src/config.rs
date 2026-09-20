@@ -62,7 +62,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatadirOpts {
     pub path: PathBuf,
-    /// When set, Class A `inwit.body` / `inwit.loc` live under `{cold}/store`.
+    /// When set, cold witness artifacts (`inwit.*`, `inwit.window/*`) live under `{cold}/store`.
     pub cold: Option<PathBuf>,
 }
 
@@ -263,6 +263,8 @@ pub struct NodeConfig {
     pub shindex: bool,
     /// Drop Class A inwit below a 288-height watermark (`NETWORK_LIMITED`).
     pub prune_inwit: bool,
+    /// RAM cap for prune+IBD witness window before spill/re-fetch behavior.
+    pub prune_inwit_ram_threshold_bytes: u64,
     /// Persist / serve BIP-352 tweaks from `sp_tweaks.*`. Default **off**.
     pub sptweaks: bool,
     /// Electrum tweaks: omit P2TR outs with `value <=` this (sats). `0` serves
@@ -343,6 +345,7 @@ impl Default for NodeConfig {
             max_run_secs: None,
             shindex: false,
             prune_inwit: false,
+            prune_inwit_ram_threshold_bytes: 256 * 1024 * 1024,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: 0,
@@ -896,6 +899,16 @@ impl NodeConfig {
             "prune_inwit" => {
                 self.prune_inwit = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf prune_inwit: {e}")))?;
+            }
+            "prune_inwit_ram_threshold_bytes" => {
+                self.prune_inwit_ram_threshold_bytes = val.parse().map_err(|e| {
+                    NodeError::Config(format!("conf prune_inwit_ram_threshold_bytes: {e}"))
+                })?;
+                if self.prune_inwit_ram_threshold_bytes == 0 {
+                    return Err(NodeError::Config(
+                        "conf prune_inwit_ram_threshold_bytes must be > 0".into(),
+                    ));
+                }
             }
             "sp_tweaks" => {
                 self.sptweaks = parse_conf_bool(val)

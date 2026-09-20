@@ -9,10 +9,24 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        let (tx, outs) = self.store.get_tx_meta_and_outputs(fk)?;
+        if let Some(inputs) = self.inwit_cached_inputs(fk, tx.input_count)? {
+            if inputs.len() as u32 != tx.input_count {
+                return Err(StoreError::Corrupt("packed input count mismatch"));
+            }
+            return Ok((tx, outs, inputs));
+        }
         self.require_inwit_fk(fk)?;
         let t0 = Instant::now();
         crate::note_confirm(&self.confirm_stats().wf_body_store, 1);
-        let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
+        let (tx, inputs, outs) = match self.store.get_tx_full(fk) {
+            Ok(v) => v,
+            Err(StoreError::NotFound) if self.prune_inwit() => {
+                let height = self.store.tx_height_get(fk)?.unwrap_or(0);
+                return Err(StoreError::Pruned { height });
+            }
+            Err(e) => return Err(e),
+        };
         crate::note_confirm(
             &self.confirm_stats().wf_body_store_ns,
             t0.elapsed().as_nanos() as u64,
@@ -247,18 +261,20 @@ impl Query {
             self.require_inwit_fk(fk)?;
         }
         let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
-        if let Some((first, last)) = Self::contiguous_fk_run(tx_fks) {
-            let mut rows = self.store.get_tx_full_span(first, last)?;
-            if rows.len() != tx_fks.len() {
-                return Err(StoreError::Corrupt("invariant: span reconstruct length"));
-            }
-            for (i, (rec_tx, stored_inputs, _)) in rows.iter_mut().enumerate() {
-                if let Some(id) = tx_fks[i].get() {
-                    prev_txid_cache.insert(id, rec_tx.txid);
+        if !self.prune_inwit() {
+            if let Some((first, last)) = Self::contiguous_fk_run(tx_fks) {
+                let mut rows = self.store.get_tx_full_span(first, last)?;
+                if rows.len() != tx_fks.len() {
+                    return Err(StoreError::Corrupt("invariant: span reconstruct length"));
                 }
-                self.fill_input_prev_txids_cached(stored_inputs, &mut prev_txid_cache)?;
+                for (i, (rec_tx, stored_inputs, _)) in rows.iter_mut().enumerate() {
+                    if let Some(id) = tx_fks[i].get() {
+                        prev_txid_cache.insert(id, rec_tx.txid);
+                    }
+                    self.fill_input_prev_txids_cached(stored_inputs, &mut prev_txid_cache)?;
+                }
+                return Ok(rows);
             }
-            return Ok(rows);
         }
         let mut rows = Vec::with_capacity(tx_fks.len());
         for &fk in tx_fks {

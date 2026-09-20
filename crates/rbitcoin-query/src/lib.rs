@@ -219,6 +219,14 @@ impl std::ops::DerefMut for BodyQueueInner {
     }
 }
 
+#[derive(Default)]
+struct InwitRamWindow {
+    by_height: BTreeMap<u32, Vec<Fk>>,
+    by_fk: U64Map<Vec<InputRecord>>,
+    bytes: u64,
+    evictions: u64,
+}
+
 /// SH write-behind: confirm enqueues; one Class B appender drains.
 ///
 /// Separate mutexes on purpose: confirm enqueues on the write thread while
@@ -323,6 +331,14 @@ pub struct Query {
     pruneheight: AtomicU32,
     /// Operator `--prune-inwit` (advertise NETWORK_LIMITED even before a drop).
     prune_inwit: AtomicBool,
+    /// True while the net IBD engine is active.
+    ibd_mode: AtomicBool,
+    /// In prune+IBD mode, cap for recent witness kept in RAM.
+    inwit_ram_threshold_bytes: AtomicU64,
+    /// Recent witness cache keyed by confirmed heights/create fks.
+    inwit_ram_window: Mutex<InwitRamWindow>,
+    /// Inputs from the most recent Class A append wave (fk-keyed).
+    inwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -335,6 +351,7 @@ struct HeightByHashIndex {
 }
 
 impl Query {
+    pub const DEFAULT_INWIT_RAM_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
         Self::open_or_create_layout(StoreLayout::single(store_path.as_ref().to_path_buf()))
     }
@@ -425,6 +442,10 @@ impl Query {
             uring_recover_tip: AtomicU32::new(u32::MAX),
             pruneheight: AtomicU32::new(ph),
             prune_inwit: AtomicBool::new(prune_on),
+            ibd_mode: AtomicBool::new(false),
+            inwit_ram_threshold_bytes: AtomicU64::new(Self::DEFAULT_INWIT_RAM_THRESHOLD_BYTES),
+            inwit_ram_window: Mutex::new(InwitRamWindow::default()),
+            inwit_append_cache: Mutex::new(U64Map::default()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -462,13 +483,49 @@ impl Query {
         self.prune_inwit.load(AtomicOrdering::Acquire)
     }
 
+    pub fn ibd_mode(&self) -> bool {
+        self.ibd_mode.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn set_ibd_mode(&self, on: bool) {
+        self.ibd_mode.store(on, AtomicOrdering::Release);
+    }
+
+    pub fn inwit_ram_threshold_bytes(&self) -> u64 {
+        self.inwit_ram_threshold_bytes.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn set_inwit_ram_threshold_bytes(&self, bytes: u64) -> Result<(), QueryError> {
+        if bytes == 0 {
+            return Err(StoreError::Corrupt("inwit ram threshold must be non-zero"));
+        }
+        self.inwit_ram_threshold_bytes
+            .store(bytes, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn prune_ibd_mode(&self) -> bool {
+        self.prune_inwit() && self.ibd_mode()
+    }
+
     pub fn set_prune_inwit(&self, on: bool) -> Result<(), QueryError> {
+        let was_on = self.prune_inwit();
+        if !on && self.prune_inwit() {
+            return Err(StoreError::Layout(
+                "refusing to disable prune-inwit on a pruned datadir".into(),
+            ));
+        }
         self.prune_inwit.store(on, AtomicOrdering::Release);
         if on {
             if self.pruneheight().is_none() {
                 self.persist_pruneheight(u32::MAX)?;
             }
+            if !was_on {
+                self.seed_recent_inwit_from_store()?;
+            }
         } else {
+            self.clear_inwit_ram_window();
             self.set_pruneheight(None)?;
         }
         Ok(())
@@ -488,12 +545,7 @@ impl Query {
         if height.is_some() {
             self.prune_inwit.store(true, AtomicOrdering::Release);
             self.persist_pruneheight(v)?;
-            let (before, after) = self.store.reclaim_pruned_inwit(v)?;
-            if after < before {
-                rbitcoin_log::info!(
-                    "query: prune-inwit reclaimed bytes before={before} after={after}"
-                );
-            }
+            self.prune_inwit_spill_below(v.saturating_add(1))?;
             Ok(())
         } else {
             self.prune_inwit.store(false, AtomicOrdering::Release);
@@ -556,6 +608,225 @@ impl Query {
         }
         let height = self.store.tx_height_get(fk)?.unwrap_or(0);
         Err(StoreError::Pruned { height })
+    }
+
+    pub(crate) fn clear_inwit_ram_window(&self) {
+        *self.inwit_ram_window.lock().unwrap() = InwitRamWindow::default();
+        self.inwit_append_cache.lock().unwrap().clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inwit_ram_window_stats(&self) -> (usize, usize, u64, u64) {
+        let g = self.inwit_ram_window.lock().unwrap();
+        (g.by_height.len(), g.by_fk.len(), g.bytes, g.evictions)
+    }
+
+    pub(crate) fn inwit_ram_inputs(&self, fk: Fk) -> Option<Vec<InputRecord>> {
+        let id = fk.get()?;
+        self.inwit_ram_window
+            .lock()
+            .unwrap()
+            .by_fk
+            .get(&id)
+            .cloned()
+    }
+
+    fn inwit_spill_dir(&self) -> std::path::PathBuf {
+        self.store.path().join("inwit.window")
+    }
+
+    fn prune_inwit_spill_below(&self, min_keep_height: u32) -> Result<(), QueryError> {
+        let dir = self.inwit_spill_dir();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return Ok(());
+        };
+        for ent in rd {
+            let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
+            let path = ent.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(h) = stem.parse::<u32>() else {
+                continue;
+            };
+            if h < min_keep_height {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_inwit_spill_height(
+        &self,
+        height: Height,
+        rows: &[(Fk, Vec<InputRecord>)],
+    ) -> Result<(), QueryError> {
+        let dir = self.inwit_spill_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        let path = dir.join(format!("{}.bin", height.0));
+        let tmp = dir.join(format!("{}.bin.tmp", height.0));
+        let mut out = Vec::new();
+        for (fk, ins) in rows {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            out.extend_from_slice(&id.to_le_bytes());
+            let mut enc = Vec::new();
+            rbitcoin_store::encode_inwit_with_secret(ins, &mut enc, None);
+            out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+            out.extend_from_slice(&enc);
+        }
+        std::fs::write(&tmp, out).map_err(|e| StoreError::io(&tmp, e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))
+    }
+
+    fn inwit_spill_inputs_with_count(
+        &self,
+        fk: Fk,
+        input_count: u32,
+    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
+        if !self.prune_inwit() {
+            return Ok(None);
+        }
+        let Some(height) = self.store.tx_height_get(fk)? else {
+            return Ok(None);
+        };
+        if self.pruneheight().is_some_and(|ph| height <= ph.0) {
+            return Ok(None);
+        }
+        let path = self.inwit_spill_dir().join(format!("{height}.bin"));
+        let raw = match std::fs::read(&path) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::io(path, e)),
+        };
+        let mut i = 0usize;
+        let want = fk.get().ok_or(StoreError::InvalidFk)?;
+        while i.saturating_add(12) <= raw.len() {
+            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
+            i += 8;
+            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            if i.saturating_add(n) > raw.len() {
+                return Err(StoreError::Corrupt("inwit spill short row"));
+            }
+            if id == want {
+                let ins = rbitcoin_store::decode_inwit_secret(&raw[i..i + n], input_count, None)?;
+                return Ok(Some(ins));
+            }
+            i += n;
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn inwit_cached_inputs(
+        &self,
+        fk: Fk,
+        input_count: u32,
+    ) -> Result<Option<Vec<InputRecord>>, QueryError> {
+        if let Some(ins) = self.inwit_ram_inputs(fk) {
+            return Ok(Some(ins));
+        }
+        self.inwit_spill_inputs_with_count(fk, input_count)
+    }
+
+    pub(crate) fn note_appended_inwit_inputs(&self, fks: &[Fk], ins: &[Vec<InputRecord>]) {
+        let mut cache = self.inwit_append_cache.lock().unwrap();
+        for (fk, inputs) in fks.iter().zip(ins.iter()) {
+            if let Some(id) = fk.get() {
+                cache.insert(id, inputs.clone());
+            }
+        }
+    }
+
+    pub(crate) fn note_inwit_ram_for_confirmed(
+        &self,
+        height: Height,
+        tx_fks: &[Fk],
+    ) -> Result<(), QueryError> {
+        if !self.prune_inwit() || tx_fks.is_empty() {
+            return Ok(());
+        }
+        let threshold = self.inwit_ram_threshold_bytes();
+        let mut staged: Vec<(Fk, Vec<InputRecord>, u64)> = Vec::with_capacity(tx_fks.len());
+        let mut appended = self.inwit_append_cache.lock().unwrap();
+        for &fk in tx_fks {
+            let ins = if let Some(id) = fk.get() {
+                if let Some(v) = appended.remove(&id) {
+                    v
+                } else {
+                    let (_tx, ins, _outs) = self.store.get_tx_full(fk)?;
+                    ins
+                }
+            } else {
+                let (_tx, ins, _outs) = self.store.get_tx_full(fk)?;
+                ins
+            };
+            let bytes = ins.iter().map(|i| i.encoded_len() as u64).sum();
+            staged.push((fk, ins, bytes));
+        }
+        drop(appended);
+        let spill_rows: Vec<(Fk, Vec<InputRecord>)> = staged
+            .iter()
+            .map(|(fk, ins, _)| (*fk, ins.clone()))
+            .collect();
+        self.persist_inwit_spill_height(height, &spill_rows)?;
+        let mut g = self.inwit_ram_window.lock().unwrap();
+        let mut at_height: Vec<Fk> = Vec::with_capacity(staged.len());
+        for (fk, ins, bytes) in staged {
+            if let Some(id) = fk.get() {
+                if let Some(old) = g.by_fk.insert(id, ins) {
+                    g.bytes = g
+                        .bytes
+                        .saturating_sub(old.iter().map(|i| i.encoded_len() as u64).sum::<u64>());
+                }
+                g.bytes = g.bytes.saturating_add(bytes);
+                at_height.push(fk);
+            }
+        }
+        g.by_height.insert(height.0, at_height);
+        while g.by_height.len() > Self::INWIT_KEEP_HEIGHTS as usize || g.bytes > threshold {
+            let Some((&old_h, old_fks)) = g.by_height.first_key_value() else {
+                break;
+            };
+            let old_fks = old_fks.clone();
+            g.by_height.remove(&old_h);
+            for fk in old_fks {
+                if let Some(id) = fk.get() {
+                    if let Some(old) = g.by_fk.remove(&id) {
+                        g.bytes = g.bytes.saturating_sub(
+                            old.iter().map(|i| i.encoded_len() as u64).sum::<u64>(),
+                        );
+                        g.evictions = g.evictions.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn seed_recent_inwit_from_store(&self) -> Result<(), QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        let from = tip
+            .0
+            .saturating_sub(Self::INWIT_KEEP_HEIGHTS.saturating_sub(1));
+        for h in from..=tip.0 {
+            let tx_fks = match self.block_tx_fks(Height(h)) {
+                Ok(v) => v,
+                Err(StoreError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            if tx_fks.is_empty() {
+                continue;
+            }
+            self.note_inwit_ram_for_confirmed(Height(h), &tx_fks)?;
+        }
+        Ok(())
     }
 
     /// After `head_insert_many` returned these fks (inclusive max).
@@ -1370,9 +1641,34 @@ impl Query {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
         }
+        if let Some(inputs) = self.inwit_cached_inputs(create_fk, tx.input_count)? {
+            return inputs.get(i as usize).cloned().ok_or(StoreError::NotFound);
+        }
         self.require_inwit_fk(create_fk)?;
-        let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+        let (_, inputs, _) = match self.store.get_tx_full(create_fk) {
+            Ok(v) => v,
+            Err(StoreError::NotFound) if self.prune_inwit() => {
+                let height = self.store.tx_height_get(create_fk)?.unwrap_or(0);
+                return Err(StoreError::Pruned { height });
+            }
+            Err(e) => return Err(e),
+        };
         inputs.get(i as usize).cloned().ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn tx_prevouts_for_fk(&self, fk: Fk) -> Result<Vec<(Fk, u32)>, QueryError> {
+        match self.store.get_tx_meta_and_prevouts(fk) {
+            Ok((_, prevs)) => Ok(prevs),
+            Err(StoreError::NotFound) if self.prune_inwit() => {
+                let tx = self.get_tx(fk)?;
+                let Some(inputs) = self.inwit_cached_inputs(fk, tx.input_count)? else {
+                    let height = self.store.tx_height_get(fk)?.unwrap_or(0);
+                    return Err(StoreError::Pruned { height });
+                };
+                Ok(inputs.iter().map(|i| (i.create_fk, i.prev_index)).collect())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Output `vout` of a tx row (run-addressed).

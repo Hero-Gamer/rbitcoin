@@ -2666,84 +2666,109 @@ fn prune_watermark_survives_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn published_len(path: &std::path::Path) -> u64 {
-    let mut f = std::fs::File::open(path).unwrap();
-    let mut hdr = [0u8; 16];
-    use std::io::Read as _;
-    f.read_exact(&mut hdr).unwrap();
-    u64::from_le_bytes(hdr[8..16].try_into().unwrap())
-}
-
 #[test]
-fn apply_prune_inwit_tip_reclaims_inwit_body_bytes() {
-    let (dir, q) = temp_query("prune-reclaim-bytes");
+fn prune_ibd_ram_window_keeps_last_288_heights() {
+    let (dir, q) = temp_query("prune-ibd-ram-window");
+    q.set_prune_inwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_inwit_ram_threshold_bytes(1 << 30).unwrap();
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
-    for h in 0..400u32 {
+    for h in 0..320u32 {
         let (header, mut ta) = coinbase_block(h, prev, parent_hash);
-        ta.inputs[0].witness = vec![vec![0xab; 96]];
+        ta.inputs[0].witness = vec![vec![0x44; 96]];
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    let inwit_path = q.store().path().join("inwit.body");
-    let before = published_len(&inwit_path);
-    q.set_prune_inwit(true).unwrap();
-    q.apply_prune_inwit_tip().unwrap();
-    let after = published_len(&inwit_path);
-    assert!(
-        after < before,
-        "expected prune reclaim to shrink inwit.body: before={before} after={after}"
-    );
+    let (heights, fks, _bytes, evictions) = q.inwit_ram_window_stats();
+    assert!(heights <= Query::INWIT_KEEP_HEIGHTS as usize);
+    assert!(fks <= Query::INWIT_KEEP_HEIGHTS as usize);
+    assert!(evictions > 0, "old heights must be evicted");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn prune_reclaim_persists_across_reopen() {
-    let (dir, q) = temp_query("prune-reclaim-reopen");
+fn prune_ibd_ram_window_honors_byte_threshold() {
+    let (dir, q) = temp_query("prune-ibd-ram-threshold");
+    q.set_prune_inwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_inwit_ram_threshold_bytes(80).unwrap();
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
-    for h in 0..400u32 {
+    for h in 0..8u32 {
         let (header, mut ta) = coinbase_block(h, prev, parent_hash);
-        ta.inputs[0].witness = vec![vec![0xcd; 96]];
+        ta.inputs[0].witness = vec![vec![0x77; 128]];
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    let inwit_path = q.store().path().join("inwit.body");
-    let before = published_len(&inwit_path);
+    let (_heights, _fks, bytes, evictions) = q.inwit_ram_window_stats();
+    assert!(bytes <= 80, "bytes={bytes}");
+    assert!(evictions > 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
+    let (dir, q) = temp_query("prune-ibd-ram-serve");
     q.set_prune_inwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..300u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0x99; 48]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
     q.apply_prune_inwit_tip().unwrap();
-    let shrunk = published_len(&inwit_path);
-    assert!(
-        shrunk < before,
-        "expected prune reclaim before reopen: before={before} after={shrunk}"
+    let fk0 = q.block_tx_fks(Height(299)).unwrap()[0];
+    let tx0 = q.get_tx(fk0).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk0, &tx0, 0).unwrap().witness.len(),
+        1,
+        "recent witness is served from RAM"
     );
     drop(q);
-    let q = Query::open_or_create_tiny(dir.path()).unwrap();
-    let after_reopen = published_len(&q.store().path().join("inwit.body"));
-    assert_eq!(after_reopen, shrunk, "reopen must preserve reclaimed bytes");
+    let q2 = Query::open_or_create_tiny(dir.path()).unwrap();
+    let tx1 = q2.get_tx(fk0).unwrap();
+    assert_eq!(
+        q2.tx_input_at_fk(fk0, &tx1, 0).unwrap().witness.len(),
+        1,
+        "recent witness is served from spill after restart"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn prune_during_sync_limits_inwit_growth() {
-    let (dir, q) = temp_query("prune-growth-limit");
-    q.set_prune_inwit(true).unwrap();
+fn enable_prune_after_history_seeds_recent_spill_window() {
+    let (dir, q) = temp_query("prune-enable-seed");
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
-    for h in 0..700u32 {
+    for h in 0..300u32 {
         let (header, mut ta) = coinbase_block(h, prev, parent_hash);
-        ta.inputs[0].witness = vec![vec![0xee; 160]];
+        ta.inputs[0].witness = vec![vec![0x55; 72]];
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-        q.apply_prune_inwit_tip().unwrap();
     }
-    let inwit_path = q.store().path().join("inwit.body");
-    let now = published_len(&inwit_path);
-    let max_expected = 16 + (700u64 * 8) + (u64::from(Query::INWIT_KEEP_HEIGHTS) * 192);
-    assert!(
-        now <= max_expected,
-        "pruned inwit growth exceeded limit: now={now} max={max_expected}"
-    );
+    let tip_fk = q.block_tx_fks(Height(299)).unwrap()[0];
+    q.set_prune_inwit(true).unwrap();
+    q.apply_prune_inwit_tip().unwrap();
+    let tx = q.get_tx(tip_fk).unwrap();
+    assert_eq!(q.tx_input_at_fk(tip_fk, &tx, 0).unwrap().witness.len(), 1);
+    drop(q);
+    let q2 = Query::open_or_create_tiny(dir.path()).unwrap();
+    let tx = q2.get_tx(tip_fk).unwrap();
+    assert_eq!(q2.tx_input_at_fk(tip_fk, &tx, 0).unwrap().witness.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_mode_refuses_disable() {
+    let (dir, q) = temp_query("prune-disable-refuse");
+    q.set_prune_inwit(true).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    let err = q.set_prune_inwit(false).unwrap_err().to_string();
+    assert!(err.contains("refusing to disable prune-inwit"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
