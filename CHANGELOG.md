@@ -33,6 +33,11 @@ before 1.0).
 
 ### Changed
 
+- **Weekly cargo-mutants:** `mutants.yml` — PR `--workspace --in-diff`
+  advisory (`continue-on-error`); Sunday 8-shard `--workspace` sweep.
+  Must use `--workspace` (`default-members` is node). Snapshot lists:
+  [`docs/mutants/`](docs/mutants/). How to run: [`TESTING.md`](TESTING.md).
+
 - **Electrum/Esplora no longer require `--sh-index` to bind.** Address and
   scripthash methods return `scripthash index disabled` (Electrum JSON-RPC
   error; Esplora HTTP 503). Txid/outpoint/block/fees work. Channel watches

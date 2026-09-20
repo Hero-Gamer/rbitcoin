@@ -1,3 +1,7 @@
+# Weekly cargo-mutants + PR in-diff advisory. Not a required PR check.
+# Must pass --workspace: default-members is rbitcoin-node only.
+# Owner: TESTING.md (Mutation testing). Snapshot lists: docs/mutants/.
+
 name: mutants
 on:
   schedule:
@@ -22,13 +26,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-mutants@27.1.0
       - run: git diff origin/${{ github.base_ref }}.. --unified=0 > git.diff
@@ -44,16 +48,16 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: false
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
           tool: cargo-mutants@27.1.0
       - run: cargo mutants --workspace --shard ${{ matrix.shard }}/8 -j 2
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: mutants-${{ matrix.shard }}

@@ -30,6 +30,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | Which head file (tx / header / scripthash) | [`heads.md`](./heads.md) |
 | Crash, tip-as-commit, kill-9 | [`crash-recovery.md`](./crash-recovery.md) |
 | Tests, budgets, coverage, fixtures | [`../TESTING.md`](../TESTING.md) |
+| cargo-mutants (weekly sweep, PR advisory) | [`../TESTING.md`](../TESTING.md) (Mutation testing); snapshot [`mutants/`](./mutants/) |
 | Multi-step plan (Red → Green → Refactor) | [`how-we-plan.md`](./how-we-plan.md) |
 | cargo / clippy / deny / rustc logs (do not load into the session) | [`how-we-plan.md`](./how-we-plan.md) (Agent RAM) |
 | `rearden-grok[bot]` operator VM (ignore unless that identity) | [`../rearden-vm-HOST.md`](../rearden-vm-HOST.md) |

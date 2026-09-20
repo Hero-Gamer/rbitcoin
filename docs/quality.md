@@ -8,7 +8,8 @@ in [`CHANGELOG.md`](../CHANGELOG.md). 1.0 product gates:
 **Last reaudit:** 2026-09-17. Schema **24**. Core functional **75**
 `test_runner` jobs (**69** inventory `run`; Core expands transport twins and
 `wallet_txn_*` flags) / **198** `skip`. Findings **001–023** fixed. Nightly
-fuzz **20** jobs. Previous: 2026-09-15.
+fuzz **20** jobs. Weekly mutants **8** shards (not required; owner
+[`TESTING.md`](../TESTING.md)). Previous: 2026-09-15.
 
 | Section | Purpose |
 |---------|---------|
