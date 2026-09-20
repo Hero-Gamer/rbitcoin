@@ -128,6 +128,27 @@ def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None
         result[i] = {"txid": row.get("txid"), "wtxid": row.get("wtxid")}
 
 
+def _rewrite_forwarded_testmempoolaccept(method: Any, body: bytes) -> bytes:
+    if method != "testmempoolaccept":
+        return body
+    try:
+        parsed = json.loads(body.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(parsed, dict):
+        return body
+    result = parsed.get("result")
+    if not isinstance(result, list) or len(result) < 2:
+        return body
+    if not any(
+        isinstance(row, dict) and row.get("reject-reason") in _TMA_ABORT
+        for row in result
+    ):
+        return body
+    rewrite_testmempoolaccept_abort(method, parsed)
+    return json.dumps(parsed).encode()
+
+
 def rewrite_core_maxfeerate(item: dict[str, Any]) -> None:
     method = item.get("method")
     idx = _MAXFEERATE_METHODS.get(method) if isinstance(method, str) else None
@@ -215,7 +236,8 @@ class RpcProxy:
                 method = payload.get("method")
                 if isinstance(method, str) and method in self._handlers:
                     return 200, json.dumps(self._one(payload)).encode()
-                return self.forward_raw(json.dumps(payload).encode())
+                status, body = self.forward_raw(json.dumps(payload).encode())
+                return status, _rewrite_forwarded_testmempoolaccept(method, body)
         except RpcError as e:
             req_id = payload.get("id") if isinstance(payload, dict) else None
             body = json.dumps(

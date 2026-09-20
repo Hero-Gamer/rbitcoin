@@ -181,8 +181,25 @@ class FakeNode(BaseHTTPRequestHandler):
             ).encode()
             self.send_response(401)
         else:
+            if item.get("method") == "testmempoolaccept":
+                result = [
+                    {
+                        "txid": "aa",
+                        "wtxid": "wa",
+                        "allowed": False,
+                        "reject-reason": "missing-inputs",
+                    },
+                    {
+                        "txid": "bb",
+                        "wtxid": "wb",
+                        "allowed": True,
+                        "fees": {"base": 0.00001},
+                    },
+                ]
+            else:
+                result = item.get("method")
             body = json.dumps(
-                {"result": item.get("method"), "error": None, "id": item.get("id")}
+                {"result": result, "error": None, "id": item.get("id")}
             ).encode()
             self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -239,6 +256,11 @@ st, body = call("syncwithvalidationinterfacequeue")
 assert st == 200, st
 assert body["result"] is None, body
 assert body["error"] is None, body
+
+st, body = call("testmempoolaccept")
+assert st == 200, st
+assert body["result"][0]["reject-reason"] == "missing-inputs", body
+assert body["result"][1] == {"txid": "bb", "wtxid": "wb"}, body
 
 node.shutdown()
 proxy.shutdown()
