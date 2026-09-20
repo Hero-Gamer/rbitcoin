@@ -107,9 +107,9 @@ unsafe fn neon_deinterleave_pairs_u8x8(p: *const u8) -> ([u8; 8], [u8; 8], bool)
 #[inline]
 unsafe fn sse2_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
     use std::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_extract_epi32, _mm_loadl_epi64, _mm_set1_epi32,
-        _mm_setzero_si128, _mm_slli_epi32, _mm_slli_si128, _mm_storeu_si128, _mm_unpackhi_epi16,
-        _mm_unpacklo_epi16, _mm_unpacklo_epi8,
+        __m128i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadl_epi64, _mm_set1_epi32,
+        _mm_setzero_si128, _mm_slli_epi32, _mm_slli_si128, _mm_srli_si128, _mm_storeu_si128,
+        _mm_unpackhi_epi16, _mm_unpacklo_epi16, _mm_unpacklo_epi8,
     };
     let prefix4 = |v: __m128i| {
         let s = _mm_add_epi32(v, _mm_slli_si128(v, 4));
@@ -120,7 +120,7 @@ unsafe fn sse2_u8x8_times_8_inclusive(p: *const u8) -> [u32; 8] {
     let w = _mm_unpacklo_epi8(v, z);
     let lo = prefix4(_mm_slli_epi32(_mm_unpacklo_epi16(w, z), 3));
     let hi = prefix4(_mm_slli_epi32(_mm_unpackhi_epi16(w, z), 3));
-    let lo_sum = _mm_extract_epi32(lo, 3);
+    let lo_sum = _mm_cvtsi128_si32(_mm_srli_si128(lo, 12));
     let hi = _mm_add_epi32(hi, _mm_set1_epi32(lo_sum));
     let mut out = [0u32; 8];
     _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, lo);
