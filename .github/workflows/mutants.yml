@@ -1,0 +1,56 @@
+name: mutants
+on:
+  schedule:
+    - cron: '0 3 * * 0' # Sunday 03:00 UTC - weekly heavy job, follows fuzz.yml pattern
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.cargo/mutants.toml'
+      - '.github/workflows/mutants.yml'
+permissions:
+  contents: read
+jobs:
+  mutants-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true # informational PR check, not required gate - weekly is source of truth
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { fetch-depth: 0 }
+      - name: Generate PR diff
+        run: |
+          git diff origin/${{ github.base_ref }}.. --unified=0 > git.diff
+          echo "diff lines: $(wc -l < git.diff)"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.95.0
+        with: { toolchain: '1.95' }
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.86.7
+        with: { tool: cargo-mutants }
+      - run: cargo mutants --workspace --in-diff git.diff -j 2 -- --skip core
+      - uses: actions/upload-artifact@b4e5100c2a7a1d5b5dc374af6c92da2a48af2c4d0 # v4.2.0
+        if: always()
+        with:
+          name: mutants-diff-out
+          path: mutants.out/
+  mutants-weekly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with: { toolchain: '1.95' }
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1
+        with: { tool: cargo-mutants }
+      - run: cargo mutants --workspace --shard ${{ matrix.shard }}/8 -j 2 -- --skip core
+      - uses: actions/upload-artifact@b4e5100c2a7a1d5b5dc374af6c92da2a48af2c4d0
+        if: always()
+        with:
+          name: mutants-weekly-shard-${{ matrix.shard }}
+          path: mutants.out/

@@ -1,0 +1,11 @@
+# cargo-mutants config - baseline 23a90bfc cargo-mutants 27.1.0 rustc 1.95.0
+# At this baseline:
+#   cargo mutants --list = 7 mutants (default-members = [rbitcoin-node] trap)
+#   cargo mutants --list --workspace = 22119 mutants
+#   cargo mutants --list --workspace | grep rbitcoin-node = 0
+#   => At this baseline, rbitcoin-node contributes 0 mutants to --workspace universe,
+#      so excluding it does not reduce measured workload. Bin targets ARE eligible
+#      in general (cargo-mutants includes Bin), this is a baseline observation, not a rule.
+#   Shards: 22119/8 = 2765 per shard (vs 5530 with 4 shards) - arithmetic, needs runtime benchmark
+exclude_globs = []
+exclude_re = []
