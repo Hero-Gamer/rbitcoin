@@ -163,6 +163,13 @@ pub struct DialRequest {
     pub typ: PeerConnType,
 }
 
+#[derive(Clone, Debug)]
+pub struct PeerEndpoint {
+    pub addr: SocketAddr,
+    pub net: crate::NetAddr,
+    pub addrbind: SocketAddr,
+}
+
 /// Queued `sendcmpct` to write on the next heartbeat (`AtomicU8` payload).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -1637,11 +1644,14 @@ impl PeerHub {
             start_height: -1,
             relay: false,
         };
-        self.register_with_id_net(
-            self.next_id.fetch_add(1, Ordering::Relaxed),
+        let endpoint = PeerEndpoint {
             addr,
             net,
             addrbind,
+        };
+        self.register_with_id_net(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            endpoint,
             &ver,
             inbound,
             conn_type,
@@ -1676,7 +1686,17 @@ impl PeerHub {
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let p = self.register_with_id_net(id, addr, net, addrbind, ver, inbound, conn_type);
+        let p = self.register_with_id_net(
+            id,
+            PeerEndpoint {
+                addr,
+                net,
+                addrbind,
+            },
+            ver,
+            inbound,
+            conn_type,
+        );
         p.mark_handshake_complete();
         p.note_recv("version", 100);
         p.note_recv("verack", 0);
@@ -1694,9 +1714,11 @@ impl PeerHub {
     ) -> Arc<LivePeer> {
         self.register_with_id_net(
             id,
-            addr,
-            crate::NetAddr::Ip(addr),
-            addrbind,
+            PeerEndpoint {
+                addr,
+                net: crate::NetAddr::Ip(addr),
+                addrbind,
+            },
             ver,
             inbound,
             conn_type,
@@ -1706,9 +1728,7 @@ impl PeerHub {
     pub fn register_with_id_net(
         self: &Arc<Self>,
         id: u64,
-        addr: SocketAddr,
-        net: crate::NetAddr,
-        addrbind: SocketAddr,
+        endpoint: PeerEndpoint,
         ver: &VersionMessage,
         inbound: bool,
         conn_type: PeerConnType,
@@ -1720,9 +1740,9 @@ impl PeerHub {
         let connected_at = self.now_secs();
         let peer = Arc::new(LivePeer {
             id,
-            addr,
-            net,
-            addrbind,
+            addr: endpoint.addr,
+            net: endpoint.net,
+            addrbind: endpoint.addrbind,
             subver: ver.user_agent.clone(),
             inbound,
             services,

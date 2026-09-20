@@ -713,8 +713,8 @@ mod tests {
         ));
         Dialer::socks(proxy, false)
             .connect_net(onion)
-        .await
-        .unwrap();
+            .await
+            .unwrap();
         server.await.unwrap();
 
         assert!(

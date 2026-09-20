@@ -585,8 +585,17 @@ async fn prepare_outbound_session(
     let wants_addrv2 = provisional.wants_addrv2();
     let wtxid_relay = provisional.wtxid_relay();
     peers.unregister(provisional_id);
-    let sess =
-        peers.register_with_id_net(provisional_id, peer_hint, peer_net, bind, &ver, false, typ);
+    let sess = peers.register_with_id_net(
+        provisional_id,
+        crate::peers::PeerEndpoint {
+            addr: peer_hint,
+            net: peer_net,
+            addrbind: bind,
+        },
+        &ver,
+        false,
+        typ,
+    );
     sess.mark_handshake_complete();
     if wants_addrv2 {
         sess.set_wants_addrv2();
