@@ -2,12 +2,19 @@
 
 use crate::error::NodeError;
 use bitcoin::hex::DisplayHex;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SAFECOOKIE_SERVER_KEY: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
+const SAFECOOKIE_CLIENT_KEY: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
 
 pub const DEFAULT_CONTROL_PORT: u16 = 9051;
 pub const DEFAULT_COOKIE_PATH: &str = "/run/tor/control.authcookie";
@@ -62,16 +69,66 @@ impl TorControl {
     }
 
     async fn authenticate(&mut self, auth: &TorAuth) -> Result<String, NodeError> {
-        let line = match auth {
-            TorAuth::Cookie(path) => {
-                let bytes = std::fs::read(path).map_err(|e| {
-                    NodeError::Init(format!("tor control cookie {}: {e}", path.display()))
-                })?;
-                format!("AUTHENTICATE {}", bytes.to_lower_hex_string())
+        match auth {
+            TorAuth::Password(p) => {
+                let line = format!("AUTHENTICATE \"{}\"", escape_quoted(p));
+                self.command(&line).await
             }
-            TorAuth::Password(p) => format!("AUTHENTICATE \"{}\"", escape_quoted(p)),
-        };
+            TorAuth::Cookie(path) => {
+                let info = self.protocol_auth_info().await?;
+                if info.methods.iter().any(|m| m == "SAFECOOKIE") {
+                    self.authenticate_safecookie(path).await
+                } else {
+                    self.authenticate_cookie(path).await
+                }
+            }
+        }
+    }
+
+    async fn authenticate_cookie(&mut self, path: &Path) -> Result<String, NodeError> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| NodeError::Init(format!("tor control cookie {}: {e}", path.display())))?;
+        let line = format!("AUTHENTICATE {}", bytes.to_lower_hex_string());
         self.command(&line).await
+    }
+
+    async fn authenticate_safecookie(&mut self, path: &Path) -> Result<String, NodeError> {
+        let cookie = std::fs::read(path)
+            .map_err(|e| NodeError::Init(format!("tor control cookie {}: {e}", path.display())))?;
+        if cookie.len() != 32 {
+            return self.authenticate_cookie(path).await;
+        }
+        let mut client_nonce = [0u8; 32];
+        getrandom::fill(&mut client_nonce).map_err(|e| {
+            NodeError::Init(format!("tor control SAFECOOKIE client nonce rng: {e}"))
+        })?;
+        let reply = self
+            .command(&format!(
+                "AUTHCHALLENGE SAFECOOKIE {}",
+                client_nonce.to_lower_hex_string()
+            ))
+            .await?;
+        let challenge = parse_authchallenge_reply(&reply)?;
+        let mut mat = Vec::with_capacity(96);
+        mat.extend_from_slice(&cookie);
+        mat.extend_from_slice(&client_nonce);
+        mat.extend_from_slice(&challenge.server_nonce);
+        let want_server = hmac_sha256(SAFECOOKIE_SERVER_KEY, &mat);
+        if want_server != challenge.server_hash {
+            return Err(NodeError::Init(format!(
+                "tor control SAFECOOKIE server hash mismatch want={} got={}",
+                want_server.to_lower_hex_string(),
+                challenge.server_hash.to_lower_hex_string()
+            )));
+        }
+        let client = hmac_sha256(SAFECOOKIE_CLIENT_KEY, &mat);
+        self.command(&format!("AUTHENTICATE {}", client.to_lower_hex_string()))
+            .await
+    }
+
+    async fn protocol_auth_info(&mut self) -> Result<ProtocolAuthInfo, NodeError> {
+        let body = self.command("PROTOCOLINFO 1").await?;
+        parse_protocol_auth_info(&body)
     }
 
     pub async fn command(&mut self, cmd: &str) -> Result<String, NodeError> {
@@ -147,6 +204,17 @@ impl TorControl {
 pub struct HiddenService {
     pub service_id: String,
     pub private_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtocolAuthInfo {
+    methods: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SafeCookieChallenge {
+    server_hash: [u8; 32],
+    server_nonce: [u8; 32],
 }
 
 fn escape_quoted(s: &str) -> String {
@@ -230,6 +298,91 @@ fn parse_add_onion_reply(body: &str) -> Result<HiddenService, NodeError> {
     })
 }
 
+fn parse_protocol_auth_info(body: &str) -> Result<ProtocolAuthInfo, NodeError> {
+    for line in body.lines() {
+        if !line.starts_with("AUTH ") {
+            continue;
+        }
+        let methods = kv_token(line, "METHODS")
+            .ok_or_else(|| NodeError::Init(format!("tor control AUTH METHODS missing: {line}")))?
+            .split(',')
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        return Ok(ProtocolAuthInfo { methods });
+    }
+    Err(NodeError::Init(
+        "tor control PROTOCOLINFO missing AUTH line".into(),
+    ))
+}
+
+fn parse_authchallenge_reply(body: &str) -> Result<SafeCookieChallenge, NodeError> {
+    let mut server_hash = None;
+    let mut server_nonce = None;
+    for line in body.lines() {
+        if let Some(v) = kv_token(line, "SERVERHASH") {
+            server_hash = Some(hex32(v, "SERVERHASH")?);
+        }
+        if let Some(v) = kv_token(line, "SERVERNONCE") {
+            server_nonce = Some(hex32(v, "SERVERNONCE")?);
+        }
+    }
+    let Some(server_hash) = server_hash else {
+        return Err(NodeError::Init(
+            "tor control AUTHCHALLENGE missing SERVERHASH".into(),
+        ));
+    };
+    let Some(server_nonce) = server_nonce else {
+        return Err(NodeError::Init(
+            "tor control AUTHCHALLENGE missing SERVERNONCE".into(),
+        ));
+    };
+    Ok(SafeCookieChallenge {
+        server_hash,
+        server_nonce,
+    })
+}
+
+fn kv_token<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(&format!("{key}=")))
+}
+
+fn hex32(s: &str, field: &str) -> Result<[u8; 32], NodeError> {
+    if s.len() != 64 {
+        return Err(NodeError::Init(format!(
+            "tor control {field} must be 64 hex chars"
+        )));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hi = hex_nybble(chunk[0])
+            .ok_or_else(|| NodeError::Init(format!("tor control {field} has non-hex content")))?;
+        let lo = hex_nybble(chunk[1])
+            .ok_or_else(|| NodeError::Init(format!("tor control {field} has non-hex content")))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn hex_nybble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
 fn write_key_file(path: &Path, key: &str) -> Result<(), NodeError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -275,6 +428,7 @@ mod tests {
             let (mut s, _) = listener.accept().await.unwrap();
             let (r, mut w) = s.split();
             let mut reader = BufReader::new(r);
+            let mut safecookie_expected: Option<[u8; 32]> = None;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).await.unwrap() == 0 {
@@ -282,9 +436,65 @@ mod tests {
                 }
                 let line = line.trim_end_matches(['\r', '\n']).to_string();
                 log_task.lock().unwrap().push(line.clone());
-                if let Some(rest) = line.strip_prefix("AUTHENTICATE ") {
+                if line.eq_ignore_ascii_case("PROTOCOLINFO 1") {
+                    if cookie.is_some() {
+                        w.write_all(
+                            format!(
+                                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=COOKIE COOKIEFILE=\"{}\"\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
+                                DEFAULT_COOKIE_PATH
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    } else if password.is_some() {
+                        w.write_all(
+                            b"250-PROTOCOLINFO 1\r\n250-AUTH METHODS=HASHEDPASSWORD\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        w.write_all(
+                            b"250-PROTOCOLINFO 1\r\n250-AUTH METHODS=NULL\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                } else if let Some(rest) = line.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+                    let Some(ref cookie_bytes) = cookie else {
+                        w.write_all(b"515 Authentication failed\r\n").await.unwrap();
+                        continue;
+                    };
+                    let client_nonce = match hex32(rest, "CLIENTNONCE") {
+                        Ok(v) => v,
+                        Err(_) => {
+                            w.write_all(b"512 Bad client nonce\r\n").await.unwrap();
+                            continue;
+                        }
+                    };
+                    let server_nonce = [0x5au8; 32];
+                    let mut mat = Vec::with_capacity(96);
+                    mat.extend_from_slice(cookie_bytes);
+                    mat.extend_from_slice(&client_nonce);
+                    mat.extend_from_slice(&server_nonce);
+                    let server_hash = hmac_sha256(SAFECOOKIE_SERVER_KEY, &mat);
+                    safecookie_expected = Some(hmac_sha256(SAFECOOKIE_CLIENT_KEY, &mat));
+                    w.write_all(
+                        format!(
+                            "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                            server_hash.to_lower_hex_string(),
+                            server_nonce.to_lower_hex_string()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                } else if let Some(rest) = line.strip_prefix("AUTHENTICATE ") {
                     let ok = if let Some(ref want) = cookie {
                         rest.eq_ignore_ascii_case(&want.to_lower_hex_string())
+                            || safecookie_expected.as_ref().is_some_and(|v| {
+                                rest.eq_ignore_ascii_case(&v.to_lower_hex_string())
+                            })
                     } else if let Some(ref want) = password {
                         rest == format!("\"{}\"", escape_quoted(want))
                     } else {
@@ -323,6 +533,48 @@ mod tests {
         (addr, log)
     }
 
+    async fn fake_control_bad_safecookie() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.split();
+            let mut reader = BufReader::new(r);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let line = line.trim_end_matches(['\r', '\n']).to_string();
+                if line.eq_ignore_ascii_case("PROTOCOLINFO 1") {
+                    w.write_all(
+                        b"250-PROTOCOLINFO 1\r\n250-AUTH METHODS=SAFECOOKIE\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
+                    )
+                    .await
+                    .unwrap();
+                } else if line.starts_with("AUTHCHALLENGE SAFECOOKIE ") {
+                    let bad_hash = [0u8; 32];
+                    let nonce = [1u8; 32];
+                    w.write_all(
+                        format!(
+                            "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                            bad_hash.to_lower_hex_string(),
+                            nonce.to_lower_hex_string()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                } else if line.starts_with("AUTHENTICATE ") {
+                    w.write_all(b"515 Authentication failed\r\n").await.unwrap();
+                } else {
+                    w.write_all(b"510 Unrecognized command\r\n").await.unwrap();
+                }
+            }
+        });
+        addr
+    }
+
     fn tmp_cookie(bytes: &[u8]) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "rbtc-tor-cookie-{}-{}",
@@ -349,12 +601,14 @@ mod tests {
 
     #[tokio::test]
     async fn tor_control_auth_cookie_and_password() {
-        let cookie = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x23];
-        let (addr, _) = fake_control(Some(cookie.clone()), None).await;
+        let cookie = vec![0x2a; 32];
+        let (addr, log) = fake_control(Some(cookie.clone()), None).await;
         let path = tmp_cookie(&cookie);
         TorControl::connect_and_auth(addr, TorAuth::Cookie(path.clone()))
             .await
             .unwrap();
+        let cmds = log.lock().unwrap().clone();
+        assert!(cmds.iter().any(|c| c == "PROTOCOLINFO 1"), "{cmds:?}");
         let _ = std::fs::remove_file(&path);
 
         let (addr, _) = fake_control(None, Some("s3cret".into())).await;
@@ -363,7 +617,7 @@ mod tests {
             .unwrap();
 
         let (addr, _) = fake_control(Some(cookie.clone()), None).await;
-        let bad = tmp_cookie(&[0x00, 0x01]);
+        let bad = tmp_cookie(&[0x00; 32]);
         let err = match TorControl::connect_and_auth(addr, TorAuth::Cookie(bad.clone())).await {
             Err(e) => e,
             Ok(_) => panic!("wrong cookie must not authenticate"),
@@ -466,6 +720,20 @@ mod tests {
             .unwrap();
         assert!(none.is_none());
         let _ = std::fs::remove_file(&bad);
+    }
+
+    #[tokio::test]
+    async fn tor_control_safecookie_serverhash_mismatch_fails() {
+        let cookie = vec![0x11; 32];
+        let addr = fake_control_bad_safecookie().await;
+        let path = tmp_cookie(&cookie);
+        let err = match TorControl::connect_and_auth(addr, TorAuth::Cookie(path.clone())).await {
+            Ok(_) => panic!("bad SAFECOOKIE server hash must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("server hash mismatch"), "{msg}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

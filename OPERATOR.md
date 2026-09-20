@@ -451,7 +451,7 @@ forward). `--max-inbound 0` refuses inbound slots. `--no-discover` does not
 self-announce even when `--external-ip` is set. A later onion inbound bind
 does not require a public clearnet listen.
 
-`--tor-control [HOST:PORT]` talks to **system tor** (cookie or password). Omit
+`--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
 ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
 socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
 `127.0.0.1:<bound>` and logs `….onion:port`. The private key is
