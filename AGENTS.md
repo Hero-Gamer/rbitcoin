@@ -11,6 +11,10 @@ tables, or command cribs from those files here. Short hard-rule lines that
 wreck a session if missed stay in this file; the owner playbook stays in
 the skill.
 
+If you are acting as `rearden-grok[bot]`, also read
+[`rearden-vm-HOST.md`](rearden-vm-HOST.md). If you are not that identity,
+ignore that file.
+
 ## Language, comments, composition
 
 Write clear, concrete technical English. Keep Core-aligned terms where we
@@ -71,11 +75,9 @@ exit code, failure names (`test … FAILED`, lint ids, first rustc error),
 and at most ~80 lines of tail. `--quiet` is enough to confirm green.
 Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (Agent RAM).
 
-**Agent disk:** one `/tmp/rbtc-<session>` worktree. Export
-`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` before `nix-shell`. Do not cargo in
-the Cursor checkout or add a worktree per PR (each extra tree copies
-`target/dev` and `third_party/bitcoin`). ENOSPC: skip fat tests, not
-another silo. Owner: [`TESTING.md`](TESTING.md) (Agent VM disk).
+**Agent disk:** `rearden-grok[bot]` follows [`rearden-vm-HOST.md`](rearden-vm-HOST.md)
+(one worktree, shared silo, no cargo in the Cursor checkout). Other
+identities: ignore that file; use `$PWD/target/dev`.
 
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
@@ -100,16 +102,12 @@ when it exists.
 
 ## Ship, release, Core functional
 
-One `/tmp/rbtc-<session>` worktree, one topic branch per PR, required checks
-green before the plan is done. Do not merge unless asked. Never commit the
-plan onto `master`.
+One session worktree, one topic branch per PR, required checks green before
+the plan is done. Do not merge unless asked. Never commit the plan onto
+`master`.
 
 These wreck a session even when the skill was not opened:
 
-- Never `git remote set-url origin`. Worktrees share `origin` (fetch HTTPS,
-  `pushurl` SSH). Collapsing that split breaks bot push.
-- Bot push is `git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short>`
-  — not `git push origin`, no `-u`.
 - Fail-fast poll: `./scripts/pr-checks-watch.sh`. Do not `gh pr checks --watch`
   (it waits out coverage and CodeQL after a job this change already failed).
 - Conflicted or behind PRs skip test CI. Rebase onto `origin/master`, then
@@ -118,8 +116,11 @@ These wreck a session even when the skill was not opened:
 - Run clippy `-D warnings` before push. Do not wait out
   `./scripts/coverage.sh` or a host IBD. No empty commits to poke Actions
   (`gh run rerun` instead).
-- Do not `git worktree add` per PR or cargo in the Cursor checkout.
-  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export before `nix-shell`).
+- `rearden-grok[bot]` only (ignore [`rearden-vm-HOST.md`](rearden-vm-HOST.md)
+  otherwise): never `git remote set-url origin`; HTTPS `HEAD:<branch>` push,
+  not `git push origin`, no `-u`; one `/tmp/rbtc-<session>` worktree;
+  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` before `nix-shell`; do not cargo
+  in the Cursor checkout. Owner: [`rearden-vm-HOST.md`](rearden-vm-HOST.md).
 
 Playbooks:
 

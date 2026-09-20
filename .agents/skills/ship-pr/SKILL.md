@@ -17,10 +17,11 @@ Do not copy them here.
 
 ## Session worktree
 
-Reuse one worktree per session. Do not add a worktree per PR. Export
-`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` **before** `nix-shell`. Do not cargo
-in the Cursor checkout. Owner (why, ENOSPC, lock):
-[`TESTING.md`](../../../TESTING.md) (Agent VM disk).
+Reuse one worktree per session. Do not add a worktree per PR.
+
+`rearden-grok[bot]` on this operator VM: silo, editor tree, ENOSPC, identity,
+and HTTPS push are [`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md). If
+you are not that identity, ignore that file; use `$PWD/target/dev`.
 
 ```bash
 # once per session
@@ -28,9 +29,7 @@ git fetch origin
 git worktree add /tmp/rbtc-<session> origin/master
 cd /tmp/rbtc-<session>
 git switch -c <area>/<short-name>
-export CARGO_TARGET_DIR=/tmp/rbtc-target/dev
-git config --worktree user.name 'rearden-grok[bot]'
-git config --worktree user.email '317016512+rearden-grok[bot]@users.noreply.github.com'
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/dev}"
 
 # next PR in the same session (do not add another worktree)
 git fetch origin
@@ -42,9 +41,8 @@ git switch -C <area>/<next-short> origin/master
 | Base | Current `origin/master` (or `main`) |
 | Branch | Topic name. Never commit the plan onto `master` |
 | Worktree | One `/tmp/rbtc-<session>` for the session |
-| `CARGO_TARGET_DIR` | `/tmp/rbtc-target/dev` (VM-wide; not per worktree) |
-| Identity | Worktree-only `user.name` / `user.email` for bot commits |
-| Remotes | Worktrees share `origin`. Fetch is HTTPS; `pushurl` is SSH. Never `git remote set-url origin` |
+| `CARGO_TARGET_DIR` | `$PWD/target/dev` unless already set. `rearden-grok[bot]`: [`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md) |
+| Remotes | Worktrees share `origin`. Never `git remote set-url origin` |
 
 ### After merge
 
@@ -55,23 +53,24 @@ Do not delete a branch that still has an open PR. Do not `git push --delete mast
 git fetch origin --prune
 git switch -C <area>/<next-short> origin/master
 git branch -d <area>/<merged-short>
-git push https://github.com/reardencode/rbitcoin.git --delete <area>/<merged-short>
+# rearden-grok[bot]: delete the topic branch over HTTPS (rearden-vm-HOST.md)
 ```
 
 ```bash
 # session end
 git worktree remove /tmp/rbtc-<session>
-rm -rf /tmp/rbitcoin-*
 git fetch origin --prune
 ```
 
-Do not `cargo clean` `/tmp/rbtc-target/dev` unless that silo is stale.
-ENOSPC: [`TESTING.md`](../../../TESTING.md) (Agent VM disk).
+`rearden-grok[bot]` session-end extras (test dirs, shared silo):
+[`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md). Other identities:
+ignore that file.
 
 ## Local tests
 
-From `nix-shell` (CI pins rustc 1.95.0). Shared silo as in Session worktree.
-Same **commands** as the required jobs, not the GitHub Actions `env:`
+From `nix-shell` (CI pins rustc 1.95.0). `CARGO_TARGET_DIR` as in Session
+worktree. Same **commands** as the required jobs, not the GitHub Actions
+`env:`
 (leave `CARGO_INCREMENTAL` unset; that is [`ci.yml`](../../../.github/workflows/ci.yml) only).
 When to run which command:
 [`docs/how-we-plan.md`](../../../docs/how-we-plan.md) (The cycle).
@@ -125,14 +124,11 @@ Label `nixos-module-runtime` when the NixOS module VM test should run (not
 eval). Poll with `--interest nixos-module-runtime`. It is not a required
 check.
 
-`origin` fetch is HTTPS. This VM has no GitHub App SSH key. Bot push uses an
-explicit HTTPS URL. Do not `git push origin`. No `-u` (that retargets the
-branch remote away from `origin`).
+`rearden-grok[bot]` fetch/push (`gh-login.sh`, HTTPS `HEAD:<branch>`, never
+`git push origin`, no `-u`): [`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md).
+If you are not that identity, ignore that file.
 
 ```bash
-~/.config/rbitcoin-grok/gh-login.sh
-git fetch origin
-git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
 gh pr create --repo reardencode/rbitcoin --head <area>/<short-name> --title "…" --body "…"
 gh pr view --repo reardencode/rbitcoin --json mergeable,mergeStateStatus
 ./scripts/pr-checks-watch.sh --repo reardencode/rbitcoin --pr <n> \
@@ -165,7 +161,7 @@ topic branch, then poll. Do not `gh run rerun` to wake jobs that never queued.
 ```bash
 git fetch origin
 git rebase origin/master
-git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
+# rearden-grok[bot]: lease-force over HTTPS (rearden-vm-HOST.md)
 ```
 
 | Rule | Detail |
@@ -192,7 +188,7 @@ gh run rerun <run-id> --failed
 
 # If the API rejects: amend the tip (no empty commit) and lease-force the topic branch only
 git commit --amend --no-edit
-git push --force-with-lease https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short-name>
+# rearden-grok[bot]: lease-force over HTTPS (rearden-vm-HOST.md)
 ```
 
 If CI `coverage` fails, add a pin and push. Floor: [`TESTING.md`](../../../TESTING.md).

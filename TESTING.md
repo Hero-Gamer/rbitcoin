@@ -112,24 +112,11 @@ reads it; rustup users export it). Override coverage dir:
 Cargo incremental stays on in `target/dev`. Stale objects: `cargo clean -p
 <crate>` or wipe the silo.
 
-#### Agent VM disk (share the heavy trees)
-
-The agent VM root is ~40 G. Git worktrees already share `.git` objects.
-They do **not** share `target/dev` (~9 G warm) or a `third_party/bitcoin`
-working copy. Extra worktrees and cargo in the Cursor checkout are what
-fill the disk. Commands: [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
-
-| Share | How |
-|-------|-----|
-| One session worktree | `/tmp/rbtc-<session>` for the session. Next PR is `git switch -C`, not `git worktree add`. |
-| One dev silo | Export **`CARGO_TARGET_DIR=/tmp/rbtc-target/dev`** *before* `nix-shell` / `nix develop` (the hook only sets `$PWD/target/dev` when unset). Registry/git deps occupy disk once; workspace crates re-fingerprint if the source path changes. |
-| Editor tree | `/home/agent/workspace/rearden-bitcoin` is the Cursor checkout. Do not cargo there. |
-| One cargo at a time | A second cargo **waits** on `target/.cargo-lock` (serialized, not a torn rlib). Do not `cargo clean` under another cargo. Unhashed binaries (`debug/rbitcoin-node`) are last-writer-wins. |
-| ENOSPC | Skip production-scale body tests (`sp_tweaks` and similar multi‑GiB `/tmp` files). Skip `cargo test --workspace` when free space is a few GiB. Never `./scripts/coverage.sh` here (`target/cov` is another silo). Targeted `-p` tests plus clippy are enough to push. |
-| Session end | `git worktree remove` leftover `/tmp/rbtc-*`. `rm -rf /tmp/rbitcoin-*` test dirs. Do not `cargo clean` the shared silo unless artifacts are stale. |
-
 Humans and CI keep `$PWD/target/dev` (this table, CONTRIBUTING, `shell.nix` /
-`flake.nix`). Do not change those defaults to `/tmp/rbtc-target/dev`.
+`flake.nix`). Constrained VMs may export a shared silo *before* `nix-shell`
+(the hook only sets `$PWD/target/dev` when unset). `rearden-grok[bot]` on
+the operator VM: [`rearden-vm-HOST.md`](rearden-vm-HOST.md). Other agents:
+ignore that file.
 
 **Default vs heavy tiers**
 
