@@ -44,8 +44,6 @@ assert_ok "dry-run lists SH RAM / host_mem probes" \
   grep -q "sorted_run::tests::host_mem" <<<"$out"
 assert_ok "dry-run lists Darwin vm page math" \
   grep -q "sorted_run::tests::darwin_vm" <<<"$out"
-assert_ok "dry-run lists IOCP session tests" \
-  grep -q "io_session_iocp" <<<"$out"
 assert_ok "dry-run lists default session kind" \
   grep -q "uring_session::tests::default_kind_follows_os" <<<"$out"
 assert_ok "dry-run lists pool session tests" \
@@ -62,20 +60,22 @@ assert_ok "Windows dry-run still maps SH BDZ3 occ" \
   grep -q "bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram" <<<"$out"
 assert_ok "Windows dry-run still confirms a few blocks" \
   grep -q "connect_chain_query_surface" <<<"$out"
-assert_ok "Windows dry-run pins loc SIMD vs scalar" \
-  grep -q "create_loc::tests::prefix_sum" <<<"$out"
+assert_ok "Windows dry-run lists IOCP session tests" \
+  grep -q "io_session_iocp" <<<"$out"
+assert_ok "Windows dry-run pins loc SIMD (SSE2) vs scalar" \
+  grep -qx "primitives=loc_simd::tests" <<<"$out"
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Darwin "$RUN")"
 assert_ok "Darwin dry-run runs concurrent grow/read" \
   grep -qx "skip=" <<<"$out"
 assert_ok "Darwin dry-run still confirms a few blocks" \
   grep -q "connect_chain_query_surface" <<<"$out"
-assert_ok "Darwin dry-run pins loc SIMD vs scalar" \
-  grep -q "create_loc::tests::prefix_sum" <<<"$out"
+assert_ok "Darwin dry-run pins loc SIMD (NEON) vs scalar" \
+  grep -qx "primitives=loc_simd::tests" <<<"$out"
 
 out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Linux "$RUN")"
 assert_ok "Linux dry-run leaves loc SIMD to the full suite" \
-  test "$(grep -c 'create_loc::tests::prefix_sum' <<<"$out" || true)" = "0"
+  grep -qx "primitives=" <<<"$out"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "ci-os-smoke.test.sh: $PASS passed, $FAIL failed"
