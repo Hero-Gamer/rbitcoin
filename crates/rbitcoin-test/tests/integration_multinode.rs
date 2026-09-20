@@ -126,7 +126,7 @@ async fn seed_chain(node: &P2PNode, blocks: u32) {
 
 /// IBD from a single peer (test helper).
 async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
-    node.sync(&[peer], IbdConfig::for_test())
+    node.sync(&[rbitcoin_net::NetAddr::Ip(peer)], IbdConfig::for_test())
         .await
         .expect("ibd sync")
 }
@@ -1585,7 +1585,13 @@ async fn ibd_two_peers() {
 
         let client = start_node(&peer_dir).await;
         let n = client
-            .sync(&[seed.local_addr, mid.local_addr], IbdConfig::for_test())
+            .sync(
+                &[
+                    rbitcoin_net::NetAddr::Ip(seed.local_addr),
+                    rbitcoin_net::NetAddr::Ip(mid.local_addr),
+                ],
+                IbdConfig::for_test(),
+            )
             .await
             .expect("ibd");
         assert!(n >= 8, "accepted {n}");
@@ -1619,7 +1625,13 @@ async fn ibd_skips_dead_peer() {
     let peer = start_node(&peer_dir).await;
     let bad: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let n = peer
-        .sync(&[bad, seed.local_addr], IbdConfig::for_test())
+        .sync(
+            &[
+                rbitcoin_net::NetAddr::Ip(bad),
+                rbitcoin_net::NetAddr::Ip(seed.local_addr),
+            ],
+            IbdConfig::for_test(),
+        )
         .await
         .expect("ibd with bad+good");
     assert!(n >= 4, "downloaded {n}");
