@@ -1,5 +1,0 @@
-| File | Missed | Example |
-| :--- | ---: | :--- |
-
---- detailed ---
-
