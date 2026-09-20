@@ -277,10 +277,7 @@ mod tests {
             cred_tx.send(u).await.unwrap();
         });
 
-        let dialer = Dialer::Socks {
-            proxy,
-            randomize: true,
-        };
+        let dialer = Dialer::socks(proxy, true);
         let _standing = dialer.connect(peer_addr).await.unwrap();
         let standing_user = cred_rx.recv().await.unwrap();
 
