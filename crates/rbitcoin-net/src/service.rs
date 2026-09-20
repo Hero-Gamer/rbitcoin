@@ -332,13 +332,7 @@ impl P2PNode {
     }
 
     pub async fn follow_from_net(&mut self, peer: crate::NetAddr) -> Result<(), NetError> {
-        let target = match peer {
-            crate::NetAddr::Ip(addr) => DialTarget::Socket(addr),
-            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => DialTarget::Domain {
-                host: peer.host_str(),
-                port: peer.port(),
-            },
-        };
+        let target = DialTarget::from_net(peer);
         let prepared = prepare_outbound_session(
             target,
             self.magic,

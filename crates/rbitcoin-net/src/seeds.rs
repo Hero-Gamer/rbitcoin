@@ -565,7 +565,6 @@ impl AddrMan {
 
     /// Successful BIP324 handshake.
     pub fn note_connected(&mut self, addr: SocketAddr) {
-    pub fn note_connected(&mut self, addr: SocketAddr) {
         self.note_connected_addr(NetAddr::from_socket(addr));
     }
 

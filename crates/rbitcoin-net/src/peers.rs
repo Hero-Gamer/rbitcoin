@@ -133,6 +133,7 @@ impl DialTarget {
     pub(crate) fn from_net(addr: crate::NetAddr) -> Self {
         match addr {
             crate::NetAddr::Ip(s) => Self::Socket(s),
+            crate::NetAddr::Cjdns { ip, port } => Self::Socket(SocketAddr::from((ip, port))),
             other => Self::Domain {
                 host: other.host_str(),
                 port: other.port(),
@@ -140,7 +141,7 @@ impl DialTarget {
         }
     }
 
-    /// VERSION v1 `Address` field. Onion has no SocketAddr; Core uses 0.0.0.0.
+    /// VERSION v1 `Address` field. Overlay Domain has no SocketAddr; Core uses 0.0.0.0.
     pub fn version_socket(&self) -> SocketAddr {
         match self {
             Self::Socket(addr) => *addr,
@@ -157,7 +158,7 @@ impl DialTarget {
             Self::Socket(addr) => crate::NetAddr::Ip(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
-                .expect("DialTarget::Domain is host:port from NetAddr::Onion"),
+                .expect("DialTarget::Domain is host:port from overlay NetAddr"),
         }
     }
 }
@@ -2015,9 +2016,9 @@ impl PeerHub {
     }
 
     fn dial_manual_net(&self, addr: &crate::NetAddr) -> Result<(), String> {
-        match addr {
-            crate::NetAddr::Ip(ip) => self.dial(*ip, PeerConnType::Manual),
-            _ => self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual),
+        match addr.socket_addr() {
+            Some(ip) => self.dial(ip, PeerConnType::Manual),
+            None => self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual),
         }
     }
 
@@ -2118,11 +2119,9 @@ impl PeerHub {
     }
 
     pub fn dial_net(&self, addr: crate::NetAddr, typ: PeerConnType) -> Result<(), String> {
-        match addr {
-            crate::NetAddr::Ip(ip) => self.dial(ip, typ),
-            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => {
-                self.dial_domain(addr.host_str(), addr.port(), typ)
-            }
+        match addr.socket_addr() {
+            Some(ip) => self.dial(ip, typ),
+            None => self.dial_domain(addr.host_str(), addr.port(), typ),
         }
     }
 
@@ -3295,6 +3294,17 @@ mod tests {
             book.entries().iter().any(|e| e.addr == want),
             "I2P must stay in the book, got {:?}",
             book.entries()
+        );
+    }
+
+    #[test]
+    fn dial_target_cjdns_is_native_socket() {
+        use std::net::Ipv6Addr;
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let addr = crate::NetAddr::Cjdns { ip, port: 8333 };
+        assert_eq!(
+            DialTarget::from_net(addr),
+            DialTarget::Socket(SocketAddr::from((ip, 8333)))
         );
     }
 
