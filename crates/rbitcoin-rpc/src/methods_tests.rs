@@ -2433,6 +2433,64 @@ fn submitpackage_child_fail_keeps_parent() {
 }
 
 #[test]
+fn rpc_submit_nonstandard_version_is_version() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::non_standard(0xffff_ffffu32 as i32),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let send = dispatch(&ctx, "sendrawtransaction", vec![json!(child_hex.clone())]).unwrap_err();
+    assert_eq!(send["code"], ERR_VERIFY_REJECTED, "{send}");
+    assert_eq!(send["message"], json!("version"), "{send}");
+    let tma = dispatch(&ctx, "testmempoolaccept", vec![json!([child_hex.clone()])]).unwrap();
+    assert_eq!(tma[0]["reject-reason"], json!("version"), "{tma}");
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, child_hex]), json!(0)],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("version"),
+        "{pkg}"
+    );
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "parent must admit: {pkg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn submitpackage_multigen_chain_is_topology_disallowed() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;

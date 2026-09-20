@@ -429,6 +429,11 @@ pub(crate) fn tx_fee_sat_from_prevouts(ctx: &RpcContext, tx: &Transaction) -> Tx
     )
 }
 
+fn rpc_tx_version_nonstandard(tx: &Transaction) -> bool {
+    tx.version != bitcoin::transaction::Version::ONE
+        && tx.version != bitcoin::transaction::Version::TWO
+}
+
 fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_vb: u64) -> bool {
     match tx_fee_sat_from_prevouts(ctx, tx) {
         TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_vb),
@@ -502,6 +507,9 @@ pub(crate) fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     if burn_exceeds_max(&tx, max_burn) {
         return Err(rpc_error(ERR_INVALID_PARAMETER, MAX_BURN_MSG));
+    }
+    if rpc_tx_version_nonstandard(&tx) {
+        return Err(rpc_error(ERR_VERIFY_REJECTED, "version"));
     }
     if rpc_tx_fee_exceeds_max(ctx, &tx, max_feerate) {
         return Err(rpc_error(
@@ -680,6 +688,15 @@ fn testmempoolaccept_package_rows(
             out.push(json!({ "txid": txid, "wtxid": wtxid }));
             continue;
         }
+        if rpc_tx_version_nonstandard(tx) {
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "version",
+            }));
+            continue;
+        }
         if tx
             .input
             .iter()
@@ -759,6 +776,15 @@ fn testmempoolaccept_single_rows(
                 "wtxid": wtxid,
                 "allowed": false,
                 "reject-reason": "txn-already-known",
+            }));
+            continue;
+        }
+        if rpc_tx_version_nonstandard(&tx) {
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "version",
             }));
             continue;
         }
@@ -1284,9 +1310,21 @@ fn submitpackage_admit(
     let mut tx_results = serde_json::Map::new();
     let mut replaced = Vec::new();
     let mut to_admit = Vec::new();
+    let mut any_fail = false;
     for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
         let txid_s = hash_hex_display(&tx.compute_txid().to_byte_array());
+        if rpc_tx_version_nonstandard(tx) {
+            any_fail = true;
+            tx_results.insert(
+                wtxid,
+                json!({
+                    "txid": txid_s,
+                    "error": "version",
+                }),
+            );
+            continue;
+        }
         if !mp.contains(&tx.compute_txid()) {
             to_admit.push(tx.clone());
             continue;
@@ -1304,7 +1342,6 @@ fn submitpackage_admit(
             tx_results.insert(wtxid, json!({ "txid": txid_s }));
         }
     }
-    let mut any_fail = false;
     for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
         match res {
             Ok(ok) => {

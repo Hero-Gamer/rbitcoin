@@ -10,7 +10,6 @@
 //! min relay, **no dust limit** (1-sat OK; 0-value spendable is dust), full
 //! RBF, Libre annex.
 
-use bitcoin::transaction::Version;
 use bitcoin::Transaction;
 
 /// Minimum relay feerate: **0.1 sat/vB** = 100 sat/kvB.
@@ -136,9 +135,6 @@ pub fn check_libre_admission_at(
     if tx.is_coinbase() {
         return PolicyResult::NonStandard("coinbase");
     }
-    if tx.version != Version::ONE && tx.version != Version::TWO {
-        return PolicyResult::NonStandard("version");
-    }
     if tx.output.iter().any(|o| {
         let spk = o.script_pubkey.as_bytes();
         spk.len() > 10_000 && spk.first() != Some(&0x6a)
@@ -188,7 +184,7 @@ mod tests {
         let weight = tx.weight().to_wu();
         assert_eq!(
             check_libre_admission_at(&tx, 50_000, weight, 0),
-            PolicyResult::NonStandard("version")
+            PolicyResult::Standard
         );
         tx.version = Version::ONE;
         assert_eq!(
