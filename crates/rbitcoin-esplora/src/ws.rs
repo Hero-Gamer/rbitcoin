@@ -587,7 +587,7 @@ async fn add_addresses(
     keyed: bool,
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), ()> {
-    if !st.query.sh_index_enabled() {
+    if !st.query.sh_history_available() {
         send_error(sink, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED).await?;
         return Ok(());
     }

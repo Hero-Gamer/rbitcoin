@@ -522,6 +522,12 @@ impl Query {
         }
     }
 
+    /// Electrum/Esplora scripthash reads: operator `--sh-index` or a leftover
+    /// watermark from a previous run. Never-indexed + flag off is fail-closed.
+    pub fn sh_history_available(&self) -> bool {
+        self.sh_index_enabled() || self.sh_indexed_through_height().is_some()
+    }
+
     /// Advance SH watermark only after Class C tip commit.
     pub(crate) fn set_sh_indexed_through_height(&self, height: Option<u32>) {
         let v = height.map(|h| h as u64).unwrap_or(u64::MAX);

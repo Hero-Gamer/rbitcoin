@@ -245,7 +245,7 @@ async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Nex
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
-    if path_uses_sh_view(&path) && !st.query.sh_index_enabled() {
+    if path_uses_sh_view(&path) && !st.query.sh_history_available() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,

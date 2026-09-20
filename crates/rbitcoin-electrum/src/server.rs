@@ -1440,7 +1440,7 @@ fn dispatch_pinned(
     pinned: Option<&ChainView>,
     is_asof: bool,
 ) -> Result<Value, String> {
-    if method_needs_sh_index(method) && !query.sh_index_enabled() {
+    if method_needs_sh_index(method) && !query.sh_history_available() {
         return Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string());
     }
     let protocol = conn.protocol.clone();
