@@ -6,8 +6,10 @@ This file is the harness-injected hard-rule contract. Design lives in the
 owner docs; do not grow a second design book here.
 
 Process playbooks are Agent Skills under [`.agents/skills/`](.agents/skills/).
-Read the matching `SKILL.md` when the task needs it. Do not paste those
-playbooks back into this file.
+Read the matching `SKILL.md` when the task needs it. Do not paste bash,
+tables, or command cribs from those files here. Short hard-rule lines that
+wreck a session if missed stay in this file; the owner playbook stays in
+the skill.
 
 ## Language, comments, composition
 
@@ -57,9 +59,17 @@ and formatting need no tests. Do not open a mainnet datadir in the agent VM.
 Perf A/B is operator-host only.
 
 One plan step is one Red → Green → Refactor turn, committed before the next
-step. Keep `--lib` compiling (wrap the old API, switch one caller). Owner:
+step. Keep `--lib` compiling (wrap the old API, switch one caller). Inner
+loop is `cargo test -p <crate> --lib` / `cargo check -p <crate> --lib`.
+Do not `cargo check --tests` after every edit. Owner:
 [`docs/how-we-plan.md`](docs/how-we-plan.md). Commands:
 [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
+
+**Agent RAM:** never load `cargo test`, clippy, deny, or rustc stdout into
+the session. Redirect stdout and stderr to a file under `/tmp`; read the
+exit code, failure names (`test … FAILED`, lint ids, first rustc error),
+and at most ~80 lines of tail. `--quiet` is enough to confirm green.
+Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (Agent RAM).
 
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
@@ -84,8 +94,26 @@ when it exists.
 
 ## Ship, release, Core functional
 
-One session worktree, one topic branch per PR, required checks green before
-the plan is done. Do not merge unless asked.
+One `/tmp/rbtc-<session>` worktree, one topic branch per PR, required checks
+green before the plan is done. Do not merge unless asked. Never commit the
+plan onto `master`.
+
+These wreck a session even when the skill was not opened:
+
+- Never `git remote set-url origin`. Worktrees share `origin` (fetch HTTPS,
+  `pushurl` SSH). Collapsing that split breaks bot push.
+- Bot push is `git push https://github.com/reardencode/rbitcoin.git HEAD:<area>/<short>`
+  — not `git push origin`, no `-u`.
+- Fail-fast poll: `./scripts/pr-checks-watch.sh`. Do not `gh pr checks --watch`
+  (it waits out coverage and CodeQL after a job this change already failed).
+- Conflicted or behind PRs skip test CI. Rebase onto `origin/master`, then
+  `--force-with-lease` the topic branch. Do not `gh run rerun` jobs that
+  never queued.
+- Run clippy `-D warnings` before push. Do not wait out
+  `./scripts/coverage.sh` or a host IBD. No empty commits to poke Actions
+  (`gh run rerun` instead).
+
+Playbooks:
 
 - Opening, updating, pushing, or polling a PR:
   [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).

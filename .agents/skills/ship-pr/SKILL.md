@@ -73,11 +73,17 @@ Suite and budgets: [`TESTING.md`](../../../TESTING.md).
 
 | When | Run |
 |------|-----|
-| Inner loop (Red / Green) | Targeted `cargo test -p <crate> …`. `cargo check -p <crate> --lib`. Not `--tests` after every edit |
-| After Green | `cargo test --workspace` |
+| Inner loop (Red / Green) | Targeted `cargo test -p <crate> … -- --quiet`. `cargo check -p <crate> --lib`. Not `--tests` after every edit |
+| After Green | `cargo test --workspace --quiet` |
 | After Refactor, before commit | Local CI except coverage (below) |
 | Core functional CI red | [core-functional skill](../core-functional/SKILL.md) |
 | Never local | `./scripts/coverage.sh`, `nix build .#rbitcoin-musl`, host IBD |
+
+Redirect every command above (stdout and stderr to `/tmp`, print `EXIT`,
+search then tail on failure). Do not `tee` or `| tail` as the only sink,
+and do not load the log wholesale. Recipe:
+[`docs/how-we-plan.md`](../../../docs/how-we-plan.md) (Agent RAM). Do not
+copy that snippet here.
 
 Local CI except coverage:
 
@@ -86,7 +92,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 ./scripts/ast-grep.sh
-cargo test --workspace
+cargo test --workspace --quiet
 ./scripts/ci-os-smoke.sh
 ```
 
@@ -95,8 +101,6 @@ If the slice changed `flake.nix`, `nix/`, or the NixOS module, also
 `nixos-module-runtime` when systemd deps, users/groups, firewall, or the VM
 start argv changed — that runs `nixos-module-runtime` (qemu). Do not wait
 out the VM test locally.
-
-Agent logs: [`how-we-plan.md`](../../../docs/how-we-plan.md) (Agent RAM).
 
 Coverage and native `windows` / `macos` stay GitHub Actions;
 `ci-os-smoke.sh` is the local stand-in. Do not wait out a host IBD or a

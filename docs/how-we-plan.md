@@ -210,11 +210,51 @@ Edits inside Red and Green stay targeted: `cargo test -p <crate> …` and
 edit. The workspace suite is step 3 (and again in step 5 if Refactor
 changed code).
 
-**Agent RAM:** do not load full `cargo test`, clippy, deny, or rustc stdout
-into the session. Redirect to a file under `/tmp`, then read only the exit
-code, the failure names (`test … FAILED`, lint ids, first rustc error), and
-at most ~80 lines of tail. `--quiet` is enough to confirm green. Workspace
-suite logs in particular will OOM an agent turn.
+### Agent RAM
+
+Never return full `cargo test`, clippy, deny, or rustc stdout through the
+Shell tool into the agent session. Workspace `cargo test --workspace` is
+the dangerous one (will OOM an agent turn). Targeted
+`cargo test -p <crate> <filter>` still redirect if output can be large.
+Docs-only slices still must not dump rustc if they run fmt.
+
+Redirect **stdout and stderr** to a file under `/tmp` (`mktemp
+/tmp/rbtc-agent-XXXXXX.log` or `/tmp/rbtc-agent-<pid>.log`). Do not `tee`
+(that still streams into the tool result). Do not `| tail` as the only
+sink (the compiler still writes a huge pipe into the tool).
+
+After the command, print **exit code** in the tool result
+(`echo EXIT:$?`). Look at that first.
+
+- Exit 0 with `--quiet` (tests) or clippy `-D warnings` and no output:
+  green. Do **not** Read the log file.
+- Exit ≠ 0: search the file for failure names (`FAILED`, `error:`, clippy
+  lint ids, first rustc error). Read at most **~80 lines of tail** (or a
+  tight `rg` window). Do not `Read` a multi-megabyte log.
+
+`--quiet` is enough to confirm green. Copy-paste shape (adapt the
+`cargo …` line per command: clippy `-D warnings`, `cargo deny check`,
+`cargo fmt --all -- --check`, `./scripts/ast-grep.sh`,
+`./scripts/ci-os-smoke.sh`). Inner loop:
+`cargo test -p <crate> --lib <filter> -- --quiet` redirected the same way.
+
+```bash
+log=$(mktemp /tmp/rbtc-agent-XXXXXX.log)
+set +e
+cargo test --workspace --quiet >"$log" 2>&1
+ec=$?
+set -e
+echo EXIT:$ec
+if [ "$ec" -ne 0 ]; then
+  rg -n 'FAILED|^error:|error\[' "$log" | head -n 40
+  echo '--- tail ---'
+  tail -n 80 "$log"
+fi
+```
+
+A sequence of gates can wrap that body in a `run` function (one call per
+command). Do not paste a second copy into ship-pr; that file lists the
+commands and links here.
 
 Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
 Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
