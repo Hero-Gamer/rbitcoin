@@ -481,6 +481,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     addrman.set_cjdns_reachable(config.listen.cjdns_reachable);
     node.peers
         .set_cjdns_reachable(config.listen.cjdns_reachable);
+    node.peers.set_pruned(config.prune_inwit);
     node.peers.set_asmap(asmap);
     for c in &config.listen.connect {
         addrman.add_addr(*c);
@@ -1252,6 +1253,10 @@ fn apply_startup_index_mode(
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
     query.set_max_sh_creates(config.max_sh_creates);
+    if config.prune_inwit {
+        query.set_prune_inwit(true)?;
+        query.apply_prune_inwit_tip()?;
+    }
     if let Err(e) =
         query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
     {

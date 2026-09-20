@@ -99,6 +99,7 @@ let
   ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
   ++ optional cfg.cjdns.reachable "--cjdns-reachable"
   ++ optional cfg.esplora.hiddenService "--esplora-onion"
+  ++ optional cfg.pruneInwit "--prune-inwit"
   ++ cfg.extraArgs;
 in
 {
@@ -174,6 +175,12 @@ in
       type = types.bool;
       default = false;
       description = "Build and serve the BIP-352 silent-payment tweak index.";
+    };
+
+    pruneInwit = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Drop Class A inwit below tip-288 heights and advertise NETWORK_LIMITED. Not Core -prune of headers/txout.";
     };
 
     environment = mkOption {

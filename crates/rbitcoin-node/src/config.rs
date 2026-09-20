@@ -261,6 +261,8 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Build Class B scripthash index (Electrum/Esplora history). Default **off**.
     pub shindex: bool,
+    /// Drop Class A inwit below a 288-height watermark (`NETWORK_LIMITED`).
+    pub prune_inwit: bool,
     /// Persist / serve BIP-352 tweaks from `sp_tweaks.*`. Default **off**.
     pub sptweaks: bool,
     /// Electrum tweaks: omit P2TR outs with `value <=` this (sats). `0` serves
@@ -340,6 +342,7 @@ impl Default for NodeConfig {
             head_scale: HeadScale::Mainnet,
             max_run_secs: None,
             shindex: false,
+            prune_inwit: false,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: 0,
@@ -889,6 +892,10 @@ impl NodeConfig {
             "sh_index" => {
                 self.shindex = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
+            }
+            "prune_inwit" => {
+                self.prune_inwit = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf prune_inwit: {e}")))?;
             }
             "sp_tweaks" => {
                 self.sptweaks = parse_conf_bool(val)

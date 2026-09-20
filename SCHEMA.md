@@ -208,6 +208,7 @@ itself changed.
     header.body / header.head    # Class A headers + hash index (overflow: header.head.gN)
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
     inwit.body / inwit.loc / inwit.off / inwit.loc.ovf       # Class A inputs+witness (cold loc)
+    inwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-inwit`; missing = off)
     inwit.reloc                  # optional: inwit lives under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
