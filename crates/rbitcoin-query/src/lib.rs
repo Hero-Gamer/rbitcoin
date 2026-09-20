@@ -60,6 +60,9 @@ pub use confirm_stats::{
 
 pub type QueryError = StoreError;
 
+/// Electrum JSON-RPC error / Esplora 503 body when `--sh-index` is off.
+pub const SCRIPTHASH_INDEX_DISABLED: &str = "scripthash index disabled";
+
 /// Result of [`Query::uring_recover`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UringRecover {
@@ -517,6 +520,12 @@ impl Query {
         } else {
             Some(v as u32)
         }
+    }
+
+    /// Electrum/Esplora scripthash reads: operator `--sh-index` or a leftover
+    /// watermark from a previous run. Never-indexed + flag off is fail-closed.
+    pub fn sh_history_available(&self) -> bool {
+        self.sh_index_enabled() || self.sh_indexed_through_height().is_some()
     }
 
     /// Advance SH watermark only after Class C tip commit.

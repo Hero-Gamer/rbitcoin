@@ -448,6 +448,46 @@ fn getblockchaininfo_ibd_follows_hub_not_stale_atomic() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// CLN stock `bcli` parses these Core JSON shapes (docs/lightning.md).
+#[test]
+fn cln_bcli_rpc_shapes() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["chain"], "regtest", "{info}");
+    assert!(info["blocks"].as_u64().is_some(), "{info}");
+    assert!(info["headers"].as_u64().is_some(), "{info}");
+    assert!(info["initialblockdownload"].as_bool().is_some(), "{info}");
+
+    for target in [2_u64, 6, 12, 100] {
+        let fee = dispatch(&ctx, "estimatesmartfee", vec![json!(target)]).unwrap();
+        assert!(
+            fee.get("feerate").is_some() || fee.get("errors").is_some(),
+            "estimatesmartfee {target}: {fee}"
+        );
+        if let Some(n) = fee["blocks"].as_u64() {
+            assert!(n >= 1, "{fee}");
+        }
+    }
+
+    let (addr, _) = p2wpkh_regtest();
+    dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+    let tip = dispatch(&ctx, "getbestblockhash", vec![])
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let raw = dispatch(&ctx, "getblock", vec![json!(tip), json!(0)]).unwrap();
+    let hex = raw.as_str().expect("verbosity 0 hex");
+    assert!(hex.len() > 160 && hex.len() % 2 == 0, "{hex}");
+
+    let missing = dispatch(&ctx, "gettxout", vec![json!("00".repeat(32)), json!(0)]).unwrap();
+    assert!(
+        missing.is_null(),
+        "unknown outpoint must be JSON null: {missing}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn estimatesmartfee_maps_to_product() {
     let (ctx, dir) = ctx_empty();

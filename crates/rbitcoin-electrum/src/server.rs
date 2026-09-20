@@ -1285,6 +1285,12 @@ fn method_stays_on_worker(method: &str) -> bool {
     )
 }
 
+fn method_needs_sh_index(method: &str) -> bool {
+    method.starts_with("blockchain.scripthash.")
+        || method.starts_with("blockchain.tweaks.")
+        || method.starts_with("blockchain.silentpayments.")
+}
+
 fn method_stamps_chain_tip(method: &str) -> bool {
     matches!(
         method,
@@ -1434,6 +1440,9 @@ fn dispatch_pinned(
     pinned: Option<&ChainView>,
     is_asof: bool,
 ) -> Result<Value, String> {
+    if method_needs_sh_index(method) && !query.sh_history_available() {
+        return Err(rbitcoin_query::SCRIPTHASH_INDEX_DISABLED.to_string());
+    }
     let protocol = conn.protocol.clone();
     let header_sub = &mut conn.header_sub;
     let sh_subs = &mut conn.sh_subs;

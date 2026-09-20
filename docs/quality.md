@@ -30,9 +30,10 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. **Q-56** Completed (scriptnum + pack-ints). **Q-68** Completed (create.loc SIMD). |
 | 5 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
+| 6 | **Q-69** | CLN / LDK chain backend | Operator can point Core Lightning `bcli` and ldk-node Esplora/Electrum at this node on regtest/signet. Electrum/Esplora **start without** `--sh-index`; SH-only APIs fail closed (`scripthash index disabled`). Channel watches (txid/outpoint) work. BDK address history still needs SH. No LND/ZMQ/BIP157. Owner: [`lightning.md`](./lightning.md). |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
-**R-11+**. Next unused Q-id is **Q-69**.
+**R-11+**. Next unused Q-id is **Q-70**.
 
 Close work by **moving the Open row into CHANGELOG** in the same edit as
 the landing change (do not grow a Completed museum here). New item: insert

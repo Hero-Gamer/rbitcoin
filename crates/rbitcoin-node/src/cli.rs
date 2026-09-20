@@ -316,7 +316,8 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
-Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora; both require it.\n\
+Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
+  Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\

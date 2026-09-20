@@ -33,6 +33,14 @@ before 1.0).
 
 ### Changed
 
+- **Electrum/Esplora no longer require `--sh-index` to bind.** Address and
+  scripthash methods return `scripthash index disabled` (Electrum JSON-RPC
+  error; Esplora HTTP 503). Txid/outpoint/block/fees work. Channel watches
+  do not need Class B.
+
+- **Lightning chain backends (`Q-69` Open):** [`docs/lightning.md`](docs/lightning.md)
+  owns CLN `bcli` and ldk-node Esplora/Electrum.
+
 - **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
   `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
   `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is

@@ -306,7 +306,8 @@ One loop: mine a block, one Electrum RPC, one Esplora GET. This is **regtest**,
 not validated mainnet (default mainnet `--milestone` skips historical scripts).
 Signet/mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
-Electrum and Esplora **require `--sh-index`**. JSON-RPC is only there so
+Electrum and Esplora **start without `--sh-index`**. Address/scripthash
+history needs it (fail closed otherwise). JSON-RPC is only there so
 `rbitcoin-cli` can mine.
 
 ```bash
@@ -375,12 +376,12 @@ Clean smoke:
 | `--api-log PATH` | `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
 | `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `no_seeds=` | seeds on |
-| `--sh-index` | `sh_index=` | **off** — Class B scripthash (required for Electrum/Esplora) |
+| `--sh-index` | `sh_index=` | **off** — Class B scripthash (address/history; Electrum/Esplora start without it) |
 | `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
-| `--electrum-listen [ADDR]` | `electrum_listen=` | disabled (**requires** `--sh-index`); omit ADDR → `127.0.0.1:50001` |
-| `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST; **requires** `--sh-index`); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine) |
+| `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
+| `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine). Address/scripthash methods need `--sh-index` |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
@@ -790,9 +791,9 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | Mode | Behavior |
 |------|----------|
 | **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
-| **on** (`--sh-index` / `sh_index=1`) | Direct IBD SH runs + tip bulk materialize; Electrum/Esplora may start when SH is tip-ready. |
+| **on** (`--sh-index` / `sh_index=1`) | Direct IBD SH runs + tip bulk materialize; address/scripthash Electrum/Esplora methods work. |
 
-**Electrum or Esplora without `--sh-index` fails at process start** (clear config error).
+Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then fail closed (`scripthash index disabled`). Txid/outpoint/block/fees still work. Matrix: [`docs/lightning.md`](./docs/lightning.md).
 
 `--esplora-block-template` (conf `esplora_block_template=1`) enables
 `GET /block-template` on the Esplora listen (same JSON as RPC
@@ -896,7 +897,8 @@ reverse proxy**, and rely on the node’s **app DoS limits** always being on. A
 loopback-only bind is convenient with a local proxy, but it is **not** the
 security model by itself.
 
-**Requires `--sh-index`.** Without it the node refuses to start.
+**`--sh-index` is required for scripthash/address history.** Without it those
+methods return `scripthash index disabled`; the listener still binds.
 
 `server.version[0]` is `rbitcoin-electrs <ver>` so Cake Wallet
 `getNodeIsElectrs()` will probe silent-payment tweaks. Other tweaks clients
@@ -1061,7 +1063,8 @@ broadcast). `/internal/*` is **unix listen only** (mempool Node
 can retire electrs ([`COMPAT.md`](./COMPAT.md)). Same internet-facing model as Electrum: app DoS
 limits always on; terminate TLS at a reverse proxy.
 
-**Requires `--sh-index`.** Without it the node refuses to start.
+**`--sh-index` is required for `/address` and `/scripthash` history.** Without
+it those routes are 503 `scripthash index disabled`; the listener still binds.
 
 **Still out:** explorer search/`address-prefix`, Liquid, in-binary
 mempool.space `/api/v1/` catalogue. Opt-in `GET /block-template` is GBT

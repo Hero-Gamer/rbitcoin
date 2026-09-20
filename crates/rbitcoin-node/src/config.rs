@@ -450,18 +450,6 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
-        if self.listen.electrum.is_some() && !self.shindex {
-            return Err(NodeError::Config(
-                "electrum-listen requires sh_index=1 (--sh-index); Electrum history needs Class B scripthash"
-                    .into(),
-            ));
-        }
-        if self.listen.esplora.is_some() && !self.shindex {
-            return Err(NodeError::Config(
-                "esplora-listen requires sh_index=1 (--sh-index); Esplora history needs Class B scripthash"
-                    .into(),
-            ));
-        }
         Ok(())
     }
 
@@ -1669,27 +1657,19 @@ mod tests {
     }
 
     #[test]
-    fn electrum_without_shindex_fails_validate() {
+    fn electrum_without_shindex_validates() {
         let mut cfg = NodeConfig::default().with_datadir(tmp());
         cfg.listen.electrum = Some("127.0.0.1:50001".parse().unwrap());
         cfg.shindex = false;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("sh_index") || err.contains("--sh-index"),
-            "expected sh-index requirement, got {err}"
-        );
+        cfg.validate().unwrap();
     }
 
     #[test]
-    fn esplora_without_shindex_fails_validate() {
+    fn esplora_without_shindex_validates() {
         let mut cfg = NodeConfig::default().with_datadir(tmp());
         cfg.listen.esplora = Some(EsploraListen::parse("127.0.0.1:3000", 3000).unwrap());
         cfg.shindex = false;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("sh_index") || err.contains("--sh-index"),
-            "got {err}"
-        );
+        cfg.validate().unwrap();
     }
 
     #[test]
