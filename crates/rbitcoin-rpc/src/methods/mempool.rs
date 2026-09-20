@@ -680,14 +680,9 @@ fn testmempoolaccept_package_rows(
 ) -> Value {
     let mut added = Vec::new();
     let mut out = Vec::new();
-    let mut aborted = false;
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
-        if aborted {
-            out.push(json!({ "txid": txid, "wtxid": wtxid }));
-            continue;
-        }
         if rpc_tx_version_nonstandard(tx) {
             out.push(json!({
                 "txid": txid,
@@ -702,7 +697,6 @@ fn testmempoolaccept_package_rows(
             .iter()
             .any(|i| mp.spending_txid(&i.previous_output).is_some())
         {
-            blank_package_prefix(&mut out);
             out.push(json!({
                 "txid": txid,
                 "wtxid": wtxid,
@@ -710,21 +704,18 @@ fn testmempoolaccept_package_rows(
                 "reject-reason": "bip125-replacement-disallowed",
                 "reject-details": "bip125-replacement-disallowed",
             }));
-            aborted = true;
             continue;
         }
         match mp.accept_tx(tx) {
             Ok(r) => {
                 added.push(r.txid);
                 if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    blank_package_prefix(&mut out);
                     out.push(json!({
                         "txid": txid,
                         "wtxid": wtxid,
                         "allowed": false,
                         "reject-reason": "max-fee-exceeded",
                     }));
-                    aborted = true;
                 } else {
                     out.push(json!({
                         "txid": txid,
@@ -736,16 +727,11 @@ fn testmempoolaccept_package_rows(
                 }
             }
             Err(e) => {
-                let reason = accept_reject_reason(&e);
-                if package_eval_aborts(&reason) {
-                    blank_package_prefix(&mut out);
-                    aborted = true;
-                }
                 let mut row = json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": false,
-                    "reject-reason": reason,
+                    "reject-reason": accept_reject_reason(&e),
                 });
                 if let Some(details) = accept_reject_details(&e, tx) {
                     row["reject-details"] = json!(details);
@@ -822,21 +808,6 @@ fn testmempoolaccept_single_rows(
         }
     }
     Ok(json!(out))
-}
-
-fn package_eval_aborts(reason: &str) -> bool {
-    matches!(
-        reason,
-        "missing-inputs" | "max-fee-exceeded" | "bip125-replacement-disallowed"
-    )
-}
-
-fn blank_package_prefix(out: &mut [Value]) {
-    for row in out.iter_mut() {
-        let txid = row["txid"].clone();
-        let wtxid = row["wtxid"].clone();
-        *row = json!({ "txid": txid, "wtxid": wtxid });
-    }
 }
 
 fn package_has_conflicts(txs: &[Transaction]) -> bool {

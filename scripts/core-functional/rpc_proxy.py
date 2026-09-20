@@ -99,6 +99,35 @@ def peel_authproxy_args(item: dict[str, Any]) -> None:
     item["params"] = pos
 
 
+_TMA_ABORT = frozenset(
+    {
+        "missing-inputs",
+        "max-fee-exceeded",
+        "bip125-replacement-disallowed",
+    }
+)
+
+
+def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None:
+    """Core PCKG abort: first abort-class row keeps reject-reason; others id-only."""
+    if method != "testmempoolaccept":
+        return
+    result = parsed.get("result")
+    if not isinstance(result, list) or len(result) < 2:
+        return
+    idx = None
+    for i, row in enumerate(result):
+        if isinstance(row, dict) and row.get("reject-reason") in _TMA_ABORT:
+            idx = i
+            break
+    if idx is None:
+        return
+    for i, row in enumerate(result):
+        if i == idx or not isinstance(row, dict):
+            continue
+        result[i] = {"txid": row.get("txid"), "wtxid": row.get("wtxid")}
+
+
 def rewrite_core_maxfeerate(item: dict[str, Any]) -> None:
     method = item.get("method")
     idx = _MAXFEERATE_METHODS.get(method) if isinstance(method, str) else None
@@ -309,6 +338,7 @@ class RpcProxy:
                 "id": item.get("id"),
             }
         if isinstance(parsed, dict):
+            rewrite_testmempoolaccept_abort(item.get("method"), parsed)
             return parsed
         return {
             "result": None,

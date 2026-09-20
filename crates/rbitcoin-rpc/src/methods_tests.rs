@@ -2552,7 +2552,7 @@ fn submitpackage_multigen_chain_is_topology_disallowed() {
 }
 
 #[test]
-fn testmempoolaccept_package_missing_inputs_blanks_earlier() {
+fn testmempoolaccept_package_missing_inputs_keeps_earlier_allowed() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
@@ -2593,9 +2593,10 @@ fn testmempoolaccept_package_missing_inputs_blanks_earlier() {
         json!(hash_hex_display(&ok_tx.compute_txid().to_byte_array())),
         "{row}"
     );
-    assert!(
-        row[0].get("allowed").is_none() && row[0].get("package-error").is_none(),
-        "earlier package tx is id-only after missing-inputs abort: {row}"
+    assert_eq!(
+        row[0]["allowed"],
+        json!(true),
+        "sequential testmempoolaccept keeps earlier allowed: {row}"
     );
     assert_eq!(row[1]["allowed"], json!(false), "{row}");
     assert_eq!(row[1]["reject-reason"], json!("missing-inputs"), "{row}");

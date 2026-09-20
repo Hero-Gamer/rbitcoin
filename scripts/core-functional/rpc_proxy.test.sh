@@ -20,7 +20,81 @@ from rpc_proxy import (
     node_rpc_port,
     peel_authproxy_args,
     rewrite_core_maxfeerate,
+    rewrite_testmempoolaccept_abort,
 )
+
+seq = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": True,
+            "vsize": 110,
+            "fees": {"base": 0.00001},
+        },
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "missing-inputs",
+        },
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", seq)
+assert seq["result"][0] == {"txid": "aa", "wtxid": "wa"}, seq
+assert seq["result"][1]["reject-reason"] == "missing-inputs", seq
+lone = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": False,
+            "reject-reason": "missing-inputs",
+        }
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", lone)
+assert lone["result"][0]["allowed"] is False, lone
+ok_pkg = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {"txid": "bb", "wtxid": "wb", "allowed": True},
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", ok_pkg)
+assert ok_pkg["result"][0]["allowed"] is True, ok_pkg
+fee_abort = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "max-fee-exceeded",
+        },
+        {"txid": "cc", "wtxid": "wc", "allowed": False, "reject-reason": "missing-inputs"},
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", fee_abort)
+assert fee_abort["result"][0] == {"txid": "aa", "wtxid": "wa"}, fee_abort
+assert fee_abort["result"][1]["reject-reason"] == "max-fee-exceeded", fee_abort
+assert fee_abort["result"][2] == {"txid": "cc", "wtxid": "wc"}, fee_abort
+rbf_abort = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "bip125-replacement-disallowed",
+        },
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", rbf_abort)
+assert rbf_abort["result"][0] == {"txid": "aa", "wtxid": "wa"}, rbf_abort
+send = {"result": [{"txid": "aa", "allowed": True}, {"txid": "bb", "allowed": False}]}
+rewrite_testmempoolaccept_abort("sendrawtransaction", send)
+assert send["result"][0]["allowed"] is True, send
 
 assert core_btc_kvb_to_sat_vb(0) == 0
 assert core_btc_kvb_to_sat_vb(0.1) == 10_000
