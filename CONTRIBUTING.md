@@ -251,7 +251,10 @@ PR, and **one PR** per plan. Each plan step follows
 [`docs/how-we-plan.md`](./docs/how-we-plan.md) and is committed only after
 local CI except coverage. Coverage and native `windows` / `macos` stay
 GitHub Actions. After merge they delete the topic branch and keep the
-session worktree. Start at [`docs/ORIENT.md`](./docs/ORIENT.md).
+session worktree. Never `git remote set-url origin`. Bot push uses an
+explicit HTTPS URL (not `git push origin`). Fail-fast poll is
+`./scripts/pr-checks-watch.sh`, not `gh pr checks --watch`. Start at
+[`docs/ORIENT.md`](./docs/ORIENT.md).
 Ship commands: [`.agents/skills/ship-pr/SKILL.md`](./.agents/skills/ship-pr/SKILL.md).
 
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):

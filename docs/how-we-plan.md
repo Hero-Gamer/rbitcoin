@@ -253,7 +253,8 @@ fi
 ```
 
 A sequence of gates can wrap that body in a `run` function (one call per
-command). The ship-pr Local tests crib does that.
+command). Do not paste a second copy into ship-pr; that file lists the
+commands and links here.
 
 Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
 Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
