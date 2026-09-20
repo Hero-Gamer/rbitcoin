@@ -506,6 +506,26 @@ impl Store {
         Ok(self.fence().height_of(tx_fk))
     }
 
+    /// Rewrite `inwit.body` so rows at/below `prune_height` are replaced with
+    /// fixed-size stubs, reclaiming witness bytes while preserving fk alignment.
+    pub fn reclaim_pruned_inwit(&self, prune_height: u32) -> Result<(u64, u64), StoreError> {
+        let n = self.txs.inwit_loc.count();
+        if n == 0 {
+            let end = self.txs.inwit.body_logical_len();
+            return Ok((end, end));
+        }
+        let mut keep = Vec::with_capacity(n as usize);
+        for id in 1..=n {
+            let fk = Fk(id);
+            let keep_fk = match self.tx_height_get(fk)? {
+                Some(h) => h > prune_height,
+                None => true,
+            };
+            keep.push(keep_fk);
+        }
+        self.txs.reclaim_pruned_inwit(&keep)
+    }
+
     /// Rebuild the fence from `confirmed[]` + `header_txs` (open / tests).
     pub fn rebuild_height_fence(&self) -> Result<(), StoreError> {
         let f = HeightFence::from_confirmed(&self.confirmed, &self.header_txs)?;

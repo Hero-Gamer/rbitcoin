@@ -4,6 +4,7 @@ use crate::compact::{
     input_flags, output_flags, script_kind_v17_disk_used, split_output_flags,
 };
 use crate::error::StoreError;
+use crate::file::FILE_HEADER_LEN;
 use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
@@ -1234,6 +1235,49 @@ impl TxTable {
             .flatten()
             .ok_or(StoreError::NotFound)
     }
+
+    /// Reclaim pruned witness bytes by rewriting `inwit.body` in-place and
+    /// replacing pruned rows with a fixed 8-byte aligned stub.
+    ///
+    /// `keep[i]` corresponds to `Fk(i+1)`: `true` keeps the original inwit
+    /// payload, `false` writes an 8-byte stub.
+    pub fn reclaim_pruned_inwit(&self, keep: &[bool]) -> Result<(u64, u64), StoreError> {
+        const PRUNED_STUB: [u8; 8] = [0u8; 8];
+        let count = self.inwit_loc.count();
+        if keep.len() != count as usize {
+            return Err(StoreError::Corrupt("invariant: prune keep/count mismatch"));
+        }
+        if count == 0 {
+            let end = self.inwit.body_logical_len();
+            return Ok((end, end));
+        }
+        let before = self.inwit.body_logical_len();
+        let mut starts = Vec::with_capacity(count as usize);
+        let mut lens = Vec::with_capacity(count as usize);
+        let mut write_at = FILE_HEADER_LEN as u64;
+        for id in 1..=count {
+            let fk = Fk(id);
+            let (old_off, old_len) = self.inwit_range(fk)?;
+            starts.push(write_at);
+            if keep[(id - 1) as usize] {
+                self.inwit.with_bytes_at(old_off, old_len, |raw| {
+                    self.inwit.write_body_abs(write_at, raw)?;
+                    Ok(())
+                })?;
+                lens.push(old_len);
+                write_at = write_at.saturating_add(old_len);
+            } else {
+                self.inwit.write_body_abs(write_at, &PRUNED_STUB)?;
+                lens.push(PRUNED_STUB.len() as u64);
+                write_at = write_at.saturating_add(PRUNED_STUB.len() as u64);
+            }
+        }
+        self.inwit_loc.truncate_to_count(0)?;
+        self.inwit_loc.append(&starts, &lens)?;
+        self.inwit.truncate_body_to(count, write_at)?;
+        Ok((before, write_at))
+    }
+
     pub fn spent_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.create_loc_range_batch(&[fk])?
             .into_iter()

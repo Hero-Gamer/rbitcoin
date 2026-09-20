@@ -390,7 +390,7 @@ Clean smoke:
 | `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `no_seeds=` | seeds on |
 | `--sh-index` | `sh_index=` | **off** — Class B scripthash (address/history; Electrum/Esplora start without it) |
-| `--prune-inwit` | `prune_inwit=` | **off** — drop Class A inwit below tip−288 **heights**; advertise `NETWORK_LIMITED` (not Core `-prune` of headers/txout) |
+| `--prune-inwit` | `prune_inwit=` | **off** — refuse wire reconstruct below tip−288 **heights**, advertise `NETWORK_LIMITED`, and compact witness rows at/below the watermark to fixed in-file stubs |
 | `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |

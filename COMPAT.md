@@ -69,7 +69,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | GetAddr | Core `MAX_ADDR_TO_SEND` / `MAX_PCT_ADDR_TO_SEND` (**1000** / **23%**), 24h per-bind cache. Named copies in `rbitcoin-net` — do not “improve” without a named reason to diverge. `MAX_ADDR_MAN` (8192) is **our** HashMap DoS cap and must stay above `1000/0.23` | Core new/tried buckets (~80k); same 1000 / 23% |
 | Package submit | RPC `submitpackage` / Esplora `POST /txs/package` (no P2P package command) | BIP331 wire |
-| Pruning / GUI | inwit prune / `NETWORK_LIMITED` (`--prune-inwit`); not Core `-prune` of headers/txout | Supported |
+| Pruning / GUI | inwit watermark / `NETWORK_LIMITED` (`--prune-inwit`; witness bytes at/below watermark are compacted to fixed stubs); not Core `-prune` of headers/txout | Supported |
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |

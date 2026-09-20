@@ -487,7 +487,14 @@ impl Query {
         self.pruneheight.store(v, AtomicOrdering::Release);
         if height.is_some() {
             self.prune_inwit.store(true, AtomicOrdering::Release);
-            self.persist_pruneheight(v)
+            self.persist_pruneheight(v)?;
+            let (before, after) = self.store.reclaim_pruned_inwit(v)?;
+            if after < before {
+                rbitcoin_log::info!(
+                    "query: prune-inwit reclaimed bytes before={before} after={after}"
+                );
+            }
+            Ok(())
         } else {
             self.prune_inwit.store(false, AtomicOrdering::Release);
             self.persist_pruneheight_clear()

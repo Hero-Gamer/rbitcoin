@@ -2666,6 +2666,87 @@ fn prune_watermark_survives_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn published_len(path: &std::path::Path) -> u64 {
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut hdr = [0u8; 16];
+    use std::io::Read as _;
+    f.read_exact(&mut hdr).unwrap();
+    u64::from_le_bytes(hdr[8..16].try_into().unwrap())
+}
+
+#[test]
+fn apply_prune_inwit_tip_reclaims_inwit_body_bytes() {
+    let (dir, q) = temp_query("prune-reclaim-bytes");
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..400u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0xab; 96]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let inwit_path = q.store().path().join("inwit.body");
+    let before = published_len(&inwit_path);
+    q.set_prune_inwit(true).unwrap();
+    q.apply_prune_inwit_tip().unwrap();
+    let after = published_len(&inwit_path);
+    assert!(
+        after < before,
+        "expected prune reclaim to shrink inwit.body: before={before} after={after}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_reclaim_persists_across_reopen() {
+    let (dir, q) = temp_query("prune-reclaim-reopen");
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..400u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0xcd; 96]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let inwit_path = q.store().path().join("inwit.body");
+    let before = published_len(&inwit_path);
+    q.set_prune_inwit(true).unwrap();
+    q.apply_prune_inwit_tip().unwrap();
+    let shrunk = published_len(&inwit_path);
+    assert!(
+        shrunk < before,
+        "expected prune reclaim before reopen: before={before} after={shrunk}"
+    );
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let after_reopen = published_len(&q.store().path().join("inwit.body"));
+    assert_eq!(after_reopen, shrunk, "reopen must preserve reclaimed bytes");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_during_sync_limits_inwit_growth() {
+    let (dir, q) = temp_query("prune-growth-limit");
+    q.set_prune_inwit(true).unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..700u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0xee; 160]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        q.apply_prune_inwit_tip().unwrap();
+    }
+    let inwit_path = q.store().path().join("inwit.body");
+    let now = published_len(&inwit_path);
+    let max_expected = 16 + (700u64 * 8) + (u64::from(Query::INWIT_KEEP_HEIGHTS) * 192);
+    assert!(
+        now <= max_expected,
+        "pruned inwit growth exceeded limit: now={now} max={max_expected}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reconstruct_span_batches_foreign_parent_txids() {
     let (dir, q) = temp_query("reconstruct-parent-batch");
