@@ -722,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
     rules = load_rules(map_path) if map_path.is_file() else []
     child_env = os.environ.copy()
     child_env["RBITCOIN_RPC_WAIT_TIP_IDLE"] = "1"
+    child_env["RBITCOIN_RPC_PACKAGE_DIALECT"] = "1"
     try:
         child = subprocess.Popen(
             cmd,

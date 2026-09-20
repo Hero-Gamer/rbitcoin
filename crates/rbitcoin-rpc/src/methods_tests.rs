@@ -2491,7 +2491,7 @@ fn rpc_submit_nonstandard_version_is_version() {
 }
 
 #[test]
-fn submitpackage_multigen_chain_is_topology_disallowed() {
+fn submitpackage_multigen_chain_is_sequential_admit() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
@@ -2538,16 +2538,22 @@ fn submitpackage_multigen_chain_is_topology_disallowed() {
     };
     let child_hex = hex_encode(serialize(&child));
     let grand_hex = hex_encode(serialize(&grandchild));
-    let e = dispatch(
+    let chain = dispatch(
         &ctx,
         "submitpackage",
         vec![json!([parent_hex.clone(), child_hex.clone(), grand_hex])],
     )
-    .unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
-    assert_eq!(e["message"], "package topology disallowed", "{e}");
-    let ok = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
-    assert_eq!(ok["package_msg"], "success", "{ok}");
+    .unwrap();
+    assert_eq!(chain["package_msg"], "success", "{chain}");
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "{chain}"
+    );
+    let pair = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
+    assert_eq!(pair["package_msg"], "success", "{pair}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2762,8 +2768,8 @@ fn submitpackage_parent_minfee_child_maxfeerate_reports_both() {
     );
     assert_eq!(
         pkg["tx-results"][&child_w]["error"],
-        json!("max feerate exceeded"),
-        "in-package child maxfeerate, not missing-inputs: {pkg}"
+        json!("bad-txns-inputs-missingorspent"),
+        "sequential child is missing-inputs, not in-package maxfeerate: {pkg}"
     );
     assert!(!ctx
         .mempool

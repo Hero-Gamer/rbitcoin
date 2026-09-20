@@ -519,7 +519,7 @@ ENV_FAKE="$WORKDIR/env-node"
 ENV_OUT="$WORKDIR/child-env"
 cat >"$ENV_FAKE" <<EOF
 #!/bin/sh
-env | grep -F RBITCOIN_RPC_WAIT_TIP_IDLE >"$ENV_OUT" || true
+env | grep -E 'RBITCOIN_RPC_WAIT_TIP_IDLE|RBITCOIN_RPC_PACKAGE_DIALECT' >"$ENV_OUT" || true
 exit 0
 EOF
 chmod +x "$ENV_FAKE"
@@ -529,6 +529,13 @@ if grep -q '^RBITCOIN_RPC_WAIT_TIP_IDLE=1$' "$ENV_OUT" 2>/dev/null; then
   PASS=$((PASS + 1))
 else
   echo "not ok - shim sets RBITCOIN_RPC_WAIT_TIP_IDLE (got: $([[ -f $ENV_OUT ]] && cat "$ENV_OUT" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+if grep -q '^RBITCOIN_RPC_PACKAGE_DIALECT=1$' "$ENV_OUT" 2>/dev/null; then
+  echo "ok - shim sets RBITCOIN_RPC_PACKAGE_DIALECT on the node"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - shim sets RBITCOIN_RPC_PACKAGE_DIALECT (got: $([[ -f $ENV_OUT ]] && cat "$ENV_OUT" || echo missing))"
   FAIL=$((FAIL + 1))
 fi
 
