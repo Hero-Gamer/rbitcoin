@@ -9,9 +9,14 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - ".github/workflows/mutants.yml"
+
+permissions:
+  contents: read
+
 concurrency:
   group: mutants-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   mutants-pr:
     if: github.event_name == 'pull_request'
@@ -19,13 +24,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with: { persist-credentials: false, submodules: false, fetch-depth: 0 }
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
-        with: { tool: cargo-mutants@27.1.0 }
+        with:
+          tool: cargo-mutants@27.1.0
       - run: git diff origin/${{ github.base_ref }}.. --unified=0 > git.diff
       - run: cargo mutants --workspace --in-diff git.diff -j 2
         continue-on-error: true
+
   mutants-weekly:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -35,11 +45,16 @@ jobs:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with: { persist-credentials: false, submodules: false }
+        with:
+          persist-credentials: false
+          submodules: false
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
-        with: { tool: cargo-mutants@27.1.0 }
+        with:
+          tool: cargo-mutants@27.1.0
       - run: cargo mutants --workspace --shard ${{ matrix.shard }}/8 -j 2
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
-        with: { name: mutants-${{ matrix.shard }}, path: mutants.out }
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: mutants.out
