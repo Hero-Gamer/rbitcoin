@@ -53,7 +53,13 @@ as `N−11`, `-whitelist` → `--net-permission`, `-whitebind` → `--net-permis
 those Core aliases. The shim sets `RBITCOIN_RPC_WAIT_TIP_IDLE=1` on the child so
 `getblockcount` waits until the tip-accept lane is empty (`sync_blocks`).
 Production (unset) waits only for the accept that was running when the RPC
-arrived.
+arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
+`submitpackage` matches Core `IsChildWithParents` (`-25`) and in-package
+maxfeerate overlay. Production (unset) is sequential admit. The RPC proxy
+rewrites multi-tx `testmempoolaccept` abort-class rows (`missing-inputs` /
+`max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
+node keeps earlier `allowed: true`. `rpc_packages.py` `run` includes that
+named shim dialect (same honesty as `WAIT_TIP_IDLE`).
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
@@ -109,7 +115,11 @@ script pass. Wallet / `createrawtransaction` / `signrawtransactionwithkey` /
 the asserts then hit `sendrawtransaction` / `generate*` / P2P. Do **not**
 `run` a script whose asserts are only shim argv, dummy `blk*.dat`, fabricated
 `Bound to` lines, vendored `rpcauth.py`, or Core decode/`validateaddress`
-dialect the node does not ship.
+dialect the node does not ship. Named Core-functional shim dialect is allowed
+when documented: child env (`RBITCOIN_RPC_WAIT_TIP_IDLE`,
+`RBITCOIN_RPC_PACKAGE_DIALECT`) and proxy JSON (`maxfeerate` BTC/kvB,
+abort-class `testmempoolaccept` blanking). Do not `run` a silent Core-clone
+of production RPC.
 
 First production-green pair (historical): `feature_uacomment.py`
 (`getnetworkinfo.subversion` BIP14 parens) and `rpc_uptime.py` (`uptime` /

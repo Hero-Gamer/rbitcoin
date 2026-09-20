@@ -20,7 +20,81 @@ from rpc_proxy import (
     node_rpc_port,
     peel_authproxy_args,
     rewrite_core_maxfeerate,
+    rewrite_testmempoolaccept_abort,
 )
+
+seq = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": True,
+            "vsize": 110,
+            "fees": {"base": 0.00001},
+        },
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "missing-inputs",
+        },
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", seq)
+assert seq["result"][0] == {"txid": "aa", "wtxid": "wa"}, seq
+assert seq["result"][1]["reject-reason"] == "missing-inputs", seq
+lone = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": False,
+            "reject-reason": "missing-inputs",
+        }
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", lone)
+assert lone["result"][0]["allowed"] is False, lone
+ok_pkg = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {"txid": "bb", "wtxid": "wb", "allowed": True},
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", ok_pkg)
+assert ok_pkg["result"][0]["allowed"] is True, ok_pkg
+fee_abort = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "max-fee-exceeded",
+        },
+        {"txid": "cc", "wtxid": "wc", "allowed": False, "reject-reason": "missing-inputs"},
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", fee_abort)
+assert fee_abort["result"][0] == {"txid": "aa", "wtxid": "wa"}, fee_abort
+assert fee_abort["result"][1]["reject-reason"] == "max-fee-exceeded", fee_abort
+assert fee_abort["result"][2] == {"txid": "cc", "wtxid": "wc"}, fee_abort
+rbf_abort = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "bip125-replacement-disallowed",
+        },
+    ]
+}
+rewrite_testmempoolaccept_abort("testmempoolaccept", rbf_abort)
+assert rbf_abort["result"][0] == {"txid": "aa", "wtxid": "wa"}, rbf_abort
+send = {"result": [{"txid": "aa", "allowed": True}, {"txid": "bb", "allowed": False}]}
+rewrite_testmempoolaccept_abort("sendrawtransaction", send)
+assert send["result"][0]["allowed"] is True, send
 
 assert core_btc_kvb_to_sat_vb(0) == 0
 assert core_btc_kvb_to_sat_vb(0.1) == 10_000
@@ -107,8 +181,25 @@ class FakeNode(BaseHTTPRequestHandler):
             ).encode()
             self.send_response(401)
         else:
+            if item.get("method") == "testmempoolaccept":
+                result = [
+                    {
+                        "txid": "aa",
+                        "wtxid": "wa",
+                        "allowed": False,
+                        "reject-reason": "missing-inputs",
+                    },
+                    {
+                        "txid": "bb",
+                        "wtxid": "wb",
+                        "allowed": True,
+                        "fees": {"base": 0.00001},
+                    },
+                ]
+            else:
+                result = item.get("method")
             body = json.dumps(
-                {"result": item.get("method"), "error": None, "id": item.get("id")}
+                {"result": result, "error": None, "id": item.get("id")}
             ).encode()
             self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -165,6 +256,11 @@ st, body = call("syncwithvalidationinterfacequeue")
 assert st == 200, st
 assert body["result"] is None, body
 assert body["error"] is None, body
+
+st, body = call("testmempoolaccept")
+assert st == 200, st
+assert body["result"][0]["reject-reason"] == "missing-inputs", body
+assert body["result"][1] == {"txid": "bb", "wtxid": "wb"}, body
 
 node.shutdown()
 proxy.shutdown()

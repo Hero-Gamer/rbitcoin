@@ -2167,6 +2167,18 @@ mod tests {
     }
 
     #[test]
+    fn accept_tx_nonstandard_version_is_ok() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut tx = spend_tx(op, 50_000);
+        tx.version = Version::non_standard(0xffff_ffffu32 as i32);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos, TIP_OK)
+            .expect("Libre P2P admits nVersion outside 1/2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reject_low_feerate() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);

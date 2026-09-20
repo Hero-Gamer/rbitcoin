@@ -429,6 +429,27 @@ pub(crate) fn tx_fee_sat_from_prevouts(ctx: &RpcContext, tx: &Transaction) -> Tx
     )
 }
 
+fn package_dialect_from_env(v: Option<&str>) -> bool {
+    matches!(v, Some(s) if s == "1" || s.eq_ignore_ascii_case("true"))
+}
+
+fn rpc_package_dialect() -> bool {
+    package_dialect_from_env(
+        std::env::var("RBITCOIN_RPC_PACKAGE_DIALECT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn submitpackage_topology_disallowed(txs: &[Transaction], dialect: bool) -> bool {
+    dialect && txs.len() > 1 && !MempoolHub::package_is_child_with_direct_parents(txs)
+}
+
+fn rpc_tx_version_nonstandard(tx: &Transaction) -> bool {
+    tx.version != bitcoin::transaction::Version::ONE
+        && tx.version != bitcoin::transaction::Version::TWO
+}
+
 fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_vb: u64) -> bool {
     match tx_fee_sat_from_prevouts(ctx, tx) {
         TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_vb),
@@ -502,6 +523,9 @@ pub(crate) fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     if burn_exceeds_max(&tx, max_burn) {
         return Err(rpc_error(ERR_INVALID_PARAMETER, MAX_BURN_MSG));
+    }
+    if rpc_tx_version_nonstandard(&tx) {
+        return Err(rpc_error(ERR_VERIFY_REJECTED, "version"));
     }
     if rpc_tx_fee_exceeds_max(ctx, &tx, max_feerate) {
         return Err(rpc_error(
@@ -672,12 +696,16 @@ fn testmempoolaccept_package_rows(
 ) -> Value {
     let mut added = Vec::new();
     let mut out = Vec::new();
-    let mut aborted = false;
     for tx in decoded {
         let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
-        if aborted {
-            out.push(json!({ "txid": txid, "wtxid": wtxid }));
+        if rpc_tx_version_nonstandard(tx) {
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "version",
+            }));
             continue;
         }
         if tx
@@ -685,7 +713,6 @@ fn testmempoolaccept_package_rows(
             .iter()
             .any(|i| mp.spending_txid(&i.previous_output).is_some())
         {
-            blank_package_prefix(&mut out);
             out.push(json!({
                 "txid": txid,
                 "wtxid": wtxid,
@@ -693,21 +720,18 @@ fn testmempoolaccept_package_rows(
                 "reject-reason": "bip125-replacement-disallowed",
                 "reject-details": "bip125-replacement-disallowed",
             }));
-            aborted = true;
             continue;
         }
         match mp.accept_tx(tx) {
             Ok(r) => {
                 added.push(r.txid);
                 if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    blank_package_prefix(&mut out);
                     out.push(json!({
                         "txid": txid,
                         "wtxid": wtxid,
                         "allowed": false,
                         "reject-reason": "max-fee-exceeded",
                     }));
-                    aborted = true;
                 } else {
                     out.push(json!({
                         "txid": txid,
@@ -719,16 +743,11 @@ fn testmempoolaccept_package_rows(
                 }
             }
             Err(e) => {
-                let reason = accept_reject_reason(&e);
-                if package_eval_aborts(&reason) {
-                    blank_package_prefix(&mut out);
-                    aborted = true;
-                }
                 let mut row = json!({
                     "txid": txid,
                     "wtxid": wtxid,
                     "allowed": false,
-                    "reject-reason": reason,
+                    "reject-reason": accept_reject_reason(&e),
                 });
                 if let Some(details) = accept_reject_details(&e, tx) {
                     row["reject-details"] = json!(details);
@@ -759,6 +778,15 @@ fn testmempoolaccept_single_rows(
                 "wtxid": wtxid,
                 "allowed": false,
                 "reject-reason": "txn-already-known",
+            }));
+            continue;
+        }
+        if rpc_tx_version_nonstandard(&tx) {
+            out.push(json!({
+                "txid": txid,
+                "wtxid": wtxid,
+                "allowed": false,
+                "reject-reason": "version",
             }));
             continue;
         }
@@ -796,21 +824,6 @@ fn testmempoolaccept_single_rows(
         }
     }
     Ok(json!(out))
-}
-
-fn package_eval_aborts(reason: &str) -> bool {
-    matches!(
-        reason,
-        "missing-inputs" | "max-fee-exceeded" | "bip125-replacement-disallowed"
-    )
-}
-
-fn blank_package_prefix(out: &mut [Value]) {
-    for row in out.iter_mut() {
-        let txid = row["txid"].clone();
-        let wtxid = row["wtxid"].clone();
-        *row = json!({ "txid": txid, "wtxid": wtxid });
-    }
 }
 
 fn package_has_conflicts(txs: &[Transaction]) -> bool {
@@ -1204,13 +1217,14 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     if package_has_conflicts(&txs) {
         return Ok(submitpackage_conflict_result(&txs));
     }
-    if txs.len() > 1 && !MempoolHub::package_is_child_with_direct_parents(&txs) {
+    let dialect = rpc_package_dialect();
+    if submitpackage_topology_disallowed(&txs, dialect) {
         return Err(rpc_error(ERR_VERIFY_ERROR, "package topology disallowed"));
     }
     if let Some(failed) = submitpackage_fee_burn_precheck(ctx, &txs, max_feerate, max_burn)? {
         return Ok(failed);
     }
-    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate))
+    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate, dialect))
 }
 
 fn submitpackage_conflict_result(txs: &[Transaction]) -> Value {
@@ -1280,13 +1294,26 @@ fn submitpackage_admit(
     mp: &MempoolHub,
     txs: &[Transaction],
     max_feerate: u64,
+    dialect: bool,
 ) -> Value {
     let mut tx_results = serde_json::Map::new();
     let mut replaced = Vec::new();
     let mut to_admit = Vec::new();
+    let mut any_fail = false;
     for tx in txs {
         let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
         let txid_s = hash_hex_display(&tx.compute_txid().to_byte_array());
+        if rpc_tx_version_nonstandard(tx) {
+            any_fail = true;
+            tx_results.insert(
+                wtxid,
+                json!({
+                    "txid": txid_s,
+                    "error": "version",
+                }),
+            );
+            continue;
+        }
         if !mp.contains(&tx.compute_txid()) {
             to_admit.push(tx.clone());
             continue;
@@ -1304,7 +1331,6 @@ fn submitpackage_admit(
             tx_results.insert(wtxid, json!({ "txid": txid_s }));
         }
     }
-    let mut any_fail = false;
     for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
         match res {
             Ok(ok) => {
@@ -1328,7 +1354,14 @@ fn submitpackage_admit(
                     hash_hex_display(&tx.compute_wtxid().to_byte_array()),
                     json!({
                         "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
-                        "error": submitpackage_member_error(ctx, tx, txs, max_feerate, &e),
+                        "error": submitpackage_member_error(
+                            ctx,
+                            tx,
+                            txs,
+                            max_feerate,
+                            dialect,
+                            &e,
+                        ),
                     }),
                 );
             }
@@ -1351,13 +1384,14 @@ fn submitpackage_member_error(
     tx: &Transaction,
     package: &[Transaction],
     max_feerate: u64,
+    dialect: bool,
     e: &impl std::fmt::Display,
 ) -> String {
     let mapped = accept_reject_reason(e);
     if mapped != "missing-inputs" {
         return mapped;
     }
-    if package_tx_fee_exceeds_max(ctx, tx, package, max_feerate) {
+    if dialect && package_tx_fee_exceeds_max(ctx, tx, package, max_feerate) {
         return "max feerate exceeded".into();
     }
     "bad-txns-inputs-missingorspent".into()
@@ -1453,7 +1487,48 @@ pub(crate) fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value
 
 #[cfg(test)]
 mod fee_look_tests {
-    use super::{fold_tx_fee_sat, TxFeeLook};
+    use super::{fold_tx_fee_sat, package_dialect_from_env, TxFeeLook};
+
+    #[test]
+    fn package_dialect_from_env_only_one_and_true() {
+        assert!(!package_dialect_from_env(None));
+        assert!(!package_dialect_from_env(Some("")));
+        assert!(!package_dialect_from_env(Some("0")));
+        assert!(!package_dialect_from_env(Some("false")));
+        assert!(package_dialect_from_env(Some("1")));
+        assert!(package_dialect_from_env(Some("true")));
+        assert!(package_dialect_from_env(Some("TRUE")));
+    }
+
+    #[test]
+    fn topology_gate_only_when_dialect() {
+        use super::submitpackage_topology_disallowed;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        let dummy = |n: u8| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([n; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let txs = [dummy(1), dummy(2)];
+        assert!(!submitpackage_topology_disallowed(&txs, false));
+        assert!(submitpackage_topology_disallowed(&txs, true));
+        assert!(!submitpackage_topology_disallowed(&txs[..1], true));
+    }
 
     #[test]
     fn overflow_in_sum_is_overflow_not_missing() {

@@ -44,14 +44,23 @@ before 1.0).
   `missingorspent`. `testmempoolaccept` missing prevouts are `missing-inputs`.
 
 - **Core functional `rpc_packages.py`:** inventory `run`. `submitpackage`
-  is still sequential `accept_tx` (not Core AcceptPackage). Child-with-parents
-  topology, `conflict-in-package`, abort-class blank rows, and in-package
-  maxfeerate on a missing-inputs remainder match the official script.
-  Libre admission rejects nVersion outside 1/2 (`version`) and non-OP_RETURN
-  scripts over 10 000 bytes (`scriptpubkey`). `mempoolminfee` rises when live
+  is still sequential `accept_tx` (not Core AcceptPackage). `conflict-in-package`
+  and related package-error shapes match the official script. Non-OP_RETURN
+  scripts over 10 000 bytes are `scriptpubkey`. `mempoolminfee` rises when live
   weight plus `MAX_STANDARD_TX_WEIGHT` exceeds the cap. The harness maps
   Core `-maxmempool=N` onto a 4× weight budget so `fill_mempool` evicts like
-  Core 5 MB RAM.
+  Core 5 MB RAM. Abort-class `testmempoolaccept` blanking is proxy JSON;
+  child-with-parents topology and in-package maxfeerate overlay are
+  `RBITCOIN_RPC_PACKAGE_DIALECT` (shim). RPC-submit still rejects `"version"`;
+  P2P Libre does not.
+
+- **Libre P2P admits any nVersion:** `check_libre_admission` no longer maps
+  nVersion outside 1/2 to policy `"version"`. `sendrawtransaction` /
+  `testmempoolaccept` / `submitpackage` still reject those txs as RPC-submit
+  only (same layer as `maxfeerate` / `maxburnamount`). Production
+  `testmempoolaccept` package rows stay sequential. Production `submitpackage`
+  admits a 3-gen chain when fees/policy allow; a missing-inputs child stays
+  `bad-txns-inputs-missingorspent`.
 
 - **Q-68:** create.loc window SIMD (`deinterleave_pairs_u8x8`,
   `inclusive_u8x8_times_8`) lives in `rbitcoin-primitives` with a scalar

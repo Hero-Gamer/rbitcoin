@@ -2433,7 +2433,65 @@ fn submitpackage_child_fail_keeps_parent() {
 }
 
 #[test]
-fn submitpackage_multigen_chain_is_topology_disallowed() {
+fn rpc_submit_nonstandard_version_is_version() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (parent_hex, parent) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = Transaction {
+        version: TxVersion::non_standard(0xffff_ffffu32 as i32),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child_hex = hex_encode(serialize(&child));
+    let send = dispatch(&ctx, "sendrawtransaction", vec![json!(child_hex.clone())]).unwrap_err();
+    assert_eq!(send["code"], ERR_VERIFY_REJECTED, "{send}");
+    assert_eq!(send["message"], json!("version"), "{send}");
+    let tma = dispatch(&ctx, "testmempoolaccept", vec![json!([child_hex.clone()])]).unwrap();
+    assert_eq!(tma[0]["reject-reason"], json!("version"), "{tma}");
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, child_hex]), json!(0)],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("version"),
+        "{pkg}"
+    );
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "parent must admit: {pkg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn submitpackage_multigen_chain_is_sequential_admit() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
@@ -2480,21 +2538,27 @@ fn submitpackage_multigen_chain_is_topology_disallowed() {
     };
     let child_hex = hex_encode(serialize(&child));
     let grand_hex = hex_encode(serialize(&grandchild));
-    let e = dispatch(
+    let chain = dispatch(
         &ctx,
         "submitpackage",
         vec![json!([parent_hex.clone(), child_hex.clone(), grand_hex])],
     )
-    .unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
-    assert_eq!(e["message"], "package topology disallowed", "{e}");
-    let ok = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
-    assert_eq!(ok["package_msg"], "success", "{ok}");
+    .unwrap();
+    assert_eq!(chain["package_msg"], "success", "{chain}");
+    assert!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .contains(&parent.compute_txid()),
+        "{chain}"
+    );
+    let pair = dispatch(&ctx, "submitpackage", vec![json!([parent_hex, child_hex])]).unwrap();
+    assert_eq!(pair["package_msg"], "success", "{pair}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn testmempoolaccept_package_missing_inputs_blanks_earlier() {
+fn testmempoolaccept_package_missing_inputs_keeps_earlier_allowed() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
@@ -2535,9 +2599,10 @@ fn testmempoolaccept_package_missing_inputs_blanks_earlier() {
         json!(hash_hex_display(&ok_tx.compute_txid().to_byte_array())),
         "{row}"
     );
-    assert!(
-        row[0].get("allowed").is_none() && row[0].get("package-error").is_none(),
-        "earlier package tx is id-only after missing-inputs abort: {row}"
+    assert_eq!(
+        row[0]["allowed"],
+        json!(true),
+        "sequential testmempoolaccept keeps earlier allowed: {row}"
     );
     assert_eq!(row[1]["allowed"], json!(false), "{row}");
     assert_eq!(row[1]["reject-reason"], json!("missing-inputs"), "{row}");
@@ -2703,8 +2768,8 @@ fn submitpackage_parent_minfee_child_maxfeerate_reports_both() {
     );
     assert_eq!(
         pkg["tx-results"][&child_w]["error"],
-        json!("max feerate exceeded"),
-        "in-package child maxfeerate, not missing-inputs: {pkg}"
+        json!("bad-txns-inputs-missingorspent"),
+        "sequential child is missing-inputs, not in-package maxfeerate: {pkg}"
     );
     assert!(!ctx
         .mempool
