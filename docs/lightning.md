@@ -13,14 +13,13 @@ Fee math: [`mempool-fee-estimation.md`](./mempool-fee-estimation.md).
 | Client | Path | Today |
 |--------|------|--------|
 | **CLN** stock `bcli` | `bitcoin-cli` → Core RPC | Methods exist on unix `{datadir}/rpc.sock`. Wrapper: [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) (`-datadir=` → `--datadir`). Cookie/TCP `rpcauth` is not the product listen. |
-| **ldk-node Esplora** | `--esplora-listen` REST | Tip, `/tx/*` (raw/status/outspend/merkleblock-proof), `/fee-estimates`, `POST /tx` are claimed **done**. Listen **InitError** without `--sh-index`. |
-| **ldk-node Electrum** | `--electrum-listen` TCP | Headers, `transaction.get` / broadcast, `estimatefee` claimed **done**. Same InitError without `--sh-index`. TLS is reverse-proxy only (**Q-63**). |
+| **ldk-node Esplora** | `--esplora-listen` REST | Tip, `/tx/*` (raw/status/outspend/merkleblock-proof), `/fee-estimates`, `POST /tx` work **without** `--sh-index`. Address/scripthash: 503 `scripthash index disabled`. |
+| **ldk-node Electrum** | `--electrum-listen` TCP | Headers, `transaction.get` / broadcast, `estimatefee` work **without** `--sh-index`. `blockchain.scripthash.*`: JSON-RPC `scripthash index disabled`. TLS is reverse-proxy only (**Q-63**). |
 | **ldk-node bitcoind REST** | Core `/rest/block/` | **Out of scope.** |
 | **LND** | bitcoind + ZMQ or BIP157 | **Out of scope.** |
 
-`--sh-index` is **not** required for channel watches (txid / outpoint). It
-**is** required today to **start** Electrum/Esplora (`NodeConfig::validate`).
-That gate is scheduled to drop; SH-only methods then fail closed.
+`--sh-index` is **not** required to start Electrum/Esplora or for channel
+watches (txid / outpoint). SH-only methods fail closed.
 
 ## `--sh-index` API matrix
 
@@ -38,9 +37,6 @@ Fail closed (never empty history/utxo that looks like a new wallet):
 
 - Electrum SH methods: JSON-RPC error, message **`scripthash index disabled`**.
 - Esplora `/address` and `/scripthash`: HTTP **503** and that same phrase (not 404, not `[]`).
-
-Today those listeners never bind without SH, so the fail-closed path is not
-reachable until the InitError is removed.
 
 Tip stamp: tx / outpoint / block routes use **live tip**. Address / scripthash
 routes use the **SH watermark** when the index is on ([`COMPAT.md`](../COMPAT.md)).
@@ -103,10 +99,8 @@ BDK on-chain wallet still needs `/address/*` and `/scripthash/*` → **`--sh-ind
 
 ## Gaps this plan still implements
 
-1. `scripts/lightning/bitcoin-cli` Core argv → `rpc.sock`.
-2. Drop Electrum/Esplora InitError without `--sh-index`; fail-closed SH APIs.
-3. Pins that CLN/LDK JSON/HTTP stay in the shapes above.
-4. Optional `scripts/lightning/run-cln.sh` / `run-ldk.sh` if those binaries exist (skip 0 otherwise).
+1. Optional `scripts/lightning/run-cln.sh` / `run-ldk.sh` if those binaries exist (skip 0 otherwise).
+2. Remaining LDK dialect holes found by those smokes.
 
 ## Not this node
 

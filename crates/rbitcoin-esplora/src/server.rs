@@ -175,7 +175,10 @@ fn asof_hash_from_uri(uri: &axum::http::Uri) -> Result<Option<[u8; 32]>, ()> {
 }
 
 fn path_uses_sh_view(path: &str) -> bool {
-    path.starts_with("/address/") || path.starts_with("/scripthash/")
+    path.starts_with("/address/")
+        || path.starts_with("/scripthash/")
+        || path.starts_with("/addresses/")
+        || path.starts_with("/scripthashes/")
 }
 
 /// COMPAT.md: `?asof=` only on tx status/outspend(s) and address/scripthash
@@ -242,6 +245,13 @@ async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Nex
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
+    if path_uses_sh_view(&path) && !st.query.sh_index_enabled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
+        )
+            .into_response();
+    }
     if asof.is_some() && !path_accepts_asof(&path) {
         return not_found();
     }
@@ -2095,6 +2105,49 @@ mod tests {
         );
 
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn address_without_sh_index_is_503_disabled() {
+        let (dir, q) = temp_query("esplora-sh-off");
+        q.set_sh_index_enabled(false);
+        let (h0, t0) = coinbase(0, Fk::NULL, None);
+        q.connect_block(Height(0), &h0, &[t0]).unwrap();
+        let state = AppState {
+            query: Arc::new(q),
+            network: Network::Regtest,
+            mempool: None,
+            max_body: 1024,
+            tip_tx: None,
+            ws_sem: None,
+            max_ws_message_bytes: 1024,
+            max_track_addresses: 1,
+            max_track_txs: 1,
+            sh_join: Arc::new(Mutex::new(JoinCache::default())),
+            join_header_trusted: false,
+            block_template: None,
+            gbt_cache: Arc::new(Mutex::new(None)),
+        };
+        let app = Router::new()
+            .route("/address/{addr}/utxo", get(handlers::address_utxo))
+            .route("/blocks/tip/height", get(tip_height))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                stamp_chain_view_mw,
+            ))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dummy = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz8z5y2";
+        let (st, body) = http_get(addr, &format!("/address/{dummy}/utxo")).await;
+        assert_eq!(st, 503, "{body}");
+        assert_eq!(body, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
+        let (st, body) = http_get(addr, "/blocks/tip/height").await;
+        assert_eq!(st, 200, "tip must work without SH: {body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

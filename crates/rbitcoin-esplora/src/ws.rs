@@ -587,6 +587,10 @@ async fn add_addresses(
     keyed: bool,
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
 ) -> Result<(), ()> {
+    if !st.query.sh_index_enabled() {
+        send_error(sink, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED).await?;
+        return Ok(());
+    }
     let mut added: HashMap<[u8; 32], String> = HashMap::new();
     for addr in addrs {
         if conn.addresses.len() >= st.max_track_addresses {

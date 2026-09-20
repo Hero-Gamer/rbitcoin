@@ -60,6 +60,9 @@ pub use confirm_stats::{
 
 pub type QueryError = StoreError;
 
+/// Electrum JSON-RPC error / Esplora 503 body when `--sh-index` is off.
+pub const SCRIPTHASH_INDEX_DISABLED: &str = "scripthash index disabled";
+
 /// Result of [`Query::uring_recover`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UringRecover {

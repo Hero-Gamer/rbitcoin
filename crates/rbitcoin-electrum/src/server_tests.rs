@@ -53,6 +53,38 @@ fn config_helpers_and_param_parsers() {
     assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");
     assert!(param_str(&json!([1]), 0).is_err());
 
+    let (dir, q) = tmp_store();
+    q.set_sh_index_enabled(false);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let err = dispatch(
+        "blockchain.scripthash.get_balance",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert_eq!(err, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
+    let ping = dispatch(
+        "server.ping",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    assert_eq!(ping, Value::Null);
+    let _ = std::fs::remove_dir_all(&dir);
+
     let mut sh_bytes = [0u8; 32];
     sh_bytes[0] = 0xaa;
     let sh_hex = hash_hex_rev(&sh_bytes);
