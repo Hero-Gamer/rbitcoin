@@ -33,6 +33,12 @@ before 1.0).
 
 ### Changed
 
+- **Lightning chain backends (`Q-69` Open):** [`docs/lightning.md`](docs/lightning.md)
+  owns CLN `bcli` (five bitcoin-cli calls) and ldk-node Esplora/Electrum.
+  `--sh-index` is still required to **start** those listeners; the matrix of
+  txid/outpoint APIs vs fail-closed scripthash/address APIs is the product
+  once that gate drops.
+
 - **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
   `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
   `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is

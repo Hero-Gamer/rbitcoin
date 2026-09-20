@@ -57,6 +57,7 @@ into `AGENTS.md`.
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
+| [`lightning.md`](./lightning.md) | CLN and LDK as Bitcoin backends: five `bcli` calls, Esplora/Electrum chain sync, `--sh-index` API matrix. Not LND. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 
 ## Root (stay at root)
