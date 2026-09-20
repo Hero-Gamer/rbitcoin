@@ -35,4 +35,3 @@ signet*.log
 
 # cargo mutants output
 mutants.out/
-mutants.out/
