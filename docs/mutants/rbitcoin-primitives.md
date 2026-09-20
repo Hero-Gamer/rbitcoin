@@ -1,4 +1,6 @@
-# rbitcoin-primitives Mutants - Full Specifics Index
+# rbitcoin-primitives mutants (generated)
+
+Owner: [`../../TESTING.md`](../../TESTING.md). Index: [`missed.md`](./missed.md).
 
 Generated from 16m run: 4 missed + 8 timeouts = 12 entries
 

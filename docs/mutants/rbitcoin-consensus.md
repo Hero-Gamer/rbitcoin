@@ -1,4 +1,6 @@
-# rbitcoin-consensus Mutants - Full Specifics Index
+# rbitcoin-consensus mutants (generated)
+
+Owner: [`../../TESTING.md`](../../TESTING.md). Index: [`missed.md`](./missed.md).
 
 Generated from 9h run: 304 missed + 38 timeouts = 342 entries
 
