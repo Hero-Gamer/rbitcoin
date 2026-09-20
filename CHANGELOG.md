@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **create.loc SIMD is SSE2-only:** inclusive `u8 << 3` extracts the low
+  prefix carry with `_mm_cvtsi128_si32(_mm_srli_si128(_, 12))`.
+  `_mm_extract_epi32` is SSE4.1; nightly Miri rejected it (`unavailable
+  target features: sse4.1`). Hosts with SSE4.1 already matched the scalar
+  oracle.
+
 - **sendraw / testmempoolaccept / submitpackage junk hex is `-22`:**
   `decode_tx_hex` matches `decoderawtransaction` (`TX decode failed`).
   Core `testmempoolaccept(['ff00baar'])`. String `rawtxs='ff00baar'` stays
