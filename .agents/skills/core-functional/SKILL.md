@@ -19,6 +19,7 @@ GitHub Actions as the inner loop. Rebuild `rbitcoin-node` after each product
 change.
 
 ```bash
+# Agent VM: keep CARGO_TARGET_DIR if already set (TESTING.md Agent VM disk).
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/dev}"
 cargo build -p rbitcoin-node
 RBITCOIN_NODE="$CARGO_TARGET_DIR/debug/rbitcoin-node" \

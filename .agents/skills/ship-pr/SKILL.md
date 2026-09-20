@@ -17,14 +17,10 @@ Do not copy them here.
 
 ## Session worktree
 
-Reuse one worktree per session. Do not add a worktree per PR. Git objects
-are already shared; `target/dev` and `third_party/bitcoin` are not. Owner
-facts: [`TESTING.md`](../../../TESTING.md) (Agent VM disk).
-
-Export the **shared** silo **before** `nix-shell` (the hook only sets
-`$PWD/target/dev` when unset). Do not cargo in the Cursor checkout
-(`/home/agent/workspace/rearden-bitcoin`). Do not run two cargos into this
-dir at once.
+Reuse one worktree per session. Do not add a worktree per PR. Export
+`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` **before** `nix-shell`. Do not cargo
+in the Cursor checkout. Owner (why, ENOSPC, lock):
+[`TESTING.md`](../../../TESTING.md) (Agent VM disk).
 
 ```bash
 # once per session
@@ -69,14 +65,12 @@ rm -rf /tmp/rbitcoin-*
 git fetch origin --prune
 ```
 
-Do not `cargo clean` `/tmp/rbtc-target/dev` unless that silo is stale. When
-`df` shows a few GiB free, skip `cargo test --workspace` and multi‑GiB
-body tests (`sp_tweaks`); do not create another `target/`.
+Do not `cargo clean` `/tmp/rbtc-target/dev` unless that silo is stale.
+ENOSPC: [`TESTING.md`](../../../TESTING.md) (Agent VM disk).
 
 ## Local tests
 
-From `nix-shell` (CI pins rustc 1.95.0).
-`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export before the shell).
+From `nix-shell` (CI pins rustc 1.95.0). Shared silo as in Session worktree.
 Same **commands** as the required jobs, not the GitHub Actions `env:`
 (leave `CARGO_INCREMENTAL` unset; that is [`ci.yml`](../../../.github/workflows/ci.yml) only).
 When to run which command:

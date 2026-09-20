@@ -102,8 +102,7 @@ when it exists.
 
 One `/tmp/rbtc-<session>` worktree, one topic branch per PR, required checks
 green before the plan is done. Do not merge unless asked. Never commit the
-plan onto `master`. Shared `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export
-before `nix-shell`). Do not cargo in `/home/agent/workspace/rearden-bitcoin`.
+plan onto `master`.
 
 These wreck a session even when the skill was not opened:
 
@@ -119,8 +118,8 @@ These wreck a session even when the skill was not opened:
 - Run clippy `-D warnings` before push. Do not wait out
   `./scripts/coverage.sh` or a host IBD. No empty commits to poke Actions
   (`gh run rerun` instead).
-- Do not `git worktree add` per PR or cargo in the Cursor checkout. Shared
-  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev`. Extra trees fill the 40 G disk.
+- Do not `git worktree add` per PR or cargo in the Cursor checkout.
+  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export before `nix-shell`).
 
 Playbooks:
 

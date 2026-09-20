@@ -256,15 +256,10 @@ A sequence of gates can wrap that body in a `run` function (one call per
 command). Do not paste a second copy into ship-pr; that file lists the
 commands and links here.
 
-### Agent disk
-
-The agent VM is ~40 G. Share **one** session worktree and **one**
-`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export before `nix-shell`). Do not
-add a worktree per PR or cargo in the Cursor checkout — those copy
-`target/dev` (~9 G) and `third_party/bitcoin`. When free space is a few
-GiB, skip `cargo test --workspace` and multi‑GiB body tests; do not create
-another `target/`. Owner: [`TESTING.md`](../TESTING.md) (Agent VM disk).
-Commands: [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+**Agent disk:** one session worktree, `CARGO_TARGET_DIR=/tmp/rbtc-target/dev`
+before `nix-shell`, no cargo in the Cursor checkout. Owner (table, ENOSPC,
+lock): [`TESTING.md`](../TESTING.md) (Agent VM disk). Commands:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
 Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
 Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
