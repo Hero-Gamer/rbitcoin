@@ -248,6 +248,7 @@ impl Query {
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
+        self.apply_prune_inwit_tip()?;
 
         Ok(out)
     }

@@ -2600,7 +2600,7 @@ fn reconstruct_pruned_returns_pruned_not_corrupt() {
         hashes.push(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    q.set_pruneheight(Some(Height(0)));
+    q.set_pruneheight(Some(Height(0))).unwrap();
     assert_eq!(q.pruneheight(), Some(Height(0)));
     let fks0 = q.block_tx_fks(Height(0)).unwrap();
     assert!(
@@ -2639,7 +2639,7 @@ fn reorg_through_pruneheight_refuses() {
     let prev = q.tip_header_fk().unwrap().unwrap();
     let (h1, t1) = coinbase_block(1, prev, Some(hash0));
     q.connect_block(Height(1), &h1, &[t1]).unwrap();
-    q.set_pruneheight(Some(Height(0)));
+    q.set_pruneheight(Some(Height(0))).unwrap();
     q.disconnect_tip().unwrap();
     assert_eq!(q.tip_height(), Some(Height(0)));
     let err = q.disconnect_tip().unwrap_err();
@@ -2648,6 +2648,21 @@ fn reorg_through_pruneheight_refuses() {
         "disconnect at/below pruneheight must be Pruned, got {err:?}"
     );
     assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_watermark_survives_reopen() {
+    let (dir, q) = temp_query("prune-reopen");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert!(q.prune_inwit());
+    let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -319,8 +319,10 @@ pub struct Query {
     confirm_stats: Arc<ConfirmStats>,
     /// Tip height of last in-process io_uring recover (`u32::MAX` = none).
     uring_recover_tip: AtomicU32,
-    /// Highest height whose inwit was dropped (`u32::MAX` = prune off).
+    /// Highest height whose inwit was dropped (`u32::MAX` = none dropped).
     pruneheight: AtomicU32,
+    /// Operator `--prune-inwit` (advertise NETWORK_LIMITED even before a drop).
+    prune_inwit: AtomicBool,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -387,6 +389,7 @@ impl Query {
         } else {
             (None, 0)
         };
+        let (ph, prune_on) = Self::load_pruneheight(&store_path)?;
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
@@ -420,7 +423,8 @@ impl Query {
             disconnect_gen: AtomicU64::new(0),
             confirm_stats: Arc::new(ConfirmStats::default()),
             uring_recover_tip: AtomicU32::new(u32::MAX),
-            pruneheight: AtomicU32::new(u32::MAX),
+            pruneheight: AtomicU32::new(ph),
+            prune_inwit: AtomicBool::new(prune_on),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -439,6 +443,37 @@ impl Query {
         Arc::clone(&self.confirm_stats)
     }
 
+    fn load_pruneheight(store_path: &Path) -> Result<(u32, bool), QueryError> {
+        let path = store_path.join("inwit.prune");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let arr: [u8; 4] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupt("invariant: inwit.prune size"))?;
+                Ok((u32::from_le_bytes(arr), true))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((u32::MAX, false)),
+            Err(e) => Err(StoreError::io(path, e)),
+        }
+    }
+
+    pub fn prune_inwit(&self) -> bool {
+        self.prune_inwit.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn set_prune_inwit(&self, on: bool) -> Result<(), QueryError> {
+        self.prune_inwit.store(on, AtomicOrdering::Release);
+        if on {
+            if self.pruneheight().is_none() {
+                self.persist_pruneheight(u32::MAX)?;
+            }
+        } else {
+            self.set_pruneheight(None)?;
+        }
+        Ok(())
+    }
+
     /// Durable-later watermark: creates at this height and below have no inwit.
     pub fn pruneheight(&self) -> Option<Height> {
         match self.pruneheight.load(AtomicOrdering::Acquire) {
@@ -447,9 +482,45 @@ impl Query {
         }
     }
 
-    pub fn set_pruneheight(&self, height: Option<Height>) {
+    pub fn set_pruneheight(&self, height: Option<Height>) -> Result<(), QueryError> {
         let v = height.map(|h| h.0).unwrap_or(u32::MAX);
         self.pruneheight.store(v, AtomicOrdering::Release);
+        if height.is_some() {
+            self.prune_inwit.store(true, AtomicOrdering::Release);
+            self.persist_pruneheight(v)
+        } else {
+            self.prune_inwit.store(false, AtomicOrdering::Release);
+            self.persist_pruneheight_clear()
+        }
+    }
+
+    fn persist_pruneheight(&self, v: u32) -> Result<(), QueryError> {
+        let path = self.store.path().join("inwit.prune");
+        std::fs::write(&path, v.to_le_bytes()).map_err(|e| StoreError::io(path, e))
+    }
+
+    fn persist_pruneheight_clear(&self) -> Result<(), QueryError> {
+        let path = self.store.path().join("inwit.prune");
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(path, e)),
+        }
+    }
+
+    pub const INWIT_KEEP_HEIGHTS: u32 = 288;
+
+    pub fn apply_prune_inwit_tip(&self) -> Result<(), QueryError> {
+        if !self.prune_inwit() {
+            return Ok(());
+        }
+        let Some(tip) = self.tip_height() else {
+            return Ok(());
+        };
+        if tip.0 <= Self::INWIT_KEEP_HEIGHTS {
+            return Ok(());
+        }
+        self.set_pruneheight(Some(Height(tip.0 - Self::INWIT_KEEP_HEIGHTS)))
     }
 
     /// `false` when this create's connected height is at/below [`Self::pruneheight`].
