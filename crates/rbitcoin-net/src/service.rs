@@ -9,7 +9,7 @@ use crate::peer::{
     FollowSessionMeta, HandshakePolicy, HANDSHAKE_TIMEOUT,
 };
 use crate::peer_dos::{inbound_semaphore, DEFAULT_MAX_INBOUND};
-use crate::peers::{DialRequest, LivePeer, PeerConnType, PeerHub};
+use crate::peers::{DialRequest, DialTarget, LivePeer, PeerConnType, PeerHub};
 use crate::v2::{V2Reader, V2Writer};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
@@ -150,7 +150,7 @@ impl P2PNode {
                 let (ah_tx, ah_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                 let h = tokio::spawn(async move {
                     let _ = run_outbound_session_with_abort(
-                        req.addr, magic, local_addr, hub, peers, ua, live, req.typ, ah_rx, d,
+                        req.target, magic, local_addr, hub, peers, ua, live, req.typ, ah_rx, d,
                     )
                     .await;
                 });
@@ -264,7 +264,7 @@ impl P2PNode {
     /// Call [`Self::sync`] first when far behind (multi-thousand height IBD).
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
         let prepared = prepare_outbound_session(
-            peer,
+            DialTarget::Socket(peer),
             self.magic,
             self.local_addr,
             self.hub.clone(),
@@ -465,7 +465,7 @@ fn default_user_agent() -> String {
 }
 
 struct PreparedOutbound {
-    peer: SocketAddr,
+    peer_hint: SocketAddr,
     magic: Magic,
     hub: Arc<ChainHub>,
     peers: Arc<PeerHub>,
@@ -478,7 +478,7 @@ struct PreparedOutbound {
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn prepare_outbound_session(
-    peer: SocketAddr,
+    peer: DialTarget,
     magic: Magic,
     local: SocketAddr,
     hub: Arc<ChainHub>,
@@ -488,20 +488,24 @@ async fn prepare_outbound_session(
     typ: PeerConnType,
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
-    rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, peer));
-    let stream = dialer.connect(peer).await?;
+    rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
+    let stream = match &peer {
+        DialTarget::Socket(addr) => dialer.connect(*addr).await?,
+        DialTarget::Domain { host, port } => dialer.connect_domain(host, *port).await?,
+    };
+    let peer_hint = peer.peer_hint();
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
     // Core adds CNode before VERSION. Provisional row so getpeerinfo is non-empty
     // during handshake (p2p_handshake self-connect wait_until + assert_debug_log).
-    let provisional = peers.register_connecting(peer, bind, false, typ);
+    let provisional = peers.register_connecting(peer_hint, bind, false, typ);
     let provisional_id = provisional.id;
     let handshake = connect_and_handshake_timed(
         HANDSHAKE_TIMEOUT,
         stream,
         magic,
         local,
-        peer,
+        peer_hint,
         height,
         false,
         &user_agent,
@@ -523,7 +527,7 @@ async fn prepare_outbound_session(
     let wants_addrv2 = provisional.wants_addrv2();
     let wtxid_relay = provisional.wtxid_relay();
     peers.unregister(provisional_id);
-    let sess = peers.register_with_id(provisional_id, peer, bind, &ver, false, typ);
+    let sess = peers.register_with_id(provisional_id, peer_hint, bind, &ver, false, typ);
     sess.mark_handshake_complete();
     if wants_addrv2 {
         sess.set_wants_addrv2();
@@ -541,7 +545,7 @@ async fn prepare_outbound_session(
     let id = sess.id;
     follow_live.fetch_add(1, Ordering::SeqCst);
     Ok(PreparedOutbound {
-        peer,
+        peer_hint,
         magic,
         hub,
         peers,
@@ -556,7 +560,7 @@ async fn prepare_outbound_session(
 async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetError> {
     let tip_rx = prepared.hub.subscribe_tips();
     let meta = FollowSessionMeta {
-        peer: Some(prepared.peer),
+        peer: Some(prepared.peer_hint),
         live: Some(prepared.follow_live),
         session: Some(prepared.sess),
     };
@@ -575,7 +579,7 @@ async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetErro
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn run_outbound_session_with_abort(
-    peer: SocketAddr,
+    peer: DialTarget,
     magic: Magic,
     local: SocketAddr,
     hub: Arc<ChainHub>,
@@ -587,9 +591,15 @@ async fn run_outbound_session_with_abort(
     dialer: crate::socks::Dialer,
 ) -> Result<(), NetError> {
     if typ == PeerConnType::Feeler {
-        let stream = dialer.connect(peer).await?;
+        let peer_addr = match peer {
+            DialTarget::Socket(addr) => addr,
+            DialTarget::Domain { .. } => {
+                return Err(NetError::Encode("feeler requires ip:port target".into()))
+            }
+        };
+        let stream = dialer.connect(peer_addr).await?;
         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
-        return crate::peer::run_feeler(stream, magic, local, peer, height, &user_agent).await;
+        return crate::peer::run_feeler(stream, magic, local, peer_addr, height, &user_agent).await;
     }
     let prepared = prepare_outbound_session(
         peer,

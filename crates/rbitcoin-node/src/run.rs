@@ -393,8 +393,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len()
         );
     } else if config.listen.proxy.is_some() && config.listen.use_seeds {
-        let n = socks_dns_seed_dests(config.network).len();
-        info!("ibd: SOCKS proxy set — skipping local DNS for {n} seed hostnames (use --connect)");
+        let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
+        info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
     } else if config.signet_challenge.is_some()
         && config.listen.connect.is_empty()
         && addrman.is_empty()
@@ -994,6 +994,17 @@ fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
         && config.listen.connect.is_empty()
         && config.signet_challenge.is_none()
         && config.listen.proxy.is_none()
+}
+
+fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: Network) -> usize {
+    let mut n = 0usize;
+    for (host, port) in socks_dns_seed_dests(network) {
+        match peers.dial_domain(host.clone(), port, PeerConnType::AddrFetch) {
+            Ok(()) => n += 1,
+            Err(e) => warn!("seednode dial {host}:{port}: {e}"),
+        }
+    }
+    n
 }
 
 /// One walker per process: SH-warm start and post-IBD `enter_tip_mode` both call this.
@@ -1931,6 +1942,24 @@ mod tests {
             !should_resolve_default_seeds(&cfg),
             "proxy path must not ToSocketAddrs DNS/fixed seeds"
         );
+    }
+
+    #[test]
+    fn proxy_seed_bootstrap_queues_domain_addrfetch() {
+        let peers = rbitcoin_net::PeerHub::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rbitcoin_net::DialRequest>();
+        peers.set_dialer(tx);
+        let n = queue_proxy_seed_addrfetch(&peers, rbitcoin_primitives::Network::Signet);
+        assert_eq!(n, 1, "signet has one default DNS seed");
+        let req = rx.try_recv().expect("queued dial request");
+        assert_eq!(req.typ, PeerConnType::AddrFetch);
+        match req.target {
+            rbitcoin_net::DialTarget::Domain { host, port } => {
+                assert_eq!(host, "seed.signet.bitcoin.sprovoost.nl");
+                assert_eq!(port, 38333);
+            }
+            other => panic!("expected domain target, got {other:?}"),
+        }
     }
 
     fn coinbase_block(

@@ -2,9 +2,11 @@
 
 use crate::error::NetError;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProxyCreds {
     pub(crate) username: Vec<u8>,
     pub(crate) password: Vec<u8>,
@@ -57,20 +59,47 @@ pub enum Dialer {
     Socks {
         proxy: SocketAddr,
         randomize: bool,
+        shared_creds: Option<Arc<(Vec<u8>, Vec<u8>)>>,
     },
 }
 
 impl Dialer {
+    pub fn socks(proxy: SocketAddr, randomize: bool) -> Self {
+        let shared_creds = (!randomize).then(|| {
+            let creds = ProxyCreds::fresh();
+            Arc::new((creds.username, creds.password))
+        });
+        Self::Socks {
+            proxy,
+            randomize,
+            shared_creds,
+        }
+    }
+
+    fn dial_creds(
+        randomize: bool,
+        shared_creds: Option<&Arc<(Vec<u8>, Vec<u8>)>>,
+    ) -> Option<ProxyCreds> {
+        if randomize {
+            Some(ProxyCreds::fresh())
+        } else {
+            shared_creds.map(|c| ProxyCreds {
+                username: c.0.clone(),
+                password: c.1.clone(),
+            })
+        }
+    }
+
     pub async fn connect(&self, target: SocketAddr) -> Result<TcpStream, NetError> {
         match self {
             Dialer::Direct => Ok(TcpStream::connect(target).await?),
-            Dialer::Socks { proxy, randomize } => {
-                if *randomize {
-                    let creds = ProxyCreds::fresh();
-                    socks5_connect(*proxy, target, Some(&creds)).await
-                } else {
-                    socks5_connect(*proxy, target, None).await
-                }
+            Dialer::Socks {
+                proxy,
+                randomize,
+                shared_creds,
+            } => {
+                let creds = Self::dial_creds(*randomize, shared_creds.as_ref());
+                socks5_connect(*proxy, target, creds.as_ref()).await
             }
         }
     }
@@ -82,13 +111,13 @@ impl Dialer {
                 let addr = addrs.next().ok_or(NetError::Protocol("dns lookup empty"))?;
                 self.connect(addr).await
             }
-            Dialer::Socks { proxy, randomize } => {
-                if *randomize {
-                    let creds = ProxyCreds::fresh();
-                    socks5_connect_domain(*proxy, host, port, Some(&creds)).await
-                } else {
-                    socks5_connect_domain(*proxy, host, port, None).await
-                }
+            Dialer::Socks {
+                proxy,
+                randomize,
+                shared_creds,
+            } => {
+                let creds = Self::dial_creds(*randomize, shared_creds.as_ref());
+                socks5_connect_domain(*proxy, host, port, creds.as_ref()).await
             }
         }
     }
@@ -132,11 +161,16 @@ async fn greet(s: &mut TcpStream, creds: Option<&ProxyCreds>) -> Result<(), NetE
             {
                 return Err(NetError::Protocol("socks username/password length"));
             }
-            s.write_all(&[5, 1, 0x02]).await?;
+            s.write_all(&[5, 2, 0x00, 0x02]).await?;
             let mut sel = [0u8; 2];
             s.read_exact(&mut sel).await?;
-            if sel[0] != 5 || sel[1] != 0x02 {
+            if sel[0] != 5 {
                 return Err(NetError::Protocol("socks method rejected"));
+            }
+            match sel[1] {
+                0x00 => return Ok(()),
+                0x02 => {}
+                _ => return Err(NetError::Protocol("socks method rejected")),
             }
             let mut auth = Vec::with_capacity(3 + c.username.len() + c.password.len());
             auth.push(1);
@@ -305,6 +339,37 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn randomize_off_with_creds_still_connects_on_noauth_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let target = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 8333));
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut ver_n = [0u8; 2];
+            s.read_exact(&mut ver_n).await.unwrap();
+            let nmethods = ver_n[1] as usize;
+            let mut methods = vec![0u8; nmethods];
+            s.read_exact(&mut methods).await.unwrap();
+            assert!(
+                methods.contains(&0x00) && methods.contains(&0x02),
+                "{methods:?}"
+            );
+            s.write_all(&[5, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 1);
+            let mut addr = [0u8; 4];
+            s.read_exact(&mut addr).await.unwrap();
+            let mut port = [0u8; 2];
+            s.read_exact(&mut port).await.unwrap();
+            s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        });
+        let d = Dialer::socks(proxy, false);
+        d.connect(target).await.unwrap();
+        server.await.unwrap();
+    }
+
     async fn accept_domain_connect(
         listener: TcpListener,
         want_host: &'static [u8],
@@ -354,25 +419,19 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap();
         let server = tokio::spawn(accept_domain_connect(listener, b"seed.example", port));
-        Dialer::Socks {
-            proxy,
-            randomize: true,
-        }
-        .connect_domain(host, port)
-        .await
-        .unwrap();
+        Dialer::socks(proxy, true)
+            .connect_domain(host, port)
+            .await
+            .unwrap();
         server.await.unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap();
         let server = tokio::spawn(accept_domain_connect(listener, b"seed.example", port));
-        Dialer::Socks {
-            proxy,
-            randomize: false,
-        }
-        .connect_domain(host, port)
-        .await
-        .unwrap();
+        Dialer::socks(proxy, false)
+            .connect_domain(host, port)
+            .await
+            .unwrap();
         server.await.unwrap();
 
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -475,6 +534,29 @@ mod tests {
         assert!(!u1.is_empty() && !u2.is_empty());
     }
 
+    #[tokio::test]
+    async fn randomize_off_reuses_stable_userpass_per_dialer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let target = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 3), 8333));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let creds = serve_userpass_ipv4(&mut s, [198, 51, 100, 3], 8333).await;
+                tx.send(creds).await.unwrap();
+            }
+        });
+        let d = Dialer::socks(proxy, false);
+        d.connect(target).await.unwrap();
+        d.connect(target).await.unwrap();
+        let (u1, p1) = rx.recv().await.unwrap();
+        let (u2, p2) = rx.recv().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(u1, u2, "randomize=0 must keep one SOCKS username");
+        assert_eq!(p1, p2, "randomize=0 must keep one SOCKS password");
+    }
+
     async fn splice_one_socks(
         listener: TcpListener,
         saw: tokio::sync::oneshot::Sender<SocketAddr>,
@@ -549,13 +631,7 @@ mod tests {
         let (saw_tx, saw_rx) = tokio::sync::oneshot::channel();
         let splice = tokio::spawn(splice_one_socks(socks_l, saw_tx));
 
-        let stream = Dialer::Socks {
-            proxy,
-            randomize: true,
-        }
-        .connect(peer_addr)
-        .await
-        .unwrap();
+        let stream = Dialer::socks(proxy, true).connect(peer_addr).await.unwrap();
         assert_eq!(saw_rx.await.unwrap(), peer_addr);
 
         connect_and_handshake_timed(

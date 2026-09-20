@@ -627,13 +627,15 @@ mod tests {
         let cfg = ready_config(["rbitcoin-node", "--proxy", "127.0.0.1:9050"]);
         assert_eq!(cfg.listen.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert!(cfg.listen.onion.is_none());
-        assert_eq!(
-            cfg.listen.dialer(),
+        match cfg.listen.dialer() {
             rbitcoin_net::Dialer::Socks {
-                proxy: "127.0.0.1:9050".parse().unwrap(),
-                randomize: true,
+                proxy, randomize, ..
+            } => {
+                assert_eq!(proxy, "127.0.0.1:9050".parse().unwrap());
+                assert!(randomize);
             }
-        );
+            other => panic!("expected socks dialer, got {other:?}"),
+        }
         assert_eq!(
             NodeConfig::default().listen.dialer(),
             rbitcoin_net::Dialer::Direct

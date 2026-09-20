@@ -123,10 +123,34 @@ pub(crate) fn trying_connection_log(typ: PeerConnType, addr: impl std::fmt::Disp
     format!("p2p: trying connection ({}) to {addr}", typ.as_str())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialTarget {
+    Socket(SocketAddr),
+    Domain { host: String, port: u16 },
+}
+
+impl DialTarget {
+    pub fn peer_hint(&self) -> SocketAddr {
+        match self {
+            Self::Socket(addr) => *addr,
+            Self::Domain { port, .. } => SocketAddr::from(([0, 0, 0, 0], *port)),
+        }
+    }
+}
+
+impl std::fmt::Display for DialTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(addr) => write!(f, "{addr}"),
+            Self::Domain { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
 /// Request that the node dial `addr` as `typ`.
 #[derive(Clone, Debug)]
 pub struct DialRequest {
-    pub addr: SocketAddr,
+    pub target: DialTarget,
     pub typ: PeerConnType,
 }
 
@@ -1980,8 +2004,29 @@ impl PeerHub {
     pub fn dial(&self, addr: SocketAddr, typ: PeerConnType) -> Result<(), String> {
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
-        tx.send(DialRequest { addr, typ })
-            .map_err(|_| "dialer closed".to_string())
+        tx.send(DialRequest {
+            target: DialTarget::Socket(addr),
+            typ,
+        })
+        .map_err(|_| "dialer closed".to_string())
+    }
+
+    pub fn dial_domain(
+        &self,
+        host: impl Into<String>,
+        port: u16,
+        typ: PeerConnType,
+    ) -> Result<(), String> {
+        let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = g.as_ref().ok_or("no dialer attached")?;
+        tx.send(DialRequest {
+            target: DialTarget::Domain {
+                host: host.into(),
+                port,
+            },
+            typ,
+        })
+        .map_err(|_| "dialer closed".to_string())
     }
 }
 

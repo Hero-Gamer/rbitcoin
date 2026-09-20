@@ -118,10 +118,7 @@ impl ListenOpts {
     pub fn dialer(&self) -> rbitcoin_net::Dialer {
         match self.proxy {
             None => rbitcoin_net::Dialer::Direct,
-            Some(proxy) => rbitcoin_net::Dialer::Socks {
-                proxy,
-                randomize: self.proxy_randomize,
-            },
+            Some(proxy) => rbitcoin_net::Dialer::socks(proxy, self.proxy_randomize),
         }
     }
 }
