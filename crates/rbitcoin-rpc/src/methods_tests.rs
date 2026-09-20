@@ -480,13 +480,11 @@ fn cln_bcli_rpc_shapes() {
     let hex = raw.as_str().expect("verbosity 0 hex");
     assert!(hex.len() > 160 && hex.len() % 2 == 0, "{hex}");
 
-    let missing = dispatch(
-        &ctx,
-        "gettxout",
-        vec![json!("00".repeat(32)), json!(0)],
-    )
-    .unwrap();
-    assert!(missing.is_null(), "unknown outpoint must be JSON null: {missing}");
+    let missing = dispatch(&ctx, "gettxout", vec![json!("00".repeat(32)), json!(0)]).unwrap();
+    assert!(
+        missing.is_null(),
+        "unknown outpoint must be JSON null: {missing}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
