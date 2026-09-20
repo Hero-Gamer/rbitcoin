@@ -12,7 +12,7 @@ Fee math: [`mempool-fee-estimation.md`](./mempool-fee-estimation.md).
 
 | Client | Path | Today |
 |--------|------|--------|
-| **CLN** stock `bcli` | `bitcoin-cli` → Core RPC | Methods exist on unix `{datadir}/rpc.sock`. **No** Core `bitcoin-cli` argv wrapper yet. Cookie/TCP `rpcauth` is not the product listen. |
+| **CLN** stock `bcli` | `bitcoin-cli` → Core RPC | Methods exist on unix `{datadir}/rpc.sock`. Wrapper: [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) (`-datadir=` → `--datadir`). Cookie/TCP `rpcauth` is not the product listen. |
 | **ldk-node Esplora** | `--esplora-listen` REST | Tip, `/tx/*` (raw/status/outspend/merkleblock-proof), `/fee-estimates`, `POST /tx` are claimed **done**. Listen **InitError** without `--sh-index`. |
 | **ldk-node Electrum** | `--electrum-listen` TCP | Headers, `transaction.get` / broadcast, `estimatefee` claimed **done**. Same InitError without `--sh-index`. TLS is reverse-proxy only (**Q-63**). |
 | **ldk-node bitcoind REST** | Core `/rest/block/` | **Out of scope.** |
@@ -56,7 +56,7 @@ lightningd --network=regtest \
   --bitcoin-datadir=/path/to/rbitcoin/datadir
 ```
 
-Wrapper (not yet in tree) talks to `{datadir}/rpc.sock` only. No `.cookie`.
+Wrapper [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) talks to `{datadir}/rpc.sock` only. No `.cookie`.
 
 | Plugin | Node RPC | Spike |
 |--------|----------|--------|

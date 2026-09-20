@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Core bitcoin-cli argv → rbitcoin-cli --datadir (unix {datadir}/rpc.sock).
+# CLN stock bcli shells out here. Ignores -rpcconnect/-rpcport/-rpcuser/-rpcpassword.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+if [[ -n "${RBITCOIN_CLI:-}" ]]; then
+  CLI="$RBITCOIN_CLI"
+elif [[ -x "$ROOT/target/dev/debug/rbitcoin-cli" ]]; then
+  CLI="$ROOT/target/dev/debug/rbitcoin-cli"
+elif command -v rbitcoin-cli >/dev/null 2>&1; then
+  CLI="$(command -v rbitcoin-cli)"
+else
+  echo "bitcoin-cli: rbitcoin-cli not found (set RBITCOIN_CLI)" >&2
+  exit 2
+fi
+
+datadir=""
+forward=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -datadir=*|--datadir=*)
+      datadir="${1#*=}"
+      shift
+      ;;
+    -datadir|--datadir)
+      datadir="$2"
+      shift 2
+      ;;
+    -rpcconnect=*|-rpcport=*|-rpcuser=*|-rpcpassword=*|-rpcwaittimeout=*|-rpcclienttimeout=*)
+      shift
+      ;;
+    -rpcconnect|-rpcport|-rpcuser|-rpcpassword|-rpcwaittimeout|-rpcclienttimeout)
+      shift 2
+      ;;
+    -rpcwait|-named|-stdinrpcpass)
+      shift
+      ;;
+    --)
+      shift
+      forward+=("$@")
+      break
+      ;;
+    *)
+      forward+=("$1")
+      shift
+      ;;
+  esac
+done
+
+args=()
+if [[ -n "$datadir" ]]; then
+  args+=(--datadir "$datadir")
+fi
+exec "$CLI" "${args[@]}" "${forward[@]}"
