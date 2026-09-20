@@ -58,22 +58,6 @@ pub fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn sigop_count_covers_pushdata_and_truncation() {
-        // 21 -= : [4c,2,ac] original 0, mutant i-=1 => 1
-        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac], true), 0);
-        // 21 *= : [4c,1,ac] original 0, mutant i*=1 => 1
-        assert_eq!(script_sigop_count(&[0x4c, 1, 0xac], true), 0);
-        // 28 *= : [4d,1,0,ac] original 0, mutant i*=2 => 1
-        assert_eq!(script_sigop_count(&[0x4d, 1, 0, 0xac], true), 0);
-        // 41 > vs >= vs == : truncated must be 0
-        assert_eq!(script_sigop_count(&[0x02, 0x00], true), 0);
-        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac, 0xac], true), 0);
-        // extra long killer for 21 -= if guard changes
-        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac, 0xac, 0xac], true), 1); // PUSHDATA1 2 [ac,ac] + ac => 1
-    }
-
     use super::*;
 
     #[test]
@@ -113,6 +97,12 @@ mod tests {
             script_sigop_count(&[0x4e, 0x01, 0x00, 0x00, 0x00, 0xcd, 0xac], false),
             1
         );
+        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac], true), 0);
+        assert_eq!(script_sigop_count(&[0x4c, 1, 0xac], true), 0);
+        assert_eq!(script_sigop_count(&[0x4d, 1, 0, 0xac], true), 0);
+        assert_eq!(script_sigop_count(&[0x02, 0x00], true), 0);
+        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac, 0xac], true), 0);
+        assert_eq!(script_sigop_count(&[0x4c, 2, 0xac, 0xac, 0xac], true), 1);
     }
 
     #[cfg(miri)]
