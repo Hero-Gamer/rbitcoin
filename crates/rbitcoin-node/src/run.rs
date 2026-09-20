@@ -393,6 +393,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .map_err(|e| NodeError::Init(format!("i2p STREAM FORWARD {port}: {e}")))?;
         info!("i2p STREAM FORWARD to {}", node.local_addr);
     }
+    if let Some(sam) = i2p_sam.as_ref() {
+        rbitcoin_net::install_i2p_dialer(sam.dialer());
+    }
     let _i2p_sam = i2p_sam;
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
@@ -596,7 +599,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         const FOLLOW_CONNECT_SECS: u64 = 8;
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
-                if let Err(e) = node.peers.dial(*peer, PeerConnType::OutboundFullRelay) {
+                if let Err(e) = node.peers.dial_net(*peer, PeerConnType::OutboundFullRelay) {
                     warn!("node: follow dial {peer}: {e}");
                 }
             }
@@ -616,7 +619,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     }
                     result = tokio::time::timeout(
                         Duration::from_secs(FOLLOW_CONNECT_SECS),
-                        node.follow_from(*peer),
+                        node.follow_from_net(*peer),
                     ) => {
                         match result {
                             Ok(Ok(())) => {
@@ -946,7 +949,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         _ = shutdown.cancelled() => break,
                         result = tokio::time::timeout(
                             Duration::from_secs(8),
-                            node.follow_from(peer),
+                            node.follow_from_net(rbitcoin_net::NetAddr::Ip(peer)),
                         ) => {
                             match result {
                                 Ok(Ok(())) => {
@@ -965,7 +968,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     let retry_cfg =
                         catch_up_retry_config(std::sync::Arc::clone(&shared_peers), node.dialer());
                     let cancel = Some(Arc::clone(&shutdown.flag));
-                    let retry_peers = [peer];
+                    let retry_peers = [rbitcoin_net::NetAddr::Ip(peer)];
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
@@ -1195,7 +1198,7 @@ fn apply_startup_index_mode(
 
 async fn run_ibd_or_skip(
     node: &P2PNode,
-    ibd_targets: &[SocketAddr],
+    ibd_targets: &[rbitcoin_net::NetAddr],
     max_out: usize,
     shared_peers: &std::sync::Arc<std::sync::Mutex<AddrMan>>,
     addrman: &mut AddrMan,
@@ -1707,15 +1710,14 @@ pub(crate) fn follow_dial_targets(
     book: &AddrMan,
     max: usize,
     occupied: &[SocketAddr],
-) -> Vec<SocketAddr> {
+) -> Vec<rbitcoin_net::NetAddr> {
     if !connect.is_empty() {
-        connect
-            .iter()
-            .copied()
-            .filter_map(rbitcoin_net::NetAddr::socket_addr)
-            .collect()
+        connect.to_vec()
     } else {
         book.take_outbound_occupied(max, occupied)
+            .into_iter()
+            .map(rbitcoin_net::NetAddr::Ip)
+            .collect()
     }
 }
 
@@ -1815,11 +1817,25 @@ mod tests {
             8333,
         ))];
         let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
-        let want = vec![SocketAddr::new(
+        let want = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8333,
-        )];
+        ))];
         assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
+    }
+
+    #[test]
+    fn follow_dial_targets_keeps_i2p_connect() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let mut am = AddrMan::new();
+        am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 1)), 8333));
+        let i2p = rbitcoin_net::NetAddr::I2p {
+            dest: [7u8; 32],
+            port: 8333,
+        };
+        let connect = vec![i2p];
+        let got = follow_dial_targets(&connect, &am, 8, &[]);
+        assert_eq!(got, vec![i2p]);
     }
 
     #[test]
@@ -1832,7 +1848,7 @@ mod tests {
         am.add(other);
         let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
         let got = follow_dial_targets(&[], &am, 1, &occupied);
-        assert_eq!(got, vec![other]);
+        assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
     }
 
     #[test]

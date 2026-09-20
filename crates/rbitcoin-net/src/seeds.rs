@@ -553,8 +553,12 @@ impl AddrMan {
 
     /// Successful BIP324 handshake.
     pub fn note_connected(&mut self, addr: SocketAddr) {
-        self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
+        self.note_connected_addr(NetAddr::Ip(addr));
+    }
+
+    pub fn note_connected_addr(&mut self, addr: NetAddr) {
+        self.add_addr(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
             f.remove(PeerFlags::INCOMPATIBLE);
@@ -570,6 +574,10 @@ impl AddrMan {
         self.last_attempt.insert(NetAddr::Ip(addr), when);
     }
 
+    pub fn note_attempt_addr(&mut self, addr: NetAddr) {
+        self.last_attempt.insert(addr, Instant::now());
+    }
+
     fn recently_attempted(&self, addr: SocketAddr, now: Instant) -> bool {
         self.last_attempt
             .get(&NetAddr::Ip(addr))
@@ -578,8 +586,12 @@ impl AddrMan {
 
     /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
     pub fn note_connect_failed(&mut self, addr: SocketAddr, incompatible: bool) {
-        self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::Ip(addr)) {
+        self.note_connect_failed_addr(NetAddr::Ip(addr), incompatible);
+    }
+
+    pub fn note_connect_failed_addr(&mut self, addr: NetAddr, incompatible: bool) {
+        self.add_addr(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
             if incompatible {
                 f.insert(PeerFlags::INCOMPATIBLE);
                 f.remove(PeerFlags::FAILED_LAST_CONNECT);

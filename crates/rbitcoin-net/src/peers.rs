@@ -2019,6 +2019,15 @@ impl PeerHub {
         self.dial(addr, typ)
     }
 
+    pub fn dial_net(&self, addr: crate::NetAddr, typ: PeerConnType) -> Result<(), String> {
+        match addr {
+            crate::NetAddr::Ip(ip) => self.dial(ip, typ),
+            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => {
+                self.dial_domain(addr.host_str(), addr.port(), typ)
+            }
+        }
+    }
+
     /// Outbound full-relay sessions eligible for stale-tip slot rotation.
     /// Empty when this hub is `noban` (functional keep-alive).
     pub fn outbound_full_relay_ids(&self) -> Vec<u64> {

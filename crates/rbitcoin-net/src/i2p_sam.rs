@@ -14,6 +14,12 @@ pub struct I2pSam {
     _forward: Option<TcpStream>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2pDialer {
+    sam_addr: SocketAddr,
+    session_id: String,
+}
+
 impl I2pSam {
     pub async fn connect(sam_addr: SocketAddr) -> Result<Self, NetError> {
         Self::connect_session(sam_addr, None).await
@@ -88,23 +94,14 @@ impl I2pSam {
     }
 
     pub async fn stream_connect(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
-        let mut s = TcpStream::connect(self.sam_addr)
-            .await
-            .map_err(|e| NetError::Encode(format!("i2p sam stream connect: {e}")))?;
-        hello(&mut s).await?;
-        write_line(
-            &mut s,
-            &format!(
-                "STREAM CONNECT ID={} DESTINATION={}",
-                self.session_id, dest_b32
-            ),
-        )
-        .await?;
-        let reply = read_line(&mut s).await?;
-        if !reply.to_ascii_uppercase().contains("RESULT=OK") {
-            return Err(NetError::Encode(format!("i2p sam stream: {reply}")));
+        self.dialer().stream_connect(dest_b32).await
+    }
+
+    pub fn dialer(&self) -> I2pDialer {
+        I2pDialer {
+            sam_addr: self.sam_addr,
+            session_id: self.session_id.clone(),
         }
-        Ok(s)
     }
 
     pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
@@ -123,6 +120,28 @@ impl I2pSam {
         }
         self._forward = Some(s);
         Ok(())
+    }
+}
+
+impl I2pDialer {
+    pub async fn stream_connect(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
+        let mut s = TcpStream::connect(self.sam_addr)
+            .await
+            .map_err(|e| NetError::Encode(format!("i2p sam stream connect: {e}")))?;
+        hello(&mut s).await?;
+        write_line(
+            &mut s,
+            &format!(
+                "STREAM CONNECT ID={} DESTINATION={}",
+                self.session_id, dest_b32
+            ),
+        )
+        .await?;
+        let reply = read_line(&mut s).await?;
+        if !reply.to_ascii_uppercase().contains("RESULT=OK") {
+            return Err(NetError::Encode(format!("i2p sam stream: {reply}")));
+        }
+        Ok(s)
     }
 }
 

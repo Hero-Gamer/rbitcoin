@@ -285,14 +285,14 @@ impl P2PNode {
     /// IBD / catch-up: multi-peer densify across `peers`.
     ///
     /// This is the only history-sync path. Tip-follow is [`Self::follow_from`].
-    pub async fn sync(&self, peers: &[SocketAddr], cfg: IbdConfig) -> Result<u32, NetError> {
+    pub async fn sync(&self, peers: &[crate::NetAddr], cfg: IbdConfig) -> Result<u32, NetError> {
         self.sync_cancellable(peers, cfg, None).await
     }
 
     /// IBD with optional cooperative cancel flag (SIGINT / SIGTERM path).
     pub async fn sync_cancellable(
         &self,
-        peers: &[SocketAddr],
+        peers: &[crate::NetAddr],
         cfg: IbdConfig,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<u32, NetError> {
@@ -308,7 +308,7 @@ impl P2PNode {
     }
 
     /// IBD with default window (1024 concurrent getdata, 16/peer).
-    pub async fn sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
+    pub async fn sync_default(&self, peers: &[crate::NetAddr]) -> Result<u32, NetError> {
         self.sync(peers, IbdConfig::default()).await
     }
 
@@ -320,8 +320,19 @@ impl P2PNode {
     /// any gap (e.g. blocks mined during SH materialize) is filled actively.
     /// Call [`Self::sync`] first when far behind (multi-thousand height IBD).
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
+        self.follow_from_net(crate::NetAddr::Ip(peer)).await
+    }
+
+    pub async fn follow_from_net(&mut self, peer: crate::NetAddr) -> Result<(), NetError> {
+        let target = match peer {
+            crate::NetAddr::Ip(addr) => DialTarget::Socket(addr),
+            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => DialTarget::Domain {
+                host: peer.host_str(),
+                port: peer.port(),
+            },
+        };
         let prepared = prepare_outbound_session(
-            DialTarget::Socket(peer),
+            target,
             self.magic,
             self.local_addr,
             self.hub.clone(),

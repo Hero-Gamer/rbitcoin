@@ -153,14 +153,17 @@ pub(crate) fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usi
 
 pub(crate) async fn spawn_peer(
     id: usize,
-    addr: SocketAddr,
+    addr: crate::NetAddr,
     magic: Magic,
     local: SocketAddr,
     tip_h: Option<u32>,
     sinks: PeerEventSinks,
     dialer: crate::socks::Dialer,
 ) -> Result<PeerSlot, NetError> {
-    let stream = dialer.connect_net(crate::NetAddr::Ip(addr)).await?;
+    let stream = dialer.connect_net(addr).await?;
+    let version_socket = addr
+        .socket_addr()
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], addr.port())));
     let ua = rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str])
         .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
     let (ver, reader, writer, _wire, _tcp_shutdown) = connect_and_handshake_timed(
@@ -168,7 +171,7 @@ pub(crate) async fn spawn_peer(
         stream,
         magic,
         local,
-        addr,
+        version_socket,
         tip_h.map(|h| h as i32).unwrap_or(0),
         false,
         &ua,
@@ -422,7 +425,7 @@ pub(crate) async fn spawn_peer(
 
     Ok(PeerSlot {
         id,
-        addr,
+        addr: version_socket,
         cmd_tx,
         in_flight: HashSet::new(),
         peer_height,

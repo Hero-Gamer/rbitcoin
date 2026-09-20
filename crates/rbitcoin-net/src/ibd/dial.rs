@@ -223,8 +223,8 @@ fn classify_dial_err(e: &NetError) -> DialFailKind {
 /// Result of a dial batch: live slots + failures for the peer book.
 pub(crate) struct DialBatchResult {
     pub slots: Vec<PeerSlot>,
-    pub failed: Vec<(SocketAddr, DialFailKind)>,
-    pub attempted: Vec<SocketAddr>,
+    pub failed: Vec<(crate::NetAddr, DialFailKind)>,
+    pub attempted: Vec<crate::NetAddr>,
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -235,7 +235,7 @@ pub(crate) async fn dial_batch(
     book: &AddrMan,
     next_id: &AtomicUsize,
     count: usize,
-    mut already: HashSet<SocketAddr>,
+    mut already: HashSet<crate::NetAddr>,
     occupied: &[SocketAddr],
     magic: Magic,
     local_addr: SocketAddr,
@@ -260,7 +260,7 @@ pub(crate) async fn dial_batch(
             .unwrap_or(false)
     };
 
-    let candidates = book.take_dial_candidates(count, &already, occupied);
+    let candidates = book.take_dial_candidates_net(count, &already, occupied);
     out.attempted = candidates.clone();
     let mut handles = Vec::new();
     for addr in candidates {
@@ -333,13 +333,13 @@ pub(crate) fn redial_want(alive: usize, target: usize) -> usize {
 /// Apply dial successes / failures to the peer book.
 pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
     for &addr in &result.attempted {
-        book.note_attempt(addr);
+        book.note_attempt_addr(addr);
     }
     for s in &result.slots {
         book.note_connected(s.addr);
     }
     for &(addr, kind) in &result.failed {
-        book.note_connect_failed(addr, kind == DialFailKind::Incompatible);
+        book.note_connect_failed_addr(addr, kind == DialFailKind::Incompatible);
     }
 }
 
@@ -441,11 +441,12 @@ pub(crate) fn dial_blocked_addrs(
     slots: &[PeerSlot],
     cooldown: &HashMap<SocketAddr, Instant>,
     now: Instant,
-) -> HashSet<SocketAddr> {
-    let mut blocked: HashSet<SocketAddr> = slots.iter().map(|s| s.addr).collect();
+) -> HashSet<crate::NetAddr> {
+    let mut blocked: HashSet<crate::NetAddr> =
+        slots.iter().map(|s| crate::NetAddr::Ip(s.addr)).collect();
     for (&addr, &until) in cooldown {
         if until > now {
-            blocked.insert(addr);
+            blocked.insert(crate::NetAddr::Ip(addr));
         }
     }
     blocked
@@ -700,9 +701,9 @@ mod tests {
         cooldown.insert(addr(2), now + Duration::from_secs(60));
         cooldown.insert(addr(3), now - Duration::from_secs(1)); // expired
         let blocked = dial_blocked_addrs(&[s], &cooldown, now);
-        assert!(blocked.contains(&addr(1)));
-        assert!(blocked.contains(&addr(2)));
-        assert!(!blocked.contains(&addr(3)));
+        assert!(blocked.contains(&crate::NetAddr::Ip(addr(1))));
+        assert!(blocked.contains(&crate::NetAddr::Ip(addr(2))));
+        assert!(!blocked.contains(&crate::NetAddr::Ip(addr(3))));
 
         expire_addr_cooldown(&mut cooldown, now);
         assert!(cooldown.contains_key(&addr(2)));
@@ -724,7 +725,7 @@ mod tests {
         assert_eq!(book.flags(&lemon).dial_tier(), 2);
         assert!(cooldown.contains_key(&lemon));
         let blocked = dial_blocked_addrs(&[], &cooldown, now);
-        assert!(blocked.contains(&lemon));
+        assert!(blocked.contains(&crate::NetAddr::Ip(lemon)));
 
         let good = addr(5);
         book.note_connected(good);
@@ -903,10 +904,14 @@ mod tests {
         let result = DialBatchResult {
             slots: vec![slot],
             failed: vec![
-                (bad, DialFailKind::Network),
-                (inc, DialFailKind::Incompatible),
+                (crate::NetAddr::Ip(bad), DialFailKind::Network),
+                (crate::NetAddr::Ip(inc), DialFailKind::Incompatible),
             ],
-            attempted: vec![good, bad, inc],
+            attempted: vec![
+                crate::NetAddr::Ip(good),
+                crate::NetAddr::Ip(bad),
+                crate::NetAddr::Ip(inc),
+            ],
         };
         apply_dial_result(&mut book, &result);
         assert!(book.flags(&good).has_connected());

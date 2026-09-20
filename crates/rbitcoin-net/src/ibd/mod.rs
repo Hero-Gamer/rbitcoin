@@ -208,14 +208,16 @@ struct PeerBookSession {
 impl PeerBookSession {
     fn new(
         shared: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
-        seed_peers: &[SocketAddr],
+        seed_peers: &[crate::NetAddr],
     ) -> Self {
         let mut book = if let Some(ref s) = shared {
             s.lock().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
             crate::seeds::AddrMan::new()
         };
-        book.inject(seed_peers.iter().copied());
+        for &addr in seed_peers {
+            book.add_addr(addr);
+        }
         Self { book, shared }
     }
 
@@ -247,7 +249,7 @@ pub async fn ibd_cancellable(
     hub: Arc<ChainHub>,
     magic: Magic,
     local_addr: SocketAddr,
-    peers: &[SocketAddr],
+    peers: &[crate::NetAddr],
     cfg: IbdConfig,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<u32, NetError> {
@@ -672,7 +674,7 @@ pub async fn ibd_cancellable(
                         let mut n = 0usize;
                         for s in result.slots {
                             // Race: same addr may have connected on another path.
-                            if blocked.contains(&s.addr)
+                            if blocked.contains(&crate::NetAddr::Ip(s.addr))
                                 || st.slots.iter().any(|x| x.addr == s.addr)
                             {
                                 warn!(
@@ -1104,7 +1106,10 @@ mod peer_book_and_config_tests {
     fn peer_book_session_injects_seeds_and_flushes_on_drop() {
         let shared = Arc::new(Mutex::new(AddrMan::new()));
         {
-            let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[sa(1), sa(2)]);
+            let mut sess = PeerBookSession::new(
+                Some(Arc::clone(&shared)),
+                &[crate::NetAddr::Ip(sa(1)), crate::NetAddr::Ip(sa(2))],
+            );
             assert!(sess.book().entry(&sa(1)).is_some());
             assert!(sess.book().entry(&sa(2)).is_some());
             // Mutate book via book_mut.
@@ -1119,7 +1124,7 @@ mod peer_book_and_config_tests {
         assert!(shared.lock().unwrap().entry(&sa(1)).is_some());
 
         // No shared book — seeds only, flush is a no-op.
-        let sess2 = PeerBookSession::new(None, &[sa(9)]);
+        let sess2 = PeerBookSession::new(None, &[crate::NetAddr::Ip(sa(9))]);
         assert!(sess2.book().entry(&sa(9)).is_some());
         sess2.flush();
     }
