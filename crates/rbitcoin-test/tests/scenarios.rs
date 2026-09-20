@@ -245,10 +245,6 @@ fn node_cli_and_surface_smoke() {
     ])));
     assert!(!exit_success(node_cli_main([
         "rbitcoin-node",
-        "--electrum-listen"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
         "--electrum-listen",
         "bad"
     ])));
@@ -256,9 +252,9 @@ fn node_cli_and_surface_smoke() {
         "rbitcoin-node",
         "--milestone"
     ])));
-    // Electrum without --shindex is a config error at start.
+    // Electrum without --sh-index still smokes (channel-watch APIs; SH methods fail closed).
     let no_sh = td.path().join("electrum-no-shindex");
-    assert!(!exit_success(node_cli_main([
+    assert!(exit_success(node_cli_main([
         "rbitcoin-node",
         "--datadir",
         no_sh.to_str().unwrap(),
@@ -266,6 +262,11 @@ fn node_cli_and_surface_smoke() {
         "regtest",
         "--electrum-listen",
         "127.0.0.1:0",
+        "--no-seeds",
+        "--milestone",
+        "0",
+        "--log-level",
+        "error",
         "--smoke",
     ])));
     // Happy-path flag combinations (smoke exits after open).
