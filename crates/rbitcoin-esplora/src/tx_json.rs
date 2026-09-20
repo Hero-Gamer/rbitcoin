@@ -146,7 +146,13 @@ pub fn history_items_to_tx_json(
 
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
 pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
-    let wire = query.reconstruct_tx(tx_fk)?;
+    let wire = match query.reconstruct_tx(tx_fk) {
+        Ok(w) => w,
+        Err(rbitcoin_store::StoreError::Pruned { .. }) => {
+            return build_tx_json_pruned(query, tx_fk, network);
+        }
+        Err(e) => return Err(e),
+    };
     let status = tx_status_json(query, tx_fk)?;
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
     let stored_txid = query
@@ -164,6 +170,26 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
         None,
         None,
     )
+}
+
+fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
+    let tx = query.store().get_tx(tx_fk)?;
+    let (_meta, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
+    let txid = query.store().txs.body_txid(tx_fk).unwrap_or(tx.txid);
+    let status = tx_status_json(query, tx_fk)?;
+    let vout: Vec<Value> = outs
+        .iter()
+        .map(|o| vout_fields(&o.script, o.value, network))
+        .collect();
+    Ok(json!({
+        "txid": block_hash_hex(&txid),
+        "version": tx.version,
+        "locktime": tx.locktime,
+        "vin": [],
+        "vout": vout,
+        "status": status,
+        "pruned": true,
+    }))
 }
 
 /// Esplora tx JSON from a mempool wire body (not in Class A).
