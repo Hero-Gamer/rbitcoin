@@ -35,6 +35,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--max-inbound` / conf omitted |
 | `RBITCOIN_URING_DRAIN_HARD_SECS` | 120 | `drain_all` zero-CQE abort (Linux/pool/IOCP). Raise if completions are slow but still arriving |
 | `RBITCOIN_RPC_WAIT_TIP_IDLE` | off | `getblockcount` / `getbestblockhash` / `wait_height` wait until the tip-accept lane is empty. Default (unset) waits only for the job that was running when the RPC arrived. The Core-functional bitcoind shim sets `1` so `sync_blocks` stays deterministic. **Not** a production operator knob |
+| `RBITCOIN_RPC_PACKAGE_DIALECT` | off | `submitpackage` uses Core `IsChildWithParents` (`-25 package topology disallowed`) and remaps a missing-inputs remainder whose in-package prevouts exceed `maxfeerate` to `"max feerate exceeded"`. Default (unset) is sequential admit; that child stays `bad-txns-inputs-missingorspent`. The Core-functional bitcoind shim sets `1`. **Not** a production operator knob |
 
 ## Hardcoded (no env)
 
