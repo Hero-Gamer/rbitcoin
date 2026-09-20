@@ -136,6 +136,15 @@ impl DialTarget {
             Self::Domain { port, .. } => SocketAddr::from(([0, 0, 0, 0], *port)),
         }
     }
+
+    pub fn net_addr(&self) -> crate::NetAddr {
+        match self {
+            Self::Socket(addr) => crate::NetAddr::Ip(*addr),
+            Self::Domain { host, port } => format!("{host}:{port}")
+                .parse()
+                .unwrap_or(crate::NetAddr::Ip(self.peer_hint())),
+        }
+    }
 }
 
 impl std::fmt::Display for DialTarget {
@@ -177,6 +186,7 @@ impl PendingSendCmpct {
 pub struct LivePeer {
     pub id: u64,
     pub addr: SocketAddr,
+    pub net: crate::NetAddr,
     pub addrbind: SocketAddr,
     pub subver: String,
     pub inbound: bool,
@@ -911,6 +921,7 @@ impl LivePeer {
         PeerInfo {
             id: self.id,
             addr: self.addr,
+            net: self.net,
             addrbind: self.addrbind,
             subver: self.subver.clone(),
             inbound: self.inbound,
@@ -995,6 +1006,7 @@ fn acct_bytes(cmd: &str, payload: u64) -> u64 {
 pub struct PeerInfo {
     pub id: u64,
     pub addr: SocketAddr,
+    pub net: crate::NetAddr,
     pub addrbind: SocketAddr,
     pub subver: String,
     pub inbound: bool,
@@ -1042,7 +1054,7 @@ pub struct PeerInfo {
 pub struct PeerHub {
     next_id: AtomicU64,
     live: RwLock<HashMap<u64, Arc<LivePeer>>>,
-    added: Mutex<HashSet<SocketAddr>>,
+    added: Mutex<HashSet<crate::NetAddr>>,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
     /// Peers we asked to send us compact (BIP152 HB, max 3, prefer outbound).
     hb_selected: Mutex<Vec<u64>>,
@@ -1601,6 +1613,17 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
+        self.register_connecting_net(addr, crate::NetAddr::Ip(addr), addrbind, inbound, conn_type)
+    }
+
+    pub fn register_connecting_net(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        net: crate::NetAddr,
+        addrbind: SocketAddr,
+        inbound: bool,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
         use bitcoin::p2p::address::Address;
         use bitcoin::p2p::ServiceFlags;
         let ver = VersionMessage {
@@ -1614,9 +1637,10 @@ impl PeerHub {
             start_height: -1,
             relay: false,
         };
-        self.register_with_id(
+        self.register_with_id_net(
             self.next_id.fetch_add(1, Ordering::Relaxed),
             addr,
+            net,
             addrbind,
             &ver,
             inbound,
@@ -1632,8 +1656,27 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
+        self.register_net(
+            addr,
+            crate::NetAddr::Ip(addr),
+            addrbind,
+            ver,
+            inbound,
+            conn_type,
+        )
+    }
+
+    pub fn register_net(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+        net: crate::NetAddr,
+        addrbind: SocketAddr,
+        ver: &VersionMessage,
+        inbound: bool,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let p = self.register_with_id(id, addr, addrbind, ver, inbound, conn_type);
+        let p = self.register_with_id_net(id, addr, net, addrbind, ver, inbound, conn_type);
         p.mark_handshake_complete();
         p.note_recv("version", 100);
         p.note_recv("verack", 0);
@@ -1649,6 +1692,27 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
+        self.register_with_id_net(
+            id,
+            addr,
+            crate::NetAddr::Ip(addr),
+            addrbind,
+            ver,
+            inbound,
+            conn_type,
+        )
+    }
+
+    pub fn register_with_id_net(
+        self: &Arc<Self>,
+        id: u64,
+        addr: SocketAddr,
+        net: crate::NetAddr,
+        addrbind: SocketAddr,
+        ver: &VersionMessage,
+        inbound: bool,
+        conn_type: PeerConnType,
+    ) -> Arc<LivePeer> {
         let _ = self
             .next_id
             .fetch_max(id.saturating_add(1), Ordering::Relaxed);
@@ -1657,6 +1721,7 @@ impl PeerHub {
         let peer = Arc::new(LivePeer {
             id,
             addr,
+            net,
             addrbind,
             subver: ver.user_agent.clone(),
             inbound,
@@ -1813,14 +1878,28 @@ impl PeerHub {
     }
 
     pub fn addnode(&self, addr: SocketAddr, cmd: &str) -> Result<(), String> {
+        self.addnode_net(crate::NetAddr::Ip(addr), cmd)
+    }
+
+    pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
         match cmd {
-            "onetry" => self.dial(addr, PeerConnType::Manual),
+            "onetry" => match addr {
+                crate::NetAddr::Ip(ip) => self.dial(ip, PeerConnType::Manual),
+                crate::NetAddr::Onion { .. } => {
+                    self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual)
+                }
+            },
             "add" => {
                 self.added
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(addr);
-                let _ = self.dial(addr, PeerConnType::Manual);
+                let _ = match addr {
+                    crate::NetAddr::Ip(ip) => self.dial(ip, PeerConnType::Manual),
+                    crate::NetAddr::Onion { .. } => {
+                        self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual)
+                    }
+                };
                 Ok(())
             }
             "remove" => {
@@ -1828,7 +1907,7 @@ impl PeerHub {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&addr);
-                self.disconnect_addr(addr);
+                self.disconnect_net(addr);
                 Ok(())
             }
             other => Err(format!("unknown addnode command {other}")),
@@ -2002,12 +2081,13 @@ impl PeerHub {
     }
 
     pub fn disconnect_addr(&self, addr: SocketAddr) -> bool {
+        self.disconnect_net(crate::NetAddr::Ip(addr))
+    }
+
+    pub fn disconnect_net(&self, addr: crate::NetAddr) -> bool {
         let ids: Vec<u64> = {
             let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-            g.values()
-                .filter(|p| p.addr == addr)
-                .map(|p| p.id)
-                .collect()
+            g.values().filter(|p| p.net == addr).map(|p| p.id).collect()
         };
         let mut n = 0usize;
         for id in ids {
@@ -2079,6 +2159,11 @@ fn service_flags_u64(f: ServiceFlags) -> u64 {
 
 /// Parse Core `ip:port` / `[v6]:port`.
 pub fn parse_peer_addr(s: &str) -> Result<SocketAddr, NetError> {
+    s.parse()
+        .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
+}
+
+pub fn parse_peer_net(s: &str) -> Result<crate::NetAddr, NetError> {
     s.parse()
         .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
 }

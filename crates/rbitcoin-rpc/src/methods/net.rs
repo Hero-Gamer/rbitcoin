@@ -99,7 +99,7 @@ pub(crate) fn peerinfo_json(ctx: &RpcContext, p: rbitcoin_net::PeerInfo) -> Valu
     };
     let mut row = json!({
         "id": p.id,
-        "addr": p.addr.to_string(),
+        "addr": p.net.to_string(),
         "addrbind": p.addrbind.to_string(),
         "subver": p.subver,
         "inbound": p.inbound,
@@ -111,7 +111,7 @@ pub(crate) fn peerinfo_json(ctx: &RpcContext, p: rbitcoin_net::PeerInfo) -> Valu
         "connection_type": p.conn_type.as_str(),
         "relaytxes": p.relay && !matches!(p.conn_type, rbitcoin_net::PeerConnType::BlockRelay),
         "transport_protocol_type": "v2",
-        "network": "ipv4",
+        "network": p.net.network_label(),
         "synced_headers": synced_headers,
         "synced_blocks": synced_blocks,
         "timeoffset": p.time_offset_secs,
@@ -178,9 +178,10 @@ pub(crate) fn addnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     let node = params.req_str(0, "node")?;
     let cmd = params.req_str(1, "command")?;
     let _v2 = params.opt_bool(2, "v2transport")?;
-    let addr = rbitcoin_net::parse_peer_addr(node)
+    let addr = rbitcoin_net::parse_peer_net(node)
         .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    hub.addnode(addr, cmd).map_err(|e| rpc_error(ERR_MISC, e))?;
+    hub.addnode_net(addr, cmd)
+        .map_err(|e| rpc_error(ERR_MISC, e))?;
     Ok(Value::Null)
 }
 
@@ -197,9 +198,9 @@ pub(crate) fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Val
         return Ok(Value::Null);
     }
     if let Some(a) = params.get(0, "address").and_then(|v| v.as_str()) {
-        let addr = rbitcoin_net::parse_peer_addr(a)
+        let addr = rbitcoin_net::parse_peer_net(a)
             .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-        if !hub.disconnect_addr(addr) {
+        if !hub.disconnect_net(addr) {
             return Err(rpc_error(
                 ERR_CLIENT_NODE_NOT_CONNECTED,
                 "Node not found in connected nodes",

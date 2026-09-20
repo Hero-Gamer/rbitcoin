@@ -711,11 +711,8 @@ mod tests {
             b"pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
             8333,
         ));
-        Dialer::Socks {
-            proxy,
-            randomize: false,
-        }
-        .connect_net(onion)
+        Dialer::socks(proxy, false)
+            .connect_net(onion)
         .await
         .unwrap();
         server.await.unwrap();

@@ -4687,6 +4687,48 @@ fn addnode_and_disconnectnode_on_table() {
 }
 
 #[test]
+fn getpeerinfo_and_disconnectnode_support_onion_addr() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    hub.register_net(
+        addr,
+        onion,
+        bind,
+        &test_version(0, 0),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    ctx.peers = Some(hub);
+
+    let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    let row = &r.as_array().unwrap()[0];
+    assert_eq!(
+        row["addr"],
+        json!("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333")
+    );
+    assert_eq!(row["network"], json!("onion"));
+    dispatch(
+        &ctx,
+        "disconnectnode",
+        vec![json!(
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+        )],
+    )
+    .unwrap();
+    assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn addpeeraddress_updates_addrman_without_rewriting_peers_file() {
     use rbitcoin_net::AddrMan;
     use std::sync::Mutex;

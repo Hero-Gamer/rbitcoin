@@ -550,12 +550,13 @@ async fn prepare_outbound_session(
         DialTarget::Socket(addr) => dialer.connect_net(crate::NetAddr::Ip(*addr)).await?,
         DialTarget::Domain { host, port } => dialer.connect_domain(host, *port).await?,
     };
+    let peer_net = peer.net_addr();
     let peer_hint = peer.peer_hint();
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
     // Core adds CNode before VERSION. Provisional row so getpeerinfo is non-empty
     // during handshake (p2p_handshake self-connect wait_until + assert_debug_log).
-    let provisional = peers.register_connecting(peer_hint, bind, false, typ);
+    let provisional = peers.register_connecting_net(peer_hint, peer_net, bind, false, typ);
     let provisional_id = provisional.id;
     let handshake = connect_and_handshake_timed(
         HANDSHAKE_TIMEOUT,
@@ -584,7 +585,8 @@ async fn prepare_outbound_session(
     let wants_addrv2 = provisional.wants_addrv2();
     let wtxid_relay = provisional.wtxid_relay();
     peers.unregister(provisional_id);
-    let sess = peers.register_with_id(provisional_id, peer_hint, bind, &ver, false, typ);
+    let sess =
+        peers.register_with_id_net(provisional_id, peer_hint, peer_net, bind, &ver, false, typ);
     sess.mark_handshake_complete();
     if wants_addrv2 {
         sess.set_wants_addrv2();
