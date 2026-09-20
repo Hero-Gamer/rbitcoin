@@ -1922,6 +1922,41 @@ fn getblock_named_verbose_genesis_and_hex() {
 }
 
 #[test]
+fn getblock_pruned_minus8() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
+    let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    ctx.query.set_pruneheight(Some(Height(0))).unwrap();
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["pruned"], true);
+    assert_eq!(info["pruneheight"], 0);
+    let err = dispatch(&ctx, "getblock", vec![genesis.clone(), json!(0)]).unwrap_err();
+    assert_eq!(err["code"], json!(-8));
+    assert!(err["message"].as_str().unwrap().contains("pruned"), "{err}");
+    let v1 = dispatch(&ctx, "getblock", vec![genesis.clone(), json!(1)]).unwrap();
+    assert_eq!(v1["tx"].as_array().unwrap().len(), 1);
+    let err2 = dispatch(&ctx, "getblock", vec![genesis, json!(2)]).unwrap_err();
+    assert_eq!(err2["code"], json!(-8));
+    let txid = v1["tx"][0].clone();
+    let rerr = dispatch(&ctx, "getrawtransaction", vec![txid]).unwrap_err();
+    assert_eq!(rerr["code"], json!(-8));
+    assert!(
+        rerr["message"].as_str().unwrap().contains("pruned"),
+        "{rerr}"
+    );
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let names: Vec<&str> = net["localservicesnames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(names.contains(&"NETWORK_LIMITED"), "{names:?}");
+    assert!(!names.contains(&"NETWORK"), "{names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn generateblock_submit_false_returns_hex_without_connecting() {
     let (ctx, dir, hub) = ctx_regtest_hub();
     let tip_before = hub.tip_height();

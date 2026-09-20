@@ -83,7 +83,7 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
     } else {
         (0u32, 0u32)
     };
-    Ok(json!({
+    let mut info = json!({
         "chain": chain_name(ctx.network),
         "blocks": tip,
         "headers": headers,
@@ -95,9 +95,13 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         "initialblockdownload": ibd,
         "chainwork": chainwork_hex(ctx, ctx.query.tip_height()),
         "size_on_disk": ctx.query.store().datadir_bytes(),
-        "pruned": false,
+        "pruned": ctx.query.prune_inwit(),
         "warnings": rpc_warnings(ctx),
-    }))
+    });
+    if let Some(h) = ctx.query.pruneheight() {
+        info["pruneheight"] = json!(h.0);
+    }
+    Ok(info)
 }
 
 pub(crate) fn rpc_warnings(ctx: &RpcContext) -> Vec<String> {
@@ -378,7 +382,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let block = ctx
         .query
         .reconstruct_block_at_height(height)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
     if verbosity == 0 {
         let mut raw = Vec::new();
         block

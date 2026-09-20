@@ -347,7 +347,7 @@ pub(crate) fn getnetworkinfo(ctx: &RpcContext) -> Value {
     } else {
         (0, ctx.connections.load(Ordering::Relaxed), 0)
     };
-    let flags = rbitcoin_net::local_service_flags();
+    let flags = rbitcoin_net::local_service_flags_pruned(ctx.query.prune_inwit());
     let svc_bits = flags.to_u64();
     json!({
         "version": rpc_client_version(env!("CARGO_PKG_VERSION")),

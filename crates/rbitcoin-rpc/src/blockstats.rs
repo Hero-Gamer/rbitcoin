@@ -1,7 +1,7 @@
 //! Core `getblockstats` — reconstruct a block and sum fees / UTXO / weight.
 
 use crate::methods::{
-    parse_hash32_display, rpc_error, RpcContext, RpcParams, ERR_INVALID_ADDRESS_OR_KEY,
+    map_query, parse_hash32_display, rpc_error, RpcContext, RpcParams, ERR_INVALID_ADDRESS_OR_KEY,
     ERR_INVALID_PARAMETER, ERR_MISC,
 };
 use bitcoin::consensus::Encodable;
@@ -485,7 +485,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
             let block = ctx
                 .query
                 .reconstruct_block_at_height(height)
-                .map_err(|_| rpc_error(ERR_MISC, "block body not in store"))?;
+                .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
             (height, block)
         }
         HashOrHeight::Hash(hash) => {
@@ -498,7 +498,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
                     let block = ctx
                         .query
                         .reconstruct_block_at_height(height)
-                        .map_err(|_| rpc_error(ERR_MISC, "block body not in store"))?;
+                        .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
                     (height, block)
                 }
                 None => {

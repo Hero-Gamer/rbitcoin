@@ -1154,6 +1154,7 @@ pub(crate) fn not_found() -> Response {
 pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
     match e {
         StoreError::NotFound => not_found(),
+        StoreError::Pruned { .. } => (StatusCode::NOT_FOUND, "pruned").into_response(),
         StoreError::Stale(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         StoreError::Rejected(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),

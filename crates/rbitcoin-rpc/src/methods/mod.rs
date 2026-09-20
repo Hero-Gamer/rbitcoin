@@ -171,6 +171,13 @@ pub const ERR_VERIFY_REJECTED: i64 = -26;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 
+pub(crate) fn map_query(e: rbitcoin_query::QueryError, pruned: &'static str) -> Value {
+    match e {
+        rbitcoin_store::StoreError::Pruned { .. } => rpc_error(ERR_INVALID_PARAMETER, pruned),
+        other => rpc_error(ERR_MISC, other.to_string()),
+    }
+}
+
 /// JSON-RPC `params`: positional array or Core named object.
 #[derive(Clone, Debug, Default)]
 pub struct RpcParams {
