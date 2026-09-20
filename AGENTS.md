@@ -71,6 +71,12 @@ exit code, failure names (`test … FAILED`, lint ids, first rustc error),
 and at most ~80 lines of tail. `--quiet` is enough to confirm green.
 Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (Agent RAM).
 
+**Agent disk:** one `/tmp/rbtc-<session>` worktree. Export
+`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` before `nix-shell`. Do not cargo in
+the Cursor checkout or add a worktree per PR (each extra tree copies
+`target/dev` and `third_party/bitcoin`). ENOSPC: skip fat tests, not
+another silo. Owner: [`TESTING.md`](TESTING.md) (Agent VM disk).
+
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
 RPC / P2P / Electrum / Esplora: [`COMPAT.md`](COMPAT.md).
@@ -112,6 +118,8 @@ These wreck a session even when the skill was not opened:
 - Run clippy `-D warnings` before push. Do not wait out
   `./scripts/coverage.sh` or a host IBD. No empty commits to poke Actions
   (`gh run rerun` instead).
+- Do not `git worktree add` per PR or cargo in the Cursor checkout.
+  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` (export before `nix-shell`).
 
 Playbooks:
 

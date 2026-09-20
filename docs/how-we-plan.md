@@ -256,6 +256,11 @@ A sequence of gates can wrap that body in a `run` function (one call per
 command). Do not paste a second copy into ship-pr; that file lists the
 commands and links here.
 
+**Agent disk:** one session worktree, `CARGO_TARGET_DIR=/tmp/rbtc-target/dev`
+before `nix-shell`, no cargo in the Cursor checkout. Owner (table, ENOSPC,
+lock): [`TESTING.md`](../TESTING.md) (Agent VM disk). Commands:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+
 Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
 Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
 gates if the slice also changed Rust, scripts, or lint.

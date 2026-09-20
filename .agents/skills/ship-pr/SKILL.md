@@ -17,8 +17,10 @@ Do not copy them here.
 
 ## Session worktree
 
-Reuse one worktree per session so `target/dev` stays warm. Do not add a
-worktree per PR.
+Reuse one worktree per session. Do not add a worktree per PR. Export
+`CARGO_TARGET_DIR=/tmp/rbtc-target/dev` **before** `nix-shell`. Do not cargo
+in the Cursor checkout. Owner (why, ENOSPC, lock):
+[`TESTING.md`](../../../TESTING.md) (Agent VM disk).
 
 ```bash
 # once per session
@@ -26,7 +28,7 @@ git fetch origin
 git worktree add /tmp/rbtc-<session> origin/master
 cd /tmp/rbtc-<session>
 git switch -c <area>/<short-name>
-export CARGO_TARGET_DIR=/tmp/rbtc-<session>/target/dev
+export CARGO_TARGET_DIR=/tmp/rbtc-target/dev
 git config --worktree user.name 'rearden-grok[bot]'
 git config --worktree user.email '317016512+rearden-grok[bot]@users.noreply.github.com'
 
@@ -40,7 +42,7 @@ git switch -C <area>/<next-short> origin/master
 | Base | Current `origin/master` (or `main`) |
 | Branch | Topic name. Never commit the plan onto `master` |
 | Worktree | One `/tmp/rbtc-<session>` for the session |
-| `CARGO_TARGET_DIR` | Inside the session worktree (`…/target/dev`) |
+| `CARGO_TARGET_DIR` | `/tmp/rbtc-target/dev` (VM-wide; not per worktree) |
 | Identity | Worktree-only `user.name` / `user.email` for bot commits |
 | Remotes | Worktrees share `origin`. Fetch is HTTPS; `pushurl` is SSH. Never `git remote set-url origin` |
 
@@ -59,12 +61,16 @@ git push https://github.com/reardencode/rbitcoin.git --delete <area>/<merged-sho
 ```bash
 # session end
 git worktree remove /tmp/rbtc-<session>
+rm -rf /tmp/rbitcoin-*
 git fetch origin --prune
 ```
 
+Do not `cargo clean` `/tmp/rbtc-target/dev` unless that silo is stale.
+ENOSPC: [`TESTING.md`](../../../TESTING.md) (Agent VM disk).
+
 ## Local tests
 
-From `nix-shell` (CI pins rustc 1.95.0). `CARGO_TARGET_DIR=target/dev`.
+From `nix-shell` (CI pins rustc 1.95.0). Shared silo as in Session worktree.
 Same **commands** as the required jobs, not the GitHub Actions `env:`
 (leave `CARGO_INCREMENTAL` unset; that is [`ci.yml`](../../../.github/workflows/ci.yml) only).
 When to run which command:

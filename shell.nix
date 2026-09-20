@@ -38,6 +38,8 @@ pkgs.mkShell {
     export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
     # Host gnu debug artifacts (fmt/clippy/test). Coverage uses target/cov
     # (scripts/coverage.sh); musl release is nix/crane, not this tree.
+    # Agent VM: export CARGO_TARGET_DIR=/tmp/rbtc-target/dev before this
+    # shell (TESTING.md Agent VM disk). Humans keep the $PWD default.
     # Override only if you know why: CARGO_TARGET_DIR=... nix-shell
     if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
       export CARGO_TARGET_DIR="$PWD/target/dev"
