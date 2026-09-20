@@ -249,14 +249,20 @@ impl Query {
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
-        self.apply_prune_inwit_tip()?;
-        if self.prune_inwit() {
-            for item in items {
-                self.note_inwit_ram_for_confirmed(item.height, &item.tx_fks)?;
-            }
-        }
+        self.record_confirmed_inwit_window(items)?;
 
         Ok(out)
+    }
+
+    fn record_confirmed_inwit_window(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
+        self.apply_prune_inwit_tip()?;
+        if !self.prune_inwit() {
+            return Ok(());
+        }
+        for item in items {
+            self.note_inwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+        }
+        Ok(())
     }
 
     fn enqueue_sh_pending(
