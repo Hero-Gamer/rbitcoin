@@ -429,6 +429,38 @@ fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
     }
 }
 
+fn refuse_schema15_packed_tx_body(dir: &Path) -> Result<(), StoreError> {
+    if dir.join("tx.body").exists()
+        && !dir.join("txout.body").exists()
+        && class_a_body_occupied(dir, "tx")
+    {
+        return Err(StoreError::Corrupt(
+            "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
+        ));
+    }
+    Ok(())
+}
+
+fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
+    if dir.join("create.loc").exists() {
+        crate::create_loc::CreateLoc::open(dir)
+    } else if class_a_body_occupied(dir, "txout") {
+        Err(StoreError::Corrupt("invariant: create.loc missing"))
+    } else {
+        crate::create_loc::CreateLoc::create(dir)
+    }
+}
+
+fn open_or_create_inwit_loc(inwit_dir: &Path) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
+    if inwit_dir.join("inwit.loc").exists() {
+        crate::delta_loc::DeltaLoc::open(inwit_dir, "inwit")
+    } else if class_a_body_occupied(inwit_dir, "inwit") {
+        Err(StoreError::Corrupt("invariant: inwit.loc missing"))
+    } else {
+        crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")
+    }
+}
+
 fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
     for stem in ["txout", "spent", "inwit"] {
         let p = dir.join(format!("{stem}.idx"));
@@ -442,6 +474,84 @@ fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
                 "store: dropping leftover {stem}.idx (schema 22 uses create.loc / inwit.loc)"
             );
         }
+    }
+    Ok(())
+}
+
+fn repair_class_a_count_skew(
+    create_loc: &crate::create_loc::CreateLoc,
+    inwit_loc: &crate::delta_loc::DeltaLoc,
+    body: &VarTable,
+    spent: &VarTable,
+    inwit: &VarTable,
+    txids: &crate::txid_body::TxidBody,
+    prune_inwit_mode: bool,
+) -> Result<(), StoreError> {
+    let n_loc = create_loc.count();
+    let n_txids = txids.count();
+    let n_inwit_loc = inwit_loc.count();
+    if n_txids == n_loc && (prune_inwit_mode || n_inwit_loc == n_loc) {
+        return Ok(());
+    }
+    let n = if prune_inwit_mode {
+        n_loc.min(n_txids)
+    } else {
+        n_loc.min(n_txids).min(n_inwit_loc)
+    };
+    rbitcoin_log::warn!(
+        "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
+         txid.body={n_txids} — truncating to {n}"
+    );
+    let (tx_end, sp_end, in_end) = if n == 0 {
+        let h = crate::file::FILE_HEADER_LEN as u64;
+        (h, h, h)
+    } else {
+        let p = create_loc
+            .range_batch(&[Fk(n)])?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
+        let in_end = if prune_inwit_mode {
+            crate::file::FILE_HEADER_LEN as u64
+        } else {
+            let ir = inwit_loc
+                .range_batch(&[Fk(n)])?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or(StoreError::Corrupt(
+                    "invariant: inwit.loc range for truncate",
+                ))?;
+            ir.0.saturating_add(ir.1)
+        };
+        (
+            p.txout.0.saturating_add(p.txout.1),
+            p.spent.0.saturating_add(p.spent.1),
+            in_end,
+        )
+    };
+    create_loc.truncate_to_count(n)?;
+    if !prune_inwit_mode {
+        inwit_loc.truncate_to_count(n)?;
+    }
+    body.truncate_body_to(n, tx_end)?;
+    spent.truncate_body_to(n, sp_end)?;
+    if !prune_inwit_mode {
+        inwit.truncate_body_to(n, in_end)?;
+    }
+    if n_txids > n {
+        txids.truncate_to_count(n)?;
+    }
+    if body.count() != txids.count() || create_loc.count() != txids.count() {
+        return Err(StoreError::Corrupt(
+            "Class A stem counts still mismatch after repair (reindex required)",
+        ));
+    }
+    if !prune_inwit_mode && inwit_loc.count() != txids.count() {
+        return Err(StoreError::Corrupt(
+            "Class A stem counts still mismatch after repair (reindex required)",
+        ));
     }
     Ok(())
 }
@@ -555,14 +665,7 @@ impl TxTable {
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
         let prune_inwit_mode = false;
-        if dir.join("tx.body").exists()
-            && !dir.join("txout.body").exists()
-            && class_a_body_occupied(dir, "tx")
-        {
-            return Err(StoreError::Corrupt(
-                "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
-            ));
-        }
+        refuse_schema15_packed_tx_body(dir)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if inwit_dir != dir {
@@ -572,20 +675,8 @@ impl TxTable {
         let had_txout = dir.join("txout.body").exists();
         let had_inwit = inwit_dir.join("inwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
-        let create_loc = if dir.join("create.loc").exists() {
-            crate::create_loc::CreateLoc::open(dir)?
-        } else if class_a_body_occupied(dir, "txout") {
-            return Err(StoreError::Corrupt("invariant: create.loc missing"));
-        } else {
-            crate::create_loc::CreateLoc::create(dir)?
-        };
-        let inwit_loc = if inwit_dir.join("inwit.loc").exists() {
-            crate::delta_loc::DeltaLoc::open(inwit_dir, "inwit")?
-        } else if class_a_body_occupied(inwit_dir, "inwit") {
-            return Err(StoreError::Corrupt("invariant: inwit.loc missing"));
-        } else {
-            crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")?
-        };
+        let create_loc = open_or_create_create_loc(dir)?;
+        let inwit_loc = open_or_create_inwit_loc(inwit_dir)?;
         let loc_count = create_loc.count();
         if !prune_inwit_mode && inwit_loc.count() != loc_count {
             return Err(StoreError::Corrupt("invariant: inwit.loc count"));
@@ -621,71 +712,15 @@ impl TxTable {
         } else {
             crate::txid_body::TxidBody::create(dir)?
         };
-        let n_loc = create_loc.count();
-        let n_txids = txids.count();
-        let n_inwit_loc = inwit_loc.count();
-        if n_txids != n_loc || (!prune_inwit_mode && n_inwit_loc != n_loc) {
-            let n = if prune_inwit_mode {
-                n_loc.min(n_txids)
-            } else {
-                n_loc.min(n_txids).min(n_inwit_loc)
-            };
-            rbitcoin_log::warn!(
-                "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
-                 txid.body={n_txids} — truncating to {n}"
-            );
-            let (tx_end, sp_end, in_end) = if n == 0 {
-                let h = crate::file::FILE_HEADER_LEN as u64;
-                (h, h, h)
-            } else {
-                let p = create_loc
-                    .range_batch(&[Fk(n)])?
-                    .into_iter()
-                    .next()
-                    .flatten()
-                    .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
-                let in_end = if prune_inwit_mode {
-                    crate::file::FILE_HEADER_LEN as u64
-                } else {
-                    let ir = inwit_loc
-                        .range_batch(&[Fk(n)])?
-                        .into_iter()
-                        .next()
-                        .flatten()
-                        .ok_or(StoreError::Corrupt(
-                            "invariant: inwit.loc range for truncate",
-                        ))?;
-                    ir.0.saturating_add(ir.1)
-                };
-                (
-                    p.txout.0.saturating_add(p.txout.1),
-                    p.spent.0.saturating_add(p.spent.1),
-                    in_end,
-                )
-            };
-            create_loc.truncate_to_count(n)?;
-            if !prune_inwit_mode {
-                inwit_loc.truncate_to_count(n)?;
-            }
-            body.truncate_body_to(n, tx_end)?;
-            spent.truncate_body_to(n, sp_end)?;
-            if !prune_inwit_mode {
-                inwit.truncate_body_to(n, in_end)?;
-            }
-            if n_txids > n {
-                txids.truncate_to_count(n)?;
-            }
-            if body.count() != txids.count() || create_loc.count() != txids.count() {
-                return Err(StoreError::Corrupt(
-                    "Class A stem counts still mismatch after repair (reindex required)",
-                ));
-            }
-            if !prune_inwit_mode && inwit_loc.count() != txids.count() {
-                return Err(StoreError::Corrupt(
-                    "Class A stem counts still mismatch after repair (reindex required)",
-                ));
-            }
-        }
+        repair_class_a_count_skew(
+            &create_loc,
+            &inwit_loc,
+            &body,
+            &spent,
+            &inwit,
+            &txids,
+            prune_inwit_mode,
+        )?;
         let n_bodies = create_loc.count();
         let mut need_rebuild = false;
         let head = if !crate::segmented_head::head_meta_exists(dir) {
