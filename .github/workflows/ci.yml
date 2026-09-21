@@ -23,16 +23,24 @@ env:
 # Pin rustc to the nix-shell / crane baseline so fmt/clippy do not drift with
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
-# Jobs are split so each gate is its own required check on the PR/push UI:
-#   fmt + deny + clippy + ast-grep + test + nixos-module-eval + windows + macos in parallel;
-#   nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
-#   coverage waits for fmt/clippy/test.
+# Each gate is its own check. Short ubuntu gates share one runner so
+# concurrent-job slots stay free for clippy, test, and future cargo-mutants
+# shards (mutants.yml):
+#   fmt → deny → ast-grep → nixos-module-eval
+# Later gates use !cancelled() so a red earlier gate still reports its own
+# check (a skip would hide required deny / ast-grep).
+# clippy, test, windows, and macos start immediately. clippy stays parallel:
+# coverage waits on it, and a cold rust-cache is a full workspace compile.
+# coverage waits for fmt / clippy / test.
+# nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #
 # GitHub App often cannot push this file; operator `git push` if the branch
 # includes workflow YAML.
 jobs:
   deny:
+    needs: fmt
+    if: "${{ !cancelled() }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,6 +65,8 @@ jobs:
 
   # Structural lints (Q-51). fmt-class: no rustc. Required.
   ast-grep:
+    needs: deny
+    if: "${{ !cancelled() }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,6 +142,8 @@ jobs:
 
   nixos-module-eval:
     name: nixos-module-eval
+    needs: ast-grep
+    if: "${{ !cancelled() }}"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

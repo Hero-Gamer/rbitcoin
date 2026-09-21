@@ -33,6 +33,11 @@ before 1.0).
 
 ### Changed
 
+- **CI short gates share one runner:** `fmt` → `deny` → `ast-grep` →
+  `nixos-module-eval`. clippy, test, windows, and macos still start
+  immediately. Concurrent-job slots stay free for future cargo-mutants
+  shards.
+
 - **Weekly cargo-mutants:** `mutants.yml` — PR `--workspace --in-diff`
   advisory (`continue-on-error`); Sunday 8-shard `--workspace` sweep.
   Must use `--workspace` (`default-members` is node). Snapshot lists:
