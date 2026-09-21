@@ -14,12 +14,14 @@ static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
 struct Installed {
     dialer: I2pDialer,
     _keepalive: Option<TcpStream>,
+    _forward: Option<TcpStream>,
 }
 
 pub struct I2pSam {
     sam_addr: SocketAddr,
     session_id: String,
     destination: String,
+    forward_port: Option<u16>,
     _control: TcpStream,
     _forward: Option<TcpStream>,
 }
@@ -29,19 +31,22 @@ pub struct I2pDialer {
     sam_addr: SocketAddr,
     session_id: String,
     destination: String,
+    forward_port: Option<u16>,
 }
 
 pub fn install(dialer: I2pDialer) {
     *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
         dialer,
         _keepalive: None,
+        _forward: None,
     });
 }
 
-fn install_kept(dialer: I2pDialer, keepalive: TcpStream) {
+fn install_kept(dialer: I2pDialer, keepalive: TcpStream, forward: Option<TcpStream>) {
     *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
         dialer,
         _keepalive: Some(keepalive),
+        _forward: forward,
     });
 }
 
@@ -50,8 +55,8 @@ pub async fn stream_connect_installed(dest_b32: &str) -> Result<TcpStream, NetEr
     match first.stream_connect(dest_b32).await {
         Ok(s) => Ok(s),
         Err(e) if session_dead(&e) => {
-            let (fresh, keepalive) = first.recreate_session().await?;
-            install_kept(fresh.clone(), keepalive);
+            let (fresh, keepalive, forward) = first.recreate_session().await?;
+            install_kept(fresh.clone(), keepalive, forward);
             fresh.stream_connect(dest_b32).await
         }
         Err(e) => Err(e),
@@ -184,14 +189,7 @@ impl I2pSam {
         hello(&mut control).await?;
         let session_id = fresh_session_id();
         let dest_arg = dest.unwrap_or("TRANSIENT");
-        write_line(
-            &mut control,
-            &format!(
-                "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg} \
-                 inbound.length=1 outbound.length=1 inbound.quantity=1 outbound.quantity=1"
-            ),
-        )
-        .await?;
+        write_line(&mut control, &session_create_line(&session_id, dest_arg)).await?;
         let reply = read_line(&mut control).await?;
         if !reply.to_ascii_uppercase().contains("RESULT=OK") {
             return Err(NetError::Encode(format!("i2p sam session: {reply}")));
@@ -206,6 +204,7 @@ impl I2pSam {
                 sam_addr,
                 session_id,
                 destination: destination.clone(),
+                forward_port: None,
                 _control: control,
                 _forward: None,
             },
@@ -222,6 +221,7 @@ impl I2pSam {
             sam_addr: self.sam_addr,
             session_id: self.session_id.clone(),
             destination: self.destination.clone(),
+            forward_port: self.forward_port,
         }
     }
 
@@ -240,6 +240,7 @@ impl I2pSam {
         for _ in 0..24 {
             match self.stream_forward_once(port).await {
                 Ok(s) => {
+                    self.forward_port = Some(port);
                     self._forward = Some(s);
                     return Ok(());
                 }
@@ -298,7 +299,7 @@ impl I2pDialer {
         write_line(
             &mut s,
             &format!(
-                "STREAM CONNECT ID={} DESTINATION={}",
+                "STREAM CONNECT ID={} DESTINATION={} SILENT=true",
                 self.session_id, dest_b32
             ),
         )
@@ -310,10 +311,33 @@ impl I2pDialer {
         Ok(s)
     }
 
-    async fn recreate_session(&self) -> Result<(Self, TcpStream), NetError> {
-        let (sam, _) = I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
-        Ok(sam.into_keepalive())
+    async fn recreate_session(&self) -> Result<(Self, TcpStream, Option<TcpStream>), NetError> {
+        let (mut sam, _) =
+            I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+        let forward = match self.forward_port {
+            Some(port) => {
+                sam.stream_forward(port).await?;
+                sam._forward.take()
+            }
+            None => None,
+        };
+        let (dialer, keepalive) = sam.into_keepalive();
+        Ok((dialer, keepalive, forward))
     }
+}
+
+// Ed25519 (7), not the SAM DSA_SHA1 default. leaseSetEncType 4 is ECIES.
+fn session_create_line(session_id: &str, dest_arg: &str) -> String {
+    let sig = if dest_arg.eq_ignore_ascii_case("TRANSIENT") {
+        " SIGNATURE_TYPE=7"
+    } else {
+        ""
+    };
+    format!(
+        "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg}{sig} \
+         i2cp.leaseSetEncType=4,0 inbound.length=1 outbound.length=1 \
+         inbound.quantity=1 outbound.quantity=1"
+    )
 }
 
 // Public Destination is 387 bytes plus the cert length at bytes 385–386.
@@ -635,6 +659,7 @@ mod tests {
         for g in &got {
             assert!(g.contains(dest), "{g}");
             assert!(g.contains("ID=rbtc"), "{g}");
+            assert!(g.contains("SILENT=true"), "{g}");
         }
 
         let (bad, _live) = fake_sam(false, Arc::new(Mutex::new(Vec::new()))).await;
@@ -702,9 +727,12 @@ mod tests {
         assert!(fw[0].contains("SILENT=true"), "{}", fw[0]);
         let creates = stream_lines(&log, "SESSION CREATE");
         assert!(
-            creates
-                .iter()
-                .any(|c| c.contains("DESTINATION=TRANSIENT") && c.contains("inbound.length=1")),
+            creates.iter().any(|c| {
+                c.contains("DESTINATION=TRANSIENT")
+                    && c.contains("SIGNATURE_TYPE=7")
+                    && c.contains("i2cp.leaseSetEncType=4,0")
+                    && c.contains("inbound.length=1")
+            }),
             "{creates:?}"
         );
 
@@ -712,9 +740,11 @@ mod tests {
         sam2.stream_forward(18444).await.unwrap();
         let creates = stream_lines(&log, "SESSION CREATE");
         assert!(
-            creates
-                .iter()
-                .any(|c| c.contains(&format!("DESTINATION={FAKE_DEST}"))),
+            creates.iter().any(|c| {
+                c.contains(&format!("DESTINATION={FAKE_DEST}"))
+                    && c.contains("i2cp.leaseSetEncType=4,0")
+                    && !c.contains("SIGNATURE_TYPE=")
+            }),
             "{creates:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -760,6 +790,36 @@ mod tests {
             2,
             "published dialer must keep the new session id"
         );
+        clear_installed();
+    }
+
+    #[tokio::test]
+    async fn i2p_sam_recreate_restores_forward() {
+        let _gate = INSTALL_GATE.lock().await;
+        clear_installed();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, live) = fake_sam(true, Arc::clone(&log)).await;
+        let mut sam = I2pSam::connect(addr).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        crate::socks::install_i2p_dialer(sam.dialer());
+        let peer = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 0,
+        };
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .unwrap();
+        assert_eq!(stream_lines(&log, "STREAM FORWARD").len(), 1);
+        live.lock().unwrap().clear();
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .expect("INVALID_ID must recreate the session");
+        let fw = stream_lines(&log, "STREAM FORWARD");
+        assert_eq!(fw.len(), 2, "dropped session must FORWARD again: {fw:?}");
+        assert!(fw[1].contains("PORT=18444"), "{}", fw[1]);
+        assert!(fw[1].contains("SILENT=true"), "{}", fw[1]);
         clear_installed();
     }
 
