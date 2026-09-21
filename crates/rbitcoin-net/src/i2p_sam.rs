@@ -299,7 +299,7 @@ impl I2pDialer {
         write_line(
             &mut s,
             &format!(
-                "STREAM CONNECT ID={} DESTINATION={} SILENT=true",
+                "STREAM CONNECT ID={} DESTINATION={}",
                 self.session_id, dest_b32
             ),
         )
@@ -659,7 +659,10 @@ mod tests {
         for g in &got {
             assert!(g.contains(dest), "{g}");
             assert!(g.contains("ID=rbtc"), "{g}");
-            assert!(g.contains("SILENT=true"), "{g}");
+            // i2pd drops the STREAM STATUS line when CONNECT sets SILENT=true,
+            // so the dial never sees RESULT=OK. FORWARD is the command that
+            // prefixes the peer destination; CONNECT must stay non-silent.
+            assert!(!g.to_ascii_uppercase().contains("SILENT=TRUE"), "{g}");
         }
 
         let (bad, _live) = fake_sam(false, Arc::new(Mutex::new(Vec::new()))).await;
