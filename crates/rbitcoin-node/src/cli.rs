@@ -672,7 +672,7 @@ mod tests {
             rbitcoin_net::Dialer::Socks {
                 proxy, randomize, ..
             } => {
-                assert_eq!(proxy, "127.0.0.1:9050".parse().unwrap());
+                assert_eq!(proxy, Some("127.0.0.1:9050".parse().unwrap()));
                 assert!(randomize);
             }
             other => panic!("expected socks dialer, got {other:?}"),
@@ -720,6 +720,37 @@ mod tests {
         assert!(split.listen.proxy.is_some());
         assert!(split.listen.onion.is_some());
         assert_ne!(split.listen.proxy, split.listen.onion);
+        match split.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { proxy, onion, .. } => {
+                assert_eq!(proxy, split.listen.proxy);
+                assert_eq!(onion, split.listen.onion);
+            }
+            other => panic!("expected split socks dialer, got {other:?}"),
+        }
+        let onion_only = ready_config(["rbitcoin-node", "--onion", "127.0.0.1:9051"]);
+        match onion_only.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { proxy, onion, .. } => {
+                assert!(proxy.is_none(), "onion-only must not SOCKS clearnet");
+                assert_eq!(onion, Some("127.0.0.1:9051".parse().unwrap()));
+            }
+            other => panic!("expected onion-only socks dialer, got {other:?}"),
+        }
+        match onion_only.listen.isolated_dialer() {
+            rbitcoin_net::Dialer::Socks {
+                proxy,
+                onion,
+                randomize,
+                ..
+            } => {
+                assert!(proxy.is_none());
+                assert_eq!(onion, Some("127.0.0.1:9051".parse().unwrap()));
+                assert!(
+                    randomize,
+                    "isolated broadcast always randomizes SOCKS creds"
+                );
+            }
+            other => panic!("expected onion-only isolated dialer, got {other:?}"),
+        }
 
         let h = operator_usage();
         assert!(h.contains("--proxy"), "help must list kebab --proxy");

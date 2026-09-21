@@ -89,6 +89,7 @@ impl PeerEventSinks {
 pub(crate) struct PeerSlot {
     pub id: usize,
     pub addr: SocketAddr,
+    pub net: crate::NetAddr,
     pub cmd_tx: mpsc::UnboundedSender<PeerCmd>,
     /// Hashes currently requested from this peer.
     pub in_flight: HashSet<BlockHash>,
@@ -426,6 +427,7 @@ pub(crate) async fn spawn_peer(
     Ok(PeerSlot {
         id,
         addr: version_socket,
+        net: addr,
         cmd_tx,
         in_flight: HashSet::new(),
         peer_height,
@@ -517,6 +519,10 @@ mod tests {
         PeerSlot {
             id,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                18444,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 100,

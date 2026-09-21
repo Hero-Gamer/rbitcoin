@@ -848,6 +848,7 @@ impl MempoolHub {
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
         self.remove_relay_maps(txid);
+        self.local_origin.lock().unwrap().remove(txid);
         let mut u = self.unbroadcast.lock().unwrap();
         if u.remove(txid) {
             persist_unbroadcast_file(&self.dir, &u);

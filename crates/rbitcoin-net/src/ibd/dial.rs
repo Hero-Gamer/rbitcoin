@@ -336,7 +336,7 @@ pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
         book.note_attempt_addr(addr);
     }
     for s in &result.slots {
-        book.note_connected(s.addr);
+        book.note_connected_addr(s.net);
     }
     for &(addr, kind) in &result.failed {
         book.note_connect_failed_addr(addr, kind == DialFailKind::Incompatible);
@@ -442,8 +442,7 @@ pub(crate) fn dial_blocked_addrs(
     cooldown: &HashMap<SocketAddr, Instant>,
     now: Instant,
 ) -> HashSet<crate::NetAddr> {
-    let mut blocked: HashSet<crate::NetAddr> =
-        slots.iter().map(|s| crate::NetAddr::Ip(s.addr)).collect();
+    let mut blocked: HashSet<crate::NetAddr> = slots.iter().map(|s| s.net).collect();
     for (&addr, &until) in cooldown {
         if until > now {
             blocked.insert(crate::NetAddr::Ip(addr));
@@ -454,7 +453,11 @@ pub(crate) fn dial_blocked_addrs(
 
 /// Live slot addrs whose netgroups occupy outbound diversity (cooldown is exclude-only).
 pub(crate) fn alive_dial_addrs(slots: &[PeerSlot]) -> Vec<SocketAddr> {
-    slots.iter().filter(|s| s.alive).map(|s| s.addr).collect()
+    slots
+        .iter()
+        .filter(|s| s.alive)
+        .filter_map(|s| s.net.socket_addr())
+        .collect()
 }
 
 pub(crate) fn expire_addr_cooldown(cooldown: &mut HashMap<SocketAddr, Instant>, now: Instant) {
@@ -648,6 +651,7 @@ mod tests {
         PeerSlot {
             id,
             addr: a,
+            net: crate::NetAddr::from_socket(a),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 0,

@@ -115,7 +115,12 @@ pub fn spawn_isolated_broadcast_loop(
     }
     let mut rx = mp.subscribe_isolated();
     tokio::spawn(async move {
-        while let Ok(txid) = rx.recv().await {
+        loop {
+            let txid = match rx.recv().await {
+                Ok(txid) => txid,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             let Some(tx) = mp.get_tx(&txid) else {
                 continue;
             };
@@ -425,6 +430,38 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         mp.mark_local_origin(dummy_tx().compute_txid());
         tokio::time::sleep(Duration::from_millis(20)).await;
+        h.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_broadcast_loop_survives_lagged_kicks() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::Txid;
+
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-lag");
+        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_isolated_broadcast(true);
+        let am = Arc::new(Mutex::new(AddrMan::new()));
+        let h = spawn_isolated_broadcast_loop(
+            mp.clone(),
+            Dialer::Direct,
+            am,
+            Magic::REGTEST,
+            "/rbitcoin:test/".into(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for i in 0..40u8 {
+            mp.mark_local_origin(Txid::from_byte_array([i; 32]));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !h.is_finished(),
+            "broadcast Lagged must not stop isolated send"
+        );
+        mp.mark_local_origin(dummy_tx().compute_txid());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!h.is_finished());
         h.abort();
         let _ = std::fs::remove_dir_all(dir);
     }

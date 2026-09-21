@@ -46,7 +46,7 @@ impl OnlyNet {
     }
 }
 
-pub fn addr_allowed(addr: NetAddr, only: &[OnlyNet]) -> bool {
+pub(crate) fn addr_allowed(addr: NetAddr, only: &[OnlyNet]) -> bool {
     only.is_empty() || only.iter().any(|n| n.matches_addr(addr))
 }
 

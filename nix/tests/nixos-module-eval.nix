@@ -34,6 +34,7 @@ let
           onlyNet = [
             "onion"
             "i2p"
+            "cjdns"
           ];
           tor = {
             control = "127.0.0.1:9051";
@@ -142,6 +143,7 @@ assert builtins.match ".*--proxy 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--onion 127.0.0.1:9050.*" execStart != null;
 assert builtins.match ".*--only-net onion.*" execStart != null;
 assert builtins.match ".*--only-net i2p.*" execStart != null;
+assert builtins.match ".*--only-net cjdns.*" execStart != null;
 assert builtins.match ".*--tor-control 127.0.0.1:9051.*" execStart != null;
 assert builtins.match ".*--tor-control-cookie /run/tor/control.authcookie.*" execStart != null;
 assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;

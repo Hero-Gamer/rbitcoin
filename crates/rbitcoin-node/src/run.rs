@@ -500,7 +500,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let max_out = config.listen.max_outbound.max(1) as usize;
     let candidate_n = max_out.saturating_mul(2).clamp(16, 48);
-    let occupied = node.peers.live_outbound_full_relay_addrs();
+    let occupied = node.peers.live_outbound_full_relay_nets();
     let targets = follow_dial_targets(&config.listen.connect, &addrman, max_out, &occupied);
     let ibd_targets = follow_dial_targets(&config.listen.connect, &addrman, candidate_n, &occupied);
     let catch_up = run_ibd_or_skip(
@@ -1799,15 +1799,18 @@ pub(crate) fn follow_dial_targets(
     connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
     max: usize,
-    occupied: &[SocketAddr],
+    occupied: &[rbitcoin_net::NetAddr],
 ) -> Vec<rbitcoin_net::NetAddr> {
     if !connect.is_empty() {
         connect.to_vec()
     } else {
-        book.take_outbound_occupied(max, occupied)
-            .into_iter()
-            .map(rbitcoin_net::NetAddr::Ip)
-            .collect()
+        let exclude: std::collections::HashSet<_> = occupied.iter().copied().collect();
+        let socks: Vec<SocketAddr> = occupied
+            .iter()
+            .copied()
+            .filter_map(rbitcoin_net::NetAddr::socket_addr)
+            .collect();
+        book.take_dial_candidates_net(max, &exclude, &socks)
     }
 }
 
@@ -1906,7 +1909,10 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8333,
         ))];
-        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
+        let occupied = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
+            8333,
+        ))];
         let want = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8333,
@@ -1936,9 +1942,28 @@ mod tests {
         let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 3, 0, 1)), 8333);
         am.add(same);
         am.add(other);
-        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
+        let occupied = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
+            8333,
+        ))];
         let got = follow_dial_targets(&[], &am, 1, &occupied);
         assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
+    }
+
+    #[test]
+    fn follow_dial_targets_picks_addrman_onion() {
+        let onion: rbitcoin_net::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let mut am = AddrMan::new();
+        am.set_only_net(vec![rbitcoin_net::OnlyNet::Onion]);
+        am.add_addr(onion);
+        assert_eq!(follow_dial_targets(&[], &am, 1, &[]), vec![onion]);
+        assert!(
+            follow_dial_targets(&[], &am, 1, &[onion]).is_empty(),
+            "live onion net must not be re-dialed via 0.0.0.0 hint"
+        );
     }
 
     #[test]

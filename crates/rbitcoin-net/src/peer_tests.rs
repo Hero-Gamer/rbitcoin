@@ -1502,6 +1502,13 @@ fn local_origin_not_inv_on_standing_peer() {
         }
         other => panic!("expected WTx inv, got {other:?}"),
     }
+    let tid = local.compute_txid();
+    assert!(hub.mempool().unwrap().is_local_origin(&tid));
+    assert_eq!(hub.mempool().unwrap().remove_for_block(&[tid]), 1);
+    assert!(
+        !hub.mempool().unwrap().is_local_origin(&tid),
+        "mempool evict must drop isolated skip"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

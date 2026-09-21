@@ -70,7 +70,8 @@ pub enum Dialer {
     #[default]
     Direct,
     Socks {
-        proxy: SocketAddr,
+        proxy: Option<SocketAddr>,
+        onion: Option<SocketAddr>,
         randomize: bool,
         shared_creds: Option<Arc<(Vec<u8>, Vec<u8>)>>,
     },
@@ -78,12 +79,24 @@ pub enum Dialer {
 
 impl Dialer {
     pub fn socks(proxy: SocketAddr, randomize: bool) -> Self {
+        Self::with_proxies(Some(proxy), None, randomize)
+    }
+
+    pub fn with_proxies(
+        proxy: Option<SocketAddr>,
+        onion: Option<SocketAddr>,
+        randomize: bool,
+    ) -> Self {
+        if proxy.is_none() && onion.is_none() {
+            return Self::Direct;
+        }
         let shared_creds = (!randomize).then(|| {
             let creds = ProxyCreds::fresh();
             Arc::new((creds.username, creds.password))
         });
         Self::Socks {
             proxy,
+            onion,
             randomize,
             shared_creds,
         }
@@ -110,14 +123,22 @@ impl Dialer {
                 proxy,
                 randomize,
                 shared_creds,
-            } => {
-                let creds = Self::dial_creds(*randomize, shared_creds.as_ref());
-                socks5_connect(*proxy, target, creds.as_ref()).await
-            }
+                ..
+            } => match proxy {
+                Some(proxy) => {
+                    let creds = Self::dial_creds(*randomize, shared_creds.as_ref());
+                    socks5_connect(*proxy, target, creds.as_ref()).await
+                }
+                None => Ok(TcpStream::connect(target).await?),
+            },
         }
     }
 
     pub async fn connect_domain(&self, host: &str, port: u16) -> Result<TcpStream, NetError> {
+        if host.ends_with(".onion") || host.ends_with(".b32.i2p") {
+            let addr: crate::NetAddr = format!("{host}:{port}").parse()?;
+            return self.connect_net(addr).await;
+        }
         match self {
             Dialer::Direct => {
                 let mut addrs = tokio::net::lookup_host((host, port)).await?;
@@ -128,17 +149,26 @@ impl Dialer {
                 proxy,
                 randomize,
                 shared_creds,
+                ..
             } => {
+                let Some(proxy) = proxy else {
+                    let mut addrs = tokio::net::lookup_host((host, port)).await?;
+                    let addr = addrs.next().ok_or(NetError::Protocol("dns lookup empty"))?;
+                    return self.connect(addr).await;
+                };
                 let creds = Self::dial_creds(*randomize, shared_creds.as_ref());
                 socks5_connect_domain(*proxy, host, port, creds.as_ref()).await
             }
         }
     }
 
-    pub async fn connect_isolated(&self, target: SocketAddr) -> Result<TcpStream, NetError> {
+    pub(crate) async fn connect_isolated(&self, target: SocketAddr) -> Result<TcpStream, NetError> {
         match self {
             Dialer::Direct => self.connect(target).await,
-            Dialer::Socks { proxy, .. } => dial_isolated(*proxy, target).await,
+            Dialer::Socks { proxy, .. } => match proxy {
+                Some(proxy) => dial_isolated(*proxy, target).await,
+                None => self.connect(target).await,
+            },
         }
     }
 
@@ -152,8 +182,11 @@ impl Dialer {
                 Dialer::Direct => Err(NetError::Encode(
                     "onion dial requires SOCKS (--proxy or --onion)".into(),
                 )),
-                Dialer::Socks { proxy, .. } => {
-                    dial_isolated_domain(*proxy, &addr.host_str(), port).await
+                Dialer::Socks { proxy, onion, .. } => {
+                    let socks = onion.or(*proxy).ok_or_else(|| {
+                        NetError::Encode("onion dial requires SOCKS (--proxy or --onion)".into())
+                    })?;
+                    dial_isolated_domain(socks, &addr.host_str(), port).await
                 }
             },
             crate::NetAddr::I2p { .. } => {
@@ -169,12 +202,24 @@ impl Dialer {
         match addr {
             crate::NetAddr::Ip(s) => self.connect(s).await,
             crate::NetAddr::Onion { port, .. } => {
-                if matches!(self, Dialer::Direct) {
+                let socks = match self {
+                    Dialer::Direct => None,
+                    Dialer::Socks { proxy, onion, .. } => onion.or(*proxy),
+                };
+                let Some(socks) = socks else {
                     return Err(NetError::Encode(
                         "onion dial requires SOCKS (--proxy or --onion)".into(),
                     ));
-                }
-                self.connect_domain(&addr.host_str(), port).await
+                };
+                let creds = match self {
+                    Dialer::Socks {
+                        randomize,
+                        shared_creds,
+                        ..
+                    } => Self::dial_creds(*randomize, shared_creds.as_ref()),
+                    Dialer::Direct => None,
+                };
+                socks5_connect_domain(socks, &addr.host_str(), port, creds.as_ref()).await
             }
             crate::NetAddr::I2p { .. } => {
                 crate::i2p_sam::stream_connect_installed(&addr.host_str()).await
@@ -217,16 +262,11 @@ async fn greet(s: &mut TcpStream, creds: Option<&ProxyCreds>) -> Result<(), NetE
             {
                 return Err(NetError::Protocol("socks username/password length"));
             }
-            s.write_all(&[5, 2, 0x00, 0x02]).await?;
+            s.write_all(&[5, 1, 0x02]).await?;
             let mut sel = [0u8; 2];
             s.read_exact(&mut sel).await?;
-            if sel[0] != 5 {
+            if sel[0] != 5 || sel[1] != 0x02 {
                 return Err(NetError::Protocol("socks method rejected"));
-            }
-            match sel[1] {
-                0x00 => return Ok(()),
-                0x02 => {}
-                _ => return Err(NetError::Protocol("socks method rejected")),
             }
             let mut auth = Vec::with_capacity(3 + c.username.len() + c.password.len());
             auth.push(1);
@@ -396,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn randomize_off_with_creds_still_connects_on_noauth_proxy() {
+    async fn socks_creds_offer_only_userpass() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = listener.local_addr().unwrap();
         let target = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 8333));
@@ -407,11 +447,23 @@ mod tests {
             let nmethods = ver_n[1] as usize;
             let mut methods = vec![0u8; nmethods];
             s.read_exact(&mut methods).await.unwrap();
-            assert!(
-                methods.contains(&0x00) && methods.contains(&0x02),
-                "{methods:?}"
+            assert_eq!(
+                methods,
+                vec![0x02],
+                "creds must not offer NOAUTH: {methods:?}"
             );
-            s.write_all(&[5, 0x00]).await.unwrap();
+            s.write_all(&[5, 0x02]).await.unwrap();
+            let mut ver = [0u8; 1];
+            s.read_exact(&mut ver).await.unwrap();
+            let mut ulen = [0u8; 1];
+            s.read_exact(&mut ulen).await.unwrap();
+            let mut user = vec![0u8; ulen[0] as usize];
+            s.read_exact(&mut user).await.unwrap();
+            let mut plen = [0u8; 1];
+            s.read_exact(&mut plen).await.unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            s.read_exact(&mut pass).await.unwrap();
+            s.write_all(&[1, 0]).await.unwrap();
             let mut hdr = [0u8; 4];
             s.read_exact(&mut hdr).await.unwrap();
             assert_eq!(hdr[3], 1);
@@ -763,5 +815,31 @@ mod tests {
             Dialer::Direct.connect_net(onion).await.is_err(),
             "onion must not TcpStream::connect / local DNS"
         );
+    }
+
+    #[tokio::test]
+    async fn onion_only_dialer_keeps_clearnet_direct() {
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let onion_proxy = socks.local_addr().unwrap();
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let _ = echo.accept().await;
+        });
+        let d = Dialer::with_proxies(None, Some(onion_proxy), false);
+        d.connect(echo_addr).await.unwrap();
+        echo_task.await.unwrap();
+
+        let server = tokio::spawn(accept_domain_connect(
+            socks,
+            b"pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+            8333,
+        ));
+        d.connect_net(onion).await.unwrap();
+        server.await.unwrap();
     }
 }

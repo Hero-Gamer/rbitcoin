@@ -674,9 +674,7 @@ pub async fn ibd_cancellable(
                         let mut n = 0usize;
                         for s in result.slots {
                             // Race: same addr may have connected on another path.
-                            if blocked.contains(&crate::NetAddr::Ip(s.addr))
-                                || st.slots.iter().any(|x| x.addr == s.addr)
-                            {
+                            if blocked.contains(&s.net) || st.slots.iter().any(|x| x.net == s.net) {
                                 warn!(
                                     "ibd: drop duplicate/cooldown dial peer[{}] {}",
                                     s.id, s.addr

@@ -155,7 +155,7 @@ impl DialTarget {
 
     pub fn net_addr(&self) -> crate::NetAddr {
         match self {
-            Self::Socket(addr) => crate::NetAddr::Ip(*addr),
+            Self::Socket(addr) => crate::NetAddr::from_socket(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
                 .expect("DialTarget::Domain is host:port from overlay NetAddr"),
@@ -475,11 +475,12 @@ impl LivePeer {
             }
             if let Some(sock) = sock {
                 rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(sock, self.id));
+                let net = crate::NetAddr::from_socket(sock);
                 v.push(AddrV2Message {
                     time: t,
                     services,
-                    addr: crate::NetAddr::Ip(sock).to_addrv2(),
-                    port: sock.port(),
+                    addr: net.to_addrv2(),
+                    port: net.port(),
                 });
             }
             if v.is_empty() {
@@ -487,7 +488,10 @@ impl LivePeer {
             }
             Some(NetworkMessage::AddrV2(v))
         } else {
-            let sock = sock?;
+            let sock = match sock {
+                Some(s) if matches!(crate::NetAddr::from_socket(s), crate::NetAddr::Ip(_)) => s,
+                _ => return None,
+            };
             rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(sock, self.id));
             Some(NetworkMessage::Addr(vec![(
                 t,
@@ -1130,9 +1134,8 @@ pub struct PeerHub {
     pending_outbound_nonces: Mutex<HashSet<u64>>,
     /// Shared addrman for GetAddr responses (optional until node wires it).
     addrman: Mutex<Option<std::sync::Arc<Mutex<crate::seeds::AddrMan>>>>,
-    /// Per-listen GetAddr cache: canonical bind → (cached_at, addrs).
-    addr_response_cache:
-        Mutex<HashMap<SocketAddr, (u64, Vec<(u32, bitcoin::p2p::address::Address)>)>>,
+    /// Per-listen GetAddr cache: canonical bind + addrv2 → (cached_at, addrs).
+    addr_response_cache: Mutex<HashMap<(SocketAddr, bool), (u64, Vec<(u32, crate::NetAddr)>)>>,
     /// VERSION/VERACK handshake timeout seconds. Default 60.
     peer_timeout_secs: AtomicU64,
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
@@ -1404,19 +1407,20 @@ impl PeerHub {
 
     /// Core GetAddr reply: per-listen cache (24h) of
     /// [`crate::peer::MAX_ADDR_TO_SEND`] / [`crate::peer::MAX_PCT_ADDR_TO_SEND`]
-    /// of addrman.
-    pub fn addr_response_for_bind(
+    /// of addrman. `v2` includes onion / i2p / CJDNS; v1 ADDR is clearnet `Ip`.
+    pub(crate) fn addr_response_net(
         &self,
         bind: SocketAddr,
-    ) -> Vec<(u32, bitcoin::p2p::address::Address)> {
+        v2: bool,
+    ) -> Vec<(u32, crate::NetAddr)> {
         const CACHE_SECS: u64 = 24 * 60 * 60;
-        let bind = canonical_bind(bind);
+        let key = (canonical_bind(bind), v2);
         let now = self.now_secs();
         let mut cache = self
             .addr_response_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_at, addrs)) = cache.get(&bind) {
+        if let Some((cached_at, addrs)) = cache.get(&key) {
             if now.saturating_sub(*cached_at) < CACHE_SECS {
                 return addrs.clone();
             }
@@ -1432,9 +1436,10 @@ impl PeerHub {
             let g = am.lock().unwrap_or_else(|e| e.into_inner());
             g.entries()
         };
-        let addrs: Vec<SocketAddr> = entries
+        let addrs: Vec<crate::NetAddr> = entries
             .iter()
-            .filter_map(|e| e.addr.socket_addr())
+            .map(|e| e.addr)
+            .filter(|a| v2 || matches!(a, crate::NetAddr::Ip(_)))
             .collect();
         let n = addrs.len();
         let pct_cap = (n * crate::peer::MAX_PCT_ADDR_TO_SEND / 100).max(1);
@@ -1443,23 +1448,37 @@ impl PeerHub {
             return Vec::new();
         }
         let mut idxs: Vec<usize> = (0..n).collect();
-        let mut state = addr_sample_seed(bind, now);
+        let mut state = addr_sample_seed(key.0, now);
         for i in (1..idxs.len()).rev() {
             state = mix64(state);
             let j = (state as usize) % (i + 1);
             idxs.swap(i, j);
         }
-        let services = crate::peer::local_service_flags();
         let mut out = Vec::with_capacity(cap);
         for &i in idxs.iter().take(cap) {
-            let addr = addrs[i];
-            out.push((
-                now as u32,
-                bitcoin::p2p::address::Address::new(&addr, services),
-            ));
+            out.push((now as u32, addrs[i]));
         }
-        cache.insert(bind, (now, out.clone()));
+        cache.insert(key, (now, out.clone()));
         out
+    }
+
+    /// v1 ADDR view of [`Self::addr_response_net`] (clearnet `Ip` only).
+    pub fn addr_response_for_bind(
+        &self,
+        bind: SocketAddr,
+    ) -> Vec<(u32, bitcoin::p2p::address::Address)> {
+        let services = crate::peer::local_service_flags();
+        self.addr_response_net(bind, false)
+            .into_iter()
+            .filter_map(|(t, a)| match a {
+                crate::NetAddr::Ip(s) => {
+                    Some((t, bitcoin::p2p::address::Address::new(&s, services)))
+                }
+                crate::NetAddr::Onion { .. }
+                | crate::NetAddr::I2p { .. }
+                | crate::NetAddr::Cjdns { .. } => None,
+            })
+            .collect()
     }
 
     /// Core: register local version nonce while an outbound handshake is open.
@@ -2119,10 +2138,13 @@ impl PeerHub {
     }
 
     pub fn dial_net(&self, addr: crate::NetAddr, typ: PeerConnType) -> Result<(), String> {
-        match addr.socket_addr() {
-            Some(ip) => self.dial(ip, typ),
-            None => self.dial_domain(addr.host_str(), addr.port(), typ),
-        }
+        let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = g.as_ref().ok_or("no dialer attached")?;
+        tx.send(DialRequest {
+            target: DialTarget::from_net(addr),
+            typ,
+        })
+        .map_err(|_| "dialer closed".to_string())
     }
 
     /// Outbound full-relay sessions eligible for stale-tip slot rotation.
@@ -2157,11 +2179,19 @@ impl PeerHub {
 
     /// Live outbound full-relay addrs (not `noban`-gated) for diversity occupied.
     pub fn live_outbound_full_relay_addrs(&self) -> Vec<SocketAddr> {
-        let mut rows: Vec<(u64, SocketAddr)> = self
+        self.live_outbound_full_relay_nets()
+            .into_iter()
+            .filter_map(crate::NetAddr::socket_addr)
+            .collect()
+    }
+
+    /// Overlay identity of live outbound full-relay peers (exclude for redial).
+    pub fn live_outbound_full_relay_nets(&self) -> Vec<crate::NetAddr> {
+        let mut rows: Vec<(u64, crate::NetAddr)> = self
             .live_peers()
             .into_iter()
             .filter(|p| p.conn_type == PeerConnType::OutboundFullRelay && !p.inbound)
-            .map(|p| (p.id, p.addr))
+            .map(|p| (p.id, p.net))
             .collect();
         rows.sort_unstable_by_key(|(id, _)| *id);
         rows.into_iter().map(|(_, a)| a).collect()
@@ -3306,6 +3336,26 @@ mod tests {
             DialTarget::from_net(addr),
             DialTarget::Socket(SocketAddr::from((ip, 8333)))
         );
+        assert_eq!(DialTarget::from_net(addr).net_addr(), addr);
+    }
+
+    #[test]
+    fn dial_target_onion_and_i2p_roundtrip() {
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let t = DialTarget::from_net(onion);
+        assert!(matches!(t, DialTarget::Domain { .. }), "{t:?}");
+        assert_eq!(t.net_addr(), onion);
+
+        let i2p = crate::NetAddr::I2p {
+            dest: [7u8; 32],
+            port: 8333,
+        };
+        let t = DialTarget::from_net(i2p);
+        assert!(matches!(t, DialTarget::Domain { .. }), "{t:?}");
+        assert_eq!(t.net_addr(), i2p);
     }
 
     #[test]
@@ -3348,5 +3398,88 @@ mod tests {
             IpAddr::V6(Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7))
         );
         assert_eq!(sock.port(), 8333);
+    }
+
+    #[test]
+    fn getaddr_sample_keeps_overlay_addrs() {
+        use std::net::Ipv6Addr;
+
+        fn sample(addr: crate::NetAddr) -> (Vec<crate::NetAddr>, usize) {
+            let hub = PeerHub::new();
+            let mut am = crate::seeds::AddrMan::new();
+            am.add_addr(addr);
+            hub.set_addrman(Arc::new(Mutex::new(am)));
+            let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
+            let got: Vec<_> = hub
+                .addr_response_net(bind, true)
+                .into_iter()
+                .map(|(_, a)| a)
+                .collect();
+            (got, hub.addr_response_for_bind(bind).len())
+        }
+
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let i2p = crate::NetAddr::I2p {
+            dest: [0x11u8; 32],
+            port: 8333,
+        };
+        let cjdns = crate::NetAddr::Cjdns {
+            ip: Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7),
+            port: 8333,
+        };
+        let ip = crate::NetAddr::Ip(SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 8333)));
+        for overlay in [onion, i2p, cjdns] {
+            let (got, v1) = sample(overlay);
+            assert_eq!(got, vec![overlay], "{overlay}");
+            assert_eq!(v1, 0, "v1 ADDR omits overlay {overlay}");
+        }
+        let (got, v1) = sample(ip);
+        assert_eq!(got, vec![ip]);
+        assert_eq!(v1, 1);
+    }
+
+    #[test]
+    fn self_announce_cjdns_uses_addrv2_cjdns() {
+        use bitcoin::p2p::address::{AddrV2, Address};
+        use bitcoin::p2p::message::NetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use std::net::Ipv6Addr;
+
+        let hub = PeerHub::new();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: 1,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let v1_peer = hub.register(addr, addr, &ver, false, PeerConnType::OutboundFullRelay);
+        hub.set_discover(true);
+        hub.set_clearnet_listen(true);
+        hub.set_cjdns_reachable(true);
+        hub.set_listen_port(8333);
+        hub.set_external_ips(vec![IpAddr::V6(Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7))]);
+        assert!(
+            v1_peer.take_self_announce_msg().is_none(),
+            "v1 ADDR must not re-encode CJDNS as IPv6"
+        );
+        let v2_peer = hub.register(addr, addr, &ver, false, PeerConnType::OutboundFullRelay);
+        v2_peer.set_wants_addrv2();
+        match v2_peer.take_self_announce_msg().expect("cjdns addrv2") {
+            NetworkMessage::AddrV2(v) => {
+                assert_eq!(v.len(), 1, "{v:?}");
+                assert!(matches!(v[0].addr, AddrV2::Cjdns(_)), "{v:?}");
+                assert_eq!(v[0].port, 8333);
+            }
+            other => panic!("expected AddrV2 CJDNS, got {other:?}"),
+        }
     }
 }

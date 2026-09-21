@@ -95,7 +95,7 @@ pub struct ListenOpts {
     pub peer_timeout_secs: Option<u64>,
     /// SOCKS5 for all P2P outbound (`--proxy`).
     pub proxy: Option<SocketAddr>,
-    /// SOCKS5 for onion destinations (`--onion`); stored until plan 02.
+    /// SOCKS5 for onion destinations (`--onion`); clearnet stays `--proxy` or direct.
     pub onion: Option<SocketAddr>,
     /// Fresh SOCKS USERPASS per peer (Core `-proxyrandomize`; default on).
     pub proxy_randomize: bool,
@@ -143,17 +143,11 @@ impl Default for ListenOpts {
 
 impl ListenOpts {
     pub fn dialer(&self) -> rbitcoin_net::Dialer {
-        match self.proxy {
-            None => rbitcoin_net::Dialer::Direct,
-            Some(proxy) => rbitcoin_net::Dialer::socks(proxy, self.proxy_randomize),
-        }
+        rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, self.proxy_randomize)
     }
 
     pub fn isolated_dialer(&self) -> rbitcoin_net::Dialer {
-        match self.proxy.or(self.onion) {
-            Some(proxy) => rbitcoin_net::Dialer::socks(proxy, true),
-            None => rbitcoin_net::Dialer::Direct,
-        }
+        rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, true)
     }
 
     pub fn p2p_bind_addr(&self, network: Network) -> Option<SocketAddr> {

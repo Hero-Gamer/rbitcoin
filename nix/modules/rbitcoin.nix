@@ -253,6 +253,7 @@ in
         "ipv6"
         "onion"
         "i2p"
+        "cjdns"
       ]);
       default = [ ];
       description = "Restrict P2P to these networks. onion requires proxy or onionProxy; i2p requires i2p.sam.";
