@@ -390,13 +390,25 @@ fn file_starts_with_shsr(path: &Path) -> bool {
     matches!(f.read_exact(&mut magic), Ok(())) && magic == *b"SHSR"
 }
 
-fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) -> PathBuf {
+pub(crate) fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) -> PathBuf {
     let p = dir.join("scripthash.head");
     if n_shards <= 1 && p.is_file() {
         p
     } else {
         p.join(format!("{shard:02x}"))
     }
+}
+
+/// Dummy 32 B key in `shard` whose bytes 4..8 encode `slot` (postings pack grouping).
+fn pack_key_for_slot(shard: usize, n_shards: usize, slot: u32) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    let n = n_shards.max(1);
+    if n > 1 {
+        let bits = n.trailing_zeros();
+        k[0] = (shard as u8) << (8 - bits as u8);
+    }
+    k[4..8].copy_from_slice(&slot.to_le_bytes());
+    k
 }
 
 fn open_sorted_main_shards(
@@ -2499,6 +2511,7 @@ impl ScriptHashTable {
             resume_from_shard: 0,
             active_shard: None,
             recs: Vec::new(),
+            slot_words: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
@@ -2547,6 +2560,7 @@ impl ScriptHashTable {
             resume_from_shard: 0,
             active_shard: Some(shard),
             recs: Vec::new(),
+            slot_words: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
@@ -2609,6 +2623,7 @@ impl ScriptHashTable {
             resume_from_shard: progress.next_shard,
             active_shard: None,
             recs: Vec::new(),
+            slot_words: Vec::new(),
             key_budget,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH),
             body_write_off: bump,
@@ -2636,6 +2651,18 @@ impl ScriptHashTable {
     /// Dir variant: shard 0's bump (each shard file has its own SHAL).
     pub fn alloc_bump(&self) -> u64 {
         self.allocs[0].lock().unwrap().bump
+    }
+
+    /// Pass-1 BDZ singles already inline in `head/NN` (not yet packed body).
+    pub(crate) fn set_extract_inline_creates(
+        &self,
+        shard: usize,
+        n: u64,
+    ) -> Result<(), StoreError> {
+        let body = self.shard_body(shard);
+        let mut g = self.shard_alloc(shard).lock().unwrap();
+        g.live_count = n;
+        write_alloc_header(body, &g)
     }
 
     /// Seal `recs` as sorted main shard `shard` and publish alloc HWM.
@@ -2683,7 +2710,15 @@ impl ScriptHashTable {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let sealed = MphfHead::write_pack8(&path, &pack.recs)?;
+        let sealed = if MphfHead::exists(&path) {
+            let h = MphfHead::open(&path)?;
+            if !pack.slot_words.is_empty() {
+                h.rewrite_val_slots(&pack.slot_words)?;
+            }
+            h
+        } else {
+            MphfHead::write_pack8(&path, &pack.recs)?
+        };
         self.install_sorted_main(shard, sealed);
         let body = self.shard_body(shard);
         if bump > body.logical_len() {
@@ -2725,6 +2760,8 @@ pub struct ScriptHashBulkSession<'a> {
     active_shard: Option<usize>,
     /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
     recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
+    /// MPHF slot + pack8 when packing fuse-hit postings (pass 2).
+    slot_words: Vec<(u32, u64)>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
     /// Sequential slab bytes; flushed at [`BULK_BODY_FLUSH`] or before a
@@ -2755,17 +2792,21 @@ pub struct ScriptHashBulkSession<'a> {
 /// One shard packed onto its live body, ready for ordered head publish.
 pub struct ShShardPack {
     pub recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
+    pub slot_words: Vec<(u32, u64)>,
     pub creates: u64,
     pub max_fk: u64,
     pub keys: u64,
     pub bump: u64,
     pub body_flush_ns: u64,
     pub pack_ns: u64,
+    /// Fuse-hit postings with one unique create_fk (left inline; no body).
+    pub fp_singles: u64,
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
 struct BulkOpenKey {
     key: [u8; 32],
+    slot: Option<u32>,
     buf: Vec<u64>,
     stream_used: usize,
     n_total: u32,
@@ -2875,16 +2916,18 @@ impl<'a> ScriptHashBulkSession<'a> {
         }
         self.finish_key()?;
         self.flush_body()?;
-        let persist_live = self.live_count;
+        let persist_live = self.committed_live_count.saturating_add(self.live_count);
         self.persist_session_alloc(persist_live, self.bump)?;
         let pack = ShShardPack {
             recs: std::mem::take(&mut self.recs),
+            slot_words: std::mem::take(&mut self.slot_words),
             creates: self.live_count,
             max_fk: self.max_fk,
             keys: self.keys_written,
             bump: self.bump,
             body_flush_ns: self.body_flush_ns,
             pack_ns: self.pack_ns,
+            fp_singles: 0,
         };
         self.finished = true;
         Ok(pack)
@@ -2909,6 +2952,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             let buf = self.take_fk_scratch();
             self.open_key = Some(BulkOpenKey {
                 key,
+                slot: None,
                 buf,
                 stream_used: 0,
                 n_total: 0,
@@ -2955,6 +2999,22 @@ impl<'a> ScriptHashBulkSession<'a> {
         open.n_total = open.n_total.saturating_add(1);
         if fk.0 > self.max_fk {
             self.max_fk = fk.0;
+        }
+        Ok(())
+    }
+
+    /// Stream one create_fk for MPHF `slot` (postings pack; keys grouped by slot).
+    pub fn push_sorted_slot_fk(&mut self, slot: u32, fk: Fk) -> Result<(), StoreError> {
+        if fk.is_null() {
+            return Ok(());
+        }
+        let si = self.active_shard.ok_or(StoreError::Corrupt(
+            "scripthash pack slot stream requires pack_shard_session",
+        ))?;
+        let key = pack_key_for_slot(si, self.table.head_shard_count(), slot);
+        self.push_sorted_fk(key, fk)?;
+        if let Some(open) = self.open_key.as_mut() {
+            open.slot = Some(slot);
         }
         Ok(())
     }
@@ -3015,6 +3075,9 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
         let rec = (head_key_from_full(&open.key), pack8(&val)?);
+        if let Some(slot) = open.slot {
+            self.slot_words.push((slot, rec.1));
+        }
         self.recs.push(rec);
         self.peak_table_bytes = self
             .peak_table_bytes

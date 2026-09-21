@@ -43,16 +43,8 @@ pub fn mix_key16(key: &ShHeadKey) -> u64 {
     fuse_key_from_mixed(&pad)
 }
 
-fn mix64_keys_unique(recs: &[(ShHeadKey, u64)]) -> Result<Vec<u64>, StoreError> {
-    let keys: Vec<u64> = recs.iter().map(|(k, _)| mix_key16(k)).collect();
-    if keys.len() >= 2 {
-        let mut sorted = keys.clone();
-        sorted.sort_unstable();
-        if sorted.windows(2).any(|w| w[0] == w[1]) {
-            return Err(StoreError::Corrupt("sh mphf: mix64 collision"));
-        }
-    }
-    Ok(keys)
+pub(crate) fn mix64_keys(recs: &[(ShHeadKey, u64)]) -> Vec<u64> {
+    recs.iter().map(|(k, _)| mix_key16(k)).collect()
 }
 
 impl MphfHead {
@@ -92,12 +84,20 @@ impl MphfHead {
         base: impl AsRef<Path>,
         recs: &[(ShHeadKey, u64)],
     ) -> Result<Self, StoreError> {
+        let keys = mix64_keys(recs);
+        Self::write_pack8_mixed(base, recs, &keys)
+    }
+
+    pub(crate) fn write_pack8_mixed(
+        base: impl AsRef<Path>,
+        recs: &[(ShHeadKey, u64)],
+        keys: &[u64],
+    ) -> Result<Self, StoreError> {
         let base = base.as_ref();
         if let Some(parent) = base.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let keys = mix64_keys_unique(recs)?;
-        let mphf = BdzMphf::build_compact(&keys)?;
+        let mphf = BdzMphf::build_compact(keys)?;
         let n = recs.len();
         let mut val = vec![0u8; n.saturating_mul(8)];
         let mut tags = vec![0u8; n.saturating_mul(8)];
@@ -123,6 +123,30 @@ impl MphfHead {
         let vp = val_path(base);
         crate::file::write_synced_tmp_rename(&vp, &val)?;
         Self::open(base)
+    }
+
+    /// MPHF slot for a key known to be in the set (no tag pread).
+    pub fn slot_for_key16(&self, key: &ShHeadKey) -> Result<u32, StoreError> {
+        if self.mphf.n() == 0 {
+            return Err(StoreError::Corrupt("sh mphf: empty shard has key"));
+        }
+        self.mphf.index(mix_key16(key))
+    }
+
+    /// Overwrite pack8 words by MPHF slot (pass-2 pack; does not rebuild BDZ).
+    pub fn rewrite_val_slots(&self, words: &[(u32, u64)]) -> Result<(), StoreError> {
+        let n = self.mphf.n();
+        for &(slot, w) in words {
+            if slot >= n {
+                return Err(StoreError::Corrupt("sh mphf: slot OOB"));
+            }
+            pwrite_file(&self.val_file, u64::from(slot) * 8, &w.to_le_bytes())
+                .map_err(|e| StoreError::io(val_path(&self.base), e))?;
+        }
+        self.val_file
+            .sync_data()
+            .map_err(|e| StoreError::io(val_path(&self.base), e))?;
+        Ok(())
     }
 
     pub fn open(base: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -359,15 +383,41 @@ mod tests {
     }
 
     #[test]
-    fn sh_mphf_duplicate_key16_is_mix64_collision() {
+    fn sh_mphf_write_keys_zero_val_then_rewrite_slots() {
+        let dir = tmp();
+        let base = dir.join("00");
+        let k1 = key(1);
+        let k2 = key(2);
+        let h = MphfHead::write_pack8(&base, &[(k1, 0), (k2, 0)]).unwrap();
+        assert!(h.get(&k1).unwrap().unwrap().is_empty());
+        let s1 = h.slot_for_key16(&k1).unwrap();
+        let s2 = h.slot_for_key16(&k2).unwrap();
+        let a = pack8(&ShHeadValue::inline_one(Fk(11))).unwrap();
+        let b = pack8(&ShHeadValue::inline_one(Fk(22))).unwrap();
+        h.rewrite_val_slots(&[(s1, a), (s2, b)]).unwrap();
+        assert_eq!(
+            h.get(&k1).unwrap().unwrap(),
+            ShHeadValue::inline_one(Fk(11))
+        );
+        assert_eq!(
+            h.get(&k2).unwrap().unwrap(),
+            ShHeadValue::inline_one(Fk(22))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sh_mphf_duplicate_key16_does_not_clone_sort_mix64() {
         let dir = tmp();
         let base = dir.join("00");
         let a = ShHeadValue::inline_one(Fk(11));
         let recs = [(key(1), pack8(&a).unwrap()), (key(1), pack8(&a).unwrap())];
         match MphfHead::write_pack8(&base, &recs) {
-            Err(StoreError::Corrupt(m)) if m.contains("mix64 collision") => {}
-            Err(e) => panic!("expected mix64 collision, got {e}"),
-            Ok(_) => panic!("expected mix64 collision"),
+            Err(StoreError::Corrupt(m)) if m.contains("mix64 collision") => {
+                panic!("mix64 clone-sort is not the collision path: {m}")
+            }
+            Err(StoreError::Corrupt(_)) | Ok(_) => {}
+            Err(e) => panic!("unexpected {e}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

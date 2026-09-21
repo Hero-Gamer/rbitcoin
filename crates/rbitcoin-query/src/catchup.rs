@@ -860,7 +860,10 @@ mod tests {
         let done_last = rbitcoin_store::unsorted_done_last_fk(&udir, n_shards).unwrap();
         extend_direct_chain(&q, 2);
         assert!(q.store.txs.count() > done_last);
-        assert!(!q.store.scripthash.has_durable_index());
+        assert!(
+            !q.store.scripthash.unsealed_main_shards().is_empty(),
+            "RAM merge writes head files; pack seal is later"
+        );
         let _ = q.finalize_sh_runs().unwrap();
         let sh_old = rbitcoin_store::script_hash(&[0x51, 0]);
         let sh_new = rbitcoin_store::script_hash(&[0x51, 3]);

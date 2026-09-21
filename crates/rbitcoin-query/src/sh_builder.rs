@@ -1,5 +1,5 @@
-//! Post-IBD scripthash collect: one Class A pass into unsorted per-shard
-//! files, then in-place unique-sort + seal.
+//! Post-IBD scripthash collect: two Class A `txout` scans (unique key16,
+//! then fuse-hit postings), then pack + seal.
 //!
 //! Direct confirm does **not** enqueue SH. A durable head never enters this
 //! path (write-behind / `recover_sh_writebehind` instead). Leftover
