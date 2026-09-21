@@ -130,6 +130,37 @@
             '';
           };
         }
+        // nixpkgs.lib.optionalAttrs (builtins.elem system systems) {
+          # Private Tor / i2pd / cjdns meshes for scripts/overlay-functional.
+          # Not the default shell: extra daemons, Linux-only (cjdns TUN).
+          overlayFunctional = pkgs.mkShell {
+            packages = with pkgs; [
+              rustc
+              cargo
+              rustfmt
+              clippy
+              llvmPackages.bintools
+              llvmPackages.llvm
+              pkg-config
+              python3
+              tor
+              i2pd
+              cjdns
+              iproute2
+              procps
+              iputils
+            ];
+            RUST_BACKTRACE = "1";
+            RUSTFLAGS = "-Dwarnings";
+            shellHook = ''
+              export OVERLAY_IN_NIX=1
+              if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
+                export CARGO_TARGET_DIR="$PWD/target/dev"
+              fi
+              echo "rbitcoin overlayFunctional: rustc=$(rustc --version) tor=$(tor --version | head -n1) CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+            '';
+          };
+        }
       );
 
       # `nix flake check` can validate the package builds on the current system.

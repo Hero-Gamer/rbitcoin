@@ -50,5 +50,14 @@ path = "tests/core_analogs.rs"
 name = "cross_surface"
 path = "tests/cross_surface.rs"
 
+[features]
+# Live private-mesh journeys. Default `cargo test` stays fake SOCKS/SAM/control.
+overlay = []
+
+[[test]]
+name = "overlay"
+path = "tests/overlay.rs"
+required-features = ["overlay"]
+
 [lints]
 workspace = true

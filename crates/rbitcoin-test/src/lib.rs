@@ -4,6 +4,8 @@
 
 pub mod chain_fixture;
 pub mod mine;
+#[cfg(feature = "overlay")]
+pub mod overlay;
 
 pub use chain_fixture::{
     assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,

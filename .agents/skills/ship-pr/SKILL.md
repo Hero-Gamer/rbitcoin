@@ -82,6 +82,7 @@ Suite and budgets: [`TESTING.md`](../../../TESTING.md).
 | After Green | `cargo test --workspace --quiet` |
 | After Refactor, before commit | Local CI except coverage (below) |
 | Core functional CI red | [core-functional skill](../core-functional/SKILL.md) |
+| Overlay functional CI red | [overlay-functional skill](../overlay-functional/SKILL.md) |
 | Never local | `./scripts/coverage.sh`, `nix build .#rbitcoin-musl`, host IBD |
 
 Redirect every command above (stdout and stderr to `/tmp`, print `EXIT`,
@@ -120,6 +121,9 @@ not operator zips.
 
 Label `core-functional` when the PR touches that harness, and on every ship
 version-bump PR. Do not label ordinary net or RPC PRs.
+Label `overlay-functional` when the PR touches that harness, and on every
+ship version-bump PR. Poll with `--interest overlay-functional`. It is not
+a required check.
 Label `nixos-module-runtime` when the NixOS module VM test should run (not
 eval). Poll with `--interest nixos-module-runtime`. It is not a required
 check.

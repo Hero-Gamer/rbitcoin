@@ -127,6 +127,8 @@ jobs:
         run: ./scripts/ci-os-smoke.test.sh
       - name: pr-checks-watch self-test
         run: ./scripts/pr-checks-watch.test.sh
+      - name: overlay-functional runner self-test
+        run: ./scripts/overlay-functional/run.sh.test.sh
       - name: cargo test
         run: cargo test --workspace
 
