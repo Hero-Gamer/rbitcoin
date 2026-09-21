@@ -64,6 +64,8 @@ a["router"]["dnsSeeds"] = []
 b["router"]["dnsSeeds"] = []
 a["security"] = [{"keepNetAdmin": 1}, {"noforks": 1}, {"setupComplete": 1}]
 b["security"] = [{"keepNetAdmin": 1}, {"noforks": 1}, {"setupComplete": 1}]
+a["logging"] = {"logTo": "stdout"}
+b["logging"] = {"logTo": "stdout"}
 a["admin"]["bind"] = f"127.0.0.1:{admin_a}"
 b["admin"]["bind"] = f"127.0.0.1:{admin_b}"
 a["pipe"] = f"{root}/a.cjdns.sock"
@@ -88,17 +90,33 @@ PY
 
 CJDNS_BIN="$(command -v cjdroute)"
 
-# Open the conf inside sudo. `sudo cjdroute <conf &` often gets a closed
-# stdin on GitHub Actions, so the Angel cancels the core immediately.
+# cjdroute reads stdin until EOF as JSON conf, then `--nobg` keeps the
+# client in the event loop so the core is not reaped (parent would
+# otherwise `return 0`). setsid: cargo/nix must not SIGHUP the pair.
 start_cjdroute() {
   local name="$1"
-  sudo bash -c 'exec "$1" <"$2" >"$3" 2>&1' _ "$CJDNS_BIN" "$ROOT/$name.conf" "$ROOT/$name.log" &
+  sudo bash -c 'exec setsid "$1" --nobg <"$2" >"$3" 2>&1' \
+    _ "$CJDNS_BIN" "$ROOT/$name.conf" "$ROOT/$name.log" &
   echo $! >"$ROOT/$name.pid"
 }
 
+wait_tun() {
+  local dev="$1"
+  local i
+  for i in $(seq 1 50); do
+    if ip link show "$dev" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "cjdns: $dev never appeared" >&2
+  return 1
+}
+
 start_cjdroute a
-sleep 1
+wait_tun rbtc0
 start_cjdroute b
+wait_tun rbtc1
 
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
@@ -155,6 +173,29 @@ then
   sudo ip -6 route get "$IPV6_B" >&2 || true
   exit 1
 fi
+
+for name in a b; do
+  if [[ ! -f "$ROOT/$name.pid" ]] || ! kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+    echo "cjdns: $name not running after TCP wait" >&2
+    tail -n 40 "$ROOT/$name.log" >&2 || true
+    exit 1
+  fi
+done
+# GHA: angel/core can crash ~1s after the first TCP; require the addrs
+# still bind after a settle so we do not hand a dead TUN to the journey.
+sleep 2
+python3 - "$IPV6_A" "$IPV6_B" <<'PY'
+import socket, sys
+for ip in sys.argv[1:]:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        s.bind((ip, 0))
+    except OSError as e:
+        print(f"cjdns: bind {ip} after settle: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        s.close()
+PY
 
 cat >"$ROOT/env" <<EOF
 OVERLAY_CJDNS_A=${IPV6_A}
