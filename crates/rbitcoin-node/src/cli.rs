@@ -720,6 +720,26 @@ mod tests {
         assert!(split.listen.proxy.is_some());
         assert!(split.listen.onion.is_some());
         assert_ne!(split.listen.proxy, split.listen.onion);
+
+        let h = operator_usage();
+        assert!(h.contains("--proxy"), "help must list kebab --proxy");
+        assert!(h.contains("--onion"), "help must list kebab --onion");
+        assert!(
+            h.contains("--proxy-randomize"),
+            "help must list kebab --proxy-randomize"
+        );
+    }
+
+    #[test]
+    fn onion_only_dialer_does_not_socks_clearnet() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        let split = ready_config([
+            "rbitcoin-node",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--onion",
+            "127.0.0.1:9051",
+        ]);
         match split.listen.dialer() {
             rbitcoin_net::Dialer::Socks { proxy, onion, .. } => {
                 assert_eq!(proxy, split.listen.proxy);
@@ -751,14 +771,6 @@ mod tests {
             }
             other => panic!("expected onion-only isolated dialer, got {other:?}"),
         }
-
-        let h = operator_usage();
-        assert!(h.contains("--proxy"), "help must list kebab --proxy");
-        assert!(h.contains("--onion"), "help must list kebab --onion");
-        assert!(
-            h.contains("--proxy-randomize"),
-            "help must list kebab --proxy-randomize"
-        );
     }
 
     #[test]
