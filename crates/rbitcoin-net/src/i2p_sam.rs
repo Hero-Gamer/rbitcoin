@@ -4,12 +4,21 @@ use crate::error::NetError;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
+
+struct Installed {
+    dialer: I2pDialer,
+    _keepalive: Option<TcpStream>,
+}
 
 pub struct I2pSam {
     sam_addr: SocketAddr,
     session_id: String,
+    destination: String,
     _control: TcpStream,
     _forward: Option<TcpStream>,
 }
@@ -18,6 +27,61 @@ pub struct I2pSam {
 pub struct I2pDialer {
     sam_addr: SocketAddr,
     session_id: String,
+    destination: String,
+}
+
+pub fn install(dialer: I2pDialer) {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
+        dialer,
+        _keepalive: None,
+    });
+}
+
+fn install_kept(dialer: I2pDialer, keepalive: TcpStream) {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
+        dialer,
+        _keepalive: Some(keepalive),
+    });
+}
+
+pub async fn stream_connect_installed(dest_b32: &str) -> Result<TcpStream, NetError> {
+    let first = installed()?;
+    match first.stream_connect(dest_b32).await {
+        Ok(s) => Ok(s),
+        Err(e) if session_dead(&e) => {
+            let (fresh, keepalive) = first.recreate_session().await?;
+            install_kept(fresh.clone(), keepalive);
+            fresh.stream_connect(dest_b32).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn installed() -> Result<I2pDialer, NetError> {
+    INSTALLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.dialer.clone())
+        .ok_or_else(|| NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
+}
+
+fn session_dead(err: &NetError) -> bool {
+    match err {
+        NetError::Io(_) | NetError::Disconnected => true,
+        NetError::Encode(s) => {
+            let up = s.to_ascii_uppercase();
+            up.contains("INVALID_ID")
+                || up.contains("CONNECTION CLOSED")
+                || up.contains("STREAM CONNECT:")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn clear_installed() {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 impl I2pSam {
@@ -86,6 +150,7 @@ impl I2pSam {
             Self {
                 sam_addr,
                 session_id,
+                destination: destination.clone(),
                 _control: control,
                 _forward: None,
             },
@@ -101,7 +166,13 @@ impl I2pSam {
         I2pDialer {
             sam_addr: self.sam_addr,
             session_id: self.session_id.clone(),
+            destination: self.destination.clone(),
         }
+    }
+
+    fn into_keepalive(self) -> (I2pDialer, TcpStream) {
+        let dialer = self.dialer();
+        (dialer, self._control)
     }
 
     pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
@@ -142,6 +213,11 @@ impl I2pDialer {
             return Err(NetError::Encode(format!("i2p sam stream: {reply}")));
         }
         Ok(s)
+    }
+
+    async fn recreate_session(&self) -> Result<(Self, TcpStream), NetError> {
+        let (sam, _) = I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+        Ok(sam.into_keepalive())
     }
 }
 
@@ -224,23 +300,32 @@ async fn read_line(s: &mut TcpStream) -> Result<String, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
 
     const FAKE_DEST: &str = "fakeprivdest";
+    static INSTALL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    async fn fake_sam(ok_hello: bool, dest_log: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+    async fn fake_sam(
+        ok_hello: bool,
+        dest_log: Arc<Mutex<Vec<String>>>,
+    ) -> (SocketAddr, Arc<Mutex<HashSet<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let live = Arc::new(Mutex::new(HashSet::new()));
+        let live_accept = Arc::clone(&live);
         tokio::spawn(async move {
             loop {
                 let Ok((mut s, _)) = listener.accept().await else {
                     break;
                 };
                 let log = Arc::clone(&dest_log);
+                let live = Arc::clone(&live_accept);
                 let ok = ok_hello;
                 tokio::spawn(async move {
+                    let mut created_id: Option<String> = None;
                     loop {
                         let line = match read_line(&mut s).await {
                             Ok(l) => l,
@@ -257,6 +342,10 @@ mod tests {
                             }
                         } else if up.starts_with("SESSION CREATE") {
                             log.lock().unwrap().push(line.clone());
+                            if let Some(id) = sam_kv(&line, "ID") {
+                                live.lock().unwrap().insert(id.to_string());
+                                created_id = Some(id.to_string());
+                            }
                             let dest = sam_kv(&line, "DESTINATION").unwrap_or("TRANSIENT");
                             let reply_dest = if dest.eq_ignore_ascii_case("TRANSIENT") {
                                 FAKE_DEST
@@ -273,16 +362,25 @@ mod tests {
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                         } else if up.starts_with("STREAM CONNECT") {
                             log.lock().unwrap().push(line.clone());
-                            let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            let id = sam_kv(&line, "ID").unwrap_or("");
+                            let known = live.lock().unwrap().contains(id);
+                            if known {
+                                let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            } else {
+                                let _ = write_line(&mut s, "STREAM STATUS RESULT=INVALID_ID").await;
+                            }
                             break;
                         } else {
                             let _ = write_line(&mut s, "PING").await;
                         }
                     }
+                    if let Some(id) = created_id {
+                        live.lock().unwrap().remove(&id);
+                    }
                 });
             }
         });
-        addr
+        (addr, live)
     }
 
     fn stream_lines(log: &Arc<Mutex<Vec<String>>>, prefix: &str) -> Vec<String> {
@@ -297,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn i2p_sam_stream_connect_fake() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let addr = fake_sam(true, Arc::clone(&log)).await;
+        let (addr, _live) = fake_sam(true, Arc::clone(&log)).await;
         let sam = I2pSam::connect(addr).await.unwrap();
         let dest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p";
         sam.stream_connect(dest).await.unwrap();
@@ -309,7 +407,7 @@ mod tests {
             assert!(g.contains("ID=rbtc"), "{g}");
         }
 
-        let bad = fake_sam(false, Arc::new(Mutex::new(Vec::new()))).await;
+        let (bad, _live) = fake_sam(false, Arc::new(Mutex::new(Vec::new()))).await;
         let err = match I2pSam::connect(bad).await {
             Err(e) => e,
             Ok(_) => panic!("bad HELLO must fail"),
@@ -323,8 +421,10 @@ mod tests {
 
     #[tokio::test]
     async fn dial_i2p_uses_sam() {
+        let _gate = INSTALL_GATE.lock().await;
+        clear_installed();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let addr = fake_sam(true, Arc::clone(&log)).await;
+        let (addr, _live) = fake_sam(true, Arc::clone(&log)).await;
         let sam = I2pSam::connect(addr).await.unwrap();
         let peer = crate::NetAddr::I2p {
             dest: [0u8; 32],
@@ -344,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn i2p_accept_incoming_forwards_to_loopback() {
         let log = Arc::new(Mutex::new(Vec::new()));
-        let addr = fake_sam(true, Arc::clone(&log)).await;
+        let (addr, _live) = fake_sam(true, Arc::clone(&log)).await;
         let dir = std::env::temp_dir().join(format!(
             "rbtc-i2p-{}-{}",
             std::process::id(),
@@ -384,5 +484,48 @@ mod tests {
             "{creates:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn i2p_sam_reconnects_after_invalid_id() {
+        let _gate = INSTALL_GATE.lock().await;
+        clear_installed();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, live) = fake_sam(true, Arc::clone(&log)).await;
+        let sam = I2pSam::connect(addr).await.unwrap();
+        crate::socks::install_i2p_dialer(sam.dialer());
+        let peer = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 8333,
+        };
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .unwrap();
+        assert_eq!(stream_lines(&log, "SESSION CREATE").len(), 1);
+
+        live.lock().unwrap().clear();
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .expect("SAM INVALID_ID must recreate the session and retry");
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert_eq!(creates.len(), 2, "{creates:?}");
+        assert!(
+            creates[1].contains(&format!("DESTINATION={FAKE_DEST}")),
+            "{}",
+            creates[1]
+        );
+
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_lines(&log, "SESSION CREATE").len(),
+            2,
+            "published dialer must keep the new session id"
+        );
+        clear_installed();
     }
 }

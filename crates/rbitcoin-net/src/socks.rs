@@ -3,14 +3,11 @@
 use crate::error::NetError;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-static I2P_DIALER: OnceLock<crate::i2p_sam::I2pDialer> = OnceLock::new();
-
 pub fn install_i2p_dialer(dialer: crate::i2p_sam::I2pDialer) {
-    let _ = I2P_DIALER.set(dialer);
+    crate::i2p_sam::install(dialer);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,10 +145,7 @@ impl Dialer {
                 self.connect_domain(&addr.host_str(), port).await
             }
             crate::NetAddr::I2p { .. } => {
-                let dialer = I2P_DIALER
-                    .get()
-                    .ok_or_else(|| NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))?;
-                dialer.stream_connect(&addr.host_str()).await
+                crate::i2p_sam::stream_connect_installed(&addr.host_str()).await
             }
         }
     }
