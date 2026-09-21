@@ -416,6 +416,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         sam.stream_forward(port)
             .await
             .map_err(|e| NodeError::Init(format!("i2p STREAM FORWARD {port}: {e}")))?;
+        let local = sam
+            .local_netaddr()
+            .map_err(|e| NodeError::Init(format!("i2p address: {e}")))?;
+        info!("i2p address {local}");
+        node.peers.set_p2p_i2p(local);
         info!("i2p STREAM FORWARD to {}", node.local_addr);
     }
     if let Some(sam) = i2p_sam.as_ref() {

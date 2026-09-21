@@ -1,6 +1,7 @@
 //! I2P SAM v3 STREAM CONNECT / FORWARD (system router, not SOCKS).
 
 use crate::error::NetError;
+use bitcoin::hashes::{sha256, Hash};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -224,6 +225,11 @@ impl I2pSam {
         }
     }
 
+    /// BIP155 address of this session. Port is 0: SAM 3.1 does not use ports.
+    pub fn local_netaddr(&self) -> Result<crate::NetAddr, NetError> {
+        i2p_addr_from_sam_b64(&self.destination)
+    }
+
     fn into_keepalive(self) -> (I2pDialer, TcpStream) {
         let dialer = self.dialer();
         (dialer, self._control)
@@ -308,6 +314,68 @@ impl I2pDialer {
         let (sam, _) = I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
         Ok(sam.into_keepalive())
     }
+}
+
+// Public Destination is 387 bytes plus the cert length at bytes 385–386.
+// The trailing private key is not part of the BIP155 hash.
+fn i2p_addr_from_sam_b64(dest_b64: &str) -> Result<crate::NetAddr, NetError> {
+    let raw = decode_i2p_b64(dest_b64.trim())?;
+    let public = i2p_public_destination(&raw)?;
+    let digest = sha256::Hash::hash(public);
+    Ok(crate::NetAddr::I2p {
+        dest: *digest.as_byte_array(),
+        port: 0,
+    })
+}
+
+fn i2p_public_destination(raw: &[u8]) -> Result<&[u8], NetError> {
+    const DEST_LEN_BASE: usize = 387;
+    const CERT_LEN_POS: usize = 385;
+    if raw.len() < CERT_LEN_POS + 2 {
+        return Err(NetError::Encode(format!(
+            "i2p destination too short ({})",
+            raw.len()
+        )));
+    }
+    let cert_len = u16::from_be_bytes([raw[CERT_LEN_POS], raw[CERT_LEN_POS + 1]]) as usize;
+    let dest_len = DEST_LEN_BASE + cert_len;
+    if dest_len > raw.len() {
+        return Err(NetError::Encode(format!(
+            "i2p certificate length {cert_len} needs {dest_len} bytes, have {}",
+            raw.len()
+        )));
+    }
+    Ok(&raw[..dest_len])
+}
+
+fn decode_i2p_b64(s: &str) -> Result<Vec<u8>, NetError> {
+    let mut bytes = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut n = 0u32;
+    for c in s.chars() {
+        if c == '=' {
+            break;
+        }
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '-' | '+' => 62,
+            '~' | '/' => 63,
+            _ => {
+                return Err(NetError::Encode(format!(
+                    "i2p destination base64 contains {c:?}"
+                )));
+            }
+        };
+        acc = (acc << 6) | v;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            bytes.push((acc >> n) as u8);
+        }
+    }
+    Ok(bytes)
 }
 
 fn sam_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -693,5 +761,76 @@ mod tests {
             "published dialer must keep the new session id"
         );
         clear_installed();
+    }
+
+    fn i2p_b64_encode(raw: &[u8]) -> String {
+        const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+        let mut out = String::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let b0 = raw[i];
+            let b1 = if i + 1 < raw.len() { raw[i + 1] } else { 0 };
+            let b2 = if i + 2 < raw.len() { raw[i + 2] } else { 0 };
+            out.push(ALPH[(b0 >> 2) as usize] as char);
+            out.push(ALPH[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+            if i + 1 < raw.len() {
+                out.push(ALPH[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+            }
+            if i + 2 < raw.len() {
+                out.push(ALPH[(b2 & 63) as usize] as char);
+            }
+            i += 3;
+        }
+        out
+    }
+
+    #[test]
+    fn i2p_addr_hashes_public_destination_only() {
+        let mut ident = vec![7u8; 387];
+        ident[384] = 0;
+        ident[385] = 0;
+        ident[386] = 0;
+        let mut privd = ident.clone();
+        privd.extend_from_slice(&[9u8; 80]);
+        let a = i2p_addr_from_sam_b64(&i2p_b64_encode(&ident)).unwrap();
+        let b = i2p_addr_from_sam_b64(&i2p_b64_encode(&privd)).unwrap();
+        let want = crate::NetAddr::I2p {
+            dest: [
+                0x15, 0xe2, 0xe8, 0x24, 0x7c, 0x9d, 0xfa, 0x2e, 0xd0, 0xaa, 0x88, 0x04, 0xf8, 0x36,
+                0xfc, 0x3a, 0x53, 0x23, 0x0d, 0x3c, 0xa5, 0x8e, 0x03, 0x4d, 0x05, 0x7f, 0xb0, 0xee,
+                0x90, 0x7b, 0x3a, 0x57,
+            ],
+            port: 0,
+        };
+        assert_eq!(a, want);
+        assert_eq!(b, want, "private key suffix must not change the b32");
+        assert_eq!(
+            a.to_string(),
+            "cxroqjd4tx5c5ufkracpqnx4hjjsgdj4uwhagtifp6yo5ed3hjlq.b32.i2p:0"
+        );
+
+        let mut public = vec![9u8; 387];
+        public[384] = 5;
+        public[385] = 0;
+        public[386] = 4;
+        public.extend_from_slice(&[0x00, 0x07, 0x00, 0x04]);
+        let mut full = public.clone();
+        full.extend_from_slice(&[0xab; 64]);
+        let ed = i2p_addr_from_sam_b64(&i2p_b64_encode(&public)).unwrap();
+        let ed_priv = i2p_addr_from_sam_b64(&i2p_b64_encode(&full)).unwrap();
+        assert_eq!(ed, ed_priv);
+        assert_eq!(
+            ed,
+            crate::NetAddr::I2p {
+                dest: [
+                    0x0f, 0x35, 0x9f, 0x01, 0x19, 0x78, 0x92, 0x09, 0x23, 0x60, 0xcb, 0x0d, 0x3e,
+                    0xeb, 0x27, 0xcf, 0x5f, 0xf7, 0xb7, 0x1f, 0x70, 0xef, 0xe7, 0xf7, 0x8d, 0x45,
+                    0x03, 0x1e, 0x1a, 0xe2, 0x11, 0x75,
+                ],
+                port: 0,
+            }
+        );
+        assert!(i2p_addr_from_sam_b64("!!!").is_err());
+        assert!(i2p_addr_from_sam_b64(&i2p_b64_encode(&[1, 2, 3])).is_err());
     }
 }

@@ -446,8 +446,9 @@ impl LivePeer {
         }
         let hub = self.owner.upgrade()?;
         let onion = hub.p2p_onion();
+        let i2p = hub.p2p_i2p();
         let sock = hub.advertise_local_socket();
-        if onion.is_none() && sock.is_none() {
+        if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -465,6 +466,15 @@ impl LivePeer {
         if self.wants_addrv2() {
             let mut v = Vec::new();
             if let Some(addr) = onion {
+                rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(addr, self.id));
+                v.push(AddrV2Message {
+                    time: t,
+                    services,
+                    addr: addr.to_addrv2(),
+                    port: addr.port(),
+                });
+            }
+            if let Some(addr) = i2p {
                 rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(addr, self.id));
                 v.push(AddrV2Message {
                     time: t,
@@ -1142,6 +1152,7 @@ pub struct PeerHub {
     external_ips: Mutex<Vec<IpAddr>>,
     wallet_onions: Mutex<Vec<(String, u16)>>,
     p2p_onion: Mutex<Option<(String, u16)>>,
+    p2p_i2p: Mutex<Option<crate::NetAddr>>,
     /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
@@ -1232,6 +1243,7 @@ impl PeerHub {
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
+            p2p_i2p: Mutex::new(None),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             clearnet_listen: AtomicBool::new(true),
@@ -1311,6 +1323,16 @@ impl PeerHub {
         format!("{host}:{port}").parse().ok()
     }
 
+    pub fn set_p2p_i2p(&self, addr: crate::NetAddr) {
+        if matches!(addr, crate::NetAddr::I2p { .. }) {
+            *self.p2p_i2p.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
+        }
+    }
+
+    pub fn p2p_i2p(&self) -> Option<crate::NetAddr> {
+        *self.p2p_i2p.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn set_clearnet_listen(&self, on: bool) {
         self.clearnet_listen.store(on, Ordering::Relaxed);
     }
@@ -1345,6 +1367,9 @@ impl PeerHub {
             .clone()
         {
             rows.push((host, port, LOCAL_MANUAL));
+        }
+        if let Some(addr) = self.p2p_i2p() {
+            rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
         }
         if !self.discover.load(Ordering::Relaxed) {
             return rows;

@@ -74,7 +74,6 @@ pub fn base_node(datadir: &Path) -> NodeConfig {
     cfg.listen.use_seeds = false;
     cfg.listen.discover = false;
     cfg.max_tip_age_secs = Some(u64::MAX);
-    cfg.max_run_secs = Some(180);
     cfg
 }
 

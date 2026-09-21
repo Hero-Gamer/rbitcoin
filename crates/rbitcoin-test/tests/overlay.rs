@@ -7,13 +7,12 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::Amount;
 use rbitcoin_net::{NetAddr, OnlyNet};
 use rbitcoin_node::{NodeConfig, P2pListen};
-use rbitcoin_primitives::Network;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
-    base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, live_p2p_lock, require_env,
-    socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream, wait_jsonrpc,
-    wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion, write_rpc_token,
-    OverlayEnv,
+    base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, live_p2p_lock, localaddresses,
+    require_env, socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream,
+    wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion,
+    write_rpc_token, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -187,8 +186,18 @@ async fn i2p_sam_two_node() {
     let again = std::fs::read_to_string(b_dir.path().join("i2p").join("p2p.priv")).unwrap();
     assert_eq!(dest, again.trim(), "persistent dest round-trip");
     let b32 = i2p_b32_from_dest(&dest);
-    let port = Network::Regtest.default_p2p_port();
-    let dest_addr: NetAddr = format!("{b32}:{port}").parse().unwrap();
+    let info = jsonrpc(b_rpc, "getnetworkinfo", json!([])).await;
+    let published = localaddresses(&info)
+        .iter()
+        .find(|r| {
+            r["address"]
+                .as_str()
+                .is_some_and(|a| a.ends_with(".b32.i2p"))
+        })
+        .unwrap_or_else(|| panic!("i2p local address missing: {info}"));
+    assert_eq!(published["address"], b32, "{info}");
+    assert_eq!(published["port"], 0, "SAM 3.1 port is 0: {info}");
+    let dest_addr: NetAddr = format!("{b32}:0").parse().unwrap();
     wait_i2p_stream(env.i2p_sam, &b32, Duration::from_secs(180)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -213,6 +222,18 @@ async fn i2p_sam_two_node() {
     assert_eq!(
         peers["result"][0]["transport_protocol_type"], "v2",
         "{peers}"
+    );
+    let addr = peers["result"][0]["addr"].as_str().unwrap_or("");
+    assert!(
+        addr.starts_with(&b32) && addr.ends_with(":0"),
+        "dialed peer must be the published dest: {peers}"
+    );
+    let addrv2 = peers["result"][0]["bytesrecv_per_msg"]["addrv2"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        addrv2 > 0,
+        "inbound I2P node must addrv2 its destination: {peers}"
     );
 
     a.stop().await;
