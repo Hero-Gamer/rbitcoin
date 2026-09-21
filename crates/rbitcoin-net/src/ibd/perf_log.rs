@@ -678,20 +678,30 @@ pub struct ProcRss {
 
 /// Cheap once-per-tick resident-size read (not hot path).
 ///
-/// Prefer `/proc/self/status` fields present on modern kernels (`RssAnon` /
-/// `RssFile` / `VmRSS`). Fall back to `smaps_rollup` (`Anonymous:`, `Rss:`,
-/// `Locked:`) when status split is missing — older rollups do **not** expose
-/// `RssAnon:` / `RssFile:` (that bug made `ibd: sizes` print `anon=0 file=0`).
+/// One platform arm compiles at a time: Linux reads `/proc`, Darwin asks
+/// `proc_pid_rusage`, anything else (Windows) has neither and reports zeros.
+/// Gating beats letting a missing `/proc` fail at runtime — it keeps non-Linux
+/// hosts from two doomed `open` calls on every 5s sample.
 ///
-/// Darwin has no `/proc`, so both reads miss and `proc_pid_rusage` fills
-/// `rss` instead. That flavor carries no anon/file resident split and no
-/// resident peak, so `anon` / `file` / `hwm` / `locked` stay zero there: the
+/// Linux prefers `/proc/self/status` fields present on modern kernels
+/// (`RssAnon` / `RssFile` / `VmRSS`), falling back to `smaps_rollup`
+/// (`Anonymous:`, `Rss:`, `Locked:`) when the status split is missing — older
+/// rollups do **not** expose `RssAnon:` / `RssFile:` (that bug made
+/// `ibd: sizes` print `anon=0 file=0`).
+///
+/// Darwin gets `rss` only. That flavor carries no anon/file resident split and
+/// no resident peak, so `anon` / `file` / `hwm` / `locked` stay zero there: the
 /// `ibd: sizes` `residual≈` heap cross-check (anon minus accounted) and the
 /// `hwm=` peak are Linux-only. Darwin's only lifetime peak is over
 /// `phys_footprint`, which excludes clean file-backed pages and so can read
 /// below a mapped-file RSS — a "peak" under the current value is worse than
 /// none, so it is not wired to `hwm`.
 pub fn read_proc_rss() -> ProcRss {
+    read_platform_rss()
+}
+
+#[cfg(target_os = "linux")]
+fn read_platform_rss() -> ProcRss {
     let mut out = ProcRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         fill_rss_from_status(&mut out, &s);
@@ -699,9 +709,19 @@ pub fn read_proc_rss() -> ProcRss {
     if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
         fill_rss_from_smaps_rollup(&mut out, &s);
     }
-    #[cfg(target_os = "macos")]
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn read_platform_rss() -> ProcRss {
+    let mut out = ProcRss::default();
     fill_rss_from_rusage(&mut out);
     out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_platform_rss() -> ProcRss {
+    ProcRss::default()
 }
 
 #[cfg(target_os = "macos")]
@@ -721,6 +741,7 @@ fn fill_rss_from_rusage(out: &mut ProcRss) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
@@ -740,6 +761,7 @@ fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fill_rss_from_smaps_rollup(out: &mut ProcRss, s: &str) {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("Rss:") {
@@ -767,6 +789,7 @@ fn fill_rss_from_smaps_rollup(out: &mut ProcRss, s: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_kb_field(rest: &str) -> u64 {
     rest.split_whitespace()
         .next()
@@ -2573,6 +2596,7 @@ mod tests {
         assert!(!line.contains("residency creates="), "{line}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fill_rss_from_status_and_smaps_edges() {
         let mut r = ProcRss::default();
