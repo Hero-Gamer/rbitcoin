@@ -25,5 +25,10 @@ sha3 = "0.12"
 # POLLRDHUP: peer FIN with unread bytes still in the receive buffer.
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# proc_pid_rusage: resident size for `ibd: sizes` / `tip: perf`; Darwin
+# has no /proc.
+libc = "0.2"
+
 [lints]
 workspace = true

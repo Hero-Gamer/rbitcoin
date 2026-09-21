@@ -676,12 +676,21 @@ pub struct ProcRss {
     pub locked_kb: u64,
 }
 
-/// Cheap once-per-tick `/proc` read (not hot path).
+/// Cheap once-per-tick resident-size read (not hot path).
 ///
 /// Prefer `/proc/self/status` fields present on modern kernels (`RssAnon` /
 /// `RssFile` / `VmRSS`). Fall back to `smaps_rollup` (`Anonymous:`, `Rss:`,
 /// `Locked:`) when status split is missing — older rollups do **not** expose
 /// `RssAnon:` / `RssFile:` (that bug made `ibd: sizes` print `anon=0 file=0`).
+///
+/// Darwin has no `/proc`, so both reads miss and `proc_pid_rusage` fills
+/// `rss` instead. That flavor carries no anon/file resident split and no
+/// resident peak, so `anon` / `file` / `hwm` / `locked` stay zero there: the
+/// `ibd: sizes` `residual≈` heap cross-check (anon minus accounted) and the
+/// `hwm=` peak are Linux-only. Darwin's only lifetime peak is over
+/// `phys_footprint`, which excludes clean file-backed pages and so can read
+/// below a mapped-file RSS — a "peak" under the current value is worse than
+/// none, so it is not wired to `hwm`.
 pub fn read_proc_rss() -> ProcRss {
     let mut out = ProcRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
@@ -690,7 +699,26 @@ pub fn read_proc_rss() -> ProcRss {
     if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
         fill_rss_from_smaps_rollup(&mut out, &s);
     }
+    #[cfg(target_os = "macos")]
+    fill_rss_from_rusage(&mut out);
     out
+}
+
+#[cfg(target_os = "macos")]
+fn fill_rss_from_rusage(out: &mut ProcRss) {
+    let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
+    // SAFETY: RUSAGE_INFO_V0 selects the `rusage_info_v0` layout being written
+    // here; an unsupported flavor returns non-zero without touching `info`.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V0,
+            std::ptr::addr_of_mut!(info).cast(),
+        )
+    };
+    if rc == 0 {
+        out.rss_kb = info.ri_resident_size / 1024;
+    }
 }
 
 fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
@@ -2574,14 +2602,21 @@ mod tests {
         assert_eq!(r.file_kb, 500);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn read_proc_rss_returns_nonzero_on_linux() {
+    fn read_proc_rss_reports_resident_size() {
         let r = read_proc_rss();
-        // Agent VM is Linux with /proc; RSS should be readable for this process.
-        assert!(
-            r.rss_kb > 0,
-            "expected VmRSS from /proc/self/status, got {r:?}"
-        );
+        // Linux reads /proc/self/status; Darwin reads proc_pid_rusage.
+        // A live test process is resident either way.
+        assert!(r.rss_kb > 0, "expected a resident size, got {r:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_proc_rss_splits_anon_and_file_on_linux() {
+        let r = read_proc_rss();
+        // VmHWM is a high-water mark, so it never trails current residency.
+        assert!(r.hwm_kb >= r.rss_kb, "hwm should not trail rss, got {r:?}");
         // Modern kernels expose RssAnon/RssFile on status; at least one side
         // of the split should be non-zero for a running process with heap+.text.
         assert!(
