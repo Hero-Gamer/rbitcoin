@@ -546,12 +546,9 @@ async fn prepare_outbound_session(
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
-    let stream = match &peer {
-        DialTarget::Socket(addr) => dialer.connect_net(crate::NetAddr::Ip(*addr)).await?,
-        DialTarget::Domain { host, port } => dialer.connect_domain(host, *port).await?,
-    };
     let peer_net = peer.net_addr();
-    let peer_hint = peer.peer_hint();
+    let stream = dialer.connect_net(peer_net).await?;
+    let peer_hint = peer.version_socket();
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
     // Core adds CNode before VERSION. Provisional row so getpeerinfo is non-empty

@@ -130,11 +130,26 @@ pub enum DialTarget {
 }
 
 impl DialTarget {
-    pub fn peer_hint(&self) -> SocketAddr {
+    pub(crate) fn from_net(addr: crate::NetAddr) -> Self {
+        match addr {
+            crate::NetAddr::Ip(s) => Self::Socket(s),
+            other => Self::Domain {
+                host: other.host_str(),
+                port: other.port(),
+            },
+        }
+    }
+
+    /// VERSION v1 `Address` field. Onion has no SocketAddr; Core uses 0.0.0.0.
+    pub fn version_socket(&self) -> SocketAddr {
         match self {
             Self::Socket(addr) => *addr,
             Self::Domain { port, .. } => SocketAddr::from(([0, 0, 0, 0], *port)),
         }
+    }
+
+    pub fn peer_hint(&self) -> SocketAddr {
+        self.version_socket()
     }
 
     pub fn net_addr(&self) -> crate::NetAddr {
@@ -142,7 +157,7 @@ impl DialTarget {
             Self::Socket(addr) => crate::NetAddr::Ip(*addr),
             Self::Domain { host, port } => format!("{host}:{port}")
                 .parse()
-                .unwrap_or(crate::NetAddr::Ip(self.peer_hint())),
+                .expect("DialTarget::Domain is host:port from NetAddr::Onion"),
         }
     }
 }
@@ -2119,7 +2134,7 @@ impl PeerHub {
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
         tx.send(DialRequest {
-            target: DialTarget::Socket(addr),
+            target: DialTarget::from_net(crate::NetAddr::Ip(addr)),
             typ,
         })
         .map_err(|_| "dialer closed".to_string())
@@ -3143,5 +3158,19 @@ mod tests {
             .any(|e| e.addr
                 == crate::NetAddr::Ip(SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 18444)))));
         assert_eq!(ents.len(), 2, "I2P is not stored until plan 04");
+    }
+
+    #[test]
+    fn dial_target_onion_keeps_net_addr_not_unspecified() {
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let t = DialTarget::from_net(onion);
+        assert!(matches!(t, DialTarget::Domain { .. }), "{t:?}");
+        assert_eq!(t.net_addr(), onion);
+        let hint = t.version_socket();
+        assert!(hint.ip().is_unspecified(), "{hint}");
+        assert_eq!(hint.port(), 8333);
     }
 }
