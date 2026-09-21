@@ -100,6 +100,14 @@ impl Shutdown {
     }
 }
 
+/// Clearnet follow handshake bound. Overlay STREAM CONNECT is slower; see
+/// [`follow_connect_timeout`].
+const FOLLOW_CONNECT_SECS: u64 = 8;
+
+fn follow_connect_timeout(peer: rbitcoin_net::NetAddr) -> Duration {
+    rbitcoin_net::connect_timeout_for(peer, Duration::from_secs(FOLLOW_CONNECT_SECS))
+}
+
 /// Install SIGTERM / SIGINT (and Ctrl+C) handlers that trip `shutdown`.
 fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     tokio::spawn(async move {
@@ -625,7 +633,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     if tip_follow_ready && !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
-        const FOLLOW_CONNECT_SECS: u64 = 8;
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
                 if let Err(e) = node.peers.dial_net(*peer, PeerConnType::OutboundFullRelay) {
@@ -640,16 +647,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 if shutdown.requested() {
                     break;
                 }
+                let to = follow_connect_timeout(*peer);
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
                         warn!("signal: skip remaining follow connects");
                         break;
                     }
-                    result = tokio::time::timeout(
-                        Duration::from_secs(FOLLOW_CONNECT_SECS),
-                        node.follow_from_net(*peer),
-                    ) => {
+                    result = tokio::time::timeout(to, node.follow_from_net(*peer)) => {
                         match result {
                             Ok(Ok(())) => {
                                 info!(
@@ -658,9 +663,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 );
                             }
                             Ok(Err(e)) => warn!("node: follow {peer} failed: {e}"),
-                            Err(_) => warn!(
-                                "node: follow {peer} timed out ({FOLLOW_CONNECT_SECS}s)"
-                            ),
+                            Err(_) => warn!("node: follow {peer} timed out ({to:?})"),
                         }
                     }
                 }
@@ -2119,6 +2122,20 @@ mod tests {
         assert_eq!(catch_up_after_err(10, false, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(0, true, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(10, true, true), CatchUp::Incomplete);
+    }
+
+    #[test]
+    fn follow_connect_timeout_i2p_is_longer_than_clearnet() {
+        let i2p = rbitcoin_net::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 1,
+        };
+        let ip: rbitcoin_net::NetAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(
+            follow_connect_timeout(ip),
+            Duration::from_secs(FOLLOW_CONNECT_SECS)
+        );
+        assert_eq!(follow_connect_timeout(i2p), Duration::from_secs(90));
     }
 
     #[test]

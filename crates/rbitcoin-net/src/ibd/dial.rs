@@ -319,7 +319,7 @@ pub(crate) async fn dial_batch(
 }
 
 /// I2P STREAM CONNECT waits on tunnel + leaseset lookup; 8s is a clearnet RTT.
-pub(crate) fn connect_timeout_for(addr: crate::NetAddr, base: Duration) -> Duration {
+pub fn connect_timeout_for(addr: crate::NetAddr, base: Duration) -> Duration {
     match addr {
         crate::NetAddr::I2p { .. } => base.max(Duration::from_secs(90)),
         _ => base,
