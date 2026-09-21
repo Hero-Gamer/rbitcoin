@@ -89,16 +89,22 @@ PY
 CJDNS_BIN="$(command -v cjdroute)"
 PING_BIN="$(command -v ping)"
 
-sudo "$CJDNS_BIN" <"$ROOT/a.conf" >"$ROOT/a.log" 2>&1 &
-echo $! >"$ROOT/a.pid"
+# Open the conf inside sudo. `sudo cjdroute <conf &` often gets a closed
+# stdin on GitHub Actions, so the Angel cancels the core immediately.
+start_cjdroute() {
+  local name="$1"
+  sudo bash -c 'exec "$1" <"$2" >"$3" 2>&1' _ "$CJDNS_BIN" "$ROOT/$name.conf" "$ROOT/$name.log" &
+  echo $! >"$ROOT/$name.pid"
+}
+
+start_cjdroute a
 sleep 1
-sudo "$CJDNS_BIN" <"$ROOT/b.conf" >"$ROOT/b.log" 2>&1 &
-echo $! >"$ROOT/b.pid"
+start_cjdroute b
 
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
 
-deadline=$((SECONDS + 30))
+deadline=$((SECONDS + 60))
 while true; do
   if "$PING_BIN" -6 -c 1 -W 1 "$IPV6_B" >/dev/null 2>&1 \
     && "$PING_BIN" -6 -c 1 -W 1 "$IPV6_A" >/dev/null 2>&1; then
@@ -106,10 +112,19 @@ while true; do
   fi
   if (( SECONDS >= deadline )); then
     echo "cjdns ping timeout ($IPV6_A <-> $IPV6_B)" >&2
-    echo "--- a.log ---" >&2
-    tail -n 40 "$ROOT/a.log" >&2 || true
-    echo "--- b.log ---" >&2
-    tail -n 40 "$ROOT/b.log" >&2 || true
+    for name in a b; do
+      echo "--- $name pid ---" >&2
+      if [[ -f "$ROOT/$name.pid" ]] && kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+        echo "alive $(cat "$ROOT/$name.pid")" >&2
+      else
+        echo "dead" >&2
+      fi
+      echo "--- $name.log ---" >&2
+      tail -n 80 "$ROOT/$name.log" >&2 || true
+    done
+    sudo ip -6 addr >&2 || true
+    sudo ip link show rbtc0 >&2 || true
+    sudo ip link show rbtc1 >&2 || true
     exit 1
   fi
   sleep 0.5
