@@ -3334,6 +3334,29 @@ mod tests {
     }
 
     #[test]
+    fn learn_addrv2_keeps_i2p_port_zero() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let dest = [0x22u8; 32];
+        hub.learn_addrv2(&[AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::I2p(dest),
+            port: 0,
+        }]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let want = crate::NetAddr::I2p { dest, port: 0 };
+        assert!(
+            book.entries().iter().any(|e| e.addr == want),
+            "Core I2P port 0 must stay in the book, got {:?}",
+            book.entries()
+        );
+    }
+
+    #[test]
     fn dial_target_cjdns_is_native_socket() {
         use std::net::Ipv6Addr;
         let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
