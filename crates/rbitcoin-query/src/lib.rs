@@ -635,6 +635,25 @@ impl Query {
         self.store.path().join("inwit.window")
     }
 
+    fn inwit_spill_file(&self, height: u32) -> Result<std::path::PathBuf, QueryError> {
+        let dir = self.inwit_spill_dir();
+        let name = format!("{height}.bin");
+        let stem_ok = name
+            .strip_suffix(".bin")
+            .and_then(|s| s.parse::<u32>().ok())
+            == Some(height);
+        if !stem_ok {
+            return Err(StoreError::Corrupt("invariant: inwit spill name"));
+        }
+        let path = dir.join(&name);
+        if !path.starts_with(&dir) {
+            return Err(StoreError::Corrupt(
+                "invariant: inwit spill path escaped window dir",
+            ));
+        }
+        Ok(path)
+    }
+
     fn prune_inwit_spill_below(&self, min_keep_height: u32) -> Result<(), QueryError> {
         let dir = self.inwit_spill_dir();
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -643,9 +662,6 @@ impl Query {
         for ent in rd {
             let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
             let path = ent.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
-                continue;
-            }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
@@ -653,6 +669,7 @@ impl Query {
                 continue;
             };
             if h < min_keep_height {
+                let path = self.inwit_spill_file(h)?;
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -666,8 +683,21 @@ impl Query {
     ) -> Result<(), QueryError> {
         let dir = self.inwit_spill_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
-        let path = dir.join(format!("{}.bin", height.0));
-        let tmp = dir.join(format!("{}.bin.tmp", height.0));
+        let path = self.inwit_spill_file(height.0)?;
+        let tmp_name = format!("{}.bin.tmp", height.0);
+        if tmp_name
+            .strip_suffix(".bin.tmp")
+            .and_then(|s| s.parse::<u32>().ok())
+            != Some(height.0)
+        {
+            return Err(StoreError::Corrupt("invariant: inwit spill name"));
+        }
+        let tmp = dir.join(&tmp_name);
+        if !tmp.starts_with(&dir) {
+            return Err(StoreError::Corrupt(
+                "invariant: inwit spill path escaped window dir",
+            ));
+        }
         let mut out = Vec::new();
         for (fk, ins) in rows {
             let Some(id) = fk.get() else {
@@ -697,7 +727,37 @@ impl Query {
         if self.pruneheight().is_some_and(|ph| height <= ph.0) {
             return Ok(None);
         }
-        let path = self.inwit_spill_dir().join(format!("{height}.bin"));
+        let dir = self.inwit_spill_dir();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::io(&dir, e)),
+        };
+        let mut path = None;
+        for ent in rd {
+            let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
+            let fname = ent.file_name();
+            let Some(stem) = fname.to_str().and_then(|s| s.strip_suffix(".bin")) else {
+                continue;
+            };
+            let Ok(h) = stem.parse::<u32>() else {
+                continue;
+            };
+            if h != height {
+                continue;
+            }
+            let p = ent.path();
+            if !p.starts_with(&dir) {
+                return Err(StoreError::Corrupt(
+                    "invariant: inwit spill path escaped window dir",
+                ));
+            }
+            path = Some(p);
+            break;
+        }
+        let Some(path) = path else {
+            return Ok(None);
+        };
         let raw = match std::fs::read(&path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

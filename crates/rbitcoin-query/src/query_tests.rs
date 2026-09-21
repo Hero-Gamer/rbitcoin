@@ -2728,6 +2728,14 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
         1,
         "recent witness is served from RAM"
     );
+    let window = q.store.path().join("inwit.window");
+    for ent in std::fs::read_dir(&window).unwrap() {
+        let p = ent.unwrap().path();
+        assert_eq!(p.parent(), Some(window.as_path()), "{p:?}");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        let stem = name.strip_suffix(".bin").expect(name);
+        assert!(stem.parse::<u32>().is_ok(), "{name}");
+    }
     drop(q);
     let q2 = Query::open_or_create_tiny(dir.path()).unwrap();
     let tx1 = q2.get_tx(fk0).unwrap();
