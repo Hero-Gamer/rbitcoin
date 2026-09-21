@@ -5,12 +5,15 @@ mod cache;
 mod chain;
 mod codec;
 mod compact;
+mod ephemeral;
 mod error;
 mod eviction;
+mod i2p_sam;
 mod ibd;
 mod most_work;
 mod msg_decode;
 mod net_permissions;
+mod netaddr;
 mod netgroup;
 mod peer;
 mod peer_dos;
@@ -19,6 +22,7 @@ mod reactor;
 mod seeds;
 mod serve_perf;
 mod service;
+mod socks;
 mod tip_accept;
 mod tx_relay;
 mod v2;
@@ -31,8 +35,10 @@ pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     CmpctPeerFrame,
 };
+pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use i2p_sam::I2pSam;
 pub use ibd::{
     format_tip_perf_sizes, read_proc_rss, rehydrate_block_queue_residue, IbdConfig, ProcRss,
     TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
@@ -42,6 +48,7 @@ pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,
 };
+pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
 pub use netgroup::netgroup;
 pub use peer::{
     drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,
@@ -49,18 +56,20 @@ pub use peer::{
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{
-    parse_peer_addr, pick_stale_follow_evict, DialRequest, LivePeer, PeerConnType, PeerHub,
-    PeerInfo, PeerOut, PingAction,
+    parse_peer_addr, parse_peer_net, pick_stale_follow_evict, DialRequest, DialTarget, LivePeer,
+    PeerConnType, PeerHub, PeerInfo, PeerOut, PingAction,
 };
 pub use rbitcoin_mempool::AcceptError;
 pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use reactor::BlockingRegion;
 pub use seeds::{
     default_port, default_rpc_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds,
-    resolve_dns_seeds, resolve_fixed_seeds, AddrMan, PeerEntry, PeerFlags, MAX_ADDR_MAN,
+    resolve_dns_seeds, resolve_fixed_seeds, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags,
+    MAX_ADDR_MAN,
 };
 pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
 pub use service::P2PNode;
+pub use socks::{install_i2p_dialer, Dialer};
 pub use tx_relay::{
     ElectrumMempoolItem, MempoolAnnounce, MempoolHub, MempoolPerfSample, MempoolTxSnapEntry,
     MempoolTxSnapshot,

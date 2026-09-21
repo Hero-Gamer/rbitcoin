@@ -1422,6 +1422,8 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     let sent = dispatch(&ctx, "sendrawtransaction", vec![json!(local_hex_tx)]).unwrap();
     let local_hex = hash_hex_display(&local.compute_txid().to_byte_array());
     assert_eq!(sent, json!(local_hex.clone()));
+    assert!(mp.is_local_origin(&local.compute_txid()));
+    assert!(!mp.is_local_origin(&parent.compute_txid()));
 
     let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(info["unbroadcastcount"], 1);
@@ -4215,6 +4217,61 @@ fn getnetworkinfo_localaddresses_from_externalip() {
     assert_eq!(addrs[0]["address"], "42.42.42.42");
     assert_eq!(addrs[0]["port"], 18445);
     assert_eq!(addrs[0]["score"], 4);
+    ctx.peers.as_ref().unwrap().set_discover(false);
+    let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let addrs = info["localaddresses"].as_array().expect("array");
+    assert!(addrs.is_empty(), "no-discover localaddresses: {info}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getnetworkinfo_includes_electrum_onion() {
+    use rbitcoin_net::PeerHub;
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_discover(false);
+    hub.set_wallet_onion(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion".into(),
+        50001,
+    );
+    hub.set_wallet_onion(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabce.onion".into(),
+        3000,
+    );
+    ctx.peers = Some(hub);
+    let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let addrs = info["localaddresses"].as_array().expect("array");
+    assert_eq!(addrs.len(), 2, "{info}");
+    assert_eq!(
+        addrs[0]["address"],
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion"
+    );
+    assert_eq!(addrs[0]["port"], 50001);
+    assert_eq!(addrs[1]["port"], 3000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getnetworkinfo_includes_p2p_onion() {
+    use rbitcoin_net::PeerHub;
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_discover(false);
+    hub.set_p2p_onion(
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(),
+        18444,
+    );
+    ctx.peers = Some(hub);
+    let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let addrs = info["localaddresses"].as_array().expect("array");
+    assert_eq!(addrs.len(), 1, "{info}");
+    assert_eq!(
+        addrs[0]["address"],
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+    );
+    assert_eq!(addrs[0]["port"], 18444);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4679,6 +4736,48 @@ fn addnode_and_disconnectnode_on_table() {
     assert!(e["message"].as_str().unwrap().contains("dialer"), "{e}");
     let e = dispatch(&ctx, "disconnectnode", vec![json!("127.0.0.1:1")]).unwrap_err();
     assert_eq!(e["code"], ERR_CLIENT_NODE_NOT_CONNECTED);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getpeerinfo_and_disconnectnode_support_onion_addr() {
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    hub.register_net(
+        addr,
+        onion,
+        bind,
+        &test_version(0, 0),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    ctx.peers = Some(hub);
+
+    let r = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
+    let row = &r.as_array().unwrap()[0];
+    assert_eq!(
+        row["addr"],
+        json!("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333")
+    );
+    assert_eq!(row["network"], json!("onion"));
+    dispatch(
+        &ctx,
+        "disconnectnode",
+        vec![json!(
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+        )],
+    )
+    .unwrap();
+    assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

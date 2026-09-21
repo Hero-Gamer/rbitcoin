@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::asmap::AsMap;
+use crate::netaddr::{addr_allowed, NetAddr, OnlyNet};
 use crate::netgroup::{netgroup, select_diverse};
 
 /// Skip a recently dialed addr while any other candidate remains.
@@ -155,6 +156,17 @@ pub fn resolve_all_seeds(network: Network) -> Vec<SocketAddr> {
     out
 }
 
+/// DNS seed hostnames with the network default port for SOCKS domain CONNECT.
+///
+/// Does not call [`ToSocketAddrs`] — the proxy performs remote DNS.
+pub fn socks_dns_seed_dests(network: Network) -> Vec<(String, u16)> {
+    let port = default_port(network);
+    dns_seeds(network)
+        .iter()
+        .map(|host| ((*host).to_string(), port))
+        .collect()
+}
+
 /// Informational peer flags packed into one byte (more bits reserved for later).
 ///
 /// | bit | name | meaning |
@@ -265,7 +277,7 @@ impl PeerFlags {
 /// One remembered peer address + flags.
 #[derive(Clone, Debug)]
 pub struct PeerEntry {
-    pub addr: SocketAddr,
+    pub addr: NetAddr,
     pub flags: PeerFlags,
 }
 
@@ -282,10 +294,12 @@ pub const MAX_ADDR_MAN: usize = 8192;
 #[derive(Debug, Default, Clone)]
 pub struct AddrMan {
     /// Insertion-order keys (IPv4 preferred on inject).
-    order: Vec<SocketAddr>,
-    by_addr: HashMap<SocketAddr, PeerFlags>,
+    order: Vec<NetAddr>,
+    by_addr: HashMap<NetAddr, PeerFlags>,
     asmap: Option<Arc<AsMap>>,
-    last_attempt: HashMap<SocketAddr, Instant>,
+    last_attempt: HashMap<NetAddr, Instant>,
+    only_net: Vec<OnlyNet>,
+    cjdns_reachable: bool,
 }
 
 impl AddrMan {
@@ -315,7 +329,70 @@ impl AddrMan {
         self.sort_order_ipv4_first();
     }
 
+    pub fn set_only_net(&mut self, only: Vec<OnlyNet>) {
+        self.only_net = only;
+    }
+
+    pub fn set_cjdns_reachable(&mut self, on: bool) {
+        self.cjdns_reachable = on;
+    }
+
+    fn allowed(&self, addr: NetAddr) -> bool {
+        addr_allowed(addr, &self.only_net)
+    }
+
+    fn dialable(&self, addr: NetAddr) -> bool {
+        if matches!(addr, NetAddr::Cjdns { .. }) && !self.cjdns_reachable {
+            return false;
+        }
+        self.allowed(addr)
+    }
+
+    /// Like [`Self::take_dial_candidates`] plus onion rows when `--only-net` allows them.
+    pub fn take_dial_candidates_net(
+        &self,
+        max: usize,
+        exclude: &HashSet<NetAddr>,
+        occupied: &[SocketAddr],
+    ) -> Vec<NetAddr> {
+        let ip_ex: HashSet<SocketAddr> = exclude
+            .iter()
+            .copied()
+            .filter_map(NetAddr::socket_addr)
+            .collect();
+        let mut out: Vec<NetAddr> = self
+            .take_dial_candidates(max, &ip_ex, occupied)
+            .into_iter()
+            .map(NetAddr::from_socket)
+            .collect();
+        if out.len() >= max {
+            return out;
+        }
+        for &a in &self.order {
+            if out.len() >= max {
+                break;
+            }
+            if !matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. })
+                || !self.dialable(a)
+                || exclude.contains(&a)
+            {
+                continue;
+            }
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
     pub fn add(&mut self, addr: SocketAddr) {
+        self.add_addr(NetAddr::from_socket(addr));
+    }
+
+    pub fn add_addr(&mut self, addr: NetAddr) {
+        if !self.allowed(addr) {
+            return;
+        }
         if self.by_addr.contains_key(&addr) {
             return;
         }
@@ -330,6 +407,10 @@ impl AddrMan {
     ///
     /// Uncapped so `load` can keep tried-first then trim. `merge_from` trims.
     pub fn add_with_flags(&mut self, addr: SocketAddr, flags: PeerFlags) {
+        self.add_with_flags_addr(NetAddr::from_socket(addr), flags);
+    }
+
+    pub fn add_with_flags_addr(&mut self, addr: NetAddr, flags: PeerFlags) {
         if let Some(f) = self.by_addr.get_mut(&addr) {
             // Union: remember the best information we have.
             f.0 |= flags.0;
@@ -345,6 +426,13 @@ impl AddrMan {
     /// over-cap book (`add` exceed), and a full book of only tried addrs
     /// return false. Never exceeds `cap`.
     pub fn add_learned(&mut self, addr: SocketAddr, cap: usize) -> bool {
+        self.add_learned_addr(NetAddr::from_socket(addr), cap)
+    }
+
+    pub fn add_learned_addr(&mut self, addr: NetAddr, cap: usize) -> bool {
+        if !self.allowed(addr) {
+            return false;
+        }
         if self.by_addr.contains_key(&addr) || cap == 0 {
             return false;
         }
@@ -359,7 +447,7 @@ impl AddrMan {
         true
     }
 
-    fn evict_one(&mut self, addr: SocketAddr) {
+    fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
         self.last_attempt.remove(&addr);
         self.order.retain(|a| *a != addr);
@@ -370,7 +458,7 @@ impl AddrMan {
             .order
             .iter()
             .copied()
-            .find(|a| !self.flags(a).has_connected());
+            .find(|a| !self.flags_of(a).has_connected());
         let Some(addr) = victim else {
             return false;
         };
@@ -383,12 +471,12 @@ impl AddrMan {
             .order
             .iter()
             .copied()
-            .find(|a| self.flags(a).is_incompatible())
+            .find(|a| self.flags_of(a).is_incompatible())
             .or_else(|| {
                 self.order
                     .iter()
                     .copied()
-                    .find(|a| self.flags(a).failed_last_connect())
+                    .find(|a| self.flags_of(a).failed_last_connect())
             });
         if let Some(addr) = victim {
             self.evict_one(addr);
@@ -401,20 +489,20 @@ impl AddrMan {
         if self.order.len() <= cap {
             return;
         }
-        let mut keep: Vec<SocketAddr> = self
+        let mut keep: Vec<NetAddr> = self
             .order
             .iter()
             .copied()
-            .filter(|a| self.flags(a).has_connected())
+            .filter(|a| self.flags_of(a).has_connected())
             .collect();
         keep.extend(
             self.order
                 .iter()
                 .copied()
-                .filter(|a| !self.flags(a).has_connected()),
+                .filter(|a| !self.flags_of(a).has_connected()),
         );
         keep.truncate(cap);
-        let keep_set: HashSet<SocketAddr> = keep.iter().copied().collect();
+        let keep_set: HashSet<NetAddr> = keep.iter().copied().collect();
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
@@ -426,7 +514,7 @@ impl AddrMan {
     /// This path is not load: trim after the union.
     pub fn merge_from(&mut self, other: &AddrMan) {
         for e in other.entries() {
-            self.add_with_flags(e.addr, e.flags);
+            self.add_with_flags_addr(e.addr, e.flags);
         }
         self.trim_to_cap(MAX_ADDR_MAN);
         self.sort_order_ipv4_first();
@@ -438,11 +526,19 @@ impl AddrMan {
         self.order.sort_by_key(|a| a.is_ipv6());
     }
 
-    pub fn peers(&self) -> &[SocketAddr] {
-        &self.order
+    pub fn peers(&self) -> Vec<SocketAddr> {
+        self.order
+            .iter()
+            .copied()
+            .filter_map(NetAddr::socket_addr)
+            .collect()
     }
 
     pub fn flags(&self, addr: &SocketAddr) -> PeerFlags {
+        self.flags_of(&NetAddr::from_socket(*addr))
+    }
+
+    fn flags_of(&self, addr: &NetAddr) -> PeerFlags {
         self.by_addr
             .get(addr)
             .copied()
@@ -450,6 +546,10 @@ impl AddrMan {
     }
 
     pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
+        self.entry_of(&NetAddr::from_socket(*addr))
+    }
+
+    fn entry_of(&self, addr: &NetAddr) -> Option<PeerEntry> {
         self.by_addr
             .get(addr)
             .map(|&flags| PeerEntry { addr: *addr, flags })
@@ -465,7 +565,11 @@ impl AddrMan {
 
     /// Successful BIP324 handshake.
     pub fn note_connected(&mut self, addr: SocketAddr) {
-        self.add(addr);
+        self.note_connected_addr(NetAddr::from_socket(addr));
+    }
+
+    pub fn note_connected_addr(&mut self, addr: NetAddr) {
+        self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
@@ -479,18 +583,26 @@ impl AddrMan {
     }
 
     pub(crate) fn note_attempt_at(&mut self, addr: SocketAddr, when: Instant) {
-        self.last_attempt.insert(addr, when);
+        self.last_attempt.insert(NetAddr::from_socket(addr), when);
+    }
+
+    pub fn note_attempt_addr(&mut self, addr: NetAddr) {
+        self.last_attempt.insert(addr, Instant::now());
     }
 
     fn recently_attempted(&self, addr: SocketAddr, now: Instant) -> bool {
         self.last_attempt
-            .get(&addr)
+            .get(&NetAddr::from_socket(addr))
             .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
     }
 
     /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
     pub fn note_connect_failed(&mut self, addr: SocketAddr, incompatible: bool) {
-        self.add(addr);
+        self.note_connect_failed_addr(NetAddr::from_socket(addr), incompatible);
+    }
+
+    pub fn note_connect_failed_addr(&mut self, addr: NetAddr, incompatible: bool) {
+        self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             if incompatible {
                 f.insert(PeerFlags::INCOMPATIBLE);
@@ -504,7 +616,7 @@ impl AddrMan {
     /// Throughput / latency sample from an active session.
     pub fn note_speed(&mut self, addr: SocketAddr, latency_ms: u64, bytes_per_sec: u64) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.apply_speed_sample(latency_ms, bytes_per_sec);
         }
@@ -514,7 +626,7 @@ impl AddrMan {
     /// would otherwise leave a prior FAST bit and keep `dial_tier` 0).
     pub fn note_ibd_slow(&mut self, addr: SocketAddr) {
         self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&addr) {
+        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.insert(PeerFlags::SLOW);
             f.remove(PeerFlags::FAST);
@@ -562,10 +674,17 @@ impl AddrMan {
         let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
             .iter()
-            .filter(|a| !exclude.contains(*a))
-            .map(|&a| {
-                let f = self.flags(&a);
-                (f.dial_tier(), a.is_ipv6(), f.is_incompatible(), a)
+            .copied()
+            .filter_map(|a| {
+                if !self.dialable(a) {
+                    return None;
+                }
+                let sock = a.socket_addr()?;
+                if exclude.contains(&sock) {
+                    return None;
+                }
+                let f = self.flags_of(&a);
+                Some((f.dial_tier(), sock.is_ipv6(), f.is_incompatible(), sock))
             })
             .collect();
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -645,11 +764,12 @@ impl AddrMan {
 
     /// Snapshot of all entries (for tests / diagnostics).
     pub fn entries(&self) -> Vec<PeerEntry> {
-        self.order.iter().filter_map(|a| self.entry(a)).collect()
+        self.order.iter().filter_map(|a| self.entry_of(a)).collect()
     }
 
     /// On-disk format magic line (text, one peer per line).
     pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
+    pub const PEERS_FILE_MAGIC_V2: &'static str = "rbitcoin-peers-v2";
 
     /// Load peers + flags from `path`. Missing file → empty book (not an error).
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -667,14 +787,15 @@ impl AddrMan {
                 continue;
             }
             if !saw_magic {
-                if line != Self::PEERS_FILE_MAGIC {
+                if line != Self::PEERS_FILE_MAGIC && line != Self::PEERS_FILE_MAGIC_V2 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "peers file {}:{}: expected magic `{}`",
+                            "peers file {}:{}: expected magic `{}` or `{}`",
                             path.display(),
                             lineno + 1,
-                            Self::PEERS_FILE_MAGIC
+                            Self::PEERS_FILE_MAGIC,
+                            Self::PEERS_FILE_MAGIC_V2
                         ),
                     ));
                 }
@@ -686,7 +807,7 @@ impl AddrMan {
                 continue;
             };
             let flags_s = parts.next().unwrap_or("0");
-            let addr: SocketAddr = addr_s.parse().map_err(|e| {
+            let addr: NetAddr = addr_s.parse().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -722,7 +843,7 @@ impl AddrMan {
                     )
                 })?
             };
-            am.add_with_flags(addr, PeerFlags(flags_u));
+            am.add_with_flags_addr(addr, PeerFlags(flags_u));
         }
         if !saw_magic && am.is_empty() {
             // Empty or comment-only without magic — treat as empty book.
@@ -741,7 +862,7 @@ impl AddrMan {
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
-            writeln!(f, "{}", Self::PEERS_FILE_MAGIC)?;
+            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V2)?;
             writeln!(
                 f,
                 "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
@@ -1234,6 +1355,28 @@ mod tests {
     }
 
     #[test]
+    fn dns_seeds_not_resolved_locally_when_proxy() {
+        for net in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Signet,
+            Network::Regtest,
+        ] {
+            let dests = socks_dns_seed_dests(net);
+            let names = dns_seeds(net);
+            assert_eq!(dests.len(), names.len());
+            for ((host, port), want) in dests.iter().zip(names.iter()) {
+                assert_eq!(host, want);
+                assert_eq!(*port, default_port(net));
+                assert!(
+                    host.parse::<std::net::IpAddr>().is_err(),
+                    "SOCKS seed dest must stay a hostname, got {host}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn peer_flags_set_remove_and_mid_range_speed() {
         let mut f = PeerFlags::empty();
         assert!(f.is_untried());
@@ -1410,6 +1553,191 @@ mod tests {
         am.save(&nested).unwrap();
         assert!(nested.is_file());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_onion() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-onion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let onion: NetAddr = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+        let mut am = AddrMan::new();
+        am.add_addr(onion);
+        am.add(addr(1));
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == onion),
+            "onion must persist, got {:?}",
+            loaded.entries()
+        );
+        assert!(loaded.entry(&addr(1)).is_some());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("rbitcoin-peers-v2"),
+            "new writes use v2, got {body}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_i2p() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-i2p-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let i2p = NetAddr::I2p {
+            dest: [0x11u8; 32],
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.add_addr(i2p);
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == i2p),
+            "i2p must persist, got {:?}",
+            loaded.entries()
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains(".b32.i2p:8333"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peers_file_v1_ipv4_still_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        std::fs::write(&path, format!("rbitcoin-peers-v1\n{} 0x01\n", addr(4))).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(loaded.entry(&addr(4)).is_some());
+        assert!(loaded.flags(&addr(4)).has_connected());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_net_onion_filters_ipv4_candidates() {
+        let onion: NetAddr = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+        let mut am = AddrMan::new();
+        am.add(addr(1));
+        am.add_addr(onion);
+        am.set_only_net(vec![OnlyNet::Onion]);
+        let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![onion]);
+        assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn only_net_i2p_filters_ipv4_candidates() {
+        let i2p = NetAddr::I2p {
+            dest: [0x11u8; 32],
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.add(addr(1));
+        am.add_addr(i2p);
+        am.set_only_net(vec![OnlyNet::I2p]);
+        let got = am.take_dial_candidates_net(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![i2p]);
+        assert!(am.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    }
+
+    #[test]
+    fn cjdns_not_dialed_when_unreachable() {
+        use std::net::Ipv6Addr;
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let cjdns = NetAddr::Cjdns { ip, port: 8333 };
+        let sock = SocketAddr::from((ip, 8333));
+        let mut am = AddrMan::new();
+        am.add_addr(cjdns);
+        am.add(addr(1));
+        assert!(am
+            .take_dial_candidates(8, &HashSet::new(), &[])
+            .contains(&addr(1)));
+        assert!(
+            !am.take_dial_candidates(8, &HashSet::new(), &[])
+                .contains(&sock),
+            "fc00 must not dial without --cjdns-reachable"
+        );
+        am.set_cjdns_reachable(true);
+        am.add_addr(cjdns);
+        let got = am.take_dial_candidates(8, &HashSet::new(), &[]);
+        assert!(
+            got.contains(&sock),
+            "reachable cjdns must dial, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn only_net_cjdns_filters_ipv4() {
+        use std::net::Ipv6Addr;
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let cjdns = NetAddr::Cjdns { ip, port: 8333 };
+        let sock = SocketAddr::from((ip, 8333));
+        let mut am = AddrMan::new();
+        am.set_cjdns_reachable(true);
+        am.add(addr(1));
+        am.add_addr(cjdns);
+        am.set_only_net(vec![OnlyNet::Cjdns]);
+        let got = am.take_dial_candidates(8, &HashSet::new(), &[]);
+        assert_eq!(got, vec![sock]);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_cjdns() {
+        use std::net::Ipv6Addr;
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-cjdns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let cjdns = NetAddr::Cjdns {
+            ip: Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7),
+            port: 8333,
+        };
+        let mut am = AddrMan::new();
+        am.set_cjdns_reachable(true);
+        am.add_addr(cjdns);
+        am.save(&path).unwrap();
+        let loaded = AddrMan::load(&path).unwrap();
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == cjdns),
+            "cjdns must persist, got {:?}",
+            loaded.entries()
+        );
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("fc00:"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

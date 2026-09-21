@@ -39,17 +39,41 @@ let
     else
       "${address}:${toString port}";
 
+  needTorControl = cfg.tor.control != null || cfg.electrum.hiddenService || cfg.esplora.hiddenService || cfg.p2p.listenOnion;
+  needI2pSam = cfg.i2p.sam != null;
+  needCjdns = cfg.cjdns.reachable;
+  torControlAddr =
+    if cfg.tor.control != null then
+      cfg.tor.control
+    else if cfg.electrum.hiddenService || cfg.esplora.hiddenService || cfg.p2p.listenOnion then
+      "127.0.0.1:9051"
+    else
+      null;
+
   command = [
     "${cfg.package}/bin/rbitcoin-node"
     "--datadir"
     cfg.dataDir
     "--network"
     cfg.network
-    "--listen"
-    (socket cfg.p2p.address cfg.p2p.port)
+  ]
+  ++ (
+    if cfg.p2p.listen then
+      [
+        "--listen"
+        (socket cfg.p2p.address cfg.p2p.port)
+      ]
+    else
+      [ "--no-listen" ]
+  )
+  ++ [
     "--log-level"
     cfg.logLevel
   ]
+  ++ optional (cfg.p2p.maxInbound != 125) "--max-inbound"
+  ++ optional (cfg.p2p.maxInbound != 125) (toString cfg.p2p.maxInbound)
+  ++ optional (!cfg.p2p.discover) "--no-discover"
+  ++ optional cfg.p2p.listenOnion "--listen-onion"
   ++ optional (cfg.coldDataDir != null) "--datadir-cold"
   ++ optional (cfg.coldDataDir != null) cfg.coldDataDir
   ++ optional cfg.rpc.enable "--rpc-listen"
@@ -60,6 +84,21 @@ let
   ++ optional cfg.esplora.enable (socket cfg.esplora.address cfg.esplora.port)
   ++ optional (cfg.scripthashIndex || cfg.electrum.enable || cfg.esplora.enable) "--shindex"
   ++ optional cfg.silentPaymentIndex "--sptweaks"
+  ++ optional (cfg.proxy != null) "--proxy"
+  ++ optional (cfg.proxy != null) cfg.proxy
+  ++ optional (cfg.onionProxy != null) "--onion"
+  ++ optional (cfg.onionProxy != null) cfg.onionProxy
+  ++ optional (!cfg.proxyRandomize) "--proxy-randomize=0"
+  ++ lib.concatMap (n: [ "--only-net" n ]) cfg.onlyNet
+  ++ optional (torControlAddr != null) "--tor-control"
+  ++ optional (torControlAddr != null) torControlAddr
+  ++ optional (cfg.tor.controlCookie != null) "--tor-control-cookie"
+  ++ optional (cfg.tor.controlCookie != null) (toString cfg.tor.controlCookie)
+  ++ optional needI2pSam "--i2p-sam"
+  ++ optional needI2pSam cfg.i2p.sam
+  ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
+  ++ optional cfg.cjdns.reachable "--cjdns-reachable"
+  ++ optional cfg.esplora.hiddenService "--esplora-onion"
   ++ cfg.extraArgs;
 in
 {
@@ -149,6 +188,77 @@ in
       description = "Additional command-line arguments appended after module-managed arguments.";
     };
 
+    tor = {
+      control = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:9051";
+        description = "System tor control HOST:PORT. Unset skips the control connection.";
+      };
+
+      controlCookie = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/tor/control.authcookie";
+        description = "Tor control cookie file. Default in the node is /run/tor/control.authcookie when --tor-control is set.";
+      };
+    };
+
+    i2p = {
+      sam = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:7656";
+        description = "I2P SAM v3 HOST:PORT (system i2pd). Unset skips SAM.";
+      };
+
+      acceptIncoming = mkOption {
+        type = types.bool;
+        default = false;
+        description = "STREAM FORWARD to the P2P bind. Requires i2p.sam and (p2p.listen or p2p.listenOnion). Persists {dataDir}/i2p/p2p.priv.";
+      };
+    };
+
+    cjdns = {
+      reachable = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires this. After/Wants cjdns.service. No in-process router.";
+      };
+    };
+
+    proxy = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "127.0.0.1:9050";
+      description = "SOCKS5 proxy HOST:PORT for all P2P outbound. Also enables isolated local-tx broadcast (new SOCKS circuit after sendraw / Electrum / Esplora submit; not Dandelion++). Standing peers do not INV those txs.";
+    };
+
+    onionProxy = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "127.0.0.1:9050";
+      description = "SOCKS5 proxy HOST:PORT for onion destinations.";
+    };
+
+    proxyRandomize = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Fresh SOCKS username per peer so Tor isolates circuits.";
+    };
+
+    onlyNet = mkOption {
+      type = types.listOf (types.enum [
+        "ipv4"
+        "ipv6"
+        "onion"
+        "i2p"
+        "cjdns"
+      ]);
+      default = [ ];
+      description = "Restrict P2P to these networks. onion requires proxy or onionProxy; i2p requires i2p.sam.";
+    };
+
     p2p = {
       address = mkOption {
         type = types.str;
@@ -162,10 +272,34 @@ in
         description = "Bitcoin P2P listen port.";
       };
 
+      listen = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Bind a P2P listen socket. Set false for outbound-only (no ISP port forward).";
+      };
+
+      maxInbound = mkOption {
+        type = types.ints.unsigned;
+        default = 125;
+        description = "Inbound P2P session cap. 0 with listen=false is outbound-only.";
+      };
+
+      discover = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Advertise local addresses to peers. Off with --no-discover.";
+      };
+
+      listenOnion = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for the P2P port. Binds 127.0.0.1 even with p2p.listen = false. Requires tor.control (implied 127.0.0.1:9051) and maxInbound > 0. Gossip the onion, not a home IPv4, when discover is off.";
+      };
+
       openFirewall = mkOption {
         type = types.bool;
         default = false;
-        description = "Open the P2P listen port in the NixOS firewall.";
+        description = "Open the P2P listen port in the NixOS firewall. Ignored when listen is false.";
       };
     };
 
@@ -205,6 +339,12 @@ in
         default = false;
         description = "Open the Electrum listen port in the NixOS firewall.";
       };
+
+      hiddenService = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for Electrum when --electrum-listen is on. Implies tor.control 127.0.0.1:9051 if unset.";
+      };
     };
 
     esplora = {
@@ -227,6 +367,12 @@ in
         default = false;
         description = "Open the Esplora listen port in the NixOS firewall.";
       };
+
+      hiddenService = mkOption {
+        type = types.bool;
+        default = false;
+        description = "ADD_ONION for Esplora when --esplora-listen is on. Implies tor.control 127.0.0.1:9051 if unset. REST and /ws share the TCP port.";
+      };
     };
   };
 
@@ -235,6 +381,18 @@ in
       {
         assertion = cfg.coldDataDir == null || cfg.coldDataDir != cfg.dataDir;
         message = "services.rbitcoin.coldDataDir must differ from dataDir";
+      }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.i2p.sam != null;
+        message = "services.rbitcoin.i2p.acceptIncoming requires i2p.sam";
+      }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.listen || cfg.p2p.listenOnion;
+        message = "services.rbitcoin.i2p.acceptIncoming requires p2p.listen or p2p.listenOnion (STREAM FORWARD needs a P2P bind)";
+      }
+      {
+        assertion = !(builtins.elem "cjdns" cfg.onlyNet) || cfg.cjdns.reachable;
+        message = "services.rbitcoin.onlyNet cjdns requires cjdns.reachable";
       }
     ];
 
@@ -264,8 +422,18 @@ in
       description = "rbitcoin full node";
       documentation = [ "https://github.com/reardencode/rbitcoin/blob/master/OPERATOR.md" ];
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      wants = [
+        "network-online.target"
+      ]
+      ++ optional needTorControl "tor.service"
+      ++ optional needI2pSam "i2pd.service"
+      ++ optional needCjdns "cjdns.service";
+      after = [
+        "network-online.target"
+      ]
+      ++ optional needTorControl "tor.service"
+      ++ optional needI2pSam "i2pd.service"
+      ++ optional needCjdns "cjdns.service";
       environment = cfg.environment;
 
       serviceConfig = {
@@ -281,11 +449,14 @@ in
         ProtectHome = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ cfg.dataDir ] ++ optional (cfg.coldDataDir != null) cfg.coldDataDir;
+      }
+      // lib.optionalAttrs (cfg.tor.controlCookie != null) {
+        SupplementaryGroups = [ "tor" ];
       };
     };
 
     networking.firewall.allowedTCPPorts =
-      optional cfg.p2p.openFirewall cfg.p2p.port
+      optional (cfg.p2p.openFirewall && cfg.p2p.listen) cfg.p2p.port
       ++ optional (cfg.electrum.enable && cfg.electrum.openFirewall) cfg.electrum.port
       ++ optional (cfg.esplora.enable && cfg.esplora.openFirewall) cfg.esplora.port;
 

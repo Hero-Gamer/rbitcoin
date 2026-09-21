@@ -1018,6 +1018,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
     let slot = PeerSlot {
         id: 0,
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
+        net: crate::NetAddr::from_socket(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444)),
         cmd_tx,
         in_flight: HashSet::new(),
         peer_height: 100,
@@ -1201,6 +1202,7 @@ fn zombie_pending_mid_at_confirmed_height_never_reget() {
     let slot = PeerSlot {
         id: 0,
         addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+        net: crate::NetAddr::from_socket(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445)),
         cmd_tx,
         in_flight: HashSet::new(),
         peer_height: 100,
@@ -1800,6 +1802,7 @@ fn apply_peer_event_body_and_control_surface() {
         PeerSlot {
             id,
             addr: a,
+            net: crate::NetAddr::from_socket(a),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 10,
@@ -1961,14 +1964,23 @@ fn apply_peer_event_body_and_control_surface() {
     inject_learned_addrs(
         &mut book,
         &[
-            addr(2),
-            local,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1),
+            crate::NetAddr::Ip(addr(2)),
+            crate::NetAddr::Ip(local),
+            crate::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)),
         ],
         local,
         1,
     );
     assert!(book.entry(&addr(2)).is_some());
+    let onion: crate::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    inject_learned_addrs(&mut book, &[onion], local, 1);
+    assert!(
+        book.entries().iter().any(|e| e.addr == onion),
+        "IBD addrv2 onion must enter the dial book"
+    );
 
     // Dead releases work.
     st.slots[0].in_flight.insert(h(4));
@@ -2036,6 +2048,10 @@ fn apply_peer_event_repeat_headers_skips_ensure_header_fk() {
         PeerSlot {
             id: 1,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)), 18444),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1)),
+                18444,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 10,
@@ -2177,6 +2193,10 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         PeerSlot {
             id,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                18444,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 5,
@@ -2379,7 +2399,10 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let n0 = book.len();
     inject_learned_addrs(
         &mut book,
-        &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333)],
+        &[crate::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+            8333,
+        ))],
         local,
         1,
     );
@@ -2396,7 +2419,10 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     ctrl_tx
         .send(PeerEvent::Addrs {
             peer: 1,
-            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8333)],
+            addrs: vec![crate::NetAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                8333,
+            ))],
         })
         .unwrap();
     let stats = super::super::status::LoopStats::default();
@@ -2456,6 +2482,10 @@ fn block_framed_raw_offers_body_queue_with_confirm_feed() {
         PeerSlot {
             id,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                18444,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 5,
@@ -2593,6 +2623,10 @@ fn known_headers_re_admit_to_ordered_after_tip_drain() {
         PeerSlot {
             id,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                18444,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 5,
@@ -2744,6 +2778,7 @@ fn path_slot_first_wins_chained_via_headers() {
         PeerSlot {
             id,
             addr: a,
+            net: crate::NetAddr::from_socket(a),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 10,

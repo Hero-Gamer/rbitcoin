@@ -12,7 +12,7 @@ use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::{
     rehydrate_block_queue_residue, run_feeler_timed, select_inbound_eviction, IbdConfig,
-    InboundEvictCandidate, NetError, P2PNode,
+    InboundEvictCandidate, NetAddr, NetError, P2PNode,
 };
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -126,7 +126,7 @@ async fn seed_chain(node: &P2PNode, blocks: u32) {
 
 /// IBD from a single peer (test helper).
 async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
-    node.sync(&[peer], IbdConfig::for_test())
+    node.sync(&[rbitcoin_net::NetAddr::Ip(peer)], IbdConfig::for_test())
         .await
         .expect("ibd sync")
 }
@@ -1585,7 +1585,13 @@ async fn ibd_two_peers() {
 
         let client = start_node(&peer_dir).await;
         let n = client
-            .sync(&[seed.local_addr, mid.local_addr], IbdConfig::for_test())
+            .sync(
+                &[
+                    rbitcoin_net::NetAddr::Ip(seed.local_addr),
+                    rbitcoin_net::NetAddr::Ip(mid.local_addr),
+                ],
+                IbdConfig::for_test(),
+            )
             .await
             .expect("ibd");
         assert!(n >= 8, "accepted {n}");
@@ -1619,7 +1625,13 @@ async fn ibd_skips_dead_peer() {
     let peer = start_node(&peer_dir).await;
     let bad: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let n = peer
-        .sync(&[bad, seed.local_addr], IbdConfig::for_test())
+        .sync(
+            &[
+                rbitcoin_net::NetAddr::Ip(bad),
+                rbitcoin_net::NetAddr::Ip(seed.local_addr),
+            ],
+            IbdConfig::for_test(),
+        )
         .await
         .expect("ibd with bad+good");
     assert!(n >= 4, "downloaded {n}");
@@ -2311,7 +2323,7 @@ async fn node_run_p2p_short() {
             .with_network(Network::Regtest)
             .with_p2p_listen("127.0.0.1:0".parse().unwrap())
             .with_tiny_heads();
-        cfg.listen.connect = vec![seed_addr];
+        cfg.listen.connect = vec![NetAddr::Ip(seed_addr)];
         cfg.listen.use_seeds = false;
         cfg.listen.electrum = Some(electrum_addr);
         cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));

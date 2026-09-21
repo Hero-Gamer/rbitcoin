@@ -126,7 +126,11 @@ async fn ibd_cancellable_exits_when_flag_set() {
     cfg.target_peers = 1;
     // Cancelled IBD should return Ok (partial) or complete if race finishes first.
     let _ = peer
-        .sync_cancellable(&[seed.local_addr], cfg, Some(cancel))
+        .sync_cancellable(
+            &[rbitcoin_net::NetAddr::Ip(seed.local_addr)],
+            cfg,
+            Some(cancel),
+        )
         .await;
 
     seed.shutdown().await;
@@ -158,7 +162,10 @@ async fn ibd_unreachable_peer_errors() {
     cfg.connect_timeout = Duration::from_millis(150);
     // TEST-NET-1 documentation address — closed / non-listening.
     let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let err = node.sync(&[dead], cfg).await.unwrap_err();
+    let err = node
+        .sync(&[rbitcoin_net::NetAddr::Ip(dead)], cfg)
+        .await
+        .unwrap_err();
     let s = err.to_string();
     assert!(
         s.contains("no peers") || s.contains("protocol") || s.contains("connect"),

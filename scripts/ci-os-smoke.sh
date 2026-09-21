@@ -66,9 +66,15 @@ done
 
 # A filter that matches nothing is a stale filter, not a pass: libtest reports
 # "running 0 tests" and exits 0, so the gate would silently shrink on a rename.
+# Capture the list first: `grep -q` on cargo's pipe is SIGPIPE under `pipefail`.
 assert_filter_matches() {
   local pkg="$1" f="$2"
-  if ! cargo test -q -p "$pkg" --lib -- --list "$f" | grep -q ': test'; then
+  local listed
+  if ! listed="$(cargo test -q -p "$pkg" --lib -- --list "$f")"; then
+    echo "ci-os-smoke: failed to list tests for '$f' in $pkg" >&2
+    exit 1
+  fi
+  if ! grep -q ': test' <<<"$listed"; then
     echo "ci-os-smoke: stale filter '$f' matches no test in $pkg" >&2
     exit 1
   fi

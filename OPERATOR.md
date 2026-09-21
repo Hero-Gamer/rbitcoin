@@ -366,10 +366,23 @@ Clean smoke:
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
 | `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
 | `--listen ADDR` | `listen=` | bind later default port |
-| `--connect ADDR` | `connect=` (repeatable) | seeds |
+| `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no clearnet P2P socket |
+| `--listen-onion` | `listen_onion=` | **off** — loopback P2P + `ADD_ONION` (`{datadir}/onion/p2p.priv`); needs `--tor-control` and `--max-inbound` > 0 |
+| `--no-discover` | `no_discover=` | discover **on**; flag off = no home-IP self-announce; P2P/wallet onions still listed |
+| `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` / `cjdns` |
+| `--cjdns-reachable` | `cjdns_reachable=` | **off** — `fc00::/8` is unroutable until set; `--only-net=cjdns` requires it |
+| `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port`, Tor v3 `.onion:port`, or `{52}.b32.i2p:port` |
+| `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
+| `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
+| `--proxy-randomize[=0\|1]` | `proxy_randomize=` | **on** — fresh SOCKS username per peer (Tor circuit isolation) |
+| `--tor-control [HOST:PORT]` | `tor_control=` | unset — no control connection; omit ADDR → `127.0.0.1:9051` |
+| `--tor-control-cookie PATH` | `tor_control_cookie=` | `/run/tor/control.authcookie` when `--tor-control` is set and password is unset |
+| `--tor-control-password PASS` | `tor_control_password=` | unset — cookie AUTH unless set |
+| `--i2p-sam [HOST:PORT]` | `i2p_sam=` | unset — no SAM; omit ADDR → `127.0.0.1:7656` |
+| `--i2p-accept-incoming` | `i2p_accept_incoming=` | **off** — persist `{datadir}/i2p/p2p.priv` and STREAM FORWARD to the P2P bind |
 | `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
-| `--max-inbound N` | `max_inbound=` | 125 inbound sessions |
+| `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
 | `--mempool-size-mb N` | `mempool_size_mb=` | ~300 MiB weight |
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | `log_level=` | `info` |
@@ -382,6 +395,7 @@ Clean smoke:
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
 | `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine). Address/scripthash methods need `--sh-index` |
+| `--esplora-onion[=0\|1]` | `esplora_onion=` | **on** — `ADD_ONION` for Esplora when `--tor-control` is set |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
@@ -424,6 +438,68 @@ network=signet
 max_inbound=64
 mempool_size_mb=100
 ```
+
+### P2P via system Tor SOCKS
+
+`--proxy 127.0.0.1:9050` sends every P2P outbound through SOCKS5 CONNECT
+(system `tor`, not Arti). DNS seeds are not resolved locally on that path —
+pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
+on) uses a fresh SOCKS username per peer so Tor isolates circuits.
+`--proxy` or `--onion` also turns on **isolated local-tx broadcast**:
+`sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
+`POST /tx` (and packages) are not INV'd on standing peers. After mempool
+accept the node opens a short-lived SOCKS circuit (fresh isolation
+credentials), BIP324-handshakes one or two AddrMan peers (onion first),
+sends `tx`, and disconnects. This is **not** Dandelion++. If that
+one-shot fails, the tx stays in the mempool and is still not INV'd;
+confirmation can still arrive in a block.
+`--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
+`--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`/`cjdns`) filters dial and learn;
+onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
+error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
+(v1 IPv4/IPv6 still loads).
+
+`--listen=0` / `--no-listen` starts without a P2P TCP bind (no ISP port
+forward). `--listen-onion` still binds **127.0.0.1** (ephemeral port) and
+`ADD_ONION`s the network default P2P port (8333 / signet 38333 / …) to
+that loopback (`{datadir}/onion/p2p.priv`, 0600). Needs `--tor-control`
+and `--max-inbound` > 0. `--no-discover` still gossips that onion via
+`addrv2` and lists it in `getnetworkinfo.localaddresses`; it does not
+gossip `--external-ip`. `--max-inbound 0` refuses `--listen-onion`.
+`--max-inbound 0` refuses inbound slots. `--no-discover` does not
+self-announce even when `--external-ip` is set. A later onion inbound bind
+does not require a public clearnet listen.
+
+`--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
+ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
+socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
+`127.0.0.1:<bound>` and logs `….onion:port`. The private key is
+`{datadir}/onion/electrum.priv` (0600). `server.features.hosts` is
+`{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. With
+`--esplora-listen`, the same control port `ADD_ONION`s Esplora (`{datadir}/onion/esplora.priv`);
+REST and `/ws` share that TCP port (`http://….onion:<port>`). `--esplora-onion=0`
+skips Esplora HS. `getnetworkinfo.localaddresses` lists those onion hostnames
+even with `--no-discover`. Sparrow: `tcp://<id>.onion:50001` (plain TCP; no
+in-binary TLS). JSON-RPC stays off the onion (`rpc.sock` / `--rpc-listen` only).
+Cookie path differs by distro; pass `--tor-control-cookie` rather than globbing.
+
+`--i2p-sam [HOST:PORT]` talks to **system i2pd** SAM v3 (not SOCKS, not Arti).
+Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
+error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
+`--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
+creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
+`STREAM FORWARD`s to the P2P bind. With `--listen=0` that is a start error
+unless `--listen-onion` provides a loopback accept. NixOS:
+`services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
+`i2pd.service` when SAM is set. Do not start i2pd from this module.
+
+`--cjdns-reachable` treats BIP155 `fc00::/8` as the kernel CJDNS overlay: dial
+with ordinary TCP (OS routing), advertise a `--listen` on that IPv6, keep
+tagged rows in `peers` v2. Off (default): do not dial CJDNS; do not treat
+`fc00::/8` as advertisable. `--only-net=cjdns` without the flag is a start
+error. `--listen [fc00:…]:port` binds that address when the OS has it; no
+cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
+`After`/`Wants` `cjdns.service`. Do not start a cjdns router from this module.
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
@@ -591,7 +667,9 @@ warning and continues without inhibit.
 **Peers file:** `{datadir}/peers` stores discovered addresses and **PeerFlags**
 (connected / fast / slow / incompatible / last-fail) between runs. Loaded at
 start (before seeds), updated after IBD and on shutdown. Seeds are merged in
-without clearing known flags.
+without clearing known flags. New writes are `rbitcoin-peers-v2` (IPv4, IPv6,
+and Tor v3 `.onion:port` tokens). `rbitcoin-peers-v1` IPv4/IPv6 files still
+load.
 
 **Index modes:** Direct vs Tip: [`docs/concurrency.md`](docs/concurrency.md).
 IBD finishes Class A + `tx.head` + spend annotations **before** tip; tip entry

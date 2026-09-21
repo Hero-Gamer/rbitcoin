@@ -512,7 +512,7 @@ fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).
 pub(crate) fn inject_learned_addrs(
     book: &mut AddrMan,
-    addrs: &[SocketAddr],
+    addrs: &[crate::NetAddr],
     local_addr: SocketAddr,
     from_peer: usize,
 ) {
@@ -521,10 +521,14 @@ pub(crate) fn inject_learned_addrs(
     }
     let mut added = 0usize;
     for &a in addrs {
-        if a == local_addr || a.ip().is_unspecified() || a.port() == 0 {
+        if a.port() == 0 {
             continue;
         }
-        if book.add_learned(a, MAX_PEER_POOL) {
+        match a {
+            crate::NetAddr::Ip(s) if s == local_addr || s.ip().is_unspecified() => continue,
+            _ => {}
+        }
+        if book.add_learned_addr(a, MAX_PEER_POOL) {
             added += 1;
         }
     }

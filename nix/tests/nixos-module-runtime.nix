@@ -29,12 +29,36 @@ pkgs.testers.runNixOSTest {
         p2p = {
           address = "127.0.0.1";
           port = 18445;
+          listenOnion = true;
         };
         rpc.enable = true;
+        tor.control = "127.0.0.1:9051";
+        i2p.sam = "127.0.0.1:7656";
+        cjdns.reachable = true;
         extraArgs = [
           "--max-outbound"
           "4"
         ];
+      };
+
+      systemd.services.tor = {
+        description = "fake tor unit for After= ordering";
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.coreutils}/bin/true";
+        };
+      };
+
+      systemd.services.i2pd = {
+        description = "fake i2pd unit for After= ordering";
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.coreutils}/bin/true";
+        };
       };
     };
 
@@ -49,6 +73,14 @@ pkgs.testers.runNixOSTest {
     machine.succeed("grep -Fx -- '127.0.0.1:18443' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '--max-outbound' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '4' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--tor-control' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '127.0.0.1:9051' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--listen-onion' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--i2p-sam' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--cjdns-reachable' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '127.0.0.1:7656' /var/lib/rbitcoin-test/args")
+    machine.succeed("systemctl show -p After rbitcoin.service | grep -F tor.service")
+    machine.succeed("systemctl show -p After rbitcoin.service | grep -F i2pd.service")
     machine.succeed("systemctl stop rbitcoin.service")
     machine.succeed("test -e /var/lib/rbitcoin-test/stopped")
   '';

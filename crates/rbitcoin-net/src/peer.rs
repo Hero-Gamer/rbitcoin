@@ -17,7 +17,7 @@ use crate::v2::{
 };
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
-use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
@@ -307,34 +307,34 @@ pub fn advertising_address_log(addr_port: impl std::fmt::Display, peer: u64) -> 
     format!("p2p: Advertising address {addr_port} to peer={peer}")
 }
 
-fn addrv2_from_sock(now: u32, sock: SocketAddr) -> AddrV2Message {
-    AddrV2Message {
-        time: now,
-        services: local_service_flags(),
-        addr: match sock.ip() {
-            std::net::IpAddr::V4(v) => AddrV2::Ipv4(v),
-            std::net::IpAddr::V6(v) => AddrV2::Ipv6(v),
-        },
-        port: sock.port(),
-    }
-}
-
 fn queue_addr_list(
     out: &mpsc::UnboundedSender<PeerOut>,
-    addrs: Vec<(u32, Address)>,
+    addrs: Vec<(u32, crate::NetAddr)>,
     v2: bool,
 ) -> Result<(), NetError> {
+    let services = local_service_flags();
     if v2 {
         let list: Vec<AddrV2Message> = addrs
             .into_iter()
-            .filter_map(|(t, a)| {
-                let sock = a.socket_addr().ok()?;
-                Some(addrv2_from_sock(t, sock))
+            .map(|(t, a)| AddrV2Message {
+                time: t,
+                services,
+                addr: a.to_addrv2(),
+                port: a.port(),
             })
             .collect();
         queue_out(out, NetworkMessage::AddrV2(list))
     } else {
-        queue_out(out, NetworkMessage::Addr(addrs))
+        let list: Vec<(u32, Address)> = addrs
+            .into_iter()
+            .filter_map(|(t, a)| match a {
+                crate::NetAddr::Ip(s) => Some((t, Address::new(&s, services))),
+                crate::NetAddr::Onion { .. }
+                | crate::NetAddr::I2p { .. }
+                | crate::NetAddr::Cjdns { .. } => None,
+            })
+            .collect();
+        queue_out(out, NetworkMessage::Addr(list))
     }
 }
 
@@ -1311,7 +1311,8 @@ fn tx_announce_should_queue(
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
 ) -> bool {
-    tx_announce_peer_ok(session, mp, txid)
+    !mp.skip_standing_inv(txid)
+        && tx_announce_peer_ok(session, mp, txid)
         && mp.try_contains(txid)
         && (mp.relay_enabled() || mp.is_unbroadcast(txid))
         && !tx_announce_below_feefilter(session, mp, txid)
@@ -2010,6 +2011,9 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
     let Some(mp) = hub.mempool() else {
         return;
     };
+    if mp.skip_standing_inv(&txid) {
+        return;
+    }
     let Some(tx) = mp.try_get_tx(&txid) else {
         return;
     };
@@ -2092,6 +2096,9 @@ fn tx_inv_candidate_ok(
     clock_due: bool,
     inbound_age_gate: bool,
 ) -> bool {
+    if mp.skip_standing_inv(&txid) {
+        return false;
+    }
     if from_this_peer.contains_key(&txid) {
         return false;
     }
@@ -3730,11 +3737,11 @@ fn on_getaddr(
     let bind = session
         .map(|s| s.addrbind)
         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    let v2 = session.is_some_and(|s| s.wants_addrv2());
     let addrs = match session.and_then(|s| s.peer_hub()) {
-        Some(ph) => ph.addr_response_for_bind(bind),
+        Some(ph) => ph.addr_response_net(bind, v2),
         None => Vec::new(),
     };
-    let v2 = session.is_some_and(|s| s.wants_addrv2());
     queue_addr_list(out_tx, addrs, v2)?;
     Ok(())
 }

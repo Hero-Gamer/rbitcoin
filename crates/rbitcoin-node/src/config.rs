@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 /// Default max concurrent inbound P2P sessions (same as net `DEFAULT_MAX_INBOUND`).
 pub const DEFAULT_MAX_INBOUND: u32 = rbitcoin_net::DEFAULT_MAX_INBOUND as u32;
 
+/// P2P bind: omitted flag (loopback default), `--listen=0` / `--no-listen`, or an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum P2pListen {
+    #[default]
+    Auto,
+    Off,
+    Socket(SocketAddr),
+}
+
 /// Parse Core BTC/kvB (`0.00000001`) to sat/kvB. Negatives and junk fail.
 pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
     let s = s.trim();
@@ -72,11 +81,11 @@ impl From<PathBuf> for DatadirOpts {
 /// P2P / Electrum / Esplora listen and peer-count knobs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenOpts {
-    pub p2p: Option<SocketAddr>,
+    pub p2p: P2pListen,
     pub p2p_extra: Vec<SocketAddr>,
     pub electrum: Option<SocketAddr>,
     pub esplora: Option<EsploraListen>,
-    pub connect: Vec<SocketAddr>,
+    pub connect: Vec<rbitcoin_net::NetAddr>,
     pub seednodes: Vec<String>,
     pub use_seeds: bool,
     pub max_outbound: u32,
@@ -84,12 +93,30 @@ pub struct ListenOpts {
     pub max_inbound_explicit: bool,
     pub external_ips: Vec<std::net::IpAddr>,
     pub peer_timeout_secs: Option<u64>,
+    /// SOCKS5 for all P2P outbound (`--proxy`).
+    pub proxy: Option<SocketAddr>,
+    /// SOCKS5 for onion destinations (`--onion`); clearnet stays `--proxy` or direct.
+    pub onion: Option<SocketAddr>,
+    /// Fresh SOCKS USERPASS per peer (Core `-proxyrandomize`; default on).
+    pub proxy_randomize: bool,
+    /// Core `-discover` (default on). Off: no self-announce / localaddresses.
+    pub discover: bool,
+    /// Empty = all networks. Repeatable `--only-net`.
+    pub only_net: Vec<rbitcoin_net::OnlyNet>,
+    /// SAM v3 TCP port (`--i2p-sam`).
+    pub i2p_sam: Option<SocketAddr>,
+    /// Persistent SAM destination + STREAM FORWARD to the P2P bind (`--i2p-accept-incoming`).
+    pub i2p_accept_incoming: bool,
+    /// Loopback P2P accept + Tor `ADD_ONION` (`--listen-onion`).
+    pub listen_onion: bool,
+    /// Kernel CJDNS overlay (`fc00::/8`) is routable (`--cjdns-reachable`).
+    pub cjdns_reachable: bool,
 }
 
 impl Default for ListenOpts {
     fn default() -> Self {
         Self {
-            p2p: None,
+            p2p: P2pListen::Auto,
             p2p_extra: Vec::new(),
             electrum: None,
             esplora: None,
@@ -101,7 +128,49 @@ impl Default for ListenOpts {
             max_inbound_explicit: false,
             external_ips: Vec::new(),
             peer_timeout_secs: None,
+            proxy: None,
+            onion: None,
+            proxy_randomize: true,
+            discover: true,
+            only_net: Vec::new(),
+            i2p_sam: None,
+            i2p_accept_incoming: false,
+            listen_onion: false,
+            cjdns_reachable: false,
         }
+    }
+}
+
+impl ListenOpts {
+    pub fn dialer(&self) -> rbitcoin_net::Dialer {
+        rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, self.proxy_randomize)
+    }
+
+    pub fn isolated_dialer(&self) -> rbitcoin_net::Dialer {
+        rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, true)
+    }
+
+    pub fn p2p_bind_addr(&self, network: Network) -> Option<SocketAddr> {
+        match self.p2p {
+            P2pListen::Off => None,
+            P2pListen::Auto => Some(SocketAddr::from((
+                [127, 0, 0, 1],
+                network.default_p2p_port(),
+            ))),
+            P2pListen::Socket(a) => Some(a),
+        }
+    }
+
+    /// Clearnet bind, or a loopback ephemeral port when `--listen-onion` is on
+    /// with `--no-listen`.
+    pub fn start_p2p_bind(&self, network: Network) -> Option<SocketAddr> {
+        if let Some(a) = self.p2p_bind_addr(network) {
+            return Some(a);
+        }
+        if self.listen_onion {
+            return Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+        }
+        None
     }
 }
 
@@ -128,6 +197,24 @@ impl Default for MempoolOpts {
             limit_cluster_size_kvb: None,
             blocksonly: false,
         }
+    }
+}
+
+/// System tor control port (cookie or password AUTH).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TorControlOpts {
+    pub control: Option<SocketAddr>,
+    pub cookie: Option<PathBuf>,
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for TorControlOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TorControlOpts")
+            .field("control", &self.control)
+            .field("cookie", &self.cookie)
+            .field("password", &self.password.as_ref().map(|_| "****"))
+            .finish()
     }
 }
 
@@ -159,6 +246,7 @@ pub struct NodeConfig {
     pub listen: ListenOpts,
     pub mempool: MempoolOpts,
     pub rpc: RpcOpts,
+    pub tor: TorControlOpts,
     pub network: Network,
     /// Custom BIP325 challenge. `None` selects the default global Signet.
     pub signet_challenge: Option<ScriptBuf>,
@@ -182,6 +270,8 @@ pub struct NodeConfig {
     pub max_sh_creates: u32,
     /// Opt-in Esplora `GET /block-template` (GBT template JSON). Default off.
     pub esplora_block_template: bool,
+    /// ADD_ONION for `--esplora-listen` when `--tor-control` is set. Default on.
+    pub esplora_onion: bool,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     pub milestone_height: u32,
     /// Set when conf or CLI applied `milestone` (including 0).
@@ -242,6 +332,7 @@ impl Default for NodeConfig {
             listen: ListenOpts::default(),
             mempool: MempoolOpts::default(),
             rpc: RpcOpts::default(),
+            tor: TorControlOpts::default(),
             network: Network::Mainnet,
             signet_challenge: None,
             signet_block_time: None,
@@ -253,6 +344,7 @@ impl Default for NodeConfig {
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: 0,
             esplora_block_template: false,
+            esplora_onion: true,
             milestone_height: 0,
             milestone_explicit: false,
             inhibit_suspend: false,
@@ -308,7 +400,7 @@ impl NodeConfig {
     }
 
     pub fn with_p2p_listen(mut self, addr: SocketAddr) -> Self {
-        self.listen.p2p = Some(addr);
+        self.listen.p2p = P2pListen::Socket(addr);
         self
     }
 
@@ -383,11 +475,11 @@ impl NodeConfig {
     }
 
     fn push_p2p_listen(&mut self, addr: SocketAddr) -> Result<(), NodeError> {
-        if self.listen.p2p == Some(addr) || self.listen.p2p_extra.contains(&addr) {
+        if self.listen.p2p == P2pListen::Socket(addr) || self.listen.p2p_extra.contains(&addr) {
             return Err(NodeError::Init("Duplicate binding configuration".into()));
         }
-        if self.listen.p2p.is_none() {
-            self.listen.p2p = Some(addr);
+        if matches!(self.listen.p2p, P2pListen::Auto | P2pListen::Off) {
+            self.listen.p2p = P2pListen::Socket(addr);
         } else {
             self.listen.p2p_extra.push(addr);
         }
@@ -430,9 +522,6 @@ impl NodeConfig {
         if self.listen.max_outbound == 0 {
             return Err(NodeError::Config("max-outbound must be >= 1".into()));
         }
-        if self.listen.max_inbound == 0 {
-            return Err(NodeError::Config("max-inbound must be >= 1".into()));
-        }
         if (self.signet_challenge.is_some() || self.signet_block_time.is_some())
             && self.network != Network::Signet
         {
@@ -449,6 +538,73 @@ impl NodeConfig {
             return Err(NodeError::Config(
                 "signet-block-time must be greater than zero".into(),
             ));
+        }
+        self.validate_only_net()?;
+        self.validate_hidden_inbound()
+    }
+
+    fn validate_only_net(&self) -> Result<(), NodeError> {
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::Onion)
+            && self.listen.proxy.is_none()
+            && self.listen.onion.is_none()
+        {
+            return Err(NodeError::Config(
+                "only-net=onion requires SOCKS (--proxy or --onion)".into(),
+            ));
+        }
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::I2p)
+            && self.listen.i2p_sam.is_none()
+        {
+            return Err(NodeError::Config(
+                "only-net=i2p requires SAM (--i2p-sam)".into(),
+            ));
+        }
+        if self.listen.only_net.contains(&rbitcoin_net::OnlyNet::Cjdns)
+            && !self.listen.cjdns_reachable
+        {
+            return Err(NodeError::Config(
+                "only-net=cjdns requires --cjdns-reachable".into(),
+            ));
+        }
+        if self
+            .listen
+            .connect
+            .iter()
+            .any(|a| matches!(a, rbitcoin_net::NetAddr::Cjdns { .. }))
+            && !self.listen.cjdns_reachable
+        {
+            return Err(NodeError::Config(
+                "connect to a CJDNS address requires --cjdns-reachable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_hidden_inbound(&self) -> Result<(), NodeError> {
+        if self.listen.i2p_accept_incoming {
+            if self.listen.i2p_sam.is_none() {
+                return Err(NodeError::Config(
+                    "i2p-accept-incoming requires SAM (--i2p-sam)".into(),
+                ));
+            }
+            if matches!(self.listen.p2p, P2pListen::Off) && !self.listen.listen_onion {
+                return Err(NodeError::Config(
+                    "i2p-accept-incoming needs a P2P listener (--listen); --listen=0 has no loopback to STREAM FORWARD"
+                        .into(),
+                ));
+            }
+        }
+        if self.listen.listen_onion {
+            if self.listen.max_inbound == 0 {
+                return Err(NodeError::Config(
+                    "listen-onion requires --max-inbound greater than 0".into(),
+                ));
+            }
+            if self.tor.control.is_none() {
+                return Err(NodeError::Config(
+                    "listen-onion requires --tor-control".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -624,10 +780,32 @@ impl NodeConfig {
                 );
             }
             "listen" => {
-                let addr: SocketAddr = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
-                self.push_p2p_listen(addr)?;
+                if is_listen_off(val) {
+                    self.listen.p2p = P2pListen::Off;
+                    self.listen.p2p_extra.clear();
+                } else {
+                    let addr: SocketAddr = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
+                    self.push_p2p_listen(addr)?;
+                }
+            }
+            "no_listen" => {
+                if parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf no_listen: {e}")))?
+                {
+                    self.listen.p2p = P2pListen::Off;
+                    self.listen.p2p_extra.clear();
+                }
+            }
+            "no_discover" => {
+                self.listen.discover = !is_conf_true(val);
+            }
+            "only_net" => {
+                self.listen.only_net.push(
+                    rbitcoin_net::OnlyNet::parse(val)
+                        .map_err(|e| NodeError::Config(format!("conf only_net: {e}")))?,
+                );
             }
             "connect" => {
                 self.listen.connect.push(
@@ -635,8 +813,60 @@ impl NodeConfig {
                         .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
                 );
             }
+            "proxy" => {
+                self.listen.proxy = Some(parse_required_socket(val, "proxy")?);
+            }
+            "onion" => {
+                self.listen.onion = Some(parse_required_socket(val, "onion")?);
+            }
+            "tor_control" => {
+                self.tor.control = Some(if val.is_empty() {
+                    crate::tor_control::default_control_addr()
+                } else {
+                    parse_required_socket(val, "tor_control")?
+                });
+            }
+            "tor_control_cookie" => {
+                if val.is_empty() {
+                    return Err(NodeError::Config(
+                        "conf tor_control_cookie requires a path".into(),
+                    ));
+                }
+                self.tor.cookie = Some(PathBuf::from(val));
+            }
+            "tor_control_password" => {
+                self.tor.password = Some(val.to_string());
+            }
+            "i2p_sam" => {
+                self.listen.i2p_sam = Some(if val.is_empty() {
+                    SocketAddr::from(([127, 0, 0, 1], 7656))
+                } else {
+                    parse_required_socket(val, "i2p_sam")?
+                });
+            }
+            "i2p_accept_incoming" => {
+                self.listen.i2p_accept_incoming = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf i2p_accept_incoming: {e}")))?;
+            }
+            "listen_onion" => {
+                self.listen.listen_onion = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf listen_onion: {e}")))?;
+            }
+            "cjdns_reachable" => {
+                self.listen.cjdns_reachable = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf cjdns_reachable: {e}")))?;
+            }
+            "proxy_randomize" => {
+                self.listen.proxy_randomize = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf proxy_randomize: {e}")))?;
+            }
             "seed_node" => {
                 if !val.is_empty() {
+                    if val.to_ascii_lowercase().contains(".onion") {
+                        let _: rbitcoin_net::NetAddr = val
+                            .parse()
+                            .map_err(|e| NodeError::Config(format!("conf seed_node: {e}")))?;
+                    }
                     self.listen.seednodes.push(val.to_string());
                 }
             }
@@ -677,6 +907,10 @@ impl NodeConfig {
             "esplora_block_template" => {
                 self.esplora_block_template = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf esplora_block_template: {e}")))?;
+            }
+            "esplora_onion" => {
+                self.esplora_onion = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf esplora_onion: {e}")))?;
             }
             "rpc" => {
                 self.rpc.socket = parse_conf_bool(val)
@@ -739,7 +973,9 @@ impl NodeConfig {
             "net_permission_bind" => {
                 if !val.is_empty() {
                     let g = rbitcoin_net::parse_whitebind(val).map_err(NodeError::Init)?;
-                    if self.listen.p2p != Some(g.addr) && !self.listen.p2p_extra.contains(&g.addr) {
+                    if self.listen.p2p != P2pListen::Socket(g.addr)
+                        && !self.listen.p2p_extra.contains(&g.addr)
+                    {
                         self.push_p2p_listen(g.addr)?;
                     }
                     self.net_perms.whitebind.push(g);
@@ -841,9 +1077,6 @@ impl NodeConfig {
                 let n: u32 = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf max_inbound: {e}")))?;
-                if n == 0 {
-                    return Err(NodeError::Config("conf max_inbound must be >= 1".into()));
-                }
                 self.listen.max_inbound = n;
                 self.listen.max_inbound_explicit = true;
             }
@@ -961,6 +1194,21 @@ pub(crate) fn parse_signet_challenge(value: &str) -> Result<ScriptBuf, String> {
     Vec::<u8>::from_hex(value)
         .map(ScriptBuf::from_bytes)
         .map_err(|e| format!("must be hexadecimal: {e}"))
+}
+
+fn parse_required_socket(val: &str, key: &str) -> Result<SocketAddr, NodeError> {
+    if val.is_empty() {
+        return Err(NodeError::Config(format!("conf {key}: empty")));
+    }
+    val.parse()
+        .map_err(|e| NodeError::Config(format!("conf {key}: {e}")))
+}
+
+fn is_listen_off(val: &str) -> bool {
+    matches!(
+        val.to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 
 fn is_conf_true(val: &str) -> bool {
@@ -1265,7 +1513,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             c2.listen.p2p,
-            Some("127.0.0.1:18445".parse().unwrap()),
+            P2pListen::Socket("127.0.0.1:18445".parse().unwrap()),
             "net_permission_bind listens"
         );
         assert_eq!(c2.net_perms.whitebind.len(), 1);
@@ -1607,12 +1855,35 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.listen.max_outbound = 1;
         cfg.listen.max_inbound = 0;
-        assert!(cfg.validate().is_err());
-        cfg.listen.max_inbound = 1;
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.milestone(), Milestone::NONE);
         cfg.milestone_height = 10;
         assert_eq!(cfg.milestone().height, 10);
+    }
+
+    #[test]
+    fn max_inbound_zero_is_allowed() {
+        let mut c = NodeConfig::default().with_datadir(tmp());
+        assert_eq!(c.apply_kv("max_inbound", "0").unwrap(), ConfApply::Applied);
+        assert_eq!(c.listen.max_inbound, 0);
+        assert!(c.listen.max_inbound_explicit);
+        c.validate()
+            .expect("max_inbound=0 is outbound-only, not an error");
+
+        let err = NodeConfig::default()
+            .apply_kv("max_outbound", "0")
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("max_outbound"),
+            "max_outbound=0 must still fail: {err}"
+        );
+        let mut o = NodeConfig::default().with_datadir(tmp());
+        o.listen.max_outbound = 0;
+        let verr = o.validate().unwrap_err().to_string();
+        assert!(
+            verr.contains("max-outbound"),
+            "validate must still reject max_outbound=0: {verr}"
+        );
     }
 
     #[test]
@@ -1750,7 +2021,7 @@ mod tests {
         let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
         cfg.merge_conf_file(&conf).unwrap();
         assert_eq!(cfg.network, Network::Regtest);
-        assert!(cfg.listen.p2p.is_some());
+        assert!(matches!(cfg.listen.p2p, P2pListen::Socket(_)));
         assert_eq!(cfg.listen.connect.len(), 1);
         assert!(cfg.shindex);
         assert!(!cfg.sptweaks);

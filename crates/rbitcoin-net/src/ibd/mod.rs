@@ -164,6 +164,8 @@ pub struct IbdConfig {
     /// Optional shared peer book (discovered addrs + flags). Seeded at start and
     /// written back on IBD exit so the node can persist across runs.
     pub peers: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
+    /// Outbound TCP: direct or SOCKS5.
+    pub dialer: crate::socks::Dialer,
 }
 
 impl Default for IbdConfig {
@@ -176,6 +178,7 @@ impl Default for IbdConfig {
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(8),
             peers: None,
+            dialer: crate::socks::Dialer::Direct,
         }
     }
 }
@@ -191,6 +194,7 @@ impl IbdConfig {
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_millis(400),
             peers: None,
+            dialer: crate::socks::Dialer::Direct,
         }
     }
 }
@@ -204,14 +208,16 @@ struct PeerBookSession {
 impl PeerBookSession {
     fn new(
         shared: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
-        seed_peers: &[SocketAddr],
+        seed_peers: &[crate::NetAddr],
     ) -> Self {
         let mut book = if let Some(ref s) = shared {
             s.lock().unwrap_or_else(|e| e.into_inner()).clone()
         } else {
             crate::seeds::AddrMan::new()
         };
-        book.inject(seed_peers.iter().copied());
+        for &addr in seed_peers {
+            book.add_addr(addr);
+        }
         Self { book, shared }
     }
 
@@ -243,7 +249,7 @@ pub async fn ibd_cancellable(
     hub: Arc<ChainHub>,
     magic: Magic,
     local_addr: SocketAddr,
-    peers: &[SocketAddr],
+    peers: &[crate::NetAddr],
     cfg: IbdConfig,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<u32, NetError> {
@@ -301,6 +307,7 @@ pub async fn ibd_cancellable(
         sinks.clone(),
         cfg.connect_timeout,
         cancel.as_ref().map(Arc::clone),
+        cfg.dialer.clone(),
     )
     .await;
     apply_dial_result(peer_sess.book_mut(), &initial);
@@ -667,9 +674,7 @@ pub async fn ibd_cancellable(
                         let mut n = 0usize;
                         for s in result.slots {
                             // Race: same addr may have connected on another path.
-                            if blocked.contains(&s.addr)
-                                || st.slots.iter().any(|x| x.addr == s.addr)
-                            {
+                            if blocked.contains(&s.net) || st.slots.iter().any(|x| x.net == s.net) {
                                 warn!(
                                     "ibd: drop duplicate/cooldown dial peer[{}] {}",
                                     s.id, s.addr
@@ -736,10 +741,11 @@ pub async fn ibd_cancellable(
             let sinks_r = sinks.clone();
             let cto = cfg.connect_timeout;
             let cancel_c = cancel.as_ref().map(Arc::clone);
+            let dialer_c = cfg.dialer.clone();
             redial_handle = Some(tokio::spawn(async move {
                 dial_batch(
                     &book, &next_id, want, already, &occupied, magic, local_addr, tip_h, sinks_r,
-                    cto, cancel_c,
+                    cto, cancel_c, dialer_c,
                 )
                 .await
             }));
@@ -1098,7 +1104,10 @@ mod peer_book_and_config_tests {
     fn peer_book_session_injects_seeds_and_flushes_on_drop() {
         let shared = Arc::new(Mutex::new(AddrMan::new()));
         {
-            let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[sa(1), sa(2)]);
+            let mut sess = PeerBookSession::new(
+                Some(Arc::clone(&shared)),
+                &[crate::NetAddr::Ip(sa(1)), crate::NetAddr::Ip(sa(2))],
+            );
             assert!(sess.book().entry(&sa(1)).is_some());
             assert!(sess.book().entry(&sa(2)).is_some());
             // Mutate book via book_mut.
@@ -1113,7 +1122,7 @@ mod peer_book_and_config_tests {
         assert!(shared.lock().unwrap().entry(&sa(1)).is_some());
 
         // No shared book — seeds only, flush is a no-op.
-        let sess2 = PeerBookSession::new(None, &[sa(9)]);
+        let sess2 = PeerBookSession::new(None, &[crate::NetAddr::Ip(sa(9))]);
         assert!(sess2.book().entry(&sa(9)).is_some());
         sess2.flush();
     }

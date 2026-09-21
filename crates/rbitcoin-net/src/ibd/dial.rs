@@ -223,8 +223,8 @@ fn classify_dial_err(e: &NetError) -> DialFailKind {
 /// Result of a dial batch: live slots + failures for the peer book.
 pub(crate) struct DialBatchResult {
     pub slots: Vec<PeerSlot>,
-    pub failed: Vec<(SocketAddr, DialFailKind)>,
-    pub attempted: Vec<SocketAddr>,
+    pub failed: Vec<(crate::NetAddr, DialFailKind)>,
+    pub attempted: Vec<crate::NetAddr>,
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -235,7 +235,7 @@ pub(crate) async fn dial_batch(
     book: &AddrMan,
     next_id: &AtomicUsize,
     count: usize,
-    mut already: HashSet<SocketAddr>,
+    mut already: HashSet<crate::NetAddr>,
     occupied: &[SocketAddr],
     magic: Magic,
     local_addr: SocketAddr,
@@ -243,6 +243,7 @@ pub(crate) async fn dial_batch(
     sinks: PeerEventSinks,
     connect_timeout: Duration,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    dialer: crate::socks::Dialer,
 ) -> DialBatchResult {
     let mut out = DialBatchResult {
         slots: Vec::new(),
@@ -259,7 +260,7 @@ pub(crate) async fn dial_batch(
             .unwrap_or(false)
     };
 
-    let candidates = book.take_dial_candidates(count, &already, occupied);
+    let candidates = book.take_dial_candidates_net(count, &already, occupied);
     out.attempted = candidates.clone();
     let mut handles = Vec::new();
     for addr in candidates {
@@ -278,8 +279,9 @@ pub(crate) async fn dial_batch(
             "{}",
             trying_connection_log(PeerConnType::OutboundFullRelay, addr)
         );
+        let dialer = dialer.clone();
         handles.push(tokio::spawn(async move {
-            let fut = spawn_peer(id, addr, magic, local_addr, tip_h, sinks);
+            let fut = spawn_peer(id, addr, magic, local_addr, tip_h, sinks, dialer);
             match tokio::time::timeout(connect_timeout, fut).await {
                 Ok(Ok(slot)) => Ok(slot),
                 Ok(Err(e)) => {
@@ -331,13 +333,13 @@ pub(crate) fn redial_want(alive: usize, target: usize) -> usize {
 /// Apply dial successes / failures to the peer book.
 pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
     for &addr in &result.attempted {
-        book.note_attempt(addr);
+        book.note_attempt_addr(addr);
     }
     for s in &result.slots {
-        book.note_connected(s.addr);
+        book.note_connected_addr(s.net);
     }
     for &(addr, kind) in &result.failed {
-        book.note_connect_failed(addr, kind == DialFailKind::Incompatible);
+        book.note_connect_failed_addr(addr, kind == DialFailKind::Incompatible);
     }
 }
 
@@ -439,11 +441,11 @@ pub(crate) fn dial_blocked_addrs(
     slots: &[PeerSlot],
     cooldown: &HashMap<SocketAddr, Instant>,
     now: Instant,
-) -> HashSet<SocketAddr> {
-    let mut blocked: HashSet<SocketAddr> = slots.iter().map(|s| s.addr).collect();
+) -> HashSet<crate::NetAddr> {
+    let mut blocked: HashSet<crate::NetAddr> = slots.iter().map(|s| s.net).collect();
     for (&addr, &until) in cooldown {
         if until > now {
-            blocked.insert(addr);
+            blocked.insert(crate::NetAddr::Ip(addr));
         }
     }
     blocked
@@ -451,7 +453,11 @@ pub(crate) fn dial_blocked_addrs(
 
 /// Live slot addrs whose netgroups occupy outbound diversity (cooldown is exclude-only).
 pub(crate) fn alive_dial_addrs(slots: &[PeerSlot]) -> Vec<SocketAddr> {
-    slots.iter().filter(|s| s.alive).map(|s| s.addr).collect()
+    slots
+        .iter()
+        .filter(|s| s.alive)
+        .filter_map(|s| s.net.socket_addr())
+        .collect()
 }
 
 pub(crate) fn expire_addr_cooldown(cooldown: &mut HashMap<SocketAddr, Instant>, now: Instant) {
@@ -645,6 +651,7 @@ mod tests {
         PeerSlot {
             id,
             addr: a,
+            net: crate::NetAddr::from_socket(a),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 0,
@@ -698,9 +705,9 @@ mod tests {
         cooldown.insert(addr(2), now + Duration::from_secs(60));
         cooldown.insert(addr(3), now - Duration::from_secs(1)); // expired
         let blocked = dial_blocked_addrs(&[s], &cooldown, now);
-        assert!(blocked.contains(&addr(1)));
-        assert!(blocked.contains(&addr(2)));
-        assert!(!blocked.contains(&addr(3)));
+        assert!(blocked.contains(&crate::NetAddr::Ip(addr(1))));
+        assert!(blocked.contains(&crate::NetAddr::Ip(addr(2))));
+        assert!(!blocked.contains(&crate::NetAddr::Ip(addr(3))));
 
         expire_addr_cooldown(&mut cooldown, now);
         assert!(cooldown.contains_key(&addr(2)));
@@ -722,7 +729,7 @@ mod tests {
         assert_eq!(book.flags(&lemon).dial_tier(), 2);
         assert!(cooldown.contains_key(&lemon));
         let blocked = dial_blocked_addrs(&[], &cooldown, now);
-        assert!(blocked.contains(&lemon));
+        assert!(blocked.contains(&crate::NetAddr::Ip(lemon)));
 
         let good = addr(5);
         book.note_connected(good);
@@ -901,10 +908,14 @@ mod tests {
         let result = DialBatchResult {
             slots: vec![slot],
             failed: vec![
-                (bad, DialFailKind::Network),
-                (inc, DialFailKind::Incompatible),
+                (crate::NetAddr::Ip(bad), DialFailKind::Network),
+                (crate::NetAddr::Ip(inc), DialFailKind::Incompatible),
             ],
-            attempted: vec![good, bad, inc],
+            attempted: vec![
+                crate::NetAddr::Ip(good),
+                crate::NetAddr::Ip(bad),
+                crate::NetAddr::Ip(inc),
+            ],
         };
         apply_dial_result(&mut book, &result);
         assert!(book.flags(&good).has_connected());
@@ -968,6 +979,7 @@ mod tests {
             sinks.clone(),
             Duration::from_millis(50),
             None,
+            crate::socks::Dialer::Direct,
         ));
         assert!(r.slots.is_empty() && r.failed.is_empty());
         let r2 = rt.block_on(dial_batch(
@@ -982,6 +994,7 @@ mod tests {
             sinks,
             Duration::from_millis(50),
             None,
+            crate::socks::Dialer::Direct,
         ));
         assert!(r2.slots.is_empty() && r2.failed.is_empty());
     }

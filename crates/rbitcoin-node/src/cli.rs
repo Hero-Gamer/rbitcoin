@@ -128,7 +128,12 @@ fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Re
     let mut saw_seednode = false;
     for (key, val) in kvs {
         if key == "listen" && !saw_listen {
-            config.listen.p2p = None;
+            config.listen.p2p = crate::config::P2pListen::Auto;
+            config.listen.p2p_extra.clear();
+            saw_listen = true;
+        }
+        if key == "no_listen" && !saw_listen {
+            config.listen.p2p = crate::config::P2pListen::Auto;
             config.listen.p2p_extra.clear();
             saw_listen = true;
         }
@@ -288,7 +293,10 @@ fn operator_usage() -> String {
         "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
-    [--listen ADDR] [--connect ADDR]... [--seed-node HOST]... [--electrum-listen ADDR] [--esplora-listen ADDR] \\\n\
+    [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
+    [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
+    [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
+    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
     [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
@@ -302,7 +310,7 @@ fn operator_usage() -> String {
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
-    [--no-seeds] [--smoke] [--inhibit-suspend]\n\n\
+    [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest.\n\
 Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
@@ -313,6 +321,15 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
+  --proxy HOST:PORT SOCKS5 for all P2P outbound; --onion HOST:PORT SOCKS for onion (02).\n\
+  --proxy-randomize (default on) uses a fresh SOCKS username per peer (Tor circuit isolation).\n\
+  --tor-control [HOST:PORT] talks to system tor (default 127.0.0.1:9051). Cookie or password AUTH;\n\
+  failed AUTH is a start error. Unset: no control connection.\n\
+  --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
+  --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
+  --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen.\n\
+  --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
+  --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
@@ -320,6 +337,7 @@ Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
+  --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
@@ -361,12 +379,19 @@ fn is_bool_key(key: &str) -> bool {
         "sh_index"
             | "sp_tweaks"
             | "esplora_block_template"
+            | "esplora_onion"
             | "blocks_only"
             | "prefill_compact"
             | "persist_mempool"
             | "net_permission_relay"
             | "net_permission_force_relay"
             | "no_seeds"
+            | "no_listen"
+            | "no_discover"
+            | "listen_onion"
+            | "cjdns_reachable"
+            | "proxy_randomize"
+            | "i2p_accept_incoming"
             | "inhibit_suspend"
             | "trusted"
             | "always_relay"
@@ -376,7 +401,10 @@ fn is_bool_key(key: &str) -> bool {
 }
 
 fn is_optional_addr_key(key: &str) -> bool {
-    matches!(key, "rpc_listen" | "electrum_listen" | "esplora_listen")
+    matches!(
+        key,
+        "rpc_listen" | "electrum_listen" | "esplora_listen" | "tor_control" | "i2p_sam"
+    )
 }
 
 fn looks_like_flag(s: &str) -> bool {
@@ -552,9 +580,23 @@ mod tests {
             "--sh-index",
             "--sp-tweaks",
             "--sp-tweaks-dust",
+            "--esplora-block-template",
+            "--esplora-onion",
             "--rpc",
             "--rpc-listen",
             "--rpc-token-file",
+            "--proxy",
+            "--onion",
+            "--proxy-randomize",
+            "--no-listen",
+            "--no-discover",
+            "--listen-onion",
+            "--cjdns-reachable",
+            "--tor-control",
+            "--tor-control-cookie",
+            "--tor-control-password",
+            "--i2p-sam",
+            "--i2p-accept-incoming",
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
@@ -584,6 +626,12 @@ mod tests {
             "--blocks-dir",
             "--whitelist-relay",
             "--whitelist-forcerelay",
+            "--nolisten",
+            "--nodiscover",
+            "--listenonion",
+            "--cjdnsreachable",
+            "--torcontrol",
+            "--i2psam",
         ] {
             assert!(!h.contains(concat), "help must not advertise {concat}");
         }
@@ -612,6 +660,538 @@ mod tests {
             cli_main(["rbitcoin-node", "--sptweaks-dust=1"]),
             ExitCode::from(2),
         );
+    }
+
+    #[test]
+    fn proxy_conf_and_cli() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        let cfg = ready_config(["rbitcoin-node", "--proxy", "127.0.0.1:9050"]);
+        assert_eq!(cfg.listen.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert!(cfg.listen.onion.is_none());
+        match cfg.listen.dialer() {
+            rbitcoin_net::Dialer::Socks {
+                proxy, randomize, ..
+            } => {
+                assert_eq!(proxy, Some("127.0.0.1:9050".parse().unwrap()));
+                assert!(randomize);
+            }
+            other => panic!("expected socks dialer, got {other:?}"),
+        }
+        assert_eq!(
+            NodeConfig::default().listen.dialer(),
+            rbitcoin_net::Dialer::Direct
+        );
+
+        let mut from_conf = NodeConfig::default();
+        assert_eq!(
+            from_conf.apply_kv("proxy", "127.0.0.1:9050").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(
+            from_conf.listen.proxy,
+            Some("127.0.0.1:9050".parse().unwrap())
+        );
+
+        let empty = NodeConfig::default().apply_kv("proxy", "").unwrap_err();
+        let empty_msg = format!("{empty}");
+        assert!(
+            empty_msg.contains("proxy"),
+            "empty proxy must be a start error: {empty_msg}"
+        );
+
+        let bad = NodeConfig::default()
+            .apply_kv("proxy", "not-an-addr")
+            .unwrap_err();
+        let bad_msg = format!("{bad}");
+        assert!(
+            bad_msg.contains("proxy"),
+            "invalid proxy must be a start error: {bad_msg}"
+        );
+
+        let split = ready_config([
+            "rbitcoin-node",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--onion",
+            "127.0.0.1:9051",
+        ]);
+        assert_eq!(split.listen.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert_eq!(split.listen.onion, Some("127.0.0.1:9051".parse().unwrap()));
+        assert!(split.listen.proxy.is_some());
+        assert!(split.listen.onion.is_some());
+        assert_ne!(split.listen.proxy, split.listen.onion);
+
+        let h = operator_usage();
+        assert!(h.contains("--proxy"), "help must list kebab --proxy");
+        assert!(h.contains("--onion"), "help must list kebab --onion");
+        assert!(
+            h.contains("--proxy-randomize"),
+            "help must list kebab --proxy-randomize"
+        );
+    }
+
+    #[test]
+    fn onion_only_dialer_does_not_socks_clearnet() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        let split = ready_config([
+            "rbitcoin-node",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--onion",
+            "127.0.0.1:9051",
+        ]);
+        match split.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { proxy, onion, .. } => {
+                assert_eq!(proxy, split.listen.proxy);
+                assert_eq!(onion, split.listen.onion);
+            }
+            other => panic!("expected split socks dialer, got {other:?}"),
+        }
+        let onion_only = ready_config(["rbitcoin-node", "--onion", "127.0.0.1:9051"]);
+        match onion_only.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { proxy, onion, .. } => {
+                assert!(proxy.is_none(), "onion-only must not SOCKS clearnet");
+                assert_eq!(onion, Some("127.0.0.1:9051".parse().unwrap()));
+            }
+            other => panic!("expected onion-only socks dialer, got {other:?}"),
+        }
+        match onion_only.listen.isolated_dialer() {
+            rbitcoin_net::Dialer::Socks {
+                proxy,
+                onion,
+                randomize,
+                ..
+            } => {
+                assert!(proxy.is_none());
+                assert_eq!(onion, Some("127.0.0.1:9051".parse().unwrap()));
+                assert!(
+                    randomize,
+                    "isolated broadcast always randomizes SOCKS creds"
+                );
+            }
+            other => panic!("expected onion-only isolated dialer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_randomize_defaults_on() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        assert!(NodeConfig::default().listen.proxy_randomize);
+        let off = ready_config([
+            "rbitcoin-node",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--proxy-randomize=0",
+        ]);
+        assert!(!off.listen.proxy_randomize);
+        match off.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { randomize, .. } => assert!(!randomize),
+            other => panic!("expected socks dialer, got {other:?}"),
+        }
+        let on = ready_config(["rbitcoin-node", "--proxy", "127.0.0.1:9050"]);
+        assert!(on.listen.proxy_randomize);
+        match on.listen.dialer() {
+            rbitcoin_net::Dialer::Socks { randomize, .. } => assert!(randomize),
+            other => panic!("expected socks dialer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_inbound_zero_is_allowed() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        let cfg = ready_config(["rbitcoin-node", "--max-inbound", "0"]);
+        assert_eq!(cfg.listen.max_inbound, 0);
+        assert!(cfg.listen.max_inbound_explicit);
+        cfg.validate()
+            .expect("CLI --max-inbound 0 must assemble and validate");
+        let out = NodeConfig::default()
+            .apply_kv("max_outbound", "0")
+            .unwrap_err();
+        assert!(format!("{out}").contains("max_outbound"));
+    }
+
+    #[test]
+    fn listen_zero_does_not_default_loopback() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        let mut c = NodeConfig::default();
+        assert_eq!(c.apply_kv("listen", "0").unwrap(), ConfApply::Applied);
+        assert_eq!(c.listen.p2p, crate::config::P2pListen::Off);
+        assert!(c.listen.p2p_bind_addr(Network::Regtest).is_none());
+
+        let n = ready_config(["rbitcoin-node", "--no-listen"]);
+        assert_eq!(n.listen.p2p, crate::config::P2pListen::Off);
+        assert!(n.listen.p2p_bind_addr(Network::Regtest).is_none());
+
+        let eq = ready_config(["rbitcoin-node", "--listen=0"]);
+        assert_eq!(eq.listen.p2p, crate::config::P2pListen::Off);
+
+        let bound = ready_config(["rbitcoin-node", "--listen", "127.0.0.1:18444"]);
+        assert_eq!(
+            bound.listen.p2p,
+            crate::config::P2pListen::Socket("127.0.0.1:18444".parse().unwrap())
+        );
+        assert_eq!(
+            bound.listen.p2p_bind_addr(Network::Regtest),
+            Some("127.0.0.1:18444".parse().unwrap())
+        );
+
+        let auto = NodeConfig::default();
+        assert_eq!(auto.listen.p2p, crate::config::P2pListen::Auto);
+        assert_eq!(
+            auto.listen.p2p_bind_addr(Network::Regtest),
+            Some("127.0.0.1:18444".parse().unwrap())
+        );
+
+        let h = operator_usage();
+        assert!(
+            h.contains("--no-listen"),
+            "help must list kebab --no-listen"
+        );
+        assert!(
+            !h.contains("--nolisten"),
+            "help must not advertise concatenated --nolisten"
+        );
+    }
+
+    #[test]
+    fn listen_onion_binds_loopback_when_nolisten() {
+        let c = ready_config(["rbitcoin-node", "--no-listen", "--listen-onion"]);
+        assert!(c.listen.listen_onion);
+        assert_eq!(c.listen.p2p, crate::config::P2pListen::Off);
+        assert!(c.listen.p2p_bind_addr(Network::Regtest).is_none());
+        assert_eq!(
+            c.listen.start_p2p_bind(Network::Regtest),
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("listen_onion", "1").unwrap();
+        assert!(conf.listen.listen_onion);
+    }
+
+    #[test]
+    fn listen_onion_refused_when_max_inbound_zero() {
+        let c = ready_config([
+            "rbitcoin-node",
+            "--listen-onion",
+            "--max-inbound",
+            "0",
+            "--tor-control",
+        ]);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("listen-onion") && err.contains("max-inbound"),
+            "{err}"
+        );
+        let no_tor = ready_config(["rbitcoin-node", "--listen-onion"]);
+        let err = no_tor.validate().unwrap_err().to_string();
+        assert!(err.contains("tor-control"), "{err}");
+    }
+
+    #[test]
+    fn listen_cjdns_addr_parses() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("listen", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
+        match c.listen.p2p {
+            crate::config::P2pListen::Socket(a) => {
+                assert!(a.is_ipv6(), "{a}");
+                assert_eq!(a.port(), 8333);
+                let ip = match a.ip() {
+                    std::net::IpAddr::V6(v) => v,
+                    other => panic!("expected v6, got {other}"),
+                };
+                assert!(rbitcoin_net::is_cjdns_ip(ip), "{ip}");
+            }
+            other => panic!("expected socket listen, got {other:?}"),
+        }
+        let off = ready_config(["rbitcoin-node", "--no-listen"]);
+        assert_eq!(off.listen.p2p, crate::config::P2pListen::Off);
+        assert!(off.listen.p2p_bind_addr(Network::Regtest).is_none());
+    }
+
+    #[test]
+    fn connect_onion_and_ipv4() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("connect", "1.2.3.4:8333").unwrap();
+        c.apply_kv(
+            "connect",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        )
+        .unwrap();
+        assert_eq!(c.listen.connect.len(), 2);
+        assert_eq!(c.listen.connect[0], "1.2.3.4:8333".parse().unwrap());
+        assert!(matches!(
+            c.listen.connect[1],
+            rbitcoin_net::NetAddr::Onion { port: 8333, .. }
+        ));
+        let err = NodeConfig::default()
+            .apply_kv("connect", "short.onion:8333")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("connect") || msg.contains("onion") || msg.contains("bad"),
+            "{msg}"
+        );
+        let mut s = NodeConfig::default();
+        s.apply_kv(
+            "seed_node",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        )
+        .unwrap();
+        assert_eq!(
+            s.listen.seednodes,
+            vec!["pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333".to_string()]
+        );
+        assert!(NodeConfig::default()
+            .apply_kv("seed_node", "short.onion:8333")
+            .is_err());
+        let n = ready_config([
+            "rbitcoin-node",
+            "--connect",
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333",
+        ]);
+        assert!(matches!(
+            n.listen.connect[0],
+            rbitcoin_net::NetAddr::Onion { port: 8333, .. }
+        ));
+    }
+
+    #[test]
+    fn only_net_onion_without_proxy_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "onion").unwrap();
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SOCKS") && msg.contains("only-net"), "{msg}");
+        c.apply_kv("proxy", "127.0.0.1:9050").unwrap();
+        c.validate().unwrap();
+        let mut i2p_ok = NodeConfig::default();
+        i2p_ok.apply_kv("only_net", "i2p").unwrap();
+        assert_eq!(i2p_ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
+        let mut cjdns = NodeConfig::default();
+        cjdns.apply_kv("only_net", "cjdns").unwrap();
+        assert_eq!(cjdns.listen.only_net, vec![rbitcoin_net::OnlyNet::Cjdns]);
+        let err = cjdns.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        cjdns.apply_kv("cjdns_reachable", "1").unwrap();
+        cjdns.validate().unwrap();
+        let ok = ready_config([
+            "rbitcoin-node",
+            "--only-net",
+            "onion",
+            "--proxy",
+            "127.0.0.1:9050",
+        ]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::Onion]);
+        let h = operator_usage();
+        assert!(h.contains("--only-net"), "help must list kebab --only-net");
+        assert!(
+            !h.contains("--onlynet"),
+            "help must not advertise concatenated --onlynet"
+        );
+    }
+
+    #[test]
+    fn tor_control_cli_defaults() {
+        let omitted = ready_config(["rbitcoin-node", "--tor-control"]);
+        assert_eq!(omitted.tor.control, Some("127.0.0.1:9051".parse().unwrap()));
+        assert!(omitted.tor.cookie.is_none());
+        assert!(omitted.tor.password.is_none());
+        let explicit = ready_config(["rbitcoin-node", "--tor-control", "10.0.0.5:9151"]);
+        assert_eq!(explicit.tor.control, Some("10.0.0.5:9151".parse().unwrap()));
+        let cookie = ready_config([
+            "rbitcoin-node",
+            "--tor-control",
+            "--tor-control-cookie",
+            "/tmp/rbtc-tor-cookie",
+        ]);
+        assert_eq!(
+            cookie.tor.cookie.as_deref(),
+            Some(std::path::Path::new("/tmp/rbtc-tor-cookie"))
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("tor_control", "").unwrap();
+        conf.apply_kv("tor_control_password", "pw").unwrap();
+        assert_eq!(conf.tor.control, Some("127.0.0.1:9051".parse().unwrap()));
+        assert_eq!(conf.tor.password.as_deref(), Some("pw"));
+        let h = operator_usage();
+        assert!(h.contains("--tor-control"));
+        assert!(h.contains("--tor-control-cookie"));
+        assert!(h.contains("--tor-control-password"));
+        assert!(!h.contains("--torcontrol"));
+    }
+
+    #[test]
+    fn i2p_sam_cli() {
+        let omitted = ready_config(["rbitcoin-node", "--i2p-sam"]);
+        assert_eq!(
+            omitted.listen.i2p_sam,
+            Some("127.0.0.1:7656".parse().unwrap())
+        );
+        let explicit = ready_config(["rbitcoin-node", "--i2p-sam", "127.0.0.1:7656"]);
+        assert_eq!(
+            explicit.listen.i2p_sam,
+            Some("127.0.0.1:7656".parse().unwrap())
+        );
+        let h = operator_usage();
+        assert!(h.contains("--i2p-sam"));
+        assert!(!h.contains("--i2psam"));
+        assert!(h.contains("--i2p-accept-incoming"));
+        assert!(!h.contains("--i2pacceptincoming"));
+    }
+
+    #[test]
+    fn i2p_accept_incoming_cli() {
+        let c = ready_config(["rbitcoin-node", "--i2p-sam", "--i2p-accept-incoming"]);
+        assert!(c.listen.i2p_accept_incoming);
+        assert_eq!(c.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("i2p_sam", "").unwrap();
+        conf.apply_kv("i2p_accept_incoming", "1").unwrap();
+        conf.validate().unwrap();
+        assert!(conf.listen.i2p_accept_incoming);
+    }
+
+    #[test]
+    fn i2p_accept_incoming_without_listen_is_config_error() {
+        let c = ready_config([
+            "rbitcoin-node",
+            "--no-listen",
+            "--i2p-sam",
+            "--i2p-accept-incoming",
+        ]);
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--listen") && msg.contains("i2p"), "{msg}");
+        let mut no_sam = NodeConfig::default();
+        no_sam.apply_kv("i2p_accept_incoming", "1").unwrap();
+        let err = no_sam.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SAM") && msg.contains("i2p"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn i2p_accept_incoming_forwards_to_loopback() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn write_line(s: &mut TcpStream, line: &str) {
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.write_all(b"\n").await.unwrap();
+            s.flush().await.unwrap();
+        }
+        async fn read_line(s: &mut TcpStream) -> Option<String> {
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log_acc = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = Arc::clone(&log_acc);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(line) = read_line(&mut s).await else {
+                            break;
+                        };
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("HELLO VERSION") {
+                            write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
+                        } else if up.starts_with("SESSION CREATE") {
+                            write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=fakeprivdest")
+                                .await;
+                        } else if up.starts_with("STREAM FORWARD") {
+                            log.lock().unwrap().push(line);
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                        } else if up.starts_with("STREAM CONNECT") {
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = tmp_datadir();
+        let dest_path = dir.join("i2p").join("p2p.priv");
+        let mut sam = rbitcoin_net::I2pSam::connect_persistent(addr, &dest_path)
+            .await
+            .unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&dest_path).unwrap().trim(),
+            "fakeprivdest"
+        );
+        let fw = log.lock().unwrap().clone();
+        assert_eq!(fw.len(), 1, "{fw:?}");
+        assert!(fw[0].contains("PORT=18444"), "{}", fw[0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_net_i2p_without_sam_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "i2p").unwrap();
+        let err = c.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("SAM") && msg.contains("i2p"), "{msg}");
+        c.apply_kv("i2p_sam", "").unwrap();
+        c.validate().unwrap();
+        let ok = ready_config(["rbitcoin-node", "--only-net", "i2p", "--i2p-sam"]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::I2p]);
+        assert_eq!(ok.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_net_cjdns_without_reachable_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("only_net", "cjdns").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        c.apply_kv("cjdns_reachable", "1").unwrap();
+        c.validate().unwrap();
+        let ok = ready_config(["rbitcoin-node", "--only-net", "cjdns", "--cjdns-reachable"]);
+        assert_eq!(ok.listen.only_net, vec![rbitcoin_net::OnlyNet::Cjdns]);
+        assert!(ok.listen.cjdns_reachable);
+        ok.validate().unwrap();
+    }
+
+    #[test]
+    fn cjdns_connect_without_reachable_is_config_error() {
+        let mut c = NodeConfig::default();
+        c.apply_kv("connect", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
+        assert!(matches!(
+            c.listen.connect[0],
+            rbitcoin_net::NetAddr::Cjdns { .. }
+        ));
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("cjdns-reachable"), "{err}");
+        c.apply_kv("cjdns_reachable", "1").unwrap();
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn no_discover_conf() {
+        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
+        assert!(NodeConfig::default().listen.discover);
+        let off = ready_config(["rbitcoin-node", "--no-discover"]);
+        assert!(!off.listen.discover);
+        let mut c = NodeConfig::default();
+        assert_eq!(c.apply_kv("no_discover", "1").unwrap(), ConfApply::Applied);
+        assert!(!c.listen.discover);
+        c.apply_kv("no_discover", "0").unwrap();
+        assert!(c.listen.discover);
     }
 
     #[test]
@@ -700,6 +1280,9 @@ mod tests {
         assert!(gbt_eq.esplora_block_template);
         let off = ready_config(["rbitcoin-node", "--esplora-block-template=0"]);
         assert!(!off.esplora_block_template);
+        assert!(NodeConfig::default().esplora_onion);
+        let onion_off = ready_config(["rbitcoin-node", "--esplora-onion=0"]);
+        assert!(!onion_off.esplora_onion);
     }
 
     #[test]
@@ -906,10 +1489,6 @@ mod tests {
         assert_exit(cli_main(["rbitcoin-node", "--conf"]), ExitCode::from(2));
         assert_exit(
             cli_main(["rbitcoin-node", "--max-inbound"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound", "0"]),
             ExitCode::from(2),
         );
         assert_exit(

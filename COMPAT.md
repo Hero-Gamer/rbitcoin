@@ -138,7 +138,7 @@ Per-method notes, auth, and the shindex matrix live in
 | relayfee / estimatefee / histogram / `mempool.get_info` | done | Libre min + live median. `mempool.get_info` is 1.6 (`minrelaytxfee` replaces `relayfee` for 1.6 clients; `relayfee` stays for 1.4). |
 | outpoint.get_status / subscribe / unsubscribe | done | Electrum **1.7** methods; `protocol_max` stays **1.6** until `scriptpubkey.*`. Spent = confirmed-strong or mempool. |
 | silentpayments.subscribe / unsubscribe | done | Frigate remote-scanner: session-only scan key; historical + tip notifies via tweak index / naive `tweaks_for_height`. Not Cake `tweaks.subscribe`. |
-| TLS | external | terminate at reverse proxy; node is plain TCP. In-binary 50002 + onion is parked **Q-63**. |
+| TLS | external | terminate at reverse proxy for **clearnet**; onion is plain TCP (`ADD_ONION` to loopback). In-binary 50002 + TLS is parked **Q-63**. |
 
 ### Protocol versions
 
@@ -215,7 +215,8 @@ without the dialect is an error. `server.features.protocol_max` remains
 ## Esplora REST surface
 
 Plain HTTP via `--esplora-listen` / conf `esplora_listen` (default **off**). TLS
-via reverse proxy; app `ServeLimits` always on (same model as Electrum).
+via reverse proxy for **clearnet**; onion is plain TCP (`ADD_ONION` to loopback).
+App `ServeLimits` always on (same model as Electrum).
 
 | Endpoint group | Status | Notes |
 |----------------|--------|-------|

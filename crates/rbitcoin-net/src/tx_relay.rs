@@ -562,6 +562,9 @@ pub struct MempoolHub {
     dir: PathBuf,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     unbroadcast: Mutex<HashSet<Txid>>,
+    local_origin: Mutex<HashSet<Txid>>,
+    isolated_broadcast: AtomicBool,
+    isolated_kick: broadcast::Sender<Txid>,
     /// Wtxids re-admitted from a disconnected block. Core serves these
     /// even if this peer has not been INV'd yet (`mempool_reorg`).
     reorg_servable: Mutex<HashSet<Wtxid>>,
@@ -635,6 +638,7 @@ impl MempoolHub {
             .map_err(|e| format!("mempool open: {e}"))?;
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
+        let (isolated_kick, _) = broadcast::channel(32);
         let unbroadcast = if persist {
             load_unbroadcast_file(&dir_buf)
         } else {
@@ -685,6 +689,9 @@ impl MempoolHub {
             meter_get_coin_create_mtp: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
+            local_origin: Mutex::new(HashSet::new()),
+            isolated_broadcast: AtomicBool::new(false),
+            isolated_kick,
             reorg_servable: Mutex::new(HashSet::new()),
             relay_seq: Mutex::new(HashMap::new()),
             wtxid_by_txid: Mutex::new(HashMap::new()),
@@ -841,6 +848,7 @@ impl MempoolHub {
     fn unindex_txid(&self, txid: &Txid) {
         self.sh_index.lock().unwrap().remove(txid);
         self.remove_relay_maps(txid);
+        self.local_origin.lock().unwrap().remove(txid);
         let mut u = self.unbroadcast.lock().unwrap();
         if u.remove(txid) {
             persist_unbroadcast_file(&self.dir, &u);
@@ -3147,6 +3155,33 @@ impl MempoolHub {
         persist_unbroadcast_file(&self.dir, &u);
     }
 
+    pub fn mark_local_origin(&self, txid: Txid) {
+        self.local_origin.lock().unwrap().insert(txid);
+        if self.isolated_broadcast() {
+            let _ = self.isolated_kick.send(txid);
+        }
+    }
+
+    pub(crate) fn subscribe_isolated(&self) -> broadcast::Receiver<Txid> {
+        self.isolated_kick.subscribe()
+    }
+
+    pub fn is_local_origin(&self, txid: &Txid) -> bool {
+        self.local_origin.lock().unwrap().contains(txid)
+    }
+
+    pub fn set_isolated_broadcast(&self, on: bool) {
+        self.isolated_broadcast.store(on, Ordering::Relaxed);
+    }
+
+    pub fn isolated_broadcast(&self) -> bool {
+        self.isolated_broadcast.load(Ordering::Relaxed)
+    }
+
+    pub fn skip_standing_inv(&self, txid: &Txid) -> bool {
+        self.isolated_broadcast() && self.is_local_origin(txid)
+    }
+
     /// Peer getdata served this txid — it is no longer unbroadcast.
     pub fn mark_broadcast(&self, txid: &Txid) {
         let mut u = self.unbroadcast.lock().unwrap();
@@ -4185,6 +4220,29 @@ mod tests {
                 "p2p: Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
             )
         );
+    }
+
+    #[test]
+    fn local_origin_rpc_not_p2p() {
+        let dir = tmp();
+        let store = tmp();
+        let q = Arc::new(Query::open_or_create_tiny(&store).unwrap());
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        let local = Txid::from_byte_array([0x11; 32]);
+        let wire = Txid::from_byte_array([0x22; 32]);
+        assert!(!hub.is_local_origin(&local));
+        hub.mark_local_origin(local);
+        assert!(hub.is_local_origin(&local));
+        assert!(!hub.is_local_origin(&wire));
+        assert!(
+            !hub.skip_standing_inv(&local),
+            "without --proxy/--onion, local-origin still uses standing INV"
+        );
+        hub.set_isolated_broadcast(true);
+        assert!(hub.skip_standing_inv(&local));
+        assert!(!hub.skip_standing_inv(&wire));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     #[test]

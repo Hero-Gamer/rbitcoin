@@ -7,8 +7,8 @@ use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandl
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
     default_port, format_serve_perf, format_tip_perf_sizes, netgroup, read_proc_rss,
-    sample_reset_serve_perf, AddrMan, AsMap, BlockingRegion, ChainHub, IbdConfig, MempoolHub,
-    P2PNode, PeerConnType, TipEvent, TipPerfSizes,
+    sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap, BlockingRegion, ChainHub,
+    Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
 };
 use rbitcoin_primitives::Network;
 use rbitcoin_query::{spawn_sh_writebehind, Query};
@@ -19,7 +19,7 @@ use rbitcoin_store::StoreError;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
 
@@ -183,10 +183,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
     apply_startup_index_mode(&handle.query, &config, params.taproot_height())?;
-    let listen = config
-        .listen
-        .p2p
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_port(config.network))));
+    let bind = config.listen.start_p2p_bind(config.network);
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
     let run_started = Instant::now();
@@ -208,15 +205,31 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let p2p_ua =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
             .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let mut node = P2PNode::start_with_agent(
-        listen,
-        query,
-        params.clone(),
-        milestone,
-        p2p_ua,
-        config.listen.max_inbound as usize,
-    )
-    .await
+    let mut node = match bind {
+        Some(listen) => {
+            P2PNode::start_with_dialer(
+                listen,
+                query,
+                params.clone(),
+                milestone,
+                p2p_ua,
+                config.listen.max_inbound as usize,
+                config.listen.dialer(),
+            )
+            .await
+        }
+        None => {
+            P2PNode::start_outbound_only(
+                query,
+                params.clone(),
+                milestone,
+                p2p_ua,
+                config.listen.max_inbound as usize,
+                config.listen.dialer(),
+            )
+            .await
+        }
+    }
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
     for extra in &config.listen.p2p_extra {
         let bound = node
@@ -299,11 +312,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .map_err(|e| NodeError::Config(format!("mempool open join: {e}")))?
     .map_err(NodeError::Config)?;
     node.peers.attach_mempool(&mempool);
+    if config.listen.proxy.is_some() || config.listen.onion.is_some() {
+        mempool.set_isolated_broadcast(true);
+    }
     node.peers.set_net_perms(table.clone());
     if let Some(secs) = config.listen.peer_timeout_secs {
         node.peers.set_peer_timeout_secs(secs);
     }
-    node.peers.set_listen_port(listen.port());
+    node.peers.set_discover(config.listen.discover);
+    node.peers
+        .set_clearnet_listen(!matches!(config.listen.p2p, crate::config::P2pListen::Off));
+    if node.local_addr.port() != 0 {
+        node.peers.set_listen_port(node.local_addr.port());
+    }
     if !config.listen.external_ips.is_empty() {
         node.peers
             .set_external_ips(config.listen.external_ips.clone());
@@ -324,14 +345,75 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.mempool.max_weight
     );
 
-    info!(
-        "rbitcoin-node listening on {} ({})",
-        node.local_addr,
-        config.network.as_str()
-    );
+    if node.local_addr.port() == 0 {
+        info!(
+            "rbitcoin-node P2P outbound-only ({})",
+            config.network.as_str()
+        );
+    } else {
+        info!(
+            "rbitcoin-node listening on {} ({})",
+            node.local_addr,
+            config.network.as_str()
+        );
+    }
 
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
+    let mut tor_ctl = crate::tor_control::TorControl::connect_if_configured(
+        config.tor.control,
+        config.tor.cookie.as_deref(),
+        config.tor.password.as_deref(),
+    )
+    .await?;
+    if tor_ctl.is_some() {
+        info!(
+            "tor control authenticated on {}",
+            config
+                .tor
+                .control
+                .expect("control addr set when session exists")
+        );
+    }
+    if config.listen.listen_onion {
+        let ctl = tor_ctl
+            .as_mut()
+            .expect("validate requires --tor-control with --listen-onion");
+        let virt = config.network.default_p2p_port();
+        let hs = ctl
+            .add_p2p_onion(config.datadir.path(), node.local_addr, virt)
+            .await?;
+        info!("p2p onion {}.onion:{}", hs.service_id, virt);
+        node.peers
+            .set_p2p_onion(format!("{}.onion", hs.service_id), virt);
+    }
+    let mut i2p_sam = if let Some(addr) = config.listen.i2p_sam {
+        let s = if config.listen.i2p_accept_incoming {
+            let dest = config.datadir.path().join("i2p").join("p2p.priv");
+            rbitcoin_net::I2pSam::connect_persistent(addr, &dest).await
+        } else {
+            rbitcoin_net::I2pSam::connect(addr).await
+        }
+        .map_err(|e| NodeError::Init(format!("i2p sam {addr}: {e}")))?;
+        info!("i2p SAM session on {addr}");
+        Some(s)
+    } else {
+        None
+    };
+    if config.listen.i2p_accept_incoming {
+        let port = node.local_addr.port();
+        let sam = i2p_sam
+            .as_mut()
+            .expect("validate requires --i2p-sam with --i2p-accept-incoming");
+        sam.stream_forward(port)
+            .await
+            .map_err(|e| NodeError::Init(format!("i2p STREAM FORWARD {port}: {e}")))?;
+        info!("i2p STREAM FORWARD to {}", node.local_addr);
+    }
+    if let Some(sam) = i2p_sam.as_ref() {
+        rbitcoin_net::install_i2p_dialer(sam.dialer());
+    }
+    let _i2p_sam = i2p_sam;
     // One Class B appender thread. Join it at shutdown so apply does not race flush.
     let sh_writebehind = if config.shindex {
         Some(spawn_sh_writebehind(
@@ -375,9 +457,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
     let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
     addrman.set_asmap(asmap.clone());
+    addrman.set_only_net(config.listen.only_net.clone());
+    addrman.set_cjdns_reachable(config.listen.cjdns_reachable);
+    node.peers
+        .set_cjdns_reachable(config.listen.cjdns_reachable);
     node.peers.set_asmap(asmap);
     for c in &config.listen.connect {
-        addrman.add(*c);
+        addrman.add_addr(*c);
     }
     if should_resolve_default_seeds(&config) {
         info!(
@@ -391,6 +477,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
+    } else if config.listen.proxy.is_some() && config.listen.use_seeds {
+        let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
+        info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
     } else if config.signet_challenge.is_some()
         && config.listen.connect.is_empty()
         && addrman.is_empty()
@@ -399,10 +488,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
+    if mempool.isolated_broadcast() {
+        let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
+            Arc::clone(&mempool),
+            config.listen.isolated_dialer(),
+            std::sync::Arc::clone(&shared_peers),
+            node.magic(),
+            node.user_agent().to_string(),
+        );
+    }
 
     let max_out = config.listen.max_outbound.max(1) as usize;
     let candidate_n = max_out.saturating_mul(2).clamp(16, 48);
-    let occupied = node.peers.live_outbound_full_relay_addrs();
+    let occupied = node.peers.live_outbound_full_relay_nets();
     let targets = follow_dial_targets(&config.listen.connect, &addrman, max_out, &occupied);
     let ibd_targets = follow_dial_targets(&config.listen.connect, &addrman, candidate_n, &occupied);
     let catch_up = run_ibd_or_skip(
@@ -530,7 +628,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         const FOLLOW_CONNECT_SECS: u64 = 8;
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
-                if let Err(e) = node.peers.dial(*peer, PeerConnType::OutboundFullRelay) {
+                if let Err(e) = node.peers.dial_net(*peer, PeerConnType::OutboundFullRelay) {
                     warn!("node: follow dial {peer}: {e}");
                 }
             }
@@ -550,7 +648,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     }
                     result = tokio::time::timeout(
                         Duration::from_secs(FOLLOW_CONNECT_SECS),
-                        node.follow_from(*peer),
+                        node.follow_from_net(*peer),
                     ) => {
                         match result {
                             Ok(Ok(())) => {
@@ -573,7 +671,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    let (electrum_handles, electrum_bridge) = start_electrum_if_ready(
+    let (electrum_handles, electrum_bridge, electrum_onion) = start_electrum_if_ready(
         sh_tip_ready,
         config.listen.electrum,
         config.sptweaks_dust,
@@ -583,6 +681,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &mempool,
     )
     .await;
+    if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
+        let hs = ctl
+            .add_electrum_onion(config.datadir.path(), h.local_addr)
+            .await?;
+        info!(
+            "electrum onion {}.onion:{}",
+            hs.service_id,
+            h.local_addr.port()
+        );
+        let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
+        node.peers
+            .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+    }
     let (esplora_handles, esplora_tip_bridge) = start_esplora_if_ready(
         sh_tip_ready,
         config.listen.esplora.clone(),
@@ -593,6 +704,48 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &mempool,
     )
     .await;
+    if config.esplora_onion {
+        if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
+            let hs = ctl
+                .add_esplora_onion(config.datadir.path(), h.local_addr)
+                .await?;
+            info!(
+                "esplora onion http://{}.onion:{} (/ws same port)",
+                hs.service_id,
+                h.local_addr.port()
+            );
+            node.peers
+                .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+        }
+    }
+    let mut i2p_wallet = Vec::new();
+    if config.listen.i2p_accept_incoming {
+        if let Some(addr) = config.listen.i2p_sam {
+            if let Some(h) = electrum_handles.first() {
+                i2p_wallet.push(
+                    start_i2p_named_forward(
+                        addr,
+                        config.datadir.path(),
+                        "electrum",
+                        h.local_addr.port(),
+                    )
+                    .await?,
+                );
+            }
+            if let Some(h) = esplora_handles.first() {
+                i2p_wallet.push(
+                    start_i2p_named_forward(
+                        addr,
+                        config.datadir.path(),
+                        "esplora",
+                        h.local_addr.port(),
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+    let _i2p_wallet = i2p_wallet;
 
     let mut rpc_handle: Option<RpcHandle> = None;
     if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {
@@ -869,7 +1022,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         _ = shutdown.cancelled() => break,
                         result = tokio::time::timeout(
                             Duration::from_secs(8),
-                            node.follow_from(peer),
+                            node.follow_from_net(rbitcoin_net::NetAddr::Ip(peer)),
                         ) => {
                             match result {
                                 Ok(Ok(())) => {
@@ -885,9 +1038,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     }
                 } else {
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
-                    let retry_cfg = catch_up_retry_config(std::sync::Arc::clone(&shared_peers));
+                    let retry_cfg =
+                        catch_up_retry_config(std::sync::Arc::clone(&shared_peers), node.dialer());
                     let cancel = Some(Arc::clone(&shutdown.flag));
-                    let retry_peers = [peer];
+                    let retry_peers = [rbitcoin_net::NetAddr::Ip(peer)];
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
@@ -985,7 +1139,21 @@ fn tip_meets_min_work(config: &NodeConfig, hub: &rbitcoin_net::ChainHub) -> bool
 }
 
 fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
-    config.listen.use_seeds && config.listen.connect.is_empty() && config.signet_challenge.is_none()
+    config.listen.use_seeds
+        && config.listen.connect.is_empty()
+        && config.signet_challenge.is_none()
+        && config.listen.proxy.is_none()
+}
+
+fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: Network) -> usize {
+    let mut n = 0usize;
+    for (host, port) in socks_dns_seed_dests(network) {
+        match peers.dial_domain(host.clone(), port, PeerConnType::AddrFetch) {
+            Ok(()) => n += 1,
+            Err(e) => warn!("seednode dial {host}:{port}: {e}"),
+        }
+    }
+    n
 }
 
 /// One walker per process: SH-warm start and post-IBD `enter_tip_mode` both call this.
@@ -1103,7 +1271,7 @@ fn apply_startup_index_mode(
 
 async fn run_ibd_or_skip(
     node: &P2PNode,
-    ibd_targets: &[SocketAddr],
+    ibd_targets: &[rbitcoin_net::NetAddr],
     max_out: usize,
     shared_peers: &std::sync::Arc<std::sync::Mutex<AddrMan>>,
     addrman: &mut AddrMan,
@@ -1126,6 +1294,7 @@ async fn run_ibd_or_skip(
         // could deliver mid-chain blocks). Default 30s is enough.
         stall: std::time::Duration::from_secs(30),
         peers: Some(std::sync::Arc::clone(shared_peers)),
+        dialer: node.dialer(),
         ..IbdConfig::default()
     };
     info!(
@@ -1240,6 +1409,23 @@ fn electrum_tip_notify(ev: TipEvent) -> Option<TipNotify> {
     })
 }
 
+async fn start_i2p_named_forward(
+    sam_addr: SocketAddr,
+    datadir: &Path,
+    name: &str,
+    port: u16,
+) -> Result<rbitcoin_net::I2pSam, NodeError> {
+    let dest = datadir.join("i2p").join(format!("{name}.priv"));
+    let mut sam = rbitcoin_net::I2pSam::connect_persistent(sam_addr, &dest)
+        .await
+        .map_err(|e| NodeError::Init(format!("i2p {name} session: {e}")))?;
+    sam.stream_forward(port)
+        .await
+        .map_err(|e| NodeError::Init(format!("i2p {name} STREAM FORWARD {port}: {e}")))?;
+    info!("i2p {name} STREAM FORWARD to 127.0.0.1:{port}");
+    Ok(sam)
+}
+
 async fn start_electrum_if_ready(
     sh_tip_ready: bool,
     addr: Option<SocketAddr>,
@@ -1248,12 +1434,17 @@ async fn start_electrum_if_ready(
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
-) -> (Vec<ElectrumHandle>, Option<tokio::task::JoinHandle<()>>) {
+) -> (
+    Vec<ElectrumHandle>,
+    Option<tokio::task::JoinHandle<()>>,
+    Arc<OnceLock<(String, u16)>>,
+) {
+    let onion_tcp = Arc::new(OnceLock::new());
     let Some(addr) = addr else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, onion_tcp);
     };
     if !sh_tip_ready || shutdown.requested() {
-        return (Vec::new(), None);
+        return (Vec::new(), None, onion_tcp);
     }
     let q = hub.query.clone();
     let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
@@ -1266,6 +1457,7 @@ async fn start_electrum_if_ready(
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
     ecfg.tweaks_min_dust = tweaks_min_dust;
+    ecfg.onion_tcp = Arc::clone(&onion_tcp);
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
@@ -1283,11 +1475,11 @@ async fn start_electrum_if_ready(
                 "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
                 h.local_addr, max_conn, max_line, idle_secs
             );
-            (vec![h], Some(bridge))
+            (vec![h], Some(bridge), onion_tcp)
         }
         Err(e) => {
             warn!("electrum TCP start warning: {e}");
-            (Vec::new(), Some(bridge))
+            (Vec::new(), Some(bridge), onion_tcp)
         }
     }
 }
@@ -1510,10 +1702,14 @@ pub(crate) fn enter_tip_mode(
 ///
 /// Uses [`IbdConfig::default`] (window 1024, stall 30s, connect 8s, …) — not
 /// [`IbdConfig::for_test`], which is only for unit/integration test harnesses.
-fn catch_up_retry_config(peers: std::sync::Arc<std::sync::Mutex<AddrMan>>) -> IbdConfig {
+fn catch_up_retry_config(
+    peers: std::sync::Arc<std::sync::Mutex<AddrMan>>,
+    dialer: Dialer,
+) -> IbdConfig {
     IbdConfig {
         target_peers: 1,
         peers: Some(peers),
+        dialer,
         ..IbdConfig::default()
     }
 }
@@ -1600,15 +1796,21 @@ pub(crate) fn load_asmap(datadir: &Path, configured: Option<&Path>) -> Option<Ar
 
 /// `--connect` is operator-pinned: no netgroup filter. Otherwise rank + diversity.
 pub(crate) fn follow_dial_targets(
-    connect: &[SocketAddr],
+    connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
     max: usize,
-    occupied: &[SocketAddr],
-) -> Vec<SocketAddr> {
+    occupied: &[rbitcoin_net::NetAddr],
+) -> Vec<rbitcoin_net::NetAddr> {
     if !connect.is_empty() {
         connect.to_vec()
     } else {
-        book.take_outbound_occupied(max, occupied)
+        let exclude: std::collections::HashSet<_> = occupied.iter().copied().collect();
+        let socks: Vec<SocketAddr> = occupied
+            .iter()
+            .copied()
+            .filter_map(rbitcoin_net::NetAddr::socket_addr)
+            .collect();
+        book.take_dial_candidates_net(max, &exclude, &socks)
     }
 }
 
@@ -1703,12 +1905,33 @@ mod tests {
         let mut am = AddrMan::new();
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 1)), 8333));
         am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 0, 1)), 8333));
-        let connect = vec![SocketAddr::new(
+        let connect = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             8333,
-        )];
-        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
-        assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), connect);
+        ))];
+        let occupied = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
+            8333,
+        ))];
+        let want = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8333,
+        ))];
+        assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
+    }
+
+    #[test]
+    fn follow_dial_targets_keeps_i2p_connect() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let mut am = AddrMan::new();
+        am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 1)), 8333));
+        let i2p = rbitcoin_net::NetAddr::I2p {
+            dest: [7u8; 32],
+            port: 8333,
+        };
+        let connect = vec![i2p];
+        let got = follow_dial_targets(&connect, &am, 8, &[]);
+        assert_eq!(got, vec![i2p]);
     }
 
     #[test]
@@ -1719,9 +1942,28 @@ mod tests {
         let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 3, 0, 1)), 8333);
         am.add(same);
         am.add(other);
-        let occupied = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)), 8333)];
+        let occupied = vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
+            8333,
+        ))];
         let got = follow_dial_targets(&[], &am, 1, &occupied);
-        assert_eq!(got, vec![other]);
+        assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
+    }
+
+    #[test]
+    fn follow_dial_targets_picks_addrman_onion() {
+        let onion: rbitcoin_net::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let mut am = AddrMan::new();
+        am.set_only_net(vec![rbitcoin_net::OnlyNet::Onion]);
+        am.add_addr(onion);
+        assert_eq!(follow_dial_targets(&[], &am, 1, &[]), vec![onion]);
+        assert!(
+            follow_dial_targets(&[], &am, 1, &[onion]).is_empty(),
+            "live onion net must not be re-dialed via 0.0.0.0 hint"
+        );
     }
 
     #[test]
@@ -1882,7 +2124,7 @@ mod tests {
     #[test]
     fn catch_up_retry_config_uses_production_not_for_test() {
         let peers = std::sync::Arc::new(std::sync::Mutex::new(rbitcoin_net::AddrMan::new()));
-        let cfg = catch_up_retry_config(std::sync::Arc::clone(&peers));
+        let cfg = catch_up_retry_config(std::sync::Arc::clone(&peers), Dialer::Direct);
         let prod = IbdConfig::default();
         let test = IbdConfig::for_test();
 
@@ -1907,6 +2149,35 @@ mod tests {
         assert!(should_resolve_default_seeds(&cfg));
         cfg.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
         assert!(!should_resolve_default_seeds(&cfg));
+    }
+
+    #[test]
+    fn dns_seeds_not_resolved_locally_when_proxy() {
+        let mut cfg = NodeConfig::default();
+        assert!(should_resolve_default_seeds(&cfg));
+        cfg.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        assert!(
+            !should_resolve_default_seeds(&cfg),
+            "proxy path must not ToSocketAddrs DNS/fixed seeds"
+        );
+    }
+
+    #[test]
+    fn proxy_seed_bootstrap_queues_domain_addrfetch() {
+        let peers = rbitcoin_net::PeerHub::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rbitcoin_net::DialRequest>();
+        peers.set_dialer(tx);
+        let n = queue_proxy_seed_addrfetch(&peers, rbitcoin_primitives::Network::Signet);
+        assert_eq!(n, 1, "signet has one default DNS seed");
+        let req = rx.try_recv().expect("queued dial request");
+        assert_eq!(req.typ, PeerConnType::AddrFetch);
+        match req.target {
+            rbitcoin_net::DialTarget::Domain { host, port } => {
+                assert_eq!(host, "seed.signet.bitcoin.sprovoost.nl");
+                assert_eq!(port, 38333);
+            }
+            other => panic!("expected domain target, got {other:?}"),
+        }
     }
 
     fn coinbase_block(
@@ -2457,6 +2728,81 @@ mod tests {
         // Bind fail is non-fatal warn; run should still complete.
         result.unwrap().expect("run_p2p despite electrum fail");
         drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn electrum_i2p_forward_when_sam_incoming() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn write_line(s: &mut TcpStream, line: &str) {
+            s.write_all(line.as_bytes()).await.unwrap();
+            s.write_all(b"\n").await.unwrap();
+            s.flush().await.unwrap();
+        }
+        async fn read_line(s: &mut TcpStream) -> Option<String> {
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log_acc = Arc::clone(&log);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = Arc::clone(&log_acc);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(line) = read_line(&mut s).await else {
+                            break;
+                        };
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("HELLO VERSION") {
+                            write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
+                        } else if up.starts_with("SESSION CREATE") {
+                            write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=walletfake")
+                                .await;
+                        } else if up.starts_with("STREAM FORWARD") {
+                            log.lock().unwrap().push(line);
+                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbtc-i2p-wallet-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sam = start_i2p_named_forward(addr, &dir, "electrum", 50001)
+            .await
+            .unwrap();
+        drop(sam);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("i2p").join("electrum.priv"))
+                .unwrap()
+                .trim(),
+            "walletfake"
+        );
+        let fw = log.lock().unwrap().clone();
+        assert_eq!(fw.len(), 1, "{fw:?}");
+        assert!(fw[0].contains("PORT=50001"), "{}", fw[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

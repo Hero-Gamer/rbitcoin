@@ -1283,6 +1283,10 @@ mod tests {
         PeerSlot {
             id,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444 + id as u16),
+            net: crate::NetAddr::from_socket(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                18444 + id as u16,
+            )),
             cmd_tx,
             in_flight: HashSet::new(),
             peer_height: 100,
