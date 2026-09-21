@@ -266,6 +266,7 @@ async fn cjdns_tun_two_node() {
     let mut cfg_b = base_node(b_dir.path());
     cfg_b.listen.p2p = P2pListen::Socket(b_p2p);
     cfg_b.listen.cjdns_reachable = true;
+    cfg_b.listen.discover = true;
     cfg_b.listen.only_net = vec![OnlyNet::Cjdns];
     cfg_b.rpc.listen = Some(b_rpc);
     let b = spawn_node(cfg_b, b_rpc).await;
@@ -275,6 +276,7 @@ async fn cjdns_tun_two_node() {
     let mut cfg_a = base_node(a_dir.path());
     cfg_a.listen.p2p = P2pListen::Socket(a_p2p);
     cfg_a.listen.cjdns_reachable = true;
+    cfg_a.listen.discover = true;
     cfg_a.listen.only_net = vec![OnlyNet::Cjdns];
     cfg_a.listen.connect = vec![NetAddr::from_str(&b_p2p.to_string()).unwrap()];
     cfg_a.rpc.listen = Some(a_rpc);
@@ -301,6 +303,20 @@ async fn cjdns_tun_two_node() {
             .iter()
             .any(|p| p["inbound"] == true && p["network"] == "cjdns"),
         "{bin}"
+    );
+    let binfo = jsonrpc(b_rpc, "getnetworkinfo", json!([])).await;
+    assert!(
+        localaddresses(&binfo)
+            .iter()
+            .any(|r| { r["address"] == env.cjdns_b.to_string() && r["port"] == b_p2p.port() }),
+        "cjdns listen must be a local address: {binfo}"
+    );
+    let ainfo = jsonrpc(a_rpc, "getnetworkinfo", json!([])).await;
+    assert!(
+        localaddresses(&ainfo)
+            .iter()
+            .any(|r| { r["address"] == env.cjdns_a.to_string() && r["port"] == a_p2p.port() }),
+        "cjdns listen must be a local address: {ainfo}"
     );
 
     a.stop().await;

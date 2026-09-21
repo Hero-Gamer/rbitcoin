@@ -333,9 +333,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if node.local_addr.port() != 0 {
         node.peers.set_listen_port(node.local_addr.port());
     }
-    if !config.listen.external_ips.is_empty() {
-        node.peers
-            .set_external_ips(config.listen.external_ips.clone());
+    let external = external_ips_with_cjdns_bind(
+        &config.listen.external_ips,
+        node.local_addr,
+        config.listen.cjdns_reachable,
+    );
+    if !external.is_empty() {
+        node.peers.set_external_ips(external);
     }
     if immediate_relay {
         node.peers.set_noban(true);
@@ -1871,6 +1875,27 @@ pub(crate) async fn tip_follow_next_wake(
     }
 }
 
+/// A CJDNS listen bind is the address peers should learn. `--external-ip`
+/// still wins when the operator set the same address already.
+fn external_ips_with_cjdns_bind(
+    configured: &[std::net::IpAddr],
+    bind: SocketAddr,
+    cjdns_reachable: bool,
+) -> Vec<std::net::IpAddr> {
+    let mut ips = configured.to_vec();
+    if !cjdns_reachable {
+        return ips;
+    }
+    let std::net::IpAddr::V6(ip) = bind.ip() else {
+        return ips;
+    };
+    if !rbitcoin_net::is_cjdns_ip(ip) || ips.contains(&std::net::IpAddr::V6(ip)) {
+        return ips;
+    }
+    ips.push(std::net::IpAddr::V6(ip));
+    ips
+}
+
 /// Parse Core `-seednode` host or host:port using the chain default P2P port.
 fn resolve_seednode(raw: &str, network: Network) -> Result<SocketAddr, String> {
     if let Ok(a) = raw.parse::<SocketAddr>() {
@@ -2127,6 +2152,28 @@ mod tests {
         assert_eq!(catch_up_after_err(10, false, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(0, true, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(10, true, true), CatchUp::Incomplete);
+    }
+
+    #[test]
+    fn cjdns_listen_is_advertised_without_external_ip() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let fc = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let bind = SocketAddr::from((fc, 8333));
+        let got = external_ips_with_cjdns_bind(&[], bind, true);
+        assert_eq!(got, vec![IpAddr::V6(fc)]);
+        assert!(
+            external_ips_with_cjdns_bind(&[], bind, false).is_empty(),
+            "fc00 stays unroutable until --cjdns-reachable"
+        );
+        let v4 = SocketAddr::from(([1, 2, 3, 4], 8333));
+        assert!(external_ips_with_cjdns_bind(&[], v4, true).is_empty());
+        let ula = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 8333));
+        assert!(
+            external_ips_with_cjdns_bind(&[], ula, true).is_empty(),
+            "fd00::/8 is not CJDNS"
+        );
+        let dup = external_ips_with_cjdns_bind(&[IpAddr::V6(fc)], bind, true);
+        assert_eq!(dup, vec![IpAddr::V6(fc)]);
     }
 
     #[test]
