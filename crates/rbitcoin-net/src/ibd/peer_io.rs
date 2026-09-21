@@ -58,7 +58,7 @@ pub(crate) enum PeerEvent {
     /// Addresses learned from `addr` / `addrv2` (for IBD redial pool growth).
     Addrs {
         peer: usize,
-        addrs: Vec<SocketAddr>,
+        addrs: Vec<crate::NetAddr>,
     },
     /// Peer failed or closed.
     Dead {
@@ -277,13 +277,13 @@ pub(crate) async fn spawn_peer(
                                         }
                                     }
                                     NetworkMessage::Addr(list) => {
-                                        let addrs = socket_addrs_from_addr(&list);
+                                        let addrs = net_addrs_from_addr(&list);
                                         if !addrs.is_empty() {
                                             sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
                                         }
                                     }
                                     NetworkMessage::AddrV2(list) => {
-                                        let addrs = socket_addrs_from_addrv2(&list);
+                                        let addrs = net_addrs_from_addrv2(&list);
                                         if !addrs.is_empty() {
                                             sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
                                         }
@@ -436,25 +436,35 @@ pub(crate) async fn spawn_peer(
 }
 
 /// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
-fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<SocketAddr> {
+fn net_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<crate::NetAddr> {
+    socket_addrs_from_addr(list)
+        .into_iter()
+        .map(crate::NetAddr::Ip)
+        .collect()
+}
+
+/// BIP155 rows that advertise full/limited network **and** `P2P_V2`, including onion.
+fn net_addrs_from_addrv2(list: &[bitcoin::p2p::address::AddrV2Message]) -> Vec<crate::NetAddr> {
     let mut out = Vec::with_capacity(list.len().min(32));
-    for (_ts, a) in list {
+    for a in list {
         if !services_useful_for_ibd(a.services) {
             continue;
         }
-        if let Ok(sa) = a.socket_addr() {
-            if usable_dial_addr(&sa) {
-                out.push(sa);
-            }
+        let Some(addr) = crate::NetAddr::from_addrv2(a) else {
+            continue;
+        };
+        match addr {
+            crate::NetAddr::Ip(sa) if !usable_dial_addr(&sa) => {}
+            ok => out.push(ok),
         }
     }
     out
 }
 
 /// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
-fn socket_addrs_from_addrv2(list: &[bitcoin::p2p::address::AddrV2Message]) -> Vec<SocketAddr> {
+fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<SocketAddr> {
     let mut out = Vec::with_capacity(list.len().min(32));
-    for a in list {
+    for (_ts, a) in list {
         if !services_useful_for_ibd(a.services) {
             continue;
         }
@@ -650,13 +660,13 @@ mod tests {
             addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 11)),
             port: 0,
         };
-        let out2 = socket_addrs_from_addrv2(&[v2_good, v2_net_only, v2_bad_svc, v2_zero_port]);
+        let out2 = net_addrs_from_addrv2(&[v2_good, v2_net_only, v2_bad_svc, v2_zero_port]);
         assert_eq!(
             out2,
-            vec![SocketAddr::new(
+            vec![crate::NetAddr::Ip(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
                 18444
-            )]
+            ))]
         );
 
         let v6_multi =
@@ -669,7 +679,23 @@ mod tests {
             addr: AddrV2::Ipv6(Ipv6Addr::LOCALHOST),
             port: 8333,
         };
-        let out3 = socket_addrs_from_addrv2(&[v2_v6]);
-        assert_eq!(out3, vec![v6_net]);
+        let out3 = net_addrs_from_addrv2(&[v2_v6]);
+        assert_eq!(out3, vec![crate::NetAddr::Ip(v6_net)]);
+
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let crate::NetAddr::Onion { pk, port } = onion else {
+            panic!("fixture");
+        };
+        let v2_onion = AddrV2Message {
+            time: 1,
+            services: v2_net,
+            addr: AddrV2::TorV3(pk),
+            port,
+        };
+        let nets = net_addrs_from_addrv2(&[v2_onion]);
+        assert_eq!(nets, vec![onion]);
     }
 }

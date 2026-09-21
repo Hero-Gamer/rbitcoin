@@ -1961,14 +1961,23 @@ fn apply_peer_event_body_and_control_surface() {
     inject_learned_addrs(
         &mut book,
         &[
-            addr(2),
-            local,
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1),
+            crate::NetAddr::Ip(addr(2)),
+            crate::NetAddr::Ip(local),
+            crate::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)),
         ],
         local,
         1,
     );
     assert!(book.entry(&addr(2)).is_some());
+    let onion: crate::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    inject_learned_addrs(&mut book, &[onion], local, 1);
+    assert!(
+        book.entries().iter().any(|e| e.addr == onion),
+        "IBD addrv2 onion must enter the dial book"
+    );
 
     // Dead releases work.
     st.slots[0].in_flight.insert(h(4));
@@ -2379,7 +2388,10 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let n0 = book.len();
     inject_learned_addrs(
         &mut book,
-        &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333)],
+        &[crate::NetAddr::Ip(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+            8333,
+        ))],
         local,
         1,
     );
@@ -2396,7 +2408,10 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     ctrl_tx
         .send(PeerEvent::Addrs {
             peer: 1,
-            addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8333)],
+            addrs: vec![crate::NetAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                8333,
+            ))],
         })
         .unwrap();
     let stats = super::super::status::LoopStats::default();
