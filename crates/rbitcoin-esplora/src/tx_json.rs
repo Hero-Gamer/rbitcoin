@@ -181,14 +181,23 @@ fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Va
         .iter()
         .map(|o| vout_fields(&o.script, o.value, network))
         .collect();
-    Ok(json!({
+    let mut obj = json!({
         "txid": block_hash_hex(&txid),
         "version": tx.version,
         "locktime": tx.locktime,
+        "vin": [],
         "vout": vout,
         "status": status,
         "pruned": true,
-    }))
+    });
+    if let Some(row) = query.txstat_row(tx_fk)? {
+        if row.base != 0 || row.wit_extra != 0 {
+            obj["fee"] = json!(row.fee_sat);
+            obj["size"] = json!(row.size());
+            obj["weight"] = json!(row.weight());
+        }
+    }
+    Ok(obj)
 }
 
 /// Esplora tx JSON from a mempool wire body (not in Class A).
@@ -813,6 +822,85 @@ mod tests {
         assert_eq!(v["sigops"], 4, "OP_CHECKSIG output scaled: {v}");
         assert_eq!(q.store().txs.body_txid(spend2_fk).unwrap(), spend2_txid);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruned_tx_json_has_fee_from_txstat() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord, TxStatRow};
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("esplora-pruned-txstat");
+        let mut merkle = [0u8; 32];
+        merkle[0] = 0xaa;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash: merkle,
+            size: 0,
+            weight: 0,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        q.store()
+            .write_txstat_row(
+                fk,
+                &TxStatRow {
+                    n_in: 1,
+                    fee_sat: 0,
+                    base: 81,
+                    wit_extra: 0,
+                },
+            )
+            .unwrap();
+        q.set_pruneheight(Some(Height(0))).unwrap();
+        let v = build_tx_json(&q, fk, Network::Regtest).unwrap();
+        assert_eq!(v["pruned"], true);
+        assert_eq!(v["vin"], json!([]), "pruned vin is empty: {v}");
+        assert_eq!(v["fee"], 0);
+        assert_eq!(v["size"], 81);
+        assert_eq!(v["weight"], 324);
+        assert!(v.get("sigops").is_none(), "pruned JSON omits sigops: {v}");
+        assert_eq!(v["vout"].as_array().unwrap().len(), 1);
+        assert_eq!(v["txid"], block_hash_hex(&txid));
+
+        q.store()
+            .write_txstat_row(
+                fk,
+                &TxStatRow {
+                    n_in: 0,
+                    fee_sat: 0,
+                    base: 0,
+                    wit_extra: 0,
+                },
+            )
+            .unwrap();
+        let raw = build_tx_json(&q, fk, Network::Regtest).unwrap();
+        assert_eq!(raw["pruned"], true);
+        assert_eq!(raw["vin"], json!([]), "{raw}");
+        assert!(raw.get("fee").is_none(), "unstamped omits fee: {raw}");
+        assert!(raw.get("size").is_none(), "{raw}");
+        assert!(raw.get("weight").is_none(), "{raw}");
+        assert!(raw.get("sigops").is_none(), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

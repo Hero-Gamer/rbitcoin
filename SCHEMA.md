@@ -1,7 +1,12 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 24` (`rbitcoin_primitives`).  
-**Status:** 24 is `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied
+**Version:** `SCHEMA_VERSION = 25` (`rbitcoin_primitives`).  
+**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `n_in`/`fee_sat`/`base`/`wit_extra`;
+per-header remaining-byte overflow in `txstat.ovf` + `txstat.blk`). Occupied
+24 rewrites `meta` and zero-extends `txstat.body` to `create.loc` count (**no**
+`txout.body` rewrite; leftover LAYOUT17 still has uleb `input_count`). Unreleased
+leftover `txfixed.body` is unlinked. A 24
+binary refuses 25 `meta`. 24 is `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied
 23 rewrites 88 B rows via `header.body.grow` then rename (size/weight 0 until
 confirm stamps or lazy fill). SH extent last-page reserved (offset 20) is create
 count (`0` = unknown; readers walk, appender stamps on pack/append). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
@@ -13,13 +18,13 @@ slots flags + u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bi
 is canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa
 divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
 15–21 LAYOUT17 Class A with creates is **refused**
-(wipe datadir and redo IBD). Empty 15–23 rewrite `meta` to 24 and unlink leftover
+(wipe datadir and redo IBD). Empty 15–24 rewrite `meta` to 25 and unlink leftover
 `spent.off` and leftover `*.idx`. A 23 binary refuses 24 `meta`. Occupied schema
 18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
-dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 24; `tx.head` rebuilds
+dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 25; `tx.head` rebuilds
 from Class A; SH rematerializes with `--sh-index`. An 19 binary refuses 20+
 `meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
-Class A is **refused**. Empty 17 indexes rewrite `meta` to 24.
+Class A is **refused**. Empty 17 indexes rewrite `meta` to 25.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
@@ -73,11 +78,12 @@ index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* the
 ```  
 **21→22 open:** occupied Class A with creates:
 `schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.
-Empty 21 rewrites `store/meta` to 24 and unlinks leftover `spent.off`.
-Table file headers 13–24 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
-Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 24.
+Empty 21 rewrites `store/meta` to 25 and unlinks leftover `spent.off`.
+Table file headers 13–25 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 25.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
-**23→24 open:** rewrite `header.body` 88 B rows to 96 B (`size:u32` + `weight:u32` = 0) via `header.body.grow` then rename; rewrite `meta` to 24. Class A tx stems kept. Empty 23 rewrites `meta`. A 23 binary refuses 24 `meta`. Crash with leftover `.grow` discards it and retries; 96-byte body with meta 23 only rewrites `meta`.
+**23→24 open:** rewrite `header.body` 88 B rows to 96 B (`size:u32` + `weight:u32` = 0) via `header.body.grow` then rename; rewrite `meta` to 25. Class A tx stems kept. Empty 23 rewrites `meta`. A 23 binary refuses 24 `meta`. Crash with leftover `.grow` discards it and retries; 96-byte body with meta 23 only rewrites `meta`.
+**24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
 Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md).
@@ -214,6 +220,7 @@ itself changed.
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
+    txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
     tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
@@ -282,6 +289,9 @@ the hot volume.
 | 16 | inwit (`inwit.body`) |
 | 17 | spent (`spent.body`) |
 | 18 | delta loc (`create.loc` / `inwit.loc` and `.ovf`) |
+| 19 | txstat (`txstat.body`, 8 B/create) |
+| 20 | txstat overflow (`txstat.ovf`) |
+| 21 | txstat per-header locator (`txstat.blk`, 16 B/header) |
 
 ---
 
@@ -346,7 +356,31 @@ offset 0..32    — 32-byte file header (standard 16-byte TableFile header + 16 
 offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
 ```
 
-Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `inwit` / `spent` / `txid.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
+Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `inwit` / `spent` / `txid.body` / `txstat.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
+
+### Confirm-time econ (`txstat.body`, schema 25)
+
+```text
+txstat.body  offset 0..32            — TableFile 16 + 16 pad
+             offset 32+(fk-1)×8      — 8-byte cell
+txstat.ovf   append-only             — remaining ULEB bytes when the stream exceeds 8 B
+txstat.blk   offset 32+(header_fk-1)×16 — off:u64, len:u32, n_ovf:u32
+```
+
+Cell payload is four canonical ULEBs: `n_in`, `fee_sat`, `base` (non-witness
+size), `wit_extra` (`total_size − base`). Readers derive `size = base + wit_extra`
+and `weight = 4×base + wit_extra`. `n_in` is first and ≤ 3 B (`≤ u16::MAX`, same
+cap as `spent.vin`) so pin / SH / tweaks parse it from the cell without opening
+`.ovf`. All-zero cell = unstamped. A truncated ULEB or fewer than four fields
+means the rest of the stream is in that header's overflow blob (`encoded[8..]`
+only). Missing tail is `Corrupt("invariant: txstat overflow missing")`. Overlong
+ULEB is Corrupt. Trailing non-zero after four fields is Corrupt. Placeholders
+(`n_in ≠ 0`, rest zero) always fit. Class A append of placeholders never overflows;
+only a confirm stamp can emit tails. Blob entries are `u16 index_in_block` +
+`u8 nrest` + rest, in block-index order. Empty header: `len=0`. Occupied 24 open
+extends zeros to loc count (~11.3 GiB at the 2026-08-13 census if fully allocated).
+Pin / SH / tweaks do **not** open these files. Unreleased leftover `txfixed.body`
+is unlinked on open.
 
 ### Split bodies (schema 15)
 
@@ -381,11 +415,15 @@ Decode walks meta + runs to a logical end; any remaining bytes in the loc span m
 
 **Body meta (schema 22 LAYOUT17, variable):** first byte bit 7 = `LAYOUT17`
 (required). Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 =
-locktime 0 (else uleb locktime); then uleb `input_count` only (no
-`output_count`). Typical v2+locktime 0 is **2 B**. `CreateLocPair.n_out` (≥ 1)
-fills `TxRecord.output_count`. Schema-15 16-byte prefixes (v1 starts
-`01 00 00 00`) are not accepted. `input_start_fk` / `output_start_fk` stay null
-in RAM. Soft `TxRecord.txid` is filled from the sidefile on get paths.
+locktime 0 (else uleb locktime). Bit 4 (`N_IN_TXSTAT`) omits the following
+uleb `input_count` (`n_in` is on `txstat.body`; decode reports 0 until a
+reader fills from the stamped row). Bits 5–6 reserved (nonzero → Corrupt).
+New 25 writes omit the uleb (v2+locktime 0 is **1 B**). Leftover 24 rows
+keep the uleb (typical v2+locktime 0 is **2 B**).
+`CreateLocPair.n_out` (≥ 1) fills `TxRecord.output_count`. Schema-15 16-byte
+prefixes (v1 starts `01 00 00 00`) are not accepted. `input_start_fk` /
+`output_start_fk` stay null in RAM. Soft `TxRecord.txid` is filled from the
+sidefile on get paths.
 
 ### Create / inwit locators (`create.loc` / `inwit.loc`)
 

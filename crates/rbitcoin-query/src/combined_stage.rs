@@ -104,7 +104,7 @@ pub fn load_creates_once(
         let mut decoded_outs = None;
         match mode {
             IdxBodyMode::Full => {
-                if let Ok((tx, _empty_ins, outs, rels)) =
+                if let Ok((mut tx, _empty_ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, job.n_out, Some(secret))
                 {
                     let Some(ij) = inwit_jobs.get(i) else {
@@ -122,6 +122,9 @@ pub fn load_creates_once(
                             .map_err(|_| {
                                 StoreError::Corrupt("invariant: packed create inwit decode failed")
                             })?;
+                    if tx.input_count == 0 {
+                        tx.input_count = ins.len() as u32;
+                    }
                     decoded_full = Some((tx, ins, outs, rels));
                 } else {
                     return Err(StoreError::Corrupt(

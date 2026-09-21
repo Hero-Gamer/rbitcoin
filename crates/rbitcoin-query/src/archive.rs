@@ -154,7 +154,7 @@ impl CreatePinInner {
         }
     }
 
-    fn wire_tx(&self) -> Option<&bitcoin::Transaction> {
+    pub(crate) fn wire_tx(&self) -> Option<&bitcoin::Transaction> {
         match self {
             Self::Wire {
                 block, tx_index, ..
@@ -660,6 +660,131 @@ fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
     }
 }
 
+fn stamp_txstat_rows(
+    query: &Query,
+    packed: &[(CreatePin, Vec<InputRecord>)],
+    planned: &[Fk],
+    parents: Option<&crate::BatchParents>,
+) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
+    let mut idx: crate::U64Map<usize> = crate::U64Map::default();
+    for (i, fk) in planned.iter().enumerate() {
+        if let Some(id) = fk.get() {
+            idx.insert(id, i);
+        }
+    }
+    let mut out = Vec::with_capacity(packed.len());
+    for (pin, ins) in packed {
+        out.push(stamp_one_txstat(query, packed, &idx, parents, pin, ins)?);
+    }
+    Ok(out)
+}
+
+fn stamp_one_txstat(
+    query: &Query,
+    packed: &[(CreatePin, Vec<InputRecord>)],
+    idx: &crate::U64Map<usize>,
+    parents: Option<&crate::BatchParents>,
+    pin: &CreatePin,
+    ins: &[InputRecord],
+) -> Result<rbitcoin_store::TxStatRow, QueryError> {
+    let Some(tx) = pin.wire_tx() else {
+        return Ok(txstat_placeholder_query(pin.tx().input_count));
+    };
+    let in_sum = if tx.is_coinbase() {
+        None
+    } else {
+        let mut in_sum = 0u64;
+        for inp in ins {
+            if inp.is_coinbase() {
+                return Err(StoreError::Corrupt("invariant: mixed coinbase vin"));
+            }
+            let val = prevout_value(query, packed, idx, parents, inp)?;
+            in_sum = in_sum
+                .checked_add(val)
+                .ok_or(StoreError::Corrupt("txstat in_sum overflow"))?;
+        }
+        Some(in_sum)
+    };
+    txstat_row_from_tx(tx, in_sum)
+}
+
+pub(crate) fn txstat_row_from_tx(
+    tx: &bitcoin::Transaction,
+    in_sum: Option<u64>,
+) -> Result<rbitcoin_store::TxStatRow, QueryError> {
+    let n_in = tx.input.len() as u32;
+    if n_in > u32::from(u16::MAX) {
+        return Err(StoreError::Corrupt("txstat n_in exceeds 16 bits"));
+    }
+    let base_sz = tx.base_size();
+    let total = tx.total_size();
+    let base = u32::try_from(base_sz).map_err(|_| StoreError::Corrupt("txstat base"))?;
+    let wit_extra = u32::try_from(total.saturating_sub(base_sz))
+        .map_err(|_| StoreError::Corrupt("txstat wit_extra"))?;
+    let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = match in_sum {
+        None => 0u64,
+        Some(in_sum) => {
+            if in_sum < out_sum {
+                return Err(StoreError::Corrupt("txstat fee underflow"));
+            }
+            in_sum - out_sum
+        }
+    };
+    Ok(rbitcoin_store::TxStatRow {
+        n_in,
+        fee_sat: fee,
+        base,
+        wit_extra,
+    })
+}
+
+fn txstat_placeholder_query(n_in: u32) -> rbitcoin_store::TxStatRow {
+    rbitcoin_store::TxStatRow {
+        n_in,
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    }
+}
+
+fn prevout_value(
+    query: &Query,
+    packed: &[(CreatePin, Vec<InputRecord>)],
+    idx: &crate::U64Map<usize>,
+    parents: Option<&crate::BatchParents>,
+    inp: &InputRecord,
+) -> Result<u64, QueryError> {
+    let Some(cid) = inp.create_fk.get() else {
+        return Err(StoreError::Corrupt("invariant: spend missing create_fk"));
+    };
+    if let Some(&i) = idx.get(&cid) {
+        let (val, _) = packed[i]
+            .0
+            .out_parts(inp.prev_index)
+            .ok_or(StoreError::Corrupt("invariant: same-batch prevout"))?;
+        if val < 0 {
+            return Err(StoreError::Corrupt("txstat prevout negative"));
+        }
+        return Ok(val as u64);
+    }
+    if let Some(p) = parents {
+        if let Some(hit) =
+            p.get_parent_txout_parts(inp.create_fk, inp.prev_index, |v, s, _| (v, s.to_vec()))
+        {
+            if hit.0 < 0 {
+                return Err(StoreError::Corrupt("txstat prevout negative"));
+            }
+            return Ok(hit.0 as u64);
+        }
+    }
+    let o = query.tx_output_at_fk(inp.create_fk, inp.prev_index)?;
+    if o.value < 0 {
+        return Err(StoreError::Corrupt("txstat prevout negative"));
+    }
+    Ok(o.value as u64)
+}
+
 impl Query {
     /// Class A plan + commit from wire blocks. Does not set tip.
     pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
@@ -975,7 +1100,16 @@ impl Query {
     /// Loc pairs are the Class A append starts (RAM). Empty when nothing committed.
     pub fn archive_commit_plan_defer_head(
         &self,
+        plan: ArchiveWritePlan,
+    ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
+        self.archive_commit_plan_defer_head_parents(plan, None)
+    }
+
+    /// Class A commit with optional parent pins for `txstat` fee.
+    pub fn archive_commit_plan_defer_head_parents(
+        &self,
         mut plan: ArchiveWritePlan,
+        parents: Option<&crate::BatchParents>,
     ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
         use std::time::Instant;
         if plan.packed.is_empty() {
@@ -998,10 +1132,17 @@ impl Query {
 
         let t = Instant::now();
         let overlay = plan.same_batch_spent_overlay();
-        let (got_tx_fks, loc) = self.store.put_tx_full_batch_from_pins(
+        let txstat = stamp_txstat_rows(self, &plan.packed, &plan.planned_fks, parents)?;
+        let txstat_ns = t.elapsed().as_nanos() as u64;
+        self.confirm_stats().note_write_txstat(txstat_ns);
+
+        let t = Instant::now();
+        let (got_tx_fks, loc) = self.store.put_tx_full_batch_from_pins_with_txstat(
             &plan.packed,
             /*index=*/ false,
             &overlay,
+            &txstat,
+            &plan.per_header_ranges,
         )?;
         let body_ns = t.elapsed().as_nanos() as u64;
         if got_tx_fks.len() != plan.packed.len() {

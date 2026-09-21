@@ -103,6 +103,12 @@ before 1.0).
 - **Lightning chain backends (`Q-69` Open):** [`docs/lightning.md`](docs/lightning.md)
   owns CLN `bcli` and ldk-node Esplora/Electrum.
 
+- **Schema 25 `txstat.body`:** 8 B/create ULEB confirm-time econ
+  (`n_in`/`fee_sat`/`base`/`wit_extra`) with per-header remaining-byte overflow.
+  Occupied 24 open rewrites `meta` and zero-extends the file to loc count (no
+  `txout.body` rewrite). Unreleased leftover `txfixed.body` is unlinked. A 24
+  binary refuses 25 `meta`.
+
 - **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
   `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
   `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is

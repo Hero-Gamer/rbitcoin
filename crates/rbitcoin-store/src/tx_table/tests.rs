@@ -170,6 +170,164 @@ fn put_full_batch_from_pins_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn put_full_batch_writes_txstat_and_reopen() {
+    let dir = tempfile_dir("txstat-append");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [9u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    let fks = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap();
+    assert_eq!(fks, vec![Fk(1)]);
+    assert_eq!(t.txstat.count(), 1);
+    assert_eq!(
+        crate::txstat::parse_cell(t.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
+        crate::txstat::CellParse::Complete(crate::txstat::TxStatRow {
+            n_in: 1,
+            fee_sat: 0,
+            base: 0,
+            wit_extra: 0,
+        })
+    );
+    drop(t);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t2.count(), 1);
+    assert_eq!(t2.txid_sidefile().count(), 1);
+    assert_eq!(t2.txstat.count(), 1);
+    assert_eq!(
+        crate::txstat::parse_cell(t2.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
+        crate::txstat::CellParse::Complete(crate::txstat::TxStatRow {
+            n_in: 1,
+            fee_sat: 0,
+            base: 0,
+            wit_extra: 0,
+        })
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn two_input_item() -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+    let tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 2,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![
+        InputRecord::coinbase(u32::MAX, vec![0x01], vec![]),
+        InputRecord {
+            prev_txid: [2u8; 32],
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        },
+    ];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    (tx, ins, outs)
+}
+
+#[test]
+fn prevouts_use_txstat_n_in_without_full_txout() {
+    let dir = tempfile_dir("prevouts-txstat");
+    let t = create_tiny(&dir);
+    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    let (off, len) = t.body_range(fk).unwrap();
+    t.body
+        .write_body_abs(off, &vec![0u8; len as usize])
+        .unwrap();
+    assert!(t.get(fk).is_err(), "txout zeros must fail full get");
+    let (meta, prevs) = t.get_meta_and_prevouts(fk).unwrap();
+    assert_eq!(meta.input_count, 2);
+    assert_eq!(prevs.len(), 2);
+    assert_eq!(prevs[0], (Fk::NULL, u32::MAX));
+    assert_eq!(prevs[1], (Fk(1), 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_create_txout_meta_omits_n_in() {
+    let dir = tempfile_dir("txout-omit-nin");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [4u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    let pin = std::sync::Arc::new((tx.clone(), outs.clone()));
+    let mut pin_bytes = Vec::new();
+    pin.encode_txout_body(&mut pin_bytes, None);
+    assert_eq!(
+        pin_bytes[0] & BODY_META_V17_N_IN_TXSTAT,
+        BODY_META_V17_N_IN_TXSTAT,
+        "pin first-wave txout omits n_in"
+    );
+    let fk = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap()[0];
+    let (off, len) = t.body_range(fk).unwrap();
+    let raw = t.with_body_span(off, len, |b| Ok(b.to_vec())).unwrap();
+    assert_eq!(
+        raw[0] & BODY_META_V17_N_IN_TXSTAT,
+        BODY_META_V17_N_IN_TXSTAT
+    );
+    let (meta, n) = decode_body_meta_v17(&raw).unwrap();
+    assert_eq!(n, 1, "v1 locktime 0 omit n_in is one flag byte");
+    assert_eq!(meta.input_count, 0);
+    let (got, gouts) = t.get_meta_and_outputs(fk).unwrap();
+    assert_eq!(got.input_count, 1, "stamped txstat fills n_in");
+    assert_eq!(gouts.len(), 1);
+    let leftover = [0x89u8, 0x01];
+    let (old, on) = decode_body_meta_v17(&leftover).unwrap();
+    assert_eq!(on, 2);
+    assert_eq!(old.input_count, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn txstat_n_in_mismatch_inwit_is_corrupt() {
+    let dir = tempfile_dir("txstat-nin-mismatch");
+    let t = create_tiny(&dir);
+    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    t.txstat
+        .write_row(
+            fk,
+            &crate::txstat::TxStatRow {
+                n_in: 1,
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    match t.get_meta_and_prevouts(fk) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(
+                m.contains("trailing") || m.contains("short") || m.contains("mismatch"),
+                "{m}"
+            );
+        }
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Class A append submits txout+inwit+spent bodies as one pwrite wave (not 3 serial).
 #[test]
 fn put_full_batch_one_body_write_wave() {
@@ -421,6 +579,7 @@ fn open_repairs_body_leading_txid_count() {
     let t2 = TxTable::open_tiny(&dir).expect("open should repair skew");
     assert_eq!(t2.count(), 3);
     assert_eq!(t2.txid_sidefile().count(), 3);
+    assert_eq!(t2.txstat.count(), 3);
     // Kept prefix still readable.
     let tx = t2.get(Fk(1)).unwrap();
     assert_eq!(tx.txid[0], 1);
@@ -523,9 +682,10 @@ fn scan_packed_meta_and_prevouts_no_output_alloc() {
     encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
     let (meta, _) = TxRecord::decode_body_meta(&raw).unwrap();
     assert_eq!(meta.txid, [0u8; 32], "body scan has no leading txid");
+    assert_eq!(meta.input_count, 0, "txout meta omits n_in");
     let mut inwit = Vec::new();
     encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let prevouts = scan_inwit_prevouts(&inwit, meta.input_count).unwrap();
+    let prevouts = scan_inwit_prevouts(&inwit, tx.input_count).unwrap();
     assert_eq!(prevouts.len(), 2);
     assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
     assert_eq!(prevouts[1], (Fk(1), 1));
@@ -1236,6 +1396,7 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(guess_full_n, 0);
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, txid);
+    assert_eq!(got.input_count, 1);
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);
@@ -1785,7 +1946,10 @@ fn tx_fixed_roundtrip() {
     };
     let enc = rec.encode();
     assert!(enc.len() > 32, "txid + thin meta");
-    assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
+    let mut got = TxRecord::decode(&enc).unwrap();
+    assert_eq!(got.input_count, 0, "encode omits n_in");
+    got.input_count = rec.input_count;
+    assert_eq!(got, rec);
 }
 
 #[test]
@@ -1817,12 +1981,12 @@ fn packed_tx_roundtrip() {
     assert!(enc.len() >= 3, "thin LAYOUT17 meta");
     let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&enc, 2).unwrap();
     assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
-    assert_eq!(dtx.input_count, 1);
+    assert_eq!(dtx.input_count, 0, "txout meta omits n_in");
     assert_eq!(dtx.output_count, 2);
     assert!(dtx.input_start_fk.get().is_none());
     let mut inwit = Vec::new();
     encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let dins = decode_inwit_secret(&inwit, dtx.input_count, None).unwrap();
+    let dins = decode_inwit_secret(&inwit, tx.input_count, None).unwrap();
     assert_eq!(dins, inputs);
     assert_eq!(douts, outputs);
 }
@@ -1860,11 +2024,12 @@ fn inwit_and_txout_secret_xor_roundtrip() {
     let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout, 1).unwrap();
     // Without secret, script stays obfuscated.
     assert_ne!(douts[0].script, outputs[0].script);
+    assert_eq!(dtx.input_count, 0, "txout meta omits n_in");
     let (dtx2, douts2, _) =
         decode_packed_tx_outs_with_spender_rels_secret(&txout, 1, Some(&secret)).unwrap();
-    assert_eq!(dtx2.input_count, dtx.input_count);
+    assert_eq!(dtx2.input_count, 0, "txout meta omits n_in");
     assert_eq!(douts2[0].script, outputs[0].script);
-    let dins = decode_inwit_secret(&inwit, dtx.input_count, Some(&secret)).unwrap();
+    let dins = decode_inwit_secret(&inwit, tx.input_count, Some(&secret)).unwrap();
     assert_eq!(dins[0].script_sig, inputs[0].script_sig);
     assert_eq!(dins[0].witness, inputs[0].witness);
 }
@@ -2150,7 +2315,10 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert_eq!(m2.txid, [0u8; 32]);
     let mut inwit = Vec::new();
     encode_inwit_with_secret(&inputs, &mut inwit, None);
-    assert_eq!(scan_inwit_prevouts(&inwit, m.input_count).unwrap().len(), 2);
+    assert_eq!(
+        scan_inwit_prevouts(&inwit, tx.input_count).unwrap().len(),
+        2
+    );
     let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
     assert_eq!(m4.txid, [0u8; 32]);
     assert_eq!(outs_rels.len(), 2);
@@ -3240,20 +3408,20 @@ fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {
 }
 
 #[test]
-fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
+fn body_meta_v17_v1_locktime_zero_is_one_byte() {
     let rec = rec_meta(1, 0, 1, 1);
     let mut buf = Vec::new();
     encode_body_meta_v17(&rec, &mut buf);
     assert_eq!(
         buf,
-        vec![0x89, 0x01],
-        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb input_count 1"
+        vec![0x89 | BODY_META_V17_N_IN_TXSTAT],
+        "LAYOUT17|VER_1|LOCKTIME_ZERO|N_IN_TXSTAT"
     );
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(n, 1);
     assert_eq!(got.version, 1);
     assert_eq!(got.locktime, 0);
-    assert_eq!(got.input_count, 1);
+    assert_eq!(got.input_count, 0);
     assert_eq!(got.output_count, 0);
 }
 
@@ -3262,7 +3430,11 @@ fn body_meta_v17_v2_locktime_zero() {
     let rec = rec_meta(2, 0, 1, 2);
     let mut buf = Vec::new();
     encode_body_meta_v17(&rec, &mut buf);
-    assert_eq!(buf[0], 0x8A, "LAYOUT17|VER_2|LOCKTIME_ZERO");
+    assert_eq!(
+        buf[0],
+        0x8A | BODY_META_V17_N_IN_TXSTAT,
+        "LAYOUT17|VER_2|LOCKTIME_ZERO|N_IN_TXSTAT"
+    );
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
     assert_eq!(n, buf.len());
     assert_eq!(got.version, 2);
@@ -3305,6 +3477,40 @@ fn body_meta_v17_rejects_missing_layout_bit() {
             assert!(m.contains("LAYOUT17") || m.contains("legacy"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_body_meta_v17_omitted_n_in() {
+    let rec = rec_meta(1, 0, 7, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf, vec![0x89 | BODY_META_V17_N_IN_TXSTAT]);
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(got.version, 1);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 0);
+}
+
+#[test]
+fn decode_body_meta_v17_reserved_bits_still_corrupt() {
+    let rec = rec_meta(1, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    buf[0] |= 0x20;
+    match decode_body_meta_v17(&buf) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("reserved"), "{m}");
+        }
+        other => panic!("expected reserved Corrupt, got {other:?}"),
+    }
+    buf[0] = (buf[0] & !0x20) | 0x40;
+    match decode_body_meta_v17(&buf) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("reserved"), "{m}");
+        }
+        other => panic!("expected reserved Corrupt, got {other:?}"),
     }
 }
 

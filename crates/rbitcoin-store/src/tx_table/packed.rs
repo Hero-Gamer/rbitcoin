@@ -684,10 +684,38 @@ pub fn decode_inwit_secret(
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<InputRecord>, StoreError> {
     if in_count == 0 {
-        return Ok(Vec::new());
+        return decode_inwit_secret_to_end(raw, secret);
     }
     let (mut inputs, used) = decode_input_run_prefix(raw, in_count)?;
     check_trailing_zero_pad(raw, used)?;
+    if let Some(sec) = secret {
+        for inp in &mut inputs {
+            if !inp.script_sig.is_empty() {
+                sec.xor_bytes(0, &mut inp.script_sig);
+            }
+            for (wi, item) in inp.witness.iter_mut().enumerate() {
+                sec.xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, item);
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+pub(crate) fn decode_inwit_secret_to_end(
+    raw: &[u8],
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<Vec<InputRecord>, StoreError> {
+    let mut inputs = Vec::new();
+    let mut off = 0usize;
+    loop {
+        if off >= raw.len() || raw[off..].iter().all(|&b| b == 0) {
+            break;
+        }
+        let (rec, used) = InputRecord::decode_at(&raw[off..])?;
+        off += used;
+        inputs.push(rec);
+    }
+    check_trailing_zero_pad(raw, off)?;
     if let Some(sec) = secret {
         for inp in &mut inputs {
             if !inp.script_sig.is_empty() {
@@ -760,6 +788,7 @@ pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, 
         off += used;
         prevouts.push((create_fk, prev_index));
     }
+    check_trailing_zero_pad(raw, off)?;
     Ok(prevouts)
 }
 
@@ -1028,6 +1057,17 @@ mod scan_p2tr_tests {
             format!("{visit}").contains("output value too large"),
             "{visit}"
         );
+    }
+
+    #[test]
+    fn decode_inwit_secret_zero_count_walks_payload() {
+        let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01, 0x02], vec![])];
+        let mut raw = Vec::new();
+        encode_inwit_with_secret(&ins, &mut raw, None);
+        let got = decode_inwit_secret(&raw, 0, None).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].script_sig, vec![0x01, 0x02]);
+        assert!(got[0].is_coinbase());
     }
 
     fn three_out_packed() -> (Vec<u8>, usize) {

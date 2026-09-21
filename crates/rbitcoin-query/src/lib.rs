@@ -27,6 +27,7 @@ mod write_create_loc;
 #[cfg(debug_assertions)]
 pub use combined_stage::{body_ok_reads, reset_body_ok_reads};
 pub use combined_stage::{load_creates_once, CombinedCreate};
+pub use reconstruct::StampedTxstatBlock;
 pub use resolved_wire::{BlockQueueWaveIntake, ResolvedWire};
 pub use soft_densify::{
     bq_assign_stop_bytes, soft_assign_restricted, soft_confirm_window_covered,
@@ -1025,6 +1026,11 @@ impl Query {
         &self.store
     }
 
+    /// Stamped confirm-time econ for one create, or `None` if the row is unstamped.
+    pub fn txstat_row(&self, fk: Fk) -> Result<Option<rbitcoin_store::TxStatRow>, QueryError> {
+        self.store.txstat_row(fk)
+    }
+
     /// Sample-and-reset archived wire-block reconstructs (Esplora `/raw` vs summary).
     pub fn sample_reset_reconstruct_archived(&self) -> u64 {
         self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
@@ -1676,6 +1682,10 @@ impl Query {
     /// Load tx row from Class A store.
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
         self.store.get_tx(fk)
+    }
+
+    pub fn get_txstat(&self, fk: Fk) -> Result<Option<rbitcoin_store::TxStatRow>, QueryError> {
+        self.store.get_txstat(fk)
     }
 
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, QueryError> {

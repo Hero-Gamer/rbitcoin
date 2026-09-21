@@ -3186,3 +3186,34 @@ fn already_at_height_retries_post_commit_spend_annotate() {
     assert_eq!(field2, spend_fk, "post_commit must annotate after Class C");
     let _ = std::fs::remove_dir_all(&path);
 }
+
+#[test]
+fn confirm_write_stamps_txstat_fee_size() {
+    use crate::{
+        accept_and_connect_block, confirm_wire_run, genesis_block, mine_empty_regtest, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let genesis = genesis_block(&params);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let g = q.get_txstat(Fk(1)).unwrap().expect("genesis txstat");
+    let gtx = &genesis.txdata[0];
+    assert_eq!(g.fee_sat, 0);
+    assert_eq!(g.n_in, 1);
+    assert_eq!(g.size() as usize, gtx.total_size());
+    assert_eq!(g.weight(), gtx.weight().to_wu());
+
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
+    let row = q.get_txstat(Fk(2)).unwrap().expect("height-1 txstat");
+    let tx = &b1.txdata[0];
+    assert_eq!(row.fee_sat, 0);
+    assert_eq!(row.n_in, 1);
+    assert_eq!(row.size() as usize, tx.total_size());
+    assert_eq!(row.weight(), tx.weight().to_wu());
+    let _ = std::fs::remove_dir_all(&path);
+}

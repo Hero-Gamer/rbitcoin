@@ -693,6 +693,56 @@ impl Store {
         self.txs.get_meta_and_prevouts(fk)
     }
 
+    /// Consecutive `txstat.body` rows `first..=last` for one header. All-zero → `None`.
+    pub fn txstat_range(
+        &self,
+        header_fk: Fk,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<Option<crate::TxStatRow>>, StoreError> {
+        let blob = self.txs.txstat.header_blob(header_fk)?;
+        self.txs.txstat.get_range(first, last, Some(&blob))
+    }
+
+    /// Overwrite one existing `txstat` row that fits in 8 B (tests / placeholders).
+    pub fn write_txstat_row(&self, fk: Fk, row: &crate::TxStatRow) -> Result<(), StoreError> {
+        self.txs.txstat.write_row(fk, row)
+    }
+
+    /// Stamp a confirmed block's `txstat` cells and that header's overflow blob.
+    pub fn write_txstat_block(
+        &self,
+        header_fk: Fk,
+        first_fk: u64,
+        rows: &[crate::TxStatRow],
+    ) -> Result<(), StoreError> {
+        self.txs.txstat.write_block_rows(header_fk, first_fk, rows)
+    }
+
+    /// One `txstat.body` row, or `None` if unstamped (all-zero). Loads overflow if needed.
+    pub fn txstat_row(&self, fk: Fk) -> Result<Option<crate::TxStatRow>, StoreError> {
+        let cell = self.txs.txstat.get_cell(fk)?;
+        match crate::txstat::parse_cell(cell)? {
+            crate::txstat::CellParse::Unstamped => Ok(None),
+            crate::txstat::CellParse::Complete(row) => Ok(Some(row)),
+            crate::txstat::CellParse::NeedTail => {
+                let h = self
+                    .tx_height_get(fk)?
+                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
+                let hfk = self
+                    .confirmed
+                    .get(Height(h))?
+                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
+                let (first, _) = self
+                    .header_txs
+                    .get_range(hfk)?
+                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
+                let blob = self.txs.txstat.header_blob(hfk)?;
+                self.txs.txstat.get_row_merged(fk, first.0, &blob)
+            }
+        }
+    }
+
     /// Absolute body `(offset, len)` for `fk` (for cache idx cache).
     pub fn tx_body_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.txs.body_range(fk)
@@ -743,8 +793,29 @@ impl Store {
             .put_full_batch_from_pins(items, index, spent_overlay)
     }
 
+    pub fn put_tx_full_batch_from_pins_with_txstat<P: crate::tx_table::PackedCreate>(
+        &self,
+        items: &[(P, Vec<crate::InputRecord>)],
+        index: bool,
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        txstat: &[crate::txstat::TxStatRow],
+        header_ranges: &[(Fk, Fk, u32)],
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
+        self.txs.put_full_batch_from_pins_with_txstat(
+            items,
+            index,
+            spent_overlay,
+            txstat,
+            header_ranges,
+        )
+    }
+
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
         self.txs.get_by_txid(txid)
+    }
+
+    pub fn get_txstat(&self, fk: Fk) -> Result<Option<crate::TxStatRow>, StoreError> {
+        self.txstat_row(fk)
     }
 
     /// Annotate create outpoint as spent by `spending_tx_fk` at `spending_vin`.
@@ -2303,6 +2374,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    #[test]
+    fn open_schema24_occupied_creates_zero_txstat() {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            let item = coinbase_item([0x25u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
+            s.put_tx_full_batch_indexed(&[item], true).unwrap();
+            s.flush().unwrap();
+        }
+        std::fs::remove_file(dir.join("txstat.body")).unwrap();
+        write_store_meta_ver(&dir, 24);
+        let s = Store::open_tiny(&dir).unwrap();
+        assert_eq!(s.txs.txstat.count(), 1);
+        assert_eq!(s.txs.txstat.get_cell(Fk(1)).unwrap(), [0u8; 8]);
+        drop(s);
+        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
+        assert!(dir.join("txstat.body").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_meta_refuses_schema_past_this_binary() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = STORE_MAGIC.to_vec();
+        bytes.extend_from_slice(&(SCHEMA_VERSION + 1).to_le_bytes());
+        std::fs::write(dir.join("meta"), bytes).unwrap();
+        assert!(matches!(
+            check_meta(&dir),
+            Err(StoreError::BadSchema(v)) if v == SCHEMA_VERSION + 1
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn write_store_meta_ver(dir: &Path, ver: u16) {
         let mut bytes = STORE_MAGIC.to_vec();
         bytes.extend_from_slice(&ver.to_le_bytes());
@@ -2332,7 +2437,7 @@ mod tests {
             "schema 22 open must keep create.loc"
         );
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 24);
+        assert_eq!(SCHEMA_VERSION, 25);
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
@@ -2477,7 +2582,7 @@ mod tests {
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 24);
+        assert_eq!(SCHEMA_VERSION, 25);
         assert!(
             !dir.join("spent.off").exists(),
             "empty 21 open must unlink leftover spent.off"

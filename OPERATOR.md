@@ -698,7 +698,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](./SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 24`). This section is
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 25`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -708,23 +708,24 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **24** | Open. |
-| **23** | Rewrite `meta` to 24 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. |
-| **22**, occupied Class A | Rewrite `meta` to 24 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 24 `meta` + old ovf/header; this binary retries those file rewrites. |
-| **22**, empty Class A | Rewrite `meta` to 24, then open. |
-| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 24, then open. |
+| **25** | Open. |
+| **24** | Rewrite `meta` to 25, then create/extend zeroed `txstat.body` to `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. |
+| **23** | Rewrite `meta` to 25 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. Zero-extend `txstat.body`. |
+| **22**, occupied Class A | Rewrite `meta` to 25 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 25 `meta` + old ovf/header; this binary retries those file rewrites. Zero-extend `txstat.body`. |
+| **22**, empty Class A | Rewrite `meta` to 25, then open. |
+| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 25, then open. |
 | **21**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 24, then open. |
+| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 25, then open. |
 | **20**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 24, then open. |
+| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 25, then open. |
 | **19** or **18**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
 | **19** or **18**, empty Class A, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
-| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 24, then open. |
+| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 25, then open. |
 | **17**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
 | **17**, empty Class A, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
-A **23 binary** refuses 24 `meta` (do not downgrade in place). A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
+A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
 When the schema-22 Class A refuse fires, the log line is:
 

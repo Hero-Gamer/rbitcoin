@@ -173,7 +173,7 @@ fn apply_plan_pins(
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
                 let tx = pin.tx();
-                let cb = if tx.input_count != 1 {
+                let cb = if tx.input_count > 1 {
                     Some(false)
                 } else {
                     None
@@ -191,7 +191,7 @@ fn apply_plan_pins(
                 still_need.insert(*id, need.clone());
                 continue;
             }
-            let cb = if pin.tx().input_count != 1 {
+            let cb = if pin.tx().input_count > 1 {
                 Some(false)
             } else {
                 None
@@ -288,7 +288,7 @@ fn denserels_by_stamped_range(
                         "invariant: lookup stage miss (load parent create identity not stamped)",
                     )))?;
         }
-        let cb = if tx.input_count != 1 {
+        let cb = if tx.input_count > 1 {
             Some(false)
         } else {
             None

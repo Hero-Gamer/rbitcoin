@@ -654,7 +654,7 @@ const NAMED_HELP: &[(&str, &str)] = &[
     (
         "getblockstats",
         "getblockstats hash_or_height ( stats )\n\
-         Reconstruct the block and return fee / UTXO / weight statistics.",
+         Fee / UTXO / weight statistics from stamped txstat rows (reconstruct fallback).",
     ),
     (
         "generatetoaddress",

@@ -1,17 +1,15 @@
-//! Core `getblockstats` — reconstruct a block and sum fees / UTXO / weight.
+//! Core `getblockstats` — stamped `txstat` rows, reconstruct fallback.
 
 use crate::methods::{
     map_query, parse_hash32_display, rpc_error, RpcContext, RpcParams, ERR_INVALID_ADDRESS_OR_KEY,
     ERR_INVALID_PARAMETER, ERR_MISC,
 };
-use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, Block, OutPoint, ScriptBuf, TxOut};
+use bitcoin::{Amount, Block, BlockHash, OutPoint, ScriptBuf, TxOut};
 use rbitcoin_primitives::Height;
+use rbitcoin_query::StampedTxstatBlock;
+use rbitcoin_store::{HeaderRecord, TxStatRow};
 use serde_json::{json, Map, Value};
-
-/// Core `PER_UTXO_OVERHEAD` = `sizeof(COutPoint)+sizeof(uint32_t)+sizeof(bool)`.
-pub const PER_UTXO_OVERHEAD: i64 = 41;
 
 /// Weight percentiles reported by `getblockstats` (10 / 25 / 50 / 75 / 90).
 const PERCENTILES: [i64; 5] = [10, 25, 50, 75, 90];
@@ -21,14 +19,6 @@ const HELP: &str = "getblockstats hash_or_height ( stats )";
 /// Core `CScript::IsUnspendable`: leading `OP_RETURN`, or over `MAX_SCRIPT_SIZE`.
 pub fn is_unspendable(script: &[u8]) -> bool {
     rbitcoin_consensus::policy::is_unspendable(script)
-}
-
-/// Consensus-serialized `CTxOut` size (value + compact script).
-pub fn txout_serialized_size(out: &TxOut) -> i64 {
-    let mut buf = Vec::new();
-    out.consensus_encode(&mut buf)
-        .expect("TxOut consensus encode is infallible");
-    buf.len() as i64
 }
 
 /// Core `CalculateTruncatedMedian`: even length is the integer mean of the two middles.
@@ -95,9 +85,6 @@ pub struct BlockStats {
     pub totalfee: i64,
     pub txs: i64,
     pub utxo_increase: i64,
-    pub utxo_size_inc: i64,
-    pub utxo_increase_actual: i64,
-    pub utxo_size_inc_actual: i64,
 }
 
 impl BlockStats {
@@ -138,15 +125,6 @@ impl BlockStats {
         m.insert("totalfee".into(), json!(self.totalfee));
         m.insert("txs".into(), json!(self.txs));
         m.insert("utxo_increase".into(), json!(self.utxo_increase));
-        m.insert("utxo_size_inc".into(), json!(self.utxo_size_inc));
-        m.insert(
-            "utxo_increase_actual".into(),
-            json!(self.utxo_increase_actual),
-        );
-        m.insert(
-            "utxo_size_inc_actual".into(),
-            json!(self.utxo_size_inc_actual),
-        );
         m
     }
 
@@ -183,9 +161,6 @@ pub fn compute_block_stats(
 ) -> Result<BlockStats, String> {
     let mut ins = 0i64;
     let mut outs = 0i64;
-    let mut utxo_size_inc = 0i64;
-    let mut utxo_size_inc_actual = 0i64;
-    let mut utxo_increase_actual = 0i64;
     let mut total_out = 0i64;
     let mut total_size = 0i64;
     let mut total_weight = 0i64;
@@ -202,7 +177,6 @@ pub fn compute_block_stats(
     let mut maxfeerate = 0i64;
     let mut mintxsize = i64::MAX;
     let mut maxtxsize = 0i64;
-    let skip_actual = height == 0;
 
     for tx in &block.txdata {
         let is_cb = tx.is_coinbase();
@@ -224,12 +198,6 @@ pub fn compute_block_stats(
                 let po = prevout(&inp.previous_output)
                     .ok_or_else(|| format!("missing prevout {}", inp.previous_output))?;
                 input_value += po.value.to_sat() as i64;
-                let ser = txout_serialized_size(&po) + PER_UTXO_OVERHEAD;
-                utxo_size_inc -= ser;
-                if !is_unspendable(po.script_pubkey.as_bytes()) {
-                    utxo_size_inc_actual -= ser;
-                    utxo_increase_actual -= 1;
-                }
             }
             let mut output_value = 0i64;
             for o in &tx.output {
@@ -254,15 +222,7 @@ pub fn compute_block_stats(
             maxtxsize = maxtxsize.max(tx_size);
         }
 
-        for o in &tx.output {
-            outs += 1;
-            let ser = txout_serialized_size(o) + PER_UTXO_OVERHEAD;
-            utxo_size_inc += ser;
-            if !skip_actual && !is_unspendable(o.script_pubkey.as_bytes()) {
-                utxo_size_inc_actual += ser;
-                utxo_increase_actual += 1;
-            }
-        }
+        outs += tx.output.len() as i64;
     }
 
     let n_non_cb = fees.len() as i64;
@@ -312,10 +272,119 @@ pub fn compute_block_stats(
         totalfee,
         txs: block.txdata.len() as i64,
         utxo_increase: outs - ins,
-        utxo_size_inc,
-        utxo_increase_actual,
-        utxo_size_inc_actual,
     })
+}
+
+fn stats_from_txstat(
+    height: u32,
+    rec: &HeaderRecord,
+    mediantime: u32,
+    subsidy: i64,
+    rows: &[TxStatRow],
+    n_outs: &[u32],
+    total_out: i64,
+) -> BlockStats {
+    let mut ins = 0i64;
+    let mut outs = 0i64;
+    let mut total_size = 0i64;
+    let mut total_weight = 0i64;
+    let mut totalfee = 0i64;
+    let mut swtotal_size = 0i64;
+    let mut swtotal_weight = 0i64;
+    let mut swtxs = 0i64;
+    let mut fees = Vec::new();
+    let mut sizes = Vec::new();
+    let mut feerate_weights: Vec<(i64, i64)> = Vec::new();
+    let mut minfee = i64::MAX;
+    let mut maxfee = 0i64;
+    let mut minfeerate = i64::MAX;
+    let mut maxfeerate = 0i64;
+    let mut mintxsize = i64::MAX;
+    let mut maxtxsize = 0i64;
+
+    for (i, (row, n_out)) in rows.iter().zip(n_outs.iter()).enumerate() {
+        outs += i64::from(*n_out);
+        let is_cb = i == 0;
+        if is_cb {
+            continue;
+        }
+        ins += i64::from(row.n_in);
+        let tx_size = i64::try_from(row.size()).unwrap_or(i64::MAX);
+        let tx_weight = i64::try_from(row.weight()).unwrap_or(i64::MAX);
+        let fee = i64::try_from(row.fee_sat).unwrap_or(i64::MAX);
+        total_size += tx_size;
+        total_weight += tx_weight;
+        totalfee += fee;
+        let has_wit = row.has_witness();
+        if has_wit {
+            swtxs += 1;
+            swtotal_size += tx_size;
+            swtotal_weight += tx_weight;
+        }
+        let feerate = if tx_weight > 0 {
+            fee.saturating_mul(4) / tx_weight
+        } else {
+            0
+        };
+        fees.push(fee);
+        sizes.push(tx_size);
+        feerate_weights.push((feerate, tx_weight));
+        minfee = minfee.min(fee);
+        maxfee = maxfee.max(fee);
+        minfeerate = minfeerate.min(feerate);
+        maxfeerate = maxfeerate.max(feerate);
+        mintxsize = mintxsize.min(tx_size);
+        maxtxsize = maxtxsize.max(tx_size);
+    }
+
+    let n_non_cb = fees.len() as i64;
+    if n_non_cb == 0 {
+        minfee = 0;
+        minfeerate = 0;
+        mintxsize = 0;
+    }
+    let avgfee = if n_non_cb > 0 { totalfee / n_non_cb } else { 0 };
+    let avgfeerate = if total_weight > 0 {
+        totalfee.saturating_mul(4) / total_weight
+    } else {
+        0
+    };
+    let avgtxsize = if n_non_cb > 0 {
+        total_size / n_non_cb
+    } else {
+        0
+    };
+
+    BlockStats {
+        avgfee,
+        avgfeerate,
+        avgtxsize,
+        blockhash: BlockHash::from_byte_array(rec.hash).to_string(),
+        feerate_percentiles: percentiles_by_weight(feerate_weights, total_weight),
+        height,
+        ins,
+        maxfee,
+        maxfeerate,
+        maxtxsize,
+        medianfee: truncated_median(fees),
+        mediantime,
+        mediantxsize: truncated_median(sizes),
+        minfee,
+        minfeerate,
+        mintxsize,
+        outs,
+        subsidy,
+        swtotal_size,
+        swtotal_weight,
+        swtxs,
+        time: rec.timestamp,
+        total_out,
+        total_size,
+        total_weight,
+        totalfee,
+        txs: rows.len() as i64,
+        utxo_increase: outs - ins,
+    }
 }
 
 fn help_err() -> Value {
@@ -433,6 +502,33 @@ fn prevout_map_for_block(
     map
 }
 
+fn stats_for_stamped(
+    ctx: &RpcContext,
+    height: Height,
+    stamped: &StampedTxstatBlock,
+) -> Result<BlockStats, Value> {
+    let mediantime = rbitcoin_consensus::median_time_past(ctx.query.as_ref(), height)
+        .unwrap_or(stamped.rec.timestamp);
+    let params = match ctx.chain.as_ref() {
+        Some(c) => c.params.clone(),
+        None => rbitcoin_consensus::ChainParams::for_network(ctx.network),
+    };
+    let subsidy = rbitcoin_consensus::block_subsidy(height.0, &params);
+    let total_out = ctx
+        .query
+        .non_coinbase_total_out(&stamped.fks)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    Ok(stats_from_txstat(
+        height.0,
+        &stamped.rec,
+        mediantime,
+        subsidy,
+        &stamped.rows,
+        &stamped.n_outs,
+        total_out,
+    ))
+}
+
 fn stats_for_connected(
     ctx: &RpcContext,
     height: Height,
@@ -467,7 +563,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     let want = parse_stats(params)?;
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
 
-    let (height, block) = match parse_hash_or_height(raw)? {
+    let height = match parse_hash_or_height(raw)? {
         HashOrHeight::Height(h) => {
             if h < 0 {
                 return Err(rpc_error(
@@ -481,12 +577,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
                     format!("Target block height {h} after current tip {tip}"),
                 ));
             }
-            let height = Height(h as u32);
-            let block = ctx
-                .query
-                .reconstruct_block_at_height(height)
-                .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
-            (height, block)
+            Height(h as u32)
         }
         HashOrHeight::Hash(hash) => {
             match ctx
@@ -494,13 +585,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
                 .height_of_hash(&hash)
                 .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
             {
-                Some(height) => {
-                    let block = ctx
-                        .query
-                        .reconstruct_block_at_height(height)
-                        .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
-                    (height, block)
-                }
+                Some(height) => height,
                 None => {
                     if ctx
                         .query
@@ -519,6 +604,20 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         }
     };
 
+    if let Some(stamped) = ctx
+        .query
+        .stamped_txstat_block(height)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    {
+        let stats = stats_for_stamped(ctx, height, &stamped)?;
+        return stats.select(&want);
+    }
+
+    let block = ctx
+        .query
+        .reconstruct_block_at_height(height)
+        .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
+    let _ = ctx.query.stamp_txstat_from_block(height, &block);
     let stats = stats_for_connected(ctx, height, &block)?;
     stats.select(&want)
 }
@@ -559,19 +658,14 @@ mod unit_tests {
     }
 
     #[test]
-    fn genesis_utxo_size_is_117() {
+    fn op_return_is_unspendable() {
         let script = ScriptBuf::from_bytes({
             let mut s = vec![0x41];
             s.extend_from_slice(&[0u8; 65]);
             s.push(0xac);
             s
         });
-        let out = TxOut {
-            value: Amount::from_sat(50_0000_0000),
-            script_pubkey: script,
-        };
-        assert_eq!(txout_serialized_size(&out) + PER_UTXO_OVERHEAD, 117);
-        assert!(!is_unspendable(out.script_pubkey.as_bytes()));
+        assert!(!is_unspendable(script.as_bytes()));
         assert!(is_unspendable(&[0x6a, 0x01, 0x21]));
     }
 }

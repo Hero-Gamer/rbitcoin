@@ -115,12 +115,15 @@ const BODY_META_V17_VER_1: u8 = 1 << 0;
 const BODY_META_V17_VER_2: u8 = 1 << 1;
 const BODY_META_V17_VER_3: u8 = 1 << 2;
 const BODY_META_V17_LOCKTIME_ZERO: u8 = 1 << 3;
-const BODY_META_V17_RESERVED: u8 = 0x70;
+/// `n_in` lives on `txstat.body`; no uleb `input_count` follows locktime.
+pub(crate) const BODY_META_V17_N_IN_TXSTAT: u8 = 1 << 4;
+const BODY_META_V17_RESERVED: u8 = 0x60;
 const BODY_META_V17_VER_MASK: u8 = BODY_META_V17_VER_1 | BODY_META_V17_VER_2 | BODY_META_V17_VER_3;
 
-/// Encode schema-17 thin meta. Production still writes [`TxRecord::encode_body_meta_into`].
+/// Encode schema-17 thin meta. New writes set [`BODY_META_V17_N_IN_TXSTAT`]
+/// and omit the `input_count` uleb (`n_in` is on `txstat.body`).
 pub(crate) fn encode_body_meta_v17(rec: &TxRecord, out: &mut Vec<u8>) {
-    let mut flags = BODY_META_V17_LAYOUT17;
+    let mut flags = BODY_META_V17_LAYOUT17 | BODY_META_V17_N_IN_TXSTAT;
     match rec.version {
         1 => flags |= BODY_META_V17_VER_1,
         2 => flags |= BODY_META_V17_VER_2,
@@ -137,7 +140,6 @@ pub(crate) fn encode_body_meta_v17(rec: &TxRecord, out: &mut Vec<u8>) {
     if rec.locktime != 0 {
         write_uleb128(out, u64::from(rec.locktime));
     }
-    write_uleb128(out, u64::from(rec.input_count));
 }
 
 /// Decode schema-17 thin meta. Rejects schema-15 16-byte prefixes (no LAYOUT17 bit).
@@ -183,23 +185,46 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
         off += n;
         v as u32
     };
-    let (nin, n1) = read_uleb128(&buf[off..])?;
-    if nin > u64::from(u32::MAX) {
-        return Err(StoreError::Corrupt("v17 input_count overflow"));
-    }
-    off += n1;
+    let input_count = if flags & BODY_META_V17_N_IN_TXSTAT != 0 {
+        0
+    } else {
+        let (nin, n1) = read_uleb128(&buf[off..])?;
+        if nin > u64::from(u32::MAX) {
+            return Err(StoreError::Corrupt("v17 input_count overflow"));
+        }
+        off += n1;
+        nin as u32
+    };
     Ok((
         TxRecord {
             txid: [0u8; 32],
             version,
             locktime,
             input_start_fk: Fk::NULL,
-            input_count: nin as u32,
+            input_count,
             output_start_fk: Fk::NULL,
             output_count: 0,
         },
         off,
     ))
+}
+
+fn txstat_placeholder(n_in: u32) -> crate::txstat::TxStatRow {
+    crate::txstat::TxStatRow {
+        n_in,
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    }
+}
+
+fn txstat_placeholders(
+    items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
+) -> Vec<crate::txstat::TxStatRow> {
+    items
+        .iter()
+        .map(|(tx, _, _)| txstat_placeholder(tx.input_count))
+        .collect()
 }
 
 /// Class A output (addressed via `tx.output_start_fk` run + local vout).
@@ -407,6 +432,8 @@ pub struct TxTable {
     pub(crate) head: SegmentedTxHead,
     /// Dense create_fk-ordered txids (schema 13+).
     pub(crate) txids: crate::txid_body::TxidBody,
+    /// Dense create_fk-ordered confirm-time econ (schema 25).
+    pub(crate) txstat: crate::txstat::TxStat,
     /// Datadir secret: keyed head probes + script XOR (schema 12+).
     pub(crate) secret: crate::store_secret::StoreSecret,
     /// Unflushed head inserts (write-behind). Readers see published snapshot.
@@ -478,18 +505,23 @@ fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+struct ClassASkewStems<'a> {
+    create_loc: &'a crate::create_loc::CreateLoc,
+    inwit_loc: &'a crate::delta_loc::DeltaLoc,
+    body: &'a VarTable,
+    spent: &'a VarTable,
+    inwit: &'a VarTable,
+    txids: &'a crate::txid_body::TxidBody,
+    txstat: &'a crate::txstat::TxStat,
+}
+
 fn repair_class_a_count_skew(
-    create_loc: &crate::create_loc::CreateLoc,
-    inwit_loc: &crate::delta_loc::DeltaLoc,
-    body: &VarTable,
-    spent: &VarTable,
-    inwit: &VarTable,
-    txids: &crate::txid_body::TxidBody,
+    stems: ClassASkewStems<'_>,
     prune_inwit_mode: bool,
 ) -> Result<(), StoreError> {
-    let n_loc = create_loc.count();
-    let n_txids = txids.count();
-    let n_inwit_loc = inwit_loc.count();
+    let n_loc = stems.create_loc.count();
+    let n_txids = stems.txids.count();
+    let n_inwit_loc = stems.inwit_loc.count();
     if n_txids == n_loc && (prune_inwit_mode || n_inwit_loc == n_loc) {
         return Ok(());
     }
@@ -506,7 +538,8 @@ fn repair_class_a_count_skew(
         let h = crate::file::FILE_HEADER_LEN as u64;
         (h, h, h)
     } else {
-        let p = create_loc
+        let p = stems
+            .create_loc
             .range_batch(&[Fk(n)])?
             .into_iter()
             .next()
@@ -515,7 +548,8 @@ fn repair_class_a_count_skew(
         let in_end = if prune_inwit_mode {
             crate::file::FILE_HEADER_LEN as u64
         } else {
-            let ir = inwit_loc
+            let ir = stems
+                .inwit_loc
                 .range_batch(&[Fk(n)])?
                 .into_iter()
                 .next()
@@ -531,24 +565,28 @@ fn repair_class_a_count_skew(
             in_end,
         )
     };
-    create_loc.truncate_to_count(n)?;
+    stems.create_loc.truncate_to_count(n)?;
     if !prune_inwit_mode {
-        inwit_loc.truncate_to_count(n)?;
+        stems.inwit_loc.truncate_to_count(n)?;
     }
-    body.truncate_body_to(n, tx_end)?;
-    spent.truncate_body_to(n, sp_end)?;
+    stems.body.truncate_body_to(n, tx_end)?;
+    stems.spent.truncate_body_to(n, sp_end)?;
     if !prune_inwit_mode {
-        inwit.truncate_body_to(n, in_end)?;
+        stems.inwit.truncate_body_to(n, in_end)?;
     }
     if n_txids > n {
-        txids.truncate_to_count(n)?;
+        stems.txids.truncate_to_count(n)?;
     }
-    if body.count() != txids.count() || create_loc.count() != txids.count() {
+    if stems.txstat.count() > n {
+        stems.txstat.truncate_to_count(n)?;
+    }
+    if stems.body.count() != stems.txids.count() || stems.create_loc.count() != stems.txids.count()
+    {
         return Err(StoreError::Corrupt(
             "Class A stem counts still mismatch after repair (reindex required)",
         ));
     }
-    if !prune_inwit_mode && inwit_loc.count() != txids.count() {
+    if !prune_inwit_mode && stems.inwit_loc.count() != stems.txids.count() {
         return Err(StoreError::Corrupt(
             "Class A stem counts still mismatch after repair (reindex required)",
         ));
@@ -607,6 +645,7 @@ impl TxTable {
             inwit_loc: crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")?,
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
+            txstat: crate::txstat::TxStat::create(dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
@@ -712,16 +751,28 @@ impl TxTable {
         } else {
             crate::txid_body::TxidBody::create(dir)?
         };
+        let txstat = crate::txstat::TxStat::open(dir)?;
         repair_class_a_count_skew(
-            &create_loc,
-            &inwit_loc,
-            &body,
-            &spent,
-            &inwit,
-            &txids,
+            ClassASkewStems {
+                create_loc: &create_loc,
+                inwit_loc: &inwit_loc,
+                body: &body,
+                spent: &spent,
+                inwit: &inwit,
+                txids: &txids,
+                txstat: &txstat,
+            },
             prune_inwit_mode,
         )?;
         let n_bodies = create_loc.count();
+        if txstat.count() != n_bodies {
+            rbitcoin_log::warn!(
+                "store: txstat.body count={} loc={} — aligning to loc",
+                txstat.count(),
+                n_bodies
+            );
+            txstat.extend_or_truncate_to(n_bodies)?;
+        }
         let mut need_rebuild = false;
         let head = if !crate::segmented_head::head_meta_exists(dir) {
             need_rebuild = n_bodies > 0;
@@ -791,12 +842,16 @@ impl TxTable {
             inwit_loc,
             head,
             txids,
+            txstat,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_inwit_mode: std::sync::atomic::AtomicBool::new(prune_inwit_mode),
         };
+        if n_bodies > 0 {
+            let _ = t.txstat.n_in_at(Fk(1))?;
+        }
         if need_rebuild {
             let bits = t.head_bits();
             let slots = t.head_slots();
@@ -1101,25 +1156,47 @@ impl TxTable {
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
-    /// Used by load: discover parents without full parse into RAM.
+    /// Stamped `txstat` supplies `n_in` so this path is 8 B + inwit (no txout).
+    /// Leftover unstamped rows still decode LAYOUT17 uleb from `txout`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         if self.prune_inwit_mode() {
             return Err(StoreError::NotFound);
         }
-        let mut tx = self.get(fk)?;
-        let inwit = {
-            let ir = self
-                .inwit_loc
-                .range_batch(&[fk])?
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or(StoreError::NotFound)?;
-            self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?
+        let ir = self
+            .inwit_loc
+            .range_batch(&[fk])?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or(StoreError::NotFound)?;
+        let inwit = self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
+        let mut tx = if let Some(n_in) = self.txstat.n_in_at(fk)? {
+            TxRecord {
+                txid: [0u8; 32],
+                version: 0,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: n_in,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }
+        } else {
+            self.get(fk)?
         };
         let prevs = scan_inwit_prevouts(&inwit, tx.input_count)?;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, prevs))
+    }
+
+    pub(crate) fn overlay_stamped_n_in(&self, fk: Fk, tx: &mut TxRecord) -> Result<(), StoreError> {
+        let Some(n_in) = self.txstat.n_in_at(fk)? else {
+            return Ok(());
+        };
+        if tx.input_count != 0 && tx.input_count != n_in {
+            return Err(StoreError::Corrupt("txstat n_in mismatch txout"));
+        }
+        tx.input_count = n_in;
+        Ok(())
     }
 
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
@@ -1139,6 +1216,7 @@ impl TxTable {
         let (mut tx, _, _, _) =
             decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
+        self.overlay_stamped_n_in(fk, &mut tx)?;
         Ok(tx)
     }
 
@@ -1277,6 +1355,7 @@ impl TxTable {
             ) {
                 Ok((mut tx, live, sparse)) => {
                     tx.txid = *known_txid;
+                    self.overlay_stamped_n_in(*fk, &mut tx)?;
                     out.push(Some((tx, live, sparse)));
                 }
                 Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => out.push(None),
@@ -1669,7 +1748,12 @@ impl TxTable {
             .flatten()
             .ok_or(StoreError::NotFound)?;
         let inwit = self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
-        let ins = decode_inwit_secret(&inwit, tx.input_count, Some(&self.secret))?;
+        let ins = if tx.input_count == 0 {
+            decode_inwit_secret_to_end(&inwit, Some(&self.secret))?
+        } else {
+            decode_inwit_secret(&inwit, tx.input_count, Some(&self.secret))?
+        };
+        tx.input_count = ins.len() as u32;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, ins, outs))
     }
@@ -1730,7 +1814,12 @@ impl TxTable {
             let iraw = span_rec(&inwit_span, i0, ioff, ilen)?;
             let (mut tx, _ins, outs, _) =
                 decode_packed_tx_with_spender_rels_secret(traw, n_outs[i], Some(&self.secret))?;
-            let ins = decode_inwit_secret(iraw, tx.input_count, Some(&self.secret))?;
+            let ins = if tx.input_count == 0 {
+                decode_inwit_secret_to_end(iraw, Some(&self.secret))?
+            } else {
+                decode_inwit_secret(iraw, tx.input_count, Some(&self.secret))?
+            };
+            tx.input_count = ins.len() as u32;
             tx.txid = ids[i];
             out.push((tx, ins, outs));
         }
@@ -1754,6 +1843,7 @@ impl TxTable {
         let (mut tx, outs, _) =
             decode_packed_tx_outs_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
+        self.overlay_stamped_n_in(fk, &mut tx)?;
         Ok((tx, outs))
     }
 
@@ -1825,14 +1915,27 @@ impl TxTable {
         Ok(())
     }
 
-    /// Append Class A rows: `txout` + `inwit` + zero `spent` + `txid.body`.
+    /// Append Class A rows: `txout` + `inwit` + zero `spent` + `txid.body` + `txstat.body`.
     pub fn put_full_batch_indexed(
         &self,
         items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
         index: bool,
     ) -> Result<Vec<Fk>, StoreError> {
+        let rows = txstat_placeholders(items);
+        self.put_full_batch_indexed_with_txstat(items, index, &rows)
+    }
+
+    pub fn put_full_batch_indexed_with_txstat(
+        &self,
+        items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
+        index: bool,
+        txstat: &[crate::txstat::TxStatRow],
+    ) -> Result<Vec<Fk>, StoreError> {
         if items.is_empty() {
             return Ok(Vec::new());
+        }
+        if txstat.len() != items.len() {
+            return Err(StoreError::Corrupt("txstat batch length"));
         }
         let est_out: usize = items
             .iter()
@@ -1849,7 +1952,10 @@ impl TxTable {
             .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
             .sum();
         let base = self.body.count();
-        if (!self.prune_inwit_mode() && self.inwit.count() != base) || self.spent.count() != base {
+        if (!self.prune_inwit_mode() && self.inwit.count() != base)
+            || self.spent.count() != base
+            || self.txstat.count() != base
+        {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         if items.iter().any(|(_, _, outs)| outs.is_empty()) {
@@ -1877,6 +1983,10 @@ impl TxTable {
         )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
+        let tails = self.txstat.append_batch(base, txstat)?;
+        if !tails.is_empty() {
+            return Err(StoreError::Corrupt("txstat overflow needs header blob"));
+        }
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()
@@ -1900,8 +2010,26 @@ impl TxTable {
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
+        let rows: Vec<crate::txstat::TxStatRow> = items
+            .iter()
+            .map(|(pin, _)| txstat_placeholder(pin.packed_tx().input_count))
+            .collect();
+        self.put_full_batch_from_pins_with_txstat(items, index, spent_overlay, &rows, &[])
+    }
+
+    pub fn put_full_batch_from_pins_with_txstat<P: PackedCreate>(
+        &self,
+        items: &[(P, Vec<InputRecord>)],
+        index: bool,
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        txstat: &[crate::txstat::TxStatRow],
+        header_ranges: &[(Fk, Fk, u32)],
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         if items.is_empty() {
             return Ok((Vec::new(), Vec::new()));
+        }
+        if txstat.len() != items.len() {
+            return Err(StoreError::Corrupt("txstat batch length"));
         }
         if !spent_overlay.is_empty() && spent_overlay.len() != items.len() {
             return Err(StoreError::Corrupt("spent overlay length"));
@@ -1916,7 +2044,10 @@ impl TxTable {
             .map(|(pin, _ins)| 16 + spent_record_len(pin.packed_n_out()) as usize)
             .sum();
         let base = self.body.count();
-        if (!self.prune_inwit_mode() && self.inwit.count() != base) || self.spent.count() != base {
+        if (!self.prune_inwit_mode() && self.inwit.count() != base)
+            || self.spent.count() != base
+            || self.txstat.count() != base
+        {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         for (i, (pin, _)) in items.iter().enumerate() {
@@ -1954,6 +2085,9 @@ impl TxTable {
         )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.packed_txid()).collect();
         self.txids.append_batch(base, &ids)?;
+        let tails = self.txstat.append_batch(base, txstat)?;
+        self.txstat
+            .put_overflows_for_headers(header_ranges, &tails)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()

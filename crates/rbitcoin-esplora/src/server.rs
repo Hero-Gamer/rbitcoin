@@ -3843,7 +3843,7 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(row["txid"], tx0);
         assert_eq!(row["pruned"], true);
-        assert!(row.get("vin").is_none());
+        assert_eq!(row["vin"], serde_json::json!([]));
         assert!(row.get("vout").is_some());
 
         let (st, body) = http_get(addr, &format!("/tx/{tx0}/raw")).await;

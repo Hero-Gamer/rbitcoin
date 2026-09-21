@@ -147,7 +147,7 @@ Heights **above** the watermark behave as today. Below: table.
 | `getblock` verbosity **1** | **Keep** (`block_txids` / `txid.body`) | txid list, no vin |
 | `getblock` verbosity **2** | `-8` pruned | Full txs need inwit |
 | `getblockheader` / `getblockhash` / `getblockcount` | Keep | Headers only |
-| `getblockstats` | `-8` / existing `block body not in store` | Reconstruct |
+| `getblockstats` | serve from `txstat` when stamped, else `-8` | Reconstruct + lazy-stamp if unstamped and inwit remains |
 | `getrawtransaction` | **`-8` `Transaction not available (pruned data)`** | Not `-5` unknown txid |
 | `decoderawtransaction` | n/a (client hex) | |
 | `gettxout` | **Keep** | Class A outs + spent |
@@ -174,13 +174,14 @@ Heights **above** the watermark behave as today. Below: table.
 `GET /broadcast`, `POST /txs/test`, tx JSON `sigops`, unix listen).
 
 **Partial tx object** (when inwit is gone): `txid`, `version`, `locktime`,
-`vout[]` from txout, `status`, `"pruned": true`. **Omit** `vin`, `fee`,
-`size`, `weight`, `sigops`. Same shape on list rows so `/txs` paging matches
-`/txs/summary` (do not drop the txid from the page).
+`vout[]` from txout, `status`, `"pruned": true`. **Omit** `vin`. Fill `fee` /
+`size` / `weight` from stamped `txstat` when those rows exist;
+unstamped pruned omits those keys too. Same shape on list rows so `/txs`
+paging matches `/txs/summary` (do not drop the txid from the page).
 
 | Route | Pruned confirmed tx/block | Why |
 |-------|---------------------------|-----|
-| `GET /tx/:txid` JSON | **200** partial object | vout+status still true; explorer UIs that require `vin` fail closed on missing key (better than a fake coinbase) |
+| `GET /tx/:txid` JSON | **200** partial object; `fee`/`size`/`weight` from `txstat` when stamped | vout+status still true; still omit `vin` |
 | `GET /tx/:txid/hex`, `/raw` | **404** body `pruned` | Wire |
 | `GET /tx/:txid/status` | **Keep** (200) | Header + fk, no inwit |
 | `GET /tx/:txid/merkle-proof` | **Keep** | txids |
@@ -189,7 +190,7 @@ Heights **above** the watermark behave as today. Below: table.
 | `GET /block/:hash` JSON | **200**; omit `size`/`weight` (or only if we cannot compute them); `"pruned": true` | Header + txids; not a witness size |
 | `GET /block/:hash/raw` | **404** | Full witness block |
 | `GET /block/:hash/header` `/status` `/txids` `/txid/:i` | **Keep** | header + `txid.body` |
-| `GET /block/:hash/txs` (public 25/page and **632** `GET /internal/block/:hash/txs`) | **200** pages of **partial** tx objects | Same omit-vin rule; do not 404 the whole block list |
+| `GET /block/:hash/txs` (public 25/page and **632** `GET /internal/block/:hash/txs`) | **200** pages of **partial** tx objects | Same omit-vin rule; stamped `txstat` fills fee/size/weight |
 | Address `/` stats, `/utxo`, `/txs/summary` | **Keep** | SH + values from txout |
 | Address `/txs`, `/txs/chain`, **632** `POST /addresses/txs` | **200** with partial rows for pruned txs | Keep paging aligned with summary |
 | **632** `?after_txid=` | Keep (txid cursor) | |

@@ -4,6 +4,15 @@ use super::*;
 use crate::U64Map;
 use std::time::Instant;
 
+/// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
+#[derive(Debug, Clone)]
+pub struct StampedTxstatBlock {
+    pub rec: HeaderRecord,
+    pub fks: Vec<Fk>,
+    pub rows: Vec<rbitcoin_store::TxStatRow>,
+    pub n_outs: Vec<u32>,
+}
+
 impl Query {
     fn load_body_from_store(
         &self,
@@ -411,6 +420,123 @@ impl Query {
             Some(h) => Ok(Some(self.reconstruct_block_at_height(h)?)),
         }
     }
+
+    /// Dense confirm-time econ for a confirmed height, or `None` if any row is unstamped.
+    ///
+    /// Does not read inwit. Missing `header_txs` is `None` (header-only).
+    pub fn stamped_txstat_block(
+        &self,
+        height: Height,
+    ) -> Result<Option<StampedTxstatBlock>, QueryError> {
+        let Some((header_fk, rec)) = self.header_at_height(height)? else {
+            return Ok(None);
+        };
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let last = first
+            .0
+            .checked_add(u64::from(n.saturating_sub(1)))
+            .ok_or(StoreError::Corrupt("invariant: header_txs last fk"))?;
+        let packed = self.store.txstat_range(header_fk, first.0, last)?;
+        if packed.len() != n as usize || packed.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+        let fks: Vec<Fk> = (first.0..=last).map(Fk).collect();
+        let loc = self.store.tx_create_loc_range_batch(&fks)?;
+        if loc.len() != fks.len() {
+            return Err(StoreError::Corrupt("invariant: loc batch length"));
+        }
+        let mut n_outs = Vec::with_capacity(fks.len());
+        for p in loc {
+            let p = p.ok_or(StoreError::NotFound)?;
+            n_outs.push(p.n_out);
+        }
+        Ok(Some(StampedTxstatBlock {
+            rec,
+            fks,
+            rows: packed.into_iter().map(|r| r.unwrap()).collect(),
+            n_outs,
+        }))
+    }
+
+    /// Sum of non-coinbase output values (first fk is coinbase). Reads `txout` only.
+    pub fn non_coinbase_total_out(&self, fks: &[Fk]) -> Result<i64, QueryError> {
+        let mut sum = 0i64;
+        for &fk in fks.iter().skip(1) {
+            let (_, outs) = self.store.get_tx_meta_and_outputs(fk)?;
+            for o in outs {
+                sum = sum.saturating_add(o.value);
+            }
+        }
+        Ok(sum)
+    }
+
+    /// Fill unstamped `txstat` rows from a reconstructed wire block.
+    pub fn stamp_txstat_from_block(&self, height: Height, block: &Block) -> Result<(), QueryError> {
+        let Some((header_fk, _)) = self.header_at_height(height)? else {
+            return Err(StoreError::Corrupt(
+                "invariant: stamp txstat missing header",
+            ));
+        };
+        let fks = self.block_tx_fks(height)?;
+        if fks.len() != block.txdata.len() {
+            return Err(StoreError::Corrupt("invariant: stamp txstat fk count"));
+        }
+        let mut same_block = std::collections::HashMap::new();
+        for tx in &block.txdata {
+            same_block.insert(tx.compute_txid().to_byte_array(), tx);
+        }
+        let mut rows = Vec::with_capacity(fks.len());
+        for tx in &block.txdata {
+            let in_sum = txstat_in_sum_from_block(self, &same_block, tx)?;
+            rows.push(crate::archive::txstat_row_from_tx(tx, in_sum)?);
+        }
+        let first = fks
+            .first()
+            .and_then(|fk| fk.get())
+            .ok_or(StoreError::Corrupt("invariant: stamp txstat first fk"))?;
+        self.store.write_txstat_block(header_fk, first, &rows)?;
+        Ok(())
+    }
+}
+
+fn txstat_in_sum_from_block(
+    query: &Query,
+    same_block: &std::collections::HashMap<[u8; 32], &bitcoin::Transaction>,
+    tx: &bitcoin::Transaction,
+) -> Result<Option<u64>, QueryError> {
+    if tx.is_coinbase() {
+        return Ok(None);
+    }
+    let mut sum = 0u64;
+    for inp in &tx.input {
+        let tid = inp.previous_output.txid.to_byte_array();
+        let vout = inp.previous_output.vout;
+        let val = if let Some(parent) = same_block.get(&tid) {
+            let o = parent
+                .output
+                .get(vout as usize)
+                .ok_or(StoreError::Corrupt("invariant: stamp same-block vout"))?;
+            o.value.to_sat()
+        } else {
+            let pfk = query
+                .tx_fk_by_txid(&tid)?
+                .ok_or(StoreError::Corrupt("invariant: stamp missing prev tx"))?;
+            let o = query.tx_output_at_fk(pfk, vout)?;
+            if o.value < 0 {
+                return Err(StoreError::Corrupt("txstat prevout negative"));
+            }
+            o.value as u64
+        };
+        sum = sum
+            .checked_add(val)
+            .ok_or(StoreError::Corrupt("txstat in_sum overflow"))?;
+    }
+    Ok(Some(sum))
 }
 
 fn encode_witness_block(
@@ -494,5 +620,64 @@ mod encode_witness_tests {
         let mut plain = Vec::new();
         encode_class_a_tx(&mut plain, &rec, &no_wit, &outs);
         assert_ne!(&plain[4..6], &[0, 1]);
+    }
+
+    #[test]
+    fn txstat_in_sum_reads_same_block_parent() {
+        use bitcoin::hashes::Hash;
+        let (_dir, q) = crate::testutil::tiny_query_labeled("txstat-in-sum-same");
+        let parent = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::script::ScriptBuf::from_bytes(vec![0x01]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::script::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: bitcoin::script::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(49_0000_0000),
+                script_pubkey: bitcoin::script::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut same = std::collections::HashMap::new();
+        same.insert(parent.compute_txid().to_byte_array(), &parent);
+        assert_eq!(
+            txstat_in_sum_from_block(&q, &same, &child).unwrap(),
+            Some(50_0000_0000)
+        );
+        let bad_vout = bitcoin::Transaction {
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 9,
+                },
+                ..child.input[0].clone()
+            }],
+            ..child.clone()
+        };
+        let err = txstat_in_sum_from_block(&q, &same, &bad_vout).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(s) if s.contains("stamp same-block vout")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(_dir.path());
     }
 }

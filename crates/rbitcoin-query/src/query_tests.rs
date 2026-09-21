@@ -1,6 +1,6 @@
 use super::*;
 use crate::testutil::FixtureChain;
-use rbitcoin_store::{InputRecord, OutputRecord};
+use rbitcoin_store::{InputRecord, OutputRecord, TxRecord, TxStatRow};
 
 #[test]
 fn query_open_clears_strong_above_tip() {
@@ -2627,6 +2627,119 @@ fn reconstruct_pruned_returns_pruned_not_corrupt() {
     let fks1 = q.block_tx_fks(Height(1)).unwrap();
     assert!(q.inwit_available(fks1[0]).unwrap());
     assert!(q.tx_wire_bytes(fks1[0]).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn unstamp_txstat(q: &Query, fk: Fk) {
+    q.store()
+        .write_txstat_row(
+            fk,
+            &TxStatRow {
+                n_in: 0,
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn stamp_txstat_from_block_coinbase_and_spend() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, q) = temp_query("stamp-txstat-from-block");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    let hfk0 = q
+        .connect_block(Height(0), &h0, std::slice::from_ref(&t0))
+        .unwrap();
+    let fk0 = q.block_tx_fks(Height(0)).unwrap()[0];
+    unstamp_txstat(&q, fk0);
+    assert!(q.txstat_row(fk0).unwrap().is_none());
+
+    let empty = bitcoin::Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![],
+    };
+    let err = q.stamp_txstat_from_block(Height(99), &empty).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat missing header")),
+        "{err:?}"
+    );
+    let err = q.stamp_txstat_from_block(Height(0), &empty).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat fk count")),
+        "{err:?}"
+    );
+
+    let b0 = q.reconstruct_archived_block(&hash0).unwrap().unwrap();
+    q.stamp_txstat_from_block(Height(0), &b0).unwrap();
+    let row0 = q.txstat_row(fk0).unwrap().expect("stamped coinbase");
+    assert_eq!(row0.n_in, 1);
+    assert_eq!(row0.fee_sat, 0);
+    assert_eq!(row0.size() as usize, b0.txdata[0].total_size());
+
+    let (h1, cb1) = coinbase_block(1, hfk0, Some(hash0));
+    let foreign = TxApply {
+        tx: TxRecord {
+            txid: [0x11; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: t0.tx.txid,
+            create_fk: fk0,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(1), &h1, &[cb1, foreign]).unwrap();
+    let fks1 = q.block_tx_fks(Height(1)).unwrap();
+    for &fk in &fks1 {
+        unstamp_txstat(&q, fk);
+    }
+    let b1 = q.reconstruct_archived_block(&h1.hash).unwrap().unwrap();
+    q.stamp_txstat_from_block(Height(1), &b1).unwrap();
+    let foreign_row = q.txstat_row(fks1[1]).unwrap().expect("stamped spend");
+    assert_eq!(foreign_row.n_in, 1);
+    assert_eq!(foreign_row.fee_sat, 1_0000_0000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn txstat_row_merges_overflow_via_header_blob() {
+    let (dir, q) = temp_query("txstat-row-ovf");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hfk = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    assert!(q.store().txstat_row(fk).unwrap().is_some());
+    let fat = TxStatRow {
+        n_in: 2,
+        fee_sat: 2_000_000,
+        base: 400,
+        wit_extra: 200_000,
+    };
+    q.store()
+        .write_txstat_block(hfk, fk.get().unwrap(), &[fat])
+        .unwrap();
+    assert_eq!(q.store().txstat_row(fk).unwrap(), Some(fat));
+    unstamp_txstat(&q, fk);
+    assert_eq!(q.store().txstat_row(fk).unwrap(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

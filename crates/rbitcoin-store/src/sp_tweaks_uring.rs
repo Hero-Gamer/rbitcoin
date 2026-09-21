@@ -207,6 +207,7 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
             Some(&table.secret),
         )?;
         rec.txid = txs[i].rec.txid;
+        table.overlay_stamped_n_in(txs[i].fk, &mut rec)?;
         txs[i].need_inwit = outs.iter().any(|o| is_p2tr(&o.script));
         wave_outs.insert(txs[i].fk.0, outs.clone());
         txs[i].outs = outs;
@@ -354,7 +355,8 @@ mod tests {
         assert!(!wave.txs[0].need_inwit, "OP_TRUE must not load inwit");
         assert!(wave.txs[0].inputs.is_none());
         assert!(wave.txs[1].need_inwit, "P2TR must need inwit");
-        assert!(wave.txs[1].inputs.is_some());
+        assert_eq!(wave.txs[1].rec.input_count, 1);
+        assert_eq!(wave.txs[1].inputs.as_ref().map(Vec::len), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
