@@ -45,8 +45,8 @@ b_pub = b["publicKey"]
 def udp(cfg):
     return cfg["interfaces"]["UDPInterface"][0]
 
-udp(a)["bind"] = f"127.0.0.1:{udp_a}"
-udp(b)["bind"] = f"127.0.0.1:{udp_b}"
+udp(a)["bind"] = f"0.0.0.0:{udp_a}"
+udp(b)["bind"] = f"0.0.0.0:{udp_b}"
 udp(a)["connectTo"] = {
     f"127.0.0.1:{udp_b}": {
         "password": b["authorizedPasswords"][0]["password"],
@@ -87,7 +87,6 @@ for name, cfg in (("a", a), ("b", b)):
 PY
 
 CJDNS_BIN="$(command -v cjdroute)"
-PING_BIN="$(command -v ping)"
 
 # Open the conf inside sudo. `sudo cjdroute <conf &` often gets a closed
 # stdin on GitHub Actions, so the Angel cancels the core immediately.
@@ -104,31 +103,58 @@ start_cjdroute b
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
 
-deadline=$((SECONDS + 60))
-while true; do
-  if "$PING_BIN" -6 -c 1 -W 1 "$IPV6_B" >/dev/null 2>&1 \
-    && "$PING_BIN" -6 -c 1 -W 1 "$IPV6_A" >/dev/null 2>&1; then
-    break
-  fi
-  if (( SECONDS >= deadline )); then
-    echo "cjdns ping timeout ($IPV6_A <-> $IPV6_B)" >&2
-    for name in a b; do
-      echo "--- $name pid ---" >&2
-      if [[ -f "$ROOT/$name.pid" ]] && kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
-        echo "alive $(cat "$ROOT/$name.pid")" >&2
-      else
-        echo "dead" >&2
-      fi
-      echo "--- $name.log ---" >&2
-      tail -n 80 "$ROOT/$name.log" >&2 || true
-    done
-    sudo ip -6 addr >&2 || true
-    sudo ip link show rbtc0 >&2 || true
-    sudo ip link show rbtc1 >&2 || true
-    exit 1
-  fi
-  sleep 0.5
-done
+# Kernel TCP over the TUNs (the product path). ICMP through cjdns is not
+# reliable on GitHub-hosted runners even when the ifaces are up.
+if ! python3 - "$IPV6_A" "$IPV6_B" <<'PY'
+import socket, sys, time
+a, b = sys.argv[1], sys.argv[2]
+end = time.time() + 60
+last = ""
+while time.time() < end:
+    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((b, 0))
+        srv.listen(1)
+        srv.settimeout(1)
+        port = srv.getsockname()[1]
+        cli = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            cli.bind((a, 0))
+            cli.settimeout(1)
+            cli.connect((b, port))
+            conn, _ = srv.accept()
+            conn.close()
+            sys.exit(0)
+        except OSError as e:
+            last = str(e)
+        finally:
+            cli.close()
+    except OSError as e:
+        last = str(e)
+    finally:
+        srv.close()
+    time.sleep(0.4)
+print(f"cjdns TCP timeout ({a} -> {b}): {last}", file=sys.stderr)
+sys.exit(1)
+PY
+then
+  echo "cjdns TCP timeout ($IPV6_A <-> $IPV6_B)" >&2
+  for name in a b; do
+    echo "--- $name pid ---" >&2
+    if [[ -f "$ROOT/$name.pid" ]] && kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+      echo "alive $(cat "$ROOT/$name.pid")" >&2
+    else
+      echo "dead" >&2
+    fi
+    echo "--- $name.log ---" >&2
+    tail -n 80 "$ROOT/$name.log" >&2 || true
+  done
+  sudo ip -6 addr show rbtc0 >&2 || true
+  sudo ip -6 addr show rbtc1 >&2 || true
+  sudo ip -6 route get "$IPV6_B" >&2 || true
+  exit 1
+fi
 
 cat >"$ROOT/env" <<EOF
 OVERLAY_CJDNS_A=${IPV6_A}

@@ -63,7 +63,7 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 |---------|------|
 | Tor HS published (`getnetworkinfo` onion) | ≤ 90s |
 | I2P SAM HELLO + STREAM CONNECT | ≤ 180s |
-| cjdns `ping` + TCP | ≤ 60s |
+| cjdns TUN TCP | ≤ 60s |
 
 ## Journeys (`tests/overlay.rs`)
 
