@@ -1,9 +1,10 @@
 # Agent notes
 
 Documentation map (one owner per fact): [`docs/README.md`](docs/README.md).
-Before exploring, read [`docs/ORIENT.md`](docs/ORIENT.md).
-This file is the harness-injected hard-rule contract. Design lives in the
-owner docs; do not grow a second design book here.
+When the task area is unclear, [`docs/ORIENT.md`](docs/ORIENT.md) routes.
+Open the one row that matches the change. This file is the harness-injected
+hard-rule contract. Design lives in the owner docs; do not grow a second
+design book here.
 
 Process playbooks are Agent Skills under [`.agents/skills/`](.agents/skills/).
 Read the matching `SKILL.md` when the task needs it. Do not paste bash,
@@ -15,22 +16,27 @@ If you are acting as `rearden-grok[bot]`, also read
 [`rearden-vm-HOST.md`](rearden-vm-HOST.md). If you are not that identity,
 ignore that file.
 
-## Language, comments, composition
+## Language and shape
 
 Write clear, concrete technical English. Keep Core-aligned terms where we
 match Bitcoin Core. Do not inject moralizing or political framing, or soften
 consensus and security language. If a rename is not clearer engineering, keep
 the existing term.
 
-Comments that restate what, why, or weird are a smell. Prefer names, types,
-and structure. Keep `//` only for an invariant, protocol rule, `SAFETY`, or
-library quirk. Crate and public rustdoc (`//!` / `///`) is not this rule.
-Full text: [`CONTRIBUTING.md`](CONTRIBUTING.md) principle 7.
+Open [`CONTRIBUTING.md`](CONTRIBUTING.md) principles 7–11 and
+[`docs/code-shape.md`](docs/code-shape.md) when editing Rust. Short form:
 
-Prefer composition (has-a) over inheritance; avoid tall trees. Build
-immutable structures once, then compose them. If a map needs extra fields,
-wrap it on read rather than mutating members in place.
-Control flow: principle 10 and [`docs/code-shape.md`](docs/code-shape.md).
+- `//` only for an invariant, protocol rule, `SAFETY`, or library quirk.
+  Crate and public rustdoc (`//!` / `///`) is not this rule (principle 7).
+- Tests assert shipped behavior, not repo text. No `*_for_test` backdoors.
+  IO pins use session or table stats or on-disk state (principle 8).
+- A RAM or CPU trade is named (principle 9).
+- Control flow and composition: principle 10 and `docs/code-shape.md`.
+- Crate `pub` is the cross-crate graph only. No unused `pub`. No
+  `dead_code` silence. `#[cfg(test)]` on production items is a smell,
+  including fuzz-only exports (principle 11).
+- One logical change per commit. The message says what and why. Not WIP,
+  misc, or a drive-by rename mixed with behavior.
 
 ## Store and IBD
 
@@ -65,8 +71,8 @@ Perf A/B is operator-host only.
 One plan step is one Red → Green → Refactor turn, committed before the next
 step. Keep `--lib` compiling (wrap the old API, switch one caller). Inner
 loop is `cargo test -p <crate> --lib` / `cargo check -p <crate> --lib`.
-Do not `cargo check --tests` after every edit. Owner:
-[`docs/how-we-plan.md`](docs/how-we-plan.md). Commands:
+Do not `cargo check --tests` after every edit. Cycle and Agent RAM:
+[`docs/how-we-plan.md`](docs/how-we-plan.md#agent-contract). Commands:
 [`.agents/skills/ship-pr/SKILL.md`](.agents/skills/ship-pr/SKILL.md).
 
 **Agent RAM:** never load `cargo test`, clippy, deny, or rustc stdout into
@@ -81,24 +87,11 @@ identities: ignore that file; use `$PWD/target/dev`.
 
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
-RPC / P2P / Electrum / Esplora: [`COMPAT.md`](COMPAT.md).
-
-Tests assert shipped behavior, not repo text
-([`CONTRIBUTING.md`](CONTRIBUTING.md) principle 8). Budgets, no `*_for_test`
-backdoors, no production-scale default fixtures: [`TESTING.md`](TESTING.md).
-Tests use session or table instance stats or on-disk state, not thread-local
-hot-path IO probes.
-
-Crate `pub` is the cross-crate graph only. Unused `pub` is forbidden.
-`#[cfg(test)]` on production items is a smell, including fuzz-only exports.
-Do not leave dead code or silence `dead_code`. A RAM or CPU trade is named
-([`CONTRIBUTING.md`](CONTRIBUTING.md) principle 9).
-
-One logical change per commit. The message says what and why. Not WIP, misc,
-or a drive-by rename mixed with behavior.
+RPC / P2P / Electrum / Esplora: [`COMPAT.md`](COMPAT.md). Budgets and
+fixtures: [`TESTING.md`](TESTING.md).
 
 Before the first edit under `crates/<name>/`, read `crates/<name>/AGENTS.md`
-when it exists.
+when it exists, and open the read-first row that matches the change.
 
 ## Ship, release, Core functional
 

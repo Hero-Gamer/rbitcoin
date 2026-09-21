@@ -246,16 +246,12 @@ digging into a monolithic job log.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.
 
-**Agents** implement in **one git worktree per session**, a topic branch per
-PR, and **one PR** per plan. Each plan step follows
-[`docs/how-we-plan.md`](./docs/how-we-plan.md) and is committed only after
-local CI except coverage. Coverage and native `windows` / `macos` stay
-GitHub Actions. After merge they delete the topic branch and keep the
-session worktree. Never `git remote set-url origin`. Bot push uses an
-explicit HTTPS URL (not `git push origin`). Fail-fast poll is
-`./scripts/pr-checks-watch.sh`, not `gh pr checks --watch`. Start at
-[`docs/ORIENT.md`](./docs/ORIENT.md).
-Ship commands: [`.agents/skills/ship-pr/SKILL.md`](./.agents/skills/ship-pr/SKILL.md).
+**Agents** open [`docs/ORIENT.md`](./docs/ORIENT.md) when the area is
+unclear, follow the agent contract in
+[`docs/how-we-plan.md`](./docs/how-we-plan.md#agent-contract), and use
+[`.agents/skills/ship-pr/SKILL.md`](./.agents/skills/ship-pr/SKILL.md) to
+open or update a pull request. Humans use ordinary git. The bot host file
+does not apply to them.
 
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):
 

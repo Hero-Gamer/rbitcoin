@@ -5,15 +5,146 @@ Work lands as **small vertical slices**. Each slice is one
 This file owns that cycle. Hard-rule pointer: [`AGENTS.md`](../AGENTS.md).
 Commands: [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
 
-Plans have more steps than a typical “phase 1 / phase 2” design. Each step
-should leave the production path simpler and the suite a sharper pin.
+**Agents** follow [Agent contract](#agent-contract) through
+[Keep the tree compiling](#keep-the-tree-compiling). Do not preload
+[Rationale](#rationale).
 
-Influences: Extreme Programming (stories, planning game, small releases,
-TDD, continuous refactoring), INVEST stories, vertical slicing, YAGNI /
-simple design. Adapted for a consensus + IBD codebase and agent-driven
-execution.
+**Humans** learning the method: stories, examples, and the checklist are
+the rationale after the contract.
+
+## Agent contract
+
+Core functional scripts are not the in-tree Red test. When the labeled
+`core-functional` job is red, reproduce locally
+([`core-functional.md`](./core-functional.md)).
+
+## The cycle: Red → Green → Refactor
+
+One step is one turn of the loop, **committed before the next step starts**.
+Red pins behavior, so Green is safe to be crude. The pin makes Refactor
+safe. Refactor leaves the production path simpler and the suite sharper, so
+the next Red is easier to name. Skip a phase and the loop degrades: no Red
+is coding to logs; no Refactor is one-offs that accrete; no **test**
+refactor is a slow suite full of brittle twins. Landing several slices and
+then fighting CI is the same skip — the gates never ran under a small diff.
+
+```text
+for each plan step:
+  1. Red      new test; targeted run; see red. No production edit yet.
+  2. Green    smallest production change; targeted run; see green.
+  3. Suite    cargo test --workspace; confirm green.
+  4. Refactor fold one-offs; production and tests; still green.
+  5. Gates    local CI except coverage (commands in ship-pr).
+  6. Commit   then the next step.
+
+after the last step (optional):
+  holistic refactor → local CI except coverage → commit
+  then push and poll GitHub
+```
+
+Edits inside Red and Green stay targeted: `cargo test -p <crate> …` and
+`cargo check -p <crate> --lib`. Do not `cargo check --tests` after every
+edit. The workspace suite is step 3 (and again in step 5 if Refactor
+changed code).
+
+### Agent RAM
+
+Never return full `cargo test`, clippy, deny, or rustc stdout through the
+Shell tool into the agent session. Workspace `cargo test --workspace` is
+the dangerous one (will OOM an agent turn). Targeted
+`cargo test -p <crate> <filter>` still redirect if output can be large.
+Docs-only slices still must not dump rustc if they run fmt.
+
+Redirect **stdout and stderr** to a file under `/tmp` (`mktemp
+/tmp/rbtc-agent-XXXXXX.log` or `/tmp/rbtc-agent-<pid>.log`). Do not `tee`
+(that still streams into the tool result). Do not `| tail` as the only
+sink (the compiler still writes a huge pipe into the tool).
+
+After the command, print **exit code** in the tool result
+(`echo EXIT:$?`). Look at that first.
+
+- Exit 0 with `--quiet` (tests) or clippy `-D warnings` and no output:
+  green. Do **not** Read the log file.
+- Exit ≠ 0: search the file for failure names (`FAILED`, `error:`, clippy
+  lint ids, first rustc error). Read at most **~80 lines of tail** (or a
+  tight `rg` window). Do not `Read` a multi-megabyte log.
+
+`--quiet` is enough to confirm green. Copy-paste shape (adapt the
+`cargo …` line per command: clippy `-D warnings`, `cargo deny check`,
+`cargo fmt --all -- --check`, `./scripts/ast-grep.sh`,
+`./scripts/ci-os-smoke.sh`). Inner loop:
+`cargo test -p <crate> --lib <filter> -- --quiet` redirected the same way.
+
+```bash
+log=$(mktemp /tmp/rbtc-agent-XXXXXX.log)
+set +e
+cargo test --workspace --quiet >"$log" 2>&1
+ec=$?
+set -e
+echo EXIT:$ec
+if [ "$ec" -ne 0 ]; then
+  rg -n 'FAILED|^error:|error\[' "$log" | head -n 40
+  echo '--- tail ---'
+  tail -n 80 "$log"
+fi
+```
+
+A sequence of gates can wrap that body in a `run` function (one call per
+command). Do not paste a second copy into ship-pr; that file lists the
+commands and links here.
+
+**Agent disk:** `rearden-grok[bot]` follows
+[`rearden-vm-HOST.md`](../rearden-vm-HOST.md). Other identities: ignore
+that file. Commands:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+
+Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
+Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
+gates if the slice also changed Rust, scripts, or lint.
+
+If Refactor is empty, do not run the workspace suite twice: step 3 plus
+fmt / deny / clippy / ast-grep / `ci-os-smoke.sh` is enough.
+
+Coverage (`./scripts/coverage.sh`) and a host IBD are never local. Native
+`windows` / `macos` still run on GitHub Actions; `./scripts/ci-os-smoke.sh`
+is the local stand-in. `nixos-module-eval` only when the slice changed
+`flake.nix`, `nix/`, or the NixOS module. The qemu VM test
+(`nixos-module-runtime`) is GitHub Actions on label **`nixos-module-runtime`**
+and on Release tags — not local, not a required PR check. Push may wait until
+several slices are committed; each commit must already have passed those
+gates.
+
+A step is not done because it compiles, because the one-off is still there,
+or because “CI at the end will catch it.”
+
+
+### Keep the tree compiling
+
+Schema/API rewires stall when a session deletes the old type (`TxIdx`, a
+body meta field, …) and then spends the rest of the turn on `unresolved` /
+`dead_code` across store tests, query, consensus, and net. That is not TDD;
+it is a compile-doom loop. `rbitcoin-store --tests` is a fat rustc unit —
+do not use it as the edit cycle.
+
+| Do | Do not |
+|----|--------|
+| New type + its unit tests green, **then** a thin wrap on the old API | Delete the old module in the same dirty tree as all callers |
+| Switch **one** caller crate per step; `--lib` stays green | One uncommitted tree spanning store + confirm + query + net + docs |
+| Keep `--lib` compiling throughout; commit after local CI except coverage | Hours of un-gated WIP, or a slice commit that has not passed those gates |
+| `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
+
+`--tests` / multi-crate check belongs after Green and in Gates, not in the
+inner loop. Commands:
+[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
+
 
 ---
+
+## Rationale
+
+The contract above is the cycle. This part is why the repo plans in
+small vertical slices, and how to read a step. It is not a second
+procedure.
 
 ## Why plan this way
 
@@ -181,104 +312,7 @@ even if the slices are “vertical.”
 
 ---
 
-## The cycle: Red → Green → Refactor
-
-One step is one turn of the loop, **committed before the next step starts**.
-Red pins behavior, so Green is safe to be crude. The pin makes Refactor
-safe. Refactor leaves the production path simpler and the suite sharper, so
-the next Red is easier to name. Skip a phase and the loop degrades: no Red
-is coding to logs; no Refactor is one-offs that accrete; no **test**
-refactor is a slow suite full of brittle twins. Landing several slices and
-then fighting CI is the same skip — the gates never ran under a small diff.
-
-```text
-for each plan step:
-  1. Red      new test; targeted run; see red. No production edit yet.
-  2. Green    smallest production change; targeted run; see green.
-  3. Suite    cargo test --workspace; confirm green.
-  4. Refactor fold one-offs; production and tests; still green.
-  5. Gates    local CI except coverage (commands in ship-pr).
-  6. Commit   then the next step.
-
-after the last step (optional):
-  holistic refactor → local CI except coverage → commit
-  then push and poll GitHub
-```
-
-Edits inside Red and Green stay targeted: `cargo test -p <crate> …` and
-`cargo check -p <crate> --lib`. Do not `cargo check --tests` after every
-edit. The workspace suite is step 3 (and again in step 5 if Refactor
-changed code).
-
-### Agent RAM
-
-Never return full `cargo test`, clippy, deny, or rustc stdout through the
-Shell tool into the agent session. Workspace `cargo test --workspace` is
-the dangerous one (will OOM an agent turn). Targeted
-`cargo test -p <crate> <filter>` still redirect if output can be large.
-Docs-only slices still must not dump rustc if they run fmt.
-
-Redirect **stdout and stderr** to a file under `/tmp` (`mktemp
-/tmp/rbtc-agent-XXXXXX.log` or `/tmp/rbtc-agent-<pid>.log`). Do not `tee`
-(that still streams into the tool result). Do not `| tail` as the only
-sink (the compiler still writes a huge pipe into the tool).
-
-After the command, print **exit code** in the tool result
-(`echo EXIT:$?`). Look at that first.
-
-- Exit 0 with `--quiet` (tests) or clippy `-D warnings` and no output:
-  green. Do **not** Read the log file.
-- Exit ≠ 0: search the file for failure names (`FAILED`, `error:`, clippy
-  lint ids, first rustc error). Read at most **~80 lines of tail** (or a
-  tight `rg` window). Do not `Read` a multi-megabyte log.
-
-`--quiet` is enough to confirm green. Copy-paste shape (adapt the
-`cargo …` line per command: clippy `-D warnings`, `cargo deny check`,
-`cargo fmt --all -- --check`, `./scripts/ast-grep.sh`,
-`./scripts/ci-os-smoke.sh`). Inner loop:
-`cargo test -p <crate> --lib <filter> -- --quiet` redirected the same way.
-
-```bash
-log=$(mktemp /tmp/rbtc-agent-XXXXXX.log)
-set +e
-cargo test --workspace --quiet >"$log" 2>&1
-ec=$?
-set -e
-echo EXIT:$ec
-if [ "$ec" -ne 0 ]; then
-  rg -n 'FAILED|^error:|error\[' "$log" | head -n 40
-  echo '--- tail ---'
-  tail -n 80 "$log"
-fi
-```
-
-A sequence of gates can wrap that body in a `run` function (one call per
-command). Do not paste a second copy into ship-pr; that file lists the
-commands and links here.
-
-**Agent disk:** `rearden-grok[bot]` follows
-[`rearden-vm-HOST.md`](../rearden-vm-HOST.md). Other identities: ignore
-that file. Commands:
-[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
-
-Pure docs, comments, or formatting skip Red, Green, and the workspace suite.
-Still run `cargo fmt --all` if rustfmt would touch the tree, and the other
-gates if the slice also changed Rust, scripts, or lint.
-
-If Refactor is empty, do not run the workspace suite twice: step 3 plus
-fmt / deny / clippy / ast-grep / `ci-os-smoke.sh` is enough.
-
-Coverage (`./scripts/coverage.sh`) and a host IBD are never local. Native
-`windows` / `macos` still run on GitHub Actions; `./scripts/ci-os-smoke.sh`
-is the local stand-in. `nixos-module-eval` only when the slice changed
-`flake.nix`, `nix/`, or the NixOS module. The qemu VM test
-(`nixos-module-runtime`) is GitHub Actions on label **`nixos-module-runtime`**
-and on Release tags — not local, not a required PR check. Push may wait until
-several slices are committed; each commit must already have passed those
-gates.
-
-A step is not done because it compiles, because the one-off is still there,
-or because “CI at the end will catch it.”
+## How a step reads
 
 ### Red: name the contract
 
@@ -392,29 +426,8 @@ Each step is independently green, gated, committed, and shippable.
 | Plan ignores test runtime | Explicit unit vs scenario choice per step |
 | Core functional as the default-CI Red | In-tree catalog journey; Core stays nightly |
 | Several slices uncommitted; first GitHub run is the fmt/clippy/suite gate | Each slice commits only after those gates |
-| Delete a large type/module then `cargo check --tests` until the workspace builds | Keep-compiling facade (below) |
+| Delete a large type/module then `cargo check --tests` until the workspace builds | Keep-compiling facade ([agent contract](#keep-the-tree-compiling)) |
 | Inner loop = `cargo check --tests` after every edit | `--lib` until that crate’s lib is green |
-
-### Keep the tree compiling
-
-Schema/API rewires stall when a session deletes the old type (`TxIdx`, a
-body meta field, …) and then spends the rest of the turn on `unresolved` /
-`dead_code` across store tests, query, consensus, and net. That is not TDD;
-it is a compile-doom loop. `rbitcoin-store --tests` is a fat rustc unit —
-do not use it as the edit cycle.
-
-| Do | Do not |
-|----|--------|
-| New type + its unit tests green, **then** a thin wrap on the old API | Delete the old module in the same dirty tree as all callers |
-| Switch **one** caller crate per step; `--lib` stays green | One uncommitted tree spanning store + confirm + query + net + docs |
-| Keep `--lib` compiling throughout; commit after local CI except coverage | Hours of un-gated WIP, or a slice commit that has not passed those gates |
-| `cargo check -p <crate> --lib` (or `cargo test -p <crate> --lib <filter>`) | `cargo check -p rbitcoin-store --tests` or six-crate `--tests` after each edit |
-
-`--tests` / multi-crate check belongs after Green and in Gates, not in the
-inner loop. Commands:
-[`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md).
-
----
 
 ## Checklist for authors (and agents)
 

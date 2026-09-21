@@ -35,7 +35,9 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 
 **Policy:** Core `script_tests` / `tx_valid` / `tx_invalid` corpora must pass **every**
 data row with **no allowlist**. Do not commit if those tests fail. Findings stay
-**fixed** with a named regression on the shipped path.
+**fixed** with a named regression on the shipped path. A green regression means
+the write-up stays closed. Do not re-derive the bug from the narrative unless
+that test fails.
 
 **006–009:** consensus accept-invalid (zip 2026-08-10) — **fixed** in-tree. **010–011:**
 mempool remediation **fixed** (Coin spentness + structural tip checks + fee path).

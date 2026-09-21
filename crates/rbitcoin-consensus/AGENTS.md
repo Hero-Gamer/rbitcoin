@@ -6,6 +6,8 @@ Do not run the interpreter on an I/O thread.
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Rules we own vs Core corpora | [`docs/consensus-tests.md`](../../docs/consensus-tests.md) |

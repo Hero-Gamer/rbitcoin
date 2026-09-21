@@ -6,6 +6,8 @@ and `rbitcoin-log`. `rbitcoin-query` and everything above it call this crate.
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Stage IO, leftover union, no silent fallback | [`docs/invariants.md`](../../docs/invariants.md) |

@@ -176,30 +176,21 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 
 ---
 
-## Historical record: head insert uring ~5× slower
+## Head insert locality
 
-| Commit | Note |
-|--------|------|
-| `0ee28c0` / `77cb2ab` | io_uring bulk / page-grouped RMW for `tx.head` insert |
-| **`259b766`** (2026-07-23) | **Reverted to mmap-only head insert.** Host A/B: **io_uring head inserts ~5× slower on head ms/blk** than mmap Release. Bulk uring kept for **reads** only |
-| `788936e` | Page-coalesce insert still via **plain map** `write_at` |
-| `3a0c220` | **Body** FdOnly success (different pattern: linear append + bulk batch read) |
-| `f829090` / `11134cb` | Segmented idx/head landed **after** the 5× failure |
-
-**Implication:** do not ship head demap without **operator host** A/B (musl
-static). Prefer page-coalesced **pread→mutate→pwrite** over per-slot uring.
-Segmented heads reduce grow/remap pain but do not free us from page locality.
+Do not demap heads without an operator-host measurement (musl static).
+A host A/B showed io_uring head inserts about 5× slower on head ms/blk than
+a mapped insert. Prefer page-coalesced pread → mutate → pwrite over per-slot
+uring. Segmented heads do not remove that page-locality constraint.
 
 ---
 
-## End goal (phased)
+## Settled IO shape
 
-1. **FdOnly** for multi‑GiB random tables: `create.loc` → `tx.head` / header head → SH head/body / spenders.
-2. **InRam** (explicit process buffers) for small Class C / mempool — not leftover MapFull “because small.”
-3. **Remove `memmap2`** from the workspace.
-4. Update this doc after **each** phase with host A/B results.
-
-Agent correctness tests under `/tmp` are required; **perf ship/fail is host-only**.
+Phase 6 is done: the workspace has zero `memmap2` / `MmapMut` (top of this
+file). Multi-GiB random tables stay FdOnly. Small Class C and the mempool
+stay explicit process buffers. A host A/B comes before a demap. Agent
+correctness tests under `/tmp` are required; perf ship/fail is host-only.
 
 ---
 

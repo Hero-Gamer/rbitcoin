@@ -1,5 +1,8 @@
 # Personal wallet-node plans
 
+**Not scheduled.** Implement a numbered file only when the user names that
+plan. Do not start the next file because it is listed here.
+
 Implementation plans for a **home node that cannot open clearnet listen ports**:
 P2P over Tor SOCKS / I2P SAM / CJDNS, Electrum and Esplora on onion (and I2P
 when SAM can forward), P2P inbound on a Tor onion, local tx announce on a
@@ -11,7 +14,7 @@ is the plan group only. Do not copy step lists into [`quality.md`](../quality.md
 until a slice is scheduled (same pattern as [`peer-clients.md`](../peer-clients.md)
 ranked items).
 
-Each numbered file is one plan: [`how-we-plan.md`](../how-we-plan.md)
+Each numbered file is one plan: [`how-we-plan.md`](../how-we-plan.md#agent-contract)
 (Contract / Red / Green / Refactor / Verify). Commands:
 [`.agents/skills/ship-pr/SKILL.md`](../../.agents/skills/ship-pr/SKILL.md).
 Do not copy the cycle here.
@@ -47,7 +50,7 @@ A node on CGNAT / no forwarded TCP still:
   the write thread joins) grows — unlikely here.
 - One product PR per numbered file. Each step is one cycle turn, committed
   before the next step starts, only after **local CI except coverage**
-  ([`how-we-plan.md`](../how-we-plan.md); commands in
+  ([`how-we-plan.md`](../how-we-plan.md#agent-contract); commands in
   [ship-pr](../../.agents/skills/ship-pr/SKILL.md)). Coverage and native
   `windows` / `macos` stay GitHub Actions. Optional holistic refactor after
   the last step, then push and poll.

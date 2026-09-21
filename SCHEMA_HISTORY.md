@@ -130,14 +130,15 @@ Closed layout. SH run catalogs are unique `(scripthash, create_fk)` at
 `key_len=40`. Schema-16 `key_len=32` catalogs are refused.
 
 Hot Class A: thin LAYOUT17 `txout` meta, script kinds **0–9** (unknown
-kind is Corrupt). A new consensus script is **RAW** (no bump) or
-**soft-18** (18 reads 17; 17 refuses 18) — not a 17 datadir wipe. 8 B
-spent slots, `spent.ovf` overflow. Inwit flags bits 4–7 and spent flags
-other than `MULTI_SPENDER` are Corrupt. Inwit prevout is still
-`create_fk:u64` + CompactSize vout (Δfk is an **18 / inwit-only**
-follow-up). Writer/RAM on 17 (not on-disk): idx stems roll independently;
-`strong_tx` always L2; no `RWF_DONTCACHE`. See
-[`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze).
+kind is Corrupt). At schema 17, a new consensus script was **RAW** (no bump)
+or a kind-nibble bump the then-current binary would refuse — not a 17
+datadir wipe. 8 B spent slots, `spent.ovf` overflow. Inwit flags bits 4–7
+and spent flags other than `MULTI_SPENDER` are Corrupt. Inwit prevout is
+still `create_fk:u64` + CompactSize vout (Δfk was parked as an inwit-only
+or later-version follow-up). Writer/RAM on 17 (not on-disk): idx stems roll
+independently; `strong_tx` always L2; no `RWF_DONTCACHE`. See
+[`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze). The live bump rule is that
+file, not this section.
 
 Megakey SH pages store ULEB128 fk0+deltas (`ver=1`). Leftover raw-u64
 pages (`ver=0`, `n>0`) rematerialize.
@@ -145,8 +146,9 @@ pages (`ver=0`, `n>0`) rematerialize.
 **Body orientation (still 17):** new creates write `scripthash.body/NN`
 + `scripthash.ovf/body`. Existing file `scripthash.body` stays shared
 (one writer). Mixed file+dir or a dir without `ovf/body` is Layout
-refuse (wipe `store/scripthash*`). Not schema 18 — 18 remains the next
-incompatible Class A / idx change.
+refuse (wipe `store/scripthash*`). That body-dir change was not schema 18.
+At the time, 18 was the next incompatible Class A / idx change; 18–24 have
+since shipped.
 
 `archive_epoch` is gone. Create does not plant `wire/` or packed
 `tx.body`. Open unlinks leftover `archive_epoch`, `store/wire`, and

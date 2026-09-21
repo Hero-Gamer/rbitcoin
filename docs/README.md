@@ -33,7 +33,7 @@ into `AGENTS.md`.
 
 | Doc | Owns |
 |-----|------|
-| [`ORIENT.md`](./ORIENT.md) | Agent task router: crate graph and read-first links. Not a second index of facts. |
+| [`ORIENT.md`](./ORIENT.md) | Agent task router: crate graph and read-first links. Open one matching row. Not a second index of facts. |
 | [`architecture.md`](./architecture.md) | Why this node is different (Core / Fulcrum contrasts). No stage-IO table copy. |
 | [`concurrency.md`](./concurrency.md) | Writer roles, publish order, body-queue, pins. Links invariants for leftover union. |
 | [`invariants.md`](./invariants.md) | Confirm stage IO (the **only** copy), leftover union, store start states S0–S4, no silent fallbacks. |
@@ -47,7 +47,7 @@ into `AGENTS.md`.
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
 | [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |
-| [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract; Agent RAM (redirect cargo/clippy/rustc stdout). |
+| [`how-we-plan.md`](./how-we-plan.md) | Agent contract (cycle, Agent RAM, keep-compiling), then human rationale. |
 | [`personal-node-plans/`](./personal-node-plans/) | Home-node implementation plan group (SOCKS, overlays, wallet onions, ephemeral broadcast, inwit prune / `NETWORK_LIMITED`). Live flags stay OPERATOR/COMPAT when a slice ships. Do not copy step lists into quality.md until scheduled. |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |
 | [`code-shape.md`](./code-shape.md) | Control flow, types, naming, composition (CONTRIBUTING principle 10). Named extracts: quality.md **Q-61** (Completed). Clippy: no workspace `allow` list; leftover lints are site-local with a reason. |
@@ -56,7 +56,7 @@ into `AGENTS.md`.
 | [`reproducible-builds.md`](./reproducible-builds.md) | Pinned Nix / musl byte-identity. |
 | [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
-| [`errata.md`](./errata.md) | Known one-off store/confirm quirks. |
+| [`errata.md`](./errata.md) | Known one-off store/confirm quirks. Retired confirm dual-path names. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`lightning.md`](./lightning.md) | CLN and LDK as Bitcoin backends: five `bcli` calls, Esplora/Electrum chain sync, `--sh-index` API matrix. Not LND. |
 | [`mutants/`](./mutants/) | Generated cargo-mutants missed/timeout snapshot. How to run / CI: [`TESTING.md`](../TESTING.md). Not a quality backlog. |

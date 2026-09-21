@@ -5,6 +5,8 @@ P2P and IBD. Depends on query, store, consensus, and mempool.
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Roles, body queue, publish order | [`docs/concurrency.md`](../../docs/concurrency.md) |
