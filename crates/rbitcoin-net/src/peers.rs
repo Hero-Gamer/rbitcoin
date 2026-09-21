@@ -1753,7 +1753,13 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
-        self.register_connecting_net(addr, crate::NetAddr::Ip(addr), addrbind, inbound, conn_type)
+        self.register_connecting_net(
+            addr,
+            crate::NetAddr::from_socket(addr),
+            addrbind,
+            inbound,
+            conn_type,
+        )
     }
 
     pub fn register_connecting_net(
@@ -1801,7 +1807,7 @@ impl PeerHub {
     ) -> Arc<LivePeer> {
         self.register_net(
             addr,
-            crate::NetAddr::Ip(addr),
+            crate::NetAddr::from_socket(addr),
             addrbind,
             ver,
             inbound,
@@ -1849,7 +1855,7 @@ impl PeerHub {
             id,
             PeerEndpoint {
                 addr,
-                net: crate::NetAddr::Ip(addr),
+                net: crate::NetAddr::from_socket(addr),
                 addrbind,
             },
             ver,
@@ -3380,6 +3386,36 @@ mod tests {
             "CJDNS must stay in the book, got {:?}",
             book.entries()
         );
+    }
+
+    #[test]
+    fn inbound_fc00_getpeerinfo_network_is_cjdns() {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use std::net::Ipv6Addr;
+
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let addr = SocketAddr::from((ip, 8333));
+        let bind = SocketAddr::from((ip, 18444));
+        let hub = PeerHub::new();
+        let connecting = hub.register_connecting(addr, bind, true, PeerConnType::Inbound);
+        assert_eq!(connecting.net.network_label(), "cjdns");
+        hub.unregister(connecting.id);
+        let ver = VersionMessage {
+            version: bitcoin::p2p::PROTOCOL_VERSION,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&bind, ServiceFlags::NONE),
+            nonce: 0,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 3,
+            relay: true,
+        };
+        let live = hub.register_with_id(1, addr, bind, &ver, true, PeerConnType::Inbound);
+        assert_eq!(live.net.network_label(), "cjdns");
+        assert_eq!(hub.snapshot()[0].net.network_label(), "cjdns");
     }
 
     #[test]

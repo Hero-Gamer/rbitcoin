@@ -280,9 +280,10 @@ pub(crate) async fn dial_batch(
             trying_connection_log(PeerConnType::OutboundFullRelay, addr)
         );
         let dialer = dialer.clone();
+        let to = connect_timeout_for(addr, connect_timeout);
         handles.push(tokio::spawn(async move {
             let fut = spawn_peer(id, addr, magic, local_addr, tip_h, sinks, dialer);
-            match tokio::time::timeout(connect_timeout, fut).await {
+            match tokio::time::timeout(to, fut).await {
                 Ok(Ok(slot)) => Ok(slot),
                 Ok(Err(e)) => {
                     let kind = classify_dial_err(&e);
@@ -292,7 +293,7 @@ pub(crate) async fn dial_batch(
                     id,
                     addr,
                     DialFailKind::Network,
-                    format!("connect timeout ({connect_timeout:?})"),
+                    format!("connect timeout ({to:?})"),
                 )),
             }
         }));
@@ -315,6 +316,14 @@ pub(crate) async fn dial_batch(
     }
     out.slots.sort_by_key(|s| s.id);
     out
+}
+
+/// I2P STREAM CONNECT waits on tunnel + leaseset lookup; 8s is a clearnet RTT.
+pub(crate) fn connect_timeout_for(addr: crate::NetAddr, base: Duration) -> Duration {
+    match addr {
+        crate::NetAddr::I2p { .. } => base.max(Duration::from_secs(90)),
+        _ => base,
+    }
 }
 
 /// How many new dials to start when below `target` live peers.
@@ -638,6 +647,18 @@ mod tests {
 
     fn addr(o: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), 8333)
+    }
+
+    #[test]
+    fn i2p_connect_timeout_is_longer_than_clearnet() {
+        let i2p = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 1,
+        };
+        let ip: crate::NetAddr = "127.0.0.1:1".parse().unwrap();
+        let base = Duration::from_secs(8);
+        assert_eq!(connect_timeout_for(ip, base), base);
+        assert_eq!(connect_timeout_for(i2p, base), Duration::from_secs(90));
     }
 
     fn dummy_slot(id: usize, a: SocketAddr, alive: bool) -> PeerSlot {
