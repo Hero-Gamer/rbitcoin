@@ -515,56 +515,68 @@ struct ClassASkewStems<'a> {
     txstat: &'a crate::txstat::TxStat,
 }
 
-fn repair_class_a_count_skew(
-    stems: ClassASkewStems<'_>,
+fn class_a_skew_target_count(
+    n_loc: u64,
+    n_txids: u64,
+    n_inwit_loc: u64,
     prune_inwit_mode: bool,
-) -> Result<(), StoreError> {
-    let n_loc = stems.create_loc.count();
-    let n_txids = stems.txids.count();
-    let n_inwit_loc = stems.inwit_loc.count();
+) -> Option<u64> {
     if n_txids == n_loc && (prune_inwit_mode || n_inwit_loc == n_loc) {
-        return Ok(());
+        return None;
     }
-    let n = if prune_inwit_mode {
+    Some(if prune_inwit_mode {
         n_loc.min(n_txids)
     } else {
         n_loc.min(n_txids).min(n_inwit_loc)
-    };
-    rbitcoin_log::warn!(
-        "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
-         txid.body={n_txids} — truncating to {n}"
-    );
-    let (tx_end, sp_end, in_end) = if n == 0 {
+    })
+}
+
+fn class_a_skew_stem_ends(
+    stems: &ClassASkewStems<'_>,
+    n: u64,
+    prune_inwit_mode: bool,
+) -> Result<(u64, u64, u64), StoreError> {
+    if n == 0 {
         let h = crate::file::FILE_HEADER_LEN as u64;
-        (h, h, h)
+        return Ok((h, h, h));
+    }
+    let p = stems
+        .create_loc
+        .range_batch(&[Fk(n)])?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
+    let in_end = if prune_inwit_mode {
+        crate::file::FILE_HEADER_LEN as u64
     } else {
-        let p = stems
-            .create_loc
+        let ir = stems
+            .inwit_loc
             .range_batch(&[Fk(n)])?
             .into_iter()
             .next()
             .flatten()
-            .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
-        let in_end = if prune_inwit_mode {
-            crate::file::FILE_HEADER_LEN as u64
-        } else {
-            let ir = stems
-                .inwit_loc
-                .range_batch(&[Fk(n)])?
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or(StoreError::Corrupt(
-                    "invariant: inwit.loc range for truncate",
-                ))?;
-            ir.0.saturating_add(ir.1)
-        };
-        (
-            p.txout.0.saturating_add(p.txout.1),
-            p.spent.0.saturating_add(p.spent.1),
-            in_end,
-        )
+            .ok_or(StoreError::Corrupt(
+                "invariant: inwit.loc range for truncate",
+            ))?;
+        ir.0.saturating_add(ir.1)
     };
+    Ok((
+        p.txout.0.saturating_add(p.txout.1),
+        p.spent.0.saturating_add(p.spent.1),
+        in_end,
+    ))
+}
+
+fn class_a_skew_apply_truncate(
+    stems: &ClassASkewStems<'_>,
+    n: u64,
+    n_txids: u64,
+    tx_end: u64,
+    sp_end: u64,
+    in_end: u64,
+    prune_inwit_mode: bool,
+) -> Result<(), StoreError> {
     stems.create_loc.truncate_to_count(n)?;
     if !prune_inwit_mode {
         stems.inwit_loc.truncate_to_count(n)?;
@@ -580,6 +592,13 @@ fn repair_class_a_count_skew(
     if stems.txstat.count() > n {
         stems.txstat.truncate_to_count(n)?;
     }
+    Ok(())
+}
+
+fn class_a_skew_assert_aligned(
+    stems: &ClassASkewStems<'_>,
+    prune_inwit_mode: bool,
+) -> Result<(), StoreError> {
     if stems.body.count() != stems.txids.count() || stems.create_loc.count() != stems.txids.count()
     {
         return Err(StoreError::Corrupt(
@@ -592,6 +611,25 @@ fn repair_class_a_count_skew(
         ));
     }
     Ok(())
+}
+
+fn repair_class_a_count_skew(
+    stems: ClassASkewStems<'_>,
+    prune_inwit_mode: bool,
+) -> Result<(), StoreError> {
+    let n_loc = stems.create_loc.count();
+    let n_txids = stems.txids.count();
+    let n_inwit_loc = stems.inwit_loc.count();
+    let Some(n) = class_a_skew_target_count(n_loc, n_txids, n_inwit_loc, prune_inwit_mode) else {
+        return Ok(());
+    };
+    rbitcoin_log::warn!(
+        "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
+         txid.body={n_txids} — truncating to {n}"
+    );
+    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_inwit_mode)?;
+    class_a_skew_apply_truncate(&stems, n, n_txids, tx_end, sp_end, in_end, prune_inwit_mode)?;
+    class_a_skew_assert_aligned(&stems, prune_inwit_mode)
 }
 
 impl TxTable {
