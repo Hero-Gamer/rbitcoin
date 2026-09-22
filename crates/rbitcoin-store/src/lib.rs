@@ -24,6 +24,7 @@ pub mod head_resolve_stats;
 mod header_table;
 mod height_fence;
 mod idx_body_pipeline;
+mod inputs;
 mod int_map;
 mod integrity;
 mod io_backend;

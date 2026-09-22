@@ -209,6 +209,21 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
     ))
 }
 
+fn input_edges(ins: &[InputRecord]) -> Vec<crate::inputs::InputEdge> {
+    ins.iter()
+        .map(|inp| {
+            if inp.is_coinbase() {
+                crate::inputs::InputEdge::coinbase()
+            } else {
+                crate::inputs::InputEdge {
+                    parent: inp.create_fk,
+                    vout: inp.prev_index,
+                }
+            }
+        })
+        .collect()
+}
+
 fn txstat_placeholder(n_in: u32) -> crate::txstat::TxStatRow {
     crate::txstat::TxStatRow {
         n_in,
@@ -434,6 +449,8 @@ pub struct TxTable {
     pub(crate) txids: crate::txid_body::TxidBody,
     /// Dense create_fk-ordered confirm-time econ (schema 25).
     pub(crate) txstat: crate::txstat::TxStat,
+    /// Spender → parent edges (`inputs.loc` / `inputs.body`).
+    pub(crate) inputs: crate::inputs::Inputs,
     /// Datadir secret: keyed head probes + script XOR (schema 12+).
     pub(crate) secret: crate::store_secret::StoreSecret,
     /// Unflushed head inserts (write-behind). Readers see published snapshot.
@@ -513,6 +530,7 @@ struct ClassASkewStems<'a> {
     inwit: &'a VarTable,
     txids: &'a crate::txid_body::TxidBody,
     txstat: &'a crate::txstat::TxStat,
+    inputs: &'a crate::inputs::Inputs,
 }
 
 fn class_a_skew_target_count(
@@ -591,6 +609,9 @@ fn class_a_skew_apply_truncate(
     }
     if stems.txstat.count() > n {
         stems.txstat.truncate_to_count(n)?;
+    }
+    if stems.inputs.count() > n {
+        stems.inputs.truncate_to_count(n)?;
     }
     Ok(())
 }
@@ -684,6 +705,7 @@ impl TxTable {
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
             txstat: crate::txstat::TxStat::create(dir)?,
+            inputs: crate::inputs::Inputs::create(dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
@@ -790,6 +812,13 @@ impl TxTable {
             crate::txid_body::TxidBody::create(dir)?
         };
         let txstat = crate::txstat::TxStat::open(dir)?;
+        let inputs = if dir.join("inputs.loc").exists() {
+            crate::inputs::Inputs::open(dir)?
+        } else if dir.join("inputs.body").exists() || dir.join("inputs.off").exists() {
+            return Err(StoreError::Corrupt("invariant: inputs stems partial"));
+        } else {
+            crate::inputs::Inputs::create(dir)?
+        };
         repair_class_a_count_skew(
             ClassASkewStems {
                 create_loc: &create_loc,
@@ -799,6 +828,7 @@ impl TxTable {
                 inwit: &inwit,
                 txids: &txids,
                 txstat: &txstat,
+                inputs: &inputs,
             },
             prune_inwit_mode,
         )?;
@@ -881,6 +911,7 @@ impl TxTable {
             head,
             txids,
             txstat,
+            inputs,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
@@ -889,6 +920,13 @@ impl TxTable {
         };
         if n_bodies > 0 {
             let _ = t.txstat.n_in_at(Fk(1))?;
+        }
+        if t.inputs.count() < n_bodies {
+            t.inputs.append_unstamped(n_bodies - t.inputs.count())?;
+        } else if t.inputs.count() > n_bodies {
+            return Err(StoreError::Corrupt(
+                "invariant: inputs.loc ahead of create.loc",
+            ));
         }
         if need_rebuild {
             let bits = t.head_bits();
@@ -1993,6 +2031,7 @@ impl TxTable {
         if (!self.prune_inwit_mode() && self.inwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
+            || self.inputs.count() != base
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
@@ -2025,6 +2064,9 @@ impl TxTable {
         if !tails.is_empty() {
             return Err(StoreError::Corrupt("txstat overflow needs header blob"));
         }
+        let edges: Vec<Vec<crate::inputs::InputEdge>> =
+            items.iter().map(|(_, ins, _)| input_edges(ins)).collect();
+        self.inputs.append(&edges)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()
@@ -2085,6 +2127,7 @@ impl TxTable {
         if (!self.prune_inwit_mode() && self.inwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
+            || self.inputs.count() != base
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
@@ -2126,6 +2169,9 @@ impl TxTable {
         let tails = self.txstat.append_batch(base, txstat)?;
         self.txstat
             .put_overflows_for_headers(header_ranges, &tails)?;
+        let edges: Vec<Vec<crate::inputs::InputEdge>> =
+            items.iter().map(|(_, ins)| input_edges(ins)).collect();
+        self.inputs.append(&edges)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()

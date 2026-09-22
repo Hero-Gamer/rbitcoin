@@ -292,6 +292,8 @@ the hot volume.
 | 19 | txstat (`txstat.body`, 8 B/create) |
 | 20 | txstat overflow (`txstat.ovf`) |
 | 21 | txstat per-header locator (`txstat.blk`, 16 B/header) |
+| 22 | inputs (`inputs.body`, 8 B/input) |
+| 23 | inputs loc (`inputs.loc`, 2 B/create `n_in`) |
 
 ---
 
@@ -381,6 +383,16 @@ only a confirm stamp can emit tails. Blob entries are `u16 index_in_block` +
 extends zeros to loc count (~11.3 GiB at the 2026-08-13 census if fully allocated).
 Pin / SH / tweaks do **not** open these files. Unreleased leftover `txfixed.body`
 is unlinked on open.
+
+### Spender → parent edges (`inputs.body`, schema 25)
+
+```text
+inputs.off   ArrayLink: per 1024 creates, u64 file offset of the next window's first input
+inputs.loc   2 B/create: n_in as u16 LE. 0 = unstamped
+inputs.body  8 B × input, vin order
+```
+
+`n_in > u16::MAX` is Corrupt (no `inputs.loc.ovf`). A coinbase is `n_in == 1` and one null edge. Body record: parent `create_fk` as u40 LE (`0` = coinbase), then parent vout as u24 LE. `fk ≥ 2^40` or `vout ≥ 2^24` is Corrupt. The spending `vin` is the record index. Prefix-sum of `n_in` from the window checkpoint is the body offset (`8 × inputs_before`). Confirm wiring and the move of `n_in` off `txstat.body` land with the rest of this unreleased 25 amendment.
 
 ### Split bodies (schema 15)
 

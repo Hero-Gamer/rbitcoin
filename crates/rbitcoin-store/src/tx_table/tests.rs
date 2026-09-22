@@ -254,6 +254,15 @@ fn prevouts_use_txstat_n_in_without_full_txout() {
     assert_eq!(prevs.len(), 2);
     assert_eq!(prevs[0], (Fk::NULL, u32::MAX));
     assert_eq!(prevs[1], (Fk(1), 0));
+    let edges = t.inputs.edges(fk).unwrap().unwrap();
+    assert_eq!(edges[0], crate::inputs::InputEdge::coinbase());
+    assert_eq!(
+        edges[1],
+        crate::inputs::InputEdge {
+            parent: Fk(1),
+            vout: 0,
+        }
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

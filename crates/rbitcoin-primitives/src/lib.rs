@@ -291,6 +291,10 @@ pub enum TableKind {
     TxStatOvf = 20,
     /// Per-header overflow locator (`txstat.blk`, 16 B/header).
     TxStatBlk = 21,
+    /// Spender → parent edges (`inputs.body`, 8 B/input).
+    Inputs = 22,
+    /// Per-create `n_in` (`inputs.loc`, 2 B/create).
+    InputsLoc = 23,
 }
 
 impl TableKind {
@@ -315,6 +319,8 @@ impl TableKind {
             19 => Some(TableKind::TxStat),
             20 => Some(TableKind::TxStatOvf),
             21 => Some(TableKind::TxStatBlk),
+            22 => Some(TableKind::Inputs),
+            23 => Some(TableKind::InputsLoc),
             _ => None,
         }
     }
@@ -392,6 +398,8 @@ mod tests {
         assert_eq!(TableKind::TxStat.as_u16(), 19);
         assert_eq!(TableKind::TxStatOvf.as_u16(), 20);
         assert_eq!(TableKind::TxStatBlk.as_u16(), 21);
+        assert_eq!(TableKind::Inputs.as_u16(), 22);
+        assert_eq!(TableKind::InputsLoc.as_u16(), 23);
     }
 
     #[test]
