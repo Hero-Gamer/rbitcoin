@@ -544,5 +544,5 @@ Every new production behavior must have a demonstrable killer appropriate to its
 **First-commit gate:**
 ```bash
 git diff origin/master.. --unified=0 > /tmp/pr.diff
-cargo test -p <crate> --lib
-cargo mutants -p <crate> --in-diff /tmp/pr.diff -q
+cargo test -p <crate> --lib -- --quiet
+cargo mutants -p <crate> --in-diff /tmp/pr.diff -j2 -- --skip core -q

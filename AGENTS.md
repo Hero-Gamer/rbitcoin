@@ -125,8 +125,8 @@ Playbooks:
 - Core functional harness:
   [`.agents/skills/core-functional/SKILL.md`](.agents/skills/core-functional/SKILL.md).
 
-# Hard Rules — Mutation-Gated Testing
-- Every new production behavior must have a demonstrable killer: test/journey/check + exact observable assertion that fails when behavior is removed/inverted. Name alone is not proof.
+
+- **Mutation-gated testing:** Every new production behavior must have a demonstrable killer: test/journey/check + exact observable assertion that fails when behavior is removed/inverted. Name alone is not proof.
 - Assert observable state, not implementation text.
 - Mutation survivors must be classified: 0 / irrelevant with reason / killed by journey with demonstration / Tier4 fixture. "CI passed" alone is insufficient.
 - Specialized / property tests cover behavior classes `cargo-mutants` cannot model well (concurrency, ordering, cancellation, time).
