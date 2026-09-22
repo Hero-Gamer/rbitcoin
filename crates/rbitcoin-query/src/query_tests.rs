@@ -2682,7 +2682,7 @@ fn stamp_txstat_from_block_coinbase_and_spend() {
     let b0 = q.reconstruct_archived_block(&hash0).unwrap().unwrap();
     q.stamp_txstat_from_block(Height(0), &b0).unwrap();
     let row0 = q.txstat_row(fk0).unwrap().expect("stamped coinbase");
-    assert_eq!(q.store().inputs_n_in(fk0).unwrap(), Some(1));
+    assert_eq!(q.store().input_n_in(fk0).unwrap(), Some(1));
     assert_eq!(row0.fee_sat, 0);
     assert_eq!(row0.size() as usize, b0.txdata[0].total_size());
 
@@ -2715,7 +2715,7 @@ fn stamp_txstat_from_block_coinbase_and_spend() {
     let b1 = q.reconstruct_archived_block(&h1.hash).unwrap().unwrap();
     q.stamp_txstat_from_block(Height(1), &b1).unwrap();
     let foreign_row = q.txstat_row(fks1[1]).unwrap().expect("stamped spend");
-    assert_eq!(q.store().inputs_n_in(fks1[1]).unwrap(), Some(1));
+    assert_eq!(q.store().input_n_in(fks1[1]).unwrap(), Some(1));
     assert_eq!(foreign_row.fee_sat, 1_0000_0000);
     let _ = std::fs::remove_dir_all(&dir);
 }

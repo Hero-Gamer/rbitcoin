@@ -195,7 +195,7 @@ fn put_full_batch_writes_txstat_and_reopen() {
         crate::txstat::parse_cell(t.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
         crate::txstat::CellParse::Unstamped
     );
-    assert_eq!(t.inputs.n_in(Fk(1)).unwrap(), Some(1));
+    assert_eq!(t.input.n_in(Fk(1)).unwrap(), Some(1));
     drop(t);
     let t2 = TxTable::open_tiny(&dir).unwrap();
     assert_eq!(t2.count(), 1);
@@ -205,7 +205,7 @@ fn put_full_batch_writes_txstat_and_reopen() {
         crate::txstat::parse_cell(t2.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
         crate::txstat::CellParse::Unstamped
     );
-    assert_eq!(t2.inputs.n_in(Fk(1)).unwrap(), Some(1));
+    assert_eq!(t2.input.n_in(Fk(1)).unwrap(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -249,11 +249,11 @@ fn prevouts_use_txstat_n_in_without_full_txout() {
     assert_eq!(prevs.len(), 2);
     assert_eq!(prevs[0], (Fk::NULL, u32::MAX));
     assert_eq!(prevs[1], (Fk(1), 0));
-    let edges = t.inputs.edges(fk).unwrap().unwrap();
-    assert_eq!(edges[0], crate::inputs::InputEdge::coinbase());
+    let edges = t.input.edges(fk).unwrap().unwrap();
+    assert_eq!(edges[0], crate::input::InputEdge::coinbase());
     assert_eq!(
         edges[1],
-        crate::inputs::InputEdge {
+        crate::input::InputEdge {
             parent: Fk(1),
             vout: 0,
         }
@@ -295,7 +295,7 @@ fn new_create_txout_meta_omits_n_in() {
     assert_eq!(n, 1, "v1 locktime 0 omit n_in is one flag byte");
     assert_eq!(meta.input_count, 0);
     let (got, gouts) = t.get_meta_and_outputs(fk).unwrap();
-    assert_eq!(got.input_count, 1, "inputs.loc fills n_in");
+    assert_eq!(got.input_count, 1, "input.loc fills n_in");
     assert_eq!(gouts.len(), 1);
     let leftover = [0x89u8, 0x01];
     let (old, on) = decode_body_meta_v17(&leftover).unwrap();
@@ -306,11 +306,11 @@ fn new_create_txout_meta_omits_n_in() {
 
 #[test]
 fn reopen_without_inputs_refuses_new_seqsigwit() {
-    let dir = tempfile_dir("inputs-backfill");
+    let dir = tempfile_dir("input-backfill");
     let t = create_tiny(&dir);
     let _fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
     drop(t);
-    for name in ["inputs.loc", "inputs.off", "inputs.body"] {
+    for name in ["input.loc", "input.off", "input.body"] {
         std::fs::remove_file(dir.join(name)).unwrap();
     }
     match TxTable::open_tiny(&dir) {
@@ -322,8 +322,8 @@ fn reopen_without_inputs_refuses_new_seqsigwit() {
 }
 
 #[test]
-fn inputs_n_in_scans_both_prevouts() {
-    let dir = tempfile_dir("inputs-nin-prevouts");
+fn input_n_in_scans_both_prevouts() {
+    let dir = tempfile_dir("input-nin-prevouts");
     let t = create_tiny(&dir);
     let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
     t.txstat
@@ -339,7 +339,7 @@ fn inputs_n_in_scans_both_prevouts() {
     let (meta, prevs) = t.get_meta_and_prevouts(fk).unwrap();
     assert_eq!(meta.input_count, 2);
     assert_eq!(prevs.len(), 2);
-    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
+    assert_eq!(t.input.n_in(fk).unwrap(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -720,8 +720,8 @@ fn scan_packed_meta_and_prevouts_no_output_alloc() {
         Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
     ));
     let edges = vec![
-        crate::inputs::InputEdge::coinbase(),
-        crate::inputs::InputEdge {
+        crate::input::InputEdge::coinbase(),
+        crate::input::InputEdge {
             parent: Fk(1),
             vout: 1,
         },
@@ -1837,12 +1837,12 @@ fn input_run_roundtrip() {
     assert_eq!(dec[1].witness, vec![vec![0xab]]);
     assert_eq!(dec[1].prev_txid, [0u8; 32]);
     let edges = [
-        crate::inputs::InputEdge::coinbase(),
-        crate::inputs::InputEdge {
+        crate::input::InputEdge::coinbase(),
+        crate::input::InputEdge {
             parent: Fk(1),
             vout: 0,
         },
-        crate::inputs::InputEdge {
+        crate::input::InputEdge {
             parent: Fk(1),
             vout: 3,
         },

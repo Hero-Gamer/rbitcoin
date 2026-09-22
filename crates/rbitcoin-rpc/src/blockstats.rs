@@ -595,7 +595,7 @@ fn stats_for_stamped(
                 let n = ctx
                     .query
                     .store()
-                    .inputs_n_in(fk)
+                    .input_n_in(fk)
                     .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
                     .unwrap_or(0);
                 v.push(n);

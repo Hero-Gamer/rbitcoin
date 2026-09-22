@@ -708,8 +708,8 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **25** | Open. Leftover `inwit.*` is renamed to `seqsigwit.*`. Missing `inputs.loc` with a matching `seqsigwit` count backfills parent edges from those prevouts. |
-| **24** | Rewrite `meta` to 25, then create/extend zeroed `txstat.body` to `create.loc` count (no `txout.body` rewrite). Same `inwit` rename and `inputs` backfill as 25. Unlink leftover `txfixed.body`. |
+| **25** | Open. Leftover `inwit.*` is renamed to `seqsigwit.*`. Missing `input.loc` with a matching `seqsigwit` count backfills parent edges from those prevouts. Leftover `inputs.*` is renamed to `input.*`. |
+| **24** | Rewrite `meta` to 25, then create/extend zeroed `txstat.body` to `create.loc` count (no `txout.body` rewrite). Same `inwit` rename and `input` backfill as 25. Unlink leftover `txfixed.body`. |
 | **23** | Rewrite `meta` to 25 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. Zero-extend `txstat.body`. |
 | **22**, occupied Class A | Rewrite `meta` to 25 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 25 `meta` + old ovf/header; this binary retries those file rewrites. Zero-extend `txstat.body`. |
 | **22**, empty Class A | Rewrite `meta` to 25, then open. |

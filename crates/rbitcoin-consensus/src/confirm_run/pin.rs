@@ -289,11 +289,7 @@ fn denserels_by_stamped_range(
                     )))?;
         }
         if tx.input_count == 0 {
-            if let Some(n) = query
-                .store()
-                .inputs_n_in(fk)
-                .map_err(ConsensusError::from)?
-            {
+            if let Some(n) = query.store().input_n_in(fk).map_err(ConsensusError::from)? {
                 tx.input_count = n;
             }
         }

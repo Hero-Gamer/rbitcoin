@@ -81,9 +81,9 @@ pub mod input_flags {
     /// Empty witness stack
     pub const EMPTY_WITNESS: u8 = 1 << 2;
     /// Legacy coinbase: no inline `create_fk` payload; `prev_index` is `u32::MAX`.
-    /// New records leave the parent edge on `inputs.body` and set [`PREV_ON_INPUTS`] instead.
+    /// New records leave the parent edge on `input.body` and set [`PREV_ON_INPUTS`] instead.
     pub const NULL_PREV: u8 = 1 << 3;
-    /// Parent `create_fk` and vout are not in this record. They live on `inputs.body`.
+    /// Parent `create_fk` and vout are not in this record. They live on `input.body`.
     /// Bit 4 was v9 `LOCAL_PREV`, then reserved.
     pub const PREV_ON_INPUTS: u8 = 1 << 4;
     /// Bits 5–7 reserved (schema 17 freeze). Reject so a later Δfk writer

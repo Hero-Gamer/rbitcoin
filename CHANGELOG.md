@@ -105,10 +105,10 @@ before 1.0).
 
 - **Schema 25 econ stems:** `txstat.body` stays 8 B/create: three ULEBs
   (`fee_sat`/`base`/`wit_extra`) plus per-header remaining-byte overflow.
-  `n_in` is `inputs.loc` (u16). `inputs.body` is the parent edge (create fk
+  `n_in` is `input.loc` (u16). `input.body` is the parent edge (create fk
   and vout) per input. `seqsigwit` is the old `inwit` stem (sequence,
-  scriptSig, witness); open renames those files. `txstat.*` and `inputs.*`
-  sit next to `seqsigwit` (cold when split). Open with no `inputs.loc`
+  scriptSig, witness); open renames those files. `txstat.*` and `input.*`
+  sit next to `seqsigwit` (cold when split). Open with no `input.loc`
   backfills the edges from `seqsigwit` prevouts. A four-ULEB cell that
   started with `n_in` is not rewritten; resync that datadir. Occupied 24
   open rewrites `meta` and zero-extends `txstat.body` (no `txout.body`

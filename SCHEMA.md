@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
 **Version:** `SCHEMA_VERSION = 25` (`rbitcoin_primitives`).  
-**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `fee_sat`/`base`/`wit_extra`; `n_in` is `inputs.loc`;
+**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `fee_sat`/`base`/`wit_extra`; `n_in` is `input.loc`;
 per-header remaining-byte overflow in `txstat.ovf` + `txstat.blk`). Occupied
 24 rewrites `meta` and zero-extends `txstat.body` to `create.loc` count (**no**
 `txout.body` rewrite; leftover LAYOUT17 still has uleb `input_count`). Unreleased
@@ -292,8 +292,8 @@ the hot volume.
 | 19 | txstat (`txstat.body`, 8 B/create) |
 | 20 | txstat overflow (`txstat.ovf`) |
 | 21 | txstat per-header locator (`txstat.blk`, 16 B/header) |
-| 22 | inputs (`inputs.body`, 8 B/input) |
-| 23 | inputs loc (`inputs.loc`, 2 B/create `n_in`) |
+| 22 | inputs (`input.body`, 8 B/input) |
+| 23 | inputs loc (`input.loc`, 2 B/create `n_in`) |
 
 ---
 
@@ -370,7 +370,7 @@ txstat.blk   offset 32+(header_fk-1)×16 — off:u64, len:u32, n_ovf:u32
 ```
 
 Cell payload is three canonical ULEBs: `fee_sat`, `base` (non-witness
-size), `wit_extra` (`total_size − base`). `n_in` is `inputs.loc` (u16). Readers
+size), `wit_extra` (`total_size − base`). `n_in` is `input.loc` (u16). Readers
 derive `size = base + wit_extra` and `weight = 4×base + wit_extra`. All-zero
 cell = unstamped. A truncated ULEB or fewer than three fields means the rest
 of the stream is in that header's overflow blob (`encoded[8..]` only). Missing
@@ -385,15 +385,15 @@ extends zeros to loc count (~11.3 GiB at the 2026-08-13 census if fully alloca
 Pin / SH / tweaks do **not** open these files. Unreleased leftover `txfixed.body`
 is unlinked on open.
 
-### Spender → parent edges (`inputs.body`, schema 25)
+### Spender → parent edges (`input.body`, schema 25)
 
 ```text
-inputs.off   ArrayLink: per 1024 creates, u64 file offset of the next window's first input
-inputs.loc   2 B/create: n_in as u16 LE. 0 = unstamped
-inputs.body  8 B × input, vin order
+input.off   ArrayLink: per 1024 creates, u64 file offset of the next window's first input
+input.loc   2 B/create: n_in as u16 LE. 0 = unstamped
+input.body  8 B × input, vin order
 ```
 
-`n_in > u16::MAX` is Corrupt (no `inputs.loc.ovf`). A coinbase is `n_in == 1` and one null edge. Body record: parent `create_fk` as u40 LE (`0` = coinbase), then parent vout as u24 LE. `fk ≥ 2^40` or `vout ≥ 2^24` is Corrupt. A null parent with nonzero vout is Corrupt. The spending `vin` is the record index. Prefix-sum of `n_in` from the window checkpoint is the body offset (`8 × inputs_before`). Confirm appends these rows with Class A. Open with creates, no `inputs.loc`, and a `seqsigwit` count that matches `create.loc` walks `seqsigwit.body` with `decode_prevout_at` (prevout only) and writes the edges. A null parent in that payload is the coinbase edge (`vout` 0). `inputs` and `txstat` are not pruned.
+`n_in > u16::MAX` is Corrupt (no `input.loc.ovf`). A coinbase is `n_in == 1` and one null edge. Body record: parent `create_fk` as u40 LE (`0` = coinbase), then parent vout as u24 LE. `fk ≥ 2^40` or `vout ≥ 2^24` is Corrupt. A null parent with nonzero vout is Corrupt. The spending `vin` is the record index. Prefix-sum of `n_in` from the window checkpoint is the body offset (`8 × edges before this window`). Confirm appends these rows with Class A. Open with creates, no `input.loc`, and a `seqsigwit` count that matches `create.loc` walks `seqsigwit.body` with `decode_prevout_at` (prevout only) and writes the edges. A null parent in that payload is the coinbase edge (`vout` 0). `input` and `txstat` are not pruned.
 
 ### Split bodies (schema 15)
 
@@ -406,7 +406,7 @@ seqsigwit.body Sw:  per-input flags|seq?|script_sig?|witness?
 spent.body Ss:  8 B × n_out  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
 ```
 
-New records set flag bit 4 (`PREV_ON_INPUTS`) and do not store parent `create_fk` or vout; that edge is `inputs.body`. A record without bit 4 is the legacy inline prevout (`NULL_PREV`, or `create_fk:u64` plus CompactSize vout). Open backfill of a missing `inputs.loc` still reads those legacy records. Empty seqsigwit: **8-byte zero pad** so loc strides stay strictly monotone.
+New records set flag bit 4 (`PREV_ON_INPUTS`) and do not store parent `create_fk` or vout; that edge is `input.body`. A record without bit 4 is the legacy inline prevout (`NULL_PREV`, or `create_fk:u64` plus CompactSize vout). Open backfill of a missing `input.loc` still reads those legacy records. Empty seqsigwit: **8-byte zero pad** so loc strides stay strictly monotone.
 Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `seqsigwit`. First-wave Outs reads stay on the starting
 OS page unless `4+(max_need+1)×38` (LAYOUT17 meta + kind + 5 B uleb amount + P2TR;
@@ -429,7 +429,7 @@ Decode walks meta + runs to a logical end; any remaining bytes in the loc span m
 **Body meta (schema 22 LAYOUT17, variable):** first byte bit 7 = `LAYOUT17`
 (required). Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 =
 locktime 0 (else uleb locktime). Bit 4 (`N_IN_TXSTAT`) omits the following
-uleb `input_count` (`n_in` is on `inputs.loc`; decode reports 0 until a
+uleb `input_count` (`n_in` is on `input.loc`; decode reports 0 until a
 reader fills from that locator). Bits 5–6 reserved (nonzero → Corrupt).
 New 25 writes omit the uleb (v2+locktime 0 is **1 B**). Leftover 24 rows
 keep the uleb (typical v2+locktime 0 is **2 B**).

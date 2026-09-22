@@ -105,12 +105,12 @@ impl PackedCreate for std::sync::Arc<(TxRecord, Vec<OutputRecord>)> {
 /// Class A input + BIP141 witness.
 ///
 /// `seqsigwit` stores sequence, scriptSig, and witness. The parent edge is
-/// `inputs.body`. New records set [`input_flags::PREV_ON_INPUTS`] and omit
+/// `input.body`. New records set [`input_flags::PREV_ON_INPUTS`] and omit
 /// `create_fk` and vout. A record without that bit is the legacy layout:
 /// coinbase `NULL_PREV`, otherwise `create_fk:u64` LE plus CompactSize vout.
 ///
 /// [`Self::prev_txid`] is a soft cache for wire rebuild. Encoding never writes it.
-/// [`Self::create_fk`] on a new record is filled from `inputs.body` after decode.
+/// [`Self::create_fk`] on a new record is filled from `input.body` after decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRecord {
     /// Soft: wire txid of parent create (`[0;32]` if unknown / coinbase).
@@ -605,13 +605,13 @@ fn read_inline_prevout(
     Ok(Some((Fk(id), vout as u32)))
 }
 
-/// Fill `create_fk` and `prev_index` from `inputs.body`. Coinbase edge → null prevout.
+/// Fill `create_fk` and `prev_index` from `input.body`. Coinbase edge → null prevout.
 pub fn apply_input_edges(
     ins: &mut [InputRecord],
-    edges: &[crate::inputs::InputEdge],
+    edges: &[crate::input::InputEdge],
 ) -> Result<(), StoreError> {
     if ins.len() != edges.len() {
-        return Err(StoreError::Corrupt("inputs edge count"));
+        return Err(StoreError::Corrupt("input edge count"));
     }
     for (inp, edge) in ins.iter_mut().zip(edges.iter()) {
         if edge.parent.is_null() {
@@ -626,7 +626,7 @@ pub fn apply_input_edges(
 }
 
 /// Prevouts in the shape [`scan_seqsigwit_prevouts`] returns. Coinbase → `(NULL, u32::MAX)`.
-pub fn prevouts_from_edges(edges: &[crate::inputs::InputEdge]) -> Vec<(Fk, u32)> {
+pub fn prevouts_from_edges(edges: &[crate::input::InputEdge]) -> Vec<(Fk, u32)> {
     edges
         .iter()
         .map(|e| {

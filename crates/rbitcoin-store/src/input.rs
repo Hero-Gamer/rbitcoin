@@ -1,8 +1,8 @@
-//! Spender → parent edges (`inputs.loc` / `inputs.off` / `inputs.body`).
+//! Spender → parent edges (`input.loc` / `input.off` / `input.body`).
 //!
-//! `inputs.loc` is `n_in` as u16 LE per create (`0` = unstamped). `inputs.body`
+//! `input.loc` is `n_in` as u16 LE per create (`0` = unstamped). `input.body`
 //! is 8 bytes per input in vin order: parent `create_fk` u40 LE, parent vout
-//! u24 LE. `inputs.off` checkpoints the body file offset at each 1024-create
+//! u24 LE. `input.off` checkpoints the body file offset at each 1024-create
 //! window after the first.
 
 use crate::delta_loc::{loc_window, loc_within, LOC_WINDOW};
@@ -36,13 +36,13 @@ impl InputEdge {
 
     pub fn pack(self) -> Result<[u8; 8], StoreError> {
         if self.parent.0 >= FK_LIMIT {
-            return Err(StoreError::Corrupt("inputs create_fk"));
+            return Err(StoreError::Corrupt("input create_fk"));
         }
         if self.vout >= VOUT_LIMIT {
-            return Err(StoreError::Corrupt("inputs vout"));
+            return Err(StoreError::Corrupt("input vout"));
         }
         if self.parent.is_null() && self.vout != 0 {
-            return Err(StoreError::Corrupt("inputs coinbase vout"));
+            return Err(StoreError::Corrupt("input coinbase vout"));
         }
         let mut b = [0u8; 8];
         let fk = self.parent.0.to_le_bytes();
@@ -61,13 +61,13 @@ impl InputEdge {
         let vout = u32::from(b[5]) | (u32::from(b[6]) << 8) | (u32::from(b[7]) << 16);
         let edge = Self { parent, vout };
         if parent.is_null() && vout != 0 {
-            return Err(StoreError::Corrupt("inputs coinbase vout"));
+            return Err(StoreError::Corrupt("input coinbase vout"));
         }
         Ok(edge)
     }
 }
 
-pub struct Inputs {
+pub struct Input {
     loc: TableFile,
     off: TableFile,
     body: TableFile,
@@ -77,12 +77,12 @@ pub struct Inputs {
     body_end: AtomicU64,
 }
 
-impl Inputs {
+impl Input {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            loc: TableFile::create(dir.join("inputs.loc"), TableKind::InputsLoc)?,
-            off: TableFile::create(dir.join("inputs.off"), TableKind::ArrayLink)?,
-            body: TableFile::create(dir.join("inputs.body"), TableKind::Inputs)?,
+            loc: TableFile::create(dir.join("input.loc"), TableKind::InputLoc)?,
+            off: TableFile::create(dir.join("input.off"), TableKind::ArrayLink)?,
+            body: TableFile::create(dir.join("input.body"), TableKind::Input)?,
             checkpoints: RwLock::new(Vec::new()),
             count: AtomicU64::new(0),
             body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
@@ -90,23 +90,23 @@ impl Inputs {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let loc = TableFile::open(dir.join("inputs.loc"), TableKind::InputsLoc)?;
-        let off = TableFile::open(dir.join("inputs.off"), TableKind::ArrayLink)?;
-        let body = TableFile::open(dir.join("inputs.body"), TableKind::Inputs)?;
+        let loc = TableFile::open(dir.join("input.loc"), TableKind::InputLoc)?;
+        let off = TableFile::open(dir.join("input.off"), TableKind::ArrayLink)?;
+        let body = TableFile::open(dir.join("input.body"), TableKind::Input)?;
         let loc_data = loc.data_len();
         if loc_data % LOC_SLOT != 0 {
-            return Err(StoreError::Corrupt("invariant: inputs.loc size"));
+            return Err(StoreError::Corrupt("invariant: input.loc size"));
         }
         let count = loc_data / LOC_SLOT;
         let n_win = count / LOC_WINDOW;
         if off.data_len() != n_win * OFF_SLOT {
-            return Err(StoreError::Corrupt("invariant: inputs.off size"));
+            return Err(StoreError::Corrupt("invariant: input.off size"));
         }
         let body_len = body.logical_len();
         if body_len < FILE_HEADER_LEN as u64
             || !(body_len - FILE_HEADER_LEN as u64).is_multiple_of(REC_LEN)
         {
-            return Err(StoreError::Corrupt("invariant: inputs.body size"));
+            return Err(StoreError::Corrupt("invariant: input.body size"));
         }
         let mut checkpoints = vec![0u64; n_win as usize];
         if n_win > 0 {
@@ -166,7 +166,7 @@ impl Inputs {
         let mut body_at = self.body_end.load(Ordering::Acquire);
         for (i, edges) in txs.iter().enumerate() {
             if edges.len() > usize::from(u16::MAX) {
-                return Err(StoreError::Corrupt("inputs n_in"));
+                return Err(StoreError::Corrupt("input n_in"));
             }
             let n_in = edges.len() as u16;
             let fk = base + 1 + i as u64;
@@ -189,7 +189,7 @@ impl Inputs {
             {
                 let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
                 if new_offs[0].0 as usize != cps.len() {
-                    return Err(StoreError::Corrupt("invariant: inputs.off index"));
+                    return Err(StoreError::Corrupt("invariant: input.off index"));
                 }
             }
             let mut blob = Vec::with_capacity(new_offs.len() * OFF_SLOT as usize);
@@ -201,7 +201,7 @@ impl Inputs {
             let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             for &(w, abs) in &new_offs {
                 if w as usize != cps.len() {
-                    return Err(StoreError::Corrupt("invariant: inputs.off index"));
+                    return Err(StoreError::Corrupt("invariant: input.off index"));
                 }
                 cps.push(abs);
             }
@@ -211,7 +211,7 @@ impl Inputs {
         let last = Fk(base + txs.len() as u64);
         let wrote = self.edges(last)?.map(|v| v.len()).unwrap_or(0);
         if wrote != txs.last().map(|e| e.len()).unwrap_or(0) {
-            return Err(StoreError::Corrupt("invariant: inputs n_in"));
+            return Err(StoreError::Corrupt("invariant: input n_in"));
         }
         Ok(())
     }
@@ -248,7 +248,7 @@ impl Inputs {
             let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
             for &(w, abs) in &new_offs {
                 if w as usize != cps.len() {
-                    return Err(StoreError::Corrupt("invariant: inputs.off index"));
+                    return Err(StoreError::Corrupt("invariant: input.off index"));
                 }
                 cps.push(abs);
             }
@@ -260,7 +260,7 @@ impl Inputs {
     pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
         let cur = self.count.load(Ordering::Acquire);
         if new_count > cur {
-            return Err(StoreError::Corrupt("inputs.loc truncate past count"));
+            return Err(StoreError::Corrupt("input.loc truncate past count"));
         }
         if new_count == cur {
             return Ok(());
@@ -276,7 +276,7 @@ impl Inputs {
         let body_end = self.body_end.load(Ordering::Acquire);
         let new_body = body_end - n_drop * REC_LEN;
         if new_body < FILE_HEADER_LEN as u64 {
-            return Err(StoreError::Corrupt("invariant: inputs.body truncate"));
+            return Err(StoreError::Corrupt("invariant: input.body truncate"));
         }
         self.loc
             .set_logical_len(FILE_HEADER_LEN as u64 + new_count * LOC_SLOT)?;
@@ -318,7 +318,7 @@ impl Inputs {
         } else {
             let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
             *cps.get((w - 1) as usize)
-                .ok_or(StoreError::Corrupt("invariant: inputs.off checkpoint"))?
+                .ok_or(StoreError::Corrupt("invariant: input.off checkpoint"))?
         };
         if within == 0 {
             return Ok(base);
@@ -354,13 +354,13 @@ mod tests {
             vout: 0,
         }
         .pack();
-        assert!(matches!(err, Err(StoreError::Corrupt("inputs create_fk"))));
+        assert!(matches!(err, Err(StoreError::Corrupt("input create_fk"))));
         let err = InputEdge {
             parent: Fk(1),
             vout: VOUT_LIMIT,
         }
         .pack();
-        assert!(matches!(err, Err(StoreError::Corrupt("inputs vout"))));
+        assert!(matches!(err, Err(StoreError::Corrupt("input vout"))));
         let err = InputEdge {
             parent: Fk::NULL,
             vout: 1,
@@ -368,14 +368,14 @@ mod tests {
         .pack();
         assert!(matches!(
             err,
-            Err(StoreError::Corrupt("inputs coinbase vout"))
+            Err(StoreError::Corrupt("input coinbase vout"))
         ));
     }
 
     #[test]
     fn roundtrip_coinbase_and_parents_across_reopen() {
-        let dir = TempDir::labeled("inputs-rt").unwrap();
-        let t = Inputs::create(dir.path()).unwrap();
+        let dir = TempDir::labeled("input-rt").unwrap();
+        let t = Input::create(dir.path()).unwrap();
         t.append(&[
             vec![InputEdge::coinbase()],
             vec![edge(1, 0), edge(1, 3)],
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(t.n_in(Fk(3)).unwrap(), None);
         assert!(t.edges(Fk(3)).unwrap().is_none());
         drop(t);
-        let t = Inputs::open(dir.path()).unwrap();
+        let t = Input::open(dir.path()).unwrap();
         assert_eq!(t.count(), 3);
         assert_eq!(
             t.edges(Fk(2)).unwrap().unwrap(),
@@ -411,8 +411,8 @@ mod tests {
 
     #[test]
     fn window_checkpoint_serves_create_1025() {
-        let dir = TempDir::labeled("inputs-win").unwrap();
-        let t = Inputs::create(dir.path()).unwrap();
+        let dir = TempDir::labeled("input-win").unwrap();
+        let t = Input::create(dir.path()).unwrap();
         let one = vec![edge(7, 1)];
         let batch = vec![one; 1025];
         t.append(&batch).unwrap();
@@ -420,15 +420,15 @@ mod tests {
         assert_eq!(t.edges(Fk(1024)).unwrap().unwrap(), vec![edge(7, 1)]);
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(7, 1)]);
         drop(t);
-        let t = Inputs::open(dir.path()).unwrap();
+        let t = Input::open(dir.path()).unwrap();
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(7, 1)]);
         assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(1));
     }
 
     #[test]
     fn append_unstamped_is_zero_n_in_until_a_later_edge() {
-        let dir = TempDir::labeled("inputs-unstamped").unwrap();
-        let t = Inputs::create(dir.path()).unwrap();
+        let dir = TempDir::labeled("input-unstamped").unwrap();
+        let t = Input::create(dir.path()).unwrap();
         t.append_unstamped(0).unwrap();
         assert_eq!(t.count(), 0);
         t.append_unstamped(3).unwrap();
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(t.count(), 2049);
         assert_eq!(t.n_in(Fk(2049)).unwrap(), None);
         drop(t);
-        let t = Inputs::open(dir.path()).unwrap();
+        let t = Input::open(dir.path()).unwrap();
         assert_eq!(t.count(), 2049);
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
         assert_eq!(t.n_in(Fk(1)).unwrap(), None);
@@ -452,19 +452,19 @@ mod tests {
 
     #[test]
     fn new_store_creates_inputs_stems() {
-        let (dir, _store) = crate::testutil::tiny_store_labeled("inputs-files");
-        assert!(dir.path().join("inputs.loc").is_file());
-        assert!(dir.path().join("inputs.off").is_file());
-        assert!(dir.path().join("inputs.body").is_file());
+        let (dir, _store) = crate::testutil::tiny_store_labeled("input-files");
+        assert!(dir.path().join("input.loc").is_file());
+        assert!(dir.path().join("input.off").is_file());
+        assert!(dir.path().join("input.body").is_file());
     }
 
     #[test]
     fn append_rejects_n_in_past_u16() {
-        let dir = TempDir::labeled("inputs-wide").unwrap();
-        let t = Inputs::create(dir.path()).unwrap();
+        let dir = TempDir::labeled("input-wide").unwrap();
+        let t = Input::create(dir.path()).unwrap();
         let edges = vec![edge(1, 0); usize::from(u16::MAX) + 1];
         let err = t.append(&[edges]).unwrap_err();
-        assert!(matches!(err, StoreError::Corrupt("inputs n_in")));
+        assert!(matches!(err, StoreError::Corrupt("input n_in")));
         assert_eq!(t.count(), 0);
     }
 }

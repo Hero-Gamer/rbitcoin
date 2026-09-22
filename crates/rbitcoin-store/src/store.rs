@@ -120,6 +120,33 @@ impl StoreLayout {
     }
 }
 
+pub(crate) fn rename_legacy_input_files(dir: &Path) -> Result<(), StoreError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for (old, new) in [
+        ("inputs.loc", "input.loc"),
+        ("inputs.off", "input.off"),
+        ("inputs.body", "input.body"),
+    ] {
+        let from = dir.join(old);
+        let to = dir.join(new);
+        if !from.exists() {
+            continue;
+        }
+        if to.exists() {
+            return Err(StoreError::Layout(format!(
+                "{} and {} both exist; keep only {}",
+                from.display(),
+                to.display(),
+                new
+            )));
+        }
+        std::fs::rename(&from, &to).map_err(|e| StoreError::io(&from, e))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rename_legacy_inwit_files(dir: &Path) -> Result<(), StoreError> {
     if !dir.exists() {
         return Ok(());
@@ -167,6 +194,7 @@ fn seqsigwit_reloc_path(hot: &Path) -> PathBuf {
 /// (not `Corrupt`).
 fn resolve_seqsigwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
     rename_legacy_inwit_files(&layout.dir)?;
+    rename_legacy_input_files(&layout.dir)?;
     if !layout.is_split() {
         if seqsigwit_reloc_path(&layout.dir).exists() {
             return Err(StoreError::Layout(format!(
@@ -177,6 +205,7 @@ fn resolve_seqsigwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
     }
     let cold = layout.seqsigwit_dir();
     rename_legacy_inwit_files(cold)?;
+    rename_legacy_input_files(cold)?;
     if !cold.exists() {
         std::fs::create_dir_all(cold).map_err(|e| StoreError::io(cold, e))?;
     } else if !cold.is_dir() {
@@ -739,14 +768,14 @@ impl Store {
     }
 
     /// Overwrite one existing `txstat` row that fits in 8 B (tests / placeholders).
-    /// `n_in` from `inputs.loc`, or `None` when that create is unstamped.
-    pub fn inputs_n_in(&self, fk: Fk) -> Result<Option<u32>, StoreError> {
-        self.txs.inputs.n_in(fk)
+    /// `n_in` from `input.loc`, or `None` when that create is unstamped.
+    pub fn input_n_in(&self, fk: Fk) -> Result<Option<u32>, StoreError> {
+        self.txs.input.n_in(fk)
     }
 
-    /// Parent edges in vin order, or `None` when `inputs.loc` is unstamped.
-    pub fn input_edges(&self, fk: Fk) -> Result<Option<Vec<crate::inputs::InputEdge>>, StoreError> {
-        self.txs.inputs.edges(fk)
+    /// Parent edges in vin order, or `None` when `input.loc` is unstamped.
+    pub fn input_edges(&self, fk: Fk) -> Result<Option<Vec<crate::input::InputEdge>>, StoreError> {
+        self.txs.input.edges(fk)
     }
 
     /// Copy parent edges onto seqsigwit records that do not store them.
@@ -4142,6 +4171,20 @@ mod tests {
     }
 
     #[test]
+    fn open_renames_legacy_inputs_stem() {
+        let dir = tmp();
+        Store::create_tiny(&dir).unwrap();
+        std::fs::rename(dir.join("input.loc"), dir.join("inputs.loc")).unwrap();
+        std::fs::rename(dir.join("input.off"), dir.join("inputs.off")).unwrap();
+        std::fs::rename(dir.join("input.body"), dir.join("inputs.body")).unwrap();
+        Store::open_tiny(&dir).unwrap();
+        assert!(dir.join("input.loc").is_file());
+        assert!(dir.join("input.body").is_file());
+        assert!(!dir.join("inputs.loc").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn split_create_puts_seqsigwit_only_on_cold() {
         let root = tmp();
         let hot = root.join("hot");
@@ -4156,10 +4199,10 @@ mod tests {
         assert!(cold.join("seqsigwit.body").is_file());
         assert!(cold.join("seqsigwit.loc").is_file());
         assert!(!hot.join("txstat.body").exists());
-        assert!(!hot.join("inputs.loc").exists());
+        assert!(!hot.join("input.loc").exists());
         assert!(cold.join("txstat.body").is_file());
-        assert!(cold.join("inputs.loc").is_file());
-        assert!(cold.join("inputs.body").is_file());
+        assert!(cold.join("input.loc").is_file());
+        assert!(cold.join("input.body").is_file());
         assert!(hot.join(SEQSIGWIT_RELOC_NAME).is_file());
         drop(s);
         let s = Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();

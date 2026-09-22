@@ -209,16 +209,16 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
     ))
 }
 
-fn edges_from_seqsigwit_payload(raw: &[u8]) -> Result<Vec<crate::inputs::InputEdge>, StoreError> {
+fn edges_from_seqsigwit_payload(raw: &[u8]) -> Result<Vec<crate::input::InputEdge>, StoreError> {
     let mut off = 0usize;
     let mut edges = Vec::new();
     while off < raw.len() && raw[off..].iter().any(|&b| b != 0) {
         let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
         off += used;
         if create_fk.is_null() {
-            edges.push(crate::inputs::InputEdge::coinbase());
+            edges.push(crate::input::InputEdge::coinbase());
         } else {
-            edges.push(crate::inputs::InputEdge {
+            edges.push(crate::input::InputEdge {
                 parent: create_fk,
                 vout: prev_index,
             });
@@ -227,13 +227,13 @@ fn edges_from_seqsigwit_payload(raw: &[u8]) -> Result<Vec<crate::inputs::InputEd
     Ok(edges)
 }
 
-fn input_edges(ins: &[InputRecord]) -> Vec<crate::inputs::InputEdge> {
+fn input_edges(ins: &[InputRecord]) -> Vec<crate::input::InputEdge> {
     ins.iter()
         .map(|inp| {
             if inp.is_coinbase() {
-                crate::inputs::InputEdge::coinbase()
+                crate::input::InputEdge::coinbase()
             } else {
-                crate::inputs::InputEdge {
+                crate::input::InputEdge {
                     parent: inp.create_fk,
                     vout: inp.prev_index,
                 }
@@ -463,8 +463,8 @@ pub struct TxTable {
     pub(crate) txids: crate::txid_body::TxidBody,
     /// Dense create_fk-ordered confirm-time econ (schema 25).
     pub(crate) txstat: crate::txstat::TxStat,
-    /// Spender → parent edges (`inputs.loc` / `inputs.body`).
-    pub(crate) inputs: crate::inputs::Inputs,
+    /// Spender → parent edges (`input.loc` / `input.body`).
+    pub(crate) input: crate::input::Input,
     /// Datadir secret: keyed head probes + script XOR (schema 12+).
     pub(crate) secret: crate::store_secret::StoreSecret,
     /// Unflushed head inserts (write-behind). Readers see published snapshot.
@@ -546,7 +546,7 @@ struct ClassASkewStems<'a> {
     seqsigwit: &'a VarTable,
     txids: &'a crate::txid_body::TxidBody,
     txstat: &'a crate::txstat::TxStat,
-    inputs: &'a crate::inputs::Inputs,
+    input: &'a crate::input::Input,
 }
 
 fn class_a_skew_target_count(
@@ -626,8 +626,8 @@ fn class_a_skew_apply_truncate(
     if stems.txstat.count() > n {
         stems.txstat.truncate_to_count(n)?;
     }
-    if stems.inputs.count() > n {
-        stems.inputs.truncate_to_count(n)?;
+    if stems.input.count() > n {
+        stems.input.truncate_to_count(n)?;
     }
     Ok(())
 }
@@ -730,7 +730,7 @@ impl TxTable {
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
             txstat: crate::txstat::TxStat::create(seqsigwit_dir)?,
-            inputs: crate::inputs::Inputs::create(seqsigwit_dir)?,
+            input: crate::input::Input::create(seqsigwit_dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
@@ -790,7 +790,9 @@ impl TxTable {
     ) -> Result<Self, StoreError> {
         let prune_seqsigwit_mode = false;
         crate::store::rename_legacy_inwit_files(dir)?;
+        crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
+        crate::store::rename_legacy_input_files(seqsigwit_dir)?;
         refuse_schema15_packed_tx_body(dir)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
@@ -843,9 +845,9 @@ impl TxTable {
                 "txstat.body",
                 "txstat.ovf",
                 "txstat.blk",
-                "inputs.loc",
-                "inputs.off",
-                "inputs.body",
+                "input.loc",
+                "input.off",
+                "input.body",
             ] {
                 if dir.join(name).exists() && !seqsigwit_dir.join(name).exists() {
                     return Err(StoreError::Layout(format!(
@@ -857,14 +859,14 @@ impl TxTable {
             }
         }
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
-        let inputs = if seqsigwit_dir.join("inputs.loc").exists() {
-            crate::inputs::Inputs::open(seqsigwit_dir)?
-        } else if seqsigwit_dir.join("inputs.body").exists()
-            || seqsigwit_dir.join("inputs.off").exists()
+        let input = if seqsigwit_dir.join("input.loc").exists() {
+            crate::input::Input::open(seqsigwit_dir)?
+        } else if seqsigwit_dir.join("input.body").exists()
+            || seqsigwit_dir.join("input.off").exists()
         {
-            return Err(StoreError::Corrupt("invariant: inputs stems partial"));
+            return Err(StoreError::Corrupt("invariant: input stems partial"));
         } else {
-            crate::inputs::Inputs::create(seqsigwit_dir)?
+            crate::input::Input::create(seqsigwit_dir)?
         };
         repair_class_a_count_skew(
             ClassASkewStems {
@@ -875,7 +877,7 @@ impl TxTable {
                 seqsigwit: &seqsigwit,
                 txids: &txids,
                 txstat: &txstat,
-                inputs: &inputs,
+                input: &input,
             },
             prune_seqsigwit_mode,
         )?;
@@ -958,24 +960,24 @@ impl TxTable {
             head,
             txids,
             txstat,
-            inputs,
+            input,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
         };
-        if t.inputs.count() == 0 && n_bodies > 0 && t.seqsigwit.count() == n_bodies {
+        if t.input.count() == 0 && n_bodies > 0 && t.seqsigwit.count() == n_bodies {
             t.backfill_inputs_from_seqsigwit()?;
-        } else if t.inputs.count() < n_bodies {
-            t.inputs.append_unstamped(n_bodies - t.inputs.count())?;
-        } else if t.inputs.count() > n_bodies {
+        } else if t.input.count() < n_bodies {
+            t.input.append_unstamped(n_bodies - t.input.count())?;
+        } else if t.input.count() > n_bodies {
             return Err(StoreError::Corrupt(
-                "invariant: inputs.loc ahead of create.loc",
+                "invariant: input.loc ahead of create.loc",
             ));
         }
         if n_bodies > 0 {
-            let _ = t.inputs.n_in(Fk(1))?;
+            let _ = t.input.n_in(Fk(1))?;
         }
         if need_rebuild {
             let bits = t.head_bits();
@@ -1281,13 +1283,13 @@ impl TxTable {
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
-    /// Stamped rows read `n_in` and the parent edge from `inputs`. Leftover
+    /// Stamped rows read `n_in` and the parent edge from `input`. Leftover
     /// unstamped rows still take the inline prevout out of legacy `seqsigwit`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
-        let mut tx = if let Some(n_in) = self.inputs.n_in(fk)? {
+        let mut tx = if let Some(n_in) = self.input.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
                 version: 0,
@@ -1300,7 +1302,7 @@ impl TxTable {
         } else {
             self.get(fk)?
         };
-        let prevs = if let Some(edges) = self.inputs.edges(fk)? {
+        let prevs = if let Some(edges) = self.input.edges(fk)? {
             prevouts_from_edges(&edges)
         } else {
             let ir = self
@@ -1320,11 +1322,11 @@ impl TxTable {
     }
 
     pub(crate) fn overlay_stamped_n_in(&self, fk: Fk, tx: &mut TxRecord) -> Result<(), StoreError> {
-        let Some(n_in) = self.inputs.n_in(fk)? else {
+        let Some(n_in) = self.input.n_in(fk)? else {
             return Ok(());
         };
         if tx.input_count != 0 && tx.input_count != n_in {
-            return Err(StoreError::Corrupt("inputs n_in mismatch txout"));
+            return Err(StoreError::Corrupt("input n_in mismatch txout"));
         }
         tx.input_count = n_in;
         Ok(())
@@ -1518,24 +1520,24 @@ impl TxTable {
 
     fn backfill_inputs_from_seqsigwit(&self) -> Result<(), StoreError> {
         let n = self.create_loc.count();
-        rbitcoin_log::info!("store: inputs backfill from seqsigwit n={n}");
+        rbitcoin_log::info!("store: input backfill from seqsigwit n={n}");
         let mut batch = Vec::new();
         for id in 1..=n {
             let (off, len) = self.seqsigwit_range(Fk(id))?;
             let raw = self.seqsigwit.with_bytes_at(off, len, |b| Ok(b.to_vec()))?;
             batch.push(edges_from_seqsigwit_payload(&raw)?);
             if batch.len() == 1024 {
-                self.inputs.append(&batch)?;
+                self.input.append(&batch)?;
                 batch.clear();
             }
             if id.is_multiple_of(1_000_000) {
-                rbitcoin_log::info!("store: inputs backfill progress {id}/{n}");
+                rbitcoin_log::info!("store: input backfill progress {id}/{n}");
             }
         }
         if !batch.is_empty() {
-            self.inputs.append(&batch)?;
+            self.input.append(&batch)?;
         }
-        rbitcoin_log::info!("store: inputs backfill complete n={n}");
+        rbitcoin_log::info!("store: input backfill complete n={n}");
         Ok(())
     }
 
@@ -1920,7 +1922,7 @@ impl TxTable {
         fk: Fk,
         ins: &mut [InputRecord],
     ) -> Result<(), StoreError> {
-        let Some(edges) = self.inputs.edges(fk)? else {
+        let Some(edges) = self.input.edges(fk)? else {
             return Ok(());
         };
         apply_input_edges(ins, &edges)
@@ -2124,7 +2126,7 @@ impl TxTable {
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
-            || self.inputs.count() != base
+            || self.input.count() != base
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
@@ -2157,9 +2159,9 @@ impl TxTable {
         if !tails.is_empty() {
             return Err(StoreError::Corrupt("txstat overflow needs header blob"));
         }
-        let edges: Vec<Vec<crate::inputs::InputEdge>> =
+        let edges: Vec<Vec<crate::input::InputEdge>> =
             items.iter().map(|(_, ins, _)| input_edges(ins)).collect();
-        self.inputs.append(&edges)?;
+        self.input.append(&edges)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()
@@ -2218,7 +2220,7 @@ impl TxTable {
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
-            || self.inputs.count() != base
+            || self.input.count() != base
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
@@ -2260,9 +2262,9 @@ impl TxTable {
         let tails = self.txstat.append_batch(base, txstat)?;
         self.txstat
             .put_overflows_for_headers(header_ranges, &tails)?;
-        let edges: Vec<Vec<crate::inputs::InputEdge>> =
+        let edges: Vec<Vec<crate::input::InputEdge>> =
             items.iter().map(|(_, ins)| input_edges(ins)).collect();
-        self.inputs.append(&edges)?;
+        self.input.append(&edges)?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()

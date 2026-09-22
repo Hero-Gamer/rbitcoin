@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **25** | `txstat.body` three ULEBs (`fee_sat`/`base`/`wit_extra`); `n_in` and parent edges on `inputs.*`. `seqsigwit` is the old `inwit` stem. Occupied 24 zero-extends `txstat`; no `txout` rewrite. | **Current** |
+| **25** | `txstat.body` three ULEBs (`fee_sat`/`base`/`wit_extra`); `n_in` and parent edges on `input.*`. `seqsigwit` is the old `inwit` stem. Occupied 24 zero-extends `txstat`; no `txout` rewrite. | **Current** |
 | **24** | `header.body` 96 B (`size`/`weight` u32). Occupied 23 rewrites 88 B rows. Extent last-page reserved = create count. | Prior |
 | **23** | `create.loc.ovf` 16 B (u32 strides / `n_out`). Occupied 22 rewrites 12 B ovf. Occupied 15–21 Class A refused. | Prior |
 | **22** | `create.loc` + `seqsigwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | Prior |
@@ -39,17 +39,17 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v25 (`txstat.body` 8 B/create, `inputs.*`, `seqsigwit`)
+## v25 (`txstat.body` 8 B/create, `input.*`, `seqsigwit`)
 
 `txstat.body` is a dense `create_fk`-addressed econ sidefile, same header pad
 as `txid.body` (32 B prefix, 8 B cells). The cell is three canonical ULEBs:
-`fee_sat`, `base`, `wit_extra`. `n_in` is `inputs.loc` (u16 LE, `0` =
-unstamped). `inputs.body` is 8 B per input: parent `create_fk` u40 LE
+`fee_sat`, `base`, `wit_extra`. `n_in` is `input.loc` (u16 LE, `0` =
+unstamped). `input.body` is 8 B per input: parent `create_fk` u40 LE
 (`0` = coinbase) and parent vout u24 LE. Overflow remaining bytes live in a
 per-header blob (`txstat.ovf` + `txstat.blk`). `seqsigwit.*` is the renamed
 `inwit` stem (sequence, scriptSig, witness); open renames the files in place.
-`txstat.*` and `inputs.*` sit next to `seqsigwit` (cold when `--datadir-cold`
-is set). Open with no `inputs.loc` and a matching `seqsigwit` count backfills
+`txstat.*` and `input.*` sit next to `seqsigwit` (cold when `--datadir-cold`
+is set). Open with no `input.loc` and a matching `seqsigwit` count backfills
 parent edges from `seqsigwit` prevouts. A four-ULEB cell that started with
 `n_in` is not detected; resync that experimental datadir. Occupied 24
 rewrites `meta` and extends zeros to `create.loc` count. `txout.body` is not

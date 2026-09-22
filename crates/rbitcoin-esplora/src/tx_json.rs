@@ -172,7 +172,7 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     )
 }
 
-/// Parent txid and vout from `inputs.body`. No scriptSig, witness, or sequence.
+/// Parent txid and vout from `input.body`. No scriptSig, witness, or sequence.
 fn pruned_vin(
     query: &Query,
     tx_fk: Fk,

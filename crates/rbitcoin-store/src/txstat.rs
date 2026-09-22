@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Cell payload is three canonical ULEBs: `fee_sat`, `base` (non-witness
-//! size), `wit_extra` (`total_size − base`). `n_in` lives on `inputs.loc`.
+//! size), `wit_extra` (`total_size − base`). `n_in` lives on `input.loc`.
 //! `size = base + wit_extra`, `weight = 4×base + wit_extra`. All-zero cell =
 //! unstamped. A truncated ULEB or fewer than three fields means the rest of
 //! the stream is in that header's overflow blob (`encoded[8..]`). Pin / SH /
