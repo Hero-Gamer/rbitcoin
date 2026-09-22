@@ -311,7 +311,8 @@ cargo build -p rbitcoin-node
 ./scripts/core-functional/warnet/example.sh
 ```
 
-`example.sh` copies a **bookworm-linked** `rbitcoin-node` into the image
+The example conf sets `head_scale=tiny` so a tank does not fallocate mainnet
+heads. `example.sh` copies a **bookworm-linked** `rbitcoin-node` into the image
 (a nix devshell binary will not exec: its dynamic loader is not in Debian),
 starts `tank0` and `tank1` (`addnode=tank0`), mines one regtest block, and
 waits until `tank1` `getblockcount` is non-zero. CI builds that binary with

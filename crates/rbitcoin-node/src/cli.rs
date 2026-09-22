@@ -139,6 +139,7 @@ fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Re
         }
         if key == "connect" && !saw_connect {
             config.listen.connect.clear();
+            config.listen.connect_dns.clear();
             saw_connect = true;
         }
         if key == "seed_node" && !saw_seednode {

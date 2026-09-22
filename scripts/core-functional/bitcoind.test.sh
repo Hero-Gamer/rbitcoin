@@ -333,9 +333,10 @@ fi
 # Warnet Helm: addnode=tank name becomes --connect host:port and seeds rpc.token.
 WN_DD="$WORKDIR/warnet-conf"
 mkdir -p "$WN_DD"
-printf 'regtest=1\nrpcuser=warnet\nrpcpassword=secret0\nrpcbind=0.0.0.0\naddnode=tank-0001\nport=18444\nrpcport=18443\n' >"$WN_DD/bitcoin.conf"
+printf 'regtest=1\nrpcuser=warnet\nrpcpassword=secret0\nrpcbind=0.0.0.0\naddnode=tank-0001\nhead_scale=tiny\nport=18444\nrpcport=18443\n' >"$WN_DD/bitcoin.conf"
 OUT_WN="$("$SHIM" --print-cmd -datadir="$WN_DD" -regtest 2>/dev/null)" || OUT_WN=""
 if printf '%s' "$OUT_WN" | grep -q -- "--connect tank-0001:18444" \
+  && printf '%s' "$OUT_WN" | grep -q -- "--head-scale tiny" \
   && [[ "$(cat "$WN_DD/regtest/rpc.token")" == "secret0" ]]; then
   echo "ok - addnode= becomes --connect and rpcpassword seeds rpc.token"
   PASS=$((PASS + 1))

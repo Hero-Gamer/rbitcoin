@@ -823,6 +823,17 @@ impl NodeConfig {
             "connect" => {
                 push_connect(&mut self.listen, val)?;
             }
+            "head_scale" => {
+                self.head_scale = match val {
+                    "tiny" => HeadScale::Tiny,
+                    "mainnet" => HeadScale::Mainnet,
+                    other => {
+                        return Err(NodeError::Config(format!(
+                            "conf head_scale must be tiny or mainnet, got {other}"
+                        )))
+                    }
+                };
+            }
             "proxy" => {
                 self.listen.proxy = Some(parse_required_socket(val, "proxy")?);
             }
@@ -2166,6 +2177,8 @@ mod tests {
     #[test]
     fn connect_hostname_is_dns_not_netaddr() {
         let mut cfg = NodeConfig::default();
+        cfg.apply_kv("head_scale", "tiny").unwrap();
+        assert_eq!(cfg.head_scale, HeadScale::Tiny);
         cfg.apply_kv("connect", "tank-0001:18444").unwrap();
         cfg.apply_kv("connect", "127.0.0.1:18444").unwrap();
         assert!(cfg

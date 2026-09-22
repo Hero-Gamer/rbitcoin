@@ -675,6 +675,9 @@ def translate(
     if log_level:
         cmd += ["--log-level", log_level]
     cmd += extra_node_args
+    for scale in read_conf_keys(datadir / "bitcoin.conf", "head_scale"):
+        if scale == "tiny" or scale == "mainnet":
+            cmd += ["--head-scale", scale]
     for host in read_conf_keys(datadir / "bitcoin.conf", "addnode") + addnodes:
         if not host:
             continue

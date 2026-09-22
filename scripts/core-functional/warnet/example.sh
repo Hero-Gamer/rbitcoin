@@ -47,7 +47,10 @@ deadline=$((SECONDS + 90))
 until [[ "$(height tank0)" == "0" && "$(height tank1)" == "0" ]]; do
   if (( SECONDS > deadline )); then
     echo "example.sh: tanks did not answer getblockcount" >&2
-    "${COMPOSE[@]}" logs || true
+    "${COMPOSE[@]}" ps -a >&2 || true
+    "${COMPOSE[@]}" exec -T tank0 bitcoin-cli -regtest getblockcount >&2 || true
+    "${COMPOSE[@]}" exec -T tank0 sh -c 'ls -la /usr/local/bin/rbitcoin-node /root/.bitcoin /root/.bitcoin/regtest; tail -40 /root/.bitcoin/regtest/debug.log' >&2 || true
+    "${COMPOSE[@]}" logs --no-color >&2 || true
     exit 1
   fi
   sleep 2
