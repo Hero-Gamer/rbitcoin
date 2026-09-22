@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **`cmpct_differential` extra `getblocktxn`:** agree whenever Core's
+  indexes are a subset of ours, not only recipe `[1, 4]` vs `[1]`.
+  Nightly `[0, 251, 229, 55, 51, 13, 10]` is ours `[2, 4]` vs Core `[2]`.
+  Omitting an index Core requested still panics.
+
 - **Unreachable I2P stays out of addrman:** without `--i2p-sam`, an addrv2
   I2P row is relayed and not stored. `getnodeaddresses` `network=i2p` is
   empty. Core `p2p_addrv2_relay`.
