@@ -739,9 +739,11 @@ pub(crate) fn txstat_row_from_tx(
     })
 }
 
-fn txstat_placeholder_query(n_in: u32) -> rbitcoin_store::TxStatRow {
+fn txstat_placeholder_query(_n_in: u32) -> rbitcoin_store::TxStatRow {
+    // No wire body: leave the cell unstamped (all-zero). A row with n_in set
+    // and size 0 would make getblockstats report a real zero-size tx.
     rbitcoin_store::TxStatRow {
-        n_in,
+        n_in: 0,
         fee_sat: 0,
         base: 0,
         wit_extra: 0,
