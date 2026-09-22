@@ -439,6 +439,49 @@ fn insert_key_word(map: &mut Key16PackMap, key: ShHeadKey, word: u64) {
     }
 }
 
+struct CollectTally {
+    recs: u64,
+    hits: u64,
+    per: Vec<u64>,
+}
+
+impl CollectTally {
+    fn new(n_shards: usize) -> Self {
+        Self {
+            recs: 0,
+            hits: 0,
+            per: vec![0; n_shards],
+        }
+    }
+}
+
+/// Add a worker's batch counts once. A zero tally does not touch the atomics.
+fn flush_collect_tally(
+    tally: &mut CollectTally,
+    recs: &AtomicU64,
+    hits: Option<&AtomicU64>,
+    per: Option<&[AtomicU64]>,
+) {
+    if tally.recs != 0 {
+        recs.fetch_add(tally.recs, Ordering::Relaxed);
+        tally.recs = 0;
+    }
+    if tally.hits != 0 {
+        if let Some(hits) = hits {
+            hits.fetch_add(tally.hits, Ordering::Relaxed);
+        }
+        tally.hits = 0;
+    }
+    if let Some(per) = per {
+        for (slot, n) in per.iter().zip(tally.per.iter_mut()) {
+            if *n != 0 {
+                slot.fetch_add(*n, Ordering::Relaxed);
+                *n = 0;
+            }
+        }
+    }
+}
+
 fn insert_key_pack(map: &mut Key16PackMap, key: ShHeadKey, fk: Fk) {
     if fk.is_null() {
         return;
@@ -1105,6 +1148,7 @@ fn collect_keys_from_txs(
             scope.spawn(move || {
                 let mut locals: Vec<Key16PackMap> =
                     (0..n_shards).map(|_| Key16PackMap::default()).collect();
+                let mut tally = CollectTally::new(0);
                 for (lo, hi) in chunk_ranges(span_lo, span_hi, CLASS_A_CHUNK_FKS) {
                     if check_cancel(cancel, "scripthash keys collect").is_err() {
                         let mut g = err.lock().unwrap();
@@ -1118,10 +1162,11 @@ fn collect_keys_from_txs(
                     }
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
                         let si = prefix_shard_of(&sh, n_shards);
-                        recs.fetch_add(1, Ordering::Relaxed);
+                        tally.recs = tally.recs.saturating_add(1);
                         insert_key_pack(&mut locals[si], head_key_from_full(&sh), fk);
                         Ok(())
                     });
+                    flush_collect_tally(&mut tally, recs, None, None);
                     if let Err(e) = r {
                         *err.lock().unwrap() = Some(e);
                         break;
@@ -1535,6 +1580,7 @@ fn collect_posts_from_txs(
             scope.spawn(move || {
                 let mut locals: Vec<PostPackMap> =
                     (0..n_shards).map(|_| PostPackMap::default()).collect();
+                let mut tally = CollectTally::new(n_shards);
                 for (lo, hi) in chunk_ranges(span_lo, span_hi, CLASS_A_CHUNK_FKS) {
                     if check_cancel(cancel, "scripthash postings collect").is_err() {
                         let mut g = err.lock().unwrap();
@@ -1547,7 +1593,7 @@ fn collect_posts_from_txs(
                         break;
                     }
                     let r = txs.for_each_script_hashes_in_fk_span(lo, hi, |fk, sh| {
-                        recs.fetch_add(1, Ordering::Relaxed);
+                        tally.recs = tally.recs.saturating_add(1);
                         let si = prefix_shard_of(&sh, n_shards);
                         let Some(fuse) = fuses[si].as_ref() else {
                             return Ok(());
@@ -1557,10 +1603,11 @@ fn collect_posts_from_txs(
                             return Ok(());
                         }
                         insert_post_fk(&mut locals[si], key, fk.0);
-                        hits.fetch_add(1, Ordering::Relaxed);
-                        per[si].fetch_add(1, Ordering::Relaxed);
+                        tally.hits = tally.hits.saturating_add(1);
+                        tally.per[si] = tally.per[si].saturating_add(1);
                         Ok(())
                     });
+                    flush_collect_tally(&mut tally, recs, Some(hits), Some(per));
                     if let Err(e) = r {
                         *err.lock().unwrap() = Some(e);
                         break;
@@ -2079,6 +2126,56 @@ mod tests {
         );
         assert!(worker_fk_spans(5, 4, 4).is_empty());
         assert_eq!(worker_fk_spans(1, 8, 0), vec![(1, 8)]);
+    }
+
+    #[test]
+    fn flush_collect_tally_matches_per_item_and_skips_zeros() {
+        let recs = AtomicU64::new(0);
+        let hits = AtomicU64::new(0);
+        let per = [AtomicU64::new(0), AtomicU64::new(0)];
+        let mut one = CollectTally::new(2);
+        for _ in 0..3 {
+            one.recs = one.recs.saturating_add(1);
+            one.hits = one.hits.saturating_add(1);
+            one.per[0] = one.per[0].saturating_add(1);
+            flush_collect_tally(&mut one, &recs, Some(&hits), Some(&per));
+        }
+        let batch_recs = AtomicU64::new(0);
+        let batch_hits = AtomicU64::new(0);
+        let batch_per = [AtomicU64::new(0), AtomicU64::new(0)];
+        let mut batch = CollectTally {
+            recs: 3,
+            hits: 3,
+            per: vec![3, 0],
+        };
+        flush_collect_tally(&mut batch, &batch_recs, Some(&batch_hits), Some(&batch_per));
+        assert_eq!(
+            recs.load(Ordering::Relaxed),
+            batch_recs.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            batch_hits.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            per[0].load(Ordering::Relaxed),
+            batch_per[0].load(Ordering::Relaxed)
+        );
+        assert_eq!(per[1].load(Ordering::Relaxed), 0);
+        let snap = (
+            batch_recs.load(Ordering::Relaxed),
+            batch_hits.load(Ordering::Relaxed),
+            batch_per[0].load(Ordering::Relaxed),
+        );
+        flush_collect_tally(&mut batch, &batch_recs, Some(&batch_hits), Some(&batch_per));
+        assert_eq!(
+            snap,
+            (
+                batch_recs.load(Ordering::Relaxed),
+                batch_hits.load(Ordering::Relaxed),
+                batch_per[0].load(Ordering::Relaxed),
+            )
+        );
     }
 
     #[test]

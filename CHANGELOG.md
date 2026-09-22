@@ -55,7 +55,8 @@ before 1.0).
   share `sh_extract_workers()` = min(CPUs, max(1, free RAM / 1.5 GiB));
   `RBITCOIN_SH_MERGE_WORKERS` still overrides. Collect maps are the
   1.5 GiB worker cap (spilled and dropped before merge BDZ). Progress is
-  `scanned=` finished fks. Spills share one writer (1-slot queue). One
+  `scanned=` finished fks. Output and hit counters flush once per 64 k-fk
+  batch. Spills share one writer (1-slot queue). One
   `keys merge start`; live `keys merge shard=` with `fold=` `bdz=`; pack
   shard lines when each worker finishes. Previous `DONE` / 24 B `NN`
   unsorted is deleted and pass 1 restarts.
