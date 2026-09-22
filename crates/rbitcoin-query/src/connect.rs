@@ -731,6 +731,7 @@ impl Query {
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         self.require_inwit_at(height)?;
+        self.drop_inwit_ram_height(height.0);
         let _appender = self.sh.appender.lock().unwrap();
         if drop_pending {
             self.drop_sh_pending_from(height);

@@ -610,6 +610,23 @@ impl Query {
         Err(StoreError::Pruned { height })
     }
 
+    fn drop_inwit_ram_height(&self, height: u32) {
+        let mut g = self.inwit_ram_window.lock().unwrap();
+        let Some(old_fks) = g.by_height.remove(&height) else {
+            return;
+        };
+        for fk in old_fks {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let Some(old) = g.by_fk.remove(&id) else {
+                continue;
+            };
+            let n = old.iter().map(|i| i.encoded_len() as u64).sum();
+            g.bytes = g.bytes.saturating_sub(n);
+        }
+    }
+
     pub(crate) fn clear_inwit_ram_window(&self) {
         *self.inwit_ram_window.lock().unwrap() = InwitRamWindow::default();
         self.inwit_append_cache.lock().unwrap().clear();
@@ -670,7 +687,11 @@ impl Query {
             };
             if h < min_keep_height {
                 let path = self.inwit_spill_file(h)?;
-                let _ = std::fs::remove_file(&path);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(StoreError::io(path, e)),
+                }
             }
         }
         Ok(())
@@ -727,37 +748,7 @@ impl Query {
         if self.pruneheight().is_some_and(|ph| height <= ph.0) {
             return Ok(None);
         }
-        let dir = self.inwit_spill_dir();
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError::io(&dir, e)),
-        };
-        let mut path = None;
-        for ent in rd {
-            let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
-            let fname = ent.file_name();
-            let Some(stem) = fname.to_str().and_then(|s| s.strip_suffix(".bin")) else {
-                continue;
-            };
-            let Ok(h) = stem.parse::<u32>() else {
-                continue;
-            };
-            if h != height {
-                continue;
-            }
-            let p = ent.path();
-            if !p.starts_with(&dir) {
-                return Err(StoreError::Corrupt(
-                    "invariant: inwit spill path escaped window dir",
-                ));
-            }
-            path = Some(p);
-            break;
-        }
-        let Some(path) = path else {
-            return Ok(None);
-        };
+        let path = self.inwit_spill_file(height)?;
         let raw = match std::fs::read(&path) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -829,6 +820,7 @@ impl Query {
             staged.push((fk, ins, bytes));
         }
         drop(appended);
+        self.drop_inwit_ram_height(height.0);
         let spill_rows: Vec<(Fk, Vec<InputRecord>)> = staged
             .iter()
             .map(|(fk, ins, _)| (*fk, ins.clone()))

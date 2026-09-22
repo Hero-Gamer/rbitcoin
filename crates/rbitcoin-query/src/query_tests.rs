@@ -2688,6 +2688,38 @@ fn prune_ibd_ram_window_keeps_last_288_heights() {
 }
 
 #[test]
+fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
+    let (dir, q) = temp_query("prune-ram-replace");
+    q.set_prune_inwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_inwit_ram_threshold_bytes(1 << 30).unwrap();
+    let (h0, mut t0) = coinbase_block(0, Fk::NULL, None);
+    t0.inputs[0].witness = vec![vec![0x11; 16]];
+    let hash0 = h0.hash;
+    let prev = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let (h1, mut t1) = coinbase_block(1, prev, Some(hash0));
+    t1.inputs[0].witness = vec![vec![0x22; 16]];
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
+    assert_eq!(q.inwit_ram_window_stats().1, 2);
+    q.disconnect_tip().unwrap();
+    assert_eq!(
+        q.inwit_ram_window_stats().1,
+        1,
+        "disconnect must drop that height's inwit"
+    );
+    let (h1b, mut t1b) = coinbase_block(1, prev, Some(hash0));
+    t1b.inputs[0].witness = vec![vec![0x33; 16]];
+    q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+    let (heights, fks, _, _) = q.inwit_ram_window_stats();
+    assert_eq!(heights, 2);
+    assert_eq!(
+        fks, 2,
+        "replaced height must not keep the disconnected create"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prune_ibd_ram_window_honors_byte_threshold() {
     let (dir, q) = temp_query("prune-ibd-ram-threshold");
     q.set_prune_inwit(true).unwrap();
