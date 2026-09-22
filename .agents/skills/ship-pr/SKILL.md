@@ -155,3 +155,15 @@ If CI `coverage` fails, add a pin and push. Floor: [`TESTING.md`](../../../TESTI
 
 Operator musl binaries are [`docs/releases.md`](../../../docs/releases.md).
 Do not `nix build .#rbitcoin-musl` on a feature branch.
+
+### Behavior-Killer Gate
+
+Before first production commit:
+1. Classify changed behavior (Tier0–5)
+2. Identify killer: test + exact observable assertion
+3. Prove killer fails without the behavior
+4. Run `cargo mutants --in-diff`
+5. Classify all survivors
+6. CI passed alone is not justification
+
+Docs-only change: exempt from mutants gate.

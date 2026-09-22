@@ -522,3 +522,27 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/overlay-functional/run.sh.test.sh
 ./scripts/overlay-functional/run.sh --list
 ```
+
+## Mutation and Behavior-Killer Policy
+
+Every new production behavior must have a demonstrable killer appropriate to its behavior class.
+
+**What counts as behavior:** new rejection/acceptance decision, error code, RPC field, new file/cleanup path/cap/format/crash recovery, new ranking/selection/timeout/prefill/persistence, new concurrency/cancellation/ordering guarantee. Refactor/move with no behavior change needs no new killer but must show 0 applicable survivors.
+
+**Tier0 — Primitives / unsafe / serialization / SIMD / arithmetic:** independent reference/oracle, not copy of optimized impl. Boundary + invalid encoding. Unsafe = narrowest invariant + MIRI where applicable.
+
+**Tier1 — Observable decisions (consensus, RPC, mempool, CLI/config):** assert exact variant/code, not `is_err()` or string matching. Exercise real accept/reject path.
+
+**Tier2 — Stateful P2P / IBD / Time / Concurrency:** assert intermediate state — not just final tip height. Injected mock clock is default. Concurrency/async: `cargo-mutants` advisory only; needs property test for ordering/cancellation.
+
+**Tier3 — Store / File / Crash / Schema:** lifecycle = precondition + operation + postcondition. Crash: interrupt → reopen → assert documented recovery. Schema: test every compatibility direction.
+
+**Tier4 — Tooling / CI / Docs:** no mutants gate.
+
+**Tier5 — Docs-only:** exempt if diff only `*.md` and no `crates/` change.
+
+**First-commit gate:**
+```bash
+git diff origin/master.. --unified=0 > /tmp/pr.diff
+cargo test -p <crate> --lib
+cargo mutants -p <crate> --in-diff /tmp/pr.diff -q
