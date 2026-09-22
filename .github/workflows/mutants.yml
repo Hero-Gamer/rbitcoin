@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
           submodules: false
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-mutants@27.1.0
       - run: cargo mutants --workspace --shard ${{ matrix.shard }}/8 -j 2

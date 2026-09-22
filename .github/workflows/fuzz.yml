@@ -68,7 +68,7 @@ jobs:
       - name: clang (libFuzzer)
         run: sudo apt-get update && sudo apt-get install -y clang
 
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-fuzz@0.13.2
 
