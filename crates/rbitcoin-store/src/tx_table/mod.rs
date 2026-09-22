@@ -1281,22 +1281,12 @@ impl TxTable {
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
-    /// Stamped `txstat` supplies `n_in` so this path is 8 B + seqsigwit (no txout).
-    /// Leftover unstamped rows still decode LAYOUT17 uleb from `txout`.
+    /// Stamped rows read `n_in` and the parent edge from `inputs`. Leftover
+    /// unstamped rows still take the inline prevout out of legacy `seqsigwit`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
-        let ir = self
-            .seqsigwit_loc
-            .range_batch(&[fk])?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(StoreError::NotFound)?;
-        let seqsigwit = self
-            .seqsigwit
-            .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
         let mut tx = if let Some(n_in) = self.inputs.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
@@ -1310,7 +1300,21 @@ impl TxTable {
         } else {
             self.get(fk)?
         };
-        let prevs = scan_seqsigwit_prevouts(&seqsigwit, tx.input_count)?;
+        let prevs = if let Some(edges) = self.inputs.edges(fk)? {
+            prevouts_from_edges(&edges)
+        } else {
+            let ir = self
+                .seqsigwit_loc
+                .range_batch(&[fk])?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or(StoreError::NotFound)?;
+            let seqsigwit = self
+                .seqsigwit
+                .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
+            scan_seqsigwit_prevouts(&seqsigwit, tx.input_count)?
+        };
         tx.txid = self.txids.get(fk)?;
         Ok((tx, prevs))
     }
@@ -1900,14 +1904,26 @@ impl TxTable {
         let seqsigwit = self
             .seqsigwit
             .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
-        let ins = if tx.input_count == 0 {
+        let mut ins = if tx.input_count == 0 {
             decode_seqsigwit_secret_to_end(&seqsigwit, Some(&self.secret))?
         } else {
             decode_seqsigwit_secret(&seqsigwit, tx.input_count, Some(&self.secret))?
         };
+        self.stamp_seqsigwit_prevouts(fk, &mut ins)?;
         tx.input_count = ins.len() as u32;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, ins, outs))
+    }
+
+    pub(crate) fn stamp_seqsigwit_prevouts(
+        &self,
+        fk: Fk,
+        ins: &mut [InputRecord],
+    ) -> Result<(), StoreError> {
+        let Some(edges) = self.inputs.edges(fk)? else {
+            return Ok(());
+        };
+        apply_input_edges(ins, &edges)
     }
 
     /// Contiguous create_fks `first..=last`: one libc span each of `txout.body`
@@ -1966,11 +1982,12 @@ impl TxTable {
             let iraw = span_rec(&seqsigwit_span, i0, ioff, ilen)?;
             let (mut tx, _ins, outs, _) =
                 decode_packed_tx_with_spender_rels_secret(traw, n_outs[i], Some(&self.secret))?;
-            let ins = if tx.input_count == 0 {
+            let mut ins = if tx.input_count == 0 {
                 decode_seqsigwit_secret_to_end(iraw, Some(&self.secret))?
             } else {
                 decode_seqsigwit_secret(iraw, tx.input_count, Some(&self.secret))?
             };
+            self.stamp_seqsigwit_prevouts(Fk(first + i as u64), &mut ins)?;
             tx.input_count = ins.len() as u32;
             tx.txid = ids[i];
             out.push((tx, ins, outs));

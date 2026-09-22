@@ -234,11 +234,12 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
             if seqsigwit_jobs[j].buf.is_empty() {
                 continue;
             }
-            let ins = decode_seqsigwit_secret(
+            let mut ins = decode_seqsigwit_secret(
                 &seqsigwit_jobs[j].buf,
                 txs[ti].rec.input_count,
                 Some(&table.secret),
             )?;
+            table.stamp_seqsigwit_prevouts(txs[ti].fk, &mut ins)?;
             txs[ti].inputs = Some(ins);
         }
     }

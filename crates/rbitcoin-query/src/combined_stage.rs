@@ -117,7 +117,7 @@ pub fn load_creates_once(
                             "invariant: Full create seqsigwit body missing after load",
                         ));
                     }
-                    let ins = rbitcoin_store::decode_seqsigwit_secret(
+                    let mut ins = rbitcoin_store::decode_seqsigwit_secret(
                         &ij.body,
                         tx.input_count,
                         Some(secret),
@@ -125,6 +125,7 @@ pub fn load_creates_once(
                     .map_err(|_| {
                         StoreError::Corrupt("invariant: packed create seqsigwit decode failed")
                     })?;
+                    store.stamp_input_prevouts(*fk, &mut ins)?;
                     if tx.input_count == 0 {
                         tx.input_count = ins.len() as u32;
                     }

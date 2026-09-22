@@ -305,30 +305,19 @@ fn new_create_txout_meta_omits_n_in() {
 }
 
 #[test]
-fn reopen_backfills_inputs_from_seqsigwit() {
+fn reopen_without_inputs_refuses_new_seqsigwit() {
     let dir = tempfile_dir("inputs-backfill");
     let t = create_tiny(&dir);
-    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    let _fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
     drop(t);
     for name in ["inputs.loc", "inputs.off", "inputs.body"] {
         std::fs::remove_file(dir.join(name)).unwrap();
     }
-    let t = TxTable::open_tiny(&dir).unwrap();
-    let edges = t.inputs.edges(fk).unwrap().unwrap();
-    assert_eq!(edges[0], crate::inputs::InputEdge::coinbase());
-    assert_eq!(
-        edges[1],
-        crate::inputs::InputEdge {
-            parent: Fk(1),
-            vout: 0,
-        }
-    );
-    assert_eq!(t.inputs.count(), 1);
-    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
-    drop(t);
-    let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.inputs.count(), 1);
-    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
+    match TxTable::open_tiny(&dir) {
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs")) => {}
+        Err(e) => panic!("open without inputs: {e}"),
+        Ok(_) => panic!("open without inputs recovered a new seqsigwit"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -642,14 +631,23 @@ fn decode_prevout_at_skips_script_and_witness() {
         witness: vec![vec![0x30; 70], vec![0x21; 33]],
     };
     let enc = rec.encode();
-    let (cfk, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&enc),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
+    let (full, used) = InputRecord::decode_at(&enc).unwrap();
+    assert_eq!(used, enc.len());
+    assert_eq!(full.script_sig.len(), 40);
+    assert_eq!(full.sequence, 0xffff_fffe);
+    assert!(full.create_fk.is_null());
+    let mut legacy =
+        vec![input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS];
+    legacy.extend_from_slice(&1u64.to_le_bytes());
+    legacy.push(3);
+    let (cfk, vout, used) = InputRecord::decode_prevout_at(&legacy).unwrap();
     assert_eq!(cfk, Fk(1));
     assert_eq!(vout, 3);
-    assert_eq!(used, enc.len());
-    // Full decode still matches.
-    let (full, used2) = InputRecord::decode_at(&enc).unwrap();
-    assert_eq!(used2, used);
-    assert_eq!(full.script_sig.len(), 40);
+    assert_eq!(used, legacy.len());
 }
 
 /// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).
@@ -664,14 +662,20 @@ fn input_encode_create_fk_not_prev_txid() {
         witness: vec![],
     };
     let enc = rec.encode();
-    // flags(1) + create_fk(8) + compact vout(1 for 7) = 10
-    assert_eq!(enc.len(), 10, "enc={:?}", enc);
-    // v9 would have been flags + 32-byte txid + vout = 34 for same case
-    assert!(enc.len() + 24 <= 34);
+    assert_eq!(
+        enc.len(),
+        1,
+        "seqsigwit stores no parent outpoint, enc={enc:?}"
+    );
+    assert_eq!(
+        enc[0] & input_flags::PREV_ON_INPUTS,
+        input_flags::PREV_ON_INPUTS
+    );
     let dec = InputRecord::decode(&enc).unwrap();
-    assert_eq!(dec.create_fk, Fk(42));
-    assert_eq!(dec.prev_index, 7);
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
     assert_eq!(dec.prev_txid, [0u8; 32]);
+    assert_eq!(dec.sequence, u32::MAX);
 }
 
 #[test]
@@ -711,10 +715,21 @@ fn scan_packed_meta_and_prevouts_no_output_alloc() {
     assert_eq!(meta.input_count, 0, "txout meta omits n_in");
     let mut seqsigwit = Vec::new();
     encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
-    let prevouts = scan_seqsigwit_prevouts(&seqsigwit, tx.input_count).unwrap();
-    assert_eq!(prevouts.len(), 2);
-    assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
-    assert_eq!(prevouts[1], (Fk(1), 1));
+    assert!(matches!(
+        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
+    let edges = vec![
+        crate::inputs::InputEdge::coinbase(),
+        crate::inputs::InputEdge {
+            parent: Fk(1),
+            vout: 1,
+        },
+    ];
+    assert_eq!(
+        prevouts_from_edges(&edges),
+        vec![(Fk::NULL, u32::MAX), (Fk(1), 1)]
+    );
 }
 
 #[test]
@@ -1736,8 +1751,8 @@ fn input_witness_roundtrip() {
     };
     let enc = rec.encode();
     let dec = InputRecord::decode(&enc).unwrap();
-    assert_eq!(dec.create_fk, Fk(1));
-    assert_eq!(dec.prev_index, 2);
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
     assert_eq!(dec.sequence, rec.sequence);
     assert_eq!(dec.script_sig, rec.script_sig);
     assert_eq!(dec.witness, rec.witness);
@@ -1755,15 +1770,27 @@ fn input_flags_roundtrip() {
         witness: vec![],
     };
     let enc = rec.encode();
-    // flags only: null prev + final seq + empty script + empty witness
-    assert_eq!(enc.len(), 1);
-    assert_eq!(InputRecord::decode(&enc).unwrap(), rec);
+    assert_eq!(
+        enc,
+        vec![
+            input_flags::PREV_ON_INPUTS
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS
+        ]
+    );
+    let dec = InputRecord::decode(&enc).unwrap();
+    assert_eq!(dec.sequence, rec.sequence);
+    assert!(dec.script_sig.is_empty());
+    assert!(dec.witness.is_empty());
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
 }
 
 #[test]
 fn input_rejects_legacy_local_prev() {
     // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
-    let flags = input_flags::RESERVED4
+    let flags = input_flags::PREV_ON_INPUTS
         | input_flags::SEQ_FINAL
         | input_flags::EMPTY_SCRIPT
         | input_flags::EMPTY_WITNESS;
@@ -1803,16 +1830,29 @@ fn input_run_roundtrip() {
     ];
     let mut enc = Vec::new();
     encode_input_run_secret(&run, &mut enc, None);
-    let dec = decode_input_run(&enc, 3).unwrap();
+    let mut dec = decode_input_run(&enc, 3).unwrap();
     assert_eq!(dec.len(), 3);
+    assert!(!dec[0].is_coinbase());
+    assert!(dec[1].create_fk.is_null());
+    assert_eq!(dec[1].witness, vec![vec![0xab]]);
+    assert_eq!(dec[1].prev_txid, [0u8; 32]);
+    let edges = [
+        crate::inputs::InputEdge::coinbase(),
+        crate::inputs::InputEdge {
+            parent: Fk(1),
+            vout: 0,
+        },
+        crate::inputs::InputEdge {
+            parent: Fk(1),
+            vout: 3,
+        },
+    ];
+    apply_input_edges(&mut dec, &edges).unwrap();
     assert!(dec[0].is_coinbase());
     assert_eq!(dec[1].create_fk, Fk(1));
     assert_eq!(dec[1].prev_index, 0);
-    assert_eq!(dec[1].witness, vec![vec![0xab]]);
     assert_eq!(dec[2].create_fk, Fk(1));
     assert_eq!(dec[2].prev_index, 3);
-    // Soft prev_txid not on disk.
-    assert_eq!(dec[1].prev_txid, [0u8; 32]);
 }
 
 #[test]
@@ -2013,7 +2053,9 @@ fn packed_tx_roundtrip() {
     let mut seqsigwit = Vec::new();
     encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
     let dins = decode_seqsigwit_secret(&seqsigwit, tx.input_count, None).unwrap();
-    assert_eq!(dins, inputs);
+    assert_eq!(dins[0].script_sig, inputs[0].script_sig);
+    assert_eq!(dins[0].sequence, inputs[0].sequence);
+    assert_eq!(dins[0].witness, inputs[0].witness);
     assert_eq!(douts, outputs);
 }
 
@@ -2257,15 +2299,16 @@ fn packed_encode_decode_flags_and_error_arms() {
     for r in [&coin, &non_final] {
         let e = r.encode();
         let d = InputRecord::decode(&e).unwrap();
-        assert_eq!(d.create_fk, r.create_fk);
-        assert_eq!(d.prev_index, r.prev_index);
+        assert!(d.create_fk.is_null());
+        assert_eq!(d.prev_index, 0);
         assert_eq!(d.sequence, r.sequence);
         assert_eq!(d.script_sig, r.script_sig);
         assert_eq!(d.witness, r.witness);
-        let (cfk, vout, used) = InputRecord::decode_prevout_at(&e).unwrap();
-        assert_eq!(cfk, r.create_fk);
-        assert_eq!(vout, r.prev_index);
-        assert_eq!(used, e.len());
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&e),
+            Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+        ));
+        assert_eq!(r.encoded_len_exact(), e.len());
         let _ = r.encoded_len();
     }
     assert!(matches!(
@@ -2276,13 +2319,13 @@ fn packed_encode_decode_flags_and_error_arms() {
         InputRecord::decode_at(&[]),
         Err(StoreError::Corrupt(_))
     ));
-    // RESERVED4 flag
+    // PREV_ON_INPUTS without a sequence payload is truncated.
     assert!(matches!(
-        InputRecord::decode_at(&[input_flags::RESERVED4]),
+        InputRecord::decode_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        InputRecord::decode_prevout_at(&[input_flags::RESERVED4]),
+        InputRecord::decode_prevout_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
     // non-coinbase create_fk truncated
@@ -2341,12 +2384,10 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert_eq!(m2.txid, [0u8; 32]);
     let mut seqsigwit = Vec::new();
     encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
-    assert_eq!(
-        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count)
-            .unwrap()
-            .len(),
-        2
-    );
+    assert!(matches!(
+        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
     let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
     assert_eq!(m4.txid, [0u8; 32]);
     assert_eq!(outs_rels.len(), 2);

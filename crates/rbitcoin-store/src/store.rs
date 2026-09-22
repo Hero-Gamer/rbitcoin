@@ -749,6 +749,15 @@ impl Store {
         self.txs.inputs.edges(fk)
     }
 
+    /// Copy parent edges onto seqsigwit records that do not store them.
+    pub fn stamp_input_prevouts(
+        &self,
+        fk: Fk,
+        ins: &mut [crate::tx_table::InputRecord],
+    ) -> Result<(), StoreError> {
+        self.txs.stamp_seqsigwit_prevouts(fk, ins)
+    }
+
     pub fn write_txstat_row(&self, fk: Fk, row: &crate::TxStatRow) -> Result<(), StoreError> {
         self.txs.txstat.write_row(fk, row)
     }

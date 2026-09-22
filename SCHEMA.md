@@ -402,11 +402,11 @@ stems; spent length is `8 × n_out` with `n_out ≥ 1`):
 
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
-seqsigwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
+seqsigwit.body Sw:  per-input flags|seq?|script_sig?|witness?
 spent.body Ss:  8 B × n_out  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
 ```
 
-Empty seqsigwit: **8-byte zero pad** so loc strides stay strictly monotone.
+New records set flag bit 4 (`PREV_ON_INPUTS`) and do not store parent `create_fk` or vout; that edge is `inputs.body`. A record without bit 4 is the legacy inline prevout (`NULL_PREV`, or `create_fk:u64` plus CompactSize vout). Open backfill of a missing `inputs.loc` still reads those legacy records. Empty seqsigwit: **8-byte zero pad** so loc strides stay strictly monotone.
 Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
 Reconstruct zips `txout` + `seqsigwit`. First-wave Outs reads stay on the starting
 OS page unless `4+(max_need+1)×38` (LAYOUT17 meta + kind + 5 B uleb amount + P2TR;

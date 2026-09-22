@@ -780,8 +780,9 @@ impl Query {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
             if id == want {
-                let ins =
+                let mut ins =
                     rbitcoin_store::decode_seqsigwit_secret(&raw[i..i + n], input_count, None)?;
+                self.store.stamp_input_prevouts(fk, &mut ins)?;
                 return Ok(Some(ins));
             }
             i += n;

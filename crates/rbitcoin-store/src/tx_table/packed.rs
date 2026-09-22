@@ -102,14 +102,15 @@ impl PackedCreate for std::sync::Arc<(TxRecord, Vec<OutputRecord>)> {
     }
 }
 
-/// Class A input + BIP141 witness (schema v10).
+/// Class A input + BIP141 witness.
 ///
-/// On-disk prevout:
-/// - coinbase: `NULL_PREV` (no payload)
-/// - non-coinbase: **`create_fk:u64` LE** + CompactSize `vout` (not prev_txid)
+/// `seqsigwit` stores sequence, scriptSig, and witness. The parent edge is
+/// `inputs.body`. New records set [`input_flags::PREV_ON_INPUTS`] and omit
+/// `create_fk` and vout. A record without that bit is the legacy layout:
+/// coinbase `NULL_PREV`, otherwise `create_fk:u64` LE plus CompactSize vout.
 ///
-/// [`Self::prev_txid`] is a soft cache for wire rebuild (zeros until filled from
-/// the create body or from the wire convert path). Encoding never writes it.
+/// [`Self::prev_txid`] is a soft cache for wire rebuild. Encoding never writes it.
+/// [`Self::create_fk`] on a new record is filled from `inputs.body` after decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRecord {
     /// Soft: wire txid of parent create (`[0;32]` if unknown / coinbase).
@@ -141,8 +142,7 @@ impl InputRecord {
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
-        let mut flags = 0u8;
+        let mut flags = input_flags::PREV_ON_INPUTS;
         if self.sequence == u32::MAX {
             flags |= input_flags::SEQ_FINAL;
         }
@@ -152,18 +152,7 @@ impl InputRecord {
         if self.witness.is_empty() {
             flags |= input_flags::EMPTY_WITNESS;
         }
-        if null_prev {
-            flags |= input_flags::NULL_PREV;
-        }
         out.push(flags);
-        if !null_prev {
-            debug_assert!(
-                !self.create_fk.is_null(),
-                "non-coinbase input requires create_fk before encode"
-            );
-            out.extend_from_slice(&self.create_fk.0.to_le_bytes());
-            write_compact_size(out, u64::from(self.prev_index));
-        }
         if flags & input_flags::SEQ_FINAL == 0 {
             out.extend_from_slice(&self.sequence.to_le_bytes());
         }
@@ -186,9 +175,10 @@ impl InputRecord {
         out
     }
 
-    /// Skip past one input after reading create_fk + vout (no script/witness alloc).
+    /// Skip past one legacy input after reading its inline prevout.
     ///
     /// Returns `(create_fk, prev_index, bytes_consumed)`. Coinbase → `(NULL, u32::MAX, …)`.
+    /// A [`input_flags::PREV_ON_INPUTS`] record has no prevout here.
     pub fn decode_prevout_at(buf: &[u8]) -> Result<(Fk, u32, usize), StoreError> {
         if buf.is_empty() {
             return Err(StoreError::Corrupt("short input record"));
@@ -196,23 +186,8 @@ impl InputRecord {
         let flags = buf[0];
         let mut off = 1usize;
         check_seqsigwit_flags(flags)?;
-        let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
-            (Fk::NULL, u32::MAX)
-        } else {
-            if buf.len() < off + 8 {
-                return Err(StoreError::Corrupt("input create_fk truncated"));
-            }
-            let id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-            off += 8;
-            if id == 0 {
-                return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
-            }
-            let (vout, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            if vout > u64::from(u32::MAX) {
-                return Err(StoreError::Corrupt("prev_index too large"));
-            }
-            (Fk(id), vout as u32)
+        let Some((create_fk, prev_index)) = read_inline_prevout(buf, flags, &mut off)? else {
+            return Err(StoreError::Corrupt("seqsigwit prevout is on inputs"));
         };
         if flags & input_flags::SEQ_FINAL == 0 {
             if buf.len() < off + 4 {
@@ -255,23 +230,9 @@ impl InputRecord {
         let flags = buf[0];
         let mut off = 1usize;
         check_seqsigwit_flags(flags)?;
-        let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
-            (Fk::NULL, u32::MAX)
-        } else {
-            if buf.len() < off + 8 {
-                return Err(StoreError::Corrupt("input create_fk truncated"));
-            }
-            let id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-            off += 8;
-            if id == 0 {
-                return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
-            }
-            let (vout, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            if vout > u64::from(u32::MAX) {
-                return Err(StoreError::Corrupt("prev_index too large"));
-            }
-            (Fk(id), vout as u32)
+        let (create_fk, prev_index) = match read_inline_prevout(buf, flags, &mut off)? {
+            Some(pair) => pair,
+            None => (Fk::NULL, 0),
         };
         let sequence = if flags & input_flags::SEQ_FINAL != 0 {
             u32::MAX
@@ -350,12 +311,7 @@ impl InputRecord {
     #[inline]
     pub fn encoded_len_exact(&self) -> usize {
         use rbitcoin_primitives::compact_size_len;
-        let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
         let mut n = 1usize;
-        if !null_prev {
-            n += 8;
-            n += compact_size_len(u64::from(self.prev_index));
-        }
         if self.sequence != u32::MAX {
             n += 4;
         }
@@ -398,8 +354,8 @@ pub(super) fn xor_script_regions_in_input(
     }
     let flags = buf[start];
     let mut off = start + 1;
-    let null_prev = flags & input_flags::NULL_PREV != 0;
-    if !null_prev {
+    let inline_prev = flags & (input_flags::NULL_PREV | input_flags::PREV_ON_INPUTS) == 0;
+    if inline_prev {
         if off + 8 > buf.len() {
             return;
         }
@@ -615,10 +571,72 @@ const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
 const SPENT_VIN_U16_MAX: u32 = (1u32 << 16) - 1;
 
 fn check_seqsigwit_flags(flags: u8) -> Result<(), StoreError> {
-    if flags & (input_flags::RESERVED4 | input_flags::RESERVED_HIGH) != 0 {
+    if flags & input_flags::RESERVED_HIGH != 0 {
         return Err(StoreError::Corrupt("seqsigwit reserved flags"));
     }
     Ok(())
+}
+
+/// `Some` is a legacy inline prevout. `None` means [`input_flags::PREV_ON_INPUTS`].
+fn read_inline_prevout(
+    buf: &[u8],
+    flags: u8,
+    off: &mut usize,
+) -> Result<Option<(Fk, u32)>, StoreError> {
+    if flags & input_flags::PREV_ON_INPUTS != 0 {
+        return Ok(None);
+    }
+    if flags & input_flags::NULL_PREV != 0 {
+        return Ok(Some((Fk::NULL, u32::MAX)));
+    }
+    if buf.len() < *off + 8 {
+        return Err(StoreError::Corrupt("input create_fk truncated"));
+    }
+    let id = u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    if id == 0 {
+        return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
+    }
+    let (vout, n) = read_compact_size(&buf[*off..])?;
+    *off += n;
+    if vout > u64::from(u32::MAX) {
+        return Err(StoreError::Corrupt("prev_index too large"));
+    }
+    Ok(Some((Fk(id), vout as u32)))
+}
+
+/// Fill `create_fk` and `prev_index` from `inputs.body`. Coinbase edge → null prevout.
+pub fn apply_input_edges(
+    ins: &mut [InputRecord],
+    edges: &[crate::inputs::InputEdge],
+) -> Result<(), StoreError> {
+    if ins.len() != edges.len() {
+        return Err(StoreError::Corrupt("inputs edge count"));
+    }
+    for (inp, edge) in ins.iter_mut().zip(edges.iter()) {
+        if edge.parent.is_null() {
+            inp.create_fk = Fk::NULL;
+            inp.prev_index = u32::MAX;
+        } else {
+            inp.create_fk = edge.parent;
+            inp.prev_index = edge.vout;
+        }
+    }
+    Ok(())
+}
+
+/// Prevouts in the shape [`scan_seqsigwit_prevouts`] returns. Coinbase → `(NULL, u32::MAX)`.
+pub fn prevouts_from_edges(edges: &[crate::inputs::InputEdge]) -> Vec<(Fk, u32)> {
+    edges
+        .iter()
+        .map(|e| {
+            if e.parent.is_null() {
+                (Fk::NULL, u32::MAX)
+            } else {
+                (e.parent, e.vout)
+            }
+        })
+        .collect()
 }
 
 fn check_spent_flags(flags: u8) -> Result<(), StoreError> {
@@ -1067,7 +1085,7 @@ mod scan_p2tr_tests {
         let got = decode_seqsigwit_secret(&raw, 0, None).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].script_sig, vec![0x01, 0x02]);
-        assert!(got[0].is_coinbase());
+        assert!(!got[0].is_coinbase());
     }
 
     fn three_out_packed() -> (Vec<u8>, usize) {
