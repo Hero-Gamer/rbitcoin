@@ -336,7 +336,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
   --prune-inwit refuse inwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
-    Kept heights are store/inwit.window/{height}.bin plus a RAM cache. Unpruned nodes read inwit.body.\n\
+    Kept heights are store/inwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read inwit.body.\n\
   --prune-inwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
