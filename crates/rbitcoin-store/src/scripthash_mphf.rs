@@ -438,19 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn sh_mphf_empty_and_paged_last_only() {
+    fn sh_mphf_empty_and_extent_last_only() {
         let dir = tmp();
         let base = dir.join("00");
         let h = MphfHead::write_pack8(&base, &[]).unwrap();
         assert!(h.is_empty());
         assert!(h.get(&key(1)).unwrap().is_none());
-        let paged = ShHeadValue::paged(4096, 8192);
-        match pack8(&paged) {
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, crate::scripthash_layout::INDEX_REFUSE_PAGED_SH);
-            }
-            other => panic!("pack8 Paged must refuse, got {other:?}"),
-        }
         let extent = ShHeadValue::extent(8192);
         let h = MphfHead::write_pack8(&base, &[(key(1), pack8(&extent).unwrap())]).unwrap();
         match h.get(&key(1)).unwrap().unwrap() {

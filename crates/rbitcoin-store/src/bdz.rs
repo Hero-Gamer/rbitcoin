@@ -144,14 +144,6 @@ impl BdzMphf {
         self.modulus
     }
 
-    #[cfg(test)]
-    pub fn g_bytes(&self) -> usize {
-        match &self.g {
-            GStore::Ram(g) => g.len() * 4,
-            GStore::Fd { n_bytes, .. } => *n_bytes as usize,
-        }
-    }
-
     pub fn g_bytes_resident(&self) -> usize {
         match &self.g {
             GStore::Ram(g) => g.len() * 4,
@@ -385,26 +377,6 @@ impl BdzMphf {
         Err(StoreError::Corrupt("bdz mphf: graph did not peel"))
     }
 
-    #[cfg(test)]
-    pub fn write_to(&self, path: &Path) -> Result<(), StoreError> {
-        const MAGIC: &[u8; 4] = b"BDZ1";
-        const HEADER_LEN: u64 = 24;
-        let GStore::Ram(g) = &self.g else {
-            return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
-        };
-        let mut buf = Vec::with_capacity(HEADER_LEN as usize + g.len() * 4);
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&self.n.to_le_bytes());
-        buf.extend_from_slice(&self.m.to_le_bytes());
-        buf.extend_from_slice(&self.seed.to_le_bytes());
-        for &x in g.iter() {
-            buf.extend_from_slice(&x.to_le_bytes());
-        }
-        std::fs::write(path, &buf).map_err(|e| StoreError::io(path, e))?;
-        Ok(())
-    }
-
     pub fn write_packed_to(&self, path: &Path) -> Result<(), StoreError> {
         let GStore::Ram(g) = &self.g else {
             return Err(StoreError::Corrupt("bdz mphf: write requires RAM g"));
@@ -422,56 +394,6 @@ impl BdzMphf {
             f.write_all(&hdr).map_err(|e| StoreError::io(path, e))?;
             pack_g_write(g, g_bits, f).map_err(|e| StoreError::io(path, e))?;
             Ok(())
-        })
-    }
-
-    #[cfg(test)]
-    pub fn read_from(path: &Path) -> Result<Self, StoreError> {
-        const MAGIC: &[u8; 4] = b"BDZ1";
-        const HEADER_LEN: u64 = 24;
-        let file = File::open(path).map_err(|e| StoreError::io(path, e))?;
-        let mut hdr = [0u8; HEADER_LEN as usize];
-        pread_exact(&file, path, 0, &mut hdr)?;
-        if &hdr[0..4] != MAGIC {
-            return Err(StoreError::Corrupt("bdz mphf: bad magic"));
-        }
-        let ver = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        if ver != VERSION {
-            return Err(StoreError::Corrupt("bdz mphf: bad version"));
-        }
-        let n = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-        let m = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let seed = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        if n == 0 {
-            return Ok(Self {
-                n: 0,
-                m: 0,
-                seed: 0,
-                modulus: 0,
-                g: GStore::Ram(Box::new([])),
-                compact: None,
-            });
-        }
-        let n_words = if n == 1 { 1 } else { m };
-        let g_bytes = n_words as u64 * 4;
-        let meta = file.metadata().map_err(|e| StoreError::io(path, e))?;
-        if meta.len() < HEADER_LEN + g_bytes {
-            return Err(StoreError::Corrupt("bdz mphf: g length"));
-        }
-        Ok(Self {
-            n,
-            m: n_words,
-            seed,
-            modulus: n,
-            g: GStore::Fd {
-                file,
-                path: path.to_path_buf(),
-                off: HEADER_LEN,
-                n_bytes: g_bytes,
-                g_bits: G_BITS_WORDS,
-                page_preads: AtomicU64::new(0),
-            },
-            compact: None,
         })
     }
 
@@ -1397,62 +1319,6 @@ mod tests {
         let one = BdzMphf::build(&[42]).unwrap();
         assert_eq!(one.index(42).unwrap(), 0);
         assert_eq!(one.index(99).unwrap(), 0);
-    }
-
-    #[test]
-    fn bdz_roundtrip_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-bdz-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
-        let f = BdzMphf::build(&keys).unwrap();
-        let p = dir.join("t.mphf");
-        f.write_to(&p).unwrap();
-        assert_eq!(&std::fs::read(&p).unwrap()[0..4], b"BDZ1");
-        let g = BdzMphf::read_from(&p).unwrap();
-        for &k in &keys {
-            assert_eq!(f.index(k).unwrap(), g.index(k).unwrap());
-        }
-        assert_eq!(g.g_bytes_resident(), 0, "open must not retain the g array");
-        assert_eq!(g.g_bytes(), f.g_bytes());
-        let miss = g.index(0xDEAD_BEEF_u64).unwrap();
-        assert!(miss < keys.len() as u32);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bdz_open_matches_ram_index_without_g_heap() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-bdz-fd-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..10_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(7))
-            .collect();
-        let ram = BdzMphf::build(&keys).unwrap();
-        assert!(ram.g_bytes_resident() > 0);
-        let p = dir.join("t.mphf");
-        ram.write_to(&p).unwrap();
-        let fd = BdzMphf::read_from(&p).unwrap();
-        assert_eq!(fd.g_bytes_resident(), 0);
-        for &k in &keys {
-            assert_eq!(ram.index(k).unwrap(), fd.index(k).unwrap());
-        }
-        let miss_k = 0xDEAD_BEEF_u64;
-        assert_eq!(ram.index(miss_k).unwrap(), fd.index(miss_k).unwrap());
-        assert!(fd.index(miss_k).unwrap() < keys.len() as u32);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

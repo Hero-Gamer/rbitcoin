@@ -73,11 +73,6 @@ pub enum ShHeadValue {
         used: u16,
         off: u64,
     },
-    /// 4 KiB page chain; head stores first and last page file offsets only.
-    Paged {
-        first_page: u64,
-        last_page: u64,
-    },
     /// Schema 19 megakey: pack8 mode 11 last page; that page holds extent_base/n.
     Extent {
         last_page: u64,
@@ -91,7 +86,7 @@ impl ShHeadValue {
             ShHeadValue::Inline { used, .. } => u32::from(*used),
             ShHeadValue::Slab { used, .. } => u32::from(*used),
             // Count not stored in head; callers that need n walk pages.
-            ShHeadValue::Paged { .. } | ShHeadValue::Extent { .. } => u32::MAX,
+            ShHeadValue::Extent { .. } => u32::MAX,
         }
     }
 
@@ -100,7 +95,7 @@ impl ShHeadValue {
     }
 
     pub fn is_paged(&self) -> bool {
-        matches!(self, ShHeadValue::Paged { .. } | ShHeadValue::Extent { .. })
+        matches!(self, ShHeadValue::Extent { .. })
     }
 
     pub fn is_slab(&self) -> bool {
@@ -111,13 +106,6 @@ impl ShHeadValue {
         let mut entries = [Fk::NULL; SH_INLINE_CAP];
         entries[0] = fk;
         ShHeadValue::Inline { entries, used: 1 }
-    }
-
-    pub fn paged(first_page: u64, last_page: u64) -> Self {
-        ShHeadValue::Paged {
-            first_page,
-            last_page,
-        }
     }
 
     pub fn extent(last_page: u64) -> Self {
@@ -173,7 +161,6 @@ pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
                 | ((u64::from(*used) & SH8_USED_MASK) << SH8_USED_SHIFT)
                 | ((u64::from(*class) & SH8_CLASS_MASK) << SH8_CLASS_SHIFT))
         }
-        ShHeadValue::Paged { .. } => Err(StoreError::Corrupt(INDEX_REFUSE_PAGED_SH)),
         ShHeadValue::Extent { last_page } => {
             if *last_page > SH8_PAYLOAD62 || *last_page == 0 {
                 return Err(StoreError::Corrupt("sh pack8: last_page overflow"));
@@ -184,7 +171,7 @@ pub fn pack8(v: &ShHeadValue) -> Result<u64, StoreError> {
     }
 }
 
-/// Inverse of [`pack8`]. Paged `first_page` is 0 (lives on the last page header).
+/// Inverse of [`pack8`]. Mode 2 (old Paged megakey) refuses.
 pub fn pack8_bytes(v: &ShHeadValue) -> Result<[u8; SH_HEAD_VALUE_LEN], StoreError> {
     Ok(pack8(v)?.to_le_bytes())
 }
@@ -233,16 +220,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn head_value_roundtrip_inline_paged() {
+    fn head_value_roundtrip_inline_and_mode10_refuses() {
         let e0 = Fk(3);
         let inline = ShHeadValue::inline_one(e0);
         assert_eq!(unpack8(pack8(&inline).unwrap()).unwrap(), inline);
 
-        let paged = ShHeadValue::paged(4096, 8192);
-        match pack8(&paged) {
-            Err(StoreError::Corrupt(m)) => assert_eq!(m, INDEX_REFUSE_PAGED_SH),
-            other => panic!("pack8 Paged must refuse, got {other:?}"),
-        }
         let mode10 = (2u64 << SH8_MODE_SHIFT) | 8192;
         match unpack8(mode10) {
             Err(StoreError::Corrupt(m)) => assert_eq!(m, INDEX_REFUSE_PAGED_SH),
@@ -289,11 +271,6 @@ mod tests {
         let slab = ShHeadValue::slab(2, 9, 4096);
         let got = unpack8(pack8(&slab).unwrap()).unwrap();
         assert_eq!(got, slab);
-        let paged = ShHeadValue::paged(4096, 8192);
-        assert!(matches!(
-            pack8(&paged),
-            Err(StoreError::Corrupt(m)) if m == INDEX_REFUSE_PAGED_SH
-        ));
         assert_eq!(pack8(&ShHeadValue::Empty).unwrap(), 0);
         assert!(pack8(&ShHeadValue::inline_one(Fk(0))).is_ok());
         assert!(unpack8(1u64 << 62 | 1).is_err() || unpack8(1u64 << 62 | 1).is_ok());
@@ -342,12 +319,12 @@ mod tests {
             used: 0,
         };
         assert!(matches!(pack8(&zero_inline), Err(StoreError::Corrupt(_))));
-        let paged = ShHeadValue::paged(4096, 8192);
-        assert_eq!(paged.used(), u32::MAX);
-        assert!(paged.is_paged());
-        assert!(!paged.is_slab());
-        assert!(paged.inline_entries().is_empty());
-        assert!(paged.inline_fks().is_empty());
+        let extent = ShHeadValue::extent(8192);
+        assert_eq!(extent.used(), u32::MAX);
+        assert!(extent.is_paged());
+        assert!(!extent.is_slab());
+        assert!(extent.inline_entries().is_empty());
+        assert!(extent.inline_fks().is_empty());
         let slab = ShHeadValue::slab(0, 4, 4096);
         assert_eq!(slab.used(), 4);
         assert!(slab.is_slab());

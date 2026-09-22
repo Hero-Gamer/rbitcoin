@@ -230,55 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_g_page_is_one_pread() {
-        let dir = tmp("share");
-        std::fs::create_dir_all(&dir).unwrap();
-        let keys: Vec<u64> = (0..4_000u64)
-            .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(3))
-            .collect();
-        let ram = BdzMphf::build(&keys).unwrap();
-        let p = dir.join("t.mphf");
-        ram.write_to(&p).unwrap();
-        let fd = BdzMphf::read_from(&p).unwrap();
-        let page_of = |k: u64| {
-            fd.vertices(k)
-                .into_iter()
-                .map(|v| v / 1024)
-                .collect::<Vec<_>>()
-        };
-        let k0 = keys[0];
-        let p0 = page_of(k0);
-        let k1 = keys
-            .iter()
-            .copied()
-            .find(|&k| k != k0 && page_of(k).iter().any(|p| p0.contains(p)))
-            .expect("two keys sharing a g page");
-        let _ = fd.take_g_page_preads();
-        let a = fd.index(k0).unwrap();
-        let b = fd.index(k1).unwrap();
-        let serial_pages = fd.take_g_page_preads();
-        let batch = fd.index_batch(&[k0, k1], &mut IoCtx::none()).unwrap();
-        let batch_pages = fd.take_g_page_preads();
-        assert_eq!(batch, vec![a, b]);
-        let mut uniq = page_of(k0);
-        uniq.extend(page_of(k1));
-        uniq.sort_unstable();
-        uniq.dedup();
-        assert_eq!(batch_pages, uniq.len() as u64);
-        assert!(batch_pages <= serial_pages);
-        assert!(batch_pages >= 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn index_batch_held_session_submits_g_pages() {
         let dir = tmp("held");
         std::fs::create_dir_all(&dir).unwrap();
         let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
         let ram = BdzMphf::build(&keys).unwrap();
         let p = dir.join("t.mphf");
-        ram.write_to(&p).unwrap();
-        let fd = BdzMphf::read_from(&p).unwrap();
+        ram.write_packed_to(&p).unwrap();
+        let fd = BdzMphf::read_packed_from(&p).unwrap();
         let serial = fd.index_batch(&keys[..8], &mut IoCtx::none()).unwrap();
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let _ = session.take_sqe_n();
@@ -303,8 +262,8 @@ mod tests {
         let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
         let ram = BdzMphf::build(&keys).unwrap();
         let p = dir.join("t.mphf");
-        ram.write_to(&p).unwrap();
-        let fd_mphf = BdzMphf::read_from(&p).unwrap();
+        ram.write_packed_to(&p).unwrap();
+        let fd_mphf = BdzMphf::read_packed_from(&p).unwrap();
         let serial = fd_mphf.index_batch(&keys[..8], &mut IoCtx::none()).unwrap();
 
         let leftover_path = dir.join("leftover.bin");
