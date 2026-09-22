@@ -110,17 +110,11 @@ pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
     Some(structured_cmpct_case(data))
 }
 
-/// Core extra-txn may place a duplicate-txid slot we still `getblocktxn`
-/// (018). Agree when the sets match, or the documented 018 extra-ours
-/// (`[1, 4]` vs Core `[1]`). Omitting a Core index always disagrees.
+/// Core extra-txn may fill a duplicate-txid slot we still `getblocktxn`
+/// (018). Agree when every Core index is one of ours. Extra ours is that
+/// missing ring, not a split. Omitting a Core index disagrees.
 pub fn cmpct_getblocktxn_agrees(ours: &[u64], core: &[u64]) -> bool {
-    if !core.iter().all(|i| ours.contains(i)) {
-        return false;
-    }
-    if ours.iter().all(|i| core.contains(i)) {
-        return true;
-    }
-    ours.len() == 2 && core == [1] && ours.contains(&1) && ours.contains(&4)
+    core.iter().all(|i| ours.contains(i))
 }
 
 /// Missing indexes using the case fill set (empty = mempool-cold).
@@ -283,12 +277,25 @@ mod tests {
             "018 extra missing vs Core extra-txn fill must not panic"
         );
         assert!(cmpct_getblocktxn_agrees(&[1], &[1]));
+        assert!(
+            cmpct_getblocktxn_agrees(&[1, 2], &[1]),
+            "extra ours is the missing extra-txn ring"
+        );
+        assert!(cmpct_getblocktxn_agrees(&[2, 4], &[2]));
         assert!(!cmpct_getblocktxn_agrees(&[1], &[1, 4]));
         assert!(!cmpct_getblocktxn_agrees(&[], &[1]));
-        assert!(
-            !cmpct_getblocktxn_agrees(&[1, 2], &[1]),
-            "extra ours on a non-018 recipe must disagree"
+    }
+
+    #[test]
+    fn overnight_fill_dup_requests_2_and_4() {
+        // fuzz.yml 35728126468: `[0, 251, 229, 55, 51, 13, 10]`
+        // ours [2, 4], Core getblocktxn [2].
+        let case = prepare_cmpct_fuzz_case(&[0, 251, 229, 55, 51, 13, 10]).unwrap();
+        assert_eq!(
+            cmpct_missing_for_case(&case).as_deref(),
+            Some(&[2u64, 4][..])
         );
+        assert!(cmpct_getblocktxn_agrees(&[2, 4], &[2]));
     }
 
     #[test]
