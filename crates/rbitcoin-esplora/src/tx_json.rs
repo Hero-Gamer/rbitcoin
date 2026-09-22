@@ -172,6 +172,37 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
     )
 }
 
+/// Parent txid and vout from `inputs.body`. No scriptSig, witness, or sequence.
+fn pruned_vin(query: &Query, tx_fk: Fk, network: Network) -> Result<Option<Vec<Value>>, QueryError> {
+    let Some(edges) = query.store().input_edges(tx_fk)? else {
+        return Ok(None);
+    };
+    let mut vin = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if edge.parent.is_null() {
+            vin.push(json!({
+                "txid": "0".repeat(64),
+                "vout": 0xFFFFFFFFu32,
+                "is_coinbase": true,
+            }));
+            continue;
+        }
+        let parent_txid = query.store().txs.body_txid(edge.parent)?;
+        let mut obj = json!({
+            "txid": block_hash_hex(&parent_txid),
+            "vout": edge.vout,
+            "is_coinbase": false,
+        });
+        if let Ok((_meta, outs)) = query.store().get_tx_meta_and_outputs(edge.parent) {
+            if let Some(o) = outs.get(edge.vout as usize) {
+                obj["prevout"] = vout_fields(&o.script, o.value, network);
+            }
+        }
+        vin.push(obj);
+    }
+    Ok(Some(vin))
+}
+
 fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
     let tx = query.store().get_tx(tx_fk)?;
     let (_meta, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
@@ -181,8 +212,6 @@ fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Va
         .iter()
         .map(|o| vout_fields(&o.script, o.value, network))
         .collect();
-    // Omit vin. An empty array is not a coinbase and is not the inputs we
-    // no longer have; wallets must see the key as absent.
     let mut obj = json!({
         "txid": block_hash_hex(&txid),
         "version": tx.version,
@@ -191,6 +220,9 @@ fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Va
         "status": status,
         "pruned": true,
     });
+    if let Some(vin) = pruned_vin(query, tx_fk, network)? {
+        obj["vin"] = json!(vin);
+    }
     if let Some(row) = query.txstat_row(tx_fk)? {
         if row.base != 0 || row.wit_extra != 0 {
             obj["fee"] = json!(row.fee_sat);
@@ -860,7 +892,7 @@ mod tests {
             inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
             outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
-        q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
         let fk = q.block_tx_fks(Height(0)).unwrap()[0];
         q.store()
             .write_txstat_row(
@@ -872,10 +904,56 @@ mod tests {
                 },
             )
             .unwrap();
-        q.set_pruneheight(Some(Height(0))).unwrap();
+        let mut spend_txid = [0u8; 32];
+        spend_txid[31] = 0xee;
+        let h1_hash = rbitcoin_store::block_header_hash(1, &merkle, &spend_txid, 2, 0x207fffff, 0);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: spend_txid,
+            hash: h1_hash,
+            size: 0,
+            weight: 0,
+        };
+        let spend = TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: txid,
+                create_fk: fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![0x51],
+                witness: vec![vec![0xab]],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        q.connect_block(Height(1), &h1, &[spend]).unwrap();
+        let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+        q.set_pruneheight(Some(Height(1))).unwrap();
         let v = build_tx_json(&q, fk, Network::Regtest).unwrap();
         assert_eq!(v["pruned"], true);
-        assert!(v.get("vin").is_none(), "pruned JSON omits vin: {v}");
+        assert_eq!(v["vin"][0]["is_coinbase"], true);
+        assert!(v["vin"][0].get("witness").is_none(), "{v}");
+        assert!(v["vin"][0].get("scriptsig").is_none(), "{v}");
+        let sv = build_tx_json(&q, spend_fk, Network::Regtest).unwrap();
+        assert_eq!(sv["pruned"], true, "{sv}");
+        assert_eq!(sv["vin"][0]["txid"], block_hash_hex(&txid));
+        assert_eq!(sv["vin"][0]["vout"], 0);
+        assert_eq!(sv["vin"][0]["is_coinbase"], false);
+        assert!(sv["vin"][0].get("witness").is_none(), "{sv}");
+        assert_eq!(sv["vin"][0]["prevout"]["value"], 5_000_000_000i64);
+        q.set_pruneheight(Some(Height(0))).unwrap();
         assert_eq!(v["fee"], 0);
         assert_eq!(v["size"], 81);
         assert_eq!(v["weight"], 324);
@@ -895,7 +973,7 @@ mod tests {
             .unwrap();
         let raw = build_tx_json(&q, fk, Network::Regtest).unwrap();
         assert_eq!(raw["pruned"], true);
-        assert!(raw.get("vin").is_none(), "{raw}");
+        assert_eq!(raw["vin"][0]["is_coinbase"], true, "{raw}");
         assert!(raw.get("fee").is_none(), "unstamped omits fee: {raw}");
         assert!(raw.get("size").is_none(), "{raw}");
         assert!(raw.get("weight").is_none(), "{raw}");
