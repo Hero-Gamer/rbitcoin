@@ -1,4 +1,5 @@
-# Weekly cargo-mutants + PR in-diff advisory. Not a required PR check.
+# Weekly cargo-mutants. Not a required check.
+# PR in-diff shards are ci.yml job `mutants` (parallel with coverage).
 # Must pass --workspace: default-members is rbitcoin-node only.
 # Owner: TESTING.md (Mutation testing). Snapshot lists: docs/mutants/.
 
@@ -7,40 +8,12 @@ on:
   schedule:
     - cron: "0 3 * * 0"
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - ".github/workflows/mutants.yml"
 
 permissions:
   contents: read
 
 jobs:
-  mutants-pr:
-    if: github.event_name == 'pull_request'
-    concurrency:
-      group: mutants-pr-${{ github.ref }}
-      cancel-in-progress: true
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          submodules: false
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
-      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
-        with:
-          tool: cargo-mutants@27.1.0
-      - run: git diff origin/${{ github.base_ref }}.. --unified=0 > git.diff
-      - run: cargo mutants --workspace --in-diff git.diff -j 2
-        continue-on-error: true
-
   mutants-weekly:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:

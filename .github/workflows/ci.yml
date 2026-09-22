@@ -24,14 +24,15 @@ env:
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
 # Each gate is its own check. Short ubuntu gates share one runner so
-# concurrent-job slots stay free for clippy, test, and future cargo-mutants
-# shards (mutants.yml):
+# concurrent-job slots stay free for clippy, test, coverage, and the PR
+# mutants shards:
 #   fmt → deny → ast-grep → nixos-module-eval
 # Later gates use !cancelled() so a red earlier gate still reports its own
 # check (a skip would hide required deny / ast-grep).
 # clippy, test, windows, and macos start immediately. clippy stays parallel:
 # coverage waits on it, and a cold rust-cache is a full workspace compile.
-# coverage waits for fmt / clippy / test.
+# coverage and the advisory mutants shards wait for fmt / clippy / test.
+# Weekly full mutants sweep stays mutants.yml.
 # nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #
@@ -203,6 +204,102 @@ jobs:
           workspaces: ". -> target/dev"
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
+
+  # Crates, Cargo manifest/lock, or these workflow files. Docs-only PRs
+  # skip the four shard runners. Starts immediately; shards still wait for test.
+  mutants-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.d.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: rust or workflow diff
+        id: d
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git diff "origin/${BASE_REF}".. --unified=0 -- \
+            crates Cargo.toml Cargo.lock \
+            .github/workflows/ci.yml .github/workflows/mutants.yml \
+            > git.diff
+          if [[ -s git.diff ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # PR in-diff, four shards, same window as coverage. Advisory: a missed
+  # mutant does not fail the job. One ~300-mutant diff at -j 2 is ~50m and
+  # was canceled at 30m. Weekly sweep stays mutants.yml. Owner: TESTING.md.
+  mutants:
+    name: mutants (${{ matrix.shard }}/4)
+    needs: [fmt, clippy, test, mutants-diff]
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.fmt.result == 'success'
+      && needs.clippy.result == 'success'
+      && needs.test.result == 'success'
+      && needs.mutants-diff.result == 'success'
+      && needs.mutants-diff.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      # Workflow env disables incremental for rust-cache and denies warnings.
+      # cargo-mutants rebuilds one mutant at a time; incremental is the point.
+      # Weekly mutants.yml does not pass -D warnings. A warning-only build
+      # failure would look caught here and missed on Sunday.
+      CARGO_INCREMENTAL: "1"
+      CARGO_TERM_COLOR: never
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: in-diff shard
+        id: run
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git diff "origin/${BASE_REF}".. --unified=0 > git.diff
+          set +e
+          cargo mutants --workspace --in-diff git.diff \
+            --shard "${{ matrix.shard }}/4" --sharding slice -j 2 \
+            > mutants-shard.log 2>&1
+          ec=$?
+          set -e
+          missed=$(grep -c '^MISSED' mutants-shard.log || true)
+          echo "missed=${missed}" >> "$GITHUB_OUTPUT"
+          cat mutants-shard.log
+          exit "$ec"
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### mutants ${{ matrix.shard }}/4"
+            echo "Advisory (not a merge gate). Outcome: ${{ steps.run.outcome }}. Missed: ${{ steps.run.outputs.missed }}."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutants-pr-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore
+          retention-days: 5
 
   # Line-coverage 92% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
   # Slow; waits for the fast gates so a red fmt/clippy/test does not start
