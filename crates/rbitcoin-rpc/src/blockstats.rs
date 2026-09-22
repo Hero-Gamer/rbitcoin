@@ -66,6 +66,11 @@ struct UtxoDelta {
     size_inc_actual: i64,
 }
 
+struct StampedExtras {
+    total_out: i64,
+    utxo: UtxoDelta,
+}
+
 impl UtxoDelta {
     fn note_output(&mut self, script: &[u8], count_actual: bool) {
         let sz = txout_utxo_bytes(script.len());
@@ -372,8 +377,7 @@ fn stats_from_txstat(
     subsidy: i64,
     rows: &[TxStatRow],
     n_outs: &[u32],
-    total_out: i64,
-    delta: &UtxoDelta,
+    extras: &StampedExtras,
 ) -> BlockStats {
     let mut ins = 0i64;
     let mut outs = 0i64;
@@ -469,15 +473,15 @@ fn stats_from_txstat(
         swtotal_weight,
         swtxs,
         time: rec.timestamp,
-        total_out,
+        total_out: extras.total_out,
         total_size,
         total_weight,
         totalfee,
         txs: rows.len() as i64,
         utxo_increase: outs - ins,
-        utxo_size_inc: delta.size_inc,
-        utxo_increase_actual: delta.utxos - delta.inputs,
-        utxo_size_inc_actual: delta.size_inc_actual,
+        utxo_size_inc: extras.utxo.size_inc,
+        utxo_increase_actual: extras.utxo.utxos - extras.utxo.inputs,
+        utxo_size_inc_actual: extras.utxo.size_inc_actual,
     }
 }
 
@@ -640,17 +644,19 @@ fn stats_for_stamped(
         None => rbitcoin_consensus::ChainParams::for_network(ctx.network),
     };
     let subsidy = rbitcoin_consensus::block_subsidy(height.0, &params);
-    let total_out = ctx
-        .query
-        .non_coinbase_total_out(&stamped.fks)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    let delta = utxo_delta_from_store(
-        ctx.query.as_ref(),
-        height.0,
-        &stamped.rec.hash,
-        &stamped.fks,
-    )
-    .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let extras = StampedExtras {
+        total_out: ctx
+            .query
+            .non_coinbase_total_out(&stamped.fks)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?,
+        utxo: utxo_delta_from_store(
+            ctx.query.as_ref(),
+            height.0,
+            &stamped.rec.hash,
+            &stamped.fks,
+        )
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?,
+    };
     Ok(stats_from_txstat(
         height.0,
         &stamped.rec,
@@ -658,8 +664,7 @@ fn stats_for_stamped(
         subsidy,
         &stamped.rows,
         &stamped.n_outs,
-        total_out,
-        &delta,
+        &extras,
     ))
 }
 
