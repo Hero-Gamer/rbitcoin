@@ -42,7 +42,8 @@ before 1.0).
   Merge folds those spills into one map, one walk to pack8
   `scripthash.head/NN` (singles `inline_one`, multis Empty; file exists is
   not pack-done) and fuse8 of dupes to `multi/NN.fuse8` (on disk so other
-  shards do not keep it resident), then unlinks `keys/NN/`.
+  shards do not keep it resident), then unlinks `keys/NN/`. The folded
+  map is consumed into the pack8 records and dropped before fuse8 and BDZ.
   Pass 2 keeps fuse8 only (no BDZ): same static spans; fuse-hit creates
   fold into per-worker `key16 → Vec<fk>` maps and spill-largest as
   `SHPST01` under `post/NN/`. A `post/NN` file, or a spill whose magic is

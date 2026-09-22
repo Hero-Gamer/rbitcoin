@@ -6,7 +6,6 @@
 
 use crate::bdz::BdzMphf;
 use crate::error::StoreError;
-use crate::fuse8_filter::fuse_key_from_mixed;
 use crate::io_handle::IoHandle;
 use crate::scripthash_layout::{pack8, unpack8, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN};
 use std::fs::{File, OpenOptions};
@@ -38,9 +37,8 @@ fn sidecar(base: &Path, ext: &str) -> PathBuf {
 }
 
 pub fn mix_key16(key: &ShHeadKey) -> u64 {
-    let mut pad = [0u8; 32];
-    pad[..SH_HEAD_KEY_LEN].copy_from_slice(key);
-    fuse_key_from_mixed(&pad)
+    u64::from_le_bytes(key[0..8].try_into().expect("key16 half"))
+        ^ u64::from_le_bytes(key[8..16].try_into().expect("key16 half"))
 }
 
 pub(crate) fn mix64_keys(recs: &[(ShHeadKey, u64)]) -> Vec<u64> {

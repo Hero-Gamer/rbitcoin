@@ -979,7 +979,7 @@ fn finish_key_shard(
     n_shards: usize,
 ) -> Result<(u64, u64, u64), StoreError> {
     let map = load_keys_shard_map(dir, shard)?;
-    let times = seal_pack_map_to_head_and_fuse(table, dir, shard, n_shards, &map)?;
+    let times = seal_pack_map_to_head_and_fuse(table, dir, shard, n_shards, map)?;
     unlink_keys_shard(dir, shard);
     Ok(times)
 }
@@ -1336,23 +1336,25 @@ fn seal_pack_map_to_head_and_fuse(
     dir: &Path,
     si: usize,
     n_shards: usize,
-    map: &Key16PackMap,
+    map: Key16PackMap,
 ) -> Result<(u64, u64, u64), StoreError> {
     let nkeys = map.len() as u64;
     let t_fold = Instant::now();
-    let mut recs = Vec::with_capacity(map.len());
-    let mut mixed = Vec::with_capacity(map.len());
+    let n = map.len();
+    let mut recs = Vec::with_capacity(n);
+    let mut mixed = Vec::with_capacity(n);
     let mut dupes = Vec::new();
     let mut n_singles = 0u64;
+    // Consuming the map drops its buckets before fuse8 and BDZ.
     for (k, w) in map {
-        let m = mix_key16(k);
+        let m = mix_key16(&k);
         mixed.push(m);
-        recs.push((*k, *w));
-        if *w == 0 {
+        if w == 0 {
             dupes.push(m);
         } else {
             n_singles += 1;
         }
+        recs.push((k, w));
     }
     let _n_fuse = write_multi_fuse_keys(dir, si, &dupes)?;
     let fold_ns = t_fold.elapsed().as_nanos() as u64;
@@ -1452,7 +1454,7 @@ fn seal_one_mphf_shard(
     n_shards: usize,
 ) -> Result<(usize, u64, u64), StoreError> {
     let map = load_keys_shard_map(dir, si)?;
-    let (nkeys, fold_ns, bdz_ns) = seal_pack_map_to_head_and_fuse(table, dir, si, n_shards, &map)?;
+    let (nkeys, fold_ns, bdz_ns) = seal_pack_map_to_head_and_fuse(table, dir, si, n_shards, map)?;
     unlink_keys_shard(dir, si);
     Ok((nkeys as usize, fold_ns, bdz_ns))
 }
