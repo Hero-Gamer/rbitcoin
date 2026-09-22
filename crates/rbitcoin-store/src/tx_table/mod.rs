@@ -224,9 +224,8 @@ fn input_edges(ins: &[InputRecord]) -> Vec<crate::inputs::InputEdge> {
         .collect()
 }
 
-fn txstat_placeholder(n_in: u32) -> crate::txstat::TxStatRow {
+fn txstat_placeholder() -> crate::txstat::TxStatRow {
     crate::txstat::TxStatRow {
-        n_in,
         fee_sat: 0,
         base: 0,
         wit_extra: 0,
@@ -236,10 +235,7 @@ fn txstat_placeholder(n_in: u32) -> crate::txstat::TxStatRow {
 fn txstat_placeholders(
     items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
 ) -> Vec<crate::txstat::TxStatRow> {
-    items
-        .iter()
-        .map(|(tx, _, _)| txstat_placeholder(tx.input_count))
-        .collect()
+    items.iter().map(|_| txstat_placeholder()).collect()
 }
 
 /// Class A output (addressed via `tx.output_start_fk` run + local vout).
@@ -919,7 +915,7 @@ impl TxTable {
             prune_inwit_mode: std::sync::atomic::AtomicBool::new(prune_inwit_mode),
         };
         if n_bodies > 0 {
-            let _ = t.txstat.n_in_at(Fk(1))?;
+            let _ = t.inputs.n_in(Fk(1))?;
         }
         if t.inputs.count() < n_bodies {
             t.inputs.append_unstamped(n_bodies - t.inputs.count())?;
@@ -1246,7 +1242,7 @@ impl TxTable {
             .flatten()
             .ok_or(StoreError::NotFound)?;
         let inwit = self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
-        let mut tx = if let Some(n_in) = self.txstat.n_in_at(fk)? {
+        let mut tx = if let Some(n_in) = self.inputs.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
                 version: 0,
@@ -1265,11 +1261,11 @@ impl TxTable {
     }
 
     pub(crate) fn overlay_stamped_n_in(&self, fk: Fk, tx: &mut TxRecord) -> Result<(), StoreError> {
-        let Some(n_in) = self.txstat.n_in_at(fk)? else {
+        let Some(n_in) = self.inputs.n_in(fk)? else {
             return Ok(());
         };
         if tx.input_count != 0 && tx.input_count != n_in {
-            return Err(StoreError::Corrupt("txstat n_in mismatch txout"));
+            return Err(StoreError::Corrupt("inputs n_in mismatch txout"));
         }
         tx.input_count = n_in;
         Ok(())
@@ -2092,7 +2088,7 @@ impl TxTable {
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         let rows: Vec<crate::txstat::TxStatRow> = items
             .iter()
-            .map(|(pin, _)| txstat_placeholder(pin.packed_tx().input_count))
+            .map(|_| txstat_placeholder())
             .collect();
         self.put_full_batch_from_pins_with_txstat(items, index, spent_overlay, &rows, &[])
     }

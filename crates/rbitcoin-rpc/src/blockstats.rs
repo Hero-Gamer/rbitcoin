@@ -24,6 +24,7 @@ pub fn is_unspendable(script: &[u8]) -> bool {
 struct StampedExtras {
     total_out: i64,
     spendable_outs: i64,
+    n_ins: Vec<u32>,
 }
 
 /// Outputs Core counts in `utxo_increase_actual`: not height 0, not a
@@ -351,7 +352,7 @@ fn stats_from_txstat(
         if is_cb {
             continue;
         }
-        ins += i64::from(row.n_in);
+        ins += i64::from(*extras.n_ins.get(i).unwrap_or(&0));
         let tx_size = i64::try_from(row.size()).unwrap_or(i64::MAX);
         let tx_weight = i64::try_from(row.weight()).unwrap_or(i64::MAX);
         let fee = i64::try_from(row.fee_sat).unwrap_or(i64::MAX);
@@ -588,6 +589,19 @@ fn stats_for_stamped(
             &stamped.fks,
         )
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?,
+        n_ins: {
+            let mut v = Vec::with_capacity(stamped.fks.len());
+            for &fk in &stamped.fks {
+                let n = ctx
+                    .query
+                    .store()
+                    .inputs_n_in(fk)
+                    .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+                    .unwrap_or(0);
+                v.push(n);
+            }
+            v
+        },
     };
     Ok(stats_from_txstat(
         height.0,

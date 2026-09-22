@@ -4149,7 +4149,6 @@ fn getblockstats_reconstructs_when_txstat_unstamped() {
         .write_txstat_row(
             fk,
             &TxStatRow {
-                n_in: 0,
                 fee_sat: 0,
                 base: 0,
                 wit_extra: 0,

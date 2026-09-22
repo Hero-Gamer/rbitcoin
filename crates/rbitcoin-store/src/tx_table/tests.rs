@@ -190,13 +190,9 @@ fn put_full_batch_writes_txstat_and_reopen() {
     assert_eq!(t.txstat.count(), 1);
     assert_eq!(
         crate::txstat::parse_cell(t.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
-        crate::txstat::CellParse::Complete(crate::txstat::TxStatRow {
-            n_in: 1,
-            fee_sat: 0,
-            base: 0,
-            wit_extra: 0,
-        })
+        crate::txstat::CellParse::Unstamped
     );
+    assert_eq!(t.inputs.n_in(Fk(1)).unwrap(), Some(1));
     drop(t);
     let t2 = TxTable::open_tiny(&dir).unwrap();
     assert_eq!(t2.count(), 1);
@@ -204,13 +200,9 @@ fn put_full_batch_writes_txstat_and_reopen() {
     assert_eq!(t2.txstat.count(), 1);
     assert_eq!(
         crate::txstat::parse_cell(t2.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
-        crate::txstat::CellParse::Complete(crate::txstat::TxStatRow {
-            n_in: 1,
-            fee_sat: 0,
-            base: 0,
-            wit_extra: 0,
-        })
+        crate::txstat::CellParse::Unstamped
     );
+    assert_eq!(t2.inputs.n_in(Fk(1)).unwrap(), Some(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -300,7 +292,7 @@ fn new_create_txout_meta_omits_n_in() {
     assert_eq!(n, 1, "v1 locktime 0 omit n_in is one flag byte");
     assert_eq!(meta.input_count, 0);
     let (got, gouts) = t.get_meta_and_outputs(fk).unwrap();
-    assert_eq!(got.input_count, 1, "stamped txstat fills n_in");
+    assert_eq!(got.input_count, 1, "inputs.loc fills n_in");
     assert_eq!(gouts.len(), 1);
     let leftover = [0x89u8, 0x01];
     let (old, on) = decode_body_meta_v17(&leftover).unwrap();
@@ -310,30 +302,24 @@ fn new_create_txout_meta_omits_n_in() {
 }
 
 #[test]
-fn txstat_n_in_mismatch_inwit_is_corrupt() {
-    let dir = tempfile_dir("txstat-nin-mismatch");
+fn inputs_n_in_scans_both_prevouts() {
+    let dir = tempfile_dir("inputs-nin-prevouts");
     let t = create_tiny(&dir);
     let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
     t.txstat
         .write_row(
             fk,
             &crate::txstat::TxStatRow {
-                n_in: 1,
                 fee_sat: 0,
                 base: 0,
                 wit_extra: 0,
             },
         )
         .unwrap();
-    match t.get_meta_and_prevouts(fk) {
-        Err(StoreError::Corrupt(m)) => {
-            assert!(
-                m.contains("trailing") || m.contains("short") || m.contains("mismatch"),
-                "{m}"
-            );
-        }
-        other => panic!("expected Corrupt, got {other:?}"),
-    }
+    let (meta, prevs) = t.get_meta_and_prevouts(fk).unwrap();
+    assert_eq!(meta.input_count, 2);
+    assert_eq!(prevs.len(), 2);
+    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

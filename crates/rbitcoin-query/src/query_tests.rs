@@ -2635,7 +2635,6 @@ fn unstamp_txstat(q: &Query, fk: Fk) {
         .write_txstat_row(
             fk,
             &TxStatRow {
-                n_in: 0,
                 fee_sat: 0,
                 base: 0,
                 wit_extra: 0,
@@ -2683,7 +2682,7 @@ fn stamp_txstat_from_block_coinbase_and_spend() {
     let b0 = q.reconstruct_archived_block(&hash0).unwrap().unwrap();
     q.stamp_txstat_from_block(Height(0), &b0).unwrap();
     let row0 = q.txstat_row(fk0).unwrap().expect("stamped coinbase");
-    assert_eq!(row0.n_in, 1);
+    assert_eq!(q.store().inputs_n_in(fk0).unwrap(), Some(1));
     assert_eq!(row0.fee_sat, 0);
     assert_eq!(row0.size() as usize, b0.txdata[0].total_size());
 
@@ -2716,7 +2715,7 @@ fn stamp_txstat_from_block_coinbase_and_spend() {
     let b1 = q.reconstruct_archived_block(&h1.hash).unwrap().unwrap();
     q.stamp_txstat_from_block(Height(1), &b1).unwrap();
     let foreign_row = q.txstat_row(fks1[1]).unwrap().expect("stamped spend");
-    assert_eq!(foreign_row.n_in, 1);
+    assert_eq!(q.store().inputs_n_in(fks1[1]).unwrap(), Some(1));
     assert_eq!(foreign_row.fee_sat, 1_0000_0000);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2729,10 +2728,9 @@ fn txstat_row_merges_overflow_via_header_blob() {
     let fk = q.block_tx_fks(Height(0)).unwrap()[0];
     assert!(q.store().txstat_row(fk).unwrap().is_some());
     let fat = TxStatRow {
-        n_in: 2,
-        fee_sat: 2_000_000,
-        base: 400,
-        wit_extra: 200_000,
+        fee_sat: u64::from(u32::MAX),
+        base: 4_000_000,
+        wit_extra: 4_000_000,
     };
     q.store()
         .write_txstat_block(hfk, fk.get().unwrap(), &[fat])

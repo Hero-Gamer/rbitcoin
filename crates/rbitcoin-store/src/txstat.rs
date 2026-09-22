@@ -9,11 +9,12 @@
 //! txstat.blk   offset 32+(header_fk-1)×16 — off:u64, len:u32, n_ovf:u32
 //! ```
 //!
-//! Cell payload is four canonical ULEBs: `n_in`, `fee_sat`, `base` (non-witness
-//! size), `wit_extra` (`total_size − base`). `size = base + wit_extra`,
-//! `weight = 4×base + wit_extra`. All-zero cell = unstamped. A truncated ULEB
-//! or fewer than four fields means the rest of the stream is in that header's
-//! overflow blob (`encoded[8..]`). Pin / SH / tweaks do not open these files.
+//! Cell payload is three canonical ULEBs: `fee_sat`, `base` (non-witness
+//! size), `wit_extra` (`total_size − base`). `n_in` lives on `inputs.loc`.
+//! `size = base + wit_extra`, `weight = 4×base + wit_extra`. All-zero cell =
+//! unstamped. A truncated ULEB or fewer than three fields means the rest of
+//! the stream is in that header's overflow blob (`encoded[8..]`). Pin / SH /
+//! tweaks do not open these files.
 
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
@@ -30,7 +31,6 @@ const BLK_SLOT: u64 = 16;
 /// Packed confirm-time econ. All-zero on disk is unstamped (not this struct).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TxStatRow {
-    pub n_in: u32,
     pub fee_sat: u64,
     pub base: u32,
     pub wit_extra: u32,
@@ -53,11 +53,7 @@ impl TxStatRow {
 }
 
 pub fn encode_stream(row: &TxStatRow) -> Result<Vec<u8>, StoreError> {
-    if row.n_in > u32::from(u16::MAX) {
-        return Err(StoreError::Corrupt("txstat n_in exceeds 16 bits"));
-    }
     let mut v = Vec::new();
-    write_uleb128(&mut v, u64::from(row.n_in));
     write_uleb128(&mut v, row.fee_sat);
     write_uleb128(&mut v, u64::from(row.base));
     write_uleb128(&mut v, u64::from(row.wit_extra));
@@ -108,7 +104,7 @@ enum StreamParse {
 
 fn parse_stream(buf: &[u8], allow_trunc: bool) -> Result<StreamParse, StoreError> {
     let mut off = 0usize;
-    let mut fields = [0u64; 4];
+    let mut fields = [0u64; 3];
     for slot in &mut fields {
         if off >= buf.len() {
             if allow_trunc {
@@ -130,16 +126,11 @@ fn parse_stream(buf: &[u8], allow_trunc: bool) -> Result<StreamParse, StoreError
     if buf[off..].iter().any(|&b| b != 0) {
         return Err(StoreError::Corrupt("txstat cell trailing non-zero"));
     }
-    let n_in = u32::try_from(fields[0]).map_err(|_| StoreError::Corrupt("txstat n_in"))?;
-    let base = u32::try_from(fields[2]).map_err(|_| StoreError::Corrupt("txstat base"))?;
+    let base = u32::try_from(fields[1]).map_err(|_| StoreError::Corrupt("txstat base"))?;
     let wit_extra =
-        u32::try_from(fields[3]).map_err(|_| StoreError::Corrupt("txstat wit_extra"))?;
-    if n_in == 0 {
-        return Err(StoreError::Corrupt("txstat n_in zero in stamped cell"));
-    }
+        u32::try_from(fields[2]).map_err(|_| StoreError::Corrupt("txstat wit_extra"))?;
     Ok(StreamParse::Complete(TxStatRow {
-        n_in,
-        fee_sat: fields[1],
+        fee_sat: fields[0],
         base,
         wit_extra,
     }))
@@ -153,18 +144,6 @@ pub fn parse_with_tail(cell: [u8; 8], tail: &[u8]) -> Result<TxStatRow, StoreErr
         StreamParse::Complete(row) => Ok(row),
         StreamParse::NeedMore => Err(StoreError::Corrupt("invariant: txstat overflow missing")),
     }
-}
-
-pub fn n_in_from_cell(cell: [u8; 8]) -> Result<Option<u32>, StoreError> {
-    if cell == [0u8; 8] {
-        return Ok(None);
-    }
-    let (n, _) = read_canonical_uleb(&cell)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    let n_in = u32::try_from(n).map_err(|_| StoreError::Corrupt("txstat n_in"))?;
-    Ok(Some(n_in))
 }
 
 pub fn encode_ovf_blob(tails: &[(u16, Vec<u8>)]) -> Result<Vec<u8>, StoreError> {
@@ -357,10 +336,6 @@ impl TxStat {
         let mut buf = [0u8; 8];
         self.body.read_at(off, &mut buf)?;
         Ok(buf)
-    }
-
-    pub fn n_in_at(&self, fk: Fk) -> Result<Option<u32>, StoreError> {
-        n_in_from_cell(self.get_cell(fk)?)
     }
 
     pub fn get_row_merged(
@@ -592,9 +567,8 @@ mod tests {
     use super::*;
     use crate::testutil::TempDir;
 
-    fn tiny(n_in: u32, fee: u64, base: u32, wit: u32) -> TxStatRow {
+    fn tiny(fee: u64, base: u32, wit: u32) -> TxStatRow {
         TxStatRow {
-            n_in,
             fee_sat: fee,
             base,
             wit_extra: wit,
@@ -617,25 +591,31 @@ mod tests {
 
     #[test]
     fn uleb_typical_fits_in_cell() {
-        let row = tiny(1, 1000, 110, 112);
+        let row = tiny(1000, 110, 112);
         let (cell, tail) = pack_cell(&row).unwrap();
         assert!(tail.is_none());
         assert_eq!(parse_cell(cell).unwrap(), CellParse::Complete(row));
-        assert_eq!(n_in_from_cell(cell).unwrap(), Some(1));
         assert_eq!(row.size(), 222);
         assert_eq!(row.weight(), 4 * 110 + 112);
     }
 
     #[test]
+    fn former_n_in_byte_no_longer_forces_a_tail() {
+        let row = tiny(50_000, 200, 200_000);
+        let (cell, tail) = pack_cell(&row).unwrap();
+        assert!(tail.is_none(), "three fields of this row fit in 8 B");
+        assert_eq!(parse_cell(cell).unwrap(), CellParse::Complete(row));
+    }
+
+    #[test]
     fn overflow_is_remaining_bytes_only() {
-        let row = tiny(1, 50_000, 200, 200_000);
+        let row = tiny(u64::from(u32::MAX), 4_000_000, 4_000_000);
         let stream = encode_stream(&row).unwrap();
-        assert!(stream.len() > 8, "fat wit must miss 8 B");
+        assert!(stream.len() > 8, "wide fee and sizes must miss 8 B");
         let (cell, tail) = pack_cell(&row).unwrap();
         let tail = tail.expect("tail");
         assert_eq!(tail.as_slice(), &stream[8..]);
         assert_eq!(parse_cell(cell).unwrap(), CellParse::NeedTail);
-        assert_eq!(n_in_from_cell(cell).unwrap(), Some(1));
         assert_eq!(parse_with_tail(cell, &tail).unwrap(), row);
     }
 
@@ -643,8 +623,8 @@ mod tests {
     fn header_blob_roundtrip() {
         let dir = TempDir::labeled("txstat-ovf").unwrap();
         let t = TxStat::create(&dir).unwrap();
-        let small = tiny(1, 1000, 110, 0);
-        let fat = tiny(2, 2_000_000, 400, 200_000);
+        let small = tiny(1000, 110, 0);
+        let fat = tiny(u64::from(u32::MAX), 4_000_000, 4_000_000);
         t.append_batch(0, &[small, fat]).unwrap();
         t.write_block_rows(Fk(1), 1, &[small, fat]).unwrap();
         let blob = t.header_blob(Fk(1)).unwrap();

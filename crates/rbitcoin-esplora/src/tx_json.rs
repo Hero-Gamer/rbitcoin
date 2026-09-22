@@ -866,7 +866,6 @@ mod tests {
             .write_txstat_row(
                 fk,
                 &TxStatRow {
-                    n_in: 1,
                     fee_sat: 0,
                     base: 81,
                     wit_extra: 0,
@@ -888,7 +887,6 @@ mod tests {
             .write_txstat_row(
                 fk,
                 &TxStatRow {
-                    n_in: 0,
                     fee_sat: 0,
                     base: 0,
                     wit_extra: 0,

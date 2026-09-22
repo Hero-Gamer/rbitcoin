@@ -3203,7 +3203,7 @@ fn confirm_write_stamps_txstat_fee_size() {
     let g = q.get_txstat(Fk(1)).unwrap().expect("genesis txstat");
     let gtx = &genesis.txdata[0];
     assert_eq!(g.fee_sat, 0);
-    assert_eq!(g.n_in, 1);
+    assert_eq!(q.store().inputs_n_in(Fk(1)).unwrap(), Some(1));
     assert_eq!(g.size() as usize, gtx.total_size());
     assert_eq!(g.weight(), gtx.weight().to_wu());
 
@@ -3212,7 +3212,7 @@ fn confirm_write_stamps_txstat_fee_size() {
     let row = q.get_txstat(Fk(2)).unwrap().expect("height-1 txstat");
     let tx = &b1.txdata[0];
     assert_eq!(row.fee_sat, 0);
-    assert_eq!(row.n_in, 1);
+    assert_eq!(q.store().inputs_n_in(Fk(2)).unwrap(), Some(1));
     assert_eq!(row.size() as usize, tx.total_size());
     assert_eq!(row.weight(), tx.weight().to_wu());
     let _ = std::fs::remove_dir_all(&path);

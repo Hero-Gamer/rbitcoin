@@ -288,6 +288,15 @@ fn denserels_by_stamped_range(
                         "invariant: lookup stage miss (load parent create identity not stamped)",
                     )))?;
         }
+        if tx.input_count == 0 {
+            if let Some(n) = query
+                .store()
+                .inputs_n_in(fk)
+                .map_err(ConsensusError::from)?
+            {
+                tx.input_count = n;
+            }
+        }
         let cb = if tx.input_count > 1 {
             Some(false)
         } else {

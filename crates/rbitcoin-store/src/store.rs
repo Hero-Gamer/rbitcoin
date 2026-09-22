@@ -705,6 +705,19 @@ impl Store {
     }
 
     /// Overwrite one existing `txstat` row that fits in 8 B (tests / placeholders).
+    /// `n_in` from `inputs.loc`, or `None` when that create is unstamped.
+    pub fn inputs_n_in(&self, fk: Fk) -> Result<Option<u32>, StoreError> {
+        self.txs.inputs.n_in(fk)
+    }
+
+    /// Parent edges in vin order, or `None` when `inputs.loc` is unstamped.
+    pub fn input_edges(
+        &self,
+        fk: Fk,
+    ) -> Result<Option<Vec<crate::inputs::InputEdge>>, StoreError> {
+        self.txs.inputs.edges(fk)
+    }
+
     pub fn write_txstat_row(&self, fk: Fk, row: &crate::TxStatRow) -> Result<(), StoreError> {
         self.txs.txstat.write_row(fk, row)
     }

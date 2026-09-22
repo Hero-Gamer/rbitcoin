@@ -712,10 +712,6 @@ pub(crate) fn txstat_row_from_tx(
     tx: &bitcoin::Transaction,
     in_sum: Option<u64>,
 ) -> Result<rbitcoin_store::TxStatRow, QueryError> {
-    let n_in = tx.input.len() as u32;
-    if n_in > u32::from(u16::MAX) {
-        return Err(StoreError::Corrupt("txstat n_in exceeds 16 bits"));
-    }
     let base_sz = tx.base_size();
     let total = tx.total_size();
     let base = u32::try_from(base_sz).map_err(|_| StoreError::Corrupt("txstat base"))?;
@@ -732,7 +728,6 @@ pub(crate) fn txstat_row_from_tx(
         }
     };
     Ok(rbitcoin_store::TxStatRow {
-        n_in,
         fee_sat: fee,
         base,
         wit_extra,
@@ -740,10 +735,9 @@ pub(crate) fn txstat_row_from_tx(
 }
 
 fn txstat_placeholder_query(_n_in: u32) -> rbitcoin_store::TxStatRow {
-    // No wire body: leave the cell unstamped (all-zero). A row with n_in set
-    // and size 0 would make getblockstats report a real zero-size tx.
+    // No wire body: leave the cell unstamped (all-zero) so getblockstats
+    // reconstructs instead of reporting a zero-size row.
     rbitcoin_store::TxStatRow {
-        n_in: 0,
         fee_sat: 0,
         base: 0,
         wit_extra: 0,

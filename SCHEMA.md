@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
 **Version:** `SCHEMA_VERSION = 25` (`rbitcoin_primitives`).  
-**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `n_in`/`fee_sat`/`base`/`wit_extra`;
+**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `fee_sat`/`base`/`wit_extra`; `n_in` is `inputs.loc`;
 per-header remaining-byte overflow in `txstat.ovf` + `txstat.blk`). Occupied
 24 rewrites `meta` and zero-extends `txstat.body` to `create.loc` count (**no**
 `txout.body` rewrite; leftover LAYOUT17 still has uleb `input_count`). Unreleased
@@ -369,16 +369,15 @@ txstat.ovf   append-only             — remaining ULEB bytes when the stream ex
 txstat.blk   offset 32+(header_fk-1)×16 — off:u64, len:u32, n_ovf:u32
 ```
 
-Cell payload is four canonical ULEBs: `n_in`, `fee_sat`, `base` (non-witness
-size), `wit_extra` (`total_size − base`). Readers derive `size = base + wit_extra`
-and `weight = 4×base + wit_extra`. `n_in` is first and ≤ 3 B (`≤ u16::MAX`, same
-cap as `spent.vin`) so pin / SH / tweaks parse it from the cell without opening
-`.ovf`. All-zero cell = unstamped. A truncated ULEB or fewer than four fields
-means the rest of the stream is in that header's overflow blob (`encoded[8..]`
-only). Missing tail is `Corrupt("invariant: txstat overflow missing")`. Overlong
-ULEB is Corrupt. Trailing non-zero after four fields is Corrupt. Placeholders
-(`n_in ≠ 0`, rest zero) always fit. Class A append of placeholders never overflows;
-only a confirm stamp can emit tails. Blob entries are `u16 index_in_block` +
+Cell payload is three canonical ULEBs: `fee_sat`, `base` (non-witness
+size), `wit_extra` (`total_size − base`). `n_in` is `inputs.loc` (u16). Readers
+derive `size = base + wit_extra` and `weight = 4×base + wit_extra`. All-zero
+cell = unstamped. A truncated ULEB or fewer than three fields means the rest
+of the stream is in that header's overflow blob (`encoded[8..]` only). Missing
+tail is `Corrupt("invariant: txstat overflow missing")`. Overlong ULEB is
+Corrupt. Trailing non-zero after three fields is Corrupt. Class A append of
+placeholders is all-zero and never overflows; only a confirm stamp can emit
+tails. Blob entries are `u16 index_in_block` +
 `u8 nrest` + rest, in block-index order. Empty header: `len=0`. Occupied 24 open
 extends zeros to loc count (~11.3 GiB at the 2026-08-13 census if fully allocated).
 Pin / SH / tweaks do **not** open these files. Unreleased leftover `txfixed.body`
@@ -428,8 +427,8 @@ Decode walks meta + runs to a logical end; any remaining bytes in the loc span m
 **Body meta (schema 22 LAYOUT17, variable):** first byte bit 7 = `LAYOUT17`
 (required). Bits 0–2 encode version 1/2/3 (else explicit i32 LE); bit 3 =
 locktime 0 (else uleb locktime). Bit 4 (`N_IN_TXSTAT`) omits the following
-uleb `input_count` (`n_in` is on `txstat.body`; decode reports 0 until a
-reader fills from the stamped row). Bits 5–6 reserved (nonzero → Corrupt).
+uleb `input_count` (`n_in` is on `inputs.loc`; decode reports 0 until a
+reader fills from that locator). Bits 5–6 reserved (nonzero → Corrupt).
 New 25 writes omit the uleb (v2+locktime 0 is **1 B**). Leftover 24 rows
 keep the uleb (typical v2+locktime 0 is **2 B**).
 `CreateLocPair.n_out` (≥ 1) fills `TxRecord.output_count`. Schema-15 16-byte
