@@ -37,6 +37,15 @@ before 1.0).
 
 ### Changed
 
+- **Tor cookie HMAC uses `hmac` 0.13 and `sha2` 0.11** (digest 0.11).
+  Node `getrandom` is 0.4, matching the rest of the workspace. `bitcoin`
+  requirement is 0.32.102. Compatible lock bumps include `bitflags` 2.13.2,
+  `cc` 1.4.7, `hex-conservative` 0.2.3 / 1.3.0, `hyper` 1.11.1,
+  `smallvec` 1.16.1, `syn` 3.0.6, and `zerocopy` 0.8.57.
+  `bitcoin_hashes` stays 0.14 (`bitcoin` 0.32 requires it).
+  `tokio-tungstenite` stays 0.29 (axum 0.8). `getrandom` 0.2 and 0.3
+  stay for `rand_core`.
+
 - **Pruned SH materialize is two-pass extract:** each collect worker owns a
   contiguous create-fk span and unsized maps capped at 1.5 GiB
   (`SH_EXTRACT_WORKER_RAM_BYTES`; 64 B/key pass 1, `80n+8f` pass 2). After
