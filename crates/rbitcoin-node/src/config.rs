@@ -2180,12 +2180,16 @@ mod tests {
         cfg.apply_kv("head_scale", "tiny").unwrap();
         assert_eq!(cfg.head_scale, HeadScale::Tiny);
         cfg.apply_kv("connect", "tank-0001:18444").unwrap();
+        cfg.apply_kv("connect", "bad").unwrap();
+        cfg.apply_kv("connect", "tank-0").unwrap();
         cfg.apply_kv("connect", "127.0.0.1:18444").unwrap();
         assert!(cfg
             .listen
             .connect_dns
             .iter()
             .any(|h| h == "tank-0001:18444"));
+        assert!(cfg.listen.connect_dns.iter().any(|h| h == "bad"));
+        assert!(cfg.listen.connect_dns.iter().any(|h| h == "tank-0"));
         assert_eq!(cfg.listen.connect.len(), 1);
         assert!(cfg.apply_kv("connect", "").is_err());
         assert!(cfg

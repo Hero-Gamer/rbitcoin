@@ -962,6 +962,14 @@ mod tests {
     }
 
     #[test]
+    fn connect_bare_label_stays_config() {
+        let n = ready_config(["rbitcoin-node", "--connect", "bad"]);
+        assert_eq!(n.listen.connect_dns, vec!["bad".to_string()]);
+        assert!(n.listen.connect.is_empty());
+        assert!(operator_config_from_args(["rbitcoin-node", "--connect", "bad host"]).is_err());
+    }
+
+    #[test]
     fn only_net_onion_without_proxy_is_config_error() {
         let mut c = NodeConfig::default();
         c.apply_kv("only_net", "onion").unwrap();
