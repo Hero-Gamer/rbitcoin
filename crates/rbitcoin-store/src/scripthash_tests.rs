@@ -2517,6 +2517,45 @@ fn postings_collect_fuse_hits_skip_singles_and_logs_workers() {
 }
 
 #[test]
+fn pack_slot_stream_leaves_recs_empty_and_roundtrips() {
+    let dir = tmp();
+    let t = four_shard_dir_table(&dir);
+    let n_shards = t.head_shard_count();
+    let (low, high) = two_scripts_same_shard_reverse_hash(0, n_shards);
+    let sh_lo = script_hash(&low);
+    let sh_hi = script_hash(&high);
+    let k_lo = head_key_from_full(&sh_lo);
+    let k_hi = head_key_from_full(&sh_hi);
+    let base = sorted_main_shard_path(t.store_dir(), 0, n_shards);
+    MphfHead::write_pack8(&base, &[(k_lo, 0), (k_hi, 0)]).unwrap();
+    let head = MphfHead::open(&base).unwrap();
+    let slot_lo = head.slot_for_key16(&k_lo).unwrap();
+    let slot_hi = head.slot_for_key16(&k_hi).unwrap();
+    drop(head);
+    let mut session = t.pack_shard_session(0).unwrap();
+    session.push_sorted_slot_fk(slot_lo, Fk(2)).unwrap();
+    session.push_sorted_slot_fk(slot_lo, Fk(5)).unwrap();
+    session.push_sorted_slot_fk(slot_hi, Fk(4)).unwrap();
+    session.push_sorted_slot_fk(slot_hi, Fk(8)).unwrap();
+    let pack = session.finish_pack().unwrap();
+    assert!(
+        pack.recs.is_empty(),
+        "slot pack must not store a dummy key, recs={}",
+        pack.recs.len()
+    );
+    assert_eq!(pack.slot_words.len(), 2);
+    assert!(pack.slot_words.iter().any(|(s, _)| *s == slot_lo));
+    assert!(pack.slot_words.iter().any(|(s, _)| *s == slot_hi));
+    t.publish_packed_shard(0, pack).unwrap();
+    let fks = |sh: &[u8; 32]| -> Vec<u64> {
+        t.entries(sh).unwrap().into_iter().map(|e| e.0 .0).collect()
+    };
+    assert_eq!(fks(&sh_lo), vec![2, 5]);
+    assert_eq!(fks(&sh_hi), vec![4, 8]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unsorted_pack_sorts_numeric_fk_and_keeps_all_creates() {
     {
         let dir = tmp();

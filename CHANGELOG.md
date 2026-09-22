@@ -49,7 +49,7 @@ before 1.0).
   `SHPST01` under `post/NN/`. A `post/NN` file, or a spill whose magic is
   not `SHPST01`, is Corrupt. Pack folds those spills into one map
   (~0.3–0.5 GiB/shard; a few GiB for 8 workers), then `slot_for_key16` +
-  2+ bodies; `len == 1` after fold is `fp_singles`. `DONE.post` is
+  2+ bodies (grouped by MPHF slot); `len == 1` after fold is `fp_singles`. `DONE.post` is
   `SHPOST02` last_fk. Keys already unlinked when Class A grows before
   pack: full recollect (MPHF tags are not key16). All extract phases
   share `sh_extract_workers()` = min(CPUs, max(1, free RAM / 1.5 GiB));

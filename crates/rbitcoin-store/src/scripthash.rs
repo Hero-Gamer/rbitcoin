@@ -399,18 +399,6 @@ pub(crate) fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) 
     }
 }
 
-/// Dummy 32 B key in `shard` whose bytes 4..8 encode `slot` (postings pack grouping).
-fn pack_key_for_slot(shard: usize, n_shards: usize, slot: u32) -> [u8; 32] {
-    let mut k = [0u8; 32];
-    let n = n_shards.max(1);
-    if n > 1 {
-        let bits = n.trailing_zeros();
-        k[0] = (shard as u8) << (8 - bits as u8);
-    }
-    k[4..8].copy_from_slice(&slot.to_le_bytes());
-    k
-}
-
 fn open_sorted_main_shards(
     dir: &Path,
     n_shards: usize,
@@ -2760,7 +2748,7 @@ pub struct ScriptHashBulkSession<'a> {
     active_shard: Option<usize>,
     /// Packed recs for [`Self::bulk_session`] (sorted at shard seal; 16 B key order).
     recs: Vec<(crate::scripthash_layout::ShHeadKey, u64)>,
-    /// MPHF slot + pack8 when packing fuse-hit postings (pass 2).
+    /// MPHF slot + pack8 for pass-2 body writes (grouped by slot).
     slot_words: Vec<(u32, u64)>,
     /// Unique-key budget (log / tests). Does not pre-size an OA table.
     key_budget: u64,
@@ -2804,9 +2792,14 @@ pub struct ShShardPack {
 }
 
 /// One unfinished key in [`ScriptHashBulkSession`] (≤ one delta page of FKs).
+#[derive(Clone, Copy)]
+enum BulkGroup {
+    Script([u8; 32]),
+    Slot(u32),
+}
+
 struct BulkOpenKey {
-    key: [u8; 32],
-    slot: Option<u32>,
+    group: BulkGroup,
     buf: Vec<u64>,
     stream_used: usize,
     n_total: u32,
@@ -2942,7 +2935,11 @@ impl<'a> ScriptHashBulkSession<'a> {
         if fk.is_null() {
             return Ok(());
         }
-        if self.open_key.as_ref().is_some_and(|o| o.key != key) {
+        if self
+            .open_key
+            .as_ref()
+            .is_some_and(|o| !matches!(o.group, BulkGroup::Script(k) if k == key))
+        {
             self.finish_key()?;
         }
         if self.open_key.is_none() {
@@ -2951,8 +2948,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
             let buf = self.take_fk_scratch();
             self.open_key = Some(BulkOpenKey {
-                key,
-                slot: None,
+                group: BulkGroup::Script(key),
                 buf,
                 stream_used: 0,
                 n_total: 0,
@@ -2960,6 +2956,10 @@ impl<'a> ScriptHashBulkSession<'a> {
                 last_fk: None,
             });
         }
+        self.push_open_fk(fk)
+    }
+
+    fn push_open_fk(&mut self, fk: Fk) -> Result<(), StoreError> {
         let add = {
             let open = self
                 .open_key
@@ -3003,20 +3003,35 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    /// Stream one create_fk for MPHF `slot` (postings pack; keys grouped by slot).
+    /// Stream one create_fk for MPHF `slot` (pass-2 pack; grouped by slot).
     pub fn push_sorted_slot_fk(&mut self, slot: u32, fk: Fk) -> Result<(), StoreError> {
         if fk.is_null() {
             return Ok(());
         }
-        let si = self.active_shard.ok_or(StoreError::Corrupt(
-            "scripthash pack slot stream requires pack_shard_session",
-        ))?;
-        let key = pack_key_for_slot(si, self.table.head_shard_count(), slot);
-        self.push_sorted_fk(key, fk)?;
-        if let Some(open) = self.open_key.as_mut() {
-            open.slot = Some(slot);
+        if !self.pack_only {
+            return Err(StoreError::Corrupt(
+                "scripthash pack slot stream requires pack_shard_session",
+            ));
         }
-        Ok(())
+        if self
+            .open_key
+            .as_ref()
+            .is_some_and(|o| !matches!(o.group, BulkGroup::Slot(s) if s == slot))
+        {
+            self.finish_key()?;
+        }
+        if self.open_key.is_none() {
+            let buf = self.take_fk_scratch();
+            self.open_key = Some(BulkOpenKey {
+                group: BulkGroup::Slot(slot),
+                buf,
+                stream_used: 0,
+                n_total: 0,
+                first_page: None,
+                last_fk: None,
+            });
+        }
+        self.push_open_fk(fk)
     }
 
     /// Seal the open key (inline / slab / last page).
@@ -3074,14 +3089,18 @@ impl<'a> ScriptHashBulkSession<'a> {
         };
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
-        let rec = (head_key_from_full(&open.key), pack8(&val)?);
-        if let Some(slot) = open.slot {
-            self.slot_words.push((slot, rec.1));
+        let word = pack8(&val)?;
+        match open.group {
+            BulkGroup::Script(key) => {
+                self.recs.push((head_key_from_full(&key), word));
+                self.peak_table_bytes = self
+                    .peak_table_bytes
+                    .max(self.recs.len().saturating_mul(24));
+            }
+            BulkGroup::Slot(slot) => {
+                self.slot_words.push((slot, word));
+            }
         }
-        self.recs.push(rec);
-        self.peak_table_bytes = self
-            .peak_table_bytes
-            .max(self.recs.len().saturating_mul(24));
         self.return_fk_scratch(open.buf);
         Ok(())
     }
