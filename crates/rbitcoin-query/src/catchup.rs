@@ -202,8 +202,8 @@ impl Query {
 
     /// Cold bulk-load durable scripthash tables (tip entry).
     ///
-    /// Direct IBD defers SH. Tip: one Class A pass into unsorted per-shard
-    /// files, then in-place unique-sort + seal.
+    /// Direct IBD defers SH. Tip: two Class A scans (identity-map keys, then
+    /// fuse-hit postings) into `scripthash.unsorted`, then pack and seal.
     ///
     /// **`RBITCOIN_SH_FORCE_REBUILD=1`:** wipe SH head/runs/SEAL/HWM, then
     /// full unsorted Class A collect + pack (not a catch-up tail).

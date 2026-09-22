@@ -1234,20 +1234,17 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
     ) -> Result<Option<(ShHeadValue, KeyHome)>, StoreError> {
         if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
-            let v = self.fill_paged_first(scripthash, v, KeyHome::Ingest)?;
             return Ok(Some((v, KeyHome::Ingest)));
         }
         let hk = head_key_from_full(scripthash);
         for h in self.sealed_ovf.lock().unwrap().iter().rev() {
             if let Some(v) = h.get(&hk)? {
-                let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
                 return Ok(Some((v, KeyHome::SealedOvf)));
             }
         }
         if let Some(l1) = self.ovf_l1.lock().unwrap().as_ref() {
             if l1.fuse.contains(mix_key16(&hk)) {
                 if let Some(v) = l1.head.get(&hk)? {
-                    let v = self.fill_paged_first(scripthash, v, KeyHome::SealedOvf)?;
                     return Ok(Some((v, KeyHome::SealedOvf)));
                 }
             }
@@ -1258,32 +1255,12 @@ impl ScriptHashTable {
                 let g = slot.read().unwrap();
                 if let Some(h) = g.as_ref() {
                     if let Some(v) = h.get(&hk)? {
-                        let v = self.fill_paged_first(scripthash, v, KeyHome::Main)?;
                         return Ok(Some((v, KeyHome::Main)));
                     }
                 }
             }
         }
         Ok(None)
-    }
-
-    fn fill_paged_first(
-        &self,
-        key: &[u8; 32],
-        val: ShHeadValue,
-        home: KeyHome,
-    ) -> Result<ShHeadValue, StoreError> {
-        match val {
-            ShHeadValue::Paged {
-                first_page: 0,
-                last_page,
-            } if last_page != 0 => {
-                let first =
-                    paged_first_from_last(self.body_for(key, home), last_page, &self.page_ios)?;
-                Ok(ShHeadValue::paged(first, last_page))
-            }
-            other => Ok(other),
-        }
     }
 
     fn has_sorted_main(&self) -> bool {
@@ -1438,13 +1415,6 @@ impl ScriptHashTable {
             .collect())
     }
 
-    fn collect_page_chain(&self, body: &TableFile, first_page: u64) -> Result<Vec<Fk>, StoreError> {
-        if first_page == 0 {
-            return Ok(Vec::new());
-        }
-        collect_page_chain_linked(body, first_page, &self.page_ios)
-    }
-
     #[cfg(test)]
     pub(crate) fn take_page_ios(&self) -> u64 {
         self.page_ios.swap(0, Ordering::Relaxed)
@@ -1469,7 +1439,7 @@ impl ScriptHashTable {
                 let ents = self.read_slab(body, *class, *off)?;
                 Ok(ents.last().copied())
             }
-            ShHeadValue::Paged { last_page, .. } | ShHeadValue::Extent { last_page } => {
+            ShHeadValue::Extent { last_page } => {
                 let mut page = [0u8; SH_PAGE_SIZE];
                 body.read_at(*last_page, &mut page)?;
                 sh_page_last_fk(&page)
@@ -1917,17 +1887,6 @@ impl ScriptHashTable {
                 }
                 Ok(got)
             }
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                let first = if *first_page != 0 {
-                    *first_page
-                } else {
-                    paged_first_from_last(body, *last_page, &self.page_ios)?
-                };
-                self.collect_page_chain(body, first)
-            }
             ShHeadValue::Extent { last_page } => {
                 collect_extent_then_tail(body, *last_page, &self.page_ios)
             }
@@ -2016,14 +1975,6 @@ impl ScriptHashTable {
                     self.free_slab(body, alloc, *class, *off)?;
                 }
                 Ok(new_val)
-            }
-            ShHeadValue::Paged {
-                first_page,
-                last_page,
-            } => {
-                let last =
-                    self.append_fks_to_pages(body, alloc, *first_page, *last_page, new_ents)?;
-                Ok(ShHeadValue::paged(*first_page, last))
             }
             ShHeadValue::Extent { last_page } => {
                 let first = paged_first_from_last(body, *last_page, &self.page_ios)?;
@@ -2280,16 +2231,6 @@ impl ScriptHashTable {
         old: &ShHeadValue,
     ) -> Result<(), StoreError> {
         match old {
-            ShHeadValue::Paged { first_page, .. } => {
-                let mut off = *first_page;
-                while off != 0 {
-                    let mut page = [0u8; SH_PAGE_SIZE];
-                    body.read_at(off, &mut page)?;
-                    let next = sh_page_next(&page)?;
-                    self.free_slab(body, alloc, SH_PAGE_SLAB_CLASS, off)?;
-                    off = next;
-                }
-            }
             ShHeadValue::Extent { last_page } => {
                 let mut off = paged_first_from_last(body, *last_page, &self.page_ios)?;
                 while off != 0 {
@@ -3523,7 +3464,7 @@ fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreE
 /// Read SHAL alloc page. Returns `(state, on_disk_version)`.
 ///
 /// **v1** (schema-13 slabs) and **v2** (schema-14 page chains) share the same
-/// header field layout. Callers upgrade empty v1 → v2 or refuse durable v1.
+/// header field layout. An empty older header is reset; a durable pre-v3 body refuses.
 fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> {
     let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
     let avail = body
@@ -3532,13 +3473,13 @@ fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> 
         .min(SH_ALLOC_HEADER_LEN as u64) as usize;
     if avail < 24 {
         return Err(StoreError::Corrupt(
-            "scripthash body missing alloc header (expected hybrid SHAL; migrate v3 stores)",
+            "scripthash body missing alloc header (expected SHAL)",
         ));
     }
     body.read_at(FILE_HEADER_LEN as u64, &mut buf[..avail])?;
     if buf[0..4] != SH_ALLOC_MAGIC {
         return Err(StoreError::Corrupt(
-            "scripthash body not hybrid (no SHAL magic; run migrate)",
+            "scripthash body not hybrid (no SHAL magic)",
         ));
     }
     let ver = u16::from_le_bytes([buf[4], buf[5]]);
