@@ -305,6 +305,34 @@ fn new_create_txout_meta_omits_n_in() {
 }
 
 #[test]
+fn reopen_backfills_inputs_from_seqsigwit() {
+    let dir = tempfile_dir("inputs-backfill");
+    let t = create_tiny(&dir);
+    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    drop(t);
+    for name in ["inputs.loc", "inputs.off", "inputs.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let edges = t.inputs.edges(fk).unwrap().unwrap();
+    assert_eq!(edges[0], crate::inputs::InputEdge::coinbase());
+    assert_eq!(
+        edges[1],
+        crate::inputs::InputEdge {
+            parent: Fk(1),
+            vout: 0,
+        }
+    );
+    assert_eq!(t.inputs.count(), 1);
+    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.inputs.count(), 1);
+    assert_eq!(t.inputs.n_in(fk).unwrap(), Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn inputs_n_in_scans_both_prevouts() {
     let dir = tempfile_dir("inputs-nin-prevouts");
     let t = create_tiny(&dir);

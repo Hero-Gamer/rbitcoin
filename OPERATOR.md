@@ -708,8 +708,8 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **25** | Open. |
-| **24** | Rewrite `meta` to 25, then create/extend zeroed `txstat.body` to `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. |
+| **25** | Open. Leftover `inwit.*` is renamed to `seqsigwit.*`. Missing `inputs.loc` with a matching `seqsigwit` count backfills parent edges from those prevouts. |
+| **24** | Rewrite `meta` to 25, then create/extend zeroed `txstat.body` to `create.loc` count (no `txout.body` rewrite). Same `inwit` rename and `inputs` backfill as 25. Unlink leftover `txfixed.body`. |
 | **23** | Rewrite `meta` to 25 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. Zero-extend `txstat.body`. |
 | **22**, occupied Class A | Rewrite `meta` to 25 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 25 `meta` + old ovf/header; this binary retries those file rewrites. Zero-extend `txstat.body`. |
 | **22**, empty Class A | Rewrite `meta` to 25, then open. |
@@ -725,7 +725,7 @@ names the dirs. Corrupt files are **not** repaired in-process.
 | **17**, empty Class A, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
 | Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
 
-A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
+A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
 When the schema-22 Class A refuse fires, the log line is:
 

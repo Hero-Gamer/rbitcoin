@@ -209,6 +209,24 @@ pub(crate) fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), Stor
     ))
 }
 
+fn edges_from_seqsigwit_payload(raw: &[u8]) -> Result<Vec<crate::inputs::InputEdge>, StoreError> {
+    let mut off = 0usize;
+    let mut edges = Vec::new();
+    while off < raw.len() && raw[off..].iter().any(|&b| b != 0) {
+        let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        off += used;
+        if create_fk.is_null() {
+            edges.push(crate::inputs::InputEdge::coinbase());
+        } else {
+            edges.push(crate::inputs::InputEdge {
+                parent: create_fk,
+                vout: prev_index,
+            });
+        }
+    }
+    Ok(edges)
+}
+
 fn input_edges(ins: &[InputRecord]) -> Vec<crate::inputs::InputEdge> {
     ins.iter()
         .map(|inp| {
@@ -947,15 +965,17 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
         };
-        if n_bodies > 0 {
-            let _ = t.inputs.n_in(Fk(1))?;
-        }
-        if t.inputs.count() < n_bodies {
+        if t.inputs.count() == 0 && n_bodies > 0 && t.seqsigwit.count() == n_bodies {
+            t.backfill_inputs_from_seqsigwit()?;
+        } else if t.inputs.count() < n_bodies {
             t.inputs.append_unstamped(n_bodies - t.inputs.count())?;
         } else if t.inputs.count() > n_bodies {
             return Err(StoreError::Corrupt(
                 "invariant: inputs.loc ahead of create.loc",
             ));
+        }
+        if n_bodies > 0 {
+            let _ = t.inputs.n_in(Fk(1))?;
         }
         if need_rebuild {
             let bits = t.head_bits();
@@ -1490,6 +1510,29 @@ impl TxTable {
             .into_iter()
             .map(|p| p.map(|x| x.txout))
             .collect())
+    }
+
+    fn backfill_inputs_from_seqsigwit(&self) -> Result<(), StoreError> {
+        let n = self.create_loc.count();
+        rbitcoin_log::info!("store: inputs backfill from seqsigwit n={n}");
+        let mut batch = Vec::new();
+        for id in 1..=n {
+            let (off, len) = self.seqsigwit_range(Fk(id))?;
+            let raw = self.seqsigwit.with_bytes_at(off, len, |b| Ok(b.to_vec()))?;
+            batch.push(edges_from_seqsigwit_payload(&raw)?);
+            if batch.len() == 1024 {
+                self.inputs.append(&batch)?;
+                batch.clear();
+            }
+            if id.is_multiple_of(1_000_000) {
+                rbitcoin_log::info!("store: inputs backfill progress {id}/{n}");
+            }
+        }
+        if !batch.is_empty() {
+            self.inputs.append(&batch)?;
+        }
+        rbitcoin_log::info!("store: inputs backfill complete n={n}");
+        Ok(())
     }
 
     /// `seqsigwit.body` range for one create.

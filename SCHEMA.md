@@ -377,7 +377,9 @@ of the stream is in that header's overflow blob (`encoded[8..]` only). Missing
 tail is `Corrupt("invariant: txstat overflow missing")`. Overlong ULEB is
 Corrupt. Trailing non-zero after three fields is Corrupt. Class A append of
 placeholders is all-zero and never overflows; only a confirm stamp can emit
-tails. Blob entries are `u16 index_in_block` +
+tails. A cell written as four ULEBs starting with `n_in` (an unreleased
+experiment) is not detected and is not rewritten; resync that datadir.
+Blob entries are `u16 index_in_block` +
 `u8 nrest` + rest, in block-index order. Empty header: `len=0`. Occupied 24 open
 extends zeros to loc count (~11.3 GiB at the 2026-08-13 census if fully allocated).
 Pin / SH / tweaks do **not** open these files. Unreleased leftover `txfixed.body`
@@ -391,7 +393,7 @@ inputs.loc   2 B/create: n_in as u16 LE. 0 = unstamped
 inputs.body  8 B × input, vin order
 ```
 
-`n_in > u16::MAX` is Corrupt (no `inputs.loc.ovf`). A coinbase is `n_in == 1` and one null edge. Body record: parent `create_fk` as u40 LE (`0` = coinbase), then parent vout as u24 LE. `fk ≥ 2^40` or `vout ≥ 2^24` is Corrupt. The spending `vin` is the record index. Prefix-sum of `n_in` from the window checkpoint is the body offset (`8 × inputs_before`). Confirm wiring and the move of `n_in` off `txstat.body` land with the rest of this unreleased 25 amendment.
+`n_in > u16::MAX` is Corrupt (no `inputs.loc.ovf`). A coinbase is `n_in == 1` and one null edge. Body record: parent `create_fk` as u40 LE (`0` = coinbase), then parent vout as u24 LE. `fk ≥ 2^40` or `vout ≥ 2^24` is Corrupt. A null parent with nonzero vout is Corrupt. The spending `vin` is the record index. Prefix-sum of `n_in` from the window checkpoint is the body offset (`8 × inputs_before`). Confirm appends these rows with Class A. Open with creates, no `inputs.loc`, and a `seqsigwit` count that matches `create.loc` walks `seqsigwit.body` with `decode_prevout_at` (prevout only) and writes the edges. A null parent in that payload is the coinbase edge (`vout` 0). `inputs` and `txstat` are not pruned.
 
 ### Split bodies (schema 15)
 
