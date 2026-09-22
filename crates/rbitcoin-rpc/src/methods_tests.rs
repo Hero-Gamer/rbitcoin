@@ -4009,9 +4009,9 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
         "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
     );
     assert_eq!(genesis["utxo_increase"], 1);
-    assert!(genesis.get("utxo_size_inc").is_none());
-    assert!(genesis.get("utxo_increase_actual").is_none());
-    assert!(genesis.get("utxo_size_inc_actual").is_none());
+    assert_eq!(genesis["utxo_size_inc"], 117);
+    assert_eq!(genesis["utxo_increase_actual"], 0);
+    assert_eq!(genesis["utxo_size_inc_actual"], 0);
 
     dispatch(&ctx, "generate", vec![json!(100)]).unwrap();
     let h1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
@@ -4165,33 +4165,21 @@ fn getblockstats_reconstructs_when_txstat_unstamped() {
 }
 
 #[test]
-fn getblockstats_omits_utxo_size_keys() {
+fn getblockstats_utxo_size_matches_core_coinbase() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let got = dispatch(&ctx, "getblockstats", vec![json!(1)]).unwrap();
-    assert!(got.get("utxo_size_inc").is_none(), "{got}");
-    assert!(got.get("utxo_size_inc_actual").is_none(), "{got}");
-    assert!(got.get("utxo_increase_actual").is_none(), "{got}");
     assert_eq!(got["utxo_increase"], 1);
-    let e = dispatch(
+    assert_eq!(got["utxo_increase_actual"], 1, "{got}");
+    assert_eq!(got["utxo_size_inc"], got["utxo_size_inc_actual"]);
+    assert!(got["utxo_size_inc"].as_i64().unwrap() > 0, "{got}");
+    let one = dispatch(
         &ctx,
         "getblockstats",
         vec![json!(1), json!(["utxo_size_inc"])],
     )
-    .unwrap_err();
-    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert_eq!(e["message"], "Invalid selected statistic 'utxo_size_inc'");
-    let e = dispatch(
-        &ctx,
-        "getblockstats",
-        vec![json!(1), json!(["utxo_increase_actual"])],
-    )
-    .unwrap_err();
-    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
-    assert_eq!(
-        e["message"],
-        "Invalid selected statistic 'utxo_increase_actual'"
-    );
+    .unwrap();
+    assert_eq!(one["utxo_size_inc"], got["utxo_size_inc"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

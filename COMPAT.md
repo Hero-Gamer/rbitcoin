@@ -112,7 +112,7 @@ Per-method notes, auth, and the shindex matrix live in
 | Method group | Status |
 |--------------|--------|
 | Control (`help`, `uptime`, `stop`, `getrpcinfo`, `echo`) | done (`syncwithvalidationinterfacequeue` omitted; functional proxy no-op for Core `sync_mempools`) |
-| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (`getblockstats` from `txstat` when stamped; omit coins-DB `utxo_size_*`) |
+| Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (`getblockstats` from `txstat` when stamped, including Core `utxo_size_inc` / `utxo_increase_actual` / `utxo_size_inc_actual`) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done (BIP324 v2-only; peer `timeoffset` / `synced_*` from session state) |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done (Libre; RPC `maxfeerate` / `maxburnamount` / `"version"` only) |
 | Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done (Class A unspent walk — not a coins-DB) |
