@@ -21,72 +21,33 @@ pub fn is_unspendable(script: &[u8]) -> bool {
     rbitcoin_consensus::policy::is_unspendable(script)
 }
 
-/// `sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool)` in Core v29 `getblockstats`.
-const PER_UTXO_OVERHEAD: i64 = 36 + 4 + 1;
-
-fn txout_utxo_bytes(script_len: usize) -> i64 {
-    let n = script_len as u64;
-    let compact: i64 = if n < 253 {
-        1
-    } else if n <= u64::from(u16::MAX) {
-        3
-    } else if n <= u64::from(u32::MAX) {
-        5
-    } else {
-        9
-    };
-    8 + compact + script_len as i64 + PER_UTXO_OVERHEAD
-}
-
-/// Height 0, and the two mainnet BIP30-repeat coinbases, do not enter the UTXO set.
-fn skip_utxo_actual(height: u32, hash: &[u8; 32], is_coinbase: bool) -> bool {
-    if height == 0 {
-        return true;
-    }
-    if !is_coinbase {
-        return false;
-    }
-    let display = BlockHash::from_byte_array(*hash).to_string();
-    matches!(
-        (height, display.as_str()),
-        (
-            91842,
-            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
-        ) | (
-            91880,
-            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
-        )
-    )
-}
-
-struct UtxoDelta {
-    size_inc: i64,
-    utxos: i64,
-    inputs: i64,
-    size_inc_actual: i64,
-}
-
 struct StampedExtras {
     total_out: i64,
-    utxo: UtxoDelta,
+    spendable_outs: i64,
 }
 
-impl UtxoDelta {
-    fn note_output(&mut self, script: &[u8], count_actual: bool) {
-        let sz = txout_utxo_bytes(script.len());
-        self.size_inc += sz;
-        if count_actual && !is_unspendable(script) {
-            self.utxos += 1;
-            self.size_inc_actual += sz;
+/// Outputs Core counts in `utxo_increase_actual`: not height 0, not a
+/// BIP30-repeat coinbase, and not an unspendable script.
+fn output_enters_utxo_set(height: u32, hash: &[u8; 32], is_coinbase: bool, script: &[u8]) -> bool {
+    if height == 0 {
+        return false;
+    }
+    if is_coinbase {
+        let display = BlockHash::from_byte_array(*hash).to_string();
+        if matches!(
+            (height, display.as_str()),
+            (
+                91842,
+                "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+            ) | (
+                91880,
+                "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+            )
+        ) {
+            return false;
         }
     }
-
-    fn note_spent(&mut self, script: &[u8]) {
-        let sz = txout_utxo_bytes(script.len());
-        self.size_inc -= sz;
-        self.size_inc_actual -= sz;
-        self.inputs += 1;
-    }
+    !is_unspendable(script)
 }
 
 /// Core `CalculateTruncatedMedian`: even length is the integer mean of the two middles.
@@ -153,9 +114,8 @@ pub struct BlockStats {
     pub totalfee: i64,
     pub txs: i64,
     pub utxo_increase: i64,
-    pub utxo_size_inc: i64,
+    /// Spendable outputs minus non-coinbase inputs.
     pub utxo_increase_actual: i64,
-    pub utxo_size_inc_actual: i64,
 }
 
 impl BlockStats {
@@ -196,14 +156,9 @@ impl BlockStats {
         m.insert("totalfee".into(), json!(self.totalfee));
         m.insert("txs".into(), json!(self.txs));
         m.insert("utxo_increase".into(), json!(self.utxo_increase));
-        m.insert("utxo_size_inc".into(), json!(self.utxo_size_inc));
         m.insert(
             "utxo_increase_actual".into(),
             json!(self.utxo_increase_actual),
-        );
-        m.insert(
-            "utxo_size_inc_actual".into(),
-            json!(self.utxo_size_inc_actual),
         );
         m
     }
@@ -241,12 +196,7 @@ pub fn compute_block_stats(
 ) -> Result<BlockStats, String> {
     let mut ins = 0i64;
     let mut outs = 0i64;
-    let mut delta = UtxoDelta {
-        size_inc: 0,
-        utxos: 0,
-        inputs: 0,
-        size_inc_actual: 0,
-    };
+    let mut spendable_outs = 0i64;
     let block_hash = block.block_hash().to_byte_array();
     let mut total_out = 0i64;
     let mut total_size = 0i64;
@@ -267,9 +217,10 @@ pub fn compute_block_stats(
 
     for tx in &block.txdata {
         let is_cb = tx.is_coinbase();
-        let count_actual = !skip_utxo_actual(height, &block_hash, is_cb);
         for o in &tx.output {
-            delta.note_output(o.script_pubkey.as_bytes(), count_actual);
+            if output_enters_utxo_set(height, &block_hash, is_cb, o.script_pubkey.as_bytes()) {
+                spendable_outs += 1;
+            }
         }
         let tx_size = tx.total_size() as i64;
         let tx_weight = tx.weight().to_wu() as i64;
@@ -288,7 +239,6 @@ pub fn compute_block_stats(
                 ins += 1;
                 let po = prevout(&inp.previous_output)
                     .ok_or_else(|| format!("missing prevout {}", inp.previous_output))?;
-                delta.note_spent(po.script_pubkey.as_bytes());
                 input_value += po.value.to_sat() as i64;
             }
             let mut output_value = 0i64;
@@ -364,9 +314,7 @@ pub fn compute_block_stats(
         totalfee,
         txs: block.txdata.len() as i64,
         utxo_increase: outs - ins,
-        utxo_size_inc: delta.size_inc,
-        utxo_increase_actual: delta.utxos - delta.inputs,
-        utxo_size_inc_actual: delta.size_inc_actual,
+        utxo_increase_actual: spendable_outs - ins,
     })
 }
 
@@ -479,42 +427,26 @@ fn stats_from_txstat(
         totalfee,
         txs: rows.len() as i64,
         utxo_increase: outs - ins,
-        utxo_size_inc: extras.utxo.size_inc,
-        utxo_increase_actual: extras.utxo.utxos - extras.utxo.inputs,
-        utxo_size_inc_actual: extras.utxo.size_inc_actual,
+        utxo_increase_actual: extras.spendable_outs - ins,
     }
 }
 
-fn utxo_delta_from_store(
+fn spendable_output_count(
     query: &rbitcoin_query::Query,
     height: u32,
     block_hash: &[u8; 32],
     fks: &[rbitcoin_primitives::Fk],
-) -> Result<UtxoDelta, rbitcoin_query::QueryError> {
-    let mut delta = UtxoDelta {
-        size_inc: 0,
-        utxos: 0,
-        inputs: 0,
-        size_inc_actual: 0,
-    };
+) -> Result<i64, rbitcoin_query::QueryError> {
+    let mut n = 0i64;
     for (i, fk) in fks.iter().enumerate() {
-        let is_cb = i == 0;
         let (_meta, outs) = query.store().get_tx_meta_and_outputs(*fk)?;
-        let count_actual = !skip_utxo_actual(height, block_hash, is_cb);
         for o in &outs {
-            delta.note_output(&o.script, count_actual);
-        }
-        if is_cb {
-            continue;
-        }
-        let tx = query.get_tx(*fk)?;
-        let ins = query.tx_input_run_class_a(*fk, &tx)?;
-        for inp in &ins {
-            let parent = query.tx_output_at_fk(inp.create_fk, inp.prev_index)?;
-            delta.note_spent(&parent.script);
+            if output_enters_utxo_set(height, block_hash, i == 0, &o.script) {
+                n += 1;
+            }
         }
     }
-    Ok(delta)
+    Ok(n)
 }
 
 fn help_err() -> Value {
@@ -649,7 +581,7 @@ fn stats_for_stamped(
             .query
             .non_coinbase_total_out(&stamped.fks)
             .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?,
-        utxo: utxo_delta_from_store(
+        spendable_outs: spendable_output_count(
             ctx.query.as_ref(),
             height.0,
             &stamped.rec.hash,
