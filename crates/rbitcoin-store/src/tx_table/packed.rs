@@ -189,34 +189,7 @@ impl InputRecord {
         let Some((create_fk, prev_index)) = read_inline_prevout(buf, flags, &mut off)? else {
             return Err(StoreError::Corrupt("seqsigwit prevout is on inputs"));
         };
-        if flags & input_flags::SEQ_FINAL == 0 {
-            if buf.len() < off + 4 {
-                return Err(StoreError::Corrupt("input sequence truncated"));
-            }
-            off += 4;
-        }
-        if flags & input_flags::EMPTY_SCRIPT == 0 {
-            let (slen, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            let slen = slen as usize;
-            if buf.len() < off + slen {
-                return Err(StoreError::Corrupt("input script truncated"));
-            }
-            off += slen;
-        }
-        if flags & input_flags::EMPTY_WITNESS == 0 {
-            let (nw, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            for _ in 0..nw {
-                let (ilen, n) = read_compact_size(&buf[off..])?;
-                off += n;
-                let ilen = ilen as usize;
-                if buf.len() < off + ilen {
-                    return Err(StoreError::Corrupt("witness item truncated"));
-                }
-                off += ilen;
-            }
-        }
+        skip_seq_script_witness(buf, flags, &mut off)?;
         Ok((create_fk, prev_index, off))
     }
 
@@ -574,6 +547,60 @@ fn check_seqsigwit_flags(flags: u8) -> Result<(), StoreError> {
     if flags & input_flags::RESERVED_HIGH != 0 {
         return Err(StoreError::Corrupt("seqsigwit reserved flags"));
     }
+    Ok(())
+}
+
+fn skip_seq_script_witness(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError> {
+    skip_sequence(buf, flags, off)?;
+    skip_script(buf, flags, off)?;
+    skip_witness(buf, flags, off)
+}
+
+fn skip_sequence(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError> {
+    if flags & input_flags::SEQ_FINAL != 0 {
+        return Ok(());
+    }
+    if buf.len() < *off + 4 {
+        return Err(StoreError::Corrupt("input sequence truncated"));
+    }
+    *off += 4;
+    Ok(())
+}
+
+fn skip_script(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError> {
+    if flags & input_flags::EMPTY_SCRIPT != 0 {
+        return Ok(());
+    }
+    let (slen, n) = read_compact_size(&buf[*off..])?;
+    *off += n;
+    let slen = slen as usize;
+    if buf.len() < *off + slen {
+        return Err(StoreError::Corrupt("input script truncated"));
+    }
+    *off += slen;
+    Ok(())
+}
+
+fn skip_witness(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError> {
+    if flags & input_flags::EMPTY_WITNESS != 0 {
+        return Ok(());
+    }
+    let (nw, n) = read_compact_size(&buf[*off..])?;
+    *off += n;
+    for _ in 0..nw {
+        skip_witness_item(buf, off)?;
+    }
+    Ok(())
+}
+
+fn skip_witness_item(buf: &[u8], off: &mut usize) -> Result<(), StoreError> {
+    let (ilen, n) = read_compact_size(&buf[*off..])?;
+    *off += n;
+    let ilen = ilen as usize;
+    if buf.len() < *off + ilen {
+        return Err(StoreError::Corrupt("witness item truncated"));
+    }
+    *off += ilen;
     Ok(())
 }
 
