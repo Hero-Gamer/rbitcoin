@@ -749,10 +749,24 @@ impl Query {
             return Ok(None);
         }
         let path = self.inwit_spill_file(height)?;
-        let raw = match std::fs::read(&path) {
+        let canon = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::io(&path, e)),
+        };
+        let root = self
+            .inwit_spill_dir()
+            .canonicalize()
+            .map_err(|e| StoreError::io(self.inwit_spill_dir(), e))?;
+        if !canon.starts_with(&root) {
+            return Err(StoreError::Corrupt(
+                "invariant: inwit spill path escaped window dir",
+            ));
+        }
+        let raw = match std::fs::read(&canon) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError::io(path, e)),
+            Err(e) => return Err(StoreError::io(&canon, e)),
         };
         let mut i = 0usize;
         let want = fk.get().ok_or(StoreError::InvalidFk)?;

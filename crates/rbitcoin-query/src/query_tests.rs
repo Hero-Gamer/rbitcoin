@@ -2779,6 +2779,30 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn spill_symlink_outside_window_is_corrupt() {
+    let (dir, q) = temp_query("prune-spill-symlink");
+    q.set_prune_inwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0x42; 16]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let spill = q.store.path().join("inwit.window").join("0.bin");
+    let outside = dir.path().join("outside.bin");
+    std::fs::rename(&spill, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &spill).unwrap();
+    q.clear_inwit_ram_window();
+    let tx = q.get_tx(fk).unwrap();
+    let err = q.tx_input_at_fk(fk, &tx, 0).unwrap_err();
+    assert!(
+        matches!(err, rbitcoin_store::StoreError::Corrupt(msg) if msg.contains("escaped")),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn enable_prune_after_history_seeds_recent_spill_window() {
     let (dir, q) = temp_query("prune-enable-seed");
