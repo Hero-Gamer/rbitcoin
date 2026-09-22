@@ -33,15 +33,21 @@ before 1.0).
 
 ### Changed
 
+- **PR cargo-mutants is 4 in-diff shards:** `ci.yml` `mutants`, after
+  fmt/clippy/test, in parallel with coverage. Advisory
+  (`continue-on-error`), not a merge gate. One 30-minute job was canceled
+  on a ~300-mutant diff (`-j 2` is about 50 minutes). Weekly 8-shard sweep
+  is unchanged.
+
 - **CI short gates share one runner:** `fmt` → `deny` → `ast-grep` →
   `nixos-module-eval`. clippy, test, windows, and macos still start
-  immediately. Concurrent-job slots stay free for future cargo-mutants
-  shards.
+  immediately. Concurrent-job slots stay free for coverage and the PR
+  mutants shards.
 
-- **Weekly cargo-mutants:** `mutants.yml` — PR `--workspace --in-diff`
-  advisory (`continue-on-error`); Sunday 8-shard `--workspace` sweep.
-  Must use `--workspace` (`default-members` is node). Snapshot lists:
-  [`docs/mutants/`](docs/mutants/). How to run: [`TESTING.md`](TESTING.md).
+- **Weekly cargo-mutants:** `mutants.yml` — Sunday 8-shard `--workspace`
+  sweep. Must use `--workspace` (`default-members` is node). Snapshot
+  lists: [`docs/mutants/`](docs/mutants/). How to run:
+  [`TESTING.md`](TESTING.md).
 
 - **Electrum/Esplora no longer require `--sh-index` to bind.** Address and
   scripthash methods return `scripthash index disabled` (Electrum JSON-RPC
