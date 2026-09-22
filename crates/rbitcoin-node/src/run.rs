@@ -6,7 +6,7 @@ use rbitcoin_electrum::{run_electrum, ElectrumConfig, ElectrumHandle, TipNotify}
 use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandle, EsploraListen};
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
-    default_port, format_serve_perf, format_tip_perf_sizes, netgroup, read_proc_rss,
+    default_port, format_serve_perf, format_tip_perf_sizes, netgroup, read_platform_rss,
     sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap, BlockingRegion, ChainHub,
     Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
 };
@@ -929,7 +929,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     let el_avg = el_us.checked_div(el_n).unwrap_or(0);
                     let serve_s = format_serve_perf(&serve);
                     let sizes = format_tip_perf_sizes(&TipPerfSizes {
-                        rss: read_proc_rss(),
+                        rss: read_platform_rss(),
                         cache_bodies: node.hub.cache_body_count(),
                         held_bodies: node.hub.held_body_count(),
                         sh_heads: node.query.process_owned_size_snapshot().sh_heads,

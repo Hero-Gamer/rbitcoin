@@ -666,8 +666,13 @@ impl Default for IbdPerfSample {
 /// - `anon_kb` — process-private anonymous (heap, stacks, MAP_ANON)
 /// - `file_kb` — file-backed resident (shared libs + **our table mmaps**)
 /// - `locked_kb` — `mlock`/`mlockall` only (usually 0 for us)
+///
+/// Which fields `read_platform_rss` can fill depends on the target: Linux
+/// answers all of them, Darwin only `rss_kb`, other targets none. A zero is
+/// therefore "not measurable here" as often as it is a real zero — see the
+/// `read_platform_rss` arm for the target you are reading.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ProcRss {
+pub struct ProcessRss {
     pub rss_kb: u64,
     pub anon_kb: u64,
     pub file_kb: u64,
@@ -678,31 +683,13 @@ pub struct ProcRss {
 
 /// Cheap once-per-tick resident-size read (not hot path).
 ///
-/// One platform arm compiles at a time: Linux reads `/proc`, Darwin asks
-/// `proc_pid_rusage`, anything else (Windows) has neither and reports zeros.
-/// Gating beats letting a missing `/proc` fail at runtime — it keeps non-Linux
-/// hosts from two doomed `open` calls on every 5s sample.
-///
-/// Linux prefers `/proc/self/status` fields present on modern kernels
-/// (`RssAnon` / `RssFile` / `VmRSS`), falling back to `smaps_rollup`
-/// (`Anonymous:`, `Rss:`, `Locked:`) when the status split is missing — older
-/// rollups do **not** expose `RssAnon:` / `RssFile:` (that bug made
-/// `ibd: sizes` print `anon=0 file=0`).
-///
-/// Darwin gets `rss` only. That flavor carries no anon/file resident split and
-/// no resident peak, so `anon` / `file` / `hwm` / `locked` stay zero there: the
-/// `ibd: sizes` `residual≈` heap cross-check (anon minus accounted) and the
-/// `hwm=` peak are Linux-only. Darwin's only lifetime peak is over
-/// `phys_footprint`, which excludes clean file-backed pages and so can read
-/// below a mapped-file RSS — a "peak" under the current value is worse than
-/// none, so it is not wired to `hwm`.
-pub fn read_proc_rss() -> ProcRss {
-    read_platform_rss()
-}
-
+/// Reads `/proc/self/status` for the fields modern kernels expose (`VmRSS`,
+/// `VmHWM`, `RssAnon`, `RssFile`), then `smaps_rollup` (`Rss:`, `Anonymous:`,
+/// `Locked:`) to fill a missing split — older rollups do **not** expose
+/// `RssAnon:` / `RssFile:` (that bug made `ibd: sizes` print `anon=0 file=0`).
 #[cfg(target_os = "linux")]
-fn read_platform_rss() -> ProcRss {
-    let mut out = ProcRss::default();
+pub fn read_platform_rss() -> ProcessRss {
+    let mut out = ProcessRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         fill_rss_from_status(&mut out, &s);
     }
@@ -712,20 +699,35 @@ fn read_platform_rss() -> ProcRss {
     out
 }
 
+/// Cheap once-per-tick resident-size read (not hot path).
+///
+/// Darwin has no `/proc`, so this asks `proc_pid_rusage`. That flavor gives
+/// `rss` alone: no anon/file resident split and no resident peak, so `anon` /
+/// `file` / `hwm` / `locked` stay zero and the `ibd: sizes` `residual≈` heap
+/// cross-check (anon minus accounted) reads as `0` here rather than meaning
+/// the heap matched. Darwin's only lifetime peak is over `phys_footprint`,
+/// which excludes clean file-backed pages and so can read below a mapped-file
+/// RSS — a "peak" under the current value is worse than none, so `hwm` is
+/// left at zero instead.
 #[cfg(target_os = "macos")]
-fn read_platform_rss() -> ProcRss {
-    let mut out = ProcRss::default();
+pub fn read_platform_rss() -> ProcessRss {
+    let mut out = ProcessRss::default();
     fill_rss_from_rusage(&mut out);
     out
 }
 
+/// Cheap once-per-tick resident-size read (not hot path).
+///
+/// Windows has neither `/proc` nor `proc_pid_rusage`, and the `libc` we depend
+/// on exposes no process-memory call there, so every field reads zero. Real
+/// numbers would need `GetProcessMemoryInfo` (psapi) and a new dependency.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_platform_rss() -> ProcRss {
-    ProcRss::default()
+pub fn read_platform_rss() -> ProcessRss {
+    ProcessRss::default()
 }
 
 #[cfg(target_os = "macos")]
-fn fill_rss_from_rusage(out: &mut ProcRss) {
+fn fill_rss_from_rusage(out: &mut ProcessRss) {
     let mut info: libc::rusage_info_v0 = unsafe { std::mem::zeroed() };
     // SAFETY: RUSAGE_INFO_V0 selects the `rusage_info_v0` layout being written
     // here; an unsupported flavor returns non-zero without touching `info`.
@@ -742,7 +744,7 @@ fn fill_rss_from_rusage(out: &mut ProcRss) {
 }
 
 #[cfg(target_os = "linux")]
-fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
+fn fill_rss_from_status(out: &mut ProcessRss, s: &str) {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             out.rss_kb = parse_kb_field(rest);
@@ -762,7 +764,7 @@ fn fill_rss_from_status(out: &mut ProcRss, s: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn fill_rss_from_smaps_rollup(out: &mut ProcRss, s: &str) {
+fn fill_rss_from_smaps_rollup(out: &mut ProcessRss, s: &str) {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("Rss:") {
             if out.rss_kb == 0 {
@@ -804,7 +806,7 @@ fn kb_mib(kb: u64) -> u64 {
 /// Occupancy + RSS for the tip-follow 5s DEBUG `tip: perf` line.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TipPerfSizes {
-    pub rss: ProcRss,
+    pub rss: ProcessRss,
     pub cache_bodies: usize,
     pub held_bodies: usize,
     pub sh_heads: usize,
@@ -846,7 +848,7 @@ pub(crate) fn sample(
     work: WorkStructureSizes,
     owned: ProcessOwnedSizes,
     conf_pipe: ConfirmPipelineSizes,
-    rss: ProcRss,
+    rss: ProcessRss,
     stats: &rbitcoin_query::ConfirmStats,
 ) -> IbdPerfSample {
     let (bq_bytes, bq_count, bq_soft_stop) = bq;
@@ -2403,7 +2405,7 @@ mod tests {
         let _ = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
         rbitcoin_log::init(Level::Info);
-        let rss = read_proc_rss();
+        let rss = read_platform_rss();
         assert!(rss.rss_kb > 0 || cfg!(not(target_os = "linux")));
     }
 
@@ -2599,7 +2601,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fill_rss_from_status_and_smaps_edges() {
-        let mut r = ProcRss::default();
+        let mut r = ProcessRss::default();
         fill_rss_from_status(
             &mut r,
             "Name:\trbitcoin\nVmRSS:\t  1024 kB\nVmHWM:\t  2048 kB\nRssAnon:\t512 kB\nRssFile:\t256 kB\nRssShmem:\t128 kB\n",
@@ -2609,7 +2611,7 @@ mod tests {
         assert_eq!(r.anon_kb, 512);
         assert_eq!(r.file_kb, 384);
 
-        let mut r = ProcRss::default();
+        let mut r = ProcessRss::default();
         fill_rss_from_smaps_rollup(
             &mut r,
             "Rss:\t  800 kB\nAnonymous:\t  300 kB\nRssAnon:\t  1 kB\nRssFile:\t  2 kB\nLocked:\t  16 kB\n",
@@ -2619,7 +2621,7 @@ mod tests {
         assert_eq!(r.file_kb, 2);
         assert_eq!(r.locked_kb, 16);
 
-        let mut r = ProcRss::default();
+        let mut r = ProcessRss::default();
         fill_rss_from_smaps_rollup(&mut r, "Rss:\t  900 kB\nAnonymous:\t  400 kB\n");
         assert_eq!(r.rss_kb, 900);
         assert_eq!(r.anon_kb, 400);
@@ -2628,8 +2630,8 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn read_proc_rss_reports_resident_size() {
-        let r = read_proc_rss();
+    fn read_platform_rss_reports_resident_size() {
+        let r = read_platform_rss();
         // Linux reads /proc/self/status; Darwin reads proc_pid_rusage.
         // A live test process is resident either way.
         assert!(r.rss_kb > 0, "expected a resident size, got {r:?}");
@@ -2637,8 +2639,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn read_proc_rss_splits_anon_and_file_on_linux() {
-        let r = read_proc_rss();
+    fn read_platform_rss_splits_anon_and_file_on_linux() {
+        let r = read_platform_rss();
         // VmHWM is a high-water mark, so it never trails current residency.
         assert!(r.hwm_kb >= r.rss_kb, "hwm should not trail rss, got {r:?}");
         // Modern kernels expose RssAnon/RssFile on status; at least one side
@@ -2669,7 +2671,7 @@ mod tests {
         let work = WorkStructureSizes::default();
         let owned = ProcessOwnedSizes::default();
         let conf_pipe = ConfirmPipelineSizes::default();
-        let rss = read_proc_rss();
+        let rss = read_platform_rss();
         let s = sample(
             &loop_stats,
             4,           // inflight
@@ -2733,7 +2735,7 @@ mod tests {
     #[test]
     fn format_tip_perf_sizes_tokens_and_mib() {
         let line = super::format_tip_perf_sizes(&super::TipPerfSizes {
-            rss: super::ProcRss {
+            rss: super::ProcessRss {
                 rss_kb: 2 * 1024,
                 anon_kb: 1024,
                 file_kb: 512,
