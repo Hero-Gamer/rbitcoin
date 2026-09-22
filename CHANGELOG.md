@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Unreachable I2P stays out of addrman:** without `--i2p-sam`, an addrv2
+  I2P row is relayed and not stored. `getnodeaddresses` `network=i2p` is
+  empty. Core `p2p_addrv2_relay`.
+
 - **Orphan parent GETDATA flush cap is 100:** Core
   `MAX_PEER_TX_REQUEST_IN_FLIGHT`. A 25-tx ancestor package's missing
   parents fit one GetData (was 16).
