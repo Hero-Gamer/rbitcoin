@@ -34,9 +34,10 @@ Counts and procedures stay in the owner doc. A row is the rank and the outcome.
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. **Q-56** Completed (scriptnum + pack-ints). **Q-68** Completed (create.loc SIMD). |
 | 5 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
 | 6 | **Q-69** | CLN / LDK chain backend | Operator can point CLN `bcli` and ldk-node Esplora/Electrum at this node. Owner: [`lightning.md`](./lightning.md). |
+| 7 | **Q-70** | Batch lookup-path hit counters if a profile names them | `head_resolve_stats::add_hit_rank` does two relaxed `fetch_add`s per resolved txid (`head_resolve_denserels`, `tx_table`). SH extract collect flushes output and hit counts once per fk batch, not per output. Still once per event: `accepted_wb` (`SeqCst`, per confirmed block), `serve_perf::note_serve` (per historical getdata), `page_ios` (per SH page read). Done: a profile shows `add_hit_rank` on confirm lookup and those counters flush per batch, or the profile shows the line is noise and this row moves to Won't-fix. `add_hit_ages` is already a batched flush; `add_hit_age` remains the one-bucket path. |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
-**R-11+**. Next unused Q-id is **Q-70**.
+**R-11+**. Next unused Q-id is **Q-71**.
 
 Close work by **moving the Open row into CHANGELOG** in the same edit as
 the landing change (do not grow a Completed museum here). New item: insert

@@ -895,13 +895,23 @@ Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` �
 
 ### Abort / resume (tip materialize)
 
-Keep **`store/scripthash.unsorted/`** until all shards seal. SIGINT / SIGTERM
-mid-cold keeps every **sealed** `scripthash.head/NN`; restart with the same
+Keep **`store/scripthash.unsorted/`** until all shards seal. Extra disk during
+build is **`SHKSP01` spills** (one rec per unique key per worker map) plus
+**`SHPST01` post spills** (one rec per unique multi key per map, delta fks).
+SIGINT / SIGTERM
+mid-cold keeps every **RAM-published** `scripthash.head/NN`; restart with the same
 `--datadir --sh-index` packs **unsealed** shards only (holes stay). Incomplete
-collect (no `DONE`) restarts the Class A pass. `DONE` names the Class A
-`create_fk` scanned; restart appends new creates into unsorted files when no
+pass 1 (no `DONE.keys`) restarts the first Class A scan. A previous layout
+(`DONE` / 24 B `NN` files, or `keys/NN` / `post/NN` as a file) with no valid
+`DONE.keys` is deleted and pass 1 starts over. A spill whose magic is not
+`SHKSP01` or `SHPST01` is Corrupt — wipe `store/scripthash.unsorted` and
+rematerialize. `DONE.keys` / `DONE.post` name the Class A
+`create_fk` scanned; restart appends new creates when no
 shards are sealed, or tail-appends onto the durable head after pack when any
-`head/NN` already exists. Do not delete unsorted files
+`head/NN` is already published. Extract phases (collect, merge, BDZ, fuse,
+pass 2, pack) share one worker cap (`store: scripthash … workers=`;
+`RBITCOIN_SH_MERGE_WORKERS` override). Do not
+delete unsorted files
 to “start over” unless you intend a full Class A collect
 (`RBITCOIN_SH_FORCE_REBUILD`). Leftover `scripthash.runs` are discarded at tip
 (never k-way rematerialized).
@@ -910,8 +920,8 @@ to “start over” unless you intend a full Class A collect
 |------|-------------------|
 | SIGTERM / SIGINT mid pack | Resume. Sealed `head/NN` stays; unsealed shards re-pack from unsorted files. |
 | Kill-9 mid pack | Same idea; unfinished shard work is redone. Open follows [`docs/crash-recovery.md`](docs/crash-recovery.md) (scripthash Direct). |
-| `DONE` then more Class A, no sealed shards | Append the new fk span into unsorted files, then pack. |
-| `DONE` then more Class A, some/all shards sealed | Pack remaining unsealed files; Class A tail onto the durable head (Direct) or write-behind (Tip). |
+| `DONE.keys` / `DONE.post` then more Class A, no sealed shards | Append the new fk span into keys then postings, then pack. |
+| `DONE.keys` / `DONE.post` then more Class A, some/all shards sealed | Pack remaining unsealed `post/NN`; Class A tail onto the durable head (Direct) or write-behind (Tip). |
 | Empty SH head + leftover catalog | Wipe leftover runs + SEAL, then Class A collect into unsorted shards. |
 | Durable SH head + leftover runs | Discard leftover runs (keep SEAL); write-behind fills HWM lag. |
 | Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. |

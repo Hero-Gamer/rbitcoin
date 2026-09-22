@@ -33,6 +33,34 @@ before 1.0).
 
 ### Changed
 
+- **Pruned SH materialize is two-pass extract:** each collect worker owns a
+  contiguous create-fk span and unsized maps capped at 1.5 GiB
+  (`SH_EXTRACT_WORKER_RAM_BYTES`; 64 B/key pass 1, `80n+8f` pass 2). After
+  each 64 k-fk loc/body batch, spill the largest shard map while over
+  budget (`SHKSP01` under `keys/NN/`, first-fk delta singles). Collect spills
+  are tmp+rename without `sync_all` (no `DONE.keys` still wipes unsorted).
+  Merge folds those spills into one map, one walk to pack8
+  `scripthash.head/NN` (singles `inline_one`, multis Empty; file exists is
+  not pack-done) and fuse8 of dupes to `multi/NN.fuse8` (on disk so other
+  shards do not keep it resident), then unlinks `keys/NN/`. The folded
+  map is consumed into the pack8 records and dropped before fuse8 and BDZ.
+  Pass 2 keeps fuse8 only (no BDZ): same static spans; fuse-hit creates
+  fold into per-worker `key16 → Vec<fk>` maps and spill-largest as
+  `SHPST01` under `post/NN/`. A `post/NN` file, or a spill whose magic is
+  not `SHPST01`, is Corrupt. Pack folds those spills into one map
+  (~0.3–0.5 GiB/shard; a few GiB for 8 workers), then `slot_for_key16` +
+  2+ bodies (grouped by MPHF slot); `len == 1` after fold is `fp_singles`. `DONE.post` is
+  `SHPOST02` last_fk. Keys already unlinked when Class A grows before
+  pack: full recollect (MPHF tags are not key16). All extract phases
+  share `sh_extract_workers()` = min(CPUs, max(1, free RAM / 1.5 GiB));
+  `RBITCOIN_SH_MERGE_WORKERS` still overrides. Collect maps are the
+  1.5 GiB worker cap (spilled and dropped before merge BDZ). Progress is
+  `scanned=` finished fks. Output and hit counters flush once per 64 k-fk
+  batch. Spills share one writer (1-slot queue). One
+  `keys merge start`; live `keys merge shard=` with `fold=` `bdz=`; pack
+  shard lines when each worker finishes. Previous `DONE` / 24 B `NN`
+  unsorted is deleted and pass 1 restarts.
+
 - **PR cargo-mutants is 4 in-diff shards:** `ci.yml` `mutants`, after
   fmt/clippy/test, in parallel with coverage. Advisory
   (`continue-on-error`), not a merge gate. One 30-minute job was canceled

@@ -227,7 +227,10 @@ itself changed.
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
     scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
     scripthash.runs              # leftover catalog (key_len=40); discarded at tip
-    scripthash.unsorted/NN       # tip collect: raw 24 B recs (prefix16+fk), unsorted; DONE=SHUNSRT3+last_fk+counts; unlinked after seal
+    scripthash.unsorted/keys/NN/  # pass 1 dir of SHKSP01 spills (000000…); merge identity-map fold + one walk to head+multi fuse, unlinks; DONE.keys=SHKEYS02 last_fk marker
+    scripthash.unsorted/multi/NN.fuse8  # throwaway fuse8 of 0xFFFF keys for pass 2
+    scripthash.unsorted/post/NN/  # pass 2 dir of SHPST01 spills (000000…); pack folds to one map then slot_for_key16 + 2+ body; DONE.post=SHPOST02 last_fk; unlinked after pack
+    # previous DONE / 24 B NN (SHUNSRT3) with no SHKEYS02 is wiped and pass 1 restarts; no SCHEMA_VERSION bump
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
 
 <datadir-cold>/                  # only when --datadir-cold is set
@@ -699,8 +702,17 @@ compact still merges **heads only** — all ovf keys share
 ### Query join
 
 Heights, value, spentness, vouts: expand from Class A outputs (match full scripthash) + spend annotations + Class C.  
-IBD may stage creates in **unsorted per-shard files** (24 B `{sh_prefix16\|create_fk}`)
-and unique-sort + pack durable SH at tip entry. Leftover schema-16 `key_len=32`
+IBD may stage creates in **two Class A `txout` scans** under `scripthash.unsorted/`:
+workers write `SHKSP01` spill files under `keys/NN/`
+(n_multi key16s already `0`, then first-fk-sorted uleb(delta)‖key16 singles),
+then one map-fold walk per shard into pack8 `scripthash.head/NN` and
+`multi/NN.fuse8` (`DONE.keys` = `SHKEYS02` last_fk marker). A previous
+`DONE` / 24 B `NN` layout with no valid `DONE.keys` is deleted and pass 1
+restarts. A spill whose magic is not `SHKSP01` is Corrupt — wipe
+`scripthash.unsorted` and rematerialize. Fuse-hit `SHPST01` post spills
+under `post/NN/` (`DONE.post` = `SHPOST02` last_fk). A `post/NN` file, or a
+spill whose magic is not `SHPST01`, is Corrupt. Pack folds those spills, then
+rewrites 2+ into body and skips 1-fk fuse FPs. Leftover schema-16 `key_len=32`
 catalogs are refused.
 
 **Decision:** inline for 1-use scripts (`SH_INLINE_CAP = 1`, ~95 % of keys); geometric slabs for

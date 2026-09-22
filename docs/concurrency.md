@@ -69,9 +69,9 @@ Do not enter Tip until IBD catch-up complete: no best-chain remainder
 on-path getdata) and path high water at or within 1 of max peer height
 (one-block version chatter only when `headers_done`). Competing
 `hash_height` and leftover explore getdata are not remainder. Tip entry
-bulk-materializes SH (Class A collect → unsorted per-shard files →
-in-place unique-sort + seal `scripthash.head/NN`; pack workers capped at
-one per 2 GiB host free RAM). Shared file `scripthash.body`
+bulk-materializes SH (two Class A `txout` scans → identity-map key spills
+then fuse-hit postings → BDZ `scripthash.head/NN`; extract workers capped at
+one per 1.5 GiB host free RAM). Shared file `scripthash.body`
 is one writer. Overflow body
 is one writer (ingest / compact). It does **not** rebuild `tx.head` or
 spend annotations.

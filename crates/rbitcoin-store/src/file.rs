@@ -54,9 +54,16 @@ pub(crate) fn tmp_sidecar_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Write `bytes` to a sibling tmp, then rename over `path`. No `sync_all`.
+pub(crate) fn write_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_tmp_file(path, false, |f| {
+        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
+    })
+}
+
 /// Write `bytes` to a sibling tmp, `sync_all`, then rename over `path`.
 pub(crate) fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    write_synced_tmp_file(path, |f| {
+    write_tmp_file(path, true, |f| {
         f.write_all(bytes).map_err(|e| StoreError::io(path, e))
     })
 }
@@ -65,6 +72,13 @@ pub(crate) fn write_synced_tmp_rename(path: &Path, bytes: &[u8]) -> Result<(), S
 ///
 /// The durable name is not created or truncated until rename.
 pub(crate) fn write_synced_tmp_file<F>(path: &Path, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
+    write_tmp_file(path, true, write)
+}
+
+fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
@@ -77,7 +91,9 @@ where
     {
         let mut f = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
-        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        if sync {
+            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+        }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
     Ok(())
@@ -1408,6 +1424,23 @@ mod advise_tests {
         assert!(dest.exists());
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"sealed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_tmp_rename_installs_dest_only() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tmp-rename-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("spill.bin");
+        let tmp = tmp_sidecar_path(&dest);
+        assert!(!dest.exists());
+        write_tmp_rename(&dest, b"spill").unwrap();
+        assert!(dest.exists());
+        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"spill");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

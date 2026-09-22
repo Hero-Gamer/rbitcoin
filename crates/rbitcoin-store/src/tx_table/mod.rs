@@ -11,7 +11,7 @@ use rbitcoin_primitives::{read_uleb128, write_uleb128, Fk, TableKind};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Host RAM budget per parallel `tx.head` rebuild worker (not SH pack's 2 GiB).
+/// Host RAM budget per parallel `tx.head` rebuild worker (not SH extract's 1.5 GiB).
 /// BDZ peel scratch + keys + g at the default 2²⁵ seal is ≈1 GiB peak.
 pub const TX_HEAD_REBUILD_WORKER_FREE_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -2054,7 +2054,7 @@ impl TxTable {
     /// Range width is [`Self::rebuild_seal_keys`] (default 2²⁵). Remainder is
     /// sealed too; an empty open tail is created for later inserts.
     /// Workers: [`Self::rebuild_workers`] (min of CPUs, free RAM / 1 GiB,
-    /// and range count). Distinct from SH pack's 2 GiB cap.
+    /// and range count). Distinct from SH extract's 1.5 GiB cap.
     pub fn rebuild_head_from_bodies(
         &self,
         mut on_progress: impl FnMut(u64, u64, u64),

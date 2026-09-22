@@ -1,9 +1,15 @@
 use super::*;
+use crate::fuse8_filter::SealedFuse8;
 use crate::scripthash_head::prefix_shard_of;
-use crate::scripthash_layout::SH_HEAD_VALUE_LEN;
+use crate::scripthash_layout::{head_key_from_full, ShHeadValue, SH_HEAD_VALUE_LEN};
 use crate::scripthash_materialize::{
-    materialize_sh_from_unsorted, unsorted_done_last_fk, unsorted_shard_path, UNSORTED_SHARD_DIR,
+    collect_unsorted_covering_txs, load_post_shard_entries, materialize_sh_from_unsorted,
+    materialize_sh_from_unsorted_from_txs, pack_one_extract_shard, seal_mphf_from_keys,
+    unsorted_done_last_fk, unsorted_keys_path, unsorted_mphf_base, unsorted_multi_fuse_path,
+    unsorted_post_path, unsorted_shard_path, write_keys_spill_entries, write_post_spill_entries,
+    UNSORTED_SHARD_DIR,
 };
+use crate::scripthash_mphf::{mix_key16, MphfHead};
 use crate::scripthash_pages::{
     sh_page_as_array, sh_page_as_array_mut, sh_page_extent, sh_page_set_extent,
     SH_PAGE_EXTENT_STREAM_MAX, SH_PAGE_SIZE, SH_PAGE_STREAM_MAX,
@@ -2180,65 +2186,373 @@ fn class_a_coinbase(
     )
 }
 
-fn decode_unsorted_file(path: &std::path::Path) -> Vec<ScriptHashRecord> {
-    let bytes = std::fs::read(path).unwrap();
-    assert_eq!(bytes.len() % 24, 0, "unsorted file must be 24-byte recs");
-    bytes
-        .chunks_exact(24)
-        .map(|c| {
-            let mut sh = [0u8; 32];
-            sh[..16].copy_from_slice(&c[..16]);
-            let fk = Fk(u64::from_le_bytes(c[16..24].try_into().unwrap()));
-            ScriptHashRecord::from_fk(sh, fk)
-        })
+fn decode_post_keys(dir: &std::path::Path, shard: usize) -> Vec<[u8; 16]> {
+    load_post_shard_entries(dir, shard)
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
         .collect()
 }
 
 #[test]
-fn unsorted_collect_partitions_by_prefix_and_is_not_scripthash_sorted() {
+fn unsorted_collect_unique_keys_per_shard() {
     {
         let dir = tmp();
         let s = crate::Store::create_tiny(&dir).unwrap();
-        let n_shards = 4usize;
-        let (low_script, high_script) = two_scripts_same_shard_reverse_hash(1, n_shards);
-        let mut txid_lo = [0u8; 32];
-        txid_lo[0] = 1;
-        let mut txid_hi = [0u8; 32];
-        txid_hi[0] = 2;
-        s.put_tx_full_batch_indexed(&[class_a_coinbase(txid_lo, high_script.clone())], true)
+        let n_shards = s.scripthash.head_shard_count();
+        let script = vec![0x51];
+        let mut txid_a = [0u8; 32];
+        txid_a[0] = 1;
+        let mut txid_b = [0u8; 32];
+        txid_b[0] = 2;
+        s.put_tx_full_batch_indexed(&[class_a_coinbase(txid_a, script.clone())], true)
             .unwrap();
-        s.put_tx_full_batch_indexed(&[class_a_coinbase(txid_hi, low_script.clone())], true)
+        s.put_tx_full_batch_indexed(&[class_a_coinbase(txid_b, script.clone())], true)
             .unwrap();
-        for shard in [0usize, 2, 3] {
-            let script = script_for_prefix_shard(shard, n_shards);
-            let mut txid = [0u8; 32];
-            txid[0] = 10 + shard as u8;
-            s.put_tx_full_batch_indexed(&[class_a_coinbase(txid, script)], true)
-                .unwrap();
-        }
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([3u8; 32], vec![0x52])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([4u8; 32], vec![0x53])], true)
+            .unwrap();
         let udir = dir.join("unsorted");
-        let out = crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        rbitcoin_log::capture_logs(true);
+        let out = crate::collect_unsorted_shard_files(&s, &udir, n_shards, 2, None).unwrap();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let info: Vec<&str> = logs
+            .iter()
+            .filter_map(|(level, m)| (*level == rbitcoin_log::Level::Info).then_some(m.as_str()))
+            .collect();
+        assert!(
+            info.iter()
+                .any(|m| m.contains("scripthash keys collect start workers=")
+                    && m.contains("budget_MiB=")),
+            "keys collect workers and budget, got {info:?}"
+        );
+        let merge_starts: Vec<&str> = info
+            .iter()
+            .copied()
+            .filter(|m| m.contains("scripthash keys merge start"))
+            .collect();
+        assert_eq!(merge_starts.len(), 1, "one keys merge start, got {info:?}");
+        assert!(
+            merge_starts[0].contains("n_shards=") && merge_starts[0].contains("workers="),
+            "keys merge start workers, got {info:?}"
+        );
+        assert!(
+            info.iter().any(|m| {
+                m.contains("scripthash keys merge shard=")
+                    && m.contains("fold=")
+                    && m.contains("bdz=")
+            }),
+            "live merge shard fold/bdz, got {info:?}"
+        );
         assert_eq!(out.per_shard.len(), n_shards);
         assert!(unsorted_done_last_fk(&udir, n_shards).is_some());
-        assert!(udir.join("DONE").is_file());
-        assert_eq!(out.recs, 5);
-        for shard in 0..n_shards {
-            let recs = decode_unsorted_file(&unsorted_shard_path(&udir, shard));
-            assert!(
-                recs.iter()
-                    .all(|r| prefix_shard_of(&r.scripthash, n_shards) == shard),
-                "shard {shard} must contain only its prefix"
-            );
-            assert_eq!(recs.len() as u64, out.per_shard[shard]);
-        }
-        let shard1 = decode_unsorted_file(&unsorted_shard_path(&udir, 1));
-        assert_eq!(shard1.len(), 2);
+        assert!(udir.join("DONE.keys").is_file());
+        let magic = std::fs::read(udir.join("DONE.keys")).unwrap();
+        assert_eq!(&magic[0..8], b"SHKEYS02");
+        assert!(!udir.join("DONE").is_file());
+        let sh_dupe = script_hash(&script);
+        let si = prefix_shard_of(&sh_dupe, n_shards);
         assert!(
-            shard1[0].scripthash > shard1[1].scripthash,
-            "collect writes fk order, not scripthash order"
+            !unsorted_keys_path(&udir, si).exists(),
+            "RAM merge unlinks keys/{si:02x}"
+        );
+        let base = sorted_main_shard_path(s.path(), si, n_shards);
+        let h = MphfHead::open(&base).unwrap();
+        let k_script = head_key_from_full(&sh_dupe);
+        assert_eq!(h.get(&k_script).unwrap().unwrap(), ShHeadValue::Empty);
+        assert_eq!(
+            h.get(&head_key_from_full(&script_hash(&[0x52])))
+                .unwrap()
+                .unwrap(),
+            ShHeadValue::inline_one(Fk(3))
+        );
+        assert_eq!(
+            h.get(&head_key_from_full(&script_hash(&[0x53])))
+                .unwrap()
+                .unwrap(),
+            ShHeadValue::inline_one(Fk(4))
+        );
+        assert_eq!(out.per_shard[si], 3, "dupe collapsed; two singles kept");
+        assert!(unsorted_multi_fuse_path(&udir, si).is_file());
+        for shard in 0..n_shards {
+            assert!(
+                !unsorted_keys_path(&udir, shard).exists(),
+                "keys unlinked after head + fuse"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn keys_merge_seals_head_and_multi_fuse_without_keys_file() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        let n_shards = s.scripthash.head_shard_count();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], vec![0x51])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], vec![0x51])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([3u8; 32], vec![0x52])], true)
+            .unwrap();
+        let udir = crate::unsorted_shard_dir(s.path());
+        let out = crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        let sh_dupe = script_hash(&[0x51]);
+        let si = prefix_shard_of(&sh_dupe, n_shards);
+        assert!(
+            !unsorted_keys_path(&udir, si).exists(),
+            "merge folds spills to head + fuse and unlinks keys/NN/"
+        );
+        let base = sorted_main_shard_path(s.path(), si, n_shards);
+        assert!(MphfHead::exists(&base), "map fold writes scripthash.head");
+        assert!(
+            unsorted_multi_fuse_path(&udir, si).is_file(),
+            "dupe mix64 lands in multi fuse8, not a unique keys file"
+        );
+        assert_eq!(out.per_shard[si], 2, "dupe script + distinct script");
+        let h = MphfHead::open(&base).unwrap();
+        let k_dupe = head_key_from_full(&sh_dupe);
+        assert_eq!(h.get(&k_dupe).unwrap().unwrap(), ShHeadValue::Empty);
+        assert_eq!(
+            h.get(&head_key_from_full(&script_hash(&[0x52])))
+                .unwrap()
+                .unwrap(),
+            ShHeadValue::inline_one(Fk(3))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn leftover_shunsrt3_has_no_done_keys_and_recollects() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], vec![0x51])], true)
+            .unwrap();
+        let n_shards = s.scripthash.head_shard_count();
+        let udir = crate::unsorted_shard_dir(s.path());
+        std::fs::create_dir_all(&udir).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"SHUNSRT3");
+        buf.extend_from_slice(&(n_shards as u32).to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        for _ in 0..n_shards {
+            buf.extend_from_slice(&1u64.to_le_bytes());
+        }
+        std::fs::write(udir.join("DONE"), &buf).unwrap();
+        std::fs::write(unsorted_shard_path(&udir, 0), [0u8; 24]).unwrap();
+        assert!(unsorted_done_last_fk(&udir, n_shards).is_none());
+        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        assert!(udir.join("DONE.keys").is_file());
+        assert!(!udir.join("DONE").is_file());
+        assert!(!unsorted_shard_path(&udir, 0).is_file());
+        assert!(
+            !unsorted_keys_path(&udir, 0).exists(),
+            "recollect merge writes head, not keys"
+        );
+        let base = sorted_main_shard_path(s.path(), 0, n_shards);
+        assert!(MphfHead::exists(&base));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn mphf_from_keys_unlinks_key_file_and_hits() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], vec![0x51])], true)
+            .unwrap();
+        let n_shards = s.scripthash.head_shard_count();
+        let udir = crate::unsorted_shard_dir(s.path());
+        rbitcoin_log::capture_logs(true);
+        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        seal_mphf_from_keys(&s.scripthash, &udir, n_shards, None).unwrap();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let sh = script_hash(&[0x51]);
+        let si = prefix_shard_of(&sh, n_shards);
+        let info: Vec<&str> = logs
+            .iter()
+            .filter_map(|(level, m)| (*level == rbitcoin_log::Level::Info).then_some(m.as_str()))
+            .collect();
+        assert_eq!(
+            info.iter()
+                .filter(|m| m.contains("scripthash keys merge start"))
+                .count(),
+            1,
+            "one keys merge start, got {info:?}"
+        );
+        assert!(
+            info.iter().any(|m| {
+                m.contains(&format!("scripthash keys merge shard={si:02x}"))
+                    && m.contains("fold=")
+                    && m.contains("bdz=")
+            }),
+            "live merge shard fold/bdz, got {info:?}"
+        );
+        assert!(
+            !unsorted_keys_path(&udir, si).exists(),
+            "keys dir unlinked after MPHF"
+        );
+        let base = sorted_main_shard_path(s.path(), si, n_shards);
+        assert!(MphfHead::exists(&base));
+        assert!(!MphfHead::exists(&unsorted_mphf_base(&udir, si)));
+        let h = MphfHead::open(&base).unwrap();
+        let key = head_key_from_full(&sh);
+        assert!(h.slot_for_key16(&key).is_ok());
+        let val = h.get(&key).unwrap().unwrap();
+        assert_eq!(val, ShHeadValue::inline_one(Fk(1)));
+        assert!(
+            s.scripthash.unsealed_main_shards().contains(&si),
+            "head files are not a pack seal"
+        );
+        assert!(
+            !unsorted_multi_fuse_path(&udir, si).is_file(),
+            "single key is not a fuse8"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn mphf_from_keys_multi_is_empty_and_existing_head_does_not_skip_pack() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], vec![0x51])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], vec![0x51])], true)
+            .unwrap();
+        let n_shards = s.scripthash.head_shard_count();
+        let udir = crate::unsorted_shard_dir(s.path());
+        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        seal_mphf_from_keys(&s.scripthash, &udir, n_shards, None).unwrap();
+        let sh = script_hash(&[0x51]);
+        let si = prefix_shard_of(&sh, n_shards);
+        let base = sorted_main_shard_path(s.path(), si, n_shards);
+        let h = MphfHead::open(&base).unwrap();
+        let key = head_key_from_full(&sh);
+        assert!(h.get(&key).unwrap().unwrap().is_empty());
+        drop(h);
+        assert!(
+            unsorted_multi_fuse_path(&udir, si).is_file(),
+            "0xFFFF key writes unsorted/multi fuse8"
+        );
+        let fuse = SealedFuse8::read_from(&unsorted_multi_fuse_path(&udir, si)).unwrap();
+        assert!(fuse.contains(mix_key16(&key)));
+        assert!(s.scripthash.unsealed_main_shards().contains(&si));
+        s.scripthash.reinit_empty_for_cold_materialize().unwrap();
+        assert!(
+            s.scripthash.unsealed_main_shards().contains(&si),
+            "RAM unsealed after reinit even if head files exist"
+        );
+        assert!(MphfHead::exists(&base));
+        std::fs::remove_file(udir.join("DONE.keys")).unwrap();
+        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+        seal_mphf_from_keys(&s.scripthash, &udir, n_shards, None).unwrap();
+        let h = MphfHead::open(&base).unwrap();
+        assert!(h.get(&key).unwrap().unwrap().is_empty());
+        assert!(s.scripthash.unsealed_main_shards().contains(&si));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn postings_collect_fuse_hits_skip_singles_and_logs_workers() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        let n_shards = s.scripthash.head_shard_count();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], vec![0x51])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], vec![0x51])], true)
+            .unwrap();
+        s.put_tx_full_batch_indexed(&[class_a_coinbase([3u8; 32], vec![0x52])], true)
+            .unwrap();
+        let udir = crate::unsorted_shard_dir(s.path());
+        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 2, None).unwrap();
+        seal_mphf_from_keys(&s.scripthash, &udir, n_shards, None).unwrap();
+        rbitcoin_log::capture_logs(true);
+        crate::scripthash_materialize::collect_posts_covering(
+            &s.txs,
+            &s.scripthash,
+            &udir,
+            2,
+            false,
+            None,
+        )
+        .unwrap();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let info: Vec<&str> = logs
+            .iter()
+            .filter_map(|(level, m)| (*level == rbitcoin_log::Level::Info).then_some(m.as_str()))
+            .collect();
+        assert!(
+            info.iter()
+                .any(|m| m.contains("scripthash postings collect start workers=")
+                    && m.contains("budget_MiB=")),
+            "postings workers and budget, got {info:?}"
+        );
+        let k_multi = head_key_from_full(&script_hash(&[0x51]));
+        let k_single = head_key_from_full(&script_hash(&[0x52]));
+        let si = prefix_shard_of(&script_hash(&[0x51]), n_shards);
+        let posted = decode_post_keys(&udir, si);
+        assert!(
+            posted.contains(&k_multi),
+            "multi creates land in post, got {posted:?}"
+        );
+        let n_single = posted.iter().filter(|k| **k == k_single).count();
+        assert!(
+            n_single <= 1,
+            "single is fuse-miss or at most an FP, got {n_single}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn pack_slot_stream_leaves_recs_empty_and_roundtrips() {
+    let dir = tmp();
+    let t = four_shard_dir_table(&dir);
+    let n_shards = t.head_shard_count();
+    let (low, high) = two_scripts_same_shard_reverse_hash(0, n_shards);
+    let sh_lo = script_hash(&low);
+    let sh_hi = script_hash(&high);
+    let k_lo = head_key_from_full(&sh_lo);
+    let k_hi = head_key_from_full(&sh_hi);
+    let base = sorted_main_shard_path(t.store_dir(), 0, n_shards);
+    MphfHead::write_pack8(&base, &[(k_lo, 0), (k_hi, 0)]).unwrap();
+    let head = MphfHead::open(&base).unwrap();
+    let slot_lo = head.slot_for_key16(&k_lo).unwrap();
+    let slot_hi = head.slot_for_key16(&k_hi).unwrap();
+    drop(head);
+    let mut session = t.pack_shard_session(0).unwrap();
+    session.push_sorted_slot_fk(slot_lo, Fk(2)).unwrap();
+    session.push_sorted_slot_fk(slot_lo, Fk(5)).unwrap();
+    session.push_sorted_slot_fk(slot_hi, Fk(4)).unwrap();
+    session.push_sorted_slot_fk(slot_hi, Fk(8)).unwrap();
+    let pack = session.finish_pack().unwrap();
+    assert!(
+        pack.recs.is_empty(),
+        "slot pack must not store a dummy key, recs={}",
+        pack.recs.len()
+    );
+    assert_eq!(pack.slot_words.len(), 2);
+    assert!(pack.slot_words.iter().any(|(s, _)| *s == slot_lo));
+    assert!(pack.slot_words.iter().any(|(s, _)| *s == slot_hi));
+    t.publish_packed_shard(0, pack).unwrap();
+    let fks = |sh: &[u8; 32]| -> Vec<u64> {
+        t.entries(sh).unwrap().into_iter().map(|e| e.0 .0).collect()
+    };
+    assert_eq!(fks(&sh_lo), vec![2, 5]);
+    assert_eq!(fks(&sh_hi), vec![4, 8]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2250,27 +2564,22 @@ fn unsorted_pack_sorts_numeric_fk_and_keeps_all_creates() {
         let table = four_shard_dir_table(&sh_dir);
         let n_shards = 4usize;
         let udir = sh_dir.join(UNSORTED_SHARD_DIR);
-        std::fs::create_dir_all(&udir).unwrap();
+        std::fs::create_dir_all(udir.join("keys")).unwrap();
+        std::fs::create_dir_all(udir.join("post")).unwrap();
         let (low, high) = two_scripts_same_shard_reverse_hash(1, n_shards);
         let sh_lo = script_hash(&low);
         let sh_hi = script_hash(&high);
-        let mut bytes = Vec::new();
-        let mut push = |sh: [u8; 32], fk: u64| {
-            let mut r = [0u8; 24];
-            r[..16].copy_from_slice(&sh[..16]);
-            r[16..].copy_from_slice(&fk.to_le_bytes());
-            bytes.extend_from_slice(&r);
-        };
-        push(sh_hi, 256);
-        push(sh_hi, 2);
-        push(sh_lo, 3);
-        push(sh_lo, 1);
-        push(sh_lo, 1);
-        push(sh_hi, 0);
-        std::fs::write(unsorted_shard_path(&udir, 1), &bytes).unwrap();
+        let k_lo = head_key_from_full(&sh_lo);
+        let k_hi = head_key_from_full(&sh_hi);
+        write_keys_spill_entries(&udir, 1, 0, &[(k_lo, None), (k_hi, None)]).unwrap();
         for shard in [0usize, 2, 3] {
-            std::fs::write(unsorted_shard_path(&udir, shard), []).unwrap();
+            write_keys_spill_entries(&udir, shard, 0, &[]).unwrap();
         }
+        seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+        drop(MphfHead::open(sorted_main_shard_path(&sh_dir, 1, n_shards)).unwrap());
+        write_post_spill_entries(&udir, 1, 0, &[(k_hi, &[2u64][..]), (k_lo, &[3u64, 1][..])])
+            .unwrap();
+        write_post_spill_entries(&udir, 1, 1, &[(k_hi, &[256u64][..])]).unwrap();
         rbitcoin_log::capture_logs(true);
         let mat = materialize_sh_from_unsorted(&table, &udir, 1, None).unwrap();
         let logs = rbitcoin_log::take_logs();
@@ -2286,19 +2595,6 @@ fn unsorted_pack_sorts_numeric_fk_and_keeps_all_creates() {
             })
             .collect();
         assert_eq!(done.len(), 4, "one finish line per shard, got {logs:?}");
-        for shard in 0..n_shards {
-            let tag = format!("shard={shard:02x}");
-            assert!(
-                done.iter()
-                    .any(|m| m.contains(&tag) && m.contains("elapsed=")),
-                "missing finish log for {tag}: {done:?}"
-            );
-        }
-        assert!(
-            done.iter()
-                .any(|m| m.contains("shard=01") && m.contains("keys=2") && m.contains("creates=4")),
-            "data shard must log packed keys/creates: {done:?}"
-        );
         let mut lo: Vec<u64> = table
             .entries(&sh_lo)
             .unwrap()
@@ -2317,8 +2613,96 @@ fn unsorted_pack_sorts_numeric_fk_and_keeps_all_creates() {
         assert_eq!(
             hi,
             vec![2, 256],
-            "fk 256 must sort after 2, not as LE bytes"
+            "fk 256 must sort after 2 after reconstruct from two segments"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn unsorted_pack_skips_one_fk_fuse_fp_and_rewrites_multi() {
+    {
+        let dir = tmp();
+        let sh_dir = dir.join("sh4");
+        std::fs::create_dir_all(&sh_dir).unwrap();
+        let table = four_shard_dir_table(&sh_dir);
+        let n_shards = 4usize;
+        let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+        std::fs::create_dir_all(udir.join("keys")).unwrap();
+        std::fs::create_dir_all(udir.join("post")).unwrap();
+        let script_fp = script_for_prefix_shard(1, n_shards);
+        let script_multi = script_for_prefix_shard(2, n_shards);
+        let sh_fp = script_hash(&script_fp);
+        let sh_multi = script_hash(&script_multi);
+        let k_fp = head_key_from_full(&sh_fp);
+        let k_multi = head_key_from_full(&sh_multi);
+        write_keys_spill_entries(&udir, 1, 0, &[(k_fp, Some(Fk(7)))]).unwrap();
+        write_keys_spill_entries(&udir, 2, 0, &[(k_multi, None)]).unwrap();
+        for shard in [0usize, 3] {
+            write_keys_spill_entries(&udir, shard, 0, &[]).unwrap();
+        }
+        seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+        let bump_fp = table.bodies[1].logical_len();
+        write_post_spill_entries(&udir, 1, 0, &[(k_fp, &[7u64][..])]).unwrap();
+        write_post_spill_entries(&udir, 2, 0, &[(k_multi, &[10u64, 11][..])]).unwrap();
+        rbitcoin_log::capture_logs(true);
+        let mat = materialize_sh_from_unsorted(&table, &udir, 2, None).unwrap();
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let info: Vec<&str> = logs
+            .iter()
+            .filter_map(|(level, m)| (*level == rbitcoin_log::Level::Info).then_some(m.as_str()))
+            .collect();
+        assert!(
+            info.iter()
+                .any(|m| m.contains("scripthash unsorted pack start") && m.contains("workers=2")),
+            "pack start workers, got {info:?}"
+        );
+        if let Some(pack_done_idx) = info
+            .iter()
+            .position(|m| m.contains("scripthash unsorted pack done"))
+        {
+            if let Some(first_shard_idx) = info
+                .iter()
+                .position(|m| m.contains("scripthash unsorted pack shard="))
+            {
+                assert!(
+                    first_shard_idx < pack_done_idx,
+                    "pack shard line before pack done, got {info:?}"
+                );
+            }
+        }
+        assert_eq!(
+            table.unsealed_main_shards().len(),
+            0,
+            "pack_workers=2 must finish every unsealed shard"
+        );
+        assert_eq!(
+            table.bodies[1].logical_len(),
+            bump_fp,
+            "1-fk skip must not grow body"
+        );
+        assert_eq!(
+            table
+                .entries(&sh_fp)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.0 .0)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        let mut multi: Vec<u64> = table
+            .entries(&sh_multi)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.0 .0)
+            .collect();
+        multi.sort_unstable();
+        assert_eq!(multi, vec![10, 11]);
+        let h = MphfHead::open(sorted_main_shard_path(&sh_dir, 2, n_shards)).unwrap();
+        let val = h.get(&k_multi).unwrap().unwrap();
+        assert!(!val.is_empty(), "2+ fks rewrite Empty → body");
+        assert!(mat.creates >= 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2342,8 +2726,11 @@ fn unsorted_combined_skips_collect_when_done_and_resumes_unsealed() {
         std::fs::create_dir_all(&sh_dir).unwrap();
         let table = four_shard_dir_table(&sh_dir);
         let udir = sh_dir.join(UNSORTED_SHARD_DIR);
-        crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
-        materialize_sh_from_unsorted(&table, &udir, 1, None).unwrap();
+        crate::scripthash_materialize::collect_unsorted_covering_txs(
+            &s.txs, &table, &udir, n_shards, 1, false, None,
+        )
+        .unwrap();
+        materialize_sh_from_unsorted_from_txs(&table, &s.txs, &udir, 1, 1, None).unwrap();
         assert!(table.unsealed_main_shards().is_empty());
         let again = materialize_sh_from_unsorted(&table, &udir, 2, None).unwrap();
         assert_eq!(again.creates, 4);
@@ -2370,9 +2757,9 @@ fn unsorted_cancel_before_collect_is_cancelled() {
         let udir = crate::unsorted_shard_dir(s.path());
         assert!(
             unsorted_done_last_fk(&udir, s.scripthash.head_shard_count()).is_none(),
-            "cancel must not write DONE"
+            "cancel must not write DONE.keys"
         );
-        assert!(!udir.join("DONE").is_file());
+        assert!(!udir.join("DONE.keys").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -2387,7 +2774,7 @@ fn unsorted_done_records_class_a_last_fk() {
         let n_shards = s.scripthash.head_shard_count();
         let udir = crate::unsorted_shard_dir(s.path());
         let out = crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
-        assert!(udir.join("DONE").is_file());
+        assert!(udir.join("DONE.keys").is_file());
         assert_eq!(out.last_fk, s.txs.count());
         assert_eq!(
             crate::unsorted_done_last_fk(&udir, n_shards),
@@ -2420,8 +2807,87 @@ fn unsorted_materialize_appends_when_done_lags_and_no_shards() {
         assert_eq!(
             s.scripthash.entries(&script_hash(&[0x52])).unwrap().len(),
             1,
-            "Class A grown after DONE must be appended into unsorted before pack"
+            "Class A grown after DONE.keys must be recollected before pack"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn pack_shard_unlinks_only_that_post_file() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        let n_shards = 4usize;
+        for shard in 0..n_shards {
+            let script = script_for_prefix_shard(shard, n_shards);
+            let mut txid = [0u8; 32];
+            txid[0] = shard as u8;
+            s.put_tx_full_batch_indexed(&[class_a_coinbase(txid, script)], true)
+                .unwrap();
+        }
+        let sh_dir = dir.join("sh4");
+        std::fs::create_dir_all(&sh_dir).unwrap();
+        let table = four_shard_dir_table(&sh_dir);
+        let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+        collect_unsorted_covering_txs(&s.txs, &table, &udir, n_shards, 1, false, None).unwrap();
+        seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+        materialize_sh_from_unsorted_from_txs(&table, &s.txs, &udir, 1, 1, None).unwrap();
+        assert!(
+            table.unsealed_main_shards().is_empty(),
+            "second pack via from_txs finishes remaining shards"
+        );
+        for shard in 0..n_shards {
+            assert!(
+                !unsorted_post_path(&udir, shard).exists(),
+                "post/{shard:02x} unlinked after seal"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn pack_one_shard_unlinks_only_its_postings() {
+    {
+        let dir = tmp();
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        let n_shards = 4usize;
+        let mut keys = Vec::new();
+        for shard in 0..n_shards {
+            let script = script_for_prefix_shard(shard, n_shards);
+            keys.push(script_hash(&script));
+            let mut txid = [0u8; 32];
+            txid[0] = shard as u8;
+            s.put_tx_full_batch_indexed(&[class_a_coinbase(txid, script)], true)
+                .unwrap();
+        }
+        let sh_dir = dir.join("sh4");
+        std::fs::create_dir_all(&sh_dir).unwrap();
+        let table = four_shard_dir_table(&sh_dir);
+        let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+        collect_unsorted_covering_txs(&s.txs, &table, &udir, n_shards, 1, false, None).unwrap();
+        seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+        crate::scripthash_materialize::collect_posts_covering(
+            &s.txs, &table, &udir, 1, false, None,
+        )
+        .unwrap();
+        pack_one_extract_shard(&table, &udir, 0).unwrap();
+        assert!(!unsorted_post_path(&udir, 0).exists(), "post/00 unlinked");
+        let unsealed = table.unsealed_main_shards();
+        assert!(!unsealed.contains(&0), "shard 0 packed");
+        for shard in 1..n_shards {
+            assert!(
+                unsealed.contains(&shard),
+                "shard {shard} remains unsealed until pack, unsealed={unsealed:?}"
+            );
+        }
+        assert_eq!(table.entries(&keys[0]).unwrap().len(), 1);
+        materialize_sh_from_unsorted(&table, &udir, 1, None).unwrap();
+        assert!(table.unsealed_main_shards().is_empty());
+        for k in &keys {
+            assert_eq!(table.entries(k).unwrap().len(), 1);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

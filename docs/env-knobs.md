@@ -27,11 +27,11 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_CLASS_C_INRAM_MAX_MB` | 256 | L2 cap for `confirmed` / `header_txs_*`; over → fd L0. `strong_tx` always L2 |
 | `RBITCOIN_TX_HEAD_BITS` | scale default | `tx.head` bits (dangerous on a live datadir) |
 | `RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS` | 25 | Wipe/empty-head MPHF range `2^bits` (26 wider; clamp 6..=26) |
-| `RBITCOIN_TX_HEAD_REBUILD_WORKERS` | min(n-cpu, free-RAM/1 GiB) | Wipe/empty-head MPHF parallelism (`1` = serial). Unset = auto. **Not** SH pack's 2 GiB cap |
+| `RBITCOIN_TX_HEAD_REBUILD_WORKERS` | min(n-cpu, free-RAM/1 GiB) | Wipe/empty-head MPHF parallelism (`1` = serial). Unset = auto. **Not** the SH extract 1.5 GiB cap |
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_UNIQUE_HINT` | off | SH unique-hint probe |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
-| `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, free-RAM/2 GiB) | Unsorted SH pack (`1` = serial). Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
+| `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, max(1, free-RAM/1.5 GiB)) | SH extract (collect, merge, BDZ, fuse, pass 2, pack). `1` = serial. Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
 | `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--max-inbound` / conf omitted |
 | `RBITCOIN_URING_DRAIN_HARD_SECS` | 120 | `drain_all` zero-CQE abort (Linux/pool/IOCP). Raise if completions are slow but still arriving |
 | `RBITCOIN_RPC_WAIT_TIP_IDLE` | off | `getblockcount` / `getbestblockhash` / `wait_height` wait until the tip-accept lane is empty. Default (unset) waits only for the job that was running when the RPC arrived. The Core-functional bitcoind shim sets `1` so `sync_blocks` stays deterministic. **Not** a production operator knob |
