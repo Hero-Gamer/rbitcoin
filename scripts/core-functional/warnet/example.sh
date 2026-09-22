@@ -16,6 +16,10 @@ if [[ ! -x "$NODE_BIN" ]]; then
   echo "example.sh: missing node binary $NODE_BIN" >&2
   exit 1
 fi
+if ldd "$NODE_BIN" 2>/dev/null | grep -q '/nix/store/'; then
+  echo "example.sh: $NODE_BIN links the nix dynamic loader. Build it with rust:1.95.0-bookworm (see the Dockerfile comment)." >&2
+  exit 1
+fi
 
 docker build -t "$IMAGE" \
   --build-arg "NODE_BIN=${NODE_BIN#"$ROOT"/}" \

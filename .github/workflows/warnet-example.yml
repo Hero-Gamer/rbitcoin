@@ -30,24 +30,14 @@ jobs:
         with:
           persist-credentials: false
           submodules: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          github_access_token: ${{ github.token }}
-          enable_kvm: false
-      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: warnet-example-${{ runner.os }}-${{ hashFiles('flake.lock') }}
-          restore-prefixes-first-match: warnet-example-${{ runner.os }}-
-          gc-max-store-size-linux: 4G
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: warnet-example
-          workspaces: ". -> target/dev"
-      - name: Build node and lab image example
+      - name: Build a bookworm node and run two tanks
         run: |
           set -euo pipefail
-          nix develop --command cargo build -p rbitcoin-node
+          docker run --rm -v "$PWD":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target/docker \
+            rust:1.95.0-bookworm \
+            cargo build -p rbitcoin-node
           ./scripts/core-functional/init-submodule.sh
           ./scripts/core-functional/warnet/Dockerfile.test.sh
-          chmod +x ./scripts/core-functional/warnet/example.sh
-          ./scripts/core-functional/warnet/example.sh
+          NODE_BIN="$PWD/target/docker/debug/rbitcoin-node" \
+            ./scripts/core-functional/warnet/example.sh

@@ -1,9 +1,12 @@
 # Lab image for an all-rbitcoin Warnet tank. Not an operator Release.
-# Build from the repo root after `cargo build -p rbitcoin-node` and
-# `./scripts/core-functional/init-submodule.sh`:
+# The copied node must use Debian bookworm's dynamic linker. A nix devshell
+# binary fails at exec with "No such file or directory".
 #
+#   docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target/docker \
+#     rust:1.95.0-bookworm cargo build -p rbitcoin-node
+#   ./scripts/core-functional/init-submodule.sh
 #   docker build -t rbitcoin-warnet:local \
-#     --build-arg NODE_BIN=target/dev/debug/rbitcoin-node \
+#     --build-arg NODE_BIN=target/docker/debug/rbitcoin-node \
 #     -f scripts/core-functional/warnet/Dockerfile .
 
 FROM debian:bookworm-slim
