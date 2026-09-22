@@ -86,6 +86,14 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 ## Schema 17 freeze
 
+Class A shape settled here at schema 17 and is still the live layout under
+the `SCHEMA_VERSION` at the top of this file (24). Schemas 18–24 already
+shipped; they are open rules above and history in
+[`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
+from that live constant
+([Changing durable bytes](#changing-durable-bytes)). It does not target
+schema 18.
+
 ### What 17 locks (on-disk)
 
 | Object | Frozen choice |
@@ -113,17 +121,19 @@ catalogs, or 16-layout Class A with creates is **refused**.
 ### New script kinds without a wipe
 
 Kind nibble **10–15** is **Corrupt** on this binary (no implicit width). A new
-consensus script type does **not** force a 17 datadir wipe:
+consensus script type does **not** force a wipe of the Class A shape settled
+at 17:
 
-| Path | On-disk | Old 17 binary | New binary |
-|------|---------|---------------|------------|
+| Path | On-disk | This binary | A later binary |
+|------|---------|-------------|----------------|
 | **RAW** | kind 0 + CompactSize + bytes | already decodes | same |
-| **Soft-18** | new kind nibble + known width; `SCHEMA_VERSION = 18` | **refuses** 18 `meta` (or unknown kind) | reads 17 files; writes 18 |
+| **Kind nibble** | new kind + known width; bump `SCHEMA_VERSION` | refuses the new `meta` (or unknown kind) | reads these files; writes the new version |
 
-Use RAW when the type is rare. Use soft-18 when the type is common enough to
-pay a width table. Soft-18 is **not** a silent in-place rewrite of 17 files.
-Inwit `create_fk` Δfk (parked) is the same class: **18 or an inwit-only
-rewrite**, not a silent 17 mutate.
+Use RAW when the type is rare. Use a kind-nibble bump when the type is common
+enough to pay a width table. That bump is not a silent in-place rewrite of
+existing files. Inwit `create_fk` Δfk (parked) is the same class: a
+`SCHEMA_VERSION` bump or an inwit-only rewrite, not a silent mutate of
+existing rows.
 
 ### Field widths (10 years)
 
@@ -140,19 +150,20 @@ Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
 | `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
 | SH megakey page | 4 KiB delta stream | Page chain; not a single-integer cap |
 | `sp_tweaks` off | u32 per segment | Already segmented |
-| Script kind | 4 bits | 0–9 used; 10–15 reserved Corrupt; extension = RAW or soft-18 |
+| Script kind | 4 bits | 0–9 used; 10–15 reserved Corrupt; extension = RAW or a kind-nibble bump |
 
 Practical risks are **loc overflow without ovf** (sentinel with missing
 sidecar) and **Bitcoin timestamp 2106** (consensus, every node).
 
-### What would force schema 18
+### What forces a schema bump
 
 A **byte-incompatible** change to Class A / OA / body / idx / SH catalog
-layout, or anything that cannot soft-open 17 files.
+layout, or anything that cannot soft-open the live files. Bump from the
+live `SCHEMA_VERSION`, not from 17.
 
-| Change | 18? | Notes |
-|--------|-----|-------|
-| New implicit-width script kind | Optional | RAW = no bump; nibble = soft-18 (17 refuses 18) |
+| Change | Bump? | Notes |
+|--------|-------|-------|
+| New implicit-width script kind | Optional | RAW = no bump; nibble = next `SCHEMA_VERSION` (this binary refuses it) |
 | Inwit Δfk | Yes or inwit-only rewrite | Parked; cold stem |
 | Idx not stride-8 / not u32 | Yes | Would retire the 8-align pad |
 | Packed Class A again / merge stems | Yes | Wipe |
@@ -161,10 +172,11 @@ layout, or anything that cannot soft-open 17 files.
 | Fuse8 envelope v3 | No | Soft-migrate like v1→v2 (log + rewrite; no wipe) |
 | Independent rolls / L2 strong / no DONTCACHE | No | Writer/RAM only |
 
-Parked size work that is **not** 17: inwit Δfk; drop 8-align pad on empty
-inwit / zero-out spent (needs a different idx encoding); `txid.body`
-compression. Do not chase `inwit` size as an IBD **hot-set** win — put it
-on a cold volume (`--datadir-cold`). Census: [Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13).
+Parked size work that is **not** a live-layout tweak: inwit Δfk; drop 8-align
+pad on empty inwit / zero-out spent (needs a different idx encoding);
+`txid.body` compression. Do not chase `inwit` size as an IBD **hot-set**
+win — put it on a cold volume (`--datadir-cold`). Census:
+[Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13).
 
 Process: bump `SCHEMA_VERSION`, document this file + `SCHEMA_HISTORY.md` in
 the same commit, refuse or soft-open with a one-line operator message. Do
@@ -458,9 +470,10 @@ one code to “extension follows” and still read `e=0..=9` records).
 
 Decode expands templates to wire scripts (P2TR is `5120||32`). XOR at rest
 covers hash/data only. Spender flags live only on `spent`. A new consensus
-script type does **not** wipe a 17 datadir: encode it as kind 0 **RAW**, or
-introduce an implicit-width nibble as **soft-18** (18 reads 17; this 17
-binary refuses 18 / unknown kind). See [Schema 17 freeze](#schema-17-freeze).
+script type does **not** wipe the Class A shape settled at 17: encode it as
+kind 0 **RAW**, or introduce an implicit-width nibble as a
+`SCHEMA_VERSION` bump (the new binary reads these files; this binary refuses
+the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 
 ### Sole-spender slot (`spent.body`)
 

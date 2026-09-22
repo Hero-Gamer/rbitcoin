@@ -6,6 +6,8 @@ need `--sh-index`.
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Shipped HTTP / WS surface | [`COMPAT.md`](../../COMPAT.md) |

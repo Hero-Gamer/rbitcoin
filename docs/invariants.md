@@ -23,15 +23,8 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 **One path.** Do not reintroduce a silent colder alternate when lookup or load
 was supposed to guarantee the fact. Test-only adapters stay in `*_testutil`;
 do not grow production APIs around fixture shapes.
-**Killed dual paths (examples, not a name list to police):** soft spentness recovery for wrong/missing
-pin identity; unpinned wire-corrected create_fk spentness; load-stage `txid.body`
-identity fill after lookup promised stamp; `ColdPinMode` Allow/Forbid cold denserels
-split on load (load is range **outs** only); denserels-as-spender-abs (schema 22
-abs is `spent` loc off + `8×vout` only); `AssembleMode::Full` / `validate_block_connect`
-(confirm is optimistic assemble then `structural_validate_spends`);
-`archive_plan_batch_from_store` and production `Query` TxApply→dummy `Block`
-(`tx_apply_to_tx` / `connect_block` / `commit_class_a_only` are
-`rbitcoin_query::testutil::FixtureChain` only).
+Retired dual-path names live in [`errata.md`](./errata.md). The rule is the
+sentence above.
 
 ## Failure style
 

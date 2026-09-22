@@ -6,6 +6,8 @@ a query API already owns the fact.
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Stage IO, pin identity, leftover | [`docs/invariants.md`](../../docs/invariants.md) |

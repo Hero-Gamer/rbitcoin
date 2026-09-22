@@ -5,11 +5,11 @@ in [`CHANGELOG.md`](../CHANGELOG.md). 1.0 product gates:
 [`road-to-1.0.md`](./road-to-1.0.md). Peer-node notes:
 [`peer-clients.md`](./peer-clients.md) (do not copy here).
 
-**Last reaudit:** 2026-09-17. Schema **24**. Core functional **75**
-`test_runner` jobs (**69** inventory `run`; Core expands transport twins and
-`wallet_txn_*` flags) / **198** `skip`. Findings **001–023** fixed. Nightly
-fuzz **20** jobs. Weekly mutants **8** shards (not required; owner
-[`TESTING.md`](../TESTING.md)). Previous: 2026-09-15.
+**Last reaudit:** 2026-09-17. Live schema: [`SCHEMA.md`](../SCHEMA.md).
+Core functional inventory: [`core-functional.md`](./core-functional.md).
+Findings **001–023** fixed. Nightly fuzz **20** jobs. Weekly mutants **8**
+shards (not required; owner [`TESTING.md`](../TESTING.md)). Previous:
+2026-09-15.
 
 | Section | Purpose |
 |---------|---------|
@@ -24,14 +24,16 @@ evidence (failed Core corpus, new dual path, red required CI, MSRV drift).
 
 ## Open (priority order)
 
+Counts and procedures stay in the owner doc. A row is the rank and the outcome.
+
 | Rank | ID | Item | Done looks like |
 |-----:|----|------|-----------------|
-| 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation. Labeled `test_runner` prints **77** (**71** inventory `run` / **196** skip; 17 `rpc-missing`, 16 `core-log`, 68 `no-wallet`; Core expands transport twins and `wallet_txn_*` flags). COMPAT leftovers are `rpc-dialect`, not `rpc-missing`. `run` must hit node production (not only shim argv / dummy `blk*.dat` / Core decode dialect). Named Core-functional shim dialect (`RBITCOIN_RPC_WAIT_TIP_IDLE`, `RBITCOIN_RPC_PACKAGE_DIALECT`, proxy abort JSON) is documented, not a silent Core-clone. Next inventory `run`: recover to 72. `mempool_accept` stays skip (`policy-libre`). Unlabeled PRs stay cargo-only. Owner: [`core-functional.md`](./core-functional.md). |
-| 2 | **Q-48** | BIP331 rust-bitcoin package types | Native BIP331 `NetworkMessage` when rust-bitcoin exposes it (**RB-007**). Local packages: RPC `submitpackage`, Esplora `POST /txs/package`, Electrum 1.6 `broadcast_package`. `protocol_max` is **1.6**; 1.7 `scriptpubkey.*` still missing. |
+| 1 | **Q-41** | Grow Core functional `run` set | Inventory `run` covers claimed wallet-client / P2P / mempool / buried-activation, and each `run` hits node production. Owner: [`core-functional.md`](./core-functional.md). |
+| 2 | **Q-48** | BIP331 rust-bitcoin package types | Native package types when rust-bitcoin exposes them (**RB-007**), then the local RPC / Esplora / Electrum package calls. Owner: [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md), [`COMPAT.md`](../COMPAT.md). |
 | 3 | **Q-31** | Hermetic tip fixtures | Frozen signet/mainnet tip packs for offline consensus/Electrum regression (no live API). Fuzz already merges tiny `signet_block_*.bin` / `mainnet_block_290329.bin`. Electrum hermetic packs still Open. |
 | 4 | **R-10** | Residual god-files | Peel **only** when a higher row needs a seam. Do not split `interpreter.rs` opcode `match` or io_uring machines. Named extracts: **Q-61** Completed. **Q-56** Completed (scriptnum + pack-ints). **Q-68** Completed (create.loc SIMD). |
 | 5 | **Q-67** | `asked_blocks` clone on hold | `hold_body` clones `asked_blocks` before `held_bodies` insert so the read lock does not overlap the write (`HeldBodies::insert` already takes `&HashSet`). Bound is `MAX_SERVE_BLOCKS` × peers. Follow-up: pass the read guard with a documented lock order, or keep the clone as a named trade. Owner: `crates/rbitcoin-net/src/chain.rs`. |
-| 6 | **Q-69** | CLN / LDK chain backend | Operator can point Core Lightning `bcli` and ldk-node Esplora/Electrum at this node on regtest/signet. Electrum/Esplora **start without** `--sh-index`; SH-only APIs fail closed (`scripthash index disabled`). Channel watches (txid/outpoint) work. BDK address history still needs SH. No LND/ZMQ/BIP157. Owner: [`lightning.md`](./lightning.md). |
+| 6 | **Q-69** | CLN / LDK chain backend | Operator can point CLN `bcli` and ldk-node Esplora/Electrum at this node. Owner: [`lightning.md`](./lightning.md). |
 
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-70**.
@@ -100,7 +102,7 @@ checklist.
   appender; ibd-confirm publishes script waves (no coordinator). Pins are
   plan/batch only. [`concurrency.md`](./concurrency.md),
   [`invariants.md`](./invariants.md).
-- **On-disk:** [`SCHEMA.md`](../SCHEMA.md) current bytes (today **24**).
+- **On-disk:** [`SCHEMA.md`](../SCHEMA.md) current bytes (live `SCHEMA_VERSION`).
   Soft-migrate durable side formats; bump or refuse; **no silent wipe**.
   Same commit as the format code.
 - **io_uring:** do not flatten a purpose-built machine to batched

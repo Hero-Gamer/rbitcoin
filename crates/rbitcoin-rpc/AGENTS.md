@@ -6,6 +6,8 @@ net, and consensus. The HTTP server is `src/server.rs`; methods are
 
 ## Read first
 
+Open the row that matches the change. Leave the other owners closed.
+
 | Change | Read |
 |--------|------|
 | Method list, auth, permanent gaps | [`docs/rpc.md`](../../docs/rpc.md) |

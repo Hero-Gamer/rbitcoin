@@ -205,8 +205,9 @@ peer**. Copying that would mean reintroducing a coins view.
 
 ## Ranked if we spend time later
 
-Do not treat this as Open rank. Promote into [`quality.md`](./quality.md)
-only when scheduling a slice.
+Not scheduled. Implement a row only when the user names it. Do not treat
+this as Open rank. Promote into [`quality.md`](./quality.md) only when
+scheduling a slice.
 
 | Rank | Item | Source | Lands in |
 |-----:|------|--------|----------|
