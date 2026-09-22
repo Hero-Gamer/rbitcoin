@@ -216,6 +216,24 @@ impl P2PNode {
         });
         tasks.push(dial_task);
 
+        // DNS for remembered `--connect` / `addnode add` runs on the blocking
+        // pool (`PeerHub::redial_remembered_off_runtime`).
+        let retry_peers = peers.clone();
+        let retry_shutdown = shutdown.clone();
+        let retry_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if retry_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                retry_peers.redial_remembered_off_runtime().await;
+            }
+        });
+        tasks.push(retry_task);
+
         Ok(Self {
             cache,
             query,

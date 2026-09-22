@@ -46,6 +46,14 @@ before 1.0).
 
 ### Changed
 
+- **Hostname `--connect` / `addnode`:** clearnet names resolve at each dial
+  (`localhost` and a missing port use the network P2P default) on a blocking
+  thread, and retry until a live session exists. `--connect` does not enable
+  seed redial. Incomplete catch-up at genesis still enters tip-follow; a
+  non-zero tip stays in IBD. Relay stays gated below `--min-chain-work`.
+  Label `warnet` runs a two-tank Docker example
+  ([`docs/core-functional.md`](docs/core-functional.md)).
+
 - **Tor cookie HMAC uses `hmac` 0.13 and `sha2` 0.11** (digest 0.11).
   Node `getrandom` is 0.4, matching the rest of the workspace. `bitcoin`
   requirement is 0.32.102. Compatible lock bumps include `bitflags` 2.13.2,

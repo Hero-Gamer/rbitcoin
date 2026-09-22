@@ -283,3 +283,59 @@ no `store/` (clean-chain starts stay empty).
 python3 scripts/core-functional/create_cache.py --ensure
 ./scripts/core-functional/create_cache.test.sh
 ```
+
+## Warnet lab (all-rbitcoin tanks)
+
+Not an operator musl Release. Image tag `rbitcoin-warnet:local`. Warnet
+stays Core Helm (`bitcoin.conf`, `rpcuser`/`rpcpassword`, `addnode=tank-N`,
+`pidof bitcoind`). The node is not taught Core conf; the Python shim
+translates `addnode=` to `--connect host:18444`, seeds `{datadir}/rpc.token`
+from `rpcpassword`, and binds the test proxy on `rpcbind=0.0.0.0`. Basic
+auth accepts any username whose password matches that token.
+
+Hostname `--connect` / `addnode add` resolve at each dial on a blocking
+thread and retry every 2 seconds until a live session exists. `--connect`
+does not turn DNS seeds back on. Incomplete catch-up at **genesis** (tip 0)
+still enters tip-follow so a late tank can attach. A non-zero tip that has
+not finished catch-up stays in IBD. Relay stays off while tip work is below
+`--min-chain-work`.
+
+### CI example (label `warnet`)
+
+Two tanks on one Docker network, not kind or Helm. Unlabeled PRs do not
+run it. `workflow_dispatch` also runs it.
+
+```bash
+cargo build -p rbitcoin-node
+./scripts/core-functional/init-submodule.sh
+./scripts/core-functional/warnet/example.sh
+```
+
+`example.sh` builds the image from `target/dev/debug/rbitcoin-node` (the
+binary must sit inside the repo so `docker build` can copy it), starts
+`tank0` and `tank1` (`addnode=tank0`), mines one regtest block, and waits
+until `tank1` `getblockcount` is non-zero.
+
+`Dockerfile.test.sh` pins the image text and does not need Docker.
+
+### Operator kind / miner_std
+
+Needs Docker + kind on an operator host. Do not open mainnet. Wallet keys
+are RAM-only.
+
+```bash
+docker build -t rbitcoin-warnet:local \
+  --build-arg NODE_BIN=target/dev/debug/rbitcoin-node \
+  -f scripts/core-functional/warnet/Dockerfile .
+kind load docker-image rbitcoin-warnet:local
+python3 -m venv .venv && source .venv/bin/activate
+pip install warnet
+warnet setup
+warnet new /tmp/rbtc-warnet
+```
+
+Three tanks, ring `addnode`, unique `rpcpassword`, `pullPolicy: Never`.
+Pass when `miner_std.py --interval=10 --mature` leaves all three
+`getblockcount` values equal and greater than 0. Fail classes: CrashLoop
+`pidof`; 401 on RPC; height only on the miner (DNS or bind); ImagePullBackOff
+without `kind load`.
