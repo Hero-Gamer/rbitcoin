@@ -426,6 +426,31 @@ mod tests {
     }
 
     #[test]
+    fn append_unstamped_is_zero_n_in_until_a_later_edge() {
+        let dir = TempDir::labeled("inputs-unstamped").unwrap();
+        let t = Inputs::create(dir.path()).unwrap();
+        t.append_unstamped(0).unwrap();
+        assert_eq!(t.count(), 0);
+        t.append_unstamped(3).unwrap();
+        assert_eq!(t.count(), 3);
+        assert_eq!(t.n_in(Fk(1)).unwrap(), None);
+        assert!(t.edges(Fk(3)).unwrap().is_none());
+        t.append_unstamped(1021).unwrap();
+        assert_eq!(t.count(), 1024);
+        assert_eq!(t.n_in(Fk(1024)).unwrap(), None);
+        t.append(&[vec![edge(4, 2)]]).unwrap();
+        assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
+        t.append_unstamped(1024).unwrap();
+        assert_eq!(t.count(), 2049);
+        assert_eq!(t.n_in(Fk(2049)).unwrap(), None);
+        drop(t);
+        let t = Inputs::open(dir.path()).unwrap();
+        assert_eq!(t.count(), 2049);
+        assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
+        assert_eq!(t.n_in(Fk(1)).unwrap(), None);
+    }
+
+    #[test]
     fn new_store_creates_inputs_stems() {
         let (dir, _store) = crate::testutil::tiny_store_labeled("inputs-files");
         assert!(dir.path().join("inputs.loc").is_file());
