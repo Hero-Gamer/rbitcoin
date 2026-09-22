@@ -640,6 +640,11 @@ fn largest_posts_shard(maps: &[PostPackMap]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+fn fks_strictly_increasing(fks: &[u64]) -> bool {
+    fks.windows(2).all(|w| w[0] < w[1])
+}
+
+/// Keep `Vec<fk>` strictly increasing. Scan order appends; an older fk inserts.
 fn insert_post_fk(map: &mut PostPackMap, key: ShHeadKey, fk: u64) {
     if fk == 0 {
         return;
@@ -651,27 +656,39 @@ fn insert_post_fk(map: &mut PostPackMap, key: ShHeadKey, fk: u64) {
         }
         Entry::Occupied(mut o) => {
             let v = o.get_mut();
-            if v.last().copied() == Some(fk) {
-                return;
+            if let Some(last) = v.last().copied() {
+                if fk > last {
+                    v.push(fk);
+                    map.n_fks = map.n_fks.saturating_add(1);
+                    return;
+                }
+                if fk == last {
+                    return;
+                }
             }
-            v.push(fk);
-            map.n_fks = map.n_fks.saturating_add(1);
+            match v.binary_search(&fk) {
+                Ok(_) => {}
+                Err(i) => {
+                    v.insert(i, fk);
+                    map.n_fks = map.n_fks.saturating_add(1);
+                }
+            }
         }
     }
 }
 
-fn merge_sorted_unique_fks(dst: &mut Vec<u64>, mut src: Vec<u64>) {
+/// Linear merge of two strictly increasing fk runs. Equals collapse.
+fn merge_sorted_unique_fks(dst: &mut Vec<u64>, src: Vec<u64>) {
     if src.is_empty() {
         return;
     }
-    src.sort_unstable();
-    src.dedup();
     if dst.is_empty() {
         *dst = src;
+        dst.dedup();
         return;
     }
-    dst.sort_unstable();
-    dst.dedup();
+    debug_assert!(fks_strictly_increasing(dst));
+    debug_assert!(fks_strictly_increasing(&src));
     let mut out = Vec::with_capacity(dst.len().saturating_add(src.len()));
     let mut i = 0usize;
     let mut j = 0usize;
@@ -712,8 +729,8 @@ fn fold_post_map(dst: &mut PostPackMap, src: PostPackMap) {
         match dst.map.entry(k) {
             Entry::Vacant(v) => {
                 let mut f = fks;
-                f.sort_unstable();
                 f.dedup();
+                debug_assert!(fks_strictly_increasing(&f));
                 dst.n_fks = dst.n_fks.saturating_add(f.len());
                 v.insert(f);
             }
@@ -741,13 +758,11 @@ fn encode_posts_spill(map: &PostPackMap) -> Vec<u8> {
     bytes.extend_from_slice(POSTS_SPILL_MAGIC);
     bytes.extend_from_slice(&(map.map.len() as u32).to_le_bytes());
     for (k, fks) in &map.map {
-        let mut fks = fks.clone();
-        fks.sort_unstable();
-        fks.dedup();
+        debug_assert!(fks_strictly_increasing(fks));
         bytes.extend_from_slice(k);
         write_uleb128(&mut bytes, fks.len() as u64);
         let mut prev = 0u64;
-        for fk in fks {
+        for &fk in fks {
             write_uleb128(&mut bytes, fk.saturating_sub(prev));
             prev = fk;
         }
@@ -1658,10 +1673,9 @@ fn pack_post_shard(
     let mphf = MphfHead::open(sorted_main_shard_path(table.store_dir(), shard, n_shards))?;
     session.reserve_pack_recs(map.n_fks);
     let mut fp_singles = 0u64;
-    for (k, mut fks) in map.map {
+    for (k, fks) in map.map {
         check_cancel(cancel, "scripthash unsorted shard pack")?;
-        fks.sort_unstable();
-        fks.dedup();
+        debug_assert!(fks_strictly_increasing(&fks));
         if fks.len() <= 1 {
             if fks.len() == 1 {
                 fp_singles = fp_singles.saturating_add(1);
@@ -2405,6 +2419,38 @@ mod tests {
             h.get(&prefix_key(3)).unwrap().unwrap(),
             crate::scripthash_layout::ShHeadValue::Empty
         );
+    }
+
+    #[test]
+    fn insert_post_fk_out_of_order_stays_strict_and_roundtrips() {
+        let mut map = PostPackMap::default();
+        let k = prefix_key(4);
+        insert_post_fk(&mut map, k, 3);
+        insert_post_fk(&mut map, k, 1);
+        insert_post_fk(&mut map, k, 3);
+        assert_eq!(map.map.get(&k).map(|v| v.as_slice()), Some(&[1u64, 3][..]));
+        assert_eq!(map.n_fks, 2);
+        let bytes = encode_posts_spill(&map);
+        let mut round = PostPackMap::default();
+        fold_posts_spill_bytes(&mut round, &bytes).unwrap();
+        assert_eq!(
+            round.map.get(&k).map(|v| v.as_slice()),
+            Some(&[1u64, 3][..])
+        );
+    }
+
+    #[test]
+    fn fold_post_spills_merges_sorted_runs() {
+        let dir = crate::testutil::TempDir::labeled("sh-post-merge-order").expect("temp");
+        let k = prefix_key(8);
+        write_post_spill_entries(dir.path(), 0, 0, &[(k, &[1u64, 5][..])]).unwrap();
+        write_post_spill_entries(dir.path(), 0, 1, &[(k, &[3u64, 5, 9][..])]).unwrap();
+        let map = load_post_shard_map(dir.path(), 0).unwrap();
+        assert_eq!(
+            map.map.get(&k).map(|v| v.as_slice()),
+            Some(&[1u64, 3, 5, 9][..])
+        );
+        assert_eq!(map.n_fks, 4);
     }
 
     #[test]
