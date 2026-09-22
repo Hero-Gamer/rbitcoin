@@ -31,6 +31,7 @@ mod reorg;
 mod state;
 mod status;
 
+pub use dial::connect_timeout_for;
 pub use perf_log::{format_tip_perf_sizes, read_proc_rss, ProcRss, TipPerfSizes};
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};

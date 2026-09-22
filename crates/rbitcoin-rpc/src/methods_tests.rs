@@ -4276,6 +4276,27 @@ fn getnetworkinfo_includes_p2p_onion() {
 }
 
 #[test]
+fn getnetworkinfo_includes_p2p_i2p() {
+    use rbitcoin_net::{NetAddr, PeerHub};
+
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    hub.set_discover(false);
+    let i2p = NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    };
+    hub.set_p2p_i2p(i2p);
+    ctx.peers = Some(hub);
+    let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let addrs = info["localaddresses"].as_array().expect("array");
+    assert_eq!(addrs.len(), 1, "{info}");
+    assert_eq!(addrs[0]["address"], i2p.host_str());
+    assert_eq!(addrs[0]["port"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn getpeerinfo_lists_registered_session() {
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_network::VersionMessage;

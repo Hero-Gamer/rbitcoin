@@ -88,17 +88,16 @@ impl FromStr for NetAddr {
 
 impl NetAddr {
     pub fn from_addrv2(msg: &AddrV2Message) -> Option<Self> {
-        if msg.port == 0 {
-            return None;
-        }
         match &msg.addr {
+            // SAM 3.1 has no ports. Core advertises I2P with port 0.
+            AddrV2::I2p(dest) => Some(NetAddr::I2p {
+                dest: *dest,
+                port: msg.port,
+            }),
+            _ if msg.port == 0 => None,
             AddrV2::Ipv4(_) | AddrV2::Ipv6(_) => msg.socket_addr().ok().map(NetAddr::from_socket),
             AddrV2::TorV3(pk) => Some(NetAddr::Onion {
                 pk: *pk,
-                port: msg.port,
-            }),
-            AddrV2::I2p(dest) => Some(NetAddr::I2p {
-                dest: *dest,
                 port: msg.port,
             }),
             AddrV2::Cjdns(ip) if is_cjdns_ip(*ip) => Some(NetAddr::Cjdns {
@@ -431,6 +430,31 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p:1"
         );
         assert!("short.b32.i2p:1".parse::<NetAddr>().is_err());
+    }
+
+    /// Core SAM 3.1 advertises I2P with port 0. Other networks still reject port 0.
+    #[test]
+    fn netaddr_i2p_port_zero_is_core_sam() {
+        let dest = [0x11u8; 32];
+        let msg = AddrV2Message {
+            time: 1,
+            services: bitcoin::p2p::ServiceFlags::NETWORK,
+            addr: AddrV2::I2p(dest),
+            port: 0,
+        };
+        let a = NetAddr::from_addrv2(&msg).expect("core i2p port 0");
+        assert_eq!(a, NetAddr::I2p { dest, port: 0 });
+        assert_eq!(a.port(), 0);
+        let s = a.to_string();
+        assert!(s.ends_with(".b32.i2p:0"), "{s}");
+        assert_eq!(s.parse::<NetAddr>().unwrap(), a);
+        let onion = AddrV2Message {
+            time: 1,
+            services: bitcoin::p2p::ServiceFlags::NETWORK,
+            addr: AddrV2::TorV3([0x22; 32]),
+            port: 0,
+        };
+        assert!(NetAddr::from_addrv2(&onion).is_none());
     }
 
     #[test]

@@ -39,6 +39,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | Open, push, or poll a PR | [`../.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) (one worktree; fail-fast `pr-checks-watch.sh`) |
 | Minor, patch, or major release | [`../.agents/skills/release/SKILL.md`](../.agents/skills/release/SKILL.md) |
 | Core functional harness | [`../.agents/skills/core-functional/SKILL.md`](../.agents/skills/core-functional/SKILL.md) |
+| Overlay functional harness (private Tor / i2pd / cjdns) | [`../.agents/skills/overlay-functional/SKILL.md`](../.agents/skills/overlay-functional/SKILL.md) |
 
 ## Ask first
 

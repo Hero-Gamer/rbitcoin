@@ -18,6 +18,10 @@ Electrum TCP, Esplora HTTP, BIP324 P2P). Bitcoin Core’s Python functional
 suite is a **nightly / ship / `core-functional` label** oracle. It is **not**
 a required PR check and **not** required on PRs that merely touch net or RPC
 (too slow). Nightly Core is not a license to delete in-tree tests.
+Unlabeled PRs stay cargo-only for overlays too: live Tor / i2pd / cjdns
+meshes are the **`overlay-functional`** labeled / nightly / ship job
+([`docs/overlay-functional.md`](docs/overlay-functional.md)), not default
+`cargo test`.
 
 When adding or folding a pin:
 
@@ -497,6 +501,10 @@ suite. A red labeled run is reproduced locally with
 `./scripts/core-functional/run.sh <failing.py>` until that script passes
 ([`docs/core-functional.md`](docs/core-functional.md)); do not push-and-wait
 on that job as the inner loop.
+Label **`overlay-functional`** on harness PRs and on **ship** version-bump
+PRs. It is **not** a required PR check. A red labeled run is reproduced
+locally with `./scripts/overlay-functional/run.sh <filter>`
+([`docs/overlay-functional.md`](docs/overlay-functional.md)).
 
 ```bash
 python3 scripts/core-functional/check_inventory.py
@@ -511,4 +519,6 @@ python3 scripts/core-functional/check_inventory.py
 # cargo test stages Core JSON from the submodule:
 ./scripts/core-functional/init-submodule.sh
 ./scripts/core-functional/sync-core-fixtures.sh --check
+./scripts/overlay-functional/run.sh.test.sh
+./scripts/overlay-functional/run.sh --list
 ```

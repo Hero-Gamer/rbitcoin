@@ -100,6 +100,14 @@ impl Shutdown {
     }
 }
 
+/// Clearnet follow handshake bound. Overlay STREAM CONNECT is slower; see
+/// [`follow_connect_timeout`].
+const FOLLOW_CONNECT_SECS: u64 = 8;
+
+fn follow_connect_timeout(peer: rbitcoin_net::NetAddr) -> Duration {
+    rbitcoin_net::connect_timeout_for(peer, Duration::from_secs(FOLLOW_CONNECT_SECS))
+}
+
 /// Install SIGTERM / SIGINT (and Ctrl+C) handlers that trip `shutdown`.
 fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     tokio::spawn(async move {
@@ -325,9 +333,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if node.local_addr.port() != 0 {
         node.peers.set_listen_port(node.local_addr.port());
     }
-    if !config.listen.external_ips.is_empty() {
-        node.peers
-            .set_external_ips(config.listen.external_ips.clone());
+    let external = external_ips_with_cjdns_bind(
+        &config.listen.external_ips,
+        node.local_addr,
+        config.listen.cjdns_reachable,
+    );
+    if !external.is_empty() {
+        node.peers.set_external_ips(external);
     }
     if immediate_relay {
         node.peers.set_noban(true);
@@ -408,6 +420,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         sam.stream_forward(port)
             .await
             .map_err(|e| NodeError::Init(format!("i2p STREAM FORWARD {port}: {e}")))?;
+        let local = sam
+            .local_netaddr()
+            .map_err(|e| NodeError::Init(format!("i2p address: {e}")))?;
+        info!("i2p address {local}");
+        node.peers.set_p2p_i2p(local);
         info!("i2p STREAM FORWARD to {}", node.local_addr);
     }
     if let Some(sam) = i2p_sam.as_ref() {
@@ -625,7 +642,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     if tip_follow_ready && !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
-        const FOLLOW_CONNECT_SECS: u64 = 8;
         if catch_up.dial_failed_all() {
             for peer in targets.iter().take(follow_n) {
                 if let Err(e) = node.peers.dial_net(*peer, PeerConnType::OutboundFullRelay) {
@@ -640,16 +656,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 if shutdown.requested() {
                     break;
                 }
+                let to = follow_connect_timeout(*peer);
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
                         warn!("signal: skip remaining follow connects");
                         break;
                     }
-                    result = tokio::time::timeout(
-                        Duration::from_secs(FOLLOW_CONNECT_SECS),
-                        node.follow_from_net(*peer),
-                    ) => {
+                    result = tokio::time::timeout(to, node.follow_from_net(*peer)) => {
                         match result {
                             Ok(Ok(())) => {
                                 info!(
@@ -658,9 +672,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 );
                             }
                             Ok(Err(e)) => warn!("node: follow {peer} failed: {e}"),
-                            Err(_) => warn!(
-                                "node: follow {peer} timed out ({FOLLOW_CONNECT_SECS}s)"
-                            ),
+                            Err(_) => warn!("node: follow {peer} timed out ({to:?})"),
                         }
                     }
                 }
@@ -1863,6 +1875,27 @@ pub(crate) async fn tip_follow_next_wake(
     }
 }
 
+/// A CJDNS listen bind is the address peers should learn. `--external-ip`
+/// still wins when the operator set the same address already.
+fn external_ips_with_cjdns_bind(
+    configured: &[std::net::IpAddr],
+    bind: SocketAddr,
+    cjdns_reachable: bool,
+) -> Vec<std::net::IpAddr> {
+    let mut ips = configured.to_vec();
+    if !cjdns_reachable {
+        return ips;
+    }
+    let std::net::IpAddr::V6(ip) = bind.ip() else {
+        return ips;
+    };
+    if !rbitcoin_net::is_cjdns_ip(ip) || ips.contains(&std::net::IpAddr::V6(ip)) {
+        return ips;
+    }
+    ips.push(std::net::IpAddr::V6(ip));
+    ips
+}
+
 /// Parse Core `-seednode` host or host:port using the chain default P2P port.
 fn resolve_seednode(raw: &str, network: Network) -> Result<SocketAddr, String> {
     if let Ok(a) = raw.parse::<SocketAddr>() {
@@ -2119,6 +2152,42 @@ mod tests {
         assert_eq!(catch_up_after_err(10, false, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(0, true, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(10, true, true), CatchUp::Incomplete);
+    }
+
+    #[test]
+    fn cjdns_listen_is_advertised_without_external_ip() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let fc = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let bind = SocketAddr::from((fc, 8333));
+        let got = external_ips_with_cjdns_bind(&[], bind, true);
+        assert_eq!(got, vec![IpAddr::V6(fc)]);
+        assert!(
+            external_ips_with_cjdns_bind(&[], bind, false).is_empty(),
+            "fc00 stays unroutable until --cjdns-reachable"
+        );
+        let v4 = SocketAddr::from(([1, 2, 3, 4], 8333));
+        assert!(external_ips_with_cjdns_bind(&[], v4, true).is_empty());
+        let ula = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 8333));
+        assert!(
+            external_ips_with_cjdns_bind(&[], ula, true).is_empty(),
+            "fd00::/8 is not CJDNS"
+        );
+        let dup = external_ips_with_cjdns_bind(&[IpAddr::V6(fc)], bind, true);
+        assert_eq!(dup, vec![IpAddr::V6(fc)]);
+    }
+
+    #[test]
+    fn follow_connect_timeout_i2p_is_longer_than_clearnet() {
+        let i2p = rbitcoin_net::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 1,
+        };
+        let ip: rbitcoin_net::NetAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(
+            follow_connect_timeout(ip),
+            Duration::from_secs(FOLLOW_CONNECT_SECS)
+        );
+        assert_eq!(follow_connect_timeout(i2p), Duration::from_secs(90));
     }
 
     #[test]

@@ -34,7 +34,9 @@ A node on CGNAT / no forwarded TCP still:
 
 - Tor backend is **system `tor`** (SOCKS + control port). Not Arti-in-process.
 - Fake SOCKS / fake Tor control / fake I2P SAM under `/tmp`. **No** agent-VM
-  mainnet. **No** live Tor, I2P, or cjdns router in CI.
+  mainnet. **No** live Tor, I2P, or cjdns router in product PRs or default
+  `cargo test`. The labeled/nightly overlay job is the live-daemon oracle
+  ([`overlay-functional.md`](../overlay-functional.md)).
 - Prefer zero new crates (hand-rolled SOCKS5, control protocol, SAM). Any crate
   must pass `cargo deny` (musl operator binary).
 - Operator CLI is kebab (`--only-net`, `--i2p-sam`, `--cjdns-reachable`,

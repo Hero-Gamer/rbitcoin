@@ -46,6 +46,7 @@ into `AGENTS.md`.
 | [`rpc.md`](./rpc.md) | Core-class JSON-RPC subset. |
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
+| [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |
 | [`how-we-plan.md`](./how-we-plan.md) | Red → Green → Refactor planning contract; Agent RAM (redirect cargo/clippy/rustc stdout). |
 | [`personal-node-plans/`](./personal-node-plans/) | Home-node implementation plan group (SOCKS, overlays, wallet onions, ephemeral broadcast, inwit prune / `NETWORK_LIMITED`). Live flags stay OPERATOR/COMPAT when a slice ships. Do not copy step lists into quality.md until scheduled. |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |

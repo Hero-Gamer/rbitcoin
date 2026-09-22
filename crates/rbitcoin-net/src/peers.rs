@@ -446,8 +446,9 @@ impl LivePeer {
         }
         let hub = self.owner.upgrade()?;
         let onion = hub.p2p_onion();
+        let i2p = hub.p2p_i2p();
         let sock = hub.advertise_local_socket();
-        if onion.is_none() && sock.is_none() {
+        if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -465,6 +466,15 @@ impl LivePeer {
         if self.wants_addrv2() {
             let mut v = Vec::new();
             if let Some(addr) = onion {
+                rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(addr, self.id));
+                v.push(AddrV2Message {
+                    time: t,
+                    services,
+                    addr: addr.to_addrv2(),
+                    port: addr.port(),
+                });
+            }
+            if let Some(addr) = i2p {
                 rbitcoin_log::debug!("{}", crate::peer::advertising_address_log(addr, self.id));
                 v.push(AddrV2Message {
                     time: t,
@@ -1142,6 +1152,7 @@ pub struct PeerHub {
     external_ips: Mutex<Vec<IpAddr>>,
     wallet_onions: Mutex<Vec<(String, u16)>>,
     p2p_onion: Mutex<Option<(String, u16)>>,
+    p2p_i2p: Mutex<Option<crate::NetAddr>>,
     /// P2P listen port used with advertised external IPs.
     listen_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
@@ -1232,6 +1243,7 @@ impl PeerHub {
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
+            p2p_i2p: Mutex::new(None),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             clearnet_listen: AtomicBool::new(true),
@@ -1311,6 +1323,16 @@ impl PeerHub {
         format!("{host}:{port}").parse().ok()
     }
 
+    pub fn set_p2p_i2p(&self, addr: crate::NetAddr) {
+        if matches!(addr, crate::NetAddr::I2p { .. }) {
+            *self.p2p_i2p.lock().unwrap_or_else(|e| e.into_inner()) = Some(addr);
+        }
+    }
+
+    pub fn p2p_i2p(&self) -> Option<crate::NetAddr> {
+        *self.p2p_i2p.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn set_clearnet_listen(&self, on: bool) {
         self.clearnet_listen.store(on, Ordering::Relaxed);
     }
@@ -1345,6 +1367,9 @@ impl PeerHub {
             .clone()
         {
             rows.push((host, port, LOCAL_MANUAL));
+        }
+        if let Some(addr) = self.p2p_i2p() {
+            rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
         }
         if !self.discover.load(Ordering::Relaxed) {
             return rows;
@@ -1753,7 +1778,13 @@ impl PeerHub {
         inbound: bool,
         conn_type: PeerConnType,
     ) -> Arc<LivePeer> {
-        self.register_connecting_net(addr, crate::NetAddr::Ip(addr), addrbind, inbound, conn_type)
+        self.register_connecting_net(
+            addr,
+            crate::NetAddr::from_socket(addr),
+            addrbind,
+            inbound,
+            conn_type,
+        )
     }
 
     pub fn register_connecting_net(
@@ -1801,7 +1832,7 @@ impl PeerHub {
     ) -> Arc<LivePeer> {
         self.register_net(
             addr,
-            crate::NetAddr::Ip(addr),
+            crate::NetAddr::from_socket(addr),
             addrbind,
             ver,
             inbound,
@@ -1849,7 +1880,7 @@ impl PeerHub {
             id,
             PeerEndpoint {
                 addr,
-                net: crate::NetAddr::Ip(addr),
+                net: crate::NetAddr::from_socket(addr),
                 addrbind,
             },
             ver,
@@ -3328,6 +3359,29 @@ mod tests {
     }
 
     #[test]
+    fn learn_addrv2_keeps_i2p_port_zero() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let dest = [0x22u8; 32];
+        hub.learn_addrv2(&[AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::I2p(dest),
+            port: 0,
+        }]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let want = crate::NetAddr::I2p { dest, port: 0 };
+        assert!(
+            book.entries().iter().any(|e| e.addr == want),
+            "Core I2P port 0 must stay in the book, got {:?}",
+            book.entries()
+        );
+    }
+
+    #[test]
     fn dial_target_cjdns_is_native_socket() {
         use std::net::Ipv6Addr;
         let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
@@ -3380,6 +3434,36 @@ mod tests {
             "CJDNS must stay in the book, got {:?}",
             book.entries()
         );
+    }
+
+    #[test]
+    fn inbound_fc00_getpeerinfo_network_is_cjdns() {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::ServiceFlags;
+        use std::net::Ipv6Addr;
+
+        let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
+        let addr = SocketAddr::from((ip, 8333));
+        let bind = SocketAddr::from((ip, 18444));
+        let hub = PeerHub::new();
+        let connecting = hub.register_connecting(addr, bind, true, PeerConnType::Inbound);
+        assert_eq!(connecting.net.network_label(), "cjdns");
+        hub.unregister(connecting.id);
+        let ver = VersionMessage {
+            version: bitcoin::p2p::PROTOCOL_VERSION,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&bind, ServiceFlags::NONE),
+            nonce: 0,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 3,
+            relay: true,
+        };
+        let live = hub.register_with_id(1, addr, bind, &ver, true, PeerConnType::Inbound);
+        assert_eq!(live.net.network_label(), "cjdns");
+        assert_eq!(hub.snapshot()[0].net.network_label(), "cjdns");
     }
 
     #[test]

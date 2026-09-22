@@ -488,7 +488,10 @@ Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
 error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
 `--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
 creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
-`STREAM FORWARD`s to the P2P bind. With `--listen=0` that is a start error
+`STREAM FORWARD`s to the P2P bind. That destination is published as
+`{52}.b32.i2p:0` (SAM 3.1 has no ports; Core refuses any other I2P port)
+on `getnetworkinfo.localaddresses` and in addrv2, including with
+`--no-discover`. With `--listen=0` that is a start error
 unless `--listen-onion` provides a loopback accept. NixOS:
 `services.rbitcoin.i2p.sam` / `i2p.acceptIncoming`; the unit `After`/`Wants`
 `i2pd.service` when SAM is set. Do not start i2pd from this module.

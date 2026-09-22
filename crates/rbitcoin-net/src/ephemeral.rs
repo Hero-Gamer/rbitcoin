@@ -121,7 +121,15 @@ pub fn spawn_isolated_broadcast_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
-            let Some(tx) = mp.get_tx(&txid) else {
+            // `get_tx` refuses the reactor thread. This task is a tokio worker.
+            let tx = match mp.try_get_tx(&txid) {
+                Some(tx) => Some(tx),
+                None => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    mp.try_get_tx(&txid)
+                }
+            };
+            let Some(tx) = tx else {
                 continue;
             };
             isolated_broadcast_known_tx(&dialer, &addrman, magic, &user_agent, txid, tx).await;
@@ -411,6 +419,30 @@ mod tests {
         )
         .await
         .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn isolated_broadcast_loop_reads_mempool_off_reactor() {
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-reactor");
+        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_isolated_broadcast(true);
+        let am = Arc::new(Mutex::new(AddrMan::new()));
+        let h = spawn_isolated_broadcast_loop(
+            mp.clone(),
+            Dialer::Direct,
+            am,
+            Magic::REGTEST,
+            "/rbitcoin:test/".into(),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        mp.mark_local_origin(dummy_tx().compute_txid());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !h.is_finished(),
+            "broadcast task must not panic reading the mempool on a tokio worker"
+        );
+        h.abort();
         let _ = std::fs::remove_dir_all(dir);
     }
 

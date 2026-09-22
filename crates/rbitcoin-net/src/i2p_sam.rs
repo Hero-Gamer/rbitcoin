@@ -1,11 +1,12 @@
 //! I2P SAM v3 STREAM CONNECT / FORWARD (system router, not SOCKS).
 
 use crate::error::NetError;
+use bitcoin::hashes::{sha256, Hash};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Mutex;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
@@ -13,12 +14,14 @@ static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
 struct Installed {
     dialer: I2pDialer,
     _keepalive: Option<TcpStream>,
+    _forward: Option<TcpStream>,
 }
 
 pub struct I2pSam {
     sam_addr: SocketAddr,
     session_id: String,
     destination: String,
+    forward_port: Option<u16>,
     _control: TcpStream,
     _forward: Option<TcpStream>,
 }
@@ -28,19 +31,22 @@ pub struct I2pDialer {
     sam_addr: SocketAddr,
     session_id: String,
     destination: String,
+    forward_port: Option<u16>,
 }
 
 pub fn install(dialer: I2pDialer) {
     *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
         dialer,
         _keepalive: None,
+        _forward: None,
     });
 }
 
-fn install_kept(dialer: I2pDialer, keepalive: TcpStream) {
+fn install_kept(dialer: I2pDialer, keepalive: TcpStream, forward: Option<TcpStream>) {
     *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Installed {
         dialer,
         _keepalive: Some(keepalive),
+        _forward: forward,
     });
 }
 
@@ -49,8 +55,8 @@ pub async fn stream_connect_installed(dest_b32: &str) -> Result<TcpStream, NetEr
     match first.stream_connect(dest_b32).await {
         Ok(s) => Ok(s),
         Err(e) if session_dead(&e) => {
-            let (fresh, keepalive) = first.recreate_session().await?;
-            install_kept(fresh.clone(), keepalive);
+            let (fresh, keepalive, forward) = first.recreate_session().await?;
+            install_kept(fresh.clone(), keepalive, forward);
             fresh.stream_connect(dest_b32).await
         }
         Err(e) => Err(e),
@@ -74,6 +80,39 @@ fn session_dead(err: &NetError) -> bool {
             up.contains("INVALID_ID")
                 || up.contains("CONNECTION CLOSED")
                 || up.contains("STREAM CONNECT:")
+        }
+        _ => false,
+    }
+}
+
+fn sam_retry(err: &NetError) -> bool {
+    match err {
+        NetError::Io(_) | NetError::Disconnected => true,
+        NetError::Encode(s) => {
+            let l = s.to_ascii_lowercase();
+            l.contains("broken pipe")
+                || l.contains("connection reset")
+                || l.contains("connection closed")
+                || l.contains("i2p sam connect")
+                || l.contains("early eof")
+                || l.contains("unexpected eof")
+        }
+        _ => false,
+    }
+}
+
+fn stream_retry(err: &NetError) -> bool {
+    match err {
+        NetError::Io(_) | NetError::Disconnected => true,
+        NetError::Encode(s) => {
+            let l = s.to_ascii_lowercase();
+            l.contains("early eof")
+                || l.contains("unexpected eof")
+                || l.contains("broken pipe")
+                || l.contains("connection reset")
+                || l.contains("connection closed")
+                || l.contains("cant_reach")
+                || l.contains("timeout")
         }
         _ => false,
     }
@@ -126,17 +165,31 @@ impl I2pSam {
         sam_addr: SocketAddr,
         dest: Option<&str>,
     ) -> Result<(Self, String), NetError> {
+        let mut last = None;
+        for _ in 0..32 {
+            match Self::connect_session_dest_once(sam_addr, dest).await {
+                Ok(v) => return Ok(v),
+                Err(e) if sam_retry(&e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.expect("sam retry"))
+    }
+
+    async fn connect_session_dest_once(
+        sam_addr: SocketAddr,
+        dest: Option<&str>,
+    ) -> Result<(Self, String), NetError> {
         let mut control = TcpStream::connect(sam_addr)
             .await
             .map_err(|e| NetError::Encode(format!("i2p sam connect {sam_addr}: {e}")))?;
         hello(&mut control).await?;
         let session_id = fresh_session_id();
         let dest_arg = dest.unwrap_or("TRANSIENT");
-        write_line(
-            &mut control,
-            &format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg}"),
-        )
-        .await?;
+        write_line(&mut control, &session_create_line(&session_id, dest_arg)).await?;
         let reply = read_line(&mut control).await?;
         if !reply.to_ascii_uppercase().contains("RESULT=OK") {
             return Err(NetError::Encode(format!("i2p sam session: {reply}")));
@@ -151,6 +204,7 @@ impl I2pSam {
                 sam_addr,
                 session_id,
                 destination: destination.clone(),
+                forward_port: None,
                 _control: control,
                 _forward: None,
             },
@@ -167,7 +221,13 @@ impl I2pSam {
             sam_addr: self.sam_addr,
             session_id: self.session_id.clone(),
             destination: self.destination.clone(),
+            forward_port: self.forward_port,
         }
+    }
+
+    /// BIP155 address of this session. Port is 0: SAM 3.1 does not use ports.
+    pub fn local_netaddr(&self) -> Result<crate::NetAddr, NetError> {
+        i2p_addr_from_sam_b64(&self.destination)
     }
 
     fn into_keepalive(self) -> (I2pDialer, TcpStream) {
@@ -176,26 +236,62 @@ impl I2pSam {
     }
 
     pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
+        let mut last = None;
+        for _ in 0..24 {
+            match self.stream_forward_once(port).await {
+                Ok(s) => {
+                    self.forward_port = Some(port);
+                    self._forward = Some(s);
+                    return Ok(());
+                }
+                Err(e) if stream_retry(&e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.expect("forward retry"))
+    }
+
+    async fn stream_forward_once(&self, port: u16) -> Result<TcpStream, NetError> {
         let mut s = TcpStream::connect(self.sam_addr)
             .await
             .map_err(|e| NetError::Encode(format!("i2p sam forward connect: {e}")))?;
         hello(&mut s).await?;
         write_line(
             &mut s,
-            &format!("STREAM FORWARD ID={} PORT={port}", self.session_id),
+            &format!(
+                "STREAM FORWARD ID={} PORT={port} HOST=127.0.0.1 SILENT=true",
+                self.session_id
+            ),
         )
         .await?;
         let reply = read_line(&mut s).await?;
         if !reply.to_ascii_uppercase().contains("RESULT=OK") {
             return Err(NetError::Encode(format!("i2p sam forward: {reply}")));
         }
-        self._forward = Some(s);
-        Ok(())
+        Ok(s)
     }
 }
 
 impl I2pDialer {
     pub async fn stream_connect(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
+        let mut last = None;
+        for _ in 0..24 {
+            match self.stream_connect_once(dest_b32).await {
+                Ok(s) => return Ok(s),
+                Err(e) if stream_retry(&e) => {
+                    last = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.expect("stream retry"))
+    }
+
+    async fn stream_connect_once(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
         let mut s = TcpStream::connect(self.sam_addr)
             .await
             .map_err(|e| NetError::Encode(format!("i2p sam stream connect: {e}")))?;
@@ -215,10 +311,95 @@ impl I2pDialer {
         Ok(s)
     }
 
-    async fn recreate_session(&self) -> Result<(Self, TcpStream), NetError> {
-        let (sam, _) = I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
-        Ok(sam.into_keepalive())
+    async fn recreate_session(&self) -> Result<(Self, TcpStream, Option<TcpStream>), NetError> {
+        let (mut sam, _) =
+            I2pSam::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+        let forward = match self.forward_port {
+            Some(port) => {
+                sam.stream_forward(port).await?;
+                sam._forward.take()
+            }
+            None => None,
+        };
+        let (dialer, keepalive) = sam.into_keepalive();
+        Ok((dialer, keepalive, forward))
     }
+}
+
+// Ed25519 (7), not the SAM DSA_SHA1 default. leaseSetEncType 4 is ECIES.
+fn session_create_line(session_id: &str, dest_arg: &str) -> String {
+    let sig = if dest_arg.eq_ignore_ascii_case("TRANSIENT") {
+        " SIGNATURE_TYPE=7"
+    } else {
+        ""
+    };
+    format!(
+        "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_arg}{sig} \
+         i2cp.leaseSetEncType=4,0 inbound.length=1 outbound.length=1 \
+         inbound.quantity=1 outbound.quantity=1"
+    )
+}
+
+// Public Destination is 387 bytes plus the cert length at bytes 385–386.
+// The trailing private key is not part of the BIP155 hash.
+fn i2p_addr_from_sam_b64(dest_b64: &str) -> Result<crate::NetAddr, NetError> {
+    let raw = decode_i2p_b64(dest_b64.trim())?;
+    let public = i2p_public_destination(&raw)?;
+    let digest = sha256::Hash::hash(public);
+    Ok(crate::NetAddr::I2p {
+        dest: *digest.as_byte_array(),
+        port: 0,
+    })
+}
+
+fn i2p_public_destination(raw: &[u8]) -> Result<&[u8], NetError> {
+    const DEST_LEN_BASE: usize = 387;
+    const CERT_LEN_POS: usize = 385;
+    if raw.len() < CERT_LEN_POS + 2 {
+        return Err(NetError::Encode(format!(
+            "i2p destination too short ({})",
+            raw.len()
+        )));
+    }
+    let cert_len = u16::from_be_bytes([raw[CERT_LEN_POS], raw[CERT_LEN_POS + 1]]) as usize;
+    let dest_len = DEST_LEN_BASE + cert_len;
+    if dest_len > raw.len() {
+        return Err(NetError::Encode(format!(
+            "i2p certificate length {cert_len} needs {dest_len} bytes, have {}",
+            raw.len()
+        )));
+    }
+    Ok(&raw[..dest_len])
+}
+
+fn decode_i2p_b64(s: &str) -> Result<Vec<u8>, NetError> {
+    let mut bytes = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut n = 0u32;
+    for c in s.chars() {
+        if c == '=' {
+            break;
+        }
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '-' | '+' => 62,
+            '~' | '/' => 63,
+            _ => {
+                return Err(NetError::Encode(format!(
+                    "i2p destination base64 contains {c:?}"
+                )));
+            }
+        };
+        acc = (acc << 6) | v;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            bytes.push((acc >> n) as u8);
+        }
+    }
+    Ok(bytes)
 }
 
 fn sam_kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -285,16 +466,23 @@ async fn write_line(s: &mut TcpStream, line: &str) -> Result<(), NetError> {
 }
 
 async fn read_line(s: &mut TcpStream) -> Result<String, NetError> {
-    let mut reader = BufReader::new(s);
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .await
-        .map_err(|e| NetError::Encode(format!("i2p sam read: {e}")))?;
-    if n == 0 {
-        return Err(NetError::Encode("i2p sam: connection closed".into()));
+    let mut buf = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        s.read_exact(&mut b)
+            .await
+            .map_err(|e| NetError::Encode(format!("i2p sam read: {e}")))?;
+        if b[0] == b'\n' {
+            break;
+        }
+        if b[0] != b'\r' {
+            buf.push(b[0]);
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(NetError::Encode("i2p sam read: line too long".into()));
+        }
     }
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    String::from_utf8(buf).map_err(|e| NetError::Encode(format!("i2p sam read: {e}")))
 }
 
 #[cfg(test)]
@@ -312,6 +500,21 @@ mod tests {
         ok_hello: bool,
         dest_log: Arc<Mutex<Vec<String>>>,
     ) -> (SocketAddr, Arc<Mutex<HashSet<String>>>) {
+        fake_sam_opts(
+            ok_hello,
+            dest_log,
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(0)),
+        )
+        .await
+    }
+
+    async fn fake_sam_opts(
+        ok_hello: bool,
+        dest_log: Arc<Mutex<Vec<String>>>,
+        stream_drops: Arc<Mutex<usize>>,
+        forward_drops: Arc<Mutex<usize>>,
+    ) -> (SocketAddr, Arc<Mutex<HashSet<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let live = Arc::new(Mutex::new(HashSet::new()));
@@ -323,6 +526,8 @@ mod tests {
                 };
                 let log = Arc::clone(&dest_log);
                 let live = Arc::clone(&live_accept);
+                let drops = Arc::clone(&stream_drops);
+                let fwd_drops = Arc::clone(&forward_drops);
                 let ok = ok_hello;
                 tokio::spawn(async move {
                     let mut created_id: Option<String> = None;
@@ -359,9 +564,33 @@ mod tests {
                             .await;
                         } else if up.starts_with("STREAM FORWARD") {
                             log.lock().unwrap().push(line.clone());
+                            let drop_n = {
+                                let mut n = fwd_drops.lock().unwrap();
+                                if *n > 0 {
+                                    *n -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if drop_n {
+                                break;
+                            }
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                         } else if up.starts_with("STREAM CONNECT") {
                             log.lock().unwrap().push(line.clone());
+                            let drop_n = {
+                                let mut n = drops.lock().unwrap();
+                                if *n > 0 {
+                                    *n -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if drop_n {
+                                break;
+                            }
                             let id = sam_kv(&line, "ID").unwrap_or("");
                             let known = live.lock().unwrap().contains(id);
                             if known {
@@ -393,6 +622,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn i2p_sam_stream_connect_retries_early_eof() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(Mutex::new(2));
+        let (addr, _live) =
+            fake_sam_opts(true, Arc::clone(&log), drops, Arc::new(Mutex::new(0))).await;
+        let sam = I2pSam::connect(addr).await.unwrap();
+        let dest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p";
+        sam.stream_connect(dest).await.unwrap();
+        let got = stream_lines(&log, "STREAM CONNECT");
+        assert_eq!(got.len(), 3, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn i2p_sam_stream_forward_retries_early_eof() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let drops = Arc::new(Mutex::new(2));
+        let (addr, _live) =
+            fake_sam_opts(true, Arc::clone(&log), Arc::new(Mutex::new(0)), drops).await;
+        let mut sam = I2pSam::connect(addr).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        let got = stream_lines(&log, "STREAM FORWARD");
+        assert_eq!(got.len(), 3, "{got:?}");
+    }
+
+    #[tokio::test]
     async fn i2p_sam_stream_connect_fake() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (addr, _live) = fake_sam(true, Arc::clone(&log)).await;
@@ -405,6 +659,10 @@ mod tests {
         for g in &got {
             assert!(g.contains(dest), "{g}");
             assert!(g.contains("ID=rbtc"), "{g}");
+            // i2pd drops the STREAM STATUS line when CONNECT sets SILENT=true,
+            // so the dial never sees RESULT=OK. FORWARD is the command that
+            // prefixes the peer destination; CONNECT must stay non-silent.
+            assert!(!g.to_ascii_uppercase().contains("SILENT=TRUE"), "{g}");
         }
 
         let (bad, _live) = fake_sam(false, Arc::new(Mutex::new(Vec::new()))).await;
@@ -468,9 +726,16 @@ mod tests {
         assert_eq!(fw.len(), 1, "{fw:?}");
         assert!(fw[0].contains("PORT=18444"), "{}", fw[0]);
         assert!(fw[0].contains("ID=rbtc"), "{}", fw[0]);
+        assert!(fw[0].contains("HOST=127.0.0.1"), "{}", fw[0]);
+        assert!(fw[0].contains("SILENT=true"), "{}", fw[0]);
         let creates = stream_lines(&log, "SESSION CREATE");
         assert!(
-            creates.iter().any(|c| c.contains("DESTINATION=TRANSIENT")),
+            creates.iter().any(|c| {
+                c.contains("DESTINATION=TRANSIENT")
+                    && c.contains("SIGNATURE_TYPE=7")
+                    && c.contains("i2cp.leaseSetEncType=4,0")
+                    && c.contains("inbound.length=1")
+            }),
             "{creates:?}"
         );
 
@@ -478,9 +743,11 @@ mod tests {
         sam2.stream_forward(18444).await.unwrap();
         let creates = stream_lines(&log, "SESSION CREATE");
         assert!(
-            creates
-                .iter()
-                .any(|c| c.contains(&format!("DESTINATION={FAKE_DEST}"))),
+            creates.iter().any(|c| {
+                c.contains(&format!("DESTINATION={FAKE_DEST}"))
+                    && c.contains("i2cp.leaseSetEncType=4,0")
+                    && !c.contains("SIGNATURE_TYPE=")
+            }),
             "{creates:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -527,5 +794,106 @@ mod tests {
             "published dialer must keep the new session id"
         );
         clear_installed();
+    }
+
+    #[tokio::test]
+    async fn i2p_sam_recreate_restores_forward() {
+        let _gate = INSTALL_GATE.lock().await;
+        clear_installed();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, live) = fake_sam(true, Arc::clone(&log)).await;
+        let mut sam = I2pSam::connect(addr).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        crate::socks::install_i2p_dialer(sam.dialer());
+        let peer = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 0,
+        };
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .unwrap();
+        assert_eq!(stream_lines(&log, "STREAM FORWARD").len(), 1);
+        live.lock().unwrap().clear();
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .expect("INVALID_ID must recreate the session");
+        let fw = stream_lines(&log, "STREAM FORWARD");
+        assert_eq!(fw.len(), 2, "dropped session must FORWARD again: {fw:?}");
+        assert!(fw[1].contains("PORT=18444"), "{}", fw[1]);
+        assert!(fw[1].contains("SILENT=true"), "{}", fw[1]);
+        clear_installed();
+    }
+
+    fn i2p_b64_encode(raw: &[u8]) -> String {
+        const ALPH: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+        let mut out = String::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let b0 = raw[i];
+            let b1 = if i + 1 < raw.len() { raw[i + 1] } else { 0 };
+            let b2 = if i + 2 < raw.len() { raw[i + 2] } else { 0 };
+            out.push(ALPH[(b0 >> 2) as usize] as char);
+            out.push(ALPH[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+            if i + 1 < raw.len() {
+                out.push(ALPH[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+            }
+            if i + 2 < raw.len() {
+                out.push(ALPH[(b2 & 63) as usize] as char);
+            }
+            i += 3;
+        }
+        out
+    }
+
+    #[test]
+    fn i2p_addr_hashes_public_destination_only() {
+        let mut ident = vec![7u8; 387];
+        ident[384] = 0;
+        ident[385] = 0;
+        ident[386] = 0;
+        let mut privd = ident.clone();
+        privd.extend_from_slice(&[9u8; 80]);
+        let a = i2p_addr_from_sam_b64(&i2p_b64_encode(&ident)).unwrap();
+        let b = i2p_addr_from_sam_b64(&i2p_b64_encode(&privd)).unwrap();
+        let want = crate::NetAddr::I2p {
+            dest: [
+                0x15, 0xe2, 0xe8, 0x24, 0x7c, 0x9d, 0xfa, 0x2e, 0xd0, 0xaa, 0x88, 0x04, 0xf8, 0x36,
+                0xfc, 0x3a, 0x53, 0x23, 0x0d, 0x3c, 0xa5, 0x8e, 0x03, 0x4d, 0x05, 0x7f, 0xb0, 0xee,
+                0x90, 0x7b, 0x3a, 0x57,
+            ],
+            port: 0,
+        };
+        assert_eq!(a, want);
+        assert_eq!(b, want, "private key suffix must not change the b32");
+        assert_eq!(
+            a.to_string(),
+            "cxroqjd4tx5c5ufkracpqnx4hjjsgdj4uwhagtifp6yo5ed3hjlq.b32.i2p:0"
+        );
+
+        let mut public = vec![9u8; 387];
+        public[384] = 5;
+        public[385] = 0;
+        public[386] = 4;
+        public.extend_from_slice(&[0x00, 0x07, 0x00, 0x04]);
+        let mut full = public.clone();
+        full.extend_from_slice(&[0xab; 64]);
+        let ed = i2p_addr_from_sam_b64(&i2p_b64_encode(&public)).unwrap();
+        let ed_priv = i2p_addr_from_sam_b64(&i2p_b64_encode(&full)).unwrap();
+        assert_eq!(ed, ed_priv);
+        assert_eq!(
+            ed,
+            crate::NetAddr::I2p {
+                dest: [
+                    0x0f, 0x35, 0x9f, 0x01, 0x19, 0x78, 0x92, 0x09, 0x23, 0x60, 0xcb, 0x0d, 0x3e,
+                    0xeb, 0x27, 0xcf, 0x5f, 0xf7, 0xb7, 0x1f, 0x70, 0xef, 0xe7, 0xf7, 0x8d, 0x45,
+                    0x03, 0x1e, 0x1a, 0xe2, 0x11, 0x75,
+                ],
+                port: 0,
+            }
+        );
+        assert!(i2p_addr_from_sam_b64("!!!").is_err());
+        assert!(i2p_addr_from_sam_b64(&i2p_b64_encode(&[1, 2, 3])).is_err());
     }
 }
