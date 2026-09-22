@@ -440,6 +440,22 @@ impl P2PNode {
     }
 }
 
+impl Drop for P2PNode {
+    fn drop(&mut self) {
+        // The connect-retry interval runs until this flag or an abort.
+        // Dropping the handle without `shutdown` must not pin the test runtime.
+        self.shutdown.store(true, Ordering::SeqCst);
+        for t in &self.tasks {
+            t.abort();
+        }
+        if let Ok(g) = self.session_tasks.lock() {
+            for t in g.iter() {
+                t.abort();
+            }
+        }
+    }
+}
+
 fn push_session_task(bag: &Mutex<Vec<JoinHandle<()>>>, h: JoinHandle<()>) {
     if let Ok(mut g) = bag.lock() {
         g.retain(|t| !t.is_finished());
