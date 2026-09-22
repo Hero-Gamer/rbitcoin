@@ -1160,6 +1160,8 @@ pub struct PeerHub {
     /// Clearnet P2P bind (not onion-only loopback). Needed to gossip `--external-ip`.
     clearnet_listen: AtomicBool,
     cjdns_reachable: AtomicBool,
+    /// Core `-i2psam`: I2P rows may enter addrman. Off, they are still relayed.
+    i2p_reachable: AtomicBool,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
     /// Tip-mode mempool for Core `EraseForPeer` on disconnect.
     mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
@@ -1248,6 +1250,7 @@ impl PeerHub {
             discover: AtomicBool::new(true),
             clearnet_listen: AtomicBool::new(true),
             cjdns_reachable: AtomicBool::new(false),
+            i2p_reachable: AtomicBool::new(false),
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
@@ -1341,6 +1344,11 @@ impl PeerHub {
         self.cjdns_reachable.store(on, Ordering::Relaxed);
     }
 
+    /// Core sets `NET_I2P` reachable only when `-i2psam` is configured.
+    pub fn set_i2p_reachable(&self, on: bool) {
+        self.i2p_reachable.store(on, Ordering::Relaxed);
+    }
+
     pub fn set_listen_port(&self, port: u16) {
         self.listen_port.store(port, Ordering::Relaxed);
     }
@@ -1422,8 +1430,14 @@ impl PeerHub {
         let Some(am) = g.as_ref() else {
             return;
         };
+        let i2p_ok = self.i2p_reachable.load(Ordering::Relaxed);
         let mut book = am.lock().unwrap_or_else(|e| e.into_inner());
         for a in list {
+            // No `-i2psam`: relay the addrv2 row, do not store it. Core
+            // `p2p_addrv2_relay` expects `getnodeaddresses network=i2p` empty.
+            if matches!(a.addr, bitcoin::p2p::address::AddrV2::I2p(_)) && !i2p_ok {
+                continue;
+            }
             if let Some(addr) = crate::NetAddr::from_addrv2(a) {
                 book.add_learned_addr(addr, crate::seeds::MAX_ADDR_MAN);
             }
@@ -3336,12 +3350,51 @@ mod tests {
     }
 
     #[test]
+    fn learn_addrv2_drops_i2p_until_reachable() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+        use std::net::Ipv4Addr;
+
+        let hub = PeerHub::new();
+        let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
+        hub.set_addrman(am.clone());
+        let dest = [0x33u8; 32];
+        let v4 = Ipv4Addr::new(123, 123, 123, 1);
+        hub.learn_addrv2(&[
+            AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NETWORK,
+                addr: AddrV2::Ipv4(v4),
+                port: 8333,
+            },
+            AddrV2Message {
+                time: 2,
+                services: ServiceFlags::NETWORK,
+                addr: AddrV2::I2p(dest),
+                port: 0,
+            },
+        ]);
+        let book = am.lock().unwrap_or_else(|e| e.into_inner());
+        let addrs: Vec<_> = book.entries().iter().map(|e| e.addr).collect();
+        assert!(
+            addrs.iter().any(|a| matches!(a, crate::NetAddr::Ip(_))),
+            "{addrs:?}"
+        );
+        assert!(
+            !addrs
+                .iter()
+                .any(|a| matches!(a, crate::NetAddr::I2p { .. })),
+            "unreachable I2P must not enter addrman, got {addrs:?}"
+        );
+    }
+
+    #[test]
     fn learn_addrv2_keeps_i2p() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
         let hub = PeerHub::new();
         let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
         hub.set_addrman(am.clone());
+        hub.set_i2p_reachable(true);
         let dest = [0x11u8; 32];
         hub.learn_addrv2(&[AddrV2Message {
             time: 1,
@@ -3365,6 +3418,7 @@ mod tests {
         let hub = PeerHub::new();
         let am = Arc::new(Mutex::new(crate::seeds::AddrMan::new()));
         hub.set_addrman(am.clone());
+        hub.set_i2p_reachable(true);
         let dest = [0x22u8; 32];
         hub.learn_addrv2(&[AddrV2Message {
             time: 1,

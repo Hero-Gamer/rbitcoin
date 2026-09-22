@@ -399,6 +399,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers
             .set_p2p_onion(format!("{}.onion", hs.service_id), virt);
     }
+    if config.listen.i2p_sam.is_some() {
+        node.peers.set_i2p_reachable(true);
+    }
     let mut i2p_sam = if let Some(addr) = config.listen.i2p_sam {
         let s = if config.listen.i2p_accept_incoming {
             let dest = config.datadir.path().join("i2p").join("p2p.priv");
