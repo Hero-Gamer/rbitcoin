@@ -31,7 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${COMPOSE[@]}" up -d --force-recreate --remove-orphans
+# tank1's --connect runs catch-up before RPC listens. Mine on tank0 first.
+"${COMPOSE[@]}" up -d --force-recreate --remove-orphans tank0
 
 cli() {
   local tank="$1"
@@ -43,27 +44,29 @@ height() {
   cli "$1" getblockcount 2>/dev/null | tr -d '[:space:]' || true
 }
 
+fail() {
+  echo "example.sh: $*" >&2
+  "${COMPOSE[@]}" ps -a >&2 || true
+  "${COMPOSE[@]}" logs --no-color >&2 || true
+  exit 1
+}
+
 deadline=$((SECONDS + 90))
-until [[ "$(height tank0)" == "0" && "$(height tank1)" == "0" ]]; do
+until [[ "$(height tank0)" == "0" ]]; do
   if (( SECONDS > deadline )); then
-    echo "example.sh: tanks did not answer getblockcount" >&2
-    "${COMPOSE[@]}" ps -a >&2 || true
-    "${COMPOSE[@]}" exec -T tank0 bitcoin-cli -regtest getblockcount >&2 || true
-    "${COMPOSE[@]}" exec -T tank0 sh -c 'ls -la /usr/local/bin/rbitcoin-node /root/.bitcoin /root/.bitcoin/regtest; tail -40 /root/.bitcoin/regtest/debug.log' >&2 || true
-    "${COMPOSE[@]}" logs --no-color >&2 || true
-    exit 1
+    fail "tank0 did not answer getblockcount (got '$(height tank0)')"
   fi
   sleep 2
 done
 
 cli tank0 generate 1 >/dev/null
 
-deadline=$((SECONDS + 60))
+"${COMPOSE[@]}" up -d --remove-orphans tank1
+
+deadline=$((SECONDS + 90))
 until [[ "$(height tank1)" != "" && "$(height tank1)" != "0" ]]; do
   if (( SECONDS > deadline )); then
-    echo "example.sh: tank1 did not follow tank0 (height=$(height tank1))" >&2
-    "${COMPOSE[@]}" logs || true
-    exit 1
+    fail "tank1 did not follow tank0 (height='$(height tank1)')"
   fi
   sleep 2
 done
