@@ -496,9 +496,6 @@ impl Query {
     }
 
     pub fn set_inwit_ram_threshold_bytes(&self, bytes: u64) -> Result<(), QueryError> {
-        if bytes == 0 {
-            return Err(StoreError::Corrupt("inwit ram threshold must be non-zero"));
-        }
         self.inwit_ram_threshold_bytes
             .store(bytes, AtomicOrdering::Release);
         Ok(())
@@ -840,6 +837,9 @@ impl Query {
             .map(|(fk, ins, _)| (*fk, ins.clone()))
             .collect();
         self.persist_inwit_spill_height(height, &spill_rows)?;
+        if threshold == 0 {
+            return Ok(());
+        }
         let mut g = self.inwit_ram_window.lock().unwrap();
         let mut at_height: Vec<Fk> = Vec::with_capacity(staged.len());
         for (fk, ins, bytes) in staged {

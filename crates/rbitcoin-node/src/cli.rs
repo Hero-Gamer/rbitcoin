@@ -1009,6 +1009,9 @@ mod tests {
             .unwrap();
         assert!(conf.prune_inwit);
         assert_eq!(conf.prune_inwit_ram_threshold_bytes, 8192);
+        conf.apply_kv("prune_inwit_ram_threshold_bytes", "0")
+            .unwrap();
+        assert_eq!(conf.prune_inwit_ram_threshold_bytes, 0);
         let h = operator_usage();
         assert!(h.contains("--prune-inwit"));
         assert!(h.contains("--prune-inwit-ram-threshold-bytes"));

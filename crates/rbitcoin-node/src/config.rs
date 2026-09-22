@@ -263,7 +263,7 @@ pub struct NodeConfig {
     pub shindex: bool,
     /// Drop Class A inwit below a 288-height watermark (`NETWORK_LIMITED`).
     pub prune_inwit: bool,
-    /// RAM cap for prune+IBD witness window before spill/re-fetch behavior.
+    /// RAM cap for the prune witness window. `0` keeps nothing in RAM.
     pub prune_inwit_ram_threshold_bytes: u64,
     /// Persist / serve BIP-352 tweaks from `sp_tweaks.*`. Default **off**.
     pub sptweaks: bool,
@@ -904,11 +904,6 @@ impl NodeConfig {
                 self.prune_inwit_ram_threshold_bytes = val.parse().map_err(|e| {
                     NodeError::Config(format!("conf prune_inwit_ram_threshold_bytes: {e}"))
                 })?;
-                if self.prune_inwit_ram_threshold_bytes == 0 {
-                    return Err(NodeError::Config(
-                        "conf prune_inwit_ram_threshold_bytes must be > 0".into(),
-                    ));
-                }
             }
             "sp_tweaks" => {
                 self.sptweaks = parse_conf_bool(val)
