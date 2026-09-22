@@ -1275,11 +1275,20 @@ fn push_connect(listen: &mut ListenOpts, val: &str) -> Result<(), NodeError> {
             "conf connect requires host[:port]".into(),
         ));
     }
-    if let Ok(addr) = val.parse() {
+    if let Ok(addr) = val.parse::<rbitcoin_net::NetAddr>() {
         listen.connect.push(addr);
         return Ok(());
     }
-    if val.contains(char::is_whitespace) || val.contains('/') {
+    let host = match val.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => val,
+    };
+    let lower = host.to_ascii_lowercase();
+    if lower.ends_with(".onion")
+        || lower.ends_with(".b32.i2p")
+        || val.contains(char::is_whitespace)
+        || val.contains('/')
+    {
         return Err(NodeError::Config(format!(
             "conf connect: bad peer address {val}"
         )));
@@ -2166,6 +2175,11 @@ mod tests {
             .any(|h| h == "tank-0001:18444"));
         assert_eq!(cfg.listen.connect.len(), 1);
         assert!(cfg.apply_kv("connect", "").is_err());
+        assert!(cfg
+            .apply_kv("connect", "short.onion:8333")
+            .unwrap_err()
+            .to_string()
+            .contains("bad"));
         assert!(cfg.listen.has_pinned_connect());
     }
 }
