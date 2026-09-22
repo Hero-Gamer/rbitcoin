@@ -1,7 +1,7 @@
 //! Completion-session load for BIP-352 tweak backfill.
 //!
 //! Reads: idx ranges **before** taking the TLS ring (no nested
-//! `with_thread_local`), then S1 `txout` → S2 `inwit` / S3 parent `txout` only
+//! `with_thread_local`), then S1 `txout` → S2 `seqsigwit` / S3 parent `txout` only
 //! for P2TR creates.
 //!
 //! Writes are **not** this machine: consecutive heights go through
@@ -10,8 +10,8 @@
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use crate::tx_table::{
-    decode_inwit_secret, decode_packed_tx_outs_with_spender_rels_secret, InputRecord, OutputRecord,
-    TxRecord, TxTable,
+    decode_packed_tx_outs_with_spender_rels_secret, decode_seqsigwit_secret, InputRecord,
+    OutputRecord, TxRecord, TxTable,
 };
 use crate::uring_session::{self, UringSession};
 use crate::U64Map;
@@ -23,7 +23,7 @@ pub struct LoadedTweakTx {
     pub fk: Fk,
     pub rec: TxRecord,
     pub outs: Vec<OutputRecord>,
-    pub need_inwit: bool,
+    pub need_seqsigwit: bool,
     pub inputs: Option<Vec<InputRecord>>,
 }
 
@@ -159,7 +159,7 @@ fn empty_rec(txid: [u8; 32]) -> TxRecord {
     }
 }
 
-/// Load outs for `fks`; inwit + extra parents only for P2TR creates.
+/// Load outs for `fks`; seqsigwit + extra parents only for P2TR creates.
 ///
 /// Idx resolve ([`crate::var_table::VarTable::record_range_batch`]) runs
 /// **outside** the TLS ring. Body preads are the machine.
@@ -184,7 +184,7 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
             fk,
             rec: empty_rec(txid),
             outs: Vec::new(),
-            need_inwit: false,
+            need_seqsigwit: false,
             inputs: None,
         });
     }
@@ -208,7 +208,7 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
         )?;
         rec.txid = txs[i].rec.txid;
         table.overlay_stamped_n_in(txs[i].fk, &mut rec)?;
-        txs[i].need_inwit = outs.iter().any(|o| is_p2tr(&o.script));
+        txs[i].need_seqsigwit = outs.iter().any(|o| is_p2tr(&o.script));
         wave_outs.insert(txs[i].fk.0, outs.clone());
         txs[i].outs = outs;
         txs[i].rec = rec;
@@ -217,25 +217,25 @@ pub fn load_tweak_wave(table: &TxTable, fks: &[Fk]) -> Result<TweakWave, StoreEr
     let p2tr_i: Vec<usize> = txs
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.need_inwit)
+        .filter(|(_, t)| t.need_seqsigwit)
         .map(|(i, _)| i)
         .collect();
     if !p2tr_i.is_empty() {
-        let inwit_fks: Vec<Fk> = p2tr_i.iter().map(|&i| txs[i].fk).collect();
-        let inwit_ranges = table.inwit_loc.range_batch(&inwit_fks)?;
-        let mut inwit_jobs = jobs_from_ranges(&inwit_ranges, None);
+        let seqsigwit_fks: Vec<Fk> = p2tr_i.iter().map(|&i| txs[i].fk).collect();
+        let seqsigwit_ranges = table.seqsigwit_loc.range_batch(&seqsigwit_fks)?;
+        let mut seqsigwit_jobs = jobs_from_ranges(&seqsigwit_ranges, None);
         run_stage(
-            table.inwit.body_read_fd(),
-            table.inwit.body_file_path(),
-            uring_session::KIND_SP_INWIT,
-            &mut inwit_jobs,
+            table.seqsigwit.body_read_fd(),
+            table.seqsigwit.body_file_path(),
+            uring_session::KIND_SP_SEQSIGWIT,
+            &mut seqsigwit_jobs,
         )?;
         for (j, &ti) in p2tr_i.iter().enumerate() {
-            if inwit_jobs[j].buf.is_empty() {
+            if seqsigwit_jobs[j].buf.is_empty() {
                 continue;
             }
-            let ins = decode_inwit_secret(
-                &inwit_jobs[j].buf,
+            let ins = decode_seqsigwit_secret(
+                &seqsigwit_jobs[j].buf,
                 txs[ti].rec.input_count,
                 Some(&table.secret),
             )?;
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_marks_only_p2tr_need_inwit() {
+    fn filter_marks_only_p2tr_need_seqsigwit() {
         let dir = tmp_dir();
         let t = tiny_table(&dir);
         let p2tr = {
@@ -352,9 +352,12 @@ mod tests {
             .unwrap();
         let wave = load_tweak_wave(&t, &fks).unwrap();
         assert_eq!(wave.txs.len(), 2);
-        assert!(!wave.txs[0].need_inwit, "OP_TRUE must not load inwit");
+        assert!(
+            !wave.txs[0].need_seqsigwit,
+            "OP_TRUE must not load seqsigwit"
+        );
         assert!(wave.txs[0].inputs.is_none());
-        assert!(wave.txs[1].need_inwit, "P2TR must need inwit");
+        assert!(wave.txs[1].need_seqsigwit, "P2TR must need seqsigwit");
         assert_eq!(wave.txs[1].rec.input_count, 1);
         assert_eq!(wave.txs[1].inputs.as_ref().map(Vec::len), Some(1));
         let _ = std::fs::remove_dir_all(&dir);

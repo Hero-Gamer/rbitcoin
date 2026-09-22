@@ -61,7 +61,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 - Best-chain spentness: annotation + `is_confirmed_strong(spender)`. Same-batch pre-fill is not strong until this batch's Class C.
 - Kill-safe: stale/non-strong fields do not false-positive if filter is applied.
 - No `point.head` (v4 open-hash multimap removed).
-- Class A is **three stems** (`txout` / `inwit` / `spent`); bare-meta puts are rejected. Packed `tx.body` with creates is refused on open.
+- Class A is **three stems** (`txout` / `seqsigwit` / `spent`); bare-meta puts are rejected. Packed `tx.body` with creates is refused on open.
 
 ## Thin scripthash (Electrum outpoint pointers)
 

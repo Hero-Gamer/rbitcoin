@@ -62,7 +62,7 @@ pub(crate) fn parse_btc_to_sat(s: &str) -> Result<u64, &'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatadirOpts {
     pub path: PathBuf,
-    /// When set, cold witness artifacts (`inwit.*`, `inwit.window/*`) live under `{cold}/store`.
+    /// When set, cold witness artifacts (`seqsigwit.*`, `seqsigwit.window/*`) live under `{cold}/store`.
     pub cold: Option<PathBuf>,
 }
 
@@ -261,10 +261,10 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Build Class B scripthash index (Electrum/Esplora history). Default **off**.
     pub shindex: bool,
-    /// Drop Class A inwit below a 288-height watermark (`NETWORK_LIMITED`).
-    pub prune_inwit: bool,
+    /// Drop Class A seqsigwit below a 288-height watermark (`NETWORK_LIMITED`).
+    pub prune_seqsigwit: bool,
     /// RAM cap for the prune witness window. `0` keeps nothing in RAM.
-    pub prune_inwit_ram_threshold_bytes: u64,
+    pub prune_seqsigwit_ram_threshold_bytes: u64,
     /// Persist / serve BIP-352 tweaks from `sp_tweaks.*`. Default **off**.
     pub sptweaks: bool,
     /// Electrum tweaks: omit P2TR outs with `value <=` this (sats). `0` serves
@@ -344,8 +344,8 @@ impl Default for NodeConfig {
             head_scale: HeadScale::Mainnet,
             max_run_secs: None,
             shindex: false,
-            prune_inwit: false,
-            prune_inwit_ram_threshold_bytes: 256 * 1024 * 1024,
+            prune_seqsigwit: false,
+            prune_seqsigwit_ram_threshold_bytes: 256 * 1024 * 1024,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: 0,
@@ -896,13 +896,13 @@ impl NodeConfig {
                 self.shindex = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
             }
-            "prune_inwit" => {
-                self.prune_inwit = parse_conf_bool(val)
-                    .map_err(|e| NodeError::Config(format!("conf prune_inwit: {e}")))?;
+            "prune_seqsigwit" => {
+                self.prune_seqsigwit = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf prune_seqsigwit: {e}")))?;
             }
-            "prune_inwit_ram_threshold_bytes" => {
-                self.prune_inwit_ram_threshold_bytes = val.parse().map_err(|e| {
-                    NodeError::Config(format!("conf prune_inwit_ram_threshold_bytes: {e}"))
+            "prune_seqsigwit_ram_threshold_bytes" => {
+                self.prune_seqsigwit_ram_threshold_bytes = val.parse().map_err(|e| {
+                    NodeError::Config(format!("conf prune_seqsigwit_ram_threshold_bytes: {e}"))
                 })?;
             }
             "sp_tweaks" => {

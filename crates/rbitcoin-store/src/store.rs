@@ -12,14 +12,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Sidecar in the hot `{datadir}/store`: `inwit.body` / `inwit.loc` live under
+/// Sidecar in the hot `{datadir}/store`: `seqsigwit.body` / `seqsigwit.loc` live under
 /// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
-pub const INWIT_RELOC_NAME: &str = "inwit.reloc";
+pub const SEQSIGWIT_RELOC_NAME: &str = "seqsigwit.reloc";
 
 /// Where a store’s files live, plus open-time head geometry.
 ///
 /// `dir` is `{datadir}/store`. When `cold_dir` is set and distinct, Class A
-/// `inwit.body` + `inwit.loc` live there (bulk / HDD). Everything else stays
+/// `seqsigwit.body` + `seqsigwit.loc` live there (bulk / HDD). Everything else stays
 /// in `dir`.
 ///
 /// [`Self::single`] / [`Self::with_cold`] are **Mainnet** scale (production).
@@ -107,12 +107,12 @@ impl StoreLayout {
         }
     }
 
-    /// True when inwit is configured on a different directory than the hot store.
+    /// True when seqsigwit is configured on a different directory than the hot store.
     pub fn is_split(&self) -> bool {
         self.cold_dir.as_ref().is_some_and(|c| c != &self.dir)
     }
 
-    pub fn inwit_dir(&self) -> &Path {
+    pub fn seqsigwit_dir(&self) -> &Path {
         self.cold_dir
             .as_deref()
             .filter(|c| *c != self.dir)
@@ -120,44 +120,78 @@ impl StoreLayout {
     }
 }
 
-fn inwit_files_present(dir: &Path) -> bool {
-    dir.join("inwit.body").exists()
-        || dir.join("inwit.loc").exists()
-        || dir.join("inwit.idx").exists()
+pub(crate) fn rename_legacy_inwit_files(dir: &Path) -> Result<(), StoreError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for (old, new) in [
+        ("inwit.body", "seqsigwit.body"),
+        ("inwit.loc", "seqsigwit.loc"),
+        ("inwit.off", "seqsigwit.off"),
+        ("inwit.loc.ovf", "seqsigwit.loc.ovf"),
+        ("inwit.idx", "seqsigwit.idx"),
+        ("inwit.reloc", "seqsigwit.reloc"),
+        ("inwit.prune", "seqsigwit.prune"),
+        ("inwit.window", "seqsigwit.window"),
+    ] {
+        let from = dir.join(old);
+        let to = dir.join(new);
+        if !from.exists() {
+            continue;
+        }
+        if to.exists() {
+            return Err(StoreError::Layout(format!(
+                "{} and {} both exist; keep only {}",
+                from.display(),
+                to.display(),
+                new
+            )));
+        }
+        std::fs::rename(&from, &to).map_err(|e| StoreError::io(&from, e))?;
+    }
+    Ok(())
 }
 
-fn inwit_reloc_path(hot: &Path) -> PathBuf {
-    hot.join(INWIT_RELOC_NAME)
+fn seqsigwit_files_present(dir: &Path) -> bool {
+    dir.join("seqsigwit.body").exists()
+        || dir.join("seqsigwit.loc").exists()
+        || dir.join("seqsigwit.idx").exists()
 }
 
-/// Decide the inwit VarTable directory. Split stores refuse leftovers in hot
+fn seqsigwit_reloc_path(hot: &Path) -> PathBuf {
+    hot.join(SEQSIGWIT_RELOC_NAME)
+}
+
+/// Decide the seqsigwit VarTable directory. Split stores refuse leftovers in hot
 /// and dual copies; a reloc marker without `--datadir-cold` is a layout error
 /// (not `Corrupt`).
-fn resolve_inwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
+fn resolve_seqsigwit_dir(layout: &StoreLayout) -> Result<PathBuf, StoreError> {
+    rename_legacy_inwit_files(&layout.dir)?;
     if !layout.is_split() {
-        if inwit_reloc_path(&layout.dir).exists() {
+        if seqsigwit_reloc_path(&layout.dir).exists() {
             return Err(StoreError::Layout(format!(
-                "inwit is on a cold datadir ({INWIT_RELOC_NAME} present); pass --datadir-cold"
+                "seqsigwit is on a cold datadir ({SEQSIGWIT_RELOC_NAME} present); pass --datadir-cold"
             )));
         }
         return Ok(layout.dir.clone());
     }
-    let cold = layout.inwit_dir();
+    let cold = layout.seqsigwit_dir();
+    rename_legacy_inwit_files(cold)?;
     if !cold.exists() {
         std::fs::create_dir_all(cold).map_err(|e| StoreError::io(cold, e))?;
     } else if !cold.is_dir() {
         return Err(StoreError::NotDirectory(cold.to_path_buf()));
     }
-    let hot_has = inwit_files_present(&layout.dir);
-    let cold_has = inwit_files_present(cold);
+    let hot_has = seqsigwit_files_present(&layout.dir);
+    let cold_has = seqsigwit_files_present(cold);
     match (hot_has, cold_has) {
         (true, true) => Err(StoreError::Layout(format!(
-            "inwit.body exists in both {} and {}; keep it only under the cold store",
+            "seqsigwit.body exists in both {} and {}; keep it only under the cold store",
             layout.dir.display(),
             cold.display()
         ))),
         (true, false) => Err(StoreError::Layout(format!(
-            "inwit is still in {}; move inwit.body and inwit.loc to {} \
+            "seqsigwit is still in {}; move seqsigwit.body and seqsigwit.loc to {} \
              (copy+remove if cross-device)",
             layout.dir.display(),
             cold.display()
@@ -188,18 +222,18 @@ fn dir_file_bytes(root: &Path) -> u64 {
     n
 }
 
-fn write_inwit_reloc(hot: &Path) -> Result<(), StoreError> {
-    let p = inwit_reloc_path(hot);
+fn write_seqsigwit_reloc(hot: &Path) -> Result<(), StoreError> {
+    let p = seqsigwit_reloc_path(hot);
     if p.exists() {
         return Ok(());
     }
-    std::fs::write(&p, b"inwit\n").map_err(|e| StoreError::io(&p, e))
+    std::fs::write(&p, b"seqsigwit\n").map_err(|e| StoreError::io(&p, e))
 }
 
 /// Top-level store handle for a datadir `store/` directory.
 pub struct Store {
     path: PathBuf,
-    /// `{datadir-cold}/store` when inwit is split; `None` = inwit in [`Self::path`].
+    /// `{datadir-cold}/store` when seqsigwit is split; `None` = seqsigwit in [`Self::path`].
     cold_path: Option<PathBuf>,
     head_scale: HeadScale,
     pub headers: HeaderTable,
@@ -286,13 +320,13 @@ impl Store {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
         write_meta(&path)?;
-        let inwit_dir = resolve_inwit_dir(&layout)?;
+        let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
         let opts = layout.open_opts();
-        let txs = TxTable::create_with_head_layout_inwit(&path, &inwit_dir, head, opts)?;
+        let txs = TxTable::create_with_head_layout_seqsigwit(&path, &seqsigwit_dir, head, opts)?;
         if layout.is_split() {
-            write_inwit_reloc(&path)?;
+            write_seqsigwit_reloc(&path)?;
         }
-        let cold_path = layout.is_split().then_some(inwit_dir);
+        let cold_path = layout.is_split().then_some(seqsigwit_dir);
         Ok(Self {
             headers: HeaderTable::create_with_scale(&path, layout.head_scale)?,
             txs,
@@ -348,12 +382,12 @@ impl Store {
         drop_leftover_tx_height(&path);
         crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
         open_layout_rewrite_current(&path, meta_ver)?;
-        let inwit_dir = resolve_inwit_dir(&layout)?;
-        let txs = TxTable::open_inwit(&path, &inwit_dir, layout.open_opts())?;
+        let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
+        let txs = TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts())?;
         if layout.is_split() {
-            write_inwit_reloc(&path)?;
+            write_seqsigwit_reloc(&path)?;
         }
-        let cold_path = layout.is_split().then_some(inwit_dir);
+        let cold_path = layout.is_split().then_some(seqsigwit_dir);
         let store = Self {
             headers: HeaderTable::open_with_scale(&path, layout.head_scale)?,
             txs,
@@ -402,13 +436,13 @@ impl Store {
         &self.path
     }
 
-    /// Cold store directory when inwit is split (`{datadir-cold}/store`).
+    /// Cold store directory when seqsigwit is split (`{datadir-cold}/store`).
     pub fn cold_path(&self) -> Option<&Path> {
         self.cold_path.as_deref()
     }
 
     /// Sum of regular file lengths under the hot store and, when split, the
-    /// cold inwit directory. Used by `getblockchaininfo.size_on_disk`.
+    /// cold seqsigwit directory. Used by `getblockchaininfo.size_on_disk`.
     pub fn datadir_bytes(&self) -> u64 {
         let mut n = dir_file_bytes(&self.path);
         if let Some(cold) = &self.cold_path {
@@ -632,7 +666,7 @@ impl Store {
         Vec::new()
     }
 
-    /// Full Class A body by fk: zip `txout` + `inwit`.
+    /// Full Class A body by fk: zip `txout` + `seqsigwit`.
     pub fn get_tx_full(
         &self,
         fk: Fk,
@@ -644,7 +678,7 @@ impl Store {
         self.txs.get_full(fk)
     }
 
-    /// Contiguous `first..=last` Class A bodies: one txout span + one inwit span.
+    /// Contiguous `first..=last` Class A bodies: one txout span + one seqsigwit span.
     pub fn get_tx_full_span(
         &self,
         first: u64,
@@ -711,10 +745,7 @@ impl Store {
     }
 
     /// Parent edges in vin order, or `None` when `inputs.loc` is unstamped.
-    pub fn input_edges(
-        &self,
-        fk: Fk,
-    ) -> Result<Option<Vec<crate::inputs::InputEdge>>, StoreError> {
+    pub fn input_edges(&self, fk: Fk) -> Result<Option<Vec<crate::inputs::InputEdge>>, StoreError> {
         self.txs.inputs.edges(fk)
     }
 
@@ -766,21 +797,21 @@ impl Store {
         self.txs.spent_range(fk)
     }
 
-    /// Absolute `inwit.body` `(offset, len)` for `fk`.
-    pub fn tx_inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        self.txs.inwit_range(fk)
+    /// Absolute `seqsigwit.body` `(offset, len)` for `fk`.
+    pub fn tx_seqsigwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.txs.seqsigwit_range(fk)
     }
 
-    pub fn prune_inwit_mode(&self) -> bool {
-        self.txs.prune_inwit_mode()
+    pub fn prune_seqsigwit_mode(&self) -> bool {
+        self.txs.prune_seqsigwit_mode()
     }
 
-    pub fn set_prune_inwit_mode(&self, on: bool) {
-        self.txs.set_prune_inwit_mode(on);
+    pub fn set_prune_seqsigwit_mode(&self, on: bool) {
+        self.txs.set_prune_seqsigwit_mode(on);
     }
 
-    pub fn clear_durable_inwit(&self) -> Result<(), StoreError> {
-        self.txs.clear_durable_inwit()
+    pub fn clear_durable_seqsigwit(&self) -> Result<(), StoreError> {
+        self.txs.clear_durable_seqsigwit()
     }
 
     /// Append packed full-tx Class A rows (preferred archive path).
@@ -1071,13 +1102,13 @@ impl Store {
         crate::run_idx_body_pipeline(&self.txs.body, jobs, mode).map(|_| ())
     }
 
-    pub fn idx_inwit_pipeline(
+    pub fn idx_seqsigwit_pipeline(
         &self,
         jobs: &mut [crate::IdxBodyJob],
         mode: crate::IdxBodyMode,
     ) -> Result<(), StoreError> {
-        self.txs.fill_inwit_job_ranges(jobs)?;
-        crate::run_idx_body_pipeline(&self.txs.inwit, jobs, mode).map(|_| ())
+        self.txs.fill_seqsigwit_job_ranges(jobs)?;
+        crate::run_idx_body_pipeline(&self.txs.seqsigwit, jobs, mode).map(|_| ())
     }
 
     /// Bulk 8-byte spender meta at absolute `spent.body` offsets.
@@ -2591,7 +2622,7 @@ mod tests {
         std::fs::write(dir.join("spent.off"), b"leftover").unwrap();
         std::fs::create_dir_all(dir.join("txout.idx")).unwrap();
         std::fs::create_dir_all(dir.join("spent.idx")).unwrap();
-        std::fs::create_dir_all(dir.join("inwit.idx")).unwrap();
+        std::fs::create_dir_all(dir.join("seqsigwit.idx")).unwrap();
         let s = Store::open_tiny(&dir).unwrap();
         drop(s);
         assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
@@ -2602,9 +2633,9 @@ mod tests {
         );
         assert!(!dir.join("txout.idx").exists());
         assert!(!dir.join("spent.idx").exists());
-        assert!(!dir.join("inwit.idx").exists());
+        assert!(!dir.join("seqsigwit.idx").exists());
         assert!(dir.join("create.loc").is_file());
-        assert!(dir.join("inwit.loc").is_file());
+        assert!(dir.join("seqsigwit.loc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2653,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn put_full_and_inwit_prevouts_at() {
+    fn put_full_and_seqsigwit_prevouts_at() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
         let item = (
@@ -2673,7 +2704,7 @@ mod tests {
         let (m, prevs) = s.get_tx_meta_and_prevouts(fk).unwrap();
         assert_eq!(m.input_count, 1);
         assert_eq!(prevs.len(), 1);
-        assert!(s.tx_inwit_range(fk).unwrap().1 > 0);
+        assert!(s.tx_seqsigwit_range(fk).unwrap().1 > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4089,7 +4120,20 @@ mod tests {
     }
 
     #[test]
-    fn split_create_puts_inwit_only_on_cold() {
+    fn open_renames_legacy_inwit_stem() {
+        let dir = tmp();
+        Store::create_tiny(&dir).unwrap();
+        std::fs::rename(dir.join("seqsigwit.body"), dir.join("inwit.body")).unwrap();
+        std::fs::rename(dir.join("seqsigwit.loc"), dir.join("inwit.loc")).unwrap();
+        Store::open_tiny(&dir).unwrap();
+        assert!(dir.join("seqsigwit.body").is_file());
+        assert!(dir.join("seqsigwit.loc").is_file());
+        assert!(!dir.join("inwit.body").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_create_puts_seqsigwit_only_on_cold() {
         let root = tmp();
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -4098,11 +4142,16 @@ mod tests {
         assert_eq!(s.cold_path(), Some(cold.as_path()));
         assert!(hot.join("txout.body").is_file());
         assert!(hot.join("spent.body").is_file());
-        assert!(!hot.join("inwit.body").exists());
-        assert!(!hot.join("inwit.loc").exists());
-        assert!(cold.join("inwit.body").is_file());
-        assert!(cold.join("inwit.loc").is_file());
-        assert!(hot.join(INWIT_RELOC_NAME).is_file());
+        assert!(!hot.join("seqsigwit.body").exists());
+        assert!(!hot.join("seqsigwit.loc").exists());
+        assert!(cold.join("seqsigwit.body").is_file());
+        assert!(cold.join("seqsigwit.loc").is_file());
+        assert!(!hot.join("txstat.body").exists());
+        assert!(!hot.join("inputs.loc").exists());
+        assert!(cold.join("txstat.body").is_file());
+        assert!(cold.join("inputs.loc").is_file());
+        assert!(cold.join("inputs.body").is_file());
+        assert!(hot.join(SEQSIGWIT_RELOC_NAME).is_file());
         drop(s);
         let s = Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
         assert_eq!(s.cold_path(), Some(cold.as_path()));
@@ -4120,44 +4169,44 @@ mod tests {
         let cold = root.join("cold");
         Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
         match Store::open_tiny(&hot) {
-            Ok(_) => panic!("must refuse when inwit.reloc is present"),
+            Ok(_) => panic!("must refuse when seqsigwit.reloc is present"),
             Err(err) => {
                 let msg = err.to_string();
                 assert!(msg.contains("datadir-cold"), "{msg}");
-                assert!(msg.contains(INWIT_RELOC_NAME), "{msg}");
+                assert!(msg.contains(SEQSIGWIT_RELOC_NAME), "{msg}");
             }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn split_refuses_inwit_left_in_hot() {
+    fn split_refuses_seqsigwit_left_in_hot() {
         let root = tmp();
         let hot = root.join("hot");
         let cold = root.join("cold");
         Store::create_tiny(&hot).unwrap();
         std::fs::create_dir_all(&cold).unwrap();
         match Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)) {
-            Ok(_) => panic!("must refuse leftover inwit in hot"),
+            Ok(_) => panic!("must refuse leftover seqsigwit in hot"),
             Err(err) => {
                 let msg = err.to_string();
-                assert!(msg.contains("move inwit.body"), "{msg}");
-                assert!(msg.contains("inwit.loc"), "{msg}");
+                assert!(msg.contains("move seqsigwit.body"), "{msg}");
+                assert!(msg.contains("seqsigwit.loc"), "{msg}");
             }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn split_refuses_inwit_in_both_dirs() {
+    fn split_refuses_seqsigwit_in_both_dirs() {
         let root = tmp();
         let hot = root.join("hot");
         let cold = root.join("cold");
         Store::create_tiny(&hot).unwrap();
         std::fs::create_dir_all(&cold).unwrap();
-        std::fs::copy(hot.join("inwit.body"), cold.join("inwit.body")).unwrap();
+        std::fs::copy(hot.join("seqsigwit.body"), cold.join("seqsigwit.body")).unwrap();
         match Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)) {
-            Ok(_) => panic!("must refuse dual inwit copies"),
+            Ok(_) => panic!("must refuse dual seqsigwit copies"),
             Err(err) => {
                 let msg = err.to_string();
                 assert!(msg.contains("both"), "{msg}");
@@ -4167,7 +4216,7 @@ mod tests {
     }
 
     #[test]
-    fn split_roundtrip_create_fk_and_inwit_range() {
+    fn split_roundtrip_create_fk_and_seqsigwit_range() {
         let root = tmp();
         let hot = root.join("hot");
         let cold = root.join("cold");
@@ -4178,15 +4227,15 @@ mod tests {
             .put_full_batch_indexed(std::slice::from_ref(&item), true)
             .unwrap();
         assert_eq!(fks.len(), 1);
-        let range = s.tx_inwit_range(fks[0]).unwrap();
+        let range = s.tx_seqsigwit_range(fks[0]).unwrap();
         assert!(range.1 > 0);
         s.flush().unwrap();
         drop(s);
         let s = Store::open_or_create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
         assert_eq!(s.txs.count(), 1);
-        let range = s.tx_inwit_range(fks[0]).unwrap();
+        let range = s.tx_seqsigwit_range(fks[0]).unwrap();
         assert!(range.1 > 0);
-        assert!(!hot.join("inwit.body").exists());
+        assert!(!hot.join("seqsigwit.body").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

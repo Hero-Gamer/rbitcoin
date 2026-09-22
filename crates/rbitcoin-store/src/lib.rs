@@ -97,11 +97,11 @@ pub use store::{keep_unspent_vout_subsequence, Store, StoreLayout};
 pub use store_secret::StoreSecret;
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{
-    decode_inwit_secret, decode_packed_tx_outs_with_spender_rels,
-    decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    encode_inwit_with_secret, encode_packed_tx, encode_packed_tx_with_secret,
-    encode_txout_meta_and_outs, encode_unspent_output_into_secret, spend_meta_backend, spent_abs,
-    InputRecord, OutputRecord, PackedCreate, TxRecord,
+    decode_packed_tx_outs_with_spender_rels, decode_packed_tx_outs_with_spender_rels_secret,
+    decode_packed_tx_with_spender_rels_secret, decode_seqsigwit_secret, encode_packed_tx,
+    encode_packed_tx_with_secret, encode_seqsigwit_with_secret, encode_txout_meta_and_outs,
+    encode_unspent_output_into_secret, spend_meta_backend, spent_abs, InputRecord, OutputRecord,
+    PackedCreate, TxRecord,
 };
 pub use txstat::TxStatRow;
 pub(crate) use uring_session::IoCtx;

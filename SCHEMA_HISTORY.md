@@ -16,14 +16,14 @@ Versions below are listed **newest → oldest** after the summary table.
 | **25** | `txstat.body` 8 B/create ULEB + per-header overflow. Occupied 24 zero-extends; no `txout` rewrite. | **Current** |
 | **24** | `header.body` 96 B (`size`/`weight` u32). Occupied 23 rewrites 88 B rows. Extent last-page reserved = create count. | Prior |
 | **23** | `create.loc.ovf` 16 B (u32 strides / `n_out`). Occupied 22 rewrites 12 B ovf. Occupied 15–21 Class A refused. | Prior |
-| **22** | `create.loc` + `inwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | Prior |
+| **22** | `create.loc` + `seqsigwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | Prior |
 | **21** | Drop `spent.idx`. Spent ranges are `8 × max(n_out,1)` from txout meta; sparse `spent.off`. Unlink leftover idx; rewrite `meta` 20→21. Table headers 13–20 remain openable. | Prior |
 | **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). Refuse occupied 18/19 `tx.head` / `scripthash*`. Leftover fuse8 v1, flat `*.idx.meta`, Shared SH body, pack8 Paged (mode 10) refuse. | Prior |
 | **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
 | **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | Prior |
 | **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
 | **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
-| **15** | Class A `txout`/`inwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
+| **15** | Class A `txout`/`seqsigwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
 | **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
 | **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
@@ -69,14 +69,14 @@ A consensus-valid ~1 MiB OP_RETURN (mainnet 896696) is ~125k strides; a 1 MB
 stripped tx of min-size outputs can exceed 65535 outs. Slot sentinels stay
 2 B (`0` at ≥256). Occupied 22 rewrites 12 B ovf via tmp+rename and `meta` to
 23. Occupied 15–21 Class A still refuses. Spent vin stays u16 (8 B slot;
-stripped input ≥ ~41 B). `inwit.loc.ovf` was already u32 strides. A 22 binary
+stripped input ≥ ~41 B). `seqsigwit.loc.ovf` was already u32 strides. A 22 binary
 refuses 23 `meta`. Table file headers 13–22 remain openable.
 
-## v22 (create.loc + inwit.loc + vin pack + amount exp)
+## v22 (create.loc + seqsigwit.loc + vin pack + amount exp)
 
 `create.loc` (2 B/create: txout strides + `n_out`) plus RAM `create.off`
-checkpoints replace `txout.idx` and `spent.idx`. `inwit.loc` (u16 strides)
-on the cold volume replaces `inwit.idx`. `VarTable` is body-only. LAYOUT17
+checkpoints replace `txout.idx` and `spent.idx`. `seqsigwit.loc` (u16 strides)
+on the cold volume replaces `seqsigwit.idx`. `VarTable` is body-only. LAYOUT17
 meta is flags + version/locktime + uleb `input_count` only; decode takes
 `n_out` from loc (`n_out ≥ 1`). Spent length is `8 × n_out` (no zero-out pad).
 Spent slot is still 8 bytes: flags + u40 spend fk + u16 vin. `spent.ovf`
@@ -94,7 +94,7 @@ Occupied 15–21 LAYOUT17 Class A with creates refuses
 because the old flags+u56-fk layout has no vin, LAYOUT17 still had
 `output_count`, locators are not idx, and reserved amount bits were 0.
 Empty 15–21 rewrite `store/meta` to 22 and unlink leftover `spent.off` plus
-leftover `{txout,spent,inwit}.idx`. A 21 binary refuses 22 `meta`. Table file
+leftover `{txout,spent,seqsigwit}.idx`. A 21 binary refuses 22 `meta`. Table file
 headers 13–21 remain openable when Class A is empty.
 
 ## v21 (drop spent.idx)
@@ -144,9 +144,9 @@ Closed layout. SH run catalogs are unique `(scripthash, create_fk)` at
 Hot Class A: thin LAYOUT17 `txout` meta, script kinds **0–9** (unknown
 kind is Corrupt). At schema 17, a new consensus script was **RAW** (no bump)
 or a kind-nibble bump the then-current binary would refuse — not a 17
-datadir wipe. 8 B spent slots, `spent.ovf` overflow. Inwit flags bits 4–7
-and spent flags other than `MULTI_SPENDER` are Corrupt. Inwit prevout is
-still `create_fk:u64` + CompactSize vout (Δfk was parked as an inwit-only
+datadir wipe. 8 B spent slots, `spent.ovf` overflow. SeqSigWit flags bits 4–7
+and spent flags other than `MULTI_SPENDER` are Corrupt. SeqSigWit prevout is
+still `create_fk:u64` + CompactSize vout (Δfk was parked as an seqsigwit-only
 or later-version follow-up). Writer/RAM on 17 (not on-disk): idx stems roll
 independently; `strong_tx` always L2; no `RWF_DONTCACHE`. See
 [`SCHEMA.md`](SCHEMA.md) (Schema 17 freeze). The live bump rule is that
@@ -191,7 +191,7 @@ sealed sorted heads with idx (main has no fuse8; sealed ovf keeps fuse8),
 one global ingest OA. Empty 13/14 SH
 upgrades `meta` silently; a materialized page-era index is refused
 (wipe `store/scripthash*` and rematerialize). Class A is split:
-`txout` + `inwit` + `spent` (refuse packed `tx.body` with creates).
+`txout` + `seqsigwit` + `spent` (refuse packed `tx.body` with creates).
 
 ## v14
 

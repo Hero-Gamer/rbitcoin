@@ -1843,7 +1843,7 @@ fn getblock_verbosity_1_txids_skip_reconstruct() {
     let v1 = dispatch(&ctx, "getblock", vec![first.clone(), json!(1)]).unwrap();
     assert!(
         ctx.query.store().tx_full_gets().is_empty(),
-        "verbosity 1 must not zip inwit: {:?}",
+        "verbosity 1 must not zip seqsigwit: {:?}",
         ctx.query.store().tx_full_gets()
     );
     let txs = v1["tx"].as_array().unwrap();
@@ -1983,7 +1983,7 @@ fn miniwallet_raw_scan_and_gettxout() {
     let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
     assert!(
         ctx.query.store().tx_full_gets().is_empty(),
-        "scantxoutset shindex must not zip inwit: {:?}",
+        "scantxoutset shindex must not zip seqsigwit: {:?}",
         ctx.query.store().tx_full_gets()
     );
     assert_eq!(scan["success"], true);

@@ -41,9 +41,9 @@ header plan after lookup planned it, stamped `create_fk`, etc.).
 ```
 wire / body-queue
   → lookup (stamp create_fk + parent txout/spent ranges + parent txid;
-            IO: tx.head, create.loc, txid.body — NEVER outs/inwit decode)
+            IO: tx.head, create.loc, txid.body — NEVER outs/seqsigwit decode)
   → load / pin (BatchParents outs by known txout range only;
-            IO: txout.body — NEVER head / loc / txid.body / inwit)
+            IO: txout.body — NEVER head / loc / txid.body / seqsigwit)
   → scripts (pure CPU — NEVER any store IO)
   → Class A commit (if ArchiveWritePlan present; encode plan packed ins filled at stamp)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
@@ -70,8 +70,8 @@ the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 
 | Stage | Allowed IO | Forbidden |
 |-------|------------|-----------|
-| **lookup** | `tx.head`, `create.loc` (fk + body+spent ranges + `n_out`), `txid.body`, headers | **`txout.body`** (outs or spent-range peeks) / **`inwit` decode** |
-| **load** | **`txout.body` outs by range** (from lookup stamp) | head, loc, `txid.body`, `inwit` |
+| **lookup** | `tx.head`, `create.loc` (fk + body+spent ranges + `n_out`), `txid.body`, headers | **`txout.body`** (outs or spent-range peeks) / **`seqsigwit` decode** |
+| **load** | **`txout.body` outs by range** (from lookup stamp) | head, loc, `txid.body`, `seqsigwit` |
 | **scripts** | none | any store IO |
 
 | Stage | Invariant | Soft path allowed? |
@@ -79,7 +79,7 @@ the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 | Lookup parent stamp | Every external spent parent has create_fk + body_range (or offline in_flight CreatePin) + reverse txid. Archived parents also have computed `spent.body` range on the stamp (same-wave in-flight outs skip loc, miss OK; later-wave InFlight takes loc from the same `CreatePin` Arc write set at Class A, or skeleton TipOnly loc). IBD (`skeleton = Some`) never loc-by-fk: pin loc unset leaves spent unset for write TLS. plan=None leftover still `fill_missing_parent_ranges` | Missing → hard Err at stamp / pin contract. **No** `finish_archive_plan` `fill_missing` after stamp loc. **No** IBD load `create.loc` |
 | Parent create_fk | **same-batch** planned fks (offline at pin) → **in-flight** (lookup snapshots `drain_and_fence_hi` **before** the wave's TipOnly read and passes it on the last load batch; load drops tagged map rows with pack height **below** that snapshot after that batch's in-flight read; equality keeps; not Class C tip, not `class_a_hi`, not write freeze; one load-thread HashMap, insert after stamp) → **skeleton** (`BatchParentIds` on the `LoadBatch`: lookup TipOnly fk + body_range + spent_range + per-chunk need-vouts) → **Corrupt** on IBD miss. plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly. One helper: [`stamp_external_parents`](../crates/rbitcoin-query/src/stamp.rs). No leftover pending map, no process pin FIFO, no BQ-side hits map, no parent-store create_fk on stamp, no published live_union. Same-wave creates are omitted from TipOnly need. Header-cache GC polls store tip each load pack. One fk per txid — [`errata.md`](./errata.md). | Miss of in-flight and skeleton → `Corrupt("parent create_fk unresolved")` (**engine fault**: requeue once, then halt IBD; never blacklist). Identity without loc range → `Corrupt("invariant: loc range missing after identity")`, not a miss |
 | io_uring harvest | TLS session fail-closed ([`io-modality.md`](./io-modality.md)) | **No** silent success. `Corrupt("invariant: io_uring …")` (not `bdz g page bad slot`). Ring-unavailable still pread-fallback |
-| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO). Later-wave InFlight loc comes from the CreatePin Arc (Class A `set_loc`) | **No** loc cold outs on load; **no** `inwit` on pin; **no** IBD loc-by-fk |
+| Load body outs | By `txout` range only from lookup stamp; incomplete outs → hard Err. Pin **copies** lookup `spent_range` (no loc IO). Later-wave InFlight loc comes from the CreatePin Arc (Class A `set_loc`) | **No** loc cold outs on load; **no** `seqsigwit` on pin; **no** IBD loc-by-fk |
 | Ensure (write) | Every non-null spend edge has `spent_range` abs after ensure returns. Lookup stamped archived parents; same-batch from append RAM loc; just-written from write-thread loc packs kept until write of the last height whose TipOnly had started at note (`lookup_started_hi`; `keep_until` never bumped; fill of that write already ran). Later-wave InFlight takes CreatePin loc set at Class A. Missing abs → `invariant:` | **No** write `create.loc` read |
 | Structural spentness | Abs required for every non-null spend create_fk after load; multi-list → confirmed-strong walk (reorg protocol) | **No** unpinned “wire-corrected create_fk” soft spentness. Multi flag alone is **not** hard `Err` |
 | Pin create identity | Pin must carry non-zero create txid from **lookup stamp** (plan reverse map / wire prev_txid / `txid.body`) | Soft zero-identity pin → assemble mismatch → cold recovery is **forbidden** |

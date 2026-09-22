@@ -31,7 +31,7 @@ pub enum StoreError {
     Stale(&'static str),
     /// Request refused (DoS cap) — not on-disk corruption.
     Rejected(&'static str),
-    /// Class A inwit dropped at/below the prune watermark. Not corruption.
+    /// Class A seqsigwit dropped at/below the prune watermark. Not corruption.
     Pruned {
         height: u32,
     },
@@ -134,7 +134,7 @@ mod tests {
             StoreError::BudgetFull("block_queue"),
             StoreError::Cancelled("stop"),
             StoreError::Unavailable,
-            StoreError::Layout("inwit is on a cold datadir".into()),
+            StoreError::Layout("seqsigwit is on a cold datadir".into()),
             StoreError::Stale("chain view moved"),
             StoreError::Rejected("scripthash join exceeds --max-sh-creates"),
             StoreError::Pruned { height: 12 },
@@ -151,7 +151,7 @@ mod tests {
         assert!(texts[7].contains("budget full: block_queue"));
         assert!(texts[8].contains("cancelled: stop"));
         assert_eq!(texts[9], "io_uring unavailable");
-        assert_eq!(texts[10], "inwit is on a cold datadir");
+        assert_eq!(texts[10], "seqsigwit is on a cold datadir");
         assert_eq!(texts[11], "chain view moved");
         assert_eq!(texts[12], "scripthash join exceeds --max-sh-creates");
         assert_eq!(texts[13], "pruned data at height 12");

@@ -28,7 +28,7 @@ Related: [`env-knobs.md`](./env-knobs.md), [`concurrency.md`](./concurrency.md),
 
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
-| **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pool` \| `iocp` \| `pread` | Multi-op **completion session** on file handles (`txout` pin/outs, `inwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
+| **Bulk batch** | `RBITCOIN_IO` only | `uring` \| `pool` \| `iocp` \| `pread` | Multi-op **completion session** on file handles (`txout` pin/outs, `seqsigwit` reconstruct, spend meta/ann on `spent`, Class C bulk) |
 | **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps. Sealed `.fuse8` and SH BDZ3 occ are sidecar maps, not TableFile |
 
 **`RBITCOIN_IO` selects the completion-session backend** (not per-path).
@@ -123,7 +123,7 @@ If a change seems to require collapsing a machine, **stop and ask**.
 | **L1** | 4 KiB head pages / 3–4 KiB SH chunks (working-set caches) | Write-back dirty page/chunk with one pwrite |
 | **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full `Vec` in process | **Write-behind:** RAM mutate during commit; complete-or-fail body image on `flush_class_c_tip` **before** body-queue dequeue |
 
-**Never L2:** `txout` / `inwit` / `spent`, full `tx.head` / `*.idx`.
+**Never L2:** `txout` / `seqsigwit` / `spent`, full `tx.head` / `*.idx`.
 `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) caps **`confirmed`** and
 **`header_txs_*` only**. `strong_tx` stays L2 (1 bit/fk). Create height is a
 RAM fence (~15 MiB at 1M blocks), not a file.
@@ -136,7 +136,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 
 | Path | Env | Syscalls |
 |------|-----|----------|
-| Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `inwit`) |
+| Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `seqsigwit`) |
 | Head-resolve identity | `RBITCOIN_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
 | Spend-meta 8 B peeks | `RBITCOIN_IO` | uring/pread on **`spent.body` FD** |
 | Spend pure-write annotate | `RBITCOIN_IO` | uring/pwrite or pwrite on **`spent.body` FD** |
@@ -144,7 +144,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx) |
 | SH unsorted collect (Class A) | libc `pread` | **Two** sequential coalesced **16 MiB** `txout.body` scans (`sh_extract_workers`): static create-fk spans (no steal); per-worker identity maps spill-largest as `SHKSP01` under `keys/NN/` (one spill writer, 1-slot queue; tmp+rename, no `sync_all`; first-fk delta singles); merge folds those files into one map, one walk to `scripthash.head/NN` + `multi/NN.fuse8`; leftover keys shapes refuse. Then fuse-hit `SHPST01` post spills under `post/NN/` (`80n+8f` estimate, same 1.5 GiB worker cap and 1-slot writer; tmp+rename, no `sync_all`). Not TLS uring: one large positional read per span, not a completion machine. Writes are libc `pwrite` / tmp+rename. Pass 2 does not Fd-index the main MPHF; pack folds one shard's spills then `slot_for_key16` once per unique multi key. Packed 2-bit `g` is ~8 MiB per pack worker, not a 12 GiB `.val` page-cache set. |
 | SH Electrum/Esplora join | `RBITCOIN_IO` | Query-thread session: waved `idx_body_pipeline` on **`txout.body`**, optional page-grouped **`txid.body`** (history: creates+spenders; listunspent: unspent creates; balance/`/address` stats: none), `get_spender_meta_at_abs_batch` on **`spent.body`**. Megakey **extent**: one span pread of `extent_n` pages, then linked 4 KiB tail. Schema-18 mode 10 leftovers **refuse** on open. Does **not** share a confirm TLS ring. |
-| SP-tweak backfill | `RBITCOIN_IO` | idx ranges **before** TLS ring; uring/pread `txout.body`, then `inwit` + parent `txout` for P2TR only. Writes are **not** the load ring: batched `sp_tweaks` body+idx pwrite (not per-tx CQEs). |
+| SP-tweak backfill | `RBITCOIN_IO` | idx ranges **before** TLS ring; uring/pread `txout.body`, then `seqsigwit` + parent `txout` for P2TR only. Writes are **not** the load ring: batched `sp_tweaks` body+idx pwrite (not per-tx CQEs). |
 
 Default: Linux uring if the ring opens else pool; Darwin pool; Windows
 IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
@@ -154,9 +154,9 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | Object | Tier | Notes |
 |--------|------|--------|
 | **`txout.body`** | L0 | Hot outs (pin / SH / Electrum tweaks); pread/pwrite/uring |
-| **`inwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
+| **`seqsigwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender; annotate RMW |
-| **`create.loc` / `inwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
+| **`create.loc` / `seqsigwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
 | **`tx.head` segments** | L0+L1 | Open OA: 4 KiB page-coalesced RMW. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
@@ -172,7 +172,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 |------|------------|---------------------|
 | Pin outs | FdOnly `create.loc` ranges (batched window preads; sum/read only through max fk in-window) | uring/pread `txout` bytes (starting OS page; full span if need is likely to spill) |
 | Head resolve stream | FdOnly **page-batched** head probe on the held session; **one** FdOnly loc batch after identity (standalone bulk, not on the probe ring) | uring/pread `txid.body` identity |
-| IBD **getdata serve** reconstruct | FdOnly `create.loc` / `inwit.loc` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `inwit.body` in parallel (not confirm `idx_body_pipeline`) |
+| IBD **getdata serve** reconstruct | FdOnly `create.loc` / `seqsigwit.loc` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `seqsigwit.body` in parallel (not confirm `idx_body_pipeline`) |
 
 ---
 

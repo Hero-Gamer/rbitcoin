@@ -3828,8 +3828,8 @@ mod tests {
             hashes.push(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
-        q.set_prune_inwit(true).unwrap();
-        q.apply_prune_inwit_tip().unwrap();
+        q.set_prune_seqsigwit(true).unwrap();
+        q.apply_prune_seqsigwit_tip().unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
         let handle = run_esplora(cfg, Arc::clone(&q), None, None)

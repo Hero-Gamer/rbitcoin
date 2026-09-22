@@ -69,7 +69,7 @@ for unknown-height bodies (mark missing → re-getdata).
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
 | Primary store | **Map-free** Class A/B/C tables (fd pread/pwrite + heads; page cache L0) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
-| Historical block serve | **Reconstruct** from `txout`+`inwit`; tip uses body queue + peer wire | Serve raw blk files / undo |
+| Historical block serve | **Reconstruct** from `txout`+`seqsigwit`; tip uses body queue + peer wire | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
 | Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |
 | Transport | **BIP324 v2 only** | v1 + v2 |
@@ -106,7 +106,7 @@ commit: [`docs/crash-recovery.md`](./crash-recovery.md).
 
 | Class | Role | Mutation style |
 |-------|------|----------------|
-| **A** | Canonical archive: headers, split txs (`txout` / `inwit` / `spent` + `txid.body` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
+| **A** | Canonical archive: headers, split txs (`txout` / `seqsigwit` / `spent` + `txid.body` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
 | **B** | Forever-open indexes (e.g. Electrum scripthash) | Append + head updates; may grow forever per key |
 | **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, height fence | Tip advance is the **commit**; may lead/lag slightly across crash |
 
@@ -117,7 +117,7 @@ a LevelDB bag.
 
 ### Reconstruct (no live wire ring)
 
-- **Historical blocks** are rebuilt from Class A (zip `txout` + `inwit`) rather
+- **Historical blocks** are rebuilt from Class A (zip `txout` + `seqsigwit`) rather
   than kept forever as raw wire `blk` files.
 - Tip serve / reorg uses the **in-RAM body queue** and **peer wire**.
   There is no on-disk tip wire ring (`rbitcoin-wire-cache` is gone).

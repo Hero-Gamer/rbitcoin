@@ -133,7 +133,7 @@ Replace the hostname and email, then apply authentication and network policy to
 RPC for your deployment. nginx `virtualHosts` proxy HTTP; `streamConfig`
 proxies the Electrum TCP protocol.
 
-Use `coldDataDir` to place the large `inwit` store on another volume. The
+Use `coldDataDir` to place the large `seqsigwit` store on another volume. The
 service creates the directory but does not mount or size the volume. Use
 `environment` for documented advanced `RBITCOIN_*` settings and `extraArgs`
 for daemon flags not represented by module options.
@@ -361,7 +361,7 @@ Clean smoke:
 | Flag | Conf | Default |
 |------|------|---------|
 | `--datadir PATH` | `datadir=` | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
-| `--datadir-cold PATH` | `datadir_cold=` | unset — Class A `inwit.body` / `inwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
+| `--datadir-cold PATH` | `datadir_cold=` | unset — Class A `seqsigwit.body` / `seqsigwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
 | `--network NET` | `network=` | `mainnet` |
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
 | `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
@@ -390,8 +390,8 @@ Clean smoke:
 | `--asmap PATH` | `asmap=` | unset — try `{datadir}/ip_asn.dat` if present; else prefix groups |
 | `--no-seeds` | `no_seeds=` | seeds on |
 | `--sh-index` | `sh_index=` | **off** — Class B scripthash (address/history; Electrum/Esplora start without it) |
-| `--prune-inwit` | `prune_inwit=` | **off** — unpruned reads `inwit.body`. On: refuse wire reconstruct below tip−288 **heights**, advertise `NETWORK_LIMITED`, and keep those heights as `store/inwit.window/{height}.bin` plus a RAM cache |
-| `--prune-inwit-ram-threshold-bytes N` | `prune_inwit_ram_threshold_bytes=` | `268435456` (256 MiB). `0` keeps nothing in RAM: every height, including tiny IBD blocks, is read from its file |
+| `--prune-seqsigwit` | `prune_seqsigwit=` | **off** — unpruned reads `seqsigwit.body`. On: refuse wire reconstruct below tip−288 **heights**, advertise `NETWORK_LIMITED`, and keep those heights as `store/seqsigwit.window/{height}.bin` plus a RAM cache |
+| `--prune-seqsigwit-ram-threshold-bytes N` | `prune_seqsigwit_ram_threshold_bytes=` | `268435456` (256 MiB). `0` keeps nothing in RAM: every height, including tiny IBD blocks, is read from its file |
 | `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
@@ -508,24 +508,24 @@ cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
-rarely-read Class A **inwit** stem (`inwit.body` + `inwit.loc`, ~486 GiB + loc
+rarely-read Class A **seqsigwit** stem (`seqsigwit.body` + `seqsigwit.loc`, ~486 GiB + loc
 on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
-read inwit; reconstruct / `getrawtransaction` / block serve do.
+read seqsigwit; reconstruct / `getrawtransaction` / block serve do.
 
 ```
 --datadir /mnt/nvme/rbtc --datadir-cold /mnt/hdd/rbtc-cold
 # hot:  /mnt/nvme/rbtc/store/txout.body  (and the rest)
-# cold: /mnt/hdd/rbtc-cold/store/inwit.body
-#       /mnt/hdd/rbtc-cold/store/inwit.loc
+# cold: /mnt/hdd/rbtc-cold/store/seqsigwit.body
+#       /mnt/hdd/rbtc-cold/store/seqsigwit.loc
 ```
 
-A hot-store sidecar `inwit.reloc` records the split. Opening without
-`--datadir-cold` then refuses. Do not leave `inwit.*` in both places. Moving an
+A hot-store sidecar `seqsigwit.reloc` records the split. Opening without
+`--datadir-cold` then refuses. Do not leave `seqsigwit.*` in both places. Moving an
 existing datadir is operator `mv` (or copy+remove cross-device):
 
 ```
 mkdir -p /mnt/hdd/rbtc-cold/store
-mv /mnt/nvme/rbtc/store/inwit.body /mnt/nvme/rbtc/store/inwit.loc /mnt/nvme/rbtc/store/inwit.off /mnt/nvme/rbtc/store/inwit.loc.ovf /mnt/hdd/rbtc-cold/store/
+mv /mnt/nvme/rbtc/store/seqsigwit.body /mnt/nvme/rbtc/store/seqsigwit.loc /mnt/nvme/rbtc/store/seqsigwit.off /mnt/nvme/rbtc/store/seqsigwit.loc.ovf /mnt/hdd/rbtc-cold/store/
 ```
 
 **Advanced** IO/perf tunables may still use `RBITCOIN_*` (see below); they are
@@ -622,7 +622,7 @@ uniformly slow pack). Slow or constrained uplinks: [Slow / constrained uplink
 **Archive head resolve:** streaming — **FdOnly** page-coalesced head probe +
 **FdOnly** `create.loc` + **`txid.body`** identity via **io_uring or pread**
 (deepest-cand-first).
-**Class A `txout` / `inwit` / `spent` + `create.loc` / `inwit.loc`, `tx.head`, header head,
+**Class A `txout` / `seqsigwit` / `spent` + `create.loc` / `seqsigwit.loc`, `tx.head`, header head,
 SH head/body, and spenders are fd pread/pwrite**.
 Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
 
@@ -654,7 +654,7 @@ Token meanings and ring depth: [`docs/io-modality.md`](docs/io-modality.md).
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](docs/io-modality.md) |
-| Archive Class A append | **pwrite** (always) | `txout` / `inwit` / `spent` + `*.idx` |
+| Archive Class A append | **pwrite** (always) | `txout` / `seqsigwit` / `spent` + `*.idx` |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit**. Rebuild env: [`docs/env-knobs.md`](docs/env-knobs.md). Bytes: [`SCHEMA.md`](SCHEMA.md) / [`docs/heads.md`](docs/heads.md). Legacy mono-head datadirs require reindex |
 | Confirm stages | **lookup · load · scripts · write** | Queues and pack/wave: [`docs/concurrency.md`](docs/concurrency.md). RAM: [`docs/ibd-memory.md`](docs/ibd-memory.md) |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
@@ -757,11 +757,11 @@ Copy-paste (node stopped with SIGTERM):
 DATADIR=/path/to/datadir
 # fuse8 v1 / Shared SH body / Paged SH heads (same dirs as schema-20 index refuse):
 rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
-# leftover Class A `*.idx` dirs (schema 22 uses create.loc / inwit.loc):
-#   rm -rf "$DATADIR/store/txout.idx" "$DATADIR/store/spent.idx" "$DATADIR/store/inwit.idx"
+# leftover Class A `*.idx` dirs (schema 22 uses create.loc / seqsigwit.loc):
+#   rm -rf "$DATADIR/store/txout.idx" "$DATADIR/store/spent.idx" "$DATADIR/store/seqsigwit.idx"
 ```
 
-Keep Class A (`txout` / `inwit` / `spent` + `create.loc` / `inwit.loc`, `txid.body`, headers) and
+Keep Class A (`txout` / `seqsigwit` / `spent` + `create.loc` / `seqsigwit.loc`, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--sh-index`, SH rematerializes. Do **not** `rm -rf store/`.
 
@@ -778,7 +778,7 @@ DATADIR=/path/to/datadir
 rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 ```
 
-Keep Class A (`txout` / `inwit` / `spent` + idx, `txid.body`, headers) and
+Keep Class A (`txout` / `seqsigwit` / `spent` + idx, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--sh-index`, SH rematerializes from runs / Class A. Do **not** `rm -rf store/`.
 
@@ -834,7 +834,7 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
 
 - **BIP324 v2 only** — plaintext v1 peers disconnect (`peer does not speak BIP324 v2`).
 - **IBD `getdata` serve** reconstructs witness blocks from contiguous Class A
-  spans (`txout.body` + `inwit.body`), off the session reactor. Serve volume
+  spans (`txout.body` + `seqsigwit.body`), off the session reactor. Serve volume
   is on DEBUG `tip: perf` (`serve n= bytes= tx= avg_us= max_us=`), not a
   per-block line. Host throughput probe:
   `python3 scripts/ibd-serve-bench.py 127.0.0.1:8333` (needs `cryptography`
@@ -958,7 +958,7 @@ On disk (schema 17 dirs; leftover single files are unlinked on startup):
 
 **Not stored:** txids, Taproot outs, values, parent scripts. Notify
 `output_pubkeys` are joined from this block’s **`txout`** body (~12 ms
-sequential on a 4k-tx 9p block; witness stays in `inwit`). Indexed serve does
+sequential on a 4k-tx 9p block; witness stays in `seqsigwit`). Indexed serve does
 **not** parent-peek (~40–80 blk/s vs ~1.5–3 naive on that VM).
 
 Serve-time **`--sp-tweaks-dust SATS`** (conf `sp_tweaks_dust=`) omits P2TR outs
@@ -969,7 +969,7 @@ figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
 Tip follow writes 65 B-class records from already-pinned parents when the
 cursor is caught up. Reorg truncates with tip. Post-IBD backfill is a
-**one-core** completion machine: `txout` wave, then `inwit`/parent `txout`
+**one-core** completion machine: `txout` wave, then `seqsigwit`/parent `txout`
 only for P2TR creates, secp on **idle** `rbtc-scripts-*` workers (block
 scripts and mempool accept still win), then **batched** height-blob
 + idx writes (one body pwrite + one idx pwrite per consecutive group — not
@@ -1024,7 +1024,7 @@ proxy, or a public bind if the proxy sits elsewhere and you accept that risk).
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
 | `relayfee` / `estimatefee` / histogram | from Libre min + live mempool |
-| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sp-tweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `inwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sp-tweaks-dust` (default 1000; 546 = Cake electrs): omit P2TR outs with `value <=` the floor. Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
+| Silent Payments tweaks | `blockchain.tweaks.subscribe` — with `--sp-tweaks` index: multi-height load (default ≤128 heights / ≤16384 eligible txs per wave) then per-height notifies, **one TCP flush per wave**. Indexed JSON-RPC result shares the first wave's Class A `txout` span; remaining heights of that wave are notifies; further waves overlap the next load with the previous write. Class A join is **one sequential `txout` span** from first..=last eligible fk in the wave (not one body pread per eligible tx; `seqsigwit` stays out). Pre-taproot: **one** notify with ≤1024 empty height keys (no store; Cake last key = progress). Cake `historicalMode=false` (param `[2]`): omit confirmed-spent P2TR outs. `--sp-tweaks-dust` (default 1000; 546 = Cake electrs): omit P2TR outs with `value <=` the floor. Without index / hole: naive per height (Class A + parent outs). **Not** request/response: JSON-RPC result is the **first** height (1-height probe `[0,1,false]` → `{"0": {}}`); further heights are notifications, then `{"message":"done"}` at a **wave boundary after 60s wall** (or when `count`/tip finishes first). Cake resubscribes; kiss-bdk one-shot stops until it loops. `server.features.genesis_hash` is the chain check. `server.version[0]` contains `electrs` (Cake probe). On 9p-class IO expect slower than local disk. |
 
 ### API request log
 

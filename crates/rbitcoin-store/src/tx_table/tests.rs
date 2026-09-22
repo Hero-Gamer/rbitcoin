@@ -132,10 +132,13 @@ fn open_refuses_txout_without_peer_stems() {
         t.put_full_batch_indexed(&meta_only_items(&[rec]), true)
             .unwrap();
     }
-    let _ = std::fs::remove_file(dir.join("inwit.body"));
+    let _ = std::fs::remove_file(dir.join("seqsigwit.body"));
     match TxTable::open_tiny(&dir) {
-        Ok(_) => panic!("missing inwit must refuse"),
-        Err(err) => assert!(format!("{err}").contains("missing inwit/spent"), "{err}"),
+        Ok(_) => panic!("missing seqsigwit must refuse"),
+        Err(err) => assert!(
+            format!("{err}").contains("missing seqsigwit/spent"),
+            "{err}"
+        ),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -323,7 +326,7 @@ fn inputs_n_in_scans_both_prevouts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Class A append submits txout+inwit+spent bodies as one pwrite wave (not 3 serial).
+/// Class A append submits txout+seqsigwit+spent bodies as one pwrite wave (not 3 serial).
 #[test]
 fn put_full_batch_one_body_write_wave() {
     let dir = tempfile_dir("one-wave");
@@ -678,9 +681,9 @@ fn scan_packed_meta_and_prevouts_no_output_alloc() {
     let (meta, _) = TxRecord::decode_body_meta(&raw).unwrap();
     assert_eq!(meta.txid, [0u8; 32], "body scan has no leading txid");
     assert_eq!(meta.input_count, 0, "txout meta omits n_in");
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let prevouts = scan_inwit_prevouts(&inwit, tx.input_count).unwrap();
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
+    let prevouts = scan_seqsigwit_prevouts(&seqsigwit, tx.input_count).unwrap();
     assert_eq!(prevouts.len(), 2);
     assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
     assert_eq!(prevouts[1], (Fk(1), 1));
@@ -909,8 +912,8 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
         .unwrap()[0];
     let from_thin = t.body_txid(fk).unwrap();
     assert_eq!(from_thin, txid, "sidefile thin identity");
-    let (_off, len) = t.inwit_range(fk).unwrap();
-    assert!(len > 50_000, "inwit should hold the fat witness");
+    let (_off, len) = t.seqsigwit_range(fk).unwrap();
+    assert!(len > 50_000, "seqsigwit should hold the fat witness");
     // Head resolve still works.
     assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(fk));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1979,15 +1982,15 @@ fn packed_tx_roundtrip() {
     assert_eq!(dtx.input_count, 0, "txout meta omits n_in");
     assert_eq!(dtx.output_count, 2);
     assert!(dtx.input_start_fk.get().is_none());
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let dins = decode_inwit_secret(&inwit, tx.input_count, None).unwrap();
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
+    let dins = decode_seqsigwit_secret(&seqsigwit, tx.input_count, None).unwrap();
     assert_eq!(dins, inputs);
     assert_eq!(douts, outputs);
 }
 
 #[test]
-fn inwit_and_txout_secret_xor_roundtrip() {
+fn seqsigwit_and_txout_secret_xor_roundtrip() {
     let secret = crate::store_secret::StoreSecret::from_bytes([0x5au8; 32]);
     let tx = TxRecord {
         txid: [3u8; 32],
@@ -2009,11 +2012,11 @@ fn inwit_and_txout_secret_xor_roundtrip() {
     let outputs = vec![OutputRecord::unspent(42, vec![0x00, 0x14, 0x99])];
     let mut txout = Vec::new();
     encode_packed_tx_with_secret(&tx, &inputs, &outputs, &mut txout, Some(&secret));
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, Some(&secret));
-    assert_ne!(inwit, {
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, Some(&secret));
+    assert_ne!(seqsigwit, {
         let mut plain = Vec::new();
-        encode_inwit_with_secret(&inputs, &mut plain, None);
+        encode_seqsigwit_with_secret(&inputs, &mut plain, None);
         plain
     });
     let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout, 1).unwrap();
@@ -2024,7 +2027,7 @@ fn inwit_and_txout_secret_xor_roundtrip() {
         decode_packed_tx_outs_with_spender_rels_secret(&txout, 1, Some(&secret)).unwrap();
     assert_eq!(dtx2.input_count, 0, "txout meta omits n_in");
     assert_eq!(douts2[0].script, outputs[0].script);
-    let dins = decode_inwit_secret(&inwit, tx.input_count, Some(&secret)).unwrap();
+    let dins = decode_seqsigwit_secret(&seqsigwit, tx.input_count, Some(&secret)).unwrap();
     assert_eq!(dins[0].script_sig, inputs[0].script_sig);
     assert_eq!(dins[0].witness, inputs[0].witness);
 }
@@ -2308,10 +2311,12 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert_eq!(outs.len(), 2);
     let (m2, _) = TxRecord::decode_body_meta(&raw).unwrap();
     assert_eq!(m2.txid, [0u8; 32]);
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
     assert_eq!(
-        scan_inwit_prevouts(&inwit, tx.input_count).unwrap().len(),
+        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count)
+            .unwrap()
+            .len(),
         2
     );
     let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
@@ -2683,20 +2688,20 @@ fn pread_two_spans_parallel_matches_serial() {
     let first = fks[0].get().unwrap();
     let last = fks[3].get().unwrap();
     let txout_ranges = t.body_ranges(first, last).unwrap();
-    let inwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
-    let inwit_pairs = t.inwit_loc.range_batch(&inwit_fks).unwrap();
-    let inwit_ranges: Vec<(u64, u64)> = inwit_pairs
+    let seqsigwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
+    let seqsigwit_pairs = t.seqsigwit_loc.range_batch(&seqsigwit_fks).unwrap();
+    let seqsigwit_ranges: Vec<(u64, u64)> = seqsigwit_pairs
         .into_iter()
-        .map(|p| p.expect("inwit range"))
+        .map(|p| p.expect("seqsigwit range"))
         .collect();
     let (t0, _) = txout_ranges[0];
     let (tn, tln) = *txout_ranges.last().unwrap();
     let tspan = tn + tln - t0;
-    let (i0, _) = inwit_ranges[0];
-    let (inn, iln) = *inwit_ranges.last().unwrap();
+    let (i0, _) = seqsigwit_ranges[0];
+    let (inn, iln) = *seqsigwit_ranges.last().unwrap();
     let ispan = inn + iln - i0;
-    let serial = pread_two_spans(&t.body, t0, tspan, &t.inwit, i0, ispan, false).unwrap();
-    let parallel = pread_two_spans(&t.body, t0, tspan, &t.inwit, i0, ispan, true).unwrap();
+    let serial = pread_two_spans(&t.body, t0, tspan, &t.seqsigwit, i0, ispan, false).unwrap();
+    let parallel = pread_two_spans(&t.body, t0, tspan, &t.seqsigwit, i0, ispan, true).unwrap();
     assert_eq!(serial, parallel);
     assert!(!serial.0.is_empty());
     assert!(!serial.1.is_empty());
@@ -3764,13 +3769,13 @@ fn spent_span_matches_slot_len_times_n_out() {
 }
 
 #[test]
-fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
+fn reserved_flag_v17_seqsigwit_high_bits_are_corrupt() {
     let rec = InputRecord::coinbase(u32::MAX, vec![], vec![]);
     let mut raw = rec.encode();
     raw[0] |= 1 << 5;
     match InputRecord::decode_at(&raw) {
         Err(StoreError::Corrupt(m)) => {
-            assert!(m.contains("reserved") || m.contains("inwit"), "{m}");
+            assert!(m.contains("reserved") || m.contains("seqsigwit"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }
@@ -3812,11 +3817,11 @@ fn script_kind_v17_kind_ten_is_corrupt() {
     }
 }
 
-/// Fat inwit uses `inwit.loc` (no `{stem}.idx` dirs).
+/// Fat seqsigwit uses `seqsigwit.loc` (no `{stem}.idx` dirs).
 #[test]
-fn fat_inwit_uses_delta_loc_not_idx() {
+fn fat_seqsigwit_uses_delta_loc_not_idx() {
     {
-        let dir = tempfile_dir("inwit-loc");
+        let dir = tempfile_dir("seqsigwit-loc");
         let t = create_tiny(&dir);
         let fat_script = vec![0x6au8; 1800];
         for i in 0..6u8 {
@@ -3837,14 +3842,17 @@ fn fat_inwit_uses_delta_loc_not_idx() {
                 .unwrap();
         }
         assert!(dir.join("create.loc").is_file());
-        assert!(dir.join("inwit.loc").is_file());
+        assert!(dir.join("seqsigwit.loc").is_file());
         assert!(!dir.join("txout.idx").exists());
         assert!(!dir.join("spent.idx").exists());
-        assert!(!dir.join("inwit.idx").exists());
+        assert!(!dir.join("seqsigwit.idx").exists());
         let last = t.get(Fk(6)).unwrap();
         assert_eq!(last.output_count, 1);
-        let (off, len) = t.inwit_range(Fk(6)).unwrap();
-        let raw_in = t.inwit.with_bytes_at(off, len, |b| Ok(b.to_vec())).unwrap();
+        let (off, len) = t.seqsigwit_range(Fk(6)).unwrap();
+        let raw_in = t
+            .seqsigwit
+            .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+            .unwrap();
         assert!(raw_in.len() >= 1800, "len={}", raw_in.len());
         let _ = std::fs::remove_dir_all(&dir);
     }

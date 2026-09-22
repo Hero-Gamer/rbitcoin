@@ -19,18 +19,18 @@ impl Query {
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
         let (tx, outs) = self.store.get_tx_meta_and_outputs(fk)?;
-        if let Some(inputs) = self.inwit_cached_inputs(fk, tx.input_count)? {
+        if let Some(inputs) = self.seqsigwit_cached_inputs(fk, tx.input_count)? {
             if inputs.len() as u32 != tx.input_count {
                 return Err(StoreError::Corrupt("packed input count mismatch"));
             }
             return Ok((tx, outs, inputs));
         }
-        self.require_inwit_fk(fk)?;
+        self.require_seqsigwit_fk(fk)?;
         let t0 = Instant::now();
         crate::note_confirm(&self.confirm_stats().wf_body_store, 1);
         let (tx, inputs, outs) = match self.store.get_tx_full(fk) {
             Ok(v) => v,
-            Err(StoreError::NotFound) if self.prune_inwit() => {
+            Err(StoreError::NotFound) if self.prune_seqsigwit() => {
                 let height = self.store.tx_height_get(fk)?.unwrap_or(0);
                 return Err(StoreError::Pruned { height });
             }
@@ -267,10 +267,10 @@ impl Query {
         tx_fks: &[Fk],
     ) -> Result<Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>, QueryError> {
         if let Some(&fk) = tx_fks.first() {
-            self.require_inwit_fk(fk)?;
+            self.require_seqsigwit_fk(fk)?;
         }
         let mut prev_txid_cache: U64Map<[u8; 32]> = U64Map::default();
-        if !self.prune_inwit() {
+        if !self.prune_seqsigwit() {
             if let Some((first, last)) = Self::contiguous_fk_run(tx_fks) {
                 let mut rows = self.store.get_tx_full_span(first, last)?;
                 if rows.len() != tx_fks.len() {
@@ -300,7 +300,7 @@ impl Query {
         hash: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, QueryError> {
         if let Some(h) = self.height_of_hash(hash)? {
-            self.require_inwit_at(h)?;
+            self.require_seqsigwit_at(h)?;
         }
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
@@ -329,7 +329,7 @@ impl Query {
     pub fn reconstruct_archived_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
         self.note_reconstruct_archived();
         if let Some(h) = self.height_of_hash(hash)? {
-            self.require_inwit_at(h)?;
+            self.require_seqsigwit_at(h)?;
         }
         let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
@@ -403,7 +403,7 @@ impl Query {
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.
     pub fn reconstruct_block_at_height(&self, height: Height) -> Result<Block, QueryError> {
-        self.require_inwit_at(height)?;
+        self.require_seqsigwit_at(height)?;
         let (_fk, rec) = self.header_at_height(height)?.ok_or(StoreError::NotFound)?;
         let tx_fks = self.block_tx_fks(height)?;
         let block = self.reconstruct_archived_block_from_parts_cached(rec.clone(), tx_fks, None)?;
@@ -423,7 +423,7 @@ impl Query {
 
     /// Dense confirm-time econ for a confirmed height, or `None` if any row is unstamped.
     ///
-    /// Does not read inwit. Missing `header_txs` is `None` (header-only).
+    /// Does not read seqsigwit. Missing `header_txs` is `None` (header-only).
     pub fn stamped_txstat_block(
         &self,
         height: Height,

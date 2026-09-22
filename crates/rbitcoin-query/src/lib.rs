@@ -221,7 +221,7 @@ impl std::ops::DerefMut for BodyQueueInner {
 }
 
 #[derive(Default)]
-struct InwitRamWindow {
+struct SeqSigWitRamWindow {
     by_height: BTreeMap<u32, Vec<Fk>>,
     by_fk: U64Map<Vec<InputRecord>>,
     bytes: u64,
@@ -328,18 +328,18 @@ pub struct Query {
     confirm_stats: Arc<ConfirmStats>,
     /// Tip height of last in-process io_uring recover (`u32::MAX` = none).
     uring_recover_tip: AtomicU32,
-    /// Highest height whose inwit was dropped (`u32::MAX` = none dropped).
+    /// Highest height whose seqsigwit was dropped (`u32::MAX` = none dropped).
     pruneheight: AtomicU32,
-    /// Operator `--prune-inwit` (advertise NETWORK_LIMITED even before a drop).
-    prune_inwit: AtomicBool,
+    /// Operator `--prune-seqsigwit` (advertise NETWORK_LIMITED even before a drop).
+    prune_seqsigwit: AtomicBool,
     /// True while the net IBD engine is active.
     ibd_mode: AtomicBool,
     /// In prune+IBD mode, cap for recent witness kept in RAM.
-    inwit_ram_threshold_bytes: AtomicU64,
+    seqsigwit_ram_threshold_bytes: AtomicU64,
     /// Recent witness cache keyed by confirmed heights/create fks.
-    inwit_ram_window: Mutex<InwitRamWindow>,
+    seqsigwit_ram_window: Mutex<SeqSigWitRamWindow>,
     /// Inputs from the most recent Class A append wave (fk-keyed).
-    inwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
+    seqsigwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -352,7 +352,7 @@ struct HeightByHashIndex {
 }
 
 impl Query {
-    pub const DEFAULT_INWIT_RAM_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+    pub const DEFAULT_SEQSIGWIT_RAM_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
         Self::open_or_create_layout(StoreLayout::single(store_path.as_ref().to_path_buf()))
     }
@@ -442,11 +442,13 @@ impl Query {
             confirm_stats: Arc::new(ConfirmStats::default()),
             uring_recover_tip: AtomicU32::new(u32::MAX),
             pruneheight: AtomicU32::new(ph),
-            prune_inwit: AtomicBool::new(prune_on),
+            prune_seqsigwit: AtomicBool::new(prune_on),
             ibd_mode: AtomicBool::new(false),
-            inwit_ram_threshold_bytes: AtomicU64::new(Self::DEFAULT_INWIT_RAM_THRESHOLD_BYTES),
-            inwit_ram_window: Mutex::new(InwitRamWindow::default()),
-            inwit_append_cache: Mutex::new(U64Map::default()),
+            seqsigwit_ram_threshold_bytes: AtomicU64::new(
+                Self::DEFAULT_SEQSIGWIT_RAM_THRESHOLD_BYTES,
+            ),
+            seqsigwit_ram_window: Mutex::new(SeqSigWitRamWindow::default()),
+            seqsigwit_append_cache: Mutex::new(U64Map::default()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -466,13 +468,13 @@ impl Query {
     }
 
     fn load_pruneheight(store_path: &Path) -> Result<(u32, bool), QueryError> {
-        let path = store_path.join("inwit.prune");
+        let path = store_path.join("seqsigwit.prune");
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let arr: [u8; 4] = bytes
                     .as_slice()
                     .try_into()
-                    .map_err(|_| StoreError::Corrupt("invariant: inwit.prune size"))?;
+                    .map_err(|_| StoreError::Corrupt("invariant: seqsigwit.prune size"))?;
                 Ok((u32::from_le_bytes(arr), true))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((u32::MAX, false)),
@@ -480,8 +482,8 @@ impl Query {
         }
     }
 
-    pub fn prune_inwit(&self) -> bool {
-        self.prune_inwit.load(AtomicOrdering::Acquire)
+    pub fn prune_seqsigwit(&self) -> bool {
+        self.prune_seqsigwit.load(AtomicOrdering::Acquire)
     }
 
     pub fn ibd_mode(&self) -> bool {
@@ -492,44 +494,45 @@ impl Query {
         self.ibd_mode.store(on, AtomicOrdering::Release);
     }
 
-    pub fn inwit_ram_threshold_bytes(&self) -> u64 {
-        self.inwit_ram_threshold_bytes.load(AtomicOrdering::Acquire)
+    pub fn seqsigwit_ram_threshold_bytes(&self) -> u64 {
+        self.seqsigwit_ram_threshold_bytes
+            .load(AtomicOrdering::Acquire)
     }
 
-    pub fn set_inwit_ram_threshold_bytes(&self, bytes: u64) -> Result<(), QueryError> {
-        self.inwit_ram_threshold_bytes
+    pub fn set_seqsigwit_ram_threshold_bytes(&self, bytes: u64) -> Result<(), QueryError> {
+        self.seqsigwit_ram_threshold_bytes
             .store(bytes, AtomicOrdering::Release);
         Ok(())
     }
 
     #[inline]
     pub fn prune_ibd_mode(&self) -> bool {
-        self.prune_inwit() && self.ibd_mode()
+        self.prune_seqsigwit() && self.ibd_mode()
     }
 
-    pub fn set_prune_inwit(&self, on: bool) -> Result<(), QueryError> {
-        let was_on = self.prune_inwit();
-        if !on && self.prune_inwit() {
+    pub fn set_prune_seqsigwit(&self, on: bool) -> Result<(), QueryError> {
+        let was_on = self.prune_seqsigwit();
+        if !on && self.prune_seqsigwit() {
             return Err(StoreError::Layout(
-                "refusing to disable prune-inwit on a pruned datadir".into(),
+                "refusing to disable prune-seqsigwit on a pruned datadir".into(),
             ));
         }
-        self.prune_inwit.store(on, AtomicOrdering::Release);
+        self.prune_seqsigwit.store(on, AtomicOrdering::Release);
         if on {
             if self.pruneheight().is_none() {
                 self.persist_pruneheight(u32::MAX)?;
             }
             if !was_on {
-                self.seed_recent_inwit_from_store()?;
+                self.seed_recent_seqsigwit_from_store()?;
             }
         } else {
-            self.clear_inwit_ram_window();
+            self.clear_seqsigwit_ram_window();
             self.set_pruneheight(None)?;
         }
         Ok(())
     }
 
-    /// Durable-later watermark: creates at this height and below have no inwit.
+    /// Durable-later watermark: creates at this height and below have no seqsigwit.
     pub fn pruneheight(&self) -> Option<Height> {
         match self.pruneheight.load(AtomicOrdering::Acquire) {
             u32::MAX => None,
@@ -541,23 +544,23 @@ impl Query {
         let v = height.map(|h| h.0).unwrap_or(u32::MAX);
         self.pruneheight.store(v, AtomicOrdering::Release);
         if height.is_some() {
-            self.prune_inwit.store(true, AtomicOrdering::Release);
+            self.prune_seqsigwit.store(true, AtomicOrdering::Release);
             self.persist_pruneheight(v)?;
-            self.prune_inwit_spill_below(v.saturating_add(1))?;
+            self.prune_seqsigwit_spill_below(v.saturating_add(1))?;
             Ok(())
         } else {
-            self.prune_inwit.store(false, AtomicOrdering::Release);
+            self.prune_seqsigwit.store(false, AtomicOrdering::Release);
             self.persist_pruneheight_clear()
         }
     }
 
     fn persist_pruneheight(&self, v: u32) -> Result<(), QueryError> {
-        let path = self.store.path().join("inwit.prune");
+        let path = self.store.path().join("seqsigwit.prune");
         std::fs::write(&path, v.to_le_bytes()).map_err(|e| StoreError::io(path, e))
     }
 
     fn persist_pruneheight_clear(&self) -> Result<(), QueryError> {
-        let path = self.store.path().join("inwit.prune");
+        let path = self.store.path().join("seqsigwit.prune");
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -565,23 +568,23 @@ impl Query {
         }
     }
 
-    pub const INWIT_KEEP_HEIGHTS: u32 = 288;
+    pub const SEQSIGWIT_KEEP_HEIGHTS: u32 = 288;
 
-    pub fn apply_prune_inwit_tip(&self) -> Result<(), QueryError> {
-        if !self.prune_inwit() {
+    pub fn apply_prune_seqsigwit_tip(&self) -> Result<(), QueryError> {
+        if !self.prune_seqsigwit() {
             return Ok(());
         }
         let Some(tip) = self.tip_height() else {
             return Ok(());
         };
-        if tip.0 <= Self::INWIT_KEEP_HEIGHTS {
+        if tip.0 <= Self::SEQSIGWIT_KEEP_HEIGHTS {
             return Ok(());
         }
-        self.set_pruneheight(Some(Height(tip.0 - Self::INWIT_KEEP_HEIGHTS)))
+        self.set_pruneheight(Some(Height(tip.0 - Self::SEQSIGWIT_KEEP_HEIGHTS)))
     }
 
     /// `false` when this create's connected height is at/below [`Self::pruneheight`].
-    pub fn inwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
+    pub fn seqsigwit_available(&self, fk: Fk) -> Result<bool, QueryError> {
         let Some(ph) = self.pruneheight() else {
             return Ok(true);
         };
@@ -591,7 +594,7 @@ impl Query {
         }
     }
 
-    fn require_inwit_at(&self, height: Height) -> Result<(), QueryError> {
+    fn require_seqsigwit_at(&self, height: Height) -> Result<(), QueryError> {
         if let Some(ph) = self.pruneheight() {
             if height.0 <= ph.0 {
                 return Err(StoreError::Pruned { height: height.0 });
@@ -600,16 +603,16 @@ impl Query {
         Ok(())
     }
 
-    fn require_inwit_fk(&self, fk: Fk) -> Result<(), QueryError> {
-        if self.inwit_available(fk)? {
+    fn require_seqsigwit_fk(&self, fk: Fk) -> Result<(), QueryError> {
+        if self.seqsigwit_available(fk)? {
             return Ok(());
         }
         let height = self.store.tx_height_get(fk)?.unwrap_or(0);
         Err(StoreError::Pruned { height })
     }
 
-    fn drop_inwit_ram_height(&self, height: u32) {
-        let mut g = self.inwit_ram_window.lock().unwrap();
+    fn drop_seqsigwit_ram_height(&self, height: u32) {
+        let mut g = self.seqsigwit_ram_window.lock().unwrap();
         let Some(old_fks) = g.by_height.remove(&height) else {
             return;
         };
@@ -625,20 +628,20 @@ impl Query {
         }
     }
 
-    pub(crate) fn clear_inwit_ram_window(&self) {
-        *self.inwit_ram_window.lock().unwrap() = InwitRamWindow::default();
-        self.inwit_append_cache.lock().unwrap().clear();
+    pub(crate) fn clear_seqsigwit_ram_window(&self) {
+        *self.seqsigwit_ram_window.lock().unwrap() = SeqSigWitRamWindow::default();
+        self.seqsigwit_append_cache.lock().unwrap().clear();
     }
 
     #[cfg(test)]
-    pub(crate) fn inwit_ram_window_stats(&self) -> (usize, usize, u64, u64) {
-        let g = self.inwit_ram_window.lock().unwrap();
+    pub(crate) fn seqsigwit_ram_window_stats(&self) -> (usize, usize, u64, u64) {
+        let g = self.seqsigwit_ram_window.lock().unwrap();
         (g.by_height.len(), g.by_fk.len(), g.bytes, g.evictions)
     }
 
-    pub(crate) fn inwit_ram_inputs(&self, fk: Fk) -> Option<Vec<InputRecord>> {
+    pub(crate) fn seqsigwit_ram_inputs(&self, fk: Fk) -> Option<Vec<InputRecord>> {
         let id = fk.get()?;
-        self.inwit_ram_window
+        self.seqsigwit_ram_window
             .lock()
             .unwrap()
             .by_fk
@@ -646,31 +649,31 @@ impl Query {
             .cloned()
     }
 
-    fn inwit_spill_dir(&self) -> std::path::PathBuf {
-        self.store.path().join("inwit.window")
+    fn seqsigwit_spill_dir(&self) -> std::path::PathBuf {
+        self.store.path().join("seqsigwit.window")
     }
 
-    fn inwit_spill_file(&self, height: u32) -> Result<std::path::PathBuf, QueryError> {
-        let dir = self.inwit_spill_dir();
+    fn seqsigwit_spill_file(&self, height: u32) -> Result<std::path::PathBuf, QueryError> {
+        let dir = self.seqsigwit_spill_dir();
         let name = format!("{height}.bin");
         let stem_ok = name
             .strip_suffix(".bin")
             .and_then(|s| s.parse::<u32>().ok())
             == Some(height);
         if !stem_ok {
-            return Err(StoreError::Corrupt("invariant: inwit spill name"));
+            return Err(StoreError::Corrupt("invariant: seqsigwit spill name"));
         }
         let path = dir.join(&name);
         if !path.starts_with(&dir) {
             return Err(StoreError::Corrupt(
-                "invariant: inwit spill path escaped window dir",
+                "invariant: seqsigwit spill path escaped window dir",
             ));
         }
         Ok(path)
     }
 
-    fn prune_inwit_spill_below(&self, min_keep_height: u32) -> Result<(), QueryError> {
-        let dir = self.inwit_spill_dir();
+    fn prune_seqsigwit_spill_below(&self, min_keep_height: u32) -> Result<(), QueryError> {
+        let dir = self.seqsigwit_spill_dir();
         let Ok(rd) = std::fs::read_dir(&dir) else {
             return Ok(());
         };
@@ -684,7 +687,7 @@ impl Query {
                 continue;
             };
             if h < min_keep_height {
-                let path = self.inwit_spill_file(h)?;
+                let path = self.seqsigwit_spill_file(h)?;
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -695,26 +698,26 @@ impl Query {
         Ok(())
     }
 
-    fn persist_inwit_spill_height(
+    fn persist_seqsigwit_spill_height(
         &self,
         height: Height,
         rows: &[(Fk, Vec<InputRecord>)],
     ) -> Result<(), QueryError> {
-        let dir = self.inwit_spill_dir();
+        let dir = self.seqsigwit_spill_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
-        let path = self.inwit_spill_file(height.0)?;
+        let path = self.seqsigwit_spill_file(height.0)?;
         let tmp_name = format!("{}.bin.tmp", height.0);
         if tmp_name
             .strip_suffix(".bin.tmp")
             .and_then(|s| s.parse::<u32>().ok())
             != Some(height.0)
         {
-            return Err(StoreError::Corrupt("invariant: inwit spill name"));
+            return Err(StoreError::Corrupt("invariant: seqsigwit spill name"));
         }
         let tmp = dir.join(&tmp_name);
         if !tmp.starts_with(&dir) {
             return Err(StoreError::Corrupt(
-                "invariant: inwit spill path escaped window dir",
+                "invariant: seqsigwit spill path escaped window dir",
             ));
         }
         let mut out = Vec::new();
@@ -724,7 +727,7 @@ impl Query {
             };
             out.extend_from_slice(&id.to_le_bytes());
             let mut enc = Vec::new();
-            rbitcoin_store::encode_inwit_with_secret(ins, &mut enc, None);
+            rbitcoin_store::encode_seqsigwit_with_secret(ins, &mut enc, None);
             out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
             out.extend_from_slice(&enc);
         }
@@ -732,12 +735,12 @@ impl Query {
         std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))
     }
 
-    fn inwit_spill_inputs_with_count(
+    fn seqsigwit_spill_inputs_with_count(
         &self,
         fk: Fk,
         input_count: u32,
     ) -> Result<Option<Vec<InputRecord>>, QueryError> {
-        if !self.prune_inwit() {
+        if !self.prune_seqsigwit() {
             return Ok(None);
         }
         let Some(height) = self.store.tx_height_get(fk)? else {
@@ -746,19 +749,19 @@ impl Query {
         if self.pruneheight().is_some_and(|ph| height <= ph.0) {
             return Ok(None);
         }
-        let path = self.inwit_spill_file(height)?;
+        let path = self.seqsigwit_spill_file(height)?;
         let canon = match path.canonicalize() {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(StoreError::io(&path, e)),
         };
         let root = self
-            .inwit_spill_dir()
+            .seqsigwit_spill_dir()
             .canonicalize()
-            .map_err(|e| StoreError::io(self.inwit_spill_dir(), e))?;
+            .map_err(|e| StoreError::io(self.seqsigwit_spill_dir(), e))?;
         if !canon.starts_with(&root) {
             return Err(StoreError::Corrupt(
-                "invariant: inwit spill path escaped window dir",
+                "invariant: seqsigwit spill path escaped window dir",
             ));
         }
         let raw = match std::fs::read(&canon) {
@@ -774,10 +777,11 @@ impl Query {
             let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
             i += 4;
             if i.saturating_add(n) > raw.len() {
-                return Err(StoreError::Corrupt("inwit spill short row"));
+                return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
             if id == want {
-                let ins = rbitcoin_store::decode_inwit_secret(&raw[i..i + n], input_count, None)?;
+                let ins =
+                    rbitcoin_store::decode_seqsigwit_secret(&raw[i..i + n], input_count, None)?;
                 return Ok(Some(ins));
             }
             i += n;
@@ -785,19 +789,19 @@ impl Query {
         Ok(None)
     }
 
-    pub(crate) fn inwit_cached_inputs(
+    pub(crate) fn seqsigwit_cached_inputs(
         &self,
         fk: Fk,
         input_count: u32,
     ) -> Result<Option<Vec<InputRecord>>, QueryError> {
-        if let Some(ins) = self.inwit_ram_inputs(fk) {
+        if let Some(ins) = self.seqsigwit_ram_inputs(fk) {
             return Ok(Some(ins));
         }
-        self.inwit_spill_inputs_with_count(fk, input_count)
+        self.seqsigwit_spill_inputs_with_count(fk, input_count)
     }
 
-    pub(crate) fn note_appended_inwit_inputs(&self, fks: &[Fk], ins: &[Vec<InputRecord>]) {
-        let mut cache = self.inwit_append_cache.lock().unwrap();
+    pub(crate) fn note_appended_seqsigwit_inputs(&self, fks: &[Fk], ins: &[Vec<InputRecord>]) {
+        let mut cache = self.seqsigwit_append_cache.lock().unwrap();
         for (fk, inputs) in fks.iter().zip(ins.iter()) {
             if let Some(id) = fk.get() {
                 cache.insert(id, inputs.clone());
@@ -805,17 +809,17 @@ impl Query {
         }
     }
 
-    pub(crate) fn note_inwit_ram_for_confirmed(
+    pub(crate) fn note_seqsigwit_ram_for_confirmed(
         &self,
         height: Height,
         tx_fks: &[Fk],
     ) -> Result<(), QueryError> {
-        if !self.prune_inwit() || tx_fks.is_empty() {
+        if !self.prune_seqsigwit() || tx_fks.is_empty() {
             return Ok(());
         }
-        let threshold = self.inwit_ram_threshold_bytes();
+        let threshold = self.seqsigwit_ram_threshold_bytes();
         let mut staged: Vec<(Fk, Vec<InputRecord>, u64)> = Vec::with_capacity(tx_fks.len());
-        let mut appended = self.inwit_append_cache.lock().unwrap();
+        let mut appended = self.seqsigwit_append_cache.lock().unwrap();
         for &fk in tx_fks {
             let ins = if let Some(id) = fk.get() {
                 if let Some(v) = appended.remove(&id) {
@@ -832,16 +836,16 @@ impl Query {
             staged.push((fk, ins, bytes));
         }
         drop(appended);
-        self.drop_inwit_ram_height(height.0);
+        self.drop_seqsigwit_ram_height(height.0);
         let spill_rows: Vec<(Fk, Vec<InputRecord>)> = staged
             .iter()
             .map(|(fk, ins, _)| (*fk, ins.clone()))
             .collect();
-        self.persist_inwit_spill_height(height, &spill_rows)?;
+        self.persist_seqsigwit_spill_height(height, &spill_rows)?;
         if threshold == 0 {
             return Ok(());
         }
-        let mut g = self.inwit_ram_window.lock().unwrap();
+        let mut g = self.seqsigwit_ram_window.lock().unwrap();
         let mut at_height: Vec<Fk> = Vec::with_capacity(staged.len());
         for (fk, ins, bytes) in staged {
             if let Some(id) = fk.get() {
@@ -855,7 +859,7 @@ impl Query {
             }
         }
         g.by_height.insert(height.0, at_height);
-        while g.by_height.len() > Self::INWIT_KEEP_HEIGHTS as usize || g.bytes > threshold {
+        while g.by_height.len() > Self::SEQSIGWIT_KEEP_HEIGHTS as usize || g.bytes > threshold {
             let Some((&old_h, old_fks)) = g.by_height.first_key_value() else {
                 break;
             };
@@ -875,13 +879,13 @@ impl Query {
         Ok(())
     }
 
-    fn seed_recent_inwit_from_store(&self) -> Result<(), QueryError> {
+    fn seed_recent_seqsigwit_from_store(&self) -> Result<(), QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(());
         };
         let from = tip
             .0
-            .saturating_sub(Self::INWIT_KEEP_HEIGHTS.saturating_sub(1));
+            .saturating_sub(Self::SEQSIGWIT_KEEP_HEIGHTS.saturating_sub(1));
         for h in from..=tip.0 {
             let tx_fks = match self.block_tx_fks(Height(h)) {
                 Ok(v) => v,
@@ -891,7 +895,7 @@ impl Query {
             if tx_fks.is_empty() {
                 continue;
             }
-            self.note_inwit_ram_for_confirmed(Height(h), &tx_fks)?;
+            self.note_seqsigwit_ram_for_confirmed(Height(h), &tx_fks)?;
         }
         Ok(())
     }
@@ -1717,13 +1721,13 @@ impl Query {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
         }
-        if let Some(inputs) = self.inwit_cached_inputs(create_fk, tx.input_count)? {
+        if let Some(inputs) = self.seqsigwit_cached_inputs(create_fk, tx.input_count)? {
             return inputs.get(i as usize).cloned().ok_or(StoreError::NotFound);
         }
-        self.require_inwit_fk(create_fk)?;
+        self.require_seqsigwit_fk(create_fk)?;
         let (_, inputs, _) = match self.store.get_tx_full(create_fk) {
             Ok(v) => v,
-            Err(StoreError::NotFound) if self.prune_inwit() => {
+            Err(StoreError::NotFound) if self.prune_seqsigwit() => {
                 let height = self.store.tx_height_get(create_fk)?.unwrap_or(0);
                 return Err(StoreError::Pruned { height });
             }
@@ -1735,9 +1739,9 @@ impl Query {
     pub(crate) fn tx_prevouts_for_fk(&self, fk: Fk) -> Result<Vec<(Fk, u32)>, QueryError> {
         match self.store.get_tx_meta_and_prevouts(fk) {
             Ok((_, prevs)) => Ok(prevs),
-            Err(StoreError::NotFound) if self.prune_inwit() => {
+            Err(StoreError::NotFound) if self.prune_seqsigwit() => {
                 let tx = self.get_tx(fk)?;
-                let Some(inputs) = self.inwit_cached_inputs(fk, tx.input_count)? else {
+                let Some(inputs) = self.seqsigwit_cached_inputs(fk, tx.input_count)? else {
                     let height = self.store.tx_height_get(fk)?.unwrap_or(0);
                     return Err(StoreError::Pruned { height });
                 };
@@ -1760,7 +1764,7 @@ impl Query {
 
     /// Output at `vout` for a known create fk (packed Class A works without head).
     ///
-    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `inwit`.
+    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `seqsigwit`.
     pub fn tx_output_at_fk(&self, create_fk: Fk, vout: u32) -> Result<OutputRecord, QueryError> {
         let (meta, outs) = self.store.get_tx_meta_and_outputs(create_fk)?;
         if vout >= meta.output_count {

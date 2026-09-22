@@ -5,11 +5,11 @@
 
 use rbitcoin_store::{
     block_header_hash, block_wire_input_count, clear_unsorted_shard_dir,
-    collect_unsorted_shard_files, decode_inwit_secret, decode_packed_tx_outs_with_spender_rels,
+    collect_unsorted_shard_files, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    encode_packed_tx, encode_packed_tx_with_secret, encode_txout_meta_and_outs,
-    encode_unspent_output_into_secret, ensure_nofile_budget, free_gib_label,
-    is_probe_exhausted_error, is_store_corrupt_display, leftover_probe_diag_ready,
+    decode_seqsigwit_secret, encode_packed_tx, encode_packed_tx_with_secret,
+    encode_txout_meta_and_outs, encode_unspent_output_into_secret, ensure_nofile_budget,
+    free_gib_label, is_probe_exhausted_error, is_store_corrupt_display, leftover_probe_diag_ready,
     leftover_probe_diag_recorded, list_materialize_claims, list_runs, load_tweak_wave,
     materialize_sh_unsorted_from_class_a, merkle_root_from_txids, next_run_path, output_flags,
     script_hash, sh_heads_insert_capped, spend_ann_backend, spend_meta_backend, spent_abs,
@@ -72,7 +72,7 @@ fn crate_root_exports_cross_crate_names() {
     let _ = write_sorted_run;
     let _ = clear_unsorted_shard_dir;
     let _ = collect_unsorted_shard_files;
-    let _ = decode_inwit_secret;
+    let _ = decode_seqsigwit_secret;
     let _ = decode_packed_tx_outs_with_spender_rels;
     let _ = decode_packed_tx_outs_with_spender_rels_secret;
     let _ = decode_packed_tx_with_spender_rels_secret;

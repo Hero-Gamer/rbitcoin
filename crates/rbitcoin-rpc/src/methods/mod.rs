@@ -648,7 +648,7 @@ const NAMED_HELP: &[(&str, &str)] = &[
          initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
          max-tip-age), not still catching up. chainwork is summed header work\n\
          (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
-         cold inwit when split). verificationprogress is blocks/headers (1.0 when\n\
+         cold seqsigwit when split). verificationprogress is blocks/headers (1.0 when\n\
          headers is 0).",
     ),
     (

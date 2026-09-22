@@ -49,7 +49,7 @@ pub(crate) fn tx_head_rebuild_workers_for_free_ram(cpus: usize, free_bytes: u64)
     crate::sorted_run::workers_for_free_ram(cpus, free_bytes, TX_HEAD_REBUILD_WORKER_FREE_RAM_BYTES)
 }
 
-/// Class A tx row (no wire blob — reconstruct from txout + inwit).
+/// Class A tx row (no wire blob — reconstruct from txout + seqsigwit).
 ///
 /// On-disk `txout.body` (schema **17**): thin LAYOUT17 meta then outputs (no spender).
 /// Identity lives in [`crate::txid_body::TxidBody`]. `txid` is filled in-memory
@@ -424,7 +424,7 @@ fn pread_two_spans(
             .unwrap_or(Err(StoreError::Corrupt("txout span thread")))?;
         let vb = tb
             .join()
-            .unwrap_or(Err(StoreError::Corrupt("inwit span thread")))?;
+            .unwrap_or(Err(StoreError::Corrupt("seqsigwit span thread")))?;
         Ok((va, vb))
     })
 }
@@ -432,12 +432,12 @@ fn pread_two_spans(
 pub struct TxTable {
     /// `txout.body` — meta + outputs (hot).
     pub(crate) body: VarTable,
-    /// `inwit.body` — inputs + witness (cold).
-    pub(crate) inwit: VarTable,
+    /// `seqsigwit.body` — inputs + witness (cold).
+    pub(crate) seqsigwit: VarTable,
     /// `spent.body` — 8 B × n_out sole-spender slots.
     pub(crate) spent: VarTable,
     pub(crate) create_loc: crate::create_loc::CreateLoc,
-    pub(crate) inwit_loc: crate::delta_loc::DeltaLoc,
+    pub(crate) seqsigwit_loc: crate::delta_loc::DeltaLoc,
     /// Segmented fixed-bits heads + seal-time fuse8.
     /// Segmented fixed-bits heads + seal-time fuse8.
     pub(crate) head: SegmentedTxHead,
@@ -453,7 +453,7 @@ pub struct TxTable {
     pending_head: pending_head::PendingHeadInserts,
     rebuild_seal_bits: u32,
     rebuild_workers: usize,
-    prune_inwit_mode: std::sync::atomic::AtomicBool,
+    prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
 }
 
 /// Structural-meta backend from env hierarchy.
@@ -491,18 +491,20 @@ fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc,
     }
 }
 
-fn open_or_create_inwit_loc(inwit_dir: &Path) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
-    if inwit_dir.join("inwit.loc").exists() {
-        crate::delta_loc::DeltaLoc::open(inwit_dir, "inwit")
-    } else if class_a_body_occupied(inwit_dir, "inwit") {
-        Err(StoreError::Corrupt("invariant: inwit.loc missing"))
+fn open_or_create_seqsigwit_loc(
+    seqsigwit_dir: &Path,
+) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
+    if seqsigwit_dir.join("seqsigwit.loc").exists() {
+        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
+    } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
+        Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
-        crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")
+        crate::delta_loc::DeltaLoc::create(seqsigwit_dir, "seqsigwit")
     }
 }
 
 fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
-    for stem in ["txout", "spent", "inwit"] {
+    for stem in ["txout", "spent", "seqsigwit"] {
         let p = dir.join(format!("{stem}.idx"));
         if p.exists() {
             if p.is_dir() {
@@ -511,7 +513,7 @@ fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
                 std::fs::remove_file(&p).map_err(|e| StoreError::io(&p, e))?;
             }
             rbitcoin_log::warn!(
-                "store: dropping leftover {stem}.idx (schema 22 uses create.loc / inwit.loc)"
+                "store: dropping leftover {stem}.idx (schema 22 uses create.loc / seqsigwit.loc)"
             );
         }
     }
@@ -520,10 +522,10 @@ fn unlink_leftover_class_a_idx(dir: &Path) -> Result<(), StoreError> {
 
 struct ClassASkewStems<'a> {
     create_loc: &'a crate::create_loc::CreateLoc,
-    inwit_loc: &'a crate::delta_loc::DeltaLoc,
+    seqsigwit_loc: &'a crate::delta_loc::DeltaLoc,
     body: &'a VarTable,
     spent: &'a VarTable,
-    inwit: &'a VarTable,
+    seqsigwit: &'a VarTable,
     txids: &'a crate::txid_body::TxidBody,
     txstat: &'a crate::txstat::TxStat,
     inputs: &'a crate::inputs::Inputs,
@@ -532,23 +534,23 @@ struct ClassASkewStems<'a> {
 fn class_a_skew_target_count(
     n_loc: u64,
     n_txids: u64,
-    n_inwit_loc: u64,
-    prune_inwit_mode: bool,
+    n_seqsigwit_loc: u64,
+    prune_seqsigwit_mode: bool,
 ) -> Option<u64> {
-    if n_txids == n_loc && (prune_inwit_mode || n_inwit_loc == n_loc) {
+    if n_txids == n_loc && (prune_seqsigwit_mode || n_seqsigwit_loc == n_loc) {
         return None;
     }
-    Some(if prune_inwit_mode {
+    Some(if prune_seqsigwit_mode {
         n_loc.min(n_txids)
     } else {
-        n_loc.min(n_txids).min(n_inwit_loc)
+        n_loc.min(n_txids).min(n_seqsigwit_loc)
     })
 }
 
 fn class_a_skew_stem_ends(
     stems: &ClassASkewStems<'_>,
     n: u64,
-    prune_inwit_mode: bool,
+    prune_seqsigwit_mode: bool,
 ) -> Result<(u64, u64, u64), StoreError> {
     if n == 0 {
         let h = crate::file::FILE_HEADER_LEN as u64;
@@ -561,17 +563,17 @@ fn class_a_skew_stem_ends(
         .next()
         .flatten()
         .ok_or(StoreError::Corrupt("invariant: loc range for truncate"))?;
-    let in_end = if prune_inwit_mode {
+    let in_end = if prune_seqsigwit_mode {
         crate::file::FILE_HEADER_LEN as u64
     } else {
         let ir = stems
-            .inwit_loc
+            .seqsigwit_loc
             .range_batch(&[Fk(n)])?
             .into_iter()
             .next()
             .flatten()
             .ok_or(StoreError::Corrupt(
-                "invariant: inwit.loc range for truncate",
+                "invariant: seqsigwit.loc range for truncate",
             ))?;
         ir.0.saturating_add(ir.1)
     };
@@ -589,16 +591,16 @@ fn class_a_skew_apply_truncate(
     tx_end: u64,
     sp_end: u64,
     in_end: u64,
-    prune_inwit_mode: bool,
+    prune_seqsigwit_mode: bool,
 ) -> Result<(), StoreError> {
     stems.create_loc.truncate_to_count(n)?;
-    if !prune_inwit_mode {
-        stems.inwit_loc.truncate_to_count(n)?;
+    if !prune_seqsigwit_mode {
+        stems.seqsigwit_loc.truncate_to_count(n)?;
     }
     stems.body.truncate_body_to(n, tx_end)?;
     stems.spent.truncate_body_to(n, sp_end)?;
-    if !prune_inwit_mode {
-        stems.inwit.truncate_body_to(n, in_end)?;
+    if !prune_seqsigwit_mode {
+        stems.seqsigwit.truncate_body_to(n, in_end)?;
     }
     if n_txids > n {
         stems.txids.truncate_to_count(n)?;
@@ -614,7 +616,7 @@ fn class_a_skew_apply_truncate(
 
 fn class_a_skew_assert_aligned(
     stems: &ClassASkewStems<'_>,
-    prune_inwit_mode: bool,
+    prune_seqsigwit_mode: bool,
 ) -> Result<(), StoreError> {
     if stems.body.count() != stems.txids.count() || stems.create_loc.count() != stems.txids.count()
     {
@@ -622,7 +624,7 @@ fn class_a_skew_assert_aligned(
             "Class A stem counts still mismatch after repair (reindex required)",
         ));
     }
-    if !prune_inwit_mode && stems.inwit_loc.count() != stems.txids.count() {
+    if !prune_seqsigwit_mode && stems.seqsigwit_loc.count() != stems.txids.count() {
         return Err(StoreError::Corrupt(
             "Class A stem counts still mismatch after repair (reindex required)",
         ));
@@ -632,21 +634,30 @@ fn class_a_skew_assert_aligned(
 
 fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
-    prune_inwit_mode: bool,
+    prune_seqsigwit_mode: bool,
 ) -> Result<(), StoreError> {
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
-    let n_inwit_loc = stems.inwit_loc.count();
-    let Some(n) = class_a_skew_target_count(n_loc, n_txids, n_inwit_loc, prune_inwit_mode) else {
+    let n_seqsigwit_loc = stems.seqsigwit_loc.count();
+    let Some(n) = class_a_skew_target_count(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode)
+    else {
         return Ok(());
     };
     rbitcoin_log::warn!(
-        "store: Class A count skew loc={n_loc} inwit.loc={n_inwit_loc} \
+        "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
          txid.body={n_txids} — truncating to {n}"
     );
-    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_inwit_mode)?;
-    class_a_skew_apply_truncate(&stems, n, n_txids, tx_end, sp_end, in_end, prune_inwit_mode)?;
-    class_a_skew_assert_aligned(&stems, prune_inwit_mode)
+    let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
+    class_a_skew_apply_truncate(
+        &stems,
+        n,
+        n_txids,
+        tx_end,
+        sp_end,
+        in_end,
+        prune_seqsigwit_mode,
+    )?;
+    class_a_skew_assert_aligned(&stems, prune_seqsigwit_mode)
 }
 
 impl TxTable {
@@ -676,37 +687,37 @@ impl TxTable {
         layout: HeadLayout,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        Self::create_with_head_layout_inwit(dir, dir, layout, opts)
+        Self::create_with_head_layout_seqsigwit(dir, dir, layout, opts)
     }
 
-    /// Create Class A stems; `inwit` may live in a different directory.
-    pub(crate) fn create_with_head_layout_inwit(
+    /// Create Class A stems; `seqsigwit` may live in a different directory.
+    pub(crate) fn create_with_head_layout_seqsigwit(
         dir: &Path,
-        inwit_dir: &Path,
+        seqsigwit_dir: &Path,
         layout: HeadLayout,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        if inwit_dir != dir {
-            std::fs::create_dir_all(inwit_dir).map_err(|e| StoreError::io(inwit_dir, e))?;
+        if seqsigwit_dir != dir {
+            std::fs::create_dir_all(seqsigwit_dir).map_err(|e| StoreError::io(seqsigwit_dir, e))?;
         }
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let layout = HeadLayout::with_entry_bytes(layout.bits, 4)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         Ok(Self {
             body: VarTable::create(dir, "txout", TableKind::TxOut)?,
-            inwit: VarTable::create(inwit_dir, "inwit", TableKind::Inwit)?,
+            seqsigwit: VarTable::create(seqsigwit_dir, "seqsigwit", TableKind::SeqSigWit)?,
             spent: VarTable::create(dir, "spent", TableKind::Spent)?,
             create_loc: crate::create_loc::CreateLoc::create(dir)?,
-            inwit_loc: crate::delta_loc::DeltaLoc::create(inwit_dir, "inwit")?,
+            seqsigwit_loc: crate::delta_loc::DeltaLoc::create(seqsigwit_dir, "seqsigwit")?,
             head: SegmentedTxHead::create(dir, layout)?,
             txids: crate::txid_body::TxidBody::create(dir)?,
-            txstat: crate::txstat::TxStat::create(dir)?,
-            inputs: crate::inputs::Inputs::create(dir)?,
+            txstat: crate::txstat::TxStat::create(seqsigwit_dir)?,
+            inputs: crate::inputs::Inputs::create(seqsigwit_dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
-            prune_inwit_mode: std::sync::atomic::AtomicBool::new(false),
+            prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -750,52 +761,54 @@ impl TxTable {
     }
 
     pub fn open_with_opts(dir: &Path, opts: HeadOpenOpts) -> Result<Self, StoreError> {
-        Self::open_inwit(dir, dir, opts)
+        Self::open_seqsigwit(dir, dir, opts)
     }
 
-    /// Open Class A stems; `inwit` may live in a different directory.
-    pub(crate) fn open_inwit(
+    /// Open Class A stems; `seqsigwit` may live in a different directory.
+    pub(crate) fn open_seqsigwit(
         dir: &Path,
-        inwit_dir: &Path,
+        seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
     ) -> Result<Self, StoreError> {
-        let prune_inwit_mode = false;
+        let prune_seqsigwit_mode = false;
+        crate::store::rename_legacy_inwit_files(dir)?;
+        crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         refuse_schema15_packed_tx_body(dir)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
-        if inwit_dir != dir {
-            unlink_leftover_class_a_idx(inwit_dir)?;
-            std::fs::create_dir_all(inwit_dir).map_err(|e| StoreError::io(inwit_dir, e))?;
+        if seqsigwit_dir != dir {
+            unlink_leftover_class_a_idx(seqsigwit_dir)?;
+            std::fs::create_dir_all(seqsigwit_dir).map_err(|e| StoreError::io(seqsigwit_dir, e))?;
         }
         let had_txout = dir.join("txout.body").exists();
-        let had_inwit = inwit_dir.join("inwit.body").exists();
+        let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
         let create_loc = open_or_create_create_loc(dir)?;
-        let inwit_loc = open_or_create_inwit_loc(inwit_dir)?;
+        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
         let loc_count = create_loc.count();
-        if !prune_inwit_mode && inwit_loc.count() != loc_count {
-            return Err(StoreError::Corrupt("invariant: inwit.loc count"));
+        if !prune_seqsigwit_mode && seqsigwit_loc.count() != loc_count {
+            return Err(StoreError::Corrupt("invariant: seqsigwit.loc count"));
         }
         let body = if had_txout {
             VarTable::open_body_only(dir, "txout", TableKind::TxOut, loc_count)?
         } else {
             VarTable::create_body_only(dir, "txout", TableKind::TxOut)?
         };
-        if had_txout && loc_count > 0 && (!had_spent || (!had_inwit && !prune_inwit_mode)) {
+        if had_txout && loc_count > 0 && (!had_spent || (!had_seqsigwit && !prune_seqsigwit_mode)) {
             return Err(StoreError::Corrupt(
-                "schema 15 Class A missing inwit/spent for existing txout creates; wipe + IBD \
-                 (or --datadir-cold if inwit is on a cold volume)",
+                "schema 15 Class A missing seqsigwit/spent for existing txout creates; wipe + IBD \
+                 (or --datadir-cold if seqsigwit is on a cold volume)",
             ));
         }
-        let inwit = if had_inwit {
-            let in_count = if prune_inwit_mode {
-                inwit_loc.count()
+        let seqsigwit = if had_seqsigwit {
+            let in_count = if prune_seqsigwit_mode {
+                seqsigwit_loc.count()
             } else {
                 loc_count
             };
-            VarTable::open_body_only(inwit_dir, "inwit", TableKind::Inwit, in_count)?
+            VarTable::open_body_only(seqsigwit_dir, "seqsigwit", TableKind::SeqSigWit, in_count)?
         } else {
-            VarTable::create_body_only(inwit_dir, "inwit", TableKind::Inwit)?
+            VarTable::create_body_only(seqsigwit_dir, "seqsigwit", TableKind::SeqSigWit)?
         };
         let spent = if had_spent {
             VarTable::open_body_only(dir, "spent", TableKind::Spent, loc_count)?
@@ -807,26 +820,46 @@ impl TxTable {
         } else {
             crate::txid_body::TxidBody::create(dir)?
         };
-        let txstat = crate::txstat::TxStat::open(dir)?;
-        let inputs = if dir.join("inputs.loc").exists() {
-            crate::inputs::Inputs::open(dir)?
-        } else if dir.join("inputs.body").exists() || dir.join("inputs.off").exists() {
+        if seqsigwit_dir != dir {
+            for name in [
+                "txstat.body",
+                "txstat.ovf",
+                "txstat.blk",
+                "inputs.loc",
+                "inputs.off",
+                "inputs.body",
+            ] {
+                if dir.join(name).exists() && !seqsigwit_dir.join(name).exists() {
+                    return Err(StoreError::Layout(format!(
+                        "{name} is still in {}; move it next to seqsigwit under {}",
+                        dir.display(),
+                        seqsigwit_dir.display()
+                    )));
+                }
+            }
+        }
+        let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
+        let inputs = if seqsigwit_dir.join("inputs.loc").exists() {
+            crate::inputs::Inputs::open(seqsigwit_dir)?
+        } else if seqsigwit_dir.join("inputs.body").exists()
+            || seqsigwit_dir.join("inputs.off").exists()
+        {
             return Err(StoreError::Corrupt("invariant: inputs stems partial"));
         } else {
-            crate::inputs::Inputs::create(dir)?
+            crate::inputs::Inputs::create(seqsigwit_dir)?
         };
         repair_class_a_count_skew(
             ClassASkewStems {
                 create_loc: &create_loc,
-                inwit_loc: &inwit_loc,
+                seqsigwit_loc: &seqsigwit_loc,
                 body: &body,
                 spent: &spent,
-                inwit: &inwit,
+                seqsigwit: &seqsigwit,
                 txids: &txids,
                 txstat: &txstat,
                 inputs: &inputs,
             },
-            prune_inwit_mode,
+            prune_seqsigwit_mode,
         )?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
@@ -900,10 +933,10 @@ impl TxTable {
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
         let t = Self {
             body,
-            inwit,
+            seqsigwit,
             spent,
             create_loc,
-            inwit_loc,
+            seqsigwit_loc,
             head,
             txids,
             txstat,
@@ -912,7 +945,7 @@ impl TxTable {
             pending_head: pending_head::PendingHeadInserts::new(),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
-            prune_inwit_mode: std::sync::atomic::AtomicBool::new(prune_inwit_mode),
+            prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
         };
         if n_bodies > 0 {
             let _ = t.inputs.n_in(Fk(1))?;
@@ -964,19 +997,19 @@ impl TxTable {
         Ok(t)
     }
 
-    pub fn prune_inwit_mode(&self) -> bool {
-        self.prune_inwit_mode
+    pub fn prune_seqsigwit_mode(&self) -> bool {
+        self.prune_seqsigwit_mode
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn set_prune_inwit_mode(&self, on: bool) {
-        self.prune_inwit_mode
+    pub fn set_prune_seqsigwit_mode(&self, on: bool) {
+        self.prune_seqsigwit_mode
             .store(on, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn clear_durable_inwit(&self) -> Result<(), StoreError> {
-        self.inwit_loc.truncate_to_count(0)?;
-        self.inwit
+    pub fn clear_durable_seqsigwit(&self) -> Result<(), StoreError> {
+        self.seqsigwit_loc.truncate_to_count(0)?;
+        self.seqsigwit
             .truncate_body_to(0, crate::file::FILE_HEADER_LEN as u64)
     }
 
@@ -1157,11 +1190,11 @@ impl TxTable {
         Ok(())
     }
 
-    pub(crate) fn fill_inwit_job_ranges(
+    pub(crate) fn fill_seqsigwit_job_ranges(
         &self,
         jobs: &mut [crate::IdxBodyJob],
     ) -> Result<(), StoreError> {
-        if self.prune_inwit_mode() {
+        if self.prune_seqsigwit_mode() {
             return Ok(());
         }
         let mut need = Vec::new();
@@ -1175,7 +1208,7 @@ impl TxTable {
         if need.is_empty() {
             return Ok(());
         }
-        let pairs = self.inwit_loc.range_batch(&need)?;
+        let pairs = self.seqsigwit_loc.range_batch(&need)?;
         for (slot, p) in slots.into_iter().zip(pairs) {
             jobs[slot].range = p;
         }
@@ -1228,20 +1261,22 @@ impl TxTable {
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
-    /// Stamped `txstat` supplies `n_in` so this path is 8 B + inwit (no txout).
+    /// Stamped `txstat` supplies `n_in` so this path is 8 B + seqsigwit (no txout).
     /// Leftover unstamped rows still decode LAYOUT17 uleb from `txout`.
     pub fn get_meta_and_prevouts(&self, fk: Fk) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-        if self.prune_inwit_mode() {
+        if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
         let ir = self
-            .inwit_loc
+            .seqsigwit_loc
             .range_batch(&[fk])?
             .into_iter()
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)?;
-        let inwit = self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
+        let seqsigwit = self
+            .seqsigwit
+            .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
         let mut tx = if let Some(n_in) = self.inputs.n_in(fk)? {
             TxRecord {
                 txid: [0u8; 32],
@@ -1255,7 +1290,7 @@ impl TxTable {
         } else {
             self.get(fk)?
         };
-        let prevs = scan_inwit_prevouts(&inwit, tx.input_count)?;
+        let prevs = scan_seqsigwit_prevouts(&seqsigwit, tx.input_count)?;
         tx.txid = self.txids.get(fk)?;
         Ok((tx, prevs))
     }
@@ -1457,12 +1492,12 @@ impl TxTable {
             .collect())
     }
 
-    /// `inwit.body` range for one create.
-    pub fn inwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        if self.prune_inwit_mode() {
+    /// `seqsigwit.body` range for one create.
+    pub fn seqsigwit_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
-        self.inwit_loc
+        self.seqsigwit_loc
             .range_batch(&[fk])?
             .into_iter()
             .next()
@@ -1793,12 +1828,12 @@ impl TxTable {
         Ok(())
     }
 
-    /// Full tx: `txout` + `inwit` zip.
+    /// Full tx: `txout` + `seqsigwit` zip.
     pub fn get_full(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
-        if self.prune_inwit_mode() {
+        if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
         let pair = self
@@ -1813,17 +1848,19 @@ impl TxTable {
         let (mut tx, _ins, outs, _) =
             decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         let ir = self
-            .inwit_loc
+            .seqsigwit_loc
             .range_batch(&[fk])?
             .into_iter()
             .next()
             .flatten()
             .ok_or(StoreError::NotFound)?;
-        let inwit = self.inwit.with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
+        let seqsigwit = self
+            .seqsigwit
+            .with_bytes_at(ir.0, ir.1, |b| Ok(b.to_vec()))?;
         let ins = if tx.input_count == 0 {
-            decode_inwit_secret_to_end(&inwit, Some(&self.secret))?
+            decode_seqsigwit_secret_to_end(&seqsigwit, Some(&self.secret))?
         } else {
-            decode_inwit_secret(&inwit, tx.input_count, Some(&self.secret))?
+            decode_seqsigwit_secret(&seqsigwit, tx.input_count, Some(&self.secret))?
         };
         tx.input_count = ins.len() as u32;
         tx.txid = self.txids.get(fk)?;
@@ -1831,9 +1868,9 @@ impl TxTable {
     }
 
     /// Contiguous create_fks `first..=last`: one libc span each of `txout.body`
-    /// and `inwit.body`, plus `txid.body` range. Not the confirm uring pipeline.
+    /// and `seqsigwit.body`, plus `txid.body` range. Not the confirm uring pipeline.
     pub fn get_full_span(&self, first: u64, last: u64) -> Result<Vec<PackedTx>, StoreError> {
-        if self.prune_inwit_mode() {
+        if self.prune_seqsigwit_mode() {
             return Err(StoreError::NotFound);
         }
         if first == 0 {
@@ -1852,12 +1889,12 @@ impl TxTable {
             txout_ranges.push(p.txout);
             n_outs.push(p.n_out);
         }
-        let inwit_pairs = self.inwit_loc.range_batch(&fks)?;
-        let mut inwit_ranges = Vec::with_capacity(n);
-        for p in inwit_pairs {
-            inwit_ranges.push(p.ok_or(StoreError::NotFound)?);
+        let seqsigwit_pairs = self.seqsigwit_loc.range_batch(&fks)?;
+        let mut seqsigwit_ranges = Vec::with_capacity(n);
+        for p in seqsigwit_pairs {
+            seqsigwit_ranges.push(p.ok_or(StoreError::NotFound)?);
         }
-        if txout_ranges.len() != n || inwit_ranges.len() != n {
+        if txout_ranges.len() != n || seqsigwit_ranges.len() != n {
             return Err(StoreError::Corrupt("invariant: full span range count"));
         }
         let (t0, _) = txout_ranges[0];
@@ -1866,30 +1903,30 @@ impl TxTable {
             .checked_add(tln)
             .and_then(|end| end.checked_sub(t0))
             .ok_or(StoreError::Corrupt("txout span"))?;
-        let (i0, _) = inwit_ranges[0];
-        let (inn, iln) = inwit_ranges[n - 1];
+        let (i0, _) = seqsigwit_ranges[0];
+        let (inn, iln) = seqsigwit_ranges[n - 1];
         let ispan = inn
             .checked_add(iln)
             .and_then(|end| end.checked_sub(i0))
-            .ok_or(StoreError::Corrupt("inwit span"))?;
+            .ok_or(StoreError::Corrupt("seqsigwit span"))?;
         let ids = self.txids.get_range(first, last)?;
         if ids.len() != n {
             return Err(StoreError::Corrupt("invariant: txid.body span length"));
         }
-        let (txout_span, inwit_span) =
-            pread_two_spans(&self.body, t0, tspan, &self.inwit, i0, ispan, true)?;
+        let (txout_span, seqsigwit_span) =
+            pread_two_spans(&self.body, t0, tspan, &self.seqsigwit, i0, ispan, true)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let (toff, tlen) = txout_ranges[i];
-            let (ioff, ilen) = inwit_ranges[i];
+            let (ioff, ilen) = seqsigwit_ranges[i];
             let traw = span_rec(&txout_span, t0, toff, tlen)?;
-            let iraw = span_rec(&inwit_span, i0, ioff, ilen)?;
+            let iraw = span_rec(&seqsigwit_span, i0, ioff, ilen)?;
             let (mut tx, _ins, outs, _) =
                 decode_packed_tx_with_spender_rels_secret(traw, n_outs[i], Some(&self.secret))?;
             let ins = if tx.input_count == 0 {
-                decode_inwit_secret_to_end(iraw, Some(&self.secret))?
+                decode_seqsigwit_secret_to_end(iraw, Some(&self.secret))?
             } else {
-                decode_inwit_secret(iraw, tx.input_count, Some(&self.secret))?
+                decode_seqsigwit_secret(iraw, tx.input_count, Some(&self.secret))?
             };
             tx.input_count = ins.len() as u32;
             tx.txid = ids[i];
@@ -1987,7 +2024,7 @@ impl TxTable {
         Ok(())
     }
 
-    /// Append Class A rows: `txout` + `inwit` + zero `spent` + `txid.body` + `txstat.body`.
+    /// Append Class A rows: `txout` + `seqsigwit` + zero `spent` + `txid.body` + `txstat.body`.
     pub fn put_full_batch_indexed(
         &self,
         items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
@@ -2015,7 +2052,7 @@ impl TxTable {
                 16 + TxRecord::BODY_META_LEN + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
             })
             .sum();
-        let est_inwit: usize = items
+        let est_seqsigwit: usize = items
             .iter()
             .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
@@ -2024,7 +2061,7 @@ impl TxTable {
             .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
             .sum();
         let base = self.body.count();
-        if (!self.prune_inwit_mode() && self.inwit.count() != base)
+        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
             || self.inputs.count() != base
@@ -2044,14 +2081,14 @@ impl TxTable {
         let (fks, _loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
-            est_inwit,
+            est_seqsigwit,
             est_spent,
             &n_outs,
             |i, buf| {
                 let (tx, ins, outs) = &items[i];
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
             },
-            |i, buf| encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+            |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
             |i, buf| encode_spent_zeros(items[i].2.len() as u32, buf),
         )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
@@ -2086,10 +2123,8 @@ impl TxTable {
         index: bool,
         spent_overlay: &[Vec<(u32, Fk, u32)>],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        let rows: Vec<crate::txstat::TxStatRow> = items
-            .iter()
-            .map(|_| txstat_placeholder())
-            .collect();
+        let rows: Vec<crate::txstat::TxStatRow> =
+            items.iter().map(|_| txstat_placeholder()).collect();
         self.put_full_batch_from_pins_with_txstat(items, index, spent_overlay, &rows, &[])
     }
 
@@ -2111,7 +2146,7 @@ impl TxTable {
             return Err(StoreError::Corrupt("spent overlay length"));
         }
         let est_out: usize = items.iter().map(|(pin, _ins)| pin.packed_outs_est()).sum();
-        let est_inwit: usize = items
+        let est_seqsigwit: usize = items
             .iter()
             .map(|(_pin, ins)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
@@ -2120,7 +2155,7 @@ impl TxTable {
             .map(|(pin, _ins)| 16 + spent_record_len(pin.packed_n_out()) as usize)
             .sum();
         let base = self.body.count();
-        if (!self.prune_inwit_mode() && self.inwit.count() != base)
+        if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
             || self.txstat.count() != base
             || self.inputs.count() != base
@@ -2147,13 +2182,13 @@ impl TxTable {
         let (fks, loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
-            est_inwit,
+            est_seqsigwit,
             est_spent,
             &n_outs,
             |i, buf| {
                 items[i].0.encode_txout_body(buf, Some(&self.secret));
             },
-            |i, buf| encode_inwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+            |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
             |i, buf| {
                 let n_out = items[i].0.packed_n_out();
                 let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -2180,7 +2215,7 @@ impl TxTable {
     }
 
     #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
-    /// Encode and write `txout` + `inwit` + `spent` bodies as one pwrite wave.
+    /// Encode and write `txout` + `seqsigwit` + `spent` bodies as one pwrite wave.
     ///
     /// Order is still body → loc → HWM per stem. Not the spend-annotate machine.
     /// Loc pairs are the append starts (write keeps them in RAM; no loc pread).
@@ -2188,7 +2223,7 @@ impl TxTable {
         &self,
         n: usize,
         est_out: usize,
-        est_inwit: usize,
+        est_seqsigwit: usize,
         est_spent: usize,
         n_outs: &[u32],
         encode_out: impl FnMut(usize, &mut Vec<u8>),
@@ -2222,7 +2257,7 @@ impl TxTable {
             });
         }
 
-        if self.prune_inwit_mode() {
+        if self.prune_seqsigwit_mode() {
             crate::var_table::write_prepared_bodies_one_wave(&[
                 (&self.body, &p_out),
                 (&self.spent, &p_sp),
@@ -2238,18 +2273,22 @@ impl TxTable {
             return Ok((fks, loc));
         }
 
-        let Some(p_in) = self.inwit.prepare_batch_encode(n, est_inwit, encode_in)? else {
-            return Err(StoreError::Corrupt("Class A inwit prepare empty"));
+        let Some(p_in) = self
+            .seqsigwit
+            .prepare_batch_encode(n, est_seqsigwit, encode_in)?
+        else {
+            return Err(StoreError::Corrupt("Class A seqsigwit prepare empty"));
         };
         crate::var_table::write_prepared_bodies_one_wave(&[
             (&self.body, &p_out),
-            (&self.inwit, &p_in),
+            (&self.seqsigwit, &p_in),
             (&self.spent, &p_sp),
         ])?;
         self.create_loc.append(&recs)?;
-        self.inwit_loc.append(&p_in.starts, &p_in.aligned_lens())?;
+        self.seqsigwit_loc
+            .append(&p_in.starts, &p_in.aligned_lens())?;
         let fks = self.body.finish_prepared(p_out)?;
-        let fks_in = self.inwit.finish_prepared(p_in)?;
+        let fks_in = self.seqsigwit.finish_prepared(p_in)?;
         let fks_sp = self.spent.finish_prepared(p_sp)?;
         if fks != fks_in || fks != fks_sp {
             return Err(StoreError::Corrupt(
@@ -2674,7 +2713,7 @@ impl TxTable {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
-        self.inwit.flush()?;
+        self.seqsigwit.flush()?;
         self.spent.flush()?;
         self.head.flush()?;
         Ok(())
@@ -2682,7 +2721,7 @@ impl TxTable {
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
-        self.inwit.flush_async()?;
+        self.seqsigwit.flush_async()?;
         self.spent.flush_async()?;
         self.head.flush_async()?;
         Ok(())

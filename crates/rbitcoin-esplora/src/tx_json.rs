@@ -173,7 +173,11 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
 }
 
 /// Parent txid and vout from `inputs.body`. No scriptSig, witness, or sequence.
-fn pruned_vin(query: &Query, tx_fk: Fk, network: Network) -> Result<Option<Vec<Value>>, QueryError> {
+fn pruned_vin(
+    query: &Query,
+    tx_fk: Fk,
+    network: Network,
+) -> Result<Option<Vec<Value>>, QueryError> {
     let Some(edges) = query.store().input_edges(tx_fk)? else {
         return Ok(None);
     };
@@ -847,7 +851,7 @@ mod tests {
         let parent_id = spend1_fk.get().unwrap();
         assert!(
             !q.store().tx_full_gets().contains(&parent_id),
-            "parent prevout must not zip inwit: {:?}",
+            "parent prevout must not zip seqsigwit: {:?}",
             q.store().tx_full_gets()
         );
         assert_eq!(v["txid"], block_hash_hex(&spend2_txid));

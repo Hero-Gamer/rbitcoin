@@ -95,7 +95,7 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         "initialblockdownload": ibd,
         "chainwork": chainwork_hex(ctx, ctx.query.tip_height()),
         "size_on_disk": ctx.query.store().datadir_bytes(),
-        "pruned": ctx.query.prune_inwit(),
+        "pruned": ctx.query.prune_seqsigwit(),
         "warnings": rpc_warnings(ctx),
     });
     if let Some(h) = ctx.query.pruneheight() {

@@ -11,8 +11,8 @@ binary refuses 25 `meta`. 24 is `header.body` 96 B (trailing `size:u32` + `weigh
 confirm stamps or lazy fill). SH extent last-page reserved (offset 20) is create
 count (`0` = unknown; readers walk, appender stamps on pack/append). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
 u32) so a consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22
-Class A rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `inwit.loc` (no
-Class A `{txout,spent,inwit}.idx`), LAYOUT17 without `output_count`, and spent
+Class A rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `seqsigwit.loc` (no
+Class A `{txout,spent,seqsigwit}.idx`), LAYOUT17 without `output_count`, and spent
 slots flags + u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bits
 4–7 = decimal exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`). Encoding
 is canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa
@@ -44,7 +44,7 @@ format code:
 **13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
 rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
 (or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
-`txout` + `inwit` + `spent` (not a single packed `tx.body`).  
+`txout` + `seqsigwit` + `spent` (not a single packed `tx.body`).  
 **15→17 open:** leftover `tx_height.body` is unlinked (RAM fence). Class A
 with creates in the 16-byte-meta / 9-byte-spent layout is **refused**
 (wipe datadir and redo IBD). Empty Class A may rewrite `meta`.  
@@ -104,9 +104,9 @@ schema 18.
 
 | Object | Frozen choice |
 |--------|----------------|
-| Class A | Split `txout` / `inwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
+| Class A | Split `txout` / `seqsigwit` / `spent`; thin LAYOUT17 meta; kinds **0–9**; 8 B spent slots; `spent.ovf` |
 | Identity | Dense `txid.body` (32 B/fk); segmented `tx.head` (25-bit + fuse8 v2) |
-| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `inwit.loc`; leftover Class A `{txout,spent,inwit}.idx/` unlinked on empty 21–24. Flat `*.idx.meta` **refused**. |
+| Loc | `create.loc` (2 B/create + `create.off` + ovf) and cold `seqsigwit.loc`; leftover Class A `{txout,spent,seqsigwit}.idx/` unlinked on empty 21–24. Flat `*.idx.meta` **refused**. |
 | Class B | SH runs `key_len=40` unique `(sh, create_fk)`; megakey pages ULEB deltas (`ver=1`); body **dir** (sharded). Leftover file body **refused**. Slab **class** is the byte allocation (32…2048); `used` is the fk count and may exceed the old geometric `slab_cap(class)` when the ULEB stream fits. Decode `used` fks from the payload. |
 | Class C | `confirmed[]` + `header_txs_*`; no `tx_height.body`; `strong_tx` bitset |
 | Tweaks | Segmented `sp_tweaks.idx/` + `sp_tweaks.body/` (`off:u32`, body `0`/`33`) |
@@ -120,7 +120,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 
 | Policy | Choice |
 |--------|--------|
-| Loc | One loc pair per create; `inwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
+| Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) still caps **`confirmed`** and **`header_txs_*`** only. |
 | `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
 
@@ -137,8 +137,8 @@ at 17:
 
 Use RAW when the type is rare. Use a kind-nibble bump when the type is common
 enough to pay a width table. That bump is not a silent in-place rewrite of
-existing files. Inwit `create_fk` Δfk (parked) is the same class: a
-`SCHEMA_VERSION` bump or an inwit-only rewrite, not a silent mutate of
+existing files. SeqSigWit `create_fk` Δfk (parked) is the same class: a
+`SCHEMA_VERSION` bump or an seqsigwit-only rewrite, not a silent mutate of
 existing rows.
 
 ### Field widths (10 years)
@@ -152,7 +152,7 @@ Assume ~400k–700k creates/day. Ten years ≈ +1.5e9…2.6e9 creates on top of
 | Spent spend fk | u40 | 2^40 ids ≈ 1.1e12 creates; census ~1.42e9 at h=962k. `fk ≥ 2^40` is Corrupt (no wrap) |
 | Spent vin | u16 | Consensus max inputs at 400 kWU is ~2.4k. `vin ≥ 2^16` is Corrupt |
 | Height / `confirmed[]` index | u32 | ~1e6 heights now; 10y adds ~0.5e6; year 2106 is **timestamp**, not height |
-| Loc strides | u8 (create) / u16 (inwit) | Overflow sidecar: `create.loc.ovf` **u32** strides + **u32** `n_out` (schema 23); `inwit.loc.ovf` u32 strides. Sentinel when txout ≥ 2048 B aligned or `n_out ≥ 256`; inwit ≥ 512 KiB |
+| Loc strides | u8 (create) / u16 (seqsigwit) | Overflow sidecar: `create.loc.ovf` **u32** strides + **u32** `n_out` (schema 23); `seqsigwit.loc.ovf` u32 strides. Sentinel when txout ≥ 2048 B aligned or `n_out ≥ 256`; seqsigwit ≥ 512 KiB |
 | `tx.head` bits | 25-bit segments | Roll + seal; no mono-file widen |
 | SH megakey page | 4 KiB delta stream | Page chain; not a single-integer cap |
 | `sp_tweaks` off | u32 per segment | Already segmented |
@@ -170,7 +170,7 @@ live `SCHEMA_VERSION`, not from 17.
 | Change | Bump? | Notes |
 |--------|-------|-------|
 | New implicit-width script kind | Optional | RAW = no bump; nibble = next `SCHEMA_VERSION` (this binary refuses it) |
-| Inwit Δfk | Yes or inwit-only rewrite | Parked; cold stem |
+| SeqSigWit Δfk | Yes or seqsigwit-only rewrite | Parked; cold stem |
 | Idx not stride-8 / not u32 | Yes | Would retire the 8-align pad |
 | Packed Class A again / merge stems | Yes | Wipe |
 | SH `key_len` ≠ 40 or raw-u64 pages | Yes | 17 already refuses leftovers |
@@ -178,9 +178,9 @@ live `SCHEMA_VERSION`, not from 17.
 | Fuse8 envelope v3 | No | Soft-migrate like v1→v2 (log + rewrite; no wipe) |
 | Independent rolls / L2 strong / no DONTCACHE | No | Writer/RAM only |
 
-Parked size work that is **not** a live-layout tweak: inwit Δfk; drop 8-align
-pad on empty inwit / zero-out spent (needs a different idx encoding);
-`txid.body` compression. Do not chase `inwit` size as an IBD **hot-set**
+Parked size work that is **not** a live-layout tweak: seqsigwit Δfk; drop 8-align
+pad on empty seqsigwit / zero-out spent (needs a different idx encoding);
+`txid.body` compression. Do not chase `seqsigwit` size as an IBD **hot-set**
 win — put it on a cold volume (`--datadir-cold`). Census:
 [Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13).
 
@@ -195,7 +195,7 @@ itself changed.
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Class A body | **Split** `txout` (thin meta + template outs) + `inwit` + `spent` (8 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
+| Class A body | **Split** `txout` (thin meta + template outs) + `seqsigwit` + `spent` (8 B×n_out) | Pin/SH read outs only; annotate isolates scripts |
 | Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand via sidefile, not body peeks |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
 | Txid → create | Segmented keyless **`tx.head.*`** (25-bit OA open + MPHF/fuse sealed) | Open page from `mix_txid`; seal-time value-assigned MPHF + fuse8; **txid.body** verifies identity |
@@ -213,10 +213,10 @@ itself changed.
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index (overflow: header.head.gN)
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
-    inwit.body / inwit.loc / inwit.off / inwit.loc.ovf       # Class A inputs+witness (cold loc)
-    inwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-inwit`; missing = off)
-    inwit.window/                # optional prune window: one {height}.bin per kept height
-    inwit.reloc                  # optional: inwit lives under --datadir-cold/store
+    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness (cold loc)
+    seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off)
+    seqsigwit.window/                # optional prune window: one {height}.bin per kept height
+    seqsigwit.reloc                  # optional: seqsigwit lives under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
@@ -244,12 +244,12 @@ itself changed.
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
-    inwit.body / inwit.loc / inwit.off / inwit.loc.ovf
+    seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf
 ```
 
 `--datadir` holds both stems by default. `--datadir-cold PATH` places only
-`inwit.body` + `inwit.loc` (and `inwit.off` / `inwit.loc.ovf`) under `PATH/store/`
-(and writes `inwit.reloc` in the hot store). Pin / SH / spend-annotate stay on
+`seqsigwit.body` + `seqsigwit.loc` (and `seqsigwit.off` / `seqsigwit.loc.ovf`) under `PATH/store/`
+(and writes `seqsigwit.reloc` in the hot store). Pin / SH / spend-annotate stay on
 the hot volume.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
@@ -286,9 +286,9 @@ the hot volume.
 | 13 | spender (`spent.ovf` multi-list) |
 | 14 | txid_body (`txid.body`) |
 | 15 | sp_tweaks (`sp_tweaks.body`; idx uses array_link) |
-| 16 | inwit (`inwit.body`) |
+| 16 | seqsigwit (`seqsigwit.body`) |
 | 17 | spent (`spent.body`) |
-| 18 | delta loc (`create.loc` / `inwit.loc` and `.ovf`) |
+| 18 | delta loc (`create.loc` / `seqsigwit.loc` and `.ovf`) |
 | 19 | txstat (`txstat.body`, 8 B/create) |
 | 20 | txstat overflow (`txstat.ovf`) |
 | 21 | txstat per-header locator (`txstat.blk`, 16 B/header) |
@@ -306,13 +306,13 @@ the hot volume.
 
 ## Growable var records (`*.body` + loc)
 
-Used for Class A `txout` / `inwit` / `spent` (and historically packed `tx.body`).
+Used for Class A `txout` / `seqsigwit` / `spent` (and historically packed `tx.body`).
 
 - **body:** append-oriented **unframed** payloads (no per-record length prefix).
-- **loc:** schema 22 `create.loc` (txout + `n_out`) and `inwit.loc` (cold);
+- **loc:** schema 22 `create.loc` (txout + `n_out`) and `seqsigwit.loc` (cold);
   schema 23 ovf is 16 B u32 strides/`n_out`.
   Header hash lookup is a separate `HashHead`, not this loc.
-- Record length = loc pair (txout/spent) or `inwit.loc` (inwit). Last record
+- Record length = loc pair (txout/spent) or `seqsigwit.loc` (seqsigwit). Last record
   uses 8-aligned published body end.
 - FK = 1-based create id.
 
@@ -358,7 +358,7 @@ offset 0..32    — 32-byte file header (standard 16-byte TableFile header + 16 
 offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
 ```
 
-Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `inwit` / `spent` / `txid.body` / `txstat.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
+Append-published with Class A body/idx on the sole Class A write path. Count must match `txout` / `seqsigwit` / `spent` / `txid.body` / `txstat.body`. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
 
 ### Confirm-time econ (`txstat.body`, schema 25)
 
@@ -400,13 +400,13 @@ stems; spent length is `8 × n_out` with `n_out ≥ 1`):
 
 ```text
 txout.body  S:  thin LAYOUT17 meta | outputs (kind nibble + template payload)
-inwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
+seqsigwit.body Sw:  per-input flags|create_fk+vout|seq?|script_sig?|witness?
 spent.body Ss:  8 B × n_out  (flags + u40 fk + u16 vin). Multi overflow → spent.ovf
 ```
 
-Empty inwit: **8-byte zero pad** so loc strides stay strictly monotone.
+Empty seqsigwit: **8-byte zero pad** so loc strides stay strictly monotone.
 Pin / SH / Electrum tweaks read **`txout` only**. Annotate RMW is on **`spent`** (`abs = Ss + 8×vout`).
-Reconstruct zips `txout` + `inwit`. First-wave Outs reads stay on the starting
+Reconstruct zips `txout` + `seqsigwit`. First-wave Outs reads stay on the starting
 OS page unless `4+(max_need+1)×38` (LAYOUT17 meta + kind + 5 B uleb amount + P2TR;
 empty need: the loc span) is likely to spill; then the first wave is the full loc
 span. Extend still covers a missed need.
@@ -436,22 +436,22 @@ prefixes (v1 starts `01 00 00 00`) are not accepted. `input_start_fk` /
 `output_start_fk` stay null in RAM. Soft `TxRecord.txid` is filled from the
 sidefile on get paths.
 
-### Create / inwit locators (`create.loc` / `inwit.loc`)
+### Create / seqsigwit locators (`create.loc` / `seqsigwit.loc`)
 
 ```text
 create.off              # ArrayLink: per 1024 creates, u64 txout_abs + u64 spent_abs
 create.loc              # 2 B/create: (txout_strides:u8, n_out:u8)
 create.loc.ovf          # sorted 16 B: fk:u64, strides:u32, n_out:u32
-inwit.loc / inwit.off / inwit.loc.ovf   # u16 strides; cold with inwit.body
+seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf   # u16 strides; cold with seqsigwit.body
 ```
 
 `n_out` is the true output count, always ≥ 1. Spent length is `8 × n_out`.
 Loc byte **0** = overflow (`n_out ≥ 256` or txout aligned length ≥ 2048).
 `create.loc.ovf` holds the true u32 strides and `n_out` (a ~1 MiB OP_RETURN is
 ~125k strides; min-size outputs in a 1 MB stripped tx can exceed 65535).
-`inwit.loc` **0** = overflow (`strides ≥ 65536`, i.e. ≥ 512 KiB). Missing ovf
+`seqsigwit.loc` **0** = overflow (`strides ≥ 65536`, i.e. ≥ 512 KiB). Missing ovf
 when a sentinel is set is `Corrupt("invariant: create.loc overflow missing")`
-(or inwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`. Lookup `range_batch`
+(or seqsigwit). Checkpoints (~22 MiB) are RAM; do not L2 `create.loc`. Lookup `range_batch`
 reads and prefix-sums only through the highest fk in each 1024-create window
 (not the unused tail). Those window preads are **one** bulk batch (held
 head-resolve session, else `pread_batch`). Every window uses a SIMD prefix
@@ -464,7 +464,7 @@ packs until write of the last height whose TipOnly had started at note
 (`lookup_started_hi`; just-written abs; fill of that write runs first). Write
 does not pread `create.loc`. Occupied 21 Class A
 is refused. Occupied 22 rewrites `create.loc.ovf` 12 B → 16 B. Leftover
-`{txout,spent,inwit}.idx` and `spent.off` are unlinked on empty 21–24 open.
+`{txout,spent,seqsigwit}.idx` and `spent.off` are unlinked on empty 21–24 open.
 
 `spent_abs(off, vout) = off + 8×vout`.
 
@@ -822,15 +822,15 @@ Tip **962,298**, **1,416,970,187** creates, mean packed **502.2 B/tx**,
 | File | Packed 13/14 | Schema 15 |
 |------|--------------|-----------|
 | `tx.body` / `txout.body` | **662.73 GiB** | **~129 GiB** (schema 15; 17 thin meta + templates cut ~18–26 GiB) |
-| `inwit.body` | — | **~486 GiB** (ins + witness; cold) |
+| `seqsigwit.body` | — | **~486 GiB** (ins + witness; cold) |
 | `spent.body` | (9 B inside packed outs, ~32 GiB) | **~32 GiB** schema 15; **~21 GiB** after 8 B slots |
-| `{stem}.idx` / loc | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** idx (schema 15–21); schema 22 is `create.loc` + `inwit.loc` |
+| `{stem}.idx` / loc | 5.28 GiB (`tx.idx`) | 5.28 GiB × **3** idx (schema 15–21); schema 22 is `create.loc` + `seqsigwit.loc` |
 | `txid.body` / `tx.head` | 42.23 / 8.23 GiB | unchanged |
 
 Hot pin+annotate working set: **txout + spent + create.loc + txid + tx.head**
 (~129+21+3+42+8 ≈ **203 GiB**) vs packed **tx.body + idx + txid + head**
 (~663+5+42+8 ≈ **718 GiB**). Reconstruct / `getrawtransaction` also needs
-`inwit` (~486 GiB), which pin/SH/tweaks do **not** open.
+`seqsigwit` (~486 GiB), which pin/SH/tweaks do **not** open.
 
 ---
 

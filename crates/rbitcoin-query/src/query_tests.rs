@@ -2108,7 +2108,7 @@ fn connect_chain_query_surface() {
     let out = q.tx_output_at_fk(fks[0], 0).unwrap();
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "tx_output_at_fk is outs-only (no inwit zip)"
+        "tx_output_at_fk is outs-only (no seqsigwit zip)"
     );
     assert_eq!(out.value, 50_0000_0000);
     assert!(!q.is_outpoint_spent(&tx.txid, 0).unwrap());
@@ -2604,7 +2604,7 @@ fn reconstruct_pruned_returns_pruned_not_corrupt() {
     assert_eq!(q.pruneheight(), Some(Height(0)));
     let fks0 = q.block_tx_fks(Height(0)).unwrap();
     assert!(
-        !q.inwit_available(fks0[0]).unwrap(),
+        !q.seqsigwit_available(fks0[0]).unwrap(),
         "height 0 must be at/below watermark"
     );
     let err = q.reconstruct_archived_block(&hashes[0]).unwrap_err();
@@ -2625,7 +2625,7 @@ fn reconstruct_pruned_returns_pruned_not_corrupt() {
     let kept = q.reconstruct_archived_block(&hashes[1]).unwrap().unwrap();
     assert_eq!(kept.txdata.len(), 1);
     let fks1 = q.block_tx_fks(Height(1)).unwrap();
-    assert!(q.inwit_available(fks1[0]).unwrap());
+    assert!(q.seqsigwit_available(fks1[0]).unwrap());
     assert!(q.tx_wire_bytes(fks1[0]).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2771,7 +2771,7 @@ fn prune_watermark_survives_reopen() {
     drop(q);
     let q = Query::open_or_create_tiny(dir.path()).unwrap();
     assert_eq!(q.pruneheight(), Some(Height(0)));
-    assert!(q.prune_inwit());
+    assert!(q.prune_seqsigwit());
     let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
     assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -2780,9 +2780,9 @@ fn prune_watermark_survives_reopen() {
 #[test]
 fn prune_ibd_ram_window_keeps_last_288_heights() {
     let (dir, q) = temp_query("prune-ibd-ram-window");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
-    q.set_inwit_ram_threshold_bytes(1 << 30).unwrap();
+    q.set_seqsigwit_ram_threshold_bytes(1 << 30).unwrap();
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
     for h in 0..320u32 {
@@ -2791,9 +2791,9 @@ fn prune_ibd_ram_window_keeps_last_288_heights() {
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    let (heights, fks, _bytes, evictions) = q.inwit_ram_window_stats();
-    assert!(heights <= Query::INWIT_KEEP_HEIGHTS as usize);
-    assert!(fks <= Query::INWIT_KEEP_HEIGHTS as usize);
+    let (heights, fks, _bytes, evictions) = q.seqsigwit_ram_window_stats();
+    assert!(heights <= Query::SEQSIGWIT_KEEP_HEIGHTS as usize);
+    assert!(fks <= Query::SEQSIGWIT_KEEP_HEIGHTS as usize);
     assert!(evictions > 0, "old heights must be evicted");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2801,9 +2801,9 @@ fn prune_ibd_ram_window_keeps_last_288_heights() {
 #[test]
 fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
     let (dir, q) = temp_query("prune-ram-replace");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
-    q.set_inwit_ram_threshold_bytes(1 << 30).unwrap();
+    q.set_seqsigwit_ram_threshold_bytes(1 << 30).unwrap();
     let (h0, mut t0) = coinbase_block(0, Fk::NULL, None);
     t0.inputs[0].witness = vec![vec![0x11; 16]];
     let hash0 = h0.hash;
@@ -2811,17 +2811,17 @@ fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
     let (h1, mut t1) = coinbase_block(1, prev, Some(hash0));
     t1.inputs[0].witness = vec![vec![0x22; 16]];
     q.connect_block(Height(1), &h1, &[t1]).unwrap();
-    assert_eq!(q.inwit_ram_window_stats().1, 2);
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 2);
     q.disconnect_tip().unwrap();
     assert_eq!(
-        q.inwit_ram_window_stats().1,
+        q.seqsigwit_ram_window_stats().1,
         1,
-        "disconnect must drop that height's inwit"
+        "disconnect must drop that height's seqsigwit"
     );
     let (h1b, mut t1b) = coinbase_block(1, prev, Some(hash0));
     t1b.inputs[0].witness = vec![vec![0x33; 16]];
     q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
-    let (heights, fks, _, _) = q.inwit_ram_window_stats();
+    let (heights, fks, _, _) = q.seqsigwit_ram_window_stats();
     assert_eq!(heights, 2);
     assert_eq!(
         fks, 2,
@@ -2833,9 +2833,9 @@ fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
 #[test]
 fn prune_ibd_ram_window_honors_byte_threshold() {
     let (dir, q) = temp_query("prune-ibd-ram-threshold");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
-    q.set_inwit_ram_threshold_bytes(80).unwrap();
+    q.set_seqsigwit_ram_threshold_bytes(80).unwrap();
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
     for h in 0..8u32 {
@@ -2844,7 +2844,7 @@ fn prune_ibd_ram_window_honors_byte_threshold() {
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    let (_heights, _fks, bytes, evictions) = q.inwit_ram_window_stats();
+    let (_heights, _fks, bytes, evictions) = q.seqsigwit_ram_window_stats();
     assert!(bytes <= 80, "bytes={bytes}");
     assert!(evictions > 0);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2853,7 +2853,7 @@ fn prune_ibd_ram_window_honors_byte_threshold() {
 #[test]
 fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
     let (dir, q) = temp_query("prune-ibd-ram-serve");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
     let mut prev = Fk::NULL;
     let mut parent_hash: Option<[u8; 32]> = None;
@@ -2863,7 +2863,7 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
         parent_hash = Some(header.hash);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    q.apply_prune_inwit_tip().unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
     let fk0 = q.block_tx_fks(Height(299)).unwrap()[0];
     let tx0 = q.get_tx(fk0).unwrap();
     assert_eq!(
@@ -2871,7 +2871,7 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
         1,
         "recent witness is served from RAM"
     );
-    let window = q.store.path().join("inwit.window");
+    let window = q.store.path().join("seqsigwit.window");
     for ent in std::fs::read_dir(&window).unwrap() {
         let p = ent.unwrap().path();
         assert_eq!(p.parent(), Some(window.as_path()), "{p:?}");
@@ -2894,17 +2894,17 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
 #[test]
 fn spill_symlink_outside_window_is_corrupt() {
     let (dir, q) = temp_query("prune-spill-symlink");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
     let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
     ta.inputs[0].witness = vec![vec![0x42; 16]];
     q.connect_block(Height(0), &header, &[ta]).unwrap();
     let fk = q.block_tx_fks(Height(0)).unwrap()[0];
-    let spill = q.store.path().join("inwit.window").join("0.bin");
+    let spill = q.store.path().join("seqsigwit.window").join("0.bin");
     let outside = dir.path().join("outside.bin");
     std::fs::rename(&spill, &outside).unwrap();
     std::os::unix::fs::symlink(&outside, &spill).unwrap();
-    q.clear_inwit_ram_window();
+    q.clear_seqsigwit_ram_window();
     let tx = q.get_tx(fk).unwrap();
     let err = q.tx_input_at_fk(fk, &tx, 0).unwrap_err();
     assert!(
@@ -2917,13 +2917,13 @@ fn spill_symlink_outside_window_is_corrupt() {
 #[test]
 fn prune_ram_threshold_zero_spills_tiny_blocks() {
     let (dir, q) = temp_query("prune-ram-zero");
-    q.set_inwit_ram_threshold_bytes(0).unwrap();
-    q.set_prune_inwit(true).unwrap();
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_ibd_mode(true);
     let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
     ta.inputs[0].witness = vec![vec![0x11]];
     q.connect_block(Height(0), &header, &[ta]).unwrap();
-    let (heights, fks, bytes, _) = q.inwit_ram_window_stats();
+    let (heights, fks, bytes, _) = q.seqsigwit_ram_window_stats();
     assert_eq!(heights, 0, "threshold 0 keeps no RAM heights");
     assert_eq!(fks, 0);
     assert_eq!(bytes, 0);
@@ -2934,7 +2934,7 @@ fn prune_ram_threshold_zero_spills_tiny_blocks() {
         vec![vec![0x11]],
         "tiny block is served from the height file"
     );
-    assert!(q.store.path().join("inwit.window/0.bin").is_file());
+    assert!(q.store.path().join("seqsigwit.window/0.bin").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2950,8 +2950,8 @@ fn enable_prune_after_history_seeds_recent_spill_window() {
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
     let tip_fk = q.block_tx_fks(Height(299)).unwrap()[0];
-    q.set_prune_inwit(true).unwrap();
-    q.apply_prune_inwit_tip().unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
     let tx = q.get_tx(tip_fk).unwrap();
     assert_eq!(q.tx_input_at_fk(tip_fk, &tx, 0).unwrap().witness.len(), 1);
     drop(q);
@@ -2964,10 +2964,10 @@ fn enable_prune_after_history_seeds_recent_spill_window() {
 #[test]
 fn prune_mode_refuses_disable() {
     let (dir, q) = temp_query("prune-disable-refuse");
-    q.set_prune_inwit(true).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
     q.set_pruneheight(Some(Height(0))).unwrap();
-    let err = q.set_prune_inwit(false).unwrap_err().to_string();
-    assert!(err.contains("refusing to disable prune-inwit"), "{err}");
+    let err = q.set_prune_seqsigwit(false).unwrap_err().to_string();
+    assert!(err.contains("refusing to disable prune-seqsigwit"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3316,14 +3316,14 @@ fn sh_collect_and_disconnect_skip_get_tx_full() {
     assert_eq!(recs.len(), 1);
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "cold SH collect must not zip inwit: {:?}",
+        "cold SH collect must not zip seqsigwit: {:?}",
         q.store().tx_full_gets()
     );
     q.store().reset_tx_full_gets();
     q.disconnect_tip().unwrap();
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "disconnect SH unlink must not zip inwit: {:?}",
+        "disconnect SH unlink must not zip seqsigwit: {:?}",
         q.store().tx_full_gets()
     );
 

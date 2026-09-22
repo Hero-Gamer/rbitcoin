@@ -99,7 +99,7 @@ let
   ++ optional cfg.i2p.acceptIncoming "--i2p-accept-incoming"
   ++ optional cfg.cjdns.reachable "--cjdns-reachable"
   ++ optional cfg.esplora.hiddenService "--esplora-onion"
-  ++ optional cfg.pruneInwit "--prune-inwit"
+  ++ optional cfg.pruneSeqSigWit "--prune-seqsigwit"
   ++ cfg.extraArgs;
 in
 {
@@ -126,7 +126,7 @@ in
     coldDataDir = mkOption {
       type = types.nullOr types.path;
       default = null;
-      description = "Optional directory for the large, rarely read Class A inwit store.";
+      description = "Optional directory for the large, rarely read Class A seqsigwit store.";
     };
 
     user = mkOption {
@@ -177,10 +177,10 @@ in
       description = "Build and serve the BIP-352 silent-payment tweak index.";
     };
 
-    pruneInwit = mkOption {
+    pruneSeqSigWit = mkOption {
       type = types.bool;
       default = false;
-      description = "Drop Class A inwit below tip-288 heights and advertise NETWORK_LIMITED. Not Core -prune of headers/txout.";
+      description = "Drop Class A seqsigwit below tip-288 heights and advertise NETWORK_LIMITED. Not Core -prune of headers/txout.";
     };
 
     environment = mkOption {

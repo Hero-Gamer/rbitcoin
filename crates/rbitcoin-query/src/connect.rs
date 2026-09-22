@@ -249,18 +249,21 @@ impl Query {
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
-        self.record_confirmed_inwit_window(items)?;
+        self.record_confirmed_seqsigwit_window(items)?;
 
         Ok(out)
     }
 
-    fn record_confirmed_inwit_window(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
-        self.apply_prune_inwit_tip()?;
-        if !self.prune_inwit() {
+    fn record_confirmed_seqsigwit_window(
+        &self,
+        items: &[ConfirmPrepared],
+    ) -> Result<(), QueryError> {
+        self.apply_prune_seqsigwit_tip()?;
+        if !self.prune_seqsigwit() {
             return Ok(());
         }
         for item in items {
-            self.note_inwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+            self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
         }
         Ok(())
     }
@@ -679,7 +682,7 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let inputs = if let Some(v) = self.inwit_cached_inputs(create_fk, tx.input_count)? {
+        let inputs = if let Some(v) = self.seqsigwit_cached_inputs(create_fk, tx.input_count)? {
             v
         } else {
             let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
@@ -693,7 +696,7 @@ impl Query {
 
     /// Output run from store (keyed by known create fk — no txid lookup).
     ///
-    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `inwit`.
+    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `seqsigwit`.
     pub(crate) fn tx_output_run_class_a(
         &self,
         create_fk: Fk,
@@ -730,8 +733,8 @@ impl Query {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
-        self.require_inwit_at(height)?;
-        self.drop_inwit_ram_height(height.0);
+        self.require_seqsigwit_at(height)?;
+        self.drop_seqsigwit_ram_height(height.0);
         let _appender = self.sh.appender.lock().unwrap();
         if drop_pending {
             self.drop_sh_pending_from(height);

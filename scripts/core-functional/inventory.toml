@@ -341,7 +341,7 @@ status = "run"
 name = "feature_unsupported_utxo_db.py"
 status = "skip"
 reason = "no-utxo-set"
-analog = "schema refuse / inwit.reloc mismatch"
+analog = "schema refuse / seqsigwit.reloc mismatch"
 
 [[test]]
 name = "feature_utxo_set_hash.py"

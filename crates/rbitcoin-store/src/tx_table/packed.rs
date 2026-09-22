@@ -195,7 +195,7 @@ impl InputRecord {
         }
         let flags = buf[0];
         let mut off = 1usize;
-        check_inwit_flags(flags)?;
+        check_seqsigwit_flags(flags)?;
         let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
             (Fk::NULL, u32::MAX)
         } else {
@@ -254,7 +254,7 @@ impl InputRecord {
         }
         let flags = buf[0];
         let mut off = 1usize;
-        check_inwit_flags(flags)?;
+        check_seqsigwit_flags(flags)?;
         let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
             (Fk::NULL, u32::MAX)
         } else {
@@ -528,7 +528,7 @@ pub const BODY_PAGE_SIZE: u64 = 4096;
 
 /// Encode `txout.body` payload (schema **17**): thin meta || output_run.
 ///
-/// Inputs/witness go to [`encode_inwit_with_secret`]. Spender slots go to
+/// Inputs/witness go to [`encode_seqsigwit_with_secret`]. Spender slots go to
 /// [`encode_spent_zeros`]. `inputs` is accepted for call-site compatibility
 /// (count assert only).
 pub fn encode_packed_tx(
@@ -568,8 +568,8 @@ pub fn encode_txout_meta_and_outs(
     encode_output_run_secret(outputs, out, secret);
 }
 
-/// Encode `inwit.body` payload (input-side + witness).
-pub fn encode_inwit_with_secret(
+/// Encode `seqsigwit.body` payload (input-side + witness).
+pub fn encode_seqsigwit_with_secret(
     inputs: &[InputRecord],
     out: &mut Vec<u8>,
     secret: Option<&crate::store_secret::StoreSecret>,
@@ -614,9 +614,9 @@ pub fn spent_record_len(n_out: u32) -> u64 {
 const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
 const SPENT_VIN_U16_MAX: u32 = (1u32 << 16) - 1;
 
-fn check_inwit_flags(flags: u8) -> Result<(), StoreError> {
+fn check_seqsigwit_flags(flags: u8) -> Result<(), StoreError> {
     if flags & (input_flags::RESERVED4 | input_flags::RESERVED_HIGH) != 0 {
-        return Err(StoreError::Corrupt("inwit reserved flags"));
+        return Err(StoreError::Corrupt("seqsigwit reserved flags"));
     }
     Ok(())
 }
@@ -677,14 +677,14 @@ pub fn spent_abs(spent_off: u64, vout: u32) -> u64 {
     spent_off.saturating_add(u64::from(vout).saturating_mul(OutputRecord::SPENT_SLOT_LEN as u64))
 }
 
-/// Decode `inwit.body` payload into input records (script_sig + witness).
-pub fn decode_inwit_secret(
+/// Decode `seqsigwit.body` payload into input records (script_sig + witness).
+pub fn decode_seqsigwit_secret(
     raw: &[u8],
     in_count: u32,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<InputRecord>, StoreError> {
     if in_count == 0 {
-        return decode_inwit_secret_to_end(raw, secret);
+        return decode_seqsigwit_secret_to_end(raw, secret);
     }
     let (mut inputs, used) = decode_input_run_prefix(raw, in_count)?;
     check_trailing_zero_pad(raw, used)?;
@@ -701,7 +701,7 @@ pub fn decode_inwit_secret(
     Ok(inputs)
 }
 
-pub(crate) fn decode_inwit_secret_to_end(
+pub(crate) fn decode_seqsigwit_secret_to_end(
     raw: &[u8],
     secret: Option<&crate::store_secret::StoreSecret>,
 ) -> Result<Vec<InputRecord>, StoreError> {
@@ -777,10 +777,10 @@ pub fn txout_first_page_covers_need(raw: &[u8], n_out: u32, need_vouts: &[u32]) 
     take_all || need_i == need_vouts.len()
 }
 
-/// Prevout edges from an `inwit.body` payload (`in_count` from `txout` meta).
+/// Prevout edges from an `seqsigwit.body` payload (`in_count` from `txout` meta).
 ///
 /// Each edge is `(create_fk, vout)`; coinbase → `(Fk::NULL, u32::MAX)`.
-pub fn scan_inwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, StoreError> {
+pub fn scan_seqsigwit_prevouts(raw: &[u8], in_count: u32) -> Result<Vec<(Fk, u32)>, StoreError> {
     let mut off = 0usize;
     let mut prevouts = Vec::with_capacity(in_count as usize);
     for _ in 0..in_count {
@@ -1060,11 +1060,11 @@ mod scan_p2tr_tests {
     }
 
     #[test]
-    fn decode_inwit_secret_zero_count_walks_payload() {
+    fn decode_seqsigwit_secret_zero_count_walks_payload() {
         let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01, 0x02], vec![])];
         let mut raw = Vec::new();
-        encode_inwit_with_secret(&ins, &mut raw, None);
-        let got = decode_inwit_secret(&raw, 0, None).unwrap();
+        encode_seqsigwit_with_secret(&ins, &mut raw, None);
+        let got = decode_seqsigwit_secret(&raw, 0, None).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].script_sig, vec![0x01, 0x02]);
         assert!(got[0].is_coinbase());

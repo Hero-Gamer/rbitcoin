@@ -80,7 +80,7 @@ pub fn load_creates_once(
         .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
         .collect();
     store.idx_body_pipeline(&mut jobs, mode)?;
-    let mut inwit_jobs: Vec<IdxBodyJob> = if mode == IdxBodyMode::Full {
+    let mut seqsigwit_jobs: Vec<IdxBodyJob> = if mode == IdxBodyMode::Full {
         fks.iter()
             .map(|fk| IdxBodyJob::new(fk.get().unwrap_or(0), None))
             .collect()
@@ -88,7 +88,7 @@ pub fn load_creates_once(
         Vec::new()
     };
     if mode == IdxBodyMode::Full {
-        store.idx_inwit_pipeline(&mut inwit_jobs, IdxBodyMode::Full)?;
+        store.idx_seqsigwit_pipeline(&mut seqsigwit_jobs, IdxBodyMode::Full)?;
     }
     let secret: &StoreSecret = store.txs.store_secret();
     let mut out = Vec::with_capacity(jobs.len());
@@ -107,21 +107,24 @@ pub fn load_creates_once(
                 if let Ok((mut tx, _empty_ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, job.n_out, Some(secret))
                 {
-                    let Some(ij) = inwit_jobs.get(i) else {
+                    let Some(ij) = seqsigwit_jobs.get(i) else {
                         return Err(StoreError::Corrupt(
-                            "invariant: Full create missing inwit job",
+                            "invariant: Full create missing seqsigwit job",
                         ));
                     };
                     if !ij.ok {
                         return Err(StoreError::Corrupt(
-                            "invariant: Full create inwit body missing after load",
+                            "invariant: Full create seqsigwit body missing after load",
                         ));
                     }
-                    let ins =
-                        rbitcoin_store::decode_inwit_secret(&ij.body, tx.input_count, Some(secret))
-                            .map_err(|_| {
-                                StoreError::Corrupt("invariant: packed create inwit decode failed")
-                            })?;
+                    let ins = rbitcoin_store::decode_seqsigwit_secret(
+                        &ij.body,
+                        tx.input_count,
+                        Some(secret),
+                    )
+                    .map_err(|_| {
+                        StoreError::Corrupt("invariant: packed create seqsigwit decode failed")
+                    })?;
                     if tx.input_count == 0 {
                         tx.input_count = ins.len() as u32;
                     }

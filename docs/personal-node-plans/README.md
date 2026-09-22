@@ -31,8 +31,8 @@ A node on CGNAT / no forwarded TCP still:
    not on the standing peer set.
 5. Optionally **prunes witness** below a 288-height window. Kept heights are
    one file each plus a RAM cache (`0` means files only). The node advertises
-   BIP159 `NODE_NETWORK_LIMITED` ([09](./09-inwit-prune.md)). Unpruned nodes
-   keep `inwit.body`.
+   BIP159 `NODE_NETWORK_LIMITED` ([09](./09-seqsigwit-prune.md)). Unpruned nodes
+   keep `seqsigwit.body`.
 
 ## Constraints (all numbered files)
 
@@ -74,7 +74,7 @@ A node on CGNAT / no forwarded TCP still:
   (see [06](./06-ephemeral-tor-broadcast.md)); public Electrum `hosts` gossip
   on P2P.
 - Core `-prune` of whole `blk` files / dropping `txout`+headers (09 is
-  **inwit-only**).
+  **seqsigwit-only**).
 
 ## Dandelion++ is not plan 06
 
@@ -123,7 +123,7 @@ any PR. **07** can land as soon as **01 + 03** exist. **08** can land as soon as
 | [06-ephemeral-tor-broadcast.md](./06-ephemeral-tor-broadcast.md) | Isolated SOCKS one-shot for locally submitted txs |
 | [07-p2p-onion-inbound.md](./07-p2p-onion-inbound.md) | P2P `--listen-onion`: ADD_ONION → loopback BIP324 accept |
 | [08-cjdns.md](./08-cjdns.md) | BIP155 CJDNS, `--cjdns-reachable`, `--only-net=cjdns` |
-| [09-inwit-prune.md](./09-inwit-prune.md) | Unpruned `inwit.body`, or a 288-height window (`inwit.window/{height}.bin` + RAM; `0` = files only); BIP159 `NETWORK_LIMITED`; partial Esplora JSON, refuse wire |
+| [09-seqsigwit-prune.md](./09-seqsigwit-prune.md) | Unpruned `seqsigwit.body`, or a 288-height window (`seqsigwit.window/{height}.bin` + RAM; `0` = files only); BIP159 `NETWORK_LIMITED`; partial Esplora JSON, refuse wire |
 
 NixOS first-class options (same PR as the flags). Label **`nixos-module-runtime`**
 when the row says runtime:
@@ -139,7 +139,7 @@ when the row says runtime:
 | 06 | none if `--proxy` already implies isolated broadcast; document on `proxy` | eval |
 | 07 | `p2p.listenOnion`; compose with `p2p.listen = false` | **yes** |
 | 08 | `cjdns.reachable`; listen on cjdns; `After=cjdns.service` | **yes** |
-| 09 | `pruneInwit` (cold dir already exists) | eval |
+| 09 | `pruneSeqSigWit` (cold dir already exists) | eval |
 
 ## Follow-ups (not scheduled here)
 
