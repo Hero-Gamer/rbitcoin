@@ -93,7 +93,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (24). Schemas 18–24 already
+the `SCHEMA_VERSION` at the top of this file (25). Schemas 18–24 already
 shipped; they are open rules above and history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
@@ -264,7 +264,7 @@ the hot volume.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **24** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **13–24** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **25** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **13–25** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
