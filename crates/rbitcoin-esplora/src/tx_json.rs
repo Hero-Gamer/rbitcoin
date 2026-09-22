@@ -181,11 +181,12 @@ fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Va
         .iter()
         .map(|o| vout_fields(&o.script, o.value, network))
         .collect();
+    // Omit vin. An empty array is not a coinbase and is not the inputs we
+    // no longer have; wallets must see the key as absent.
     let mut obj = json!({
         "txid": block_hash_hex(&txid),
         "version": tx.version,
         "locktime": tx.locktime,
-        "vin": [],
         "vout": vout,
         "status": status,
         "pruned": true,
@@ -875,7 +876,7 @@ mod tests {
         q.set_pruneheight(Some(Height(0))).unwrap();
         let v = build_tx_json(&q, fk, Network::Regtest).unwrap();
         assert_eq!(v["pruned"], true);
-        assert_eq!(v["vin"], json!([]), "pruned vin is empty: {v}");
+        assert!(v.get("vin").is_none(), "pruned JSON omits vin: {v}");
         assert_eq!(v["fee"], 0);
         assert_eq!(v["size"], 81);
         assert_eq!(v["weight"], 324);
@@ -896,7 +897,7 @@ mod tests {
             .unwrap();
         let raw = build_tx_json(&q, fk, Network::Regtest).unwrap();
         assert_eq!(raw["pruned"], true);
-        assert_eq!(raw["vin"], json!([]), "{raw}");
+        assert!(raw.get("vin").is_none(), "{raw}");
         assert!(raw.get("fee").is_none(), "unstamped omits fee: {raw}");
         assert!(raw.get("size").is_none(), "{raw}");
         assert!(raw.get("weight").is_none(), "{raw}");
