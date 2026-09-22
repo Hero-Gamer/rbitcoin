@@ -18,7 +18,7 @@ rbitcoin-primitives = { path = "../crates/rbitcoin-primitives" }
 rbitcoin-store = { path = "../crates/rbitcoin-store" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 bitcoinconsensus = "0.106.0"
-bitcoin = { version = "0.32.101", default-features = true }
+bitcoin = { version = "0.32.102", default-features = true }
 
 [workspace]
 members = ["."]
