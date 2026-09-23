@@ -113,7 +113,12 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), PackError> {
         if shift >= 64 {
             return Err(PackError("uleb128 overflow"));
         }
-        result |= u64::from(b & 0x7f) << shift;
+        let piece = u64::from(b & 0x7f);
+        // Shift 63 has one bit left. A wider payload would be shifted away.
+        if shift == 63 && piece > 1 {
+            return Err(PackError("uleb128 overflow"));
+        }
+        result |= piece << shift;
         if b & 0x80 == 0 {
             return Ok((result, i + 1));
         }
@@ -210,6 +215,25 @@ mod tests {
             read_uleb128(&over).unwrap_err(),
             PackError("uleb128 overflow")
         );
+        // Ninth continuation lands on shift 63. Only the low bit fits in a u64.
+        let mut at63 = vec![0x80u8; 9];
+        at63.push(0x02);
+        assert_eq!(
+            read_uleb128(&at63).unwrap_err(),
+            PackError("uleb128 overflow")
+        );
+        at63[9] = 0x7f;
+        assert_eq!(
+            read_uleb128(&at63).unwrap_err(),
+            PackError("uleb128 overflow")
+        );
+        at63[9] = 0x00;
+        assert_eq!(read_uleb128(&at63).unwrap(), (0, 10));
+        at63[9] = 0x01;
+        assert_eq!(read_uleb128(&at63).unwrap(), (1u64 << 63, 10));
+        let mut maxb = Vec::new();
+        write_uleb128(&mut maxb, u64::MAX);
+        assert_eq!(read_uleb128(&maxb).unwrap(), (u64::MAX, maxb.len()));
         let (v, n) = read_compact_size(&[253, 0, 1]).unwrap();
         assert_eq!((v, n), (256, 3));
         let (v, n) = read_compact_size(&[254, 0, 0, 1, 0]).unwrap();

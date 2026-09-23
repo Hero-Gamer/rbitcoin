@@ -2,6 +2,11 @@
 //!
 //! Used for `.fuse8` fingerprints and BDZ3 occupancy. Kernel reclaim drops
 //! clean file pages (no swap write).
+//!
+//! `map_path` maps the file length from that open. `map_prefix` refuses a
+//! caller length past the file. Truncating the file after the map is
+//! external corruption: the next read can SIGBUS. This type does not
+//! retry or cache around that fault.
 
 use crate::error::StoreError;
 use std::fs::File;

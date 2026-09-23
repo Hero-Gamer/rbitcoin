@@ -31,6 +31,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [027](./027-script-skip-wtxid.md) | critical | Script skip keyed by txid | fixed | `tip_script_pres_skips_only_matching_wtxid` |
 | [028](./028-prevout-count.md) | high | Empty prevouts skipped script checks | fixed | `prevout_count_must_match_inputs` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
+| [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

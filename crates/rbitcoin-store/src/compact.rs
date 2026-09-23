@@ -227,6 +227,13 @@ pub fn encode_script_kind_v17(script: &[u8], out: &mut Vec<u8>) -> u8 {
 }
 
 /// Read an on-disk v17 script payload and expand it to the wire scriptPubKey.
+fn span_fits(buf_len: usize, off: usize, n: u64) -> bool {
+    match buf_len.checked_sub(off) {
+        Some(rest) => n <= rest as u64,
+        None => false,
+    }
+}
+
 pub fn decode_script_kind_v17(kind: u8, buf: &[u8]) -> Result<(Vec<u8>, usize), StoreError> {
     if kind > SCRIPT_KIND_V17_MAX {
         return Err(StoreError::Corrupt("v17 reserved script kind"));
@@ -249,10 +256,10 @@ pub fn decode_script_kind_v17(kind: u8, buf: &[u8]) -> Result<(Vec<u8>, usize), 
         }
         SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
             let (slen, n) = read_compact_size(buf)?;
-            let slen = slen as usize;
-            if buf.len() < n + slen {
+            if !span_fits(buf.len(), n, slen) {
                 return Err(StoreError::Corrupt("v17 script payload truncated"));
             }
+            let slen = slen as usize;
             Ok((expand_script_kind(kind, &buf[n..n + slen])?, n + slen))
         }
         _ => Err(StoreError::Corrupt("v17 reserved script kind")),
@@ -329,11 +336,10 @@ pub fn script_kind_v17_disk_used(kind: u8, buf: &[u8]) -> Result<usize, StoreErr
         }
         SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
             let (slen, n) = read_compact_size(buf)?;
-            let slen = slen as usize;
-            if buf.len() < n + slen {
+            if !span_fits(buf.len(), n, slen) {
                 return Err(StoreError::Corrupt("v17 script payload truncated"));
             }
-            Ok(n + slen)
+            Ok(n + slen as usize)
         }
         _ => Err(StoreError::Corrupt("v17 reserved script kind")),
     }

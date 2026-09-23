@@ -2737,6 +2737,28 @@ fn packed_encode_decode_flags_and_error_arms() {
         InputRecord::decode_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
+    // Hostile CompactSize must be Corrupt, not a capacity or add overflow panic.
+    let flags = input_flags::PREV_ON_INPUTS | input_flags::SEQ_FINAL;
+    let mut huge_script = vec![flags];
+    huge_script.push(0xff);
+    huge_script.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        matches!(
+            InputRecord::decode_at(&huge_script),
+            Err(StoreError::Corrupt(_))
+        ),
+        "hostile script length"
+    );
+    let mut huge_wit = vec![flags | input_flags::EMPTY_SCRIPT];
+    huge_wit.push(0xff);
+    huge_wit.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        matches!(
+            InputRecord::decode_at(&huge_wit),
+            Err(StoreError::Corrupt(_))
+        ),
+        "hostile witness count"
+    );
     assert!(matches!(
         InputRecord::decode_prevout_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))

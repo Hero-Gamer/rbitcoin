@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **Corrupt store lengths:** a uleb128 payload wider than one bit at
+  shift 63 is overflow. A seqsigwit script or witness length that does
+  not fit the buffer is `Corrupt`, not a capacity panic. A BDZ file with
+  a zero modulus or zero vertex count is `Corrupt` instead of a divide
+  by zero. Truncating a sealed mmap after it is mapped is fatal external
+  corruption.
 - **CI quick checks share one runner.** Job `qc` runs fmt, ast-grep,
   deny, the script self-tests, clippy, then nixos-module-eval. `test`,
   `windows`, and `macos` stay on their own runners. Coverage and mutants

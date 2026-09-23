@@ -66,7 +66,9 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
-  mislead a **wallet** backend are in scope.
+  mislead a **wallet** backend are in scope. Truncating a sealed mmap after
+  it is mapped is fatal external corruption (the next read can SIGBUS), not
+  a handled retry.
 - **No wallet keys in this repository:** do **not** send seed phrases or private
   keys in reports.
 
