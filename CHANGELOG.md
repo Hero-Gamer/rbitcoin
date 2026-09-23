@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **Per-peer send buffer:** each session stops serving the next request
+  once its outbound queue is past 4 MiB (headers, inv, notfound, tx, addr,
+  and block bodies all count). The reader waits until the writer drains.
+  One block reply may still land past the cap. `getaddr` is answered once
+  per connection.
 - **Milestone anchor:** signet’s default milestone is 0, so signet IBD runs
   every script (slower on purpose). The mainnet default still names height
   840000, and it skips scripts only when the header path contains block

@@ -6182,7 +6182,8 @@ fn try_queue_served_block_false_at_cap() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let n = AtomicUsize::new(MAX_SERVE_BLOCKS);
     let gen = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let queued = try_queue_served_block(&out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
+    let queued =
+        try_queue_served_block(None, &out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
     assert!(!queued);
     assert!(out_rx.try_recv().is_err());
     assert_eq!(n.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
@@ -10413,5 +10414,153 @@ async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
         follow.ban_score >= BAN_SCORE_THRESHOLD,
         "one past the getdata cap disconnects"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A peer that asks for headers and never reads must not grow the outbound
+/// queue without bound. One getaddr is answered; a second is not.
+#[test]
+fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
+    use crate::peers::{PeerConnType, PeerHub};
+    use bitcoin::hashes::Hash;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::ScriptBuf;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("send-budget");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let genesis = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(0))
+        .unwrap()
+        .block_hash();
+    let peers = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 7,
+        user_agent: "/rbitcoin:0.1.0(sendbuf)/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, PeerConnType::Inbound);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let gh = GetHeadersMessage::new(vec![genesis], BlockHash::from_byte_array([0u8; 32]));
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetHeaders(gh.clone()),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    let NetworkMessage::Headers(first) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("one getheaders under the budget must be answered");
+    };
+    assert_eq!(first.len(), 200, "locator after genesis walks the tip");
+
+    let mut queued = 1usize;
+    for _ in 0..400 {
+        handle_peer_inventory_msg(
+            &NetworkMessage::GetHeaders(gh.clone()),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(&peer),
+        )
+        .unwrap();
+        match out_rx.try_recv() {
+            Ok(_) => queued += 1,
+            Err(_) => break,
+        }
+    }
+    let batch = first.len().saturating_mul(81);
+    let room = crate::peers::PEER_SEND_BUDGET / batch;
+    assert!(
+        queued <= room + 2,
+        "queued {queued} header batches while the peer read nothing (room {room})"
+    );
+    assert!(
+        queued > 1,
+        "a getheaders under the budget produced no further reply"
+    );
+
+    let before = peer.send_queued();
+    queue_accounted(
+        Some(&peer),
+        &out_tx,
+        NetworkMessage::Inv(vec![Inventory::Block(genesis)]),
+    )
+    .unwrap();
+    assert_eq!(peer.send_queued() - before, 36, "inv rows are 36 bytes");
+    queue_accounted(
+        Some(&peer),
+        &out_tx,
+        NetworkMessage::NotFound(vec![Inventory::Block(genesis)]),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.send_queued() - before,
+        36 + 36,
+        "notfound rows are 36 bytes"
+    );
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let tx_n = tx.total_size();
+    queue_accounted(Some(&peer), &out_tx, NetworkMessage::Tx(tx)).unwrap();
+    let addr_msg = NetworkMessage::Addr(vec![(
+        0,
+        bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+    )]);
+    queue_accounted(Some(&peer), &out_tx, addr_msg).unwrap();
+    assert_eq!(
+        peer.send_queued() - before,
+        36 + 36 + tx_n + 30,
+        "tx total_size and addr rows count toward the same budget"
+    );
+    peer.note_send_written(peer.send_queued());
+    assert!(!peer.send_over_budget());
+
+    while out_rx.try_recv().is_ok() {}
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetAddr,
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetAddr,
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    let mut addrs = 0usize;
+    while let Ok(msg) = out_rx.try_recv() {
+        if matches!(
+            msg.expect_msg(),
+            NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_)
+        ) {
+            addrs += 1;
+        }
+    }
+    assert_eq!(addrs, 1, "getaddr is answered once per connection");
     let _ = std::fs::remove_dir_all(dir);
 }

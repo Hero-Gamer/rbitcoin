@@ -46,6 +46,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [041](./041-hygiene.md) | medium | P2PKH policy flags, RPC token, inv cap, log newlines | fixed | `peer_command_logs_have_no_raw_newline` |
 | [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
+| [043](./043-peer-send-buffer.md) | high | Unbounded per-peer outbound queue | fixed | `getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once` |
 | [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
