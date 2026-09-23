@@ -20,6 +20,11 @@ pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
 /// **Was incorrectly 101_000 WU** (4× too tight) — mainnet logs rejected single ~25–65 kvB txs.
 pub const MAX_CLUSTER_WEIGHT: u64 = MAX_CLUSTER_VSIZE * 4;
 
+/// Consensus block sigop cost limit (BIP141 `MAX_BLOCK_SIGOPS_COST`).
+pub(crate) const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+/// Sigop cost reserved for the coinbase (Core `node/miner.cpp` `nBlockSigOpsCost = 400`).
+pub(crate) const COINBASE_SIGOPS_RESERVE: u64 = 400;
+
 /// One live mempool entry (RAM index; body lives on disk).
 #[derive(Debug, Clone)]
 pub struct TxEntry {

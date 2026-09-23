@@ -1,7 +1,7 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{TxEntry, TxGraph};
+use crate::graph::{TxEntry, TxGraph, COINBASE_SIGOPS_RESERVE, MAX_BLOCK_SIGOPS_COST};
 use crate::orphanage::Orphanage;
 use crate::packed::VinAux;
 use crate::store::Mempool;
@@ -208,6 +208,11 @@ pub enum AcceptError {
     Durable(String),
     /// Consensus script verification failed for one or more inputs.
     Script(String),
+    /// Sigop cost alone exceeds what any block can hold beside the coinbase
+    /// reserve (consensus-impossible, not a Libre policy knob).
+    TooManySigops {
+        cost: u64,
+    },
 }
 
 impl std::fmt::Display for AcceptError {
@@ -232,6 +237,7 @@ impl std::fmt::Display for AcceptError {
             AcceptError::NotFound(t) => write!(f, "not found {t}"),
             AcceptError::Durable(s) => write!(f, "durable: {s}"),
             AcceptError::Script(s) => write!(f, "script: {s}"),
+            AcceptError::TooManySigops { .. } => f.write_str("bad-txns-too-many-sigops"),
         }
     }
 }
@@ -358,6 +364,8 @@ pub struct PreparedAdmit {
     /// `prioritisetransaction` delta applied at prepare (min-relay / RBF).
     pub fee_delta: i64,
     pub weight: u64,
+    /// Full BIP16 + BIP141 sigop cost (Core ATMP `GetTransactionSigOpCost`).
+    pub sigop_cost: u64,
     pub prevouts: Vec<TxOut>,
     pub chain_coins: Vec<Option<Coin>>,
     pub utxo_us: u64,
@@ -804,6 +812,16 @@ impl ActiveMempool {
 
         check_mempool_structural(tx, &chain_coins, tip)?;
 
+        // P2SH + witness flags match Core ATMP `STANDARD_SCRIPT_VERIFY_FLAGS`.
+        let spks: Vec<&[u8]> = prevouts
+            .iter()
+            .map(|o| o.script_pubkey.as_bytes())
+            .collect();
+        let sigop_cost = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
+        if sigop_cost > MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE {
+            return Err(AcceptError::TooManySigops { cost: sigop_cost });
+        }
+
         let mut output_value = 0u64;
         for o in &tx.output {
             let v = o.value.to_sat();
@@ -834,6 +852,7 @@ impl ActiveMempool {
             fee_sat,
             fee_delta,
             weight,
+            sigop_cost,
             prevouts,
             chain_coins,
             utxo_us,
@@ -2417,6 +2436,41 @@ mod tests {
         mp.accept_tx(&tx, &utxos, TIP_OK)
             .expect("0-value OP_RETURN ok");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `n` bare `OP_CHECKMULTISIG` outputs: legacy cost `n × 20 × 4`.
+    fn multisig_outputs_tx(op: OutPoint, n: usize) -> Transaction {
+        let mut tx = spend_tx(op, 1);
+        tx.output = vec![
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xae]),
+            };
+            n
+        ];
+        tx
+    }
+
+    /// Probe regression: 1001 × `OP_CHECKMULTISIG` (cost 80,080) can never be
+    /// mined, so admission rejects it. 995 outputs (79,600 = 80k − coinbase
+    /// reserve) still fit a block and are admitted.
+    #[test]
+    fn reject_tx_over_block_sigop_budget() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp
+            .accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK)
+            .unwrap_err();
+        assert!(
+            matches!(err, AcceptError::TooManySigops { cost: 80_080 }),
+            "got {err}"
+        );
+        assert_eq!(err.to_string(), "bad-txns-too-many-sigops");
+        assert_eq!(mp.live_count(), 0);
+        mp.accept_tx(&multisig_outputs_tx(op, 995), &utxos, TIP_OK)
+            .expect("79,600 fits beside the coinbase reserve");
+        assert_eq!(mp.live_count(), 1);
     }
 
     #[test]
