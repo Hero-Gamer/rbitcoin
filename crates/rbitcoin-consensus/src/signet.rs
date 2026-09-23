@@ -248,7 +248,7 @@ fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
             push_data(&mut replacement, data);
             continue;
         }
-        if matches!(op, 0x4c | 0x4d | 0x4e) {
+        if matches!(op, 0x4c..=0x4e) {
             break;
         }
         replacement.push(op);
