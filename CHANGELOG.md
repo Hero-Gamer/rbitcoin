@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Header accept:** a failed `ensure_header` does not hold the body or
+  enter tip accept. A non-genesis block whose previous hash is all zeros
+  is rejected while a tip exists. Work sums report overflow instead of
+  wrapping, and a zero target is not turned into work.
 - **Compact blocks:** a transaction count above the block weight limit
   divided by the minimum transaction weight is rejected before the slot
   vector is built. A peer keeps one partial. Another hash from that peer

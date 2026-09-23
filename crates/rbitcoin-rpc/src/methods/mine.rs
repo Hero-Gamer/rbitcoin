@@ -989,7 +989,7 @@ fn work_through(ctx: &RpcContext, height: u32) -> bitcoin::Work {
             works.push(hdr.work());
         }
     }
-    rbitcoin_net::sum_work(works.into_iter())
+    rbitcoin_net::sum_work(works.into_iter()).unwrap_or(bitcoin::Work::from_be_bytes([0xff; 32]))
 }
 
 pub(crate) fn network_hash_ps(ctx: &RpcContext, nblocks: i64, height: i64) -> Result<f64, Value> {

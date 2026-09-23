@@ -3066,7 +3066,12 @@ async fn on_block(
     if on_block_unrequested_skip(hub, follow, session, block, hash)? {
         return Ok(());
     }
-    let _ = hub.ensure_header(&block.header);
+    if let Err(e) = hub.ensure_header(&block.header) {
+        if !crate::chain::accept_err_is_temporary_time(&e) {
+            punish_disconnect(&mut follow.ban_score, session);
+        }
+        return Ok(());
+    }
     drop_pending_cmpct(follow, session, hash);
     follow.requested_blocks.remove(&hash);
     follow.pending_headers.entry(hash).or_insert(block.header);
@@ -3088,10 +3093,6 @@ fn on_block_unrequested_skip(
     if follow.requested_blocks.contains(&hash) {
         return Ok(false);
     }
-    if hub.header_below_minwork(&block.header) {
-        rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
-        return Ok(true);
-    }
     let prev = block.header.prev_blockhash;
     if prev.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&prev)
@@ -3101,12 +3102,20 @@ fn on_block_unrequested_skip(
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(true);
     }
+    if let Err(e) = hub.ensure_header(&block.header) {
+        if !crate::chain::accept_err_is_temporary_time(&e) {
+            punish_disconnect(&mut follow.ban_score, session);
+        }
+        return Ok(true);
+    }
+    if hub.header_below_minwork(&block.header) {
+        rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
+        return Ok(true);
+    }
     if hub.header_below_anti_dos(&block.header) && !follow.pending_headers.contains_key(&hash) {
-        let _ = hub.ensure_header(&block.header);
         return Ok(true);
     }
     if hub.unrequested_too_far_ahead(&block.header) {
-        let _ = hub.ensure_header(&block.header);
         return Ok(true);
     }
     Ok(false)
@@ -4174,9 +4183,7 @@ fn work_of_header_path(
                 .0;
             let base = hub.work_through_height(height).ok()?;
             extra.reverse();
-            return Some(crate::most_work::sum_work(
-                std::iter::once(base).chain(extra),
-            ));
+            return crate::most_work::sum_work(std::iter::once(base).chain(extra)).ok();
         }
         let hdr = pending.get(&h).copied().or_else(|| hub.header_of(&h))?;
         if !hub.header_claimed_pow_ok(&hdr) {
@@ -4186,7 +4193,7 @@ fn work_of_header_path(
         h = hdr.prev_blockhash;
         if h.to_byte_array() == [0u8; 32] {
             extra.reverse();
-            return Some(crate::most_work::sum_work(extra.into_iter()));
+            return crate::most_work::sum_work(extra.into_iter()).ok();
         }
     }
     None

@@ -236,7 +236,11 @@ pub(crate) fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String
             works.push(hdr.work());
         }
     }
-    hex_encode(rbitcoin_net::sum_work(works.into_iter()).to_be_bytes())
+    hex_encode(
+        rbitcoin_net::sum_work(works.into_iter())
+            .unwrap_or(bitcoin::Work::from_be_bytes([0xff; 32]))
+            .to_be_bytes(),
+    )
 }
 
 fn version_hex(version: i32) -> String {

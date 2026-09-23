@@ -245,7 +245,7 @@ fn our_work_from_lca(hub: &ChainHub, lca_height: u32) -> Result<bitcoin::Work, N
             our.push(hdr.work());
         }
     }
-    Ok(sum_work(our.into_iter()))
+    sum_work(our.into_iter()).map_err(|_| NetError::Consensus("work overflow".into()))
 }
 
 /// Index of the last hash in the shortest prefix of `path` (oldest-first)

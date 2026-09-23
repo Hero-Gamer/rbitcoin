@@ -234,7 +234,7 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
-fn accept_err_is_temporary_time(e: &NetError) -> bool {
+pub(crate) fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
             s.contains("time-too-new") || s.contains("time-too-old")
@@ -483,12 +483,15 @@ impl ChainHub {
     pub fn work_with_header(&self, header: &Header) -> Work {
         let mut extra = Vec::new();
         if self.header_claimed_pow_ok(header) {
-            extra.push(header.work());
+            if let Ok(w) = crate::most_work::header_work_checked(header) {
+                extra.push(w);
+            }
         }
         let mut prev = header.prev_blockhash;
         for _ in 0..10_000 {
             if prev.to_byte_array() == [0u8; 32] {
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             }
             if let Some(h) = self
                 .query
@@ -500,17 +503,21 @@ impl ChainHub {
                     .work_through_height(h.0)
                     .unwrap_or(Work::from_be_bytes([0u8; 32]));
                 extra.push(base);
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             }
             let Some(hdr) = self.header_of(&prev) else {
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             };
             if self.header_claimed_pow_ok(&hdr) {
-                extra.push(hdr.work());
+                if let Ok(w) = crate::most_work::header_work_checked(&hdr) {
+                    extra.push(w);
+                }
             }
             prev = hdr.prev_blockhash;
         }
-        crate::most_work::sum_work(extra.into_iter())
+        crate::most_work::sum_work(extra.into_iter()).unwrap_or(Work::from_be_bytes([0xff; 32]))
     }
 
     /// Unrequested body more than 288 heights above the validated tip.
@@ -1799,7 +1806,9 @@ impl ChainHub {
                 continue;
             }
             let tip = branch.last().map(|b| b.block_hash()).unwrap_or(start);
-            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let Ok(w) = self.branch_header_work(&branch) else {
+                continue;
+            };
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
@@ -2013,6 +2022,9 @@ impl ChainHub {
                 Ok(AcceptOutcome::Accepted { height: 0 })
             }
             Some(tip_h) => {
+                if prev.to_byte_array() == [0u8; 32] {
+                    return Err(NetError::Protocol("non-genesis prev is zero"));
+                }
                 let tip_hash = self
                     .tip_hash()
                     .ok_or(NetError::Protocol("missing tip hash"))?;
@@ -2146,6 +2158,9 @@ impl ChainHub {
     fn accept_branch_fork_height(&self, blocks: &[Block]) -> Result<Option<u32>, NetError> {
         let fork_prev = blocks[0].header.prev_blockhash;
         if fork_prev.to_byte_array() == [0u8; 32] {
+            if self.tip_height().is_some() {
+                return Err(NetError::Protocol("non-genesis prev is zero"));
+            }
             return Ok(None);
         }
         Ok(Some(
@@ -2157,12 +2172,34 @@ impl ChainHub {
         ))
     }
 
+    fn branch_header_work(&self, blocks: &[Block]) -> Result<Work, NetError> {
+        if self.tip_height().is_some()
+            && blocks
+                .iter()
+                .any(|b| b.header.prev_blockhash.to_byte_array() == [0u8; 32])
+        {
+            return Err(NetError::Protocol("non-genesis prev is zero"));
+        }
+        let mut works = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            if !self.knows_header(&b.block_hash()) {
+                return Err(NetError::Protocol("header not validated"));
+            }
+            works.push(
+                crate::most_work::header_work_checked(&b.header)
+                    .map_err(|_| NetError::Consensus("zero target".into()))?,
+            );
+        }
+        crate::most_work::sum_work(works.into_iter())
+            .map_err(|_| NetError::Consensus("work overflow".into()))
+    }
+
     fn accept_branch_weaker(
         &self,
         blocks: &[Block],
         fork_height: Option<u32>,
     ) -> Result<Option<AcceptOutcome>, NetError> {
-        let new_work = sum_work(blocks.iter().map(|b| b.header.work()));
+        let new_work = self.branch_header_work(blocks)?;
         let our_work = self.work_from_fork_to_tip(fork_height)?;
         let branch_tip = blocks.last().map(Block::block_hash);
         let precious = *self.precious.read().unwrap() == branch_tip;
@@ -2492,7 +2529,9 @@ impl ChainHub {
             {
                 continue;
             }
-            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let Ok(w) = self.branch_header_work(&branch) else {
+                continue;
+            };
             let tip = branch.last().map(Block::block_hash);
             let is_p = tip == precious;
             let seq = match tip {
@@ -3296,6 +3335,23 @@ mod tests {
             }
         }
         panic!("no distinct pow sibling");
+    }
+
+    #[test]
+    fn zero_prev_with_live_tip_is_not_held() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let tip = hub.tip_hash().unwrap();
+        let mut block = mine(tip, 1_300_000_100, 1);
+        block.header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0u8; 32]);
+        let err = hub.accept_received_block(block).expect_err("zero prev");
+        assert!(
+            err.to_string().contains("non-genesis prev is zero"),
+            "{err}"
+        );
+        assert_eq!(hub.tip_hash(), Some(tip));
+        assert_eq!(hub.held_body_count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4891,8 +4947,8 @@ mod tests {
         };
         assert!(work_better(one, z));
         assert!(!work_better(z, one));
-        assert_eq!(sum_work(std::iter::empty()), z);
-        assert_eq!(sum_work([one].into_iter()), one);
+        assert_eq!(sum_work(std::iter::empty()).unwrap(), z);
+        assert_eq!(sum_work([one].into_iter()).unwrap(), one);
     }
 
     /// `feature_chain_tiebreaks.py`: after invalidate, equal-work held tips

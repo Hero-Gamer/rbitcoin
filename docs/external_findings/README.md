@@ -28,6 +28,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
 | [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 | [023](./023-tapscript-initial-stack-limits.md) | high | Tapscript initial witness stack skipped 1000/520 limits | fixed | `script_path_rejects_initial_stack_over_max_size` |
+| [030](./030-header-accept.md) | critical | Invalid header held; zero prev wipes tip | fixed | `zero_prev_with_live_tip_is_not_held` |
 | [029](./029-compact-tx-count.md) | critical | Compact block tx count and one partial per peer | fixed | `reconstruct_rejects_tx_count_above_weight_ratio` |
 | [032](./032-block-tx-count-alloc.md) | critical | Block tx count allocated before the payload was checked | fixed | `decode_block_precomputes_rejects_tx_count_past_payload` |
 | [031](./031-signet-solution.md) | high | Signet solution CompactSize and pushes | fixed | `compact_size_and_solution_parse_errors` |
