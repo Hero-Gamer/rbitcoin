@@ -573,6 +573,11 @@ mod tests {
         spk2.extend_from_slice(&payload2);
         let (sol2, _) = fetch_and_clear_signet_section(&spk2).unwrap();
         assert_eq!(sol2, vec![0xbe]);
+        // A byte after the push must survive. `pc *= n` skips it.
+        spk2.push(0x51);
+        let (sol2, repl2) = fetch_and_clear_signet_section(&spk2).unwrap();
+        assert_eq!(sol2, vec![0xbe]);
+        assert!(repl2.ends_with(&[0x51]), "{repl2:?}");
 
         // Truncated push → None
         assert!(fetch_and_clear_signet_section(&[0x05, 0x01]).is_none());
@@ -621,6 +626,22 @@ mod tests {
         // Non-minimal witness count 0 (253, 0x0000).
         let err = parse_signet_solution(&[0x00, 253, 0x00, 0x00]).unwrap_err();
         assert!(err.to_string().contains("non-minimal"), "{err}");
+        // 253 is the smallest minimal 3-byte encoding. `v <= 253` rejects it.
+        let mut at_253 = vec![253, 253, 0];
+        at_253.extend(vec![0x11u8; 253]);
+        at_253.push(0);
+        let (ss, wit) = parse_signet_solution(&at_253).unwrap();
+        assert_eq!(ss.len(), 253);
+        assert_eq!(wit.len(), 0);
+        // u16::MAX fits in 3 bytes, so a 5-byte form is non-minimal.
+        let err = parse_signet_solution(&[254, 0xff, 0xff, 0x00, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("non-minimal"), "{err}");
+        let err = parse_signet_solution(&[254, 0x00, 0x00, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("compact size"), "{err}");
+        let err = parse_signet_solution(&[255, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("non-minimal"), "{err}");
+        let err = parse_signet_solution(&[255, 0, 0, 0, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("compact size"), "{err}");
         // Huge count must fail before allocating the stack.
         let mut huge = vec![0x00, 255];
         huge.extend_from_slice(&u64::MAX.to_le_bytes());
@@ -635,6 +656,15 @@ mod tests {
         let (sol, repl) = fetch_and_clear_signet_section(&script).expect("pushdata4");
         assert_eq!(sol, vec![0xaa, 0xbb, 0xcc, 0xdd]);
         assert_eq!(&repl[..5], &[4, 0xec, 0xc7, 0xda, 0xa2]);
+        // Four single-byte opcodes put pc at 5, so `pc * k` is not `pc + k`.
+        let mut shifted = vec![0x51, 0x51, 0x51, 0x51, 0x4e, 5, 0, 0, 0];
+        shifted.extend_from_slice(&SIGNET_HEADER);
+        shifted.push(0x7e);
+        let (sol, repl) = fetch_and_clear_signet_section(&shifted).expect("shifted pushdata4");
+        assert_eq!(sol, vec![0x7e]);
+        assert_eq!(repl.iter().filter(|b| **b == 0x51).count(), 4);
+        // Exactly three length bytes: `pc + 3 == len` must not read past the script.
+        assert!(fetch_and_clear_signet_section(&[0x51, 0x51, 0x51, 0x51, 0x4e, 0, 0, 0]).is_none());
         // Non-minimal OP_PUSHDATA1 of one byte re-encodes as a direct push.
         let (sol, repl) = fetch_and_clear_signet_section(&[
             0x4c, 8, 0xec, 0xc7, 0xda, 0xa2, 1, 2, 3, 4, 0x4c, 1, 0xab,
