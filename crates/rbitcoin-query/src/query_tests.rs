@@ -2915,6 +2915,51 @@ fn spill_symlink_outside_window_is_corrupt() {
 }
 
 #[test]
+fn prune_confirm_owns_seqsigwit_records() {
+    let (dir, q) = temp_query("prune-own-zero");
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0xab, 0xcd]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    assert_eq!(q.seqsigwit_ram_window_stats().0, 0);
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 0);
+    assert_eq!(q.seqsigwit_ram_window_stats().2, 0);
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0xab, 0xcd]]
+    );
+    assert!(q.store.path().join("seqsigwit.window/0.bin").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = temp_query("prune-own-ram");
+    q.set_seqsigwit_ram_threshold_bytes(1 << 20).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0x11, 0x22]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 1);
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0x11, 0x22]]
+    );
+    q.clear_seqsigwit_ram_window();
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0x11, 0x22]],
+        "spill matches the records that were moved into RAM"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prune_ram_threshold_zero_spills_tiny_blocks() {
     let (dir, q) = temp_query("prune-ram-zero");
     q.set_seqsigwit_ram_threshold_bytes(0).unwrap();

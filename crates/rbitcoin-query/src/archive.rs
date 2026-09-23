@@ -1151,9 +1151,12 @@ impl Query {
             ));
         }
         if self.prune_seqsigwit() {
-            let ins: Vec<Vec<rbitcoin_store::InputRecord>> =
-                plan.packed.iter().map(|(_, v)| v.clone()).collect();
-            self.note_appended_seqsigwit_inputs(&got_tx_fks, &ins);
+            let ins: Vec<Vec<rbitcoin_store::InputRecord>> = plan
+                .packed
+                .iter_mut()
+                .map(|(_, v)| std::mem::take(v))
+                .collect();
+            self.note_appended_seqsigwit_inputs(&got_tx_fks, ins);
         }
         for ((pin, _), pair) in plan.packed.iter().zip(loc.iter()) {
             pin.set_loc(*pair);

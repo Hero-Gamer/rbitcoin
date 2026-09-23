@@ -701,7 +701,7 @@ impl Query {
     fn persist_seqsigwit_spill_height(
         &self,
         height: Height,
-        rows: &[(Fk, Vec<InputRecord>)],
+        rows: &[(Fk, &[InputRecord])],
     ) -> Result<(), QueryError> {
         let dir = self.seqsigwit_spill_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
@@ -801,11 +801,11 @@ impl Query {
         self.seqsigwit_spill_inputs_with_count(fk, input_count)
     }
 
-    pub(crate) fn note_appended_seqsigwit_inputs(&self, fks: &[Fk], ins: &[Vec<InputRecord>]) {
+    pub(crate) fn note_appended_seqsigwit_inputs(&self, fks: &[Fk], ins: Vec<Vec<InputRecord>>) {
         let mut cache = self.seqsigwit_append_cache.lock().unwrap();
-        for (fk, inputs) in fks.iter().zip(ins.iter()) {
+        for (fk, inputs) in fks.iter().zip(ins) {
             if let Some(id) = fk.get() {
-                cache.insert(id, inputs.clone());
+                cache.insert(id, inputs);
             }
         }
     }
@@ -838,9 +838,9 @@ impl Query {
         }
         drop(appended);
         self.drop_seqsigwit_ram_height(height.0);
-        let spill_rows: Vec<(Fk, Vec<InputRecord>)> = staged
+        let spill_rows: Vec<(Fk, &[InputRecord])> = staged
             .iter()
-            .map(|(fk, ins, _)| (*fk, ins.clone()))
+            .map(|(fk, ins, _)| (*fk, ins.as_slice()))
             .collect();
         self.persist_seqsigwit_spill_height(height, &spill_rows)?;
         if threshold == 0 {
