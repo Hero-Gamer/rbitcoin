@@ -1056,6 +1056,76 @@ mod tests {
             "positional waitforblock slept {:?}",
             t0.elapsed()
         );
+        let named = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 3,
+            "method": "waitfornewblock",
+            "params": [0]
+        });
+        let t1 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                named.to_string().as_bytes(),
+            ),
+        )
+        .await
+        .expect("waitfornewblock timeout 0 must return");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert_eq!(body["result"]["hash"], hash, "{body}");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(1),
+            "waitfornewblock with timeout 0 slept {:?}",
+            t1.elapsed()
+        );
+        let missing = "00".repeat(32);
+        let short = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 4,
+            "method": "waitforblock",
+            "params": [missing, 50]
+        });
+        let t2 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                short.to_string().as_bytes(),
+            ),
+        )
+        .await
+        .expect("short waitforblock must hit its deadline");
+        assert_eq!(st, 200, "{body:?}");
+        assert!(
+            t2.elapsed() < std::time::Duration::from_secs(1),
+            "missing-hash waitforblock ignored the deadline: {:?}",
+            t2.elapsed()
+        );
+        let gbt = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 5,
+            "method": "getblocktemplate",
+            "params": [{"rules": ["segwit"], "longpollid": "00"}]
+        });
+        let t3 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(tcp_addr(&handle), &handle.auth, gbt.to_string().as_bytes()),
+        )
+        .await
+        .expect("stale longpollid must not wait");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert!(body["result"]["height"].is_number(), "{body}");
+        assert!(
+            t3.elapsed() < std::time::Duration::from_secs(1),
+            "stale getblocktemplate longpoll slept {:?}",
+            t3.elapsed()
+        );
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1099,8 +1169,11 @@ mod tests {
                 let body = serde_json::json!({
                     "jsonrpc": "1.0",
                     "id": "w",
-                    "method": "waitfornewblock",
-                    "params": [2000]
+                    "method": "waitforblock",
+                    "params": {
+                        "blockhash": "00".repeat(32),
+                        "timeout": 2000
+                    }
                 })
                 .to_string();
                 let req = format!(
@@ -1118,12 +1191,12 @@ mod tests {
             tokio::task::spawn_blocking(|| ()).await.unwrap();
             assert!(
                 t0.elapsed() < std::time::Duration::from_millis(400),
-                "waitfornewblock held the blocking pool for {:?}",
+                "named waitforblock held the blocking pool for {:?}",
                 t0.elapsed()
             );
             assert!(
                 !waiter.is_finished(),
-                "waitfornewblock returned before the pool probe"
+                "named waitforblock returned before the pool probe"
             );
             waiter.abort();
             handle.shutdown().await;
