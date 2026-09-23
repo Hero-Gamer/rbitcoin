@@ -75,7 +75,9 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 ## Push and poll
 
 Required jobs: `fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`,
-`macos`, `coverage`, `nixos-module-eval`. Structural scan is
+`macos`, `coverage`, `nixos-module-eval`, and `mutants (0/4)` through
+`mutants (3/4)`. A mutants shard killed at 30 minutes is a pass; a
+finished non-zero `cargo mutants` exit is a fail. Structural scan is
 `./scripts/ast-grep.sh`. `windows` / `macos` are native store plus `--smoke`,
 not operator zips.
 
@@ -155,15 +157,3 @@ If CI `coverage` fails, add a pin and push. Floor: [`TESTING.md`](../../../TESTI
 
 Operator musl binaries are [`docs/releases.md`](../../../docs/releases.md).
 Do not `nix build .#rbitcoin-musl` on a feature branch.
-
-### Behavior-Killer Gate
-
-Before first production commit:
-1. Classify changed behavior (Tier0–5)
-2. Identify killer: test + exact observable assertion
-3. Prove killer fails without the behavior
-4. Run `cargo mutants --in-diff`
-5. Classify all survivors
-6. CI passed alone is not justification
-
-Docs-only change: exempt from mutants gate.

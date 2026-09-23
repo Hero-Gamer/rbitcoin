@@ -1,5 +1,5 @@
 # Weekly cargo-mutants. Not a required check.
-# PR in-diff shards are ci.yml job `mutants` (parallel with coverage).
+# PR in-diff shards are ci.yml job `mutants` (required; a 30m timeout passes).
 # Must pass --workspace: default-members is rbitcoin-node only.
 # Owner: TESTING.md (Mutation testing). Snapshot lists: docs/mutants/.
 

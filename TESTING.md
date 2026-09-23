@@ -254,7 +254,7 @@ matches scalar in default tests). Owner: [`docs/quality.md`](./docs/quality.md).
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). `--fail-above --threshold 30`; `.cargo-crap.toml` allowlists today's production CRAP>30 functions (remove a name when it scores ≤30). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`. No `--fail-regression` (llvm-cov coverage % jitters per function) |
 | **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 92% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
-| **cargo-mutants** | Must pass `--workspace` (`Cargo.toml` `default-members` is `rbitcoin-node` only; without `--workspace` the list is ~7 mutants). PR: `git diff origin/<base>.. --unified=0 > git.diff` then `cargo mutants --workspace --in-diff git.diff --shard k/4 --sharding slice -j 2` (same flags on every shard). Weekly: `cargo mutants --workspace --shard N/8 -j 2`. Snapshot of missed/timeouts: [`docs/mutants/`](docs/mutants/). | PR: `ci.yml` `mutants`, 4 shards, needs fmt/clippy/test (same window as coverage). `continue-on-error` (not a merge gate). Skipped when the diff does not touch `crates/`, `Cargo.toml`, `Cargo.lock`, `ci.yml`, or `mutants.yml`. Weekly `mutants.yml` Sunday 03:00 UTC, 8 shards, 360min cap (not required). `workflow_dispatch`. First Sunday wall-clock is still a measurement. |
+| **cargo-mutants** | Must pass `--workspace` (`Cargo.toml` `default-members` is `rbitcoin-node` only; without `--workspace` the list is ~7 mutants). PR: `git diff origin/<base>.. --unified=0 -- crates Cargo.toml Cargo.lock .github/workflows/ci.yml .github/workflows/mutants.yml > git.diff` then `cargo mutants --workspace --in-diff git.diff --shard k/4 --sharding slice -j 2` (same flags on every shard). Weekly: `cargo mutants --workspace --shard N/8 -j 2`. Snapshot of missed/timeouts: [`docs/mutants/`](docs/mutants/). | PR: `ci.yml` `mutants (0/4)`–`mutants (3/4)`, required, needs fmt/clippy/test. A shard that finishes with a non-zero exit fails. A shard killed at 30 minutes counts as a pass, even if the partial log shows `MISSED`. No rust or workflow diff: the shard exits 0. Weekly `mutants.yml` Sunday 03:00 UTC, 8 shards, 360min cap (not required). `workflow_dispatch`. |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
 not write `target/`. `mutants.out/` is gitignored.
@@ -523,26 +523,8 @@ python3 scripts/core-functional/check_inventory.py
 ./scripts/overlay-functional/run.sh --list
 ```
 
-## Mutation and Behavior-Killer Policy
+## What a mutant kill looks like
 
-Every new production behavior must have a demonstrable killer appropriate to its behavior class.
+The PR gate is the four `mutants` shards in [`ci.yml`](.github/workflows/ci.yml), described in the table above. Do not run a different `cargo mutants` command and treat that as the gate.
 
-**What counts as behavior:** new rejection/acceptance decision, error code, RPC field, new file/cleanup path/cap/format/crash recovery, new ranking/selection/timeout/prefill/persistence, new concurrency/cancellation/ordering guarantee. Refactor/move with no behavior change needs no new killer but must show 0 applicable survivors.
-
-**Tier0 — Primitives / unsafe / serialization / SIMD / arithmetic:** independent reference/oracle, not copy of optimized impl. Boundary + invalid encoding. Unsafe = narrowest invariant + MIRI where applicable.
-
-**Tier1 — Observable decisions (consensus, RPC, mempool, CLI/config):** assert exact variant/code, not `is_err()` or string matching. Exercise real accept/reject path.
-
-**Tier2 — Stateful P2P / IBD / Time / Concurrency:** assert intermediate state — not just final tip height. Injected mock clock is default. Concurrency/async: `cargo-mutants` advisory only; needs property test for ordering/cancellation.
-
-**Tier3 — Store / File / Crash / Schema:** lifecycle = precondition + operation + postcondition. Crash: interrupt → reopen → assert documented recovery. Schema: test every compatibility direction.
-
-**Tier4 — Tooling / CI / Docs:** no mutants gate.
-
-**Tier5 — Docs-only:** exempt if diff only `*.md` and no `crates/` change.
-
-**First-commit gate:**
-```bash
-git diff origin/master.. --unified=0 > /tmp/pr.diff
-cargo test -p <crate> --lib -- --quiet
-cargo mutants -p <crate> --in-diff /tmp/pr.diff -j2 -- --skip core -q
+A new production behavior needs a test that fails when that behavior is removed or inverted. Assert the observable result (the error variant, the bytes, the height), not the test name. Concurrency, ordering, and cancellation are not what `cargo-mutants` models; those need a direct test. A diff that does not touch `crates/`, the Cargo manifests, or the mutants workflows does not run mutants.
