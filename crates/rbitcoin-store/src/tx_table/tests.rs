@@ -2773,6 +2773,18 @@ fn span_prevouts_match_per_create() {
     assert_eq!(span[1024].1[1].prev_index, 0);
     let one = t.get_full(fks[1024]).unwrap();
     assert_eq!(span[1024].1, one.1);
+    let mid = t.get_full_span(2, 2).unwrap();
+    assert_eq!(mid.len(), 1);
+    assert_eq!(mid[0].1.len(), 1);
+    assert_eq!(mid[0].1[0].create_fk, Fk(1));
+    let tail = t.get_full_span(1025, 1025).unwrap();
+    assert_eq!(tail[0].1.len(), 2);
+    assert_eq!(tail[0].1[1].create_fk, Fk(2));
+    assert_eq!(tail[0].1, t.get_full(Fk(1025)).unwrap().1);
+    let early = t.get_full_span(1, 2).unwrap();
+    assert_eq!(early.len(), 2);
+    assert!(early[0].1[0].is_coinbase());
+    assert_eq!(early[1].1[0].create_fk, Fk(1));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

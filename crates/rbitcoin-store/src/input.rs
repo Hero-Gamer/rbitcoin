@@ -497,6 +497,29 @@ mod tests {
     }
 
     #[test]
+    fn edges_span_bounds_and_mid_create() {
+        let dir = TempDir::labeled("input-span-bounds").unwrap();
+        let t = Input::create(dir.path()).unwrap();
+        t.append(&[
+            vec![edge(1, 0)],
+            vec![edge(4, 1), edge(4, 2)],
+            vec![edge(7, 3)],
+        ])
+        .unwrap();
+        assert!(matches!(t.edges_span(0, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.edges_span(3, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.edges_span(1, 4), Err(StoreError::NotFound)));
+        assert_eq!(
+            t.edges_span(2, 2).unwrap(),
+            vec![Some(vec![edge(4, 1), edge(4, 2)])]
+        );
+        assert_eq!(
+            t.edges_span(1, 2).unwrap(),
+            vec![Some(vec![edge(1, 0)]), Some(vec![edge(4, 1), edge(4, 2)]),]
+        );
+    }
+
+    #[test]
     fn input_append_reopen_reads_last_edges() {
         let dir = TempDir::labeled("input-reopen-last").unwrap();
         let t = Input::create(dir.path()).unwrap();

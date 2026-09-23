@@ -2857,13 +2857,11 @@ fn prune_watermark_unlinks_fallen_height() {
     }
     let window = q.store.path().join("seqsigwit.window");
     assert!(window.join("0.bin").is_file());
-    assert!(window.join("2.bin").is_file());
-    q.set_pruneheight(Some(Height(0))).unwrap();
-    assert!(!window.join("0.bin").exists(), "height 0 fell out");
     assert!(window.join("1.bin").is_file());
     assert!(window.join("2.bin").is_file());
     q.set_pruneheight(Some(Height(1))).unwrap();
-    assert!(!window.join("1.bin").exists(), "height 1 fell out");
+    assert!(!window.join("0.bin").exists(), "jump unlinks height 0");
+    assert!(!window.join("1.bin").exists(), "jump unlinks height 1");
     assert!(window.join("2.bin").is_file());
     std::fs::write(window.join("0.bin"), b"orphan").unwrap();
     drop(q);
