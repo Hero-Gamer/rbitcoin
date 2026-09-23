@@ -202,15 +202,15 @@ pub fn validate_block_structure_with_pres(
         }
     }
 
-    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    // Only money-range gate. `money_range_out_sum` casts a sum that passed here.
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         check_tx_local(tx, p.base_size)?;
         for o in &tx.output {
-            if o.value.to_sat() > MAX_MONEY {
+            if exceeds_max_money(o.value.to_sat()) {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
             }
         }
-        if p.out_sum > MAX_MONEY {
+        if exceeds_max_money(p.out_sum) {
             return Err(ConsensusError::BadBlock("bad-txns-txouttotal-toolarge"));
         }
     }
@@ -1115,15 +1115,48 @@ fn assemble_prevout_guards(
 }
 
 fn assemble_lock_time_cutoff(ctx: &ValidationContext<'_>, block: &Block, prev_mtp: u32) -> u32 {
-    if ctx.params.csv_active_at(ctx.height.0) {
-        if ctx.height.0 == 0 {
-            block.header.time
-        } else {
-            prev_mtp
-        }
-    } else {
+    // Height 0 has no MTP history, so the cutoff is the block time even
+    // when CSV is active.
+    if ctx.height.0 == 0 || !ctx.params.csv_active_at(ctx.height.0) {
         block.header.time
+    } else {
+        prev_mtp
     }
+}
+
+/// `MAX_BLOCK_SIGOPS_COST` (20_000 legacy sigops × witness scale 4).
+#[inline]
+fn exceeds_sigops_limit(cost: u64) -> bool {
+    const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+    cost > MAX_BLOCK_SIGOPS_COST
+}
+
+/// Attach the precompute slice only when `ti` is inside it.
+#[inline]
+fn should_use_pres(ti: usize, len: usize) -> bool {
+    ti < len
+}
+
+/// Core `MAX_MONEY` (21_000_000 BTC). This is the money-range predicate
+/// `validate_block_structure_with_pres` uses for each output and for
+/// `TxPrecompute::out_sum`.
+///
+/// `Amount::MAX_MONEY` fits in `i64`, so a sum this returns false for cannot
+/// become negative when `money_range_out_sum` casts it. That cast is not a
+/// second range check.
+#[inline]
+fn exceeds_max_money(sats: u64) -> bool {
+    sats > Amount::MAX_MONEY.to_sat()
+}
+
+/// Signed satoshis for an `out_sum` that already passed [`exceeds_max_money`].
+#[inline]
+fn money_range_out_sum(out_sum: u64) -> i64 {
+    debug_assert!(
+        !exceeds_max_money(out_sum),
+        "out_sum above MAX_MONEY must be rejected in validate_block_structure_with_pres"
+    );
+    out_sum as i64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1156,7 +1189,6 @@ fn assemble_non_cb_tx(
     build_script_jobs: bool,
     clk_job: &mut u64,
 ) -> Result<(), ConsensusError> {
-    const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
     if tx.input.is_empty() {
         return Err(ConsensusError::BadTx("no inputs"));
     }
@@ -1181,17 +1213,21 @@ fn assemble_non_cb_tx(
         None => legacy_sigop_count(tx).saturating_mul(4),
     };
     *block_sigops_cost = block_sigops_cost
-        .saturating_add(tx_legacy_sigops)
-        .saturating_add(tx_in_sigops);
-    if *block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
+        .checked_add(tx_legacy_sigops)
+        .and_then(|c| c.checked_add(tx_in_sigops))
+        .ok_or(ConsensusError::BadBlock("bad-blk-sigops"))?;
+    if exceeds_sigops_limit(*block_sigops_cost) {
         return Err(ConsensusError::BadBlock("bad-blk-sigops"));
     }
     let value_out = assemble_tx_value_out(tx, ti, pres)?;
     if value_out > value_in {
         return Err(ConsensusError::BadTx("in < out"));
     }
+    let fee = value_in
+        .checked_sub(value_out)
+        .ok_or(ConsensusError::BadTx("fee overflow"))?;
     *fees = fees
-        .checked_add(value_in - value_out)
+        .checked_add(fee)
         .ok_or(ConsensusError::BadTx("fee overflow"))?;
     if build_script_jobs {
         let t_job = Instant::now();
@@ -1201,7 +1237,7 @@ fn assemble_non_cb_tx(
             ScriptCheckJob::with_txid(txid, prevouts, tx.clone(), flags)
         };
         if let Some(ps) = pres {
-            if ti < ps.len() {
+            if should_use_pres(ti, ps.len()) {
                 job = job.with_pre_slice(Arc::clone(ps), ti);
             }
         }
@@ -1217,7 +1253,7 @@ fn assemble_tx_value_out(
     pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<i64, ConsensusError> {
     match pres.and_then(|p| p.get(ti)) {
-        Some(p) => Ok(p.out_sum as i64),
+        Some(p) => Ok(money_range_out_sum(p.out_sum)),
         None => {
             let mut value_out = 0i64;
             for o in &tx.output {
