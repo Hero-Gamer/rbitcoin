@@ -182,13 +182,57 @@ assert_fail_msg "gate fails ship until Highlights has a bullet" \
 add_highlight "$MINOR" "- **Thing:** operator-facing ship note."
 assert_ok "gate passes ship tree after Highlights" \
   bash "$GATE" --root "$MINOR"
+GIT_AUTHOR_NAME='Hero Gamer' \
+GIT_AUTHOR_EMAIL='Hero-Gamer@users.noreply.github.com' \
+GIT_COMMITTER_NAME='Hero Gamer' \
+GIT_COMMITTER_EMAIL='Hero-Gamer@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'external change'
+GIT_AUTHOR_NAME='rearden-grok[bot]' \
+GIT_AUTHOR_EMAIL='317016512+rearden-grok[bot]@users.noreply.github.com' \
+GIT_COMMITTER_NAME='rearden-grok[bot]' \
+GIT_COMMITTER_EMAIL='317016512+rearden-grok[bot]@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'bot change'
+GIT_AUTHOR_NAME='Brandon Black' \
+GIT_AUTHOR_EMAIL='freedom@reardencode.com' \
+GIT_COMMITTER_NAME='Brandon Black' \
+GIT_COMMITTER_EMAIL='freedom@reardencode.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'maintainer change'
 out="$(bash "$NOTES" --root "$MINOR")"
 assert_ok "release-notes include Highlights bullet" \
   grep -q 'operator-facing ship note' <<<"$out"
+assert_ok "release-notes without a one-shot file do not thank @otaliptus" \
+  bash -c "! grep -q '@otaliptus' <<<'$out'"
+assert_ok "release-notes thank another external login" \
+  grep -q '@Hero-Gamer' <<<"$out"
+assert_ok "release-notes omit the bot and the maintainer" \
+  bash -c "! grep -q 'rearden-grok' <<<'$out' && ! grep -q 'reardencode' <<<'$out'"
 assert_ok "release-notes omit detailed Unreleased body" \
   bash -c "! grep -q 'ship this' <<<'$out'"
 assert_ok "release-notes name CHANGELOG section" \
   grep -q '## \[0.6.0\]' <<<"$out"
+
+# --- one-shot thanks is consumed by the cut ---
+ONCE="$WORKDIR/once"
+mkdir -p "$ONCE"
+seed_dev_tree "$ONCE"
+mkdir -p "$ONCE/changelog.d"
+printf '%s\n' 'Thanks to @otaliptus for the security review, and to @dergoegge, @rob1ham, and @1440000bytes for earlier findings.' \
+  >"$ONCE/changelog.d/thanks.md"
+printf '%s\n' 'Fixed' '' '- **Beside thanks:** a normal fragment still folds.' \
+  >"$ONCE/changelog.d/fixed-beside-thanks.md"
+bash "$CUT" --root "$ONCE" --minor --date 2026-09-06
+assert_ok "cut deletes changelog.d/thanks.md" \
+  bash -c '! test -e "$ONCE/changelog.d/thanks.md"'
+assert_ok "cut folds a normal fragment next to thanks.md" \
+  grep -q 'Beside thanks' "$ONCE/CHANGELOG.md"
+assert_ok "cut keeps one-shot thanks under the shipped version" \
+  grep -q '@dergoegge' "$ONCE/CHANGELOG.md"
+add_highlight "$ONCE" "- **Thing:** operator-facing ship note."
+out="$(bash "$NOTES" --root "$ONCE")"
+assert_ok "release-notes include the one-shot thanks" \
+  bash -c "grep -q '@otaliptus' <<<'$out' && grep -q '@rob1ham' <<<'$out' && grep -q '@1440000bytes' <<<'$out'"
+assert_ok "one-shot @otaliptus appears once" \
+  bash -c "[[ \$(grep -o '@otaliptus' <<<'$out' | wc -l) -eq 1 ]]"
 
 # --- cut: major 0.5.99 → 1.0.0 ---
 MAJOR="$WORKDIR/major"
