@@ -1553,8 +1553,9 @@ pub(crate) fn structural_validate_spends(
 
     scratch.begin_block();
     let maturity = ctx.params.coinbase_maturity();
-    reject_bip30_unspent_overwrite(query, block, ctx)?;
+    // BIP30's txid batch is inside `spent_ns` (signet runs it on every block).
     let t_spent = Instant::now();
+    reject_bip30_unspent_overwrite(query, block, ctx)?;
     let t_abs = Instant::now();
     structural_abs_heights(query, spends, batch_parents, run_create_height, scratch)?;
     let tip = query.tip_height().map(|h| h.0);
@@ -1974,16 +1975,18 @@ fn structural_bip68(
 
 /// MTP for write structural. Prefers assemble-carried `prev_mtp` (seeded into
 /// `cache`). Misses go to durable headers only — never `get_header_plan`.
-/// BIP30: after BIP34, skipped. Before that, a connected instance with any
-/// unspent output may not be overwritten — except mainnet 91842 / 91880.
-/// Just-archived self is unconnected (not a hit); only a live sibling is.
+/// BIP30: a connected instance with any unspent output may not be overwritten.
+/// Skipped for the two mainnet repeats, and when the header at BIP34 height
+/// is this network's BIP34 hash and the block is below
+/// [`crate::params::BIP34_IMPLIES_BIP30_LIMIT`]. Signet and regtest have no
+/// BIP34 hash, so every block is checked. Just-archived self is unconnected.
 fn reject_bip30_unspent_overwrite(
     query: &Query,
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<(), ConsensusError> {
-    if ctx.params.bip34_active_at(ctx.height.0)
-        || ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
+    if ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
+        || bip34_ancestry_skips_bip30(query, ctx)
     {
         return Ok(());
     }
@@ -2027,6 +2030,20 @@ fn reject_bip30_unspent_overwrite(
         }
     }
     Ok(())
+}
+
+fn bip34_ancestry_skips_bip30(query: &Query, ctx: &ValidationContext<'_>) -> bool {
+    let height = ctx.height.0;
+    if ctx.params.bip34_hash.is_none() || height <= ctx.params.btc.bip34_height {
+        return ctx.params.bip30_skipped_for_bip34_ancestry(height, None);
+    }
+    let ancestor = query
+        .header_at_height(Height(ctx.params.btc.bip34_height))
+        .ok()
+        .flatten()
+        .map(|(_, rec)| bitcoin::BlockHash::from_byte_array(rec.hash));
+    ctx.params
+        .bip30_skipped_for_bip34_ancestry(height, ancestor)
 }
 
 fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32, ConsensusError> {

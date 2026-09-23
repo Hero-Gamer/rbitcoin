@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **BIP30:** enforced unless the header at BIP34 height is that network's
+  BIP34 hash, and always from height 1_983_702. Signet and regtest have no
+  BIP34 hash, so every block is checked. The two mainnet repeats stay
+  exceptions. The txid batch is inside the structural `spent=` timer.
 - **Witness padding:** witness commitment and unexpected-witness checks run
   before the block weight check. Those two failures are mutations, so the
   block hash is not cached invalid. A weight failure after a matching

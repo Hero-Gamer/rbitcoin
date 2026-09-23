@@ -402,6 +402,68 @@ fn bip30_rejects_unspent_connected_sibling() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Signet activates BIP34 at height 1. Core's empty BIP34 hash still enforces
+/// BIP30 on every signet block.
+#[test]
+fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
+    use crate::block::structural_validate_spends;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("bip30-signet");
+    q.enter_direct_index_mode().unwrap();
+
+    let first = coinbase(1);
+    let txid = first.compute_txid().to_byte_array();
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let fk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+
+    let dup = block_with(vec![first]);
+    let p = Box::leak(Box::new(ChainParams::signet()));
+    let ctx = ValidationContext::at(p, Height(2), Milestone::NONE);
+    let err = structural_validate_spends(
+        &q,
+        &dup,
+        &ctx,
+        Some(&[Fk(2)]),
+        &[],
+        0,
+        &mut OutPointSet::default(),
+        &BatchParents::new(),
+        &mut U32Map::default(),
+        &FkMap::default(),
+        &mut Vec::new(),
+    )
+    .expect_err("signet must enforce BIP30 after height 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad-txns-BIP30"),
+        "expected BIP30 reject, got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 #[test]
 fn s1_rejects_empty_txdata() {
     validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
