@@ -1115,12 +1115,13 @@ fn assemble_prevout_guards(
 }
 
 fn assemble_lock_time_cutoff(ctx: &ValidationContext<'_>, block: &Block, prev_mtp: u32) -> u32 {
+    // BIP113: cutoff = MTP if CSV active and height>0, else block time
+    // Genesis (height 0) has no MTP history, must use block time even if CSV active
+    if ctx.height.0 == 0 {
+        return block.header.time;
+    }
     if ctx.params.csv_active_at(ctx.height.0) {
-        if ctx.height.0 == 0 {
-            block.header.time
-        } else {
-            prev_mtp
-        }
+        prev_mtp
     } else {
         block.header.time
     }
@@ -1181,8 +1182,9 @@ fn assemble_non_cb_tx(
         None => legacy_sigop_count(tx).saturating_mul(4),
     };
     *block_sigops_cost = block_sigops_cost
-        .saturating_add(tx_legacy_sigops)
-        .saturating_add(tx_in_sigops);
+        .checked_add(tx_legacy_sigops)
+        .and_then(|c| c.checked_add(tx_in_sigops))
+        .ok_or(ConsensusError::BadBlock("bad-blk-sigops"))?;
     if *block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
         return Err(ConsensusError::BadBlock("bad-blk-sigops"));
     }
@@ -1190,9 +1192,11 @@ fn assemble_non_cb_tx(
     if value_out > value_in {
         return Err(ConsensusError::BadTx("in < out"));
     }
-    *fees = fees
-        .checked_add(value_in - value_out)
-        .ok_or(ConsensusError::BadTx("fee overflow"))?;
+    let fee = value_in.checked_sub(value_out).ok_or(ConsensusError::BadTx("fee overflow"))?;
+    if fee < 0 {
+        return Err(ConsensusError::BadTx("negative fee"));
+    }
+    *fees = fees.checked_add(fee).ok_or(ConsensusError::BadTx("fee overflow"))?;
     if build_script_jobs {
         let t_job = Instant::now();
         let mut job = if let Some(w) = wire {
@@ -1216,18 +1220,31 @@ fn assemble_tx_value_out(
     ti: usize,
     pres: Option<&Arc<[rbitcoin_query::TxPrecompute]>>,
 ) -> Result<i64, ConsensusError> {
+    const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
     match pres.and_then(|p| p.get(ti)) {
-        Some(p) => Ok(p.out_sum as i64),
+        Some(p) => {
+            let sum = p.out_sum as i64;
+            if sum < 0 || sum > MAX_MONEY {
+                return Err(ConsensusError::BadTx("value out of range"));
+            }
+            Ok(sum)
+        },
         None => {
             let mut value_out = 0i64;
             for o in &tx.output {
-                let sats = o.value.to_sat() as i64;
-                if sats < 0 {
-                    return Err(ConsensusError::BadTx("negative output"));
+                let sats_u64 = o.value.to_sat();
+                if sats_u64 > MAX_MONEY as u64 {
+                    return Err(ConsensusError::BadTx("output value too large"));
                 }
+                let sats = sats_u64 as i64; // safe: < MAX_MONEY < i64::MAX
+                // sats < 0 is impossible for u64, removed dead code - now check range instead
                 value_out = value_out
                     .checked_add(sats)
                     .ok_or(ConsensusError::BadTx("value out overflow"))?;
+                if value_out > MAX_MONEY {
+                    return Err(ConsensusError::BadTx("tx output sum too large"));
+                }
+
             }
             Ok(value_out)
         }
