@@ -6,8 +6,11 @@ BIP324 v2-only P2P, cluster mempool (Libre admission + **consensus script checks
 Electrum confirmed + unconfirmed (TLS via reverse proxy). **0.7 mainnet** is
 early production / high-scrutiny — see
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Watch reorgs and disk
-headroom before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
-that height; use `--milestone 0` for full scripts.
+headroom before any serious use. Default mainnet milestone is block **840000**
+(`0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`): script/sig
+checks skip only when the header path contains that hash and chain work meets
+the minimum. Explicit `--milestone HEIGHT` is height-only. `--milestone 0` is
+full scripts. Signet’s default is **0** (every script, slower on purpose).
 
 Architecture and confirm pipeline: [`docs/architecture.md`](./docs/architecture.md),
 [`docs/concurrency.md`](./docs/concurrency.md). Download defaults to **1024**
@@ -380,7 +383,7 @@ Clean smoke:
 | `--tor-control-password PASS` | `tor_control_password=` | unset — cookie AUTH unless set |
 | `--i2p-sam [HOST:PORT]` | `i2p_sam=` | unset — no SAM; omit ADDR → `127.0.0.1:7656` |
 | `--i2p-accept-incoming` | `i2p_accept_incoming=` | **off** — persist `{datadir}/i2p/p2p.priv` and STREAM FORWARD to the P2P bind |
-| `--milestone HEIGHT` | `milestone=` | network default (mainnet 840000) |
+| `--milestone HEIGHT` | `milestone=` | mainnet anchor at 840000; signet 0; explicit height is height-only |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
 | `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
 | `--mempool-size-mb N` | `mempool_size_mb=` | ~300 MiB weight |
@@ -651,7 +654,7 @@ Token meanings and ring depth: [`docs/io-modality.md`](docs/io-modality.md).
 | Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
 | Live IBD peers | **16** | `--max-outbound` |
 | Inbound P2P sessions | **125** | `--max-inbound`. At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
-| Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
+| Milestone (script skip) | mainnet anchor **840000**, signet **0**, testnet 2500000, regtest 0 | `--milestone` (`0` = full scripts; explicit height is height-only) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](docs/io-modality.md) |
 | Archive Class A append | **pwrite** (always) | `txout` / `seqsigwit` / `spent` + `*.idx` |

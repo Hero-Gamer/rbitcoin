@@ -70,8 +70,11 @@ pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, C
 pub use header::{
     expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
 };
-pub use milestone::Milestone;
-pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
+pub use milestone::{Milestone, MilestoneAnchor};
+pub use params::{
+    default_milestone_height, genesis_block, mainnet_milestone_anchor, mainnet_min_chain_work_be,
+    ChainParams, Checkpoint,
+};
 pub use policy::PolicyResult;
 pub use regtest_pad::{
     grind_regtest_pow, mine_empty_regtest, mine_regtest_paying, pad_empty_from,
@@ -489,7 +492,7 @@ mod coverage_tests {
     fn regtest_connect_archive_and_confirm_path() {
         let (path, q) = temp_store();
         let params = ChainParams::regtest();
-        let ms = Milestone { height: 1_000_000 };
+        let ms = Milestone::height(1_000_000);
         let genesis = genesis_block(&params);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 
@@ -507,7 +510,7 @@ mod coverage_tests {
     fn assemble_second_block_rejects_stale_nversion() {
         let (path, q) = temp_store();
         let params = ChainParams::regtest();
-        let ms = Milestone { height: 1_000_000 };
+        let ms = Milestone::height(1_000_000);
         let genesis = genesis_block(&params);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 

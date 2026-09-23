@@ -241,6 +241,8 @@ pub(crate) struct IbdPerfSample {
     pub prep_filter_plan_ms: u64,
     pub connect_ns: u64,
     pub script_ns: u64,
+    /// Ancestor + min-work milestone gate (lookup / assemble).
+    pub milestone_gate_ns: u64,
     pub strong_ns: u64,
     pub tip_ns: u64,
     pub structural_spent_ns: u64,
@@ -502,6 +504,7 @@ impl Default for IbdPerfSample {
             prep_filter_plan_ms: 0,
             connect_ns: 0,
             script_ns: 0,
+            milestone_gate_ns: 0,
             strong_ns: 0,
             tip_ns: 0,
             structural_spent_ns: 0,
@@ -858,6 +861,7 @@ pub(crate) fn sample(
     let w = stats.take_window();
     let connect_ns = w.connect_ns;
     let script_ns = w.script_ns;
+    let milestone_gate_ns = w.milestone_gate_ns;
     let class_c_ns = w.class_c_ns;
     let strong_ns = w.strong_ns;
     let sh_ns = w.scripthash_ns;
@@ -1012,6 +1016,7 @@ pub(crate) fn sample(
         prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
         connect_ns,
         script_ns,
+        milestone_gate_ns,
         strong_ns,
         tip_ns,
         structural_spent_ns,
@@ -1574,6 +1579,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.script_ns),
         us(write_ns),
     );
+    append_nz(&mut out, "milestone_us", us(s.milestone_gate_ns));
     append_write_inventory_debug(&mut out, s, us);
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));

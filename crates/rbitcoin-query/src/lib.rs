@@ -345,6 +345,22 @@ pub struct Query {
     seqsigwit_ram_window: Mutex<SeqSigWitRamWindow>,
     /// Inputs from the most recent Class A append wave (fk-keyed).
     seqsigwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
+    /// Header work-path height → hash plus work through the contiguous tip.
+    ///
+    /// Second map beside IBD `height_to_hash` so confirm threads can do two
+    /// O(1) milestone lookups without the IBD state lock. RAM is one hash per
+    /// header on that path for the process lifetime of the sync.
+    milestone_path: Mutex<MilestonePath>,
+}
+
+/// Best header path published by IBD header intake.
+#[derive(Default)]
+struct MilestonePath {
+    by_height: HashMap<u32, [u8; 32]>,
+    /// Work through `work_height` when `work_valid` (big-endian).
+    work_through: [u8; 32],
+    work_height: u32,
+    work_valid: bool,
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -455,6 +471,7 @@ impl Query {
             ),
             seqsigwit_ram_window: Mutex::new(SeqSigWitRamWindow::default()),
             seqsigwit_append_cache: Mutex::new(U64Map::default()),
+            milestone_path: Mutex::new(MilestonePath::default()),
         };
         if let Some(tip) = q.tip_height() {
             let _ = q.ensure_height_by_hash_index(tip);
@@ -472,6 +489,80 @@ impl Query {
     #[inline]
     pub fn confirm_stats_arc(&self) -> Arc<ConfirmStats> {
         Arc::clone(&self.confirm_stats)
+    }
+
+    fn milestone_path_lock(&self) -> std::sync::MutexGuard<'_, MilestonePath> {
+        self.milestone_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Header hash at `height` on the published header path, else the
+    /// confirmed chain, else a queued body. Missing is not an ancestor.
+    pub fn milestone_header_at(&self, height: u32) -> Option<[u8; 32]> {
+        if let Ok(Some((_, rec))) = self.header_at_height(rbitcoin_primitives::Height(height)) {
+            return Some(rec.hash);
+        }
+        let g = self.milestone_path_lock();
+        if let Some(h) = g.by_height.get(&height).copied() {
+            return Some(h);
+        }
+        drop(g);
+        self.block_queue_hash_at_height(height)
+    }
+
+    /// Work through the contiguous published header tip, if intake seeded it.
+    pub fn milestone_best_work_be(&self) -> Option<[u8; 32]> {
+        let g = self.milestone_path_lock();
+        g.work_valid.then_some(g.work_through)
+    }
+
+    /// Record one header on the work path.
+    ///
+    /// `base_through_prev` is confirmed work through the parent, and only the
+    /// caller that checked `prev` is the tip should pass it. Later headers
+    /// extend that total when `prev` is the hash already stored at `height-1`.
+    pub fn note_milestone_header(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        prev: [u8; 32],
+        header_work: bitcoin::Work,
+        base_through_prev: Option<bitcoin::Work>,
+    ) {
+        let mut g = self.milestone_path_lock();
+        g.by_height.insert(height, hash);
+        if let Some(base) = base_through_prev {
+            if !g.work_valid || height >= g.work_height {
+                let acc = base + header_work;
+                g.work_through = acc.to_be_bytes();
+                g.work_height = height;
+                g.work_valid = true;
+            }
+            return;
+        }
+        let prev_h = match height.checked_sub(1) {
+            Some(h) => h,
+            None => return,
+        };
+        if g.work_valid
+            && g.work_height == prev_h
+            && g.by_height.get(&prev_h).copied() == Some(prev)
+        {
+            let acc = bitcoin::Work::from_be_bytes(g.work_through) + header_work;
+            g.work_through = acc.to_be_bytes();
+            g.work_height = height;
+        }
+    }
+
+    /// Drop path slots above `height`. Unknown work after a rewind does not skip.
+    pub fn clear_milestone_path_above(&self, height: u32) {
+        let mut g = self.milestone_path_lock();
+        g.by_height.retain(|h, _| *h <= height);
+        if g.work_valid && g.work_height > height {
+            g.work_valid = false;
+            g.work_through = [0; 32];
+        }
     }
 
     fn load_pruneheight(store_path: &Path) -> Result<(u32, bool), QueryError> {

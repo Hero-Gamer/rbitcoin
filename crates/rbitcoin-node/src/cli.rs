@@ -1,7 +1,7 @@
 use crate::config::{ConfApply, NodeConfig};
 use crate::inhibit::SuspendInhibit;
 use crate::run::{run_node, run_p2p};
-use rbitcoin_consensus::default_milestone_height;
+use rbitcoin_consensus::{default_milestone_height, mainnet_min_chain_work_be};
 use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_store::HeadScale;
 use std::ffi::OsString;
@@ -171,6 +171,11 @@ fn finish_operator_config(
     if !config.milestone_explicit {
         config.milestone_height = default_milestone_height(config.network);
     }
+    if config.minimum_chain_work.is_none()
+        && config.network == rbitcoin_primitives::Network::Mainnet
+    {
+        config.minimum_chain_work = Some(mainnet_min_chain_work_be());
+    }
     config.smoke = smoke;
     config.absorb_inbound_env();
     config.resolve_listen_defaults();
@@ -318,7 +323,9 @@ Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG 
 API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
 Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {{datadir}}/ip_asn.dat.\n\
 Milestone: skip script/sig checks at/below HEIGHT.\n\
-  Defaults: mainnet 840000, signet 2000000, testnet 2500000, regtest 0. Use 0 for full scripts.\n\
+  Defaults: mainnet 840000 anchored to block 0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5\n\
+  (skip only on that header path, and only when header work meets min chain work),\n\
+  signet 0, testnet 2500000, regtest 0. Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
@@ -1340,7 +1347,8 @@ mod tests {
             omitted.milestone_height,
             default_milestone_height(Network::Mainnet)
         );
-        assert!(omitted.milestone().skips_scripts_at(1));
+        assert!(omitted.milestone().anchor.is_some());
+        assert!(!omitted.milestone().skips_scripts_at(1));
 
         let cli0 = ready_config(["rbitcoin-node", "--milestone", "0"]);
         assert_eq!(cli0.network, Network::Mainnet);
@@ -1382,6 +1390,30 @@ mod tests {
         let from_eq = ready_config(["rbitcoin-node", eq.as_str()]);
         assert_eq!(from_eq.milestone_height, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_milestone_is_anchored_and_signet_is_full_scripts() {
+        let omitted = ready_config(["rbitcoin-node"]);
+        assert!(omitted.milestone().anchor.is_some());
+        assert!(!omitted.milestone().skips_scripts_at(1));
+        assert!(omitted.minimum_chain_work.is_some());
+        assert!(!omitted.meets_minimum_chain_work([0; 32]));
+        let explicit = ready_config(["rbitcoin-node", "--milestone", "840000"]);
+        assert!(explicit.milestone().anchor.is_none());
+        assert!(explicit.milestone().skips_scripts_at(1));
+        let signet = ready_config(["rbitcoin-node", "--network=signet"]);
+        assert_eq!(signet.milestone_height, 0);
+        assert!(!signet.milestone().skips_scripts_at(1));
+        let signet_skip = ready_config([
+            "rbitcoin-node",
+            "--network=signet",
+            "--milestone",
+            "2000000",
+        ]);
+        assert!(signet_skip.milestone().skips_scripts_at(1));
+        let custom_work = ready_config(["rbitcoin-node", "--min-chain-work=0x65"]);
+        assert_eq!(custom_work.minimum_chain_work.unwrap()[31], 0x65);
     }
 
     #[test]

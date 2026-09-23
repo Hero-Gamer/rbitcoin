@@ -997,8 +997,15 @@ fn p3_default_milestone_heights() {
     use crate::params::default_milestone_height;
     use rbitcoin_primitives::Network;
     assert_eq!(default_milestone_height(Network::Regtest), 0);
-    assert!(default_milestone_height(Network::Mainnet) > 0);
-    assert!(default_milestone_height(Network::Signet) > 0);
+    assert_eq!(default_milestone_height(Network::Mainnet), 840_000);
+    assert_eq!(default_milestone_height(Network::Testnet), 2_500_000);
+    assert_eq!(default_milestone_height(Network::Signet), 0);
+    let anchor = crate::mainnet_milestone_anchor();
+    assert_eq!(
+        anchor.hash.to_string(),
+        crate::params::MAINNET_MILESTONE_HASH
+    );
+    assert_ne!(anchor.min_work_be, [0u8; 32]);
 }
 
 #[test]
@@ -1374,7 +1381,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let p = Box::leak(Box::new(params));
-    let ctx = ValidationContext::at(p, Height(1), Milestone { height: 840_000 });
+    let ctx = ValidationContext::at(p, Height(1), Milestone::height(840_000));
     let parents = BatchParents::new();
     let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
@@ -1577,7 +1584,7 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     };
     let b = block_with(vec![coinbase(1), spend]);
     let params = Box::leak(Box::new(ChainParams::regtest()));
-    let ctx = ValidationContext::at(params, Height(1), Milestone { height: 100 });
+    let ctx = ValidationContext::at(params, Height(1), Milestone::height(100));
     assert!(ctx.milestone.skips_scripts_at(ctx.height.0));
     let spend_fk = Fk(100);
     let mut thin = SpendEdges::default();
@@ -1618,6 +1625,136 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     .err()
     .expect("over-budget pin P2WSH must reject");
     assert_bad_block(err, "bad-blk-sigops");
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Anchored skip uses the header path. A height match with a different hash
+/// still builds script jobs.
+#[test]
+fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
+    use super::assemble_block_prevouts;
+    use crate::milestone::MilestoneAnchor;
+    use bitcoin::hashes::Hash;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, OutPointSet, SpendEdge, SpendEdges};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("assemble-anchor");
+    let mut parent_txid = [0u8; 32];
+    parent_txid[0] = 0x42;
+    let rec = TxRecord {
+        txid: parent_txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let mut parents = BatchParents::new();
+    parents.insert_owned(
+        Fk(7),
+        rec,
+        vec![(0, OutputRecord::unspent(50_0000_0000, vec![0x51]))],
+        vec![0],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let b = block_with(vec![coinbase(1), spend]);
+    let params = Box::leak(Box::new(ChainParams::regtest()));
+    let anchor_hash = [0xabu8; 32];
+    let mut min = [0u8; 32];
+    min[1] = 1;
+    let ms = Milestone {
+        height: 100,
+        anchor: Some(MilestoneAnchor {
+            hash: bitcoin::BlockHash::from_byte_array(anchor_hash),
+            min_work_be: min,
+        }),
+    };
+    let ctx = ValidationContext::at(params, Height(1), ms);
+    let spend_fk = Fk(100);
+    let mut thin = SpendEdges::default();
+    thin.insert(
+        spend_fk.0,
+        vec![SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk,
+            create_fk: Fk(7),
+            vin: 0,
+        }],
+    );
+    let tids: Vec<[u8; 32]> = b
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = b.header.block_hash().to_byte_array();
+    let run = |q: &rbitcoin_query::Query| {
+        let mut spent = OutPointSet::default();
+        let mut creates = super::PendingCreates::default();
+        assemble_block_prevouts(
+            q,
+            &b,
+            &ctx,
+            Some(&[Fk::NULL, spend_fk]),
+            &mut spent,
+            &mut creates,
+            &parents,
+            &thin,
+            &tids,
+            0,
+            &bh,
+            true,
+            None,
+            None,
+        )
+        .expect("op_true spend assembles")
+        .0
+    };
+    assert_eq!(run(&q).len(), 1, "missing anchor path still checks scripts");
+    let mut base = [0u8; 32];
+    base[1] = 2;
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    q.note_milestone_header(
+        1,
+        bh,
+        [0; 32],
+        bitcoin::Work::from_be_bytes(one),
+        Some(bitcoin::Work::from_be_bytes(base)),
+    );
+    q.note_milestone_header(
+        100,
+        anchor_hash,
+        [0; 32],
+        bitcoin::Work::from_be_bytes(one),
+        None,
+    );
+    assert!(
+        run(&q).is_empty(),
+        "header path through the anchor with enough work skips scripts"
+    );
+    q.clear_milestone_path_above(0);
+    assert_eq!(run(&q).len(), 1, "cleared path checks scripts again");
     let _ = std::fs::remove_dir_all(&path);
 }
 

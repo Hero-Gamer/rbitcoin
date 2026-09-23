@@ -266,6 +266,21 @@ fn on_headers_batch(
         st.header_fks.insert(hash, fk);
         if let Some(h) = batch_header_height(st, hub, prev, batch_prev) {
             note_header_path(st, hub, hash, h, prev);
+            if st.is_on_path(&hash, h) {
+                let tip_h = hub.tip_height();
+                let base = if tip_h == Some(h.saturating_sub(1)) && hub.tip_hash() == Some(prev) {
+                    hub.chain_work().ok()
+                } else {
+                    None
+                };
+                hub.query.note_milestone_header(
+                    h,
+                    hash.to_byte_array(),
+                    prev.to_byte_array(),
+                    hdr.work(),
+                    base,
+                );
+            }
             batch_prev = Some((hash, h));
         }
         if try_enqueue_ordered_header(st, hub, hash, prev) {

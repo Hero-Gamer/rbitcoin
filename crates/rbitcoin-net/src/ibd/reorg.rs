@@ -605,6 +605,7 @@ pub(crate) fn apply_header_rewind(
         );
     }
     st.clear_path_above(lca_h);
+    hub.query.clear_milestone_path_above(lca_h);
     hub.query.set_lookup_taken_hi(Some(lca_h));
     st.headers_done = false;
     let tip = hub.tip_height().zip(hub.tip_hash());

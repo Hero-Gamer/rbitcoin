@@ -11,6 +11,14 @@ before 1.0).
 
 ### Fixed
 
+- **Milestone anchor:** signet’s default milestone is 0, so signet IBD runs
+  every script (slower on purpose). The mainnet default still names height
+  840000, and it skips scripts only when the header path contains block
+  `0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5` at that
+  height, this block is the path hash at its own height, and header-chain
+  work meets Core `nMinimumChainWork`. A low-work fork that only shares a
+  height does not skip. Explicit `--milestone HEIGHT` stays height-only.
+  Omitted mainnet `--min-chain-work` is that same floor.
 - **P2PKH policy flags, RPC token, and inv cap:** `LOW_S`, `STRICTENC`,
   and `NULLFAIL` on a P2PKH input use the generic interpreter. The RPC
   token compare does not stop at the first differing byte, and a new

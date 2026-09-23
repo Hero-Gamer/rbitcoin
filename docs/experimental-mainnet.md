@@ -2,7 +2,10 @@
 
 **Status:** **0.7.99** (pre-0.8.0) is lab-to-operator: **early production / high-scrutiny**,
 not a soak-certified badge. **Not** 1.0. **Not** a Bitcoin Core or Fulcrum
-replacement. Default `--milestone 840000` skips historical script/sig checks.
+replacement. Default mainnet milestone is block 840000
+(`0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`): script/sig
+checks skip only on that header path once chain work meets the minimum.
+Signet’s default milestone is 0 (every script).
 Schema can still refuse a named index wipe ([`SCHEMA.md`](../SCHEMA.md)).
 Design overview: [`architecture.md`](./architecture.md).
 
@@ -63,8 +66,9 @@ after tip (see below). Slow or constrained uplinks: [`OPERATOR.md`](../OPERATOR.
 
 | Flag | Meaning |
 |------|---------|
-| *(default mainnet)* | `--milestone` defaults to **840000**: **script/sig checks skipped** at/below that height. Prevouts, double-spend, maturity, fees still run. |
-| `--milestone 0` | Full script validation for all heights (slower; use for consensus labs). |
+| *(default mainnet)* | Height **840000** anchored to `0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`. Script/sig checks skip only when the header path contains that block and header work meets the minimum chain work. Prevouts, double-spend, maturity, and fees still run. |
+| `--milestone HEIGHT` | Height-only skip at/below `HEIGHT` (operator speed switch). |
+| `--milestone 0` | Full script validation for all heights (slower; signet’s default; use for consensus labs). |
 
 Default is an **assumevalid-style speed tradeoff**, not “we validated all
 historical scripts.” State this honestly when reporting experimental mainnet

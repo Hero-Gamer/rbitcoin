@@ -262,9 +262,10 @@ pub fn confirm_bq_resolve_wave_capped(
                 continue;
             };
             let t_dec = Instant::now();
-            let Some((block, pres_vec, pre_ns)) =
-                rbitcoin_query::decode_block_precomputes(&payload, !milestone.skips_scripts_at(h))
-            else {
+            let Some((block, pres_vec, pre_ns)) = rbitcoin_query::decode_block_precomputes(
+                &payload,
+                !crate::milestone::skips_on_query(milestone, query, h, &hash),
+            ) else {
                 continue;
             };
             let wall = t_dec.elapsed().as_nanos() as u64;
@@ -719,7 +720,7 @@ mod tests {
         let expect_txid = TxPrecompute::from_tx(&b1.txdata[1]).txid;
         q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
             .unwrap();
-        let wave = resolve_wave(&q, &params, Milestone { height: 100 }, &[1]);
+        let wave = resolve_wave(&q, &params, Milestone::height(100), &[1]);
         assert_eq!(wave.items.len(), 1);
         let spend_pre = &wave.items[0].2.pres[1];
         assert_eq!(spend_pre.txid, expect_txid);

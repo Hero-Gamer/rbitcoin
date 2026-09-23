@@ -1044,7 +1044,8 @@ pub(crate) fn assemble_block_prevouts(
     let mut clk_job = 0u64;
     let mut fees = 0i64;
     let mut tx_fees = vec![0u64; n_tx];
-    let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
+    let build_script_jobs =
+        !crate::milestone::skips_on_query(ctx.milestone, query, ctx.height.0, block_hash);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
     } else {

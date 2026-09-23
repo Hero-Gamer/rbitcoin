@@ -1,7 +1,7 @@
 use crate::error::NodeError;
 use bitcoin::hex::FromHex;
 use bitcoin::ScriptBuf;
-use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_consensus::{mainnet_milestone_anchor, ChainParams, Milestone};
 use rbitcoin_esplora::EsploraListen;
 use rbitcoin_primitives::{Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT};
 use rbitcoin_store::HeadScale;
@@ -462,11 +462,17 @@ impl NodeConfig {
 
     pub fn milestone(&self) -> Milestone {
         if self.milestone_height == 0 {
-            Milestone::NONE
-        } else {
+            return Milestone::NONE;
+        }
+        // Explicit `--milestone HEIGHT` stays height-only. The omitted mainnet
+        // default also requires the block-840000 hash and min chain work.
+        if !self.milestone_explicit && self.network == Network::Mainnet {
             Milestone {
                 height: self.milestone_height,
+                anchor: Some(mainnet_milestone_anchor()),
             }
+        } else {
+            Milestone::height(self.milestone_height)
         }
     }
 

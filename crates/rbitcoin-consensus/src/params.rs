@@ -425,21 +425,49 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
     ]
 }
 
-/// Default IBD milestone (coarse assumevalid): skip **script/sig** checks
-/// at/below height. Prevouts, double-spend, maturity, and fees still run.
+/// Mainnet assumeutxo block at height 840_000 (Core `kernel/chainparams.cpp`,
+/// display order). The default milestone hash, not Core's later assumevalid.
+pub const MAINNET_MILESTONE_HASH: &str =
+    "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
+
+/// Core mainnet `nMinimumChainWork` (display hex, big-endian). Refresh with
+/// the checkpoint list at release.
+pub const MAINNET_MIN_CHAIN_WORK: &str =
+    "000000000000000000000000000000000000000145ec036acc5ba740052af1a0";
+
+/// Default IBD milestone height. `0` means full script validation.
 ///
-/// `0` means full validation. Operators override with `--milestone HEIGHT`
-/// or disable with `--milestone 0` after CLI applies network defaults.
-/// Raise mainnet as deeper buried tips become the norm.
+/// Signet is 0 on purpose: signet IBD runs every script (slower than a
+/// height skip; that is the dress rehearsal). Mainnet's default height is
+/// 840_000 and is paired with [`mainnet_milestone_anchor`]. Operators still
+/// override with `--milestone HEIGHT` (height-only) or `--milestone 0`.
 pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
     match network {
         rbitcoin_primitives::Network::Mainnet => 840_000,
         rbitcoin_primitives::Network::Testnet => 2_500_000,
-        // Signet tip moves; keep default above typical tip so catch-up stays under
-        // milestone until operators opt into full validation (`--milestone 0`).
-        rbitcoin_primitives::Network::Signet => 2_000_000,
+        rbitcoin_primitives::Network::Signet => 0,
         rbitcoin_primitives::Network::Regtest => 0,
     }
+}
+
+/// Anchor for the default mainnet milestone (block 840_000 + min chain work).
+pub fn mainnet_milestone_anchor() -> crate::milestone::MilestoneAnchor {
+    crate::milestone::MilestoneAnchor {
+        hash: block_hash_from_display_hex(MAINNET_MILESTONE_HASH),
+        min_work_be: min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK),
+    }
+}
+
+/// Mainnet `nMinimumChainWork` as 32 big-endian bytes.
+pub fn mainnet_min_chain_work_be() -> [u8; 32] {
+    min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK)
+}
+
+fn min_work_from_display_hex(hex: &str) -> [u8; 32] {
+    let raw = rbitcoin_primitives::hex_decode(hex).expect("min chain work hex");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    out
 }
 
 /// Verify height-0 block hash matches params genesis.
