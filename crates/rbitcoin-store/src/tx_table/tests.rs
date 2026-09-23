@@ -810,6 +810,21 @@ fn seqsigwit_backfill_spans_split_on_gap_and_cap() {
     assert!(backfill_progress_due(1_000_000, 1_000_000));
     assert_eq!(unstamped_tail(2, 1), 1);
     assert_eq!(unstamped_tail(1_000, 1), 999);
+    input_open_tail_cases();
+}
+
+fn input_open_tail_cases() {
+    assert_eq!(
+        input_open_tail(0, 3, 3),
+        InputOpenTail::Backfill { from: 1 }
+    );
+    assert_eq!(
+        input_open_tail(1, 3, 2),
+        InputOpenTail::Unstamped { n: 2 },
+        "short input with a seqsigwit count mismatch is the unstamped tail"
+    );
+    assert_eq!(input_open_tail(3, 3, 2), InputOpenTail::Ready);
+    assert_eq!(input_open_tail(4, 3, 3), InputOpenTail::Ahead);
 }
 
 #[test]

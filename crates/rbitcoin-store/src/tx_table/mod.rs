@@ -244,6 +244,30 @@ fn unstamped_tail(n_bodies: u64, have: u64) -> u64 {
     n_bodies.saturating_sub(have)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum InputOpenTail {
+    Backfill { from: u64 },
+    Unstamped { n: u64 },
+    Ahead,
+    Ready,
+}
+
+fn input_open_tail(input_count: u64, n_bodies: u64, seq_count: u64) -> InputOpenTail {
+    if n_bodies > 0 && seq_count == n_bodies && input_count < n_bodies {
+        InputOpenTail::Backfill {
+            from: input_count + 1,
+        }
+    } else if input_count < n_bodies {
+        InputOpenTail::Unstamped {
+            n: unstamped_tail(n_bodies, input_count),
+        }
+    } else if input_count > n_bodies {
+        InputOpenTail::Ahead
+    } else {
+        InputOpenTail::Ready
+    }
+}
+
 type ReadSeqsigwitSpan<'a> = &'a mut dyn FnMut(u64, u64, &mut Vec<u8>) -> Result<(), StoreError>;
 
 fn edges_from_seqsigwit_ranges(
@@ -279,6 +303,11 @@ fn edges_from_seqsigwit_ranges(
                 end = next;
                 j += 1;
             }
+        }
+        if j <= i {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit span did not advance",
+            ));
         }
         if end > start {
             read(start, end - start, buf)?;
@@ -1051,25 +1080,26 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
         };
-        if n_bodies > 0 && t.seqsigwit.count() == n_bodies && t.input.count() < n_bodies {
-            let from = t.input.count() + 1;
-            // A missing tail on the new layout has no inline prevout. Stamp
-            // those rows empty. A legacy tail (or a fresh backfill) still
-            // walks seqsigwit.
-            let legacy = from == 1 || t.seqsigwit_has_inline_prevout(Fk(from))?;
-            if legacy {
-                t.backfill_inputs_from_seqsigwit(from)?;
-            } else {
-                t.input
-                    .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
+        match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
+            InputOpenTail::Backfill { from } => {
+                // A missing tail on the new layout has no inline prevout. Stamp
+                // those rows empty. A legacy tail (or a fresh backfill) still
+                // walks seqsigwit.
+                let legacy = from == 1 || t.seqsigwit_has_inline_prevout(Fk(from))?;
+                if legacy {
+                    t.backfill_inputs_from_seqsigwit(from)?;
+                } else {
+                    t.input
+                        .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
+                }
             }
-        } else if t.input.count() < n_bodies {
-            t.input
-                .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
-        } else if t.input.count() > n_bodies {
-            return Err(StoreError::Corrupt(
-                "invariant: input.loc ahead of create.loc",
-            ));
+            InputOpenTail::Unstamped { n } => t.input.append_unstamped(n)?,
+            InputOpenTail::Ahead => {
+                return Err(StoreError::Corrupt(
+                    "invariant: input.loc ahead of create.loc",
+                ));
+            }
+            InputOpenTail::Ready => {}
         }
         if n_bodies > 0 {
             let _ = t.input.n_in(Fk(1))?;
@@ -1641,7 +1671,13 @@ impl TxTable {
             if backfill_progress_due(end, id) {
                 rbitcoin_log::info!("store: input backfill progress {end}/{n}");
             }
-            id = end + 1;
+            let next_id = end + 1;
+            if next_id <= id {
+                return Err(StoreError::Corrupt(
+                    "invariant: input backfill did not advance",
+                ));
+            }
+            id = next_id;
         }
         rbitcoin_log::info!("store: input backfill complete n={n}");
         Ok(())
