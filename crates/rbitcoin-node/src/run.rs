@@ -483,7 +483,15 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         .set_cjdns_reachable(config.listen.cjdns_reachable);
     node.peers.set_pruned(config.prune_seqsigwit);
     node.peers.set_asmap(asmap);
+    node.peers.set_connect_hosts(
+        config.listen.connect_dns.clone(),
+        config.network.default_p2p_port(),
+    );
+    let dns_resolved = resolve_connect_dns(&config.listen.connect_dns, config.network).await;
     for c in &config.listen.connect {
+        addrman.add_addr(*c);
+    }
+    for c in &dns_resolved {
         addrman.add_addr(*c);
     }
     if should_resolve_default_seeds(&config) {
@@ -502,7 +510,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
     } else if config.signet_challenge.is_some()
-        && config.listen.connect.is_empty()
+        && !config.listen.has_pinned_connect()
         && addrman.is_empty()
     {
         warn!("custom signet has no peers; use --connect ADDR or reuse a datadir with known peers");
@@ -522,8 +530,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let max_out = config.listen.max_outbound.max(1) as usize;
     let candidate_n = max_out.saturating_mul(2).clamp(16, 48);
     let occupied = node.peers.live_outbound_full_relay_nets();
-    let targets = follow_dial_targets(&config.listen.connect, &addrman, max_out, &occupied);
-    let ibd_targets = follow_dial_targets(&config.listen.connect, &addrman, candidate_n, &occupied);
+    let mut pinned = config.listen.connect.clone();
+    pinned.extend(dns_resolved);
+    let targets = follow_dial_targets(&pinned, &addrman, max_out, &occupied);
+    let ibd_targets = follow_dial_targets(&pinned, &addrman, candidate_n, &occupied);
     let catch_up = run_ibd_or_skip(
         &node,
         &ibd_targets,
@@ -534,6 +544,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &shutdown,
     )
     .await;
+
+    let catch_up = catch_up_with_connect(
+        catch_up,
+        config.listen.has_pinned_connect(),
+        shutdown.requested(),
+        node.tip_height().unwrap_or(0),
+    );
 
     // Still enter tip-follow when work is below `--min-chain-work` so later
     // blocks can raise the tip. Relay / getheaders stay gated on the hub floor.
@@ -560,10 +577,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     Arc::clone(&shutdown.flag),
                 );
             }
-            if !config.mempool.blocksonly
-                && tip_meets_min_work(&config, &node.hub)
-                && !node.hub.in_ibd()
-            {
+            if relay_while_following(
+                tip_meets_min_work(&config, &node.hub),
+                config.mempool.blocksonly,
+                node.hub.in_ibd(),
+            ) {
                 mempool_blocking(&mempool, |mp| mp.set_relay_enabled(true)).await?;
             }
             let mp_live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
@@ -991,7 +1009,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
 
             let stagnant = last_tip_change.elapsed() >= Duration::from_secs(STALE_TIP_SECS);
-            if !stagnant || !config.listen.connect.is_empty() || !config.listen.use_seeds {
+            if !stagnant || config.listen.has_pinned_connect() || !config.listen.use_seeds {
                 continue;
             }
             if addrman.is_empty() || shutdown.requested() {
@@ -1156,9 +1174,51 @@ fn tip_meets_min_work(config: &NodeConfig, hub: &rbitcoin_net::ChainHub) -> bool
 
 fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
     config.listen.use_seeds
-        && config.listen.connect.is_empty()
+        && !config.listen.has_pinned_connect()
         && config.signet_challenge.is_none()
         && config.listen.proxy.is_none()
+}
+
+/// Genesis `--connect` whose first catch-up accepts nothing is treated as
+/// finished so the process stays up. The later dial is a follow session
+/// (16 blocks in flight on the tip index path), not a return to the IBD
+/// window. A non-zero tip that has not finished catch-up stays in IBD.
+pub(crate) fn catch_up_with_connect(
+    catch_up: CatchUp,
+    has_connect: bool,
+    shutdown: bool,
+    tip: u32,
+) -> CatchUp {
+    if catch_up.is_complete() || shutdown || !has_connect || tip > 0 {
+        catch_up
+    } else {
+        CatchUp::complete_dial_failed()
+    }
+}
+
+/// Tip-follow may run below `--min-chain-work`. Relay stays off until the floor.
+pub(crate) fn relay_while_following(meets_min_work: bool, blocks_only: bool, in_ibd: bool) -> bool {
+    meets_min_work && !blocks_only && !in_ibd
+}
+
+async fn resolve_connect_dns(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
+    if hosts.is_empty() {
+        return Vec::new();
+    }
+    let hosts = hosts.to_vec();
+    let port = network.default_p2p_port();
+    tokio::task::spawn_blocking(move || {
+        hosts
+            .iter()
+            .filter_map(|h| {
+                rbitcoin_net::parse_peer_addr_with_port(h, Some(port))
+                    .ok()
+                    .map(rbitcoin_net::NetAddr::from_socket)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: Network) -> usize {
@@ -2191,6 +2251,46 @@ mod tests {
         assert_eq!(catch_up_after_err(10, false, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(0, true, false), CatchUp::Incomplete);
         assert_eq!(catch_up_after_err(10, true, true), CatchUp::Incomplete);
+    }
+
+    #[test]
+    fn connect_genesis_incomplete_enters_tip_follow() {
+        assert_eq!(
+            catch_up_with_connect(CatchUp::Incomplete, true, false, 0),
+            CatchUp::complete_dial_failed()
+        );
+        assert_eq!(
+            catch_up_with_connect(CatchUp::Incomplete, false, false, 0),
+            CatchUp::Incomplete
+        );
+        assert_eq!(
+            catch_up_with_connect(CatchUp::Incomplete, true, true, 0),
+            CatchUp::Incomplete
+        );
+        assert!(catch_up_with_connect(CatchUp::complete(), true, false, 0).is_complete());
+    }
+
+    #[test]
+    fn connect_nongenesis_incomplete_stays_in_ibd() {
+        assert_eq!(
+            catch_up_with_connect(CatchUp::Incomplete, true, false, 50),
+            CatchUp::Incomplete
+        );
+    }
+
+    #[test]
+    fn relay_requires_min_chain_work_even_when_following() {
+        assert!(!relay_while_following(false, false, false));
+        assert!(relay_while_following(true, false, false));
+        assert!(!relay_while_following(true, true, false));
+        assert!(!relay_while_following(true, false, true));
+        let mut cfg = NodeConfig::default();
+        assert!(cfg.meets_minimum_chain_work([0; 32]));
+        cfg.minimum_chain_work = Some([0xff; 32]);
+        assert!(
+            !cfg.meets_minimum_chain_work([0; 32]),
+            "a non-genesis tip under --min-chain-work follows, but relay stays gated"
+        );
     }
 
     #[test]

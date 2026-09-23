@@ -190,7 +190,7 @@ fn node_cli_and_surface_smoke() {
     assert!(!exit_success(node_cli_main([
         "rbitcoin-node",
         "--connect",
-        "bad"
+        "bad host"
     ])));
     assert!(!exit_success(node_cli_main([
         "rbitcoin-node",

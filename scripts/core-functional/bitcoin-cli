@@ -8,6 +8,7 @@ parallel. Core's TestNodeCLI shells out to this binary.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -85,7 +86,10 @@ def main(argv: list[str]) -> int:
         print("too few parameters (need at least command)", file=sys.stderr)
         return 1
     if datadir is None:
-        print("error: -datadir is required", file=sys.stderr)
+        env = os.environ.get("BITCOIN_DATA")
+        datadir = Path(env) if env else Path.home() / ".bitcoin"
+    if not datadir.is_dir():
+        print(f"error: -datadir {datadir} is not a directory", file=sys.stderr)
         return 1
 
     if rpcport is None:
@@ -118,6 +122,11 @@ def main(argv: list[str]) -> int:
                 params.append(a)
 
     cookie = cookie_auth(datadir)
+    if cookie is None:
+        user = conf_value(datadir, "rpcuser") or ""
+        password = conf_value(datadir, "rpcpassword")
+        if password:
+            cookie = f"{user}:{password}"
     body = json.dumps({"jsonrpc": "1.0", "id": "cli", "method": method, "params": params}).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{rpcport}/",

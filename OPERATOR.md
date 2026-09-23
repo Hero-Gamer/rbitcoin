@@ -853,6 +853,16 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   groups; the node still starts. `--connect` is operator-pinned and skips the
   filter. We do not ship a mainnet map. Core publishes maps from the same
   `ip_asn.dat` used by `bitcoind -asmap`.
+- **Genesis `--connect` after a failed first catch-up.** If that attempt
+  accepts no blocks and the tip is still height 0, the process enters
+  tip-follow instead of staying in IBD. The peer that appears later is a
+  follow session: `getheaders`, then at most 16 blocks in flight, confirmed
+  on the tip index path. The stagnant-tip loop does not start the IBD
+  scheduler again. A catch-up that finishes is unchanged, and a non-zero tip
+  that has not finished catch-up stays in IBD. This is for a peer you expect
+  to show up with a short chain. A fresh mainnet or signet datadir pointed at
+  a full node stays on this slower path for the rest of the process whenever
+  the first dial accepts nothing.
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
 - **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool/orphan/`extra_compact` short-id fill +
   `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.

@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from rpc_proxy import (
     RpcError,
     RpcProxy,
+    authorization_ok,
     core_btc_kvb_to_sat_vb,
     esplora_port,
     node_authorization,
@@ -159,6 +160,12 @@ assert node_authorization("__cookie__:secret") == "Bearer secret"
 assert node_authorization("secret") == "Bearer secret"
 
 COOKIE = "__cookie__:secret"
+assert authorization_ok("Basic " + base64.b64encode(COOKIE.encode()).decode(), COOKIE)
+attacker = "Basic " + base64.b64encode(b"attacker:secret").decode()
+assert authorization_ok(attacker, COOKIE), "username is ignored; password must match the token"
+assert not authorization_ok(
+    "Basic " + base64.b64encode(b"attacker:nope").decode(), COOKIE
+)
 
 
 class FakeNode(BaseHTTPRequestHandler):

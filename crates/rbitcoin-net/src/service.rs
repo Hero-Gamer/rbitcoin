@@ -216,6 +216,24 @@ impl P2PNode {
         });
         tasks.push(dial_task);
 
+        // DNS for remembered `--connect` / `addnode add` runs on the blocking
+        // pool (`PeerHub::redial_remembered_off_runtime`).
+        let retry_peers = peers.clone();
+        let retry_shutdown = shutdown.clone();
+        let retry_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if retry_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                retry_peers.redial_remembered_off_runtime().await;
+            }
+        });
+        tasks.push(retry_task);
+
         Ok(Self {
             cache,
             query,
@@ -419,6 +437,22 @@ impl P2PNode {
             }
         })
         .await;
+    }
+}
+
+impl Drop for P2PNode {
+    fn drop(&mut self) {
+        // The connect-retry interval runs until this flag or an abort.
+        // Dropping the handle without `shutdown` must not pin the test runtime.
+        self.shutdown.store(true, Ordering::SeqCst);
+        for t in &self.tasks {
+            t.abort();
+        }
+        if let Ok(g) = self.session_tasks.lock() {
+            for t in g.iter() {
+                t.abort();
+            }
+        }
     }
 }
 

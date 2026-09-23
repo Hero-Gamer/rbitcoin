@@ -38,6 +38,43 @@ def node_authorization(cookie_line: str) -> str:
     return f"Bearer {token}"
 
 
+def token_from_cookie_line(cookie: str) -> str:
+    prefix = "__cookie__:"
+    if cookie.startswith(prefix):
+        return cookie[len(prefix) :]
+    return cookie
+
+
+def parse_basic_userpass(authorization: str) -> tuple[str, str] | None:
+    if not authorization.startswith("Basic "):
+        return None
+    try:
+        raw = base64.b64decode(authorization[6:]).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if ":" not in raw:
+        return None
+    user, password = raw.split(":", 1)
+    return user, password
+
+
+def authorization_ok(authorization: str, cookie_line: str | None) -> bool:
+    """Cookie Basic, or any username whose password equals the token.
+
+    Warnet sends `rpcuser:rpcpassword`. The username is not Core `rpcuser`.
+    """
+    if not cookie_line:
+        return True
+    want = "Basic " + base64.b64encode(cookie_line.encode()).decode()
+    if authorization == want:
+        return True
+    parsed = parse_basic_userpass(authorization)
+    if parsed is None:
+        return False
+    _user, password = parsed
+    return password == token_from_cookie_line(cookie_line)
+
+
 def core_btc_kvb_to_sat_vb(value: Any) -> int:
     """Core `maxfeerate` BTC/kvB → node sat/vB. `>= 1` is Core `-8`."""
     if value is None:
@@ -215,10 +252,8 @@ class RpcProxy:
 
     def handle_http(self, raw: bytes, authorization: str) -> tuple[int, bytes]:
         cookie = self.cookie_line()
-        if cookie:
-            want = "Basic " + base64.b64encode(cookie.encode()).decode()
-            if authorization != want:
-                return 401, b'{"error":"unauthorized"}\n'
+        if not authorization_ok(authorization, cookie):
+            return 401, b'{"error":"unauthorized"}\n'
         try:
             payload = json.loads(raw.decode() or "null")
         except (UnicodeDecodeError, json.JSONDecodeError):

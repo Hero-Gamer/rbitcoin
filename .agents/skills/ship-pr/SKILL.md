@@ -84,6 +84,9 @@ version-bump PR. Do not label ordinary net or RPC PRs.
 Label `overlay-functional` when the PR touches that harness, and on every
 ship version-bump PR. Poll with `--interest overlay-functional`. It is not
 a required check.
+Label `warnet` to run the two-tank Docker example
+([`docs/core-functional.md`](../../../docs/core-functional.md)). Not a
+required check. Do not label ordinary PRs.
 Label `nixos-module-runtime` when the NixOS module VM test should run (not
 eval). Poll with `--interest nixos-module-runtime`. It is not a required
 check.

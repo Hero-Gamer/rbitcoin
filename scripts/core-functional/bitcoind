@@ -150,6 +150,13 @@ IGNORE_FLAGS = frozenset(
         # Stop-at-height is a later product; ignore so restart after the
         # future-tip check can proceed to the rest of rpc_blockchain.
         "rpcthreads",
+        # Warnet Helm conf. rpcpassword seeds rpc.token; addnode becomes --connect.
+        "rpcuser",
+        "rpcpassword",
+        "rpcbind",
+        "rpcallowip",
+        "rpcauth",
+        "fallbackfee",
     }
 )
 
@@ -339,6 +346,14 @@ def listen_targets(
     return seen
 
 
+def proxy_bind_host(rpcbind: str) -> str:
+    """Helm `rpcbind=0.0.0.0` / `[::]` binds the test proxy all-interfaces."""
+    host = (rpcbind or "").strip()
+    if host in ("0.0.0.0", "::", "[::]"):
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 def maybe_seed_store(node_dir: Path) -> None:
     """Copy the rbitcoin 199-block store into a Core cache-shaped datadir.
 
@@ -432,6 +447,7 @@ def translate(
     wipe_mempool = False
     blocksdir_arg: Path | None = None
     argv_binds: list[tuple[str, int | None, bool]] = []
+    addnodes: list[str] = []
     listen_off = False
     whitebind_vals: list[str] = []
     rpc_proxy = True
@@ -481,6 +497,7 @@ def translate(
             "walletdir",
             "wallet",
             "checkblocks",
+            "addnode",
         ):
             i += 1
             if i >= len(argv):
@@ -506,6 +523,8 @@ def translate(
             # Non-onion bind with an explicit port supplies the P2P listen port.
             if not onion and bport is not None:
                 p2pport = str(bport)
+        elif key == "addnode" and val:
+            addnodes.append(val)
         elif key == "whitebind" and val:
             whitebind_vals.append(val)
             hostport = val.rsplit("@", 1)[-1]
@@ -656,6 +675,22 @@ def translate(
     if log_level:
         cmd += ["--log-level", log_level]
     cmd += extra_node_args
+    for scale in read_conf_keys(datadir / "bitcoin.conf", "head_scale"):
+        if scale == "tiny" or scale == "mainnet":
+            cmd += ["--head-scale", scale]
+    for host in read_conf_keys(datadir / "bitcoin.conf", "addnode") + addnodes:
+        if not host:
+            continue
+        if ":" not in host:
+            host = f"{host}:{p2pport}"
+        cmd += ["--connect", host]
+
+    pw = (conf.get("rpcpassword") or "").strip()
+    if pw:
+        token_path = node_dir / "rpc.token"
+        if not token_path.exists():
+            token_path.write_text(pw + "\n")
+            token_path.chmod(0o600)
 
     bound_lines = [f"Bound to {addr}" for addr in listens]
 
@@ -817,7 +852,9 @@ def main(argv: list[str] | None = None) -> int:
         return _child_init_exit()
 
     try:
-        proxy = RpcProxy(("127.0.0.1", public_rpc), node_url, _cookie)
+        core_datadir = node_dir.parent
+        rpcbind = read_conf(core_datadir / "bitcoin.conf").get("rpcbind") or ""
+        proxy = RpcProxy((proxy_bind_host(rpcbind), public_rpc), node_url, _cookie)
     except OSError:
         if child.poll() is None:
             child.terminate()
