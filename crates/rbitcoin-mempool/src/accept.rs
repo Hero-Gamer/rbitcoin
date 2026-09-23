@@ -560,6 +560,8 @@ impl ActiveMempool {
                 wtxid: p.wtxid,
                 fee_sat: p.fee_sat,
                 weight: p.weight,
+                // Not in the schema-2 packed record; reload reads as zero.
+                sigop_cost: 0,
                 slot: live.slot,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
@@ -963,6 +965,7 @@ impl ActiveMempool {
             wtxid: prep.wtxid,
             fee_sat,
             weight,
+            sigop_cost: prep.sigop_cost,
             slot,
             parents: BTreeSet::new(),
             children: BTreeSet::new(),
@@ -2471,6 +2474,90 @@ mod tests {
         mp.accept_tx(&multisig_outputs_tx(op, 995), &utxos, TIP_OK)
             .expect("79,600 fits beside the coinbase reserve");
         assert_eq!(mp.live_count(), 1);
+    }
+
+    /// Chain coins at P2SH and P2WSH of `0 <pk> <pk> 2 CHECKMULTISIG` (2 accurate
+    /// sigops, zero-sig so it verifies) plus a spend of each. Legacy ×4 is 0 for
+    /// both; full cost is 8 (P2SH ×4) and 2 (witness ×1).
+    fn p2sh_p2wsh_multisig_spends() -> (MapUtxoProvider, Transaction, Transaction) {
+        use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_2};
+        use bitcoin::opcodes::OP_0;
+        let pk = [0x02u8; 33];
+        let redeem = bitcoin::script::Builder::new()
+            .push_opcode(OP_0)
+            .push_slice(pk)
+            .push_slice(pk)
+            .push_opcode(OP_PUSHNUM_2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        let p2sh_op = OutPoint {
+            txid: Txid::from_byte_array([0xa1; 32]),
+            vout: 0,
+        };
+        let p2wsh_op = OutPoint {
+            txid: Txid::from_byte_array([0xa2; 32]),
+            vout: 0,
+        };
+        let mut map = HashMap::new();
+        for (op, spk) in [
+            (p2sh_op, ScriptBuf::new_p2sh(&redeem.script_hash())),
+            (p2wsh_op, ScriptBuf::new_p2wsh(&redeem.wscript_hash())),
+        ] {
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: spk,
+                }),
+            );
+        }
+        let mut p2sh = spend_tx(p2sh_op, 90_000);
+        p2sh.input[0].script_sig = bitcoin::script::Builder::new()
+            .push_opcode(OP_0)
+            .push_slice(<&bitcoin::script::PushBytes>::try_from(redeem.as_bytes()).unwrap())
+            .into_script();
+        let mut p2wsh = spend_tx(p2wsh_op, 90_000);
+        p2wsh.input[0].witness = Witness::from_slice(&[&[][..], redeem.as_bytes()]);
+        (MapUtxoProvider { map }, p2sh, p2wsh)
+    }
+
+    fn live_sigops(mp: &ActiveMempool, tx: &Transaction) -> u64 {
+        mp.graph.get(&tx.compute_txid()).unwrap().sigop_cost
+    }
+
+    #[test]
+    fn accept_tx_records_full_sigop_cost_for_p2sh_and_p2wsh() {
+        let dir = tmp_dir();
+        let (utxos, p2sh, p2wsh) = p2sh_p2wsh_multisig_spends();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&p2sh, &utxos, TIP_OK).expect("p2sh");
+        mp.accept_tx(&p2wsh, &utxos, TIP_OK).expect("p2wsh");
+        assert_eq!(live_sigops(&mp, &p2sh), 8);
+        assert_eq!(live_sigops(&mp, &p2wsh), 2);
+    }
+
+    #[test]
+    fn package_and_reorg_readmit_record_sigop_cost() {
+        let dir = tmp_dir();
+        let (utxos, parent, _) = p2sh_p2wsh_multisig_spends();
+        let pid = parent.compute_txid();
+        let mut child = spend_tx(OutPoint { txid: pid, vout: 0 }, 80_000);
+        child.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0xae]),
+        });
+        let pkg = [parent.clone(), child.clone()];
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_package(&pkg, &utxos, TIP_OK).expect("package");
+        assert_eq!(live_sigops(&mp, &parent), 8);
+        assert_eq!(live_sigops(&mp, &child), 80);
+
+        mp.remove_for_block(&[pid, child.compute_txid()]).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        let res = mp.reorg_disconnect_reaccept(&pkg, &utxos, TIP_OK);
+        assert!(res.iter().all(Result::is_ok), "{res:?}");
+        assert_eq!(live_sigops(&mp, &parent), 8);
+        assert_eq!(live_sigops(&mp, &child), 80);
     }
 
     #[test]

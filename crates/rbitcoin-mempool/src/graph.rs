@@ -32,6 +32,8 @@ pub struct TxEntry {
     pub wtxid: Wtxid,
     pub fee_sat: u64,
     pub weight: u64,
+    /// Full BIP16 + BIP141 sigop cost recorded at admission.
+    pub sigop_cost: u64,
     /// Slot index in the durable slot table.
     pub slot: u32,
     /// In-mempool parents (txids this tx spends).
@@ -1059,6 +1061,7 @@ mod tests {
             wtxid: tx.compute_wtxid(),
             fee_sat: fee,
             weight: tx.weight().to_wu(),
+            sigop_cost: 0,
             slot,
             parents: BTreeSet::new(),
             children: BTreeSet::new(),
