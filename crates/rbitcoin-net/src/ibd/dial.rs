@@ -343,7 +343,17 @@ pub(crate) fn redial_want(alive: usize, target: usize) -> usize {
 }
 
 /// Apply dial successes / failures to the peer book.
-pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
+///
+/// A network failure (EOF, timeout) takes the same strike cooldown as a
+/// stall kick. Incompatible peers stay last-resort without that ban.
+/// A later successful connect clears the cooldown at the call site.
+pub(crate) fn apply_dial_result(
+    book: &mut AddrMan,
+    result: &DialBatchResult,
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
+    now: Instant,
+) {
     for &addr in &result.attempted {
         book.note_attempt_addr(addr);
     }
@@ -351,8 +361,36 @@ pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
         book.note_connected_addr(s.net);
     }
     for &(addr, kind) in &result.failed {
-        book.note_connect_failed_addr(addr, kind == DialFailKind::Incompatible);
+        let incompatible = kind == DialFailKind::Incompatible;
+        book.note_connect_failed_addr(addr, incompatible);
+        if incompatible {
+            continue;
+        }
+        if let Some(sock) = addr.socket_addr() {
+            record_stall_kick(addr_cooldown, addr_strikes, sock, now);
+        }
     }
+}
+
+/// True when some dialable address is neither live nor cooling and did not
+/// fail its last connect. Relative-slow must not drop a peer when this is
+/// false: the only redials would be dead seeds or addresses already banned.
+pub(crate) fn replacement_available(
+    book: &AddrMan,
+    slots: &[PeerSlot],
+    cooldown: &HashMap<SocketAddr, Instant>,
+    now: Instant,
+) -> bool {
+    let live: HashSet<crate::NetAddr> = slots.iter().filter(|s| s.alive).map(|s| s.net).collect();
+    book.dial_order().iter().copied().any(|addr| {
+        if !book.is_dialable(addr) || live.contains(&addr) {
+            return false;
+        }
+        let cooling = addr
+            .socket_addr()
+            .is_some_and(|sock| cooldown.get(&sock).is_some_and(|until| *until > now));
+        !cooling && !book.connect_failed(addr)
+    })
 }
 
 pub(crate) fn request_headers(
@@ -623,16 +661,22 @@ pub(crate) fn disconnect_stalled_block_peers_at(
 /// Absolute stall ([`disconnect_stalled_block_peers`]) remains the zero-progress
 /// floor; this only cuts peers that keep making slow progress while the bulk
 /// is dramatically faster.
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(crate) fn disconnect_relative_slow_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
+    book: &AddrMan,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
 ) {
     if !relative_slow_global_warmup_ok(slots) {
+        *suspect = None;
+        return;
+    }
+    if !replacement_available(book, slots, addr_cooldown, now) {
         *suspect = None;
         return;
     }
@@ -1064,10 +1108,27 @@ mod tests {
                 crate::NetAddr::Ip(inc),
             ],
         };
-        apply_dial_result(&mut book, &result);
+        let now = Instant::now();
+        let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
+        apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
         assert!(book.flags(&good).has_connected());
         assert!(book.flags(&bad).failed_last_connect());
         assert!(book.flags(&inc).is_incompatible());
+        assert_eq!(
+            cooldown.get(&bad).copied(),
+            Some(now + STALL_ADDR_COOLDOWN),
+            "EOF/timeout enters the stall cooldown"
+        );
+        assert!(
+            !cooldown.contains_key(&inc),
+            "incompatible is last-resort, not a stall ban"
+        );
+        apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
+        assert_eq!(
+            cooldown.get(&bad).copied(),
+            Some(now + STALL_ADDR_COOLDOWN_2)
+        );
         book.add(addr(8));
         let got = book.take_dial_candidates(8, &HashSet::new(), &[]);
         assert!(
@@ -1327,12 +1388,32 @@ mod tests {
         let mut strikes = HashMap::new();
         let mut suspect = Some((1usize, 0u64));
         let mut last_kick_ms = 0u64;
+        let mut book = AddrMan::new();
+        book.add(addr(41));
+        book.note_connect_failed(addr(41), false);
+        let now = Instant::now();
+        assert!(
+            !replacement_available(&book, &slots, &cooldown, now),
+            "a failed last connect is not a replacement"
+        );
+        book.add(addr(42));
+        assert!(
+            replacement_available(&book, &slots, &cooldown, now),
+            "an untried address can replace a kicked peer"
+        );
+        cooldown.insert(addr(42), now + Duration::from_secs(60));
+        assert!(
+            !replacement_available(&book, &slots, &cooldown, now),
+            "cooling the only clean address leaves no replacement"
+        );
+        cooldown.clear();
         disconnect_relative_slow_block_peers(
             &mut slots,
             &mut inflight,
             &mut cooldown,
             &mut strikes,
-            Instant::now(),
+            now,
+            &book,
             &mut suspect,
             &mut last_kick_ms,
         );

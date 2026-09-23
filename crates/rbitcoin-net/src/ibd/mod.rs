@@ -67,7 +67,7 @@ use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
 use bitcoin::p2p::Magic;
 use rbitcoin_log::{info, info_bold, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -320,7 +320,15 @@ pub async fn ibd_cancellable(
         cfg.dialer.clone(),
     )
     .await;
-    apply_dial_result(peer_sess.book_mut(), &initial);
+    let mut boot_cooldown = HashMap::new();
+    let mut boot_strikes = HashMap::new();
+    apply_dial_result(
+        peer_sess.book_mut(),
+        &initial,
+        &mut boot_cooldown,
+        &mut boot_strikes,
+        Instant::now(),
+    );
     let mut initial_slots = initial.slots;
     if cancelled() {
         warn!("ibd: cancel during initial dial — stopping");
@@ -364,6 +372,8 @@ pub async fn ibd_cancellable(
     let window = cfg.window;
 
     let mut st = IbdWorkState::new(initial_slots, hub.tip_hash(), hub.tip_height());
+    st.addr_cooldown = boot_cooldown;
+    st.addr_strikes = boot_strikes;
     seed_work_path_from_store(&mut st, hub.as_ref());
 
     // Channel may close if handshake races the first getheaders.
@@ -662,6 +672,7 @@ pub async fn ibd_cancellable(
                 &mut st.addr_cooldown,
                 &mut st.addr_strikes,
                 now,
+                peer_sess.book(),
                 &mut st.relative_slow_suspect,
                 &mut st.relative_slow_last_kick_ms,
             );
@@ -678,7 +689,13 @@ pub async fn ibd_cancellable(
             if let Some(h) = redial_handle.take() {
                 match h.await {
                     Ok(result) => {
-                        apply_dial_result(peer_sess.book_mut(), &result);
+                        apply_dial_result(
+                            peer_sess.book_mut(),
+                            &result,
+                            &mut st.addr_cooldown,
+                            &mut st.addr_strikes,
+                            Instant::now(),
+                        );
                         // A successful dial ends that address's cooldown, including
                         // the one we admitted while every candidate was cooling.
                         for s in &result.slots {

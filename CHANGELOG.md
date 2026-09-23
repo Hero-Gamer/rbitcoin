@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **Failed connects enter the stall cooldown.** An EOF or timeout takes
+  the same strike ban as a relative-slow kick, so dead seeds stop
+  occupying the only dial slots. Relative-slow does not disconnect
+  while every address outside cooldown failed its last connect.
+
 - **IBD redial breaks an all-cooldown book:** when more peers are
   needed and every candidate is cooling, dial the one tried least
   recently anyway. A successful connect clears that cooldown. Never
