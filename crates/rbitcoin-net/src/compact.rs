@@ -566,6 +566,13 @@ mod tests {
             matches!(reconstruct(&hsi, &empty_avail(), 2), Reconstruct::Fail),
             "count at the cap plus the prefilled coinbase is over"
         );
+        let n_pref = hsi.prefilled_txs.len();
+        hsi.short_ids =
+            vec![ShortId::from([0u8; 6]); rbitcoin_consensus::MAX_BLOCK_TX_COUNT - n_pref];
+        assert!(
+            !matches!(reconstruct(&hsi, &empty_avail(), 2), Reconstruct::Fail),
+            "exactly the cap is still a partial, not a count failure"
+        );
     }
 
     #[test]

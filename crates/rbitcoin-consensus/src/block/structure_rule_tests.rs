@@ -6,7 +6,7 @@ use super::{
     is_p2wsh_program, last_script_push, merkle_root_bytes, script_sigop_count,
     validate_block_structure, validate_block_structure_with_pres, witness_commitment_script,
     ScriptCheckJob, TxPrecompute, ValidationContext, BIP16_EXCEPTION_MAINNET,
-    MAX_BLOCK_STRIPPED_SIZE,
+    MAX_BLOCK_STRIPPED_SIZE, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
 };
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
@@ -2273,4 +2273,11 @@ fn structure_rejects_pres_out_sum_above_max_money_before_assemble_casts_it() {
             .unwrap_err();
         assert_bad_block(err, "bad-txns-txouttotal-toolarge");
     }
+}
+
+#[test]
+fn max_block_tx_count_matches_weight_over_ten_byte_tx() {
+    assert_eq!(MIN_TX_WEIGHT, 40, "10-byte tx at witness scale 4");
+    assert_eq!(MAX_BLOCK_TX_COUNT, 100_000);
+    assert_eq!(MAX_BLOCK_TX_COUNT as u64 * MIN_TX_WEIGHT, MAX_BLOCK_WEIGHT);
 }
