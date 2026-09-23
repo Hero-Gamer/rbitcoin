@@ -2970,14 +2970,8 @@ mod tests {
             .filter_map(|hash| st.hash_height.get(hash).copied())
             .collect();
         assert!(
-            issued_hts
-                .iter()
-                .any(|&ht| ht > TIP_HOLE_MAX as u32 && ht <= 300),
-            "assign-stop must densify holes inside confirm window; issued={issued_hts:?}"
-        );
-        assert!(
-            issued_hts.iter().all(|&ht| ht <= 300),
-            "assign-stop must not issue past window 300 (fetched_hi=500); issued={issued_hts:?}"
+            issued_hts.is_empty(),
+            "queue already at the assign-stop: no new getdata; issued={issued_hts:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
