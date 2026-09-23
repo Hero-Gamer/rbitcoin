@@ -28,6 +28,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
 | [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 | [023](./023-tapscript-initial-stack-limits.md) | high | Tapscript initial witness stack skipped 1000/520 limits | fixed | `script_path_rejects_initial_stack_over_max_size` |
+| [031](./031-signet-solution.md) | high | Signet solution CompactSize and pushes | fixed | `compact_size_and_solution_parse_errors` |
 | [024](./024-talip-review-index.md) | — | Talip review index | open | Q-71 |
 | [025](./025-tapleaf-annex-prefix.md) | critical | Tapleaf `0x50` rejected | fixed | `script_path_accepts_leaf_0x50_with_annex_and_0xc2` |
 | [026](./026-false-witness-program.md) | high | False witness program accepted | fixed | `false_witness_program_is_eval_false` |

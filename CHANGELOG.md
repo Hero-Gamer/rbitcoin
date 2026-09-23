@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Signet solution:** a non-minimal CompactSize is a bad block. A witness
+  count larger than the remaining bytes fails before allocation.
+  PUSHDATA4 is parsed, and non-minimal pushes are re-encoded the way
+  Core writes the modified coinbase.
 - **Tapleaf `0x50` and a false witness program:** a future leaf whose
   version byte is the annex prefix commits and is not executed. An
   all-zero or negative-zero witness program fails before anyone-can-spend
