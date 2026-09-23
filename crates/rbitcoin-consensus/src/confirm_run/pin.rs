@@ -288,11 +288,9 @@ fn denserels_by_stamped_range(
                         "invariant: lookup stage miss (load parent create identity not stamped)",
                     )))?;
         }
-        if tx.input_count == 0 {
-            if let Some(n) = query.store().input_n_in(fk).map_err(ConsensusError::from)? {
-                tx.input_count = n;
-            }
-        }
+        // Schema 25 meta leaves input_count at 0. That stays "unknown":
+        // coinbase_fk_at_heights still runs, and a pread of input.loc per
+        // parent would sit on this range-load loop.
         let cb = if tx.input_count > 1 {
             Some(false)
         } else {
