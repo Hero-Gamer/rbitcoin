@@ -1,0 +1,31 @@
+id: weak-assert-pattern
+language: rust
+severity: error
+message: "Tier1: Assert exact variant — avoid bare is_err/is_ok/matches!(_)"
+note: "Use assert_eq!(res.err().code(), Error::Variant) — see TESTING.md"
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "**/core_vectors.rs"
+  - "**/core_bip341.rs"
+  - "**/rbitcoin-net/src/tip_accept.rs"
+  - "**/rbitcoin-consensus/src/script_pool.rs"
+rule:
+  any:
+    - pattern: assert!($A.is_err())
+    - pattern: assert!($A.is_ok())
+    - pattern: debug_assert!($A.is_err())
+    - pattern: debug_assert!($A.is_ok())
+    - pattern: assert!($A.is_err(), ..)
+    - pattern: assert!($A.is_ok(), ..)
+    - pattern: assert!(matches!($A, Err(_)))
+    - pattern: assert!(matches!($A, Ok(_)))
+    - pattern: assert!(matches!($A, Err(_)), ..)
+    - pattern: assert!(matches!($A, Ok(_)), ..)
+    - pattern: assert_eq!($A.is_err(), true)
+    - pattern: assert_eq!(true, $A.is_err())
+    - pattern: assert_eq!($A.is_ok(), true)
+    - pattern: assert_eq!(true, $A.is_ok())
+    - pattern: assert!($A.is_ok_and(..))
+    - pattern: debug_assert!($A.is_ok_and(..))
