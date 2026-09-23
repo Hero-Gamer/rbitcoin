@@ -212,7 +212,7 @@ jobs:
   # in that log fails the shard. A finished non-zero exit fails.
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
-    name: mutants (${{ matrix.shard + 1 }}/4)
+    name: mutants (${{ matrix.n }}/4)
     needs: [fmt, clippy, test]
     if: >-
       github.event_name == 'pull_request'
@@ -223,8 +223,18 @@ jobs:
     timeout-minutes: 40
     strategy:
       fail-fast: false
+      # Expressions have no + operator; a `+` in ${{ }} invalidates this file.
+      # n is the check number. shard is the cargo --shard argument.
       matrix:
-        shard: [0, 1, 2, 3]
+        include:
+          - shard: 0
+            n: 1
+          - shard: 1
+            n: 2
+          - shard: 2
+            n: 3
+          - shard: 3
+            n: 4
     env:
       # Workflow env disables incremental for rust-cache and denies warnings.
       # cargo-mutants rebuilds one mutant at a time; incremental is the point.
@@ -305,7 +315,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### mutants ${{ matrix.shard + 1 }}/4"
+            echo "### mutants ${{ matrix.n }}/4"
             echo "Required. Outcome: ${{ steps.run.outcome }}. Result: ${{ steps.run.outputs.result }}. Missed: ${{ steps.run.outputs.missed }}."
             echo "A 30m kill with no MISSED warns and passes. MISSED before that kill fails. A finished non-zero exit fails."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -316,7 +326,7 @@ jobs:
           result="${{ steps.run.outputs.result }}"
           outcome="${{ steps.run.outcome }}"
           if [[ "${{ steps.diff.outputs.small }}" == "true" && "${{ matrix.shard }}" != "0" ]]; then
-            echo "small diff; mutants (${{ matrix.shard + 1 }}/4) does not run cargo mutants"
+            echo "small diff; mutants (${{ matrix.n }}/4) does not run cargo mutants"
             exit 0
           fi
           missed=0
@@ -339,7 +349,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants-pr-${{ matrix.shard + 1 }}
+          name: mutants-pr-${{ matrix.n }}
           path: mutants.out
           if-no-files-found: ignore
           retention-days: 5
