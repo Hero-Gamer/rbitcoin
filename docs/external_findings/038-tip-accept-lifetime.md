@@ -15,6 +15,7 @@ Process shutdown waits until that lane is idle before the store flush.
 Dropping a `P2PNode` still aborts the connect-retry task and returns.
 
 **Regression:** `rbitcoin-net` `tip_accept::tests::owned_job_finishes_after_waiter_abort`,
+`chain::tests::wait_tip_accept_idle_blocks_until_the_job_finishes`,
 `chain::tests::into_arc_shares_one_hub`,
 `chain::tests::accept_received_block_async_connects_off_worker`,
 `service::tests::drop_does_not_pin_and_hub_is_shared`.

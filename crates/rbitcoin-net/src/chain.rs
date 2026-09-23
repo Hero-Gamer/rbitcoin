@@ -3166,6 +3166,33 @@ mod tests {
     }
 
     #[test]
+    fn wait_tip_accept_idle_blocks_until_the_job_finishes() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (_dir, hub) = tmp_hub();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            crate::tip_accept::run_on_tip_accept(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx.recv().unwrap();
+        let waiter = thread::spawn(move || hub.wait_tip_accept_idle());
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            !waiter.is_finished(),
+            "wait_tip_accept_idle returned while a tip-accept job was running"
+        );
+        release_tx.send(()).unwrap();
+        waiter.join().expect("wait");
+        worker.join().expect("job");
+    }
+
+    #[test]
     fn reconstruct_prefill_plan_requires_knob_and_tip_child() {
         let (_dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
