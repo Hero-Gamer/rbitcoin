@@ -124,6 +124,8 @@ Playbooks:
   Owner playbook: [`docs/releases.md`](docs/releases.md).
 - Core functional harness:
   [`.agents/skills/core-functional/SKILL.md`](.agents/skills/core-functional/SKILL.md).
+- Unreleased notes are a new file under `changelog.d/`. Do not edit
+  `CHANGELOG.md` on a feature branch. Owner: [`docs/releases.md`](docs/releases.md).
 - Required CI jobs are `qc`, `test`, `windows`, `macos`, `coverage`, and
   `mutants (1/4)` through `mutants (4/4)`. `qc` is fmt, ast-grep, deny,
   the script self-tests, clippy, then nixos-module-eval. `--shard` is

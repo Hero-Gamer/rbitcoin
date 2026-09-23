@@ -141,6 +141,39 @@ assert_ok "cut --minor moves Unreleased body under 0.6.0" \
   grep -q 'ship this' "$MINOR/CHANGELOG.md"
 assert_ok "cut --minor inserts Highlights heading" \
   grep -qE '^### Highlights' "$MINOR/CHANGELOG.md"
+
+# --- cut absorbs changelog.d into the shipped section ---
+FRAG="$WORKDIR/frag"
+mkdir -p "$FRAG"
+seed_dev_tree "$FRAG"
+mkdir -p "$FRAG/changelog.d"
+cat >"$FRAG/changelog.d/715-qc.md" <<'EOF'
+Fixed
+
+- **QC:** one runner.
+EOF
+cat >"$FRAG/changelog.d/changed-note.md" <<'EOF'
+Changed
+
+- **Book:** fragments land in an existing section.
+EOF
+bash "$CUT" --root "$FRAG" --minor --date 2026-09-06
+assert_ok "cut folds a new Fixed fragment under 0.6.0" \
+  grep -q 'QC:' "$FRAG/CHANGELOG.md"
+assert_ok "cut appends Changed fragment under the existing heading" \
+  grep -q 'fragments land' "$FRAG/CHANGELOG.md"
+assert_ok "cut keeps the Unreleased body that was already in CHANGELOG" \
+  grep -q 'ship this' "$FRAG/CHANGELOG.md"
+assert_ok "cut deletes absorbed fragments" \
+  bash -c '! test -e "$FRAG/changelog.d/715-qc.md" && ! test -e "$FRAG/changelog.d/changed-note.md"'
+BAD="$WORKDIR/badfrag"
+mkdir -p "$BAD"
+seed_dev_tree "$BAD"
+mkdir -p "$BAD/changelog.d"
+printf '%s\n' "Bogus" "- **No:**" >"$BAD/changelog.d/bad.md"
+assert_fail_msg "cut rejects a fragment with an unknown category" \
+  "category must be" \
+  bash "$CUT" --root "$BAD" --minor --date 2026-09-07
 assert_ok "gate kind is ship after minor cut" \
   bash -c "[[ \$(bash '$GATE' --root '$MINOR' --kind) == ship ]]"
 assert_fail_msg "gate fails ship until Highlights has a bullet" \

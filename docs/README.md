@@ -74,7 +74,7 @@ into `AGENTS.md`.
 | `crates/*/AGENTS.md` | Crate index: neighbors, read-first owners, verify command. Owns no facts. |
 | [`COMPAT.md`](../COMPAT.md) | Product surface. |
 | [`SECURITY.md`](../SECURITY.md) | Vulnerability reporting. |
-| [`CHANGELOG.md`](../CHANGELOG.md) | Release notes. |
+| [`CHANGELOG.md`](../CHANGELOG.md) | Published release notes. Unreleased fragments: [`changelog.d/`](../changelog.d/). Process: [`releases.md`](./releases.md). |
 | [`SCHEMA.md`](../SCHEMA.md) | Current on-disk schema (`SCHEMA_VERSION` home). Soft migrate / bump / refuse. |
 | [`SCHEMA_HISTORY.md`](../SCHEMA_HISTORY.md) | Prior versions and migrations. |
 | [`TESTING.md`](../TESTING.md) | Suite, budgets, coverage policy, default-CI pin vs nightly Core. |

@@ -239,6 +239,10 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
 
 ## Workflow
 
+Unreleased notes are one file per pull in [`changelog.d/`](./changelog.d/).
+Do not edit [`CHANGELOG.md`](./CHANGELOG.md) on a feature branch. The release
+cut folds those files in. Owner: [`docs/releases.md`](./docs/releases.md).
+
 Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
 (`qc`, `test`, `windows`, `macos`, `coverage`, `mutants (1/4)` …
 `mutants (4/4)`). `qc` is fmt, ast-grep, deny, the script self-tests,
