@@ -218,9 +218,13 @@ seed_dev_tree "$ONCE"
 mkdir -p "$ONCE/changelog.d"
 printf '%s\n' 'Thanks to @otaliptus for the security review, and to @dergoegge, @rob1ham, and @1440000bytes for earlier findings.' \
   >"$ONCE/changelog.d/thanks.md"
+printf '%s\n' 'Fixed' '' '- **Beside thanks:** a normal fragment still folds.' \
+  >"$ONCE/changelog.d/fixed-beside-thanks.md"
 bash "$CUT" --root "$ONCE" --minor --date 2026-09-06
 assert_ok "cut deletes changelog.d/thanks.md" \
   bash -c '! test -e "$ONCE/changelog.d/thanks.md"'
+assert_ok "cut folds a normal fragment next to thanks.md" \
+  grep -q 'Beside thanks' "$ONCE/CHANGELOG.md"
 assert_ok "cut keeps one-shot thanks under the shipped version" \
   grep -q '@dergoegge' "$ONCE/CHANGELOG.md"
 add_highlight "$ONCE" "- **Thing:** operator-facing ship note."
