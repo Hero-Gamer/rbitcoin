@@ -2269,6 +2269,8 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     st.record_height(h1, 1);
     st.header_fks
         .insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
+    st.inflight
+        .insert(h1, super::super::state::InflightReq::new(1));
     apply_peer_event(
         &mut st,
         &hub,
@@ -2305,6 +2307,8 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     st.record_height(h2, 2);
     st.header_fks
         .insert(h2, hub.ensure_header_fk(&b2.header).unwrap());
+    st.inflight
+        .insert(h2, super::super::state::InflightReq::new(1));
     hub.query.set_lookup_taken_hi(Some(2));
     apply_peer_event(
         &mut st,
@@ -2330,6 +2334,8 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let far = shell(h1, far_h, far_h);
     let far_hash = far.block_hash();
     st.record_height(far_hash, far_h);
+    st.inflight
+        .insert(far_hash, super::super::state::InflightReq::new(1));
     apply_peer_event(
         &mut st,
         &hub,

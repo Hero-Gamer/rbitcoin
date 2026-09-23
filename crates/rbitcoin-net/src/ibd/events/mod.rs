@@ -213,34 +213,57 @@ fn try_enqueue_ordered_header(
     false
 }
 
+/// Longest prefix [`ChainHub::ensure_headers_batch`] accepts.
+///
+/// A rejected tail is not stored and must not update path or explore state.
+/// The success path is one batch. A failing tail binary-searches the prefix.
+fn ensure_accepted_prefix(
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+) -> Vec<(bitcoin::block::Header, rbitcoin_primitives::Fk)> {
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(fks) = hub.ensure_headers_batch(headers) {
+        return headers.iter().copied().zip(fks).collect();
+    }
+    if headers.len() == 1 {
+        return Vec::new();
+    }
+    let mut lo = 0usize;
+    let mut lo_fks = Vec::new();
+    let mut hi = headers.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        match hub.ensure_headers_batch(&headers[..mid]) {
+            Ok(fks) => {
+                lo = mid;
+                lo_fks = fks;
+            }
+            Err(_) => hi = mid,
+        }
+    }
+    headers[..lo].iter().copied().zip(lo_fks).collect()
+}
+
 fn on_headers_batch(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     headers: Vec<bitcoin::block::Header>,
 ) -> usize {
+    let accepted = ensure_accepted_prefix(hub, &headers);
     let mut added = 0usize;
     let mut batch_prev: Option<(BlockHash, u32)> = None;
-    let mut to_ensure: Vec<bitcoin::block::Header> = Vec::new();
-    for hdr in headers {
+    for (hdr, fk) in accepted {
         let hash = hdr.block_hash();
         let prev = hdr.prev_blockhash;
-        let already_known = st.known_headers.contains(&hash) && st.header_fks.contains_key(&hash);
+        st.header_fks.insert(hash, fk);
         if let Some(h) = batch_header_height(st, hub, prev, batch_prev) {
             note_header_path(st, hub, hash, h, prev);
             batch_prev = Some((hash, h));
         }
-        if !already_known && !st.header_fks.contains_key(&hash) {
-            to_ensure.push(hdr);
-        }
         if try_enqueue_ordered_header(st, hub, hash, prev) {
             added += 1;
-        }
-    }
-    if !to_ensure.is_empty() {
-        if let Ok(fks) = hub.ensure_headers_batch(&to_ensure) {
-            for (hdr, fk) in to_ensure.iter().zip(fks) {
-                st.header_fks.insert(hdr.block_hash(), fk);
-            }
         }
     }
     added
@@ -392,6 +415,11 @@ fn apply_block_framed(
 ) {
     let wire_bytes = payload.len();
     note_block_rx(&mut st.slots, peer, wire_bytes);
+    // Unsolicited wire is not a body we asked for. Drop it before any copy.
+    let requested = st.inflight.contains_key(&hash);
+    if !requested {
+        return;
+    }
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
@@ -444,6 +472,9 @@ fn apply_block_framed(
         return;
     }
     let raw = hash.to_byte_array();
+    if hub.query.block_queue_has_hash(&raw) {
+        return;
+    }
     match hub
         .query
         .block_queue_offer(height, raw, header_fk.0, &payload)
@@ -896,5 +927,7 @@ pub(crate) fn parent_height(
 mod confirm_reject_tests;
 #[cfg(test)]
 mod decode_header_prefix_tests;
+#[cfg(test)]
+mod ibd_memory_tests;
 #[cfg(test)]
 mod parent_height_tests;

@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **IBD header and body intake:** a headers batch that fails validation
+  does not grow the work path or explore lists (each list is capped at
+  64). An unsolicited or already-queued body is dropped before the
+  payload copy. Assign does not issue getdata when queue bytes plus
+  outstanding hashes at 4 MiB each would pass the assign-stop. A body
+  that was requested is still queued.
 - **Header accept:** a failed `ensure_header` does not hold the body or
   enter tip accept. A non-genesis block whose previous hash is all zeros
   is rejected while a tip exists. Work sums report overflow instead of

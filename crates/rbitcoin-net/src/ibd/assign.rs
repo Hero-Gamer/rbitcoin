@@ -235,6 +235,9 @@ pub(crate) fn assign_work_ordered(
         return;
     }
 
+    st.intake_stop = rbitcoin_query::bq_assign_stop_bytes();
+    st.intake_queued = hub.query.block_queue_stats().1;
+
     if download_gate_closed(st, hub) {
         static GATE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = GATE_LOG.fetch_add(1, Ordering::Relaxed) + 1;
@@ -607,6 +610,19 @@ pub(crate) fn issue_one(
     issue_batch(st, pid, vec![h], room, issued)
 }
 
+/// Bytes reserved per outstanding getdata hash when the peer did not announce a size.
+pub(crate) const GETDATA_RESERVE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `inflight_after` unique hashes, each counted at [`GETDATA_RESERVE_BYTES`],
+/// plus the snapshotted queue, fit in the assign-stop budget.
+fn intake_reserve_fits(st: &IbdWorkState, inflight_after: usize) -> bool {
+    if st.intake_stop == u64::MAX {
+        return true;
+    }
+    let reserved = (inflight_after as u64).saturating_mul(GETDATA_RESERVE_BYTES);
+    st.intake_queued.saturating_add(reserved) <= st.intake_stop
+}
+
 pub(crate) fn issue_batch(
     st: &mut IbdWorkState,
     pid: usize,
@@ -620,9 +636,23 @@ pub(crate) fn issue_batch(
     let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
         return false;
     };
+    let mut projected = st.inflight.len();
     let batch: Vec<BlockHash> = batch
         .into_iter()
-        .filter(|h| !st.slots[idx].in_flight.contains(h))
+        .filter(|h| {
+            if st.slots[idx].in_flight.contains(h) {
+                return false;
+            }
+            if st.inflight.contains_key(h) {
+                return true;
+            }
+            let next = projected.saturating_add(1);
+            if !intake_reserve_fits(st, next) {
+                return false;
+            }
+            projected = next;
+            true
+        })
         .collect();
     if batch.is_empty() {
         return false;
@@ -3071,6 +3101,38 @@ mod tests {
             st.inflight.keys().collect::<Vec<_>>()
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn assign_does_not_issue_when_queue_plus_reserve_exceeds_stop() {
+        let _g = BQ_ASSIGN_STOP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = AssignStopEnvRestore(
+            std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES"),
+            std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB"),
+        );
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "1000");
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
+        plant_work_path(&mut st, 1, 2);
+        let queued = vec![0u8; 1000];
+        hub.query
+            .block_queue_enqueue(50, h(50).to_byte_array(), 50, &queued)
+            .unwrap();
+        assert!(hub.query.block_queue_stats().1 >= 1000);
+        let stats = LoopStats::default();
+        let cfg = IbdConfig::for_test();
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assert!(
+            st.inflight.is_empty(),
+            "queue already at the stop: no new getdata; inflight={:?}",
+            st.inflight.keys().collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
