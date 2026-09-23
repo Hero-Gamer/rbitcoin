@@ -124,3 +124,6 @@ Playbooks:
   Owner playbook: [`docs/releases.md`](docs/releases.md).
 - Core functional harness:
   [`.agents/skills/core-functional/SKILL.md`](.agents/skills/core-functional/SKILL.md).
+- PR `mutants (0/4)` through `mutants (3/4)` are required. A shard that hits
+  the 30 minute limit passes. A finished shard with a non-zero
+  `cargo mutants` exit fails. Owner: [`TESTING.md`](TESTING.md).

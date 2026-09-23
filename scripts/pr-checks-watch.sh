@@ -21,6 +21,10 @@ REQUIRED=(
   macos
   coverage
   nixos-module-eval
+  "mutants (0/4)"
+  "mutants (1/4)"
+  "mutants (2/4)"
+  "mutants (3/4)"
 )
 
 usage() {

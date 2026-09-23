@@ -241,7 +241,7 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
 
 Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
 (`fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`, `macos`,
-`coverage`, `nixos-module-eval`) so a red run shows which gate failed without
+`coverage`, `nixos-module-eval`, `mutants (0/4)` … `mutants (3/4)`) so a red run shows which gate failed without
 digging into a monolithic job log.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.
