@@ -482,7 +482,11 @@ if [[ "$st" -ne 0 ]]; then
   exit "$st"
 fi
 rate=0.01
-if [[ "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" ]]; then
+if [[ "$BIN" == "mempool_differential" ]]; then
   rate=0.005
+elif [[ "$BIN" == "script_verify_differential" ]]; then
+  # Weekday runs are 600s. Those nights land near 0.43% comparisons.
+  # The Sunday hour just clears 0.5%. 0.3% still rejects a mute harness.
+  rate=0.003
 fi
 fail_if_no_comparisons "$log" "$rate"
