@@ -119,10 +119,12 @@ fn verify_control_commitment(
     output_key_bytes: &[u8],
     script: &Script,
 ) -> Result<u8, ConsensusError> {
-    if control.len() < CONTROL_BASE
-        || !(control.len() - CONTROL_BASE).is_multiple_of(CONTROL_NODE)
-        || (control.len() - CONTROL_BASE) / CONTROL_NODE > CONTROL_MAX_NODES
-    {
+    if control.len() < CONTROL_BASE {
+        return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
+    }
+    let extra = control.len() - CONTROL_BASE;
+    let nodes = extra / CONTROL_NODE;
+    if !extra.is_multiple_of(CONTROL_NODE) || nodes > CONTROL_MAX_NODES {
         return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
     }
     let leaf = control[0] & 0xfe;
@@ -143,7 +145,6 @@ fn verify_control_commitment(
         .consensus_encode(&mut eng)
         .expect("hash engines do not error");
     let mut curr = TapNodeHash::from_byte_array(TapLeafHash::from_engine(eng).to_byte_array());
-    let nodes = (control.len() - CONTROL_BASE) / CONTROL_NODE;
     for i in 0..nodes {
         let start = CONTROL_BASE + i * CONTROL_NODE;
         let node = TapNodeHash::from_byte_array(
@@ -468,6 +469,86 @@ mod bip341_tests {
         ctrl[5] ^= 0xff;
         job.tx.input[0].witness = Witness::from_slice(&[leaf.as_slice(), ctrl.as_slice()]);
         assert!(script::verify_job_all_inputs(&job).is_err());
+    }
+
+    /// Two merkle nodes, so the path offset `33 + i * 32` is not a no-op.
+    #[test]
+    fn script_path_accepts_two_merkle_nodes() {
+        let secp = Secp256k1::new();
+        let internal_sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
+        let (internal_xonly, _) = internal_kp.x_only_public_key();
+        let leaf = ScriptBuf::from_bytes(vec![0x51]);
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(2, leaf.clone())
+            .expect("leaf")
+            .add_leaf(2, ScriptBuf::from_bytes(vec![0x52]))
+            .expect("sibling")
+            .add_leaf(1, ScriptBuf::from_bytes(vec![0x53]))
+            .expect("side")
+            .finalize(&secp, internal_xonly)
+            .expect("finalize");
+        let output_key = spend_info.output_key().to_x_only_public_key();
+        let control = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("control");
+        let ctrl = control.serialize();
+        assert_eq!(ctrl.len(), 33 + 64, "two merkle nodes");
+        let (mut job, _) = make_script_path_spend();
+        let script = job.tx.input[0].witness.nth(0).unwrap().to_vec();
+        job.tx.input[0].witness = Witness::from_slice(&[script.as_slice(), ctrl.as_slice()]);
+        job.prevouts[0].script_pubkey = p2tr_spk(output_key);
+        script::verify_job_all_inputs(&job).expect("two-node script path");
+    }
+
+    fn control_size_error(control: &[u8]) -> String {
+        let (mut job, _) = make_script_path_spend();
+        let script = job.tx.input[0].witness.nth(0).unwrap().to_vec();
+        job.tx.input[0].witness = Witness::from_slice(&[script.as_slice(), control]);
+        format!(
+            "{}",
+            script::verify_job_all_inputs(&job).expect_err("control")
+        )
+    }
+
+    #[test]
+    fn control_block_size_bounds() {
+        let (job, _) = make_script_path_spend();
+        let base = job.tx.input[0].witness.nth(1).unwrap().to_vec();
+        assert_eq!(base.len(), 33);
+
+        let mut short = base.clone();
+        short.pop();
+        assert!(
+            control_size_error(&short).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "32-byte control"
+        );
+
+        let mut odd = base.clone();
+        odd.push(0);
+        assert!(
+            control_size_error(&odd).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "34-byte control"
+        );
+
+        let mut deep = base.clone();
+        deep.extend(vec![0x11u8; 128 * 32]);
+        let msg = control_size_error(&deep);
+        assert!(
+            msg.contains("WITNESS_PROGRAM_MISMATCH"),
+            "128 nodes are in range, got {msg}"
+        );
+        assert!(
+            !msg.contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "128 nodes are in range, got {msg}"
+        );
+
+        let mut too_deep = base.clone();
+        too_deep.extend(vec![0x11u8; 129 * 32]);
+        assert!(
+            control_size_error(&too_deep).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "129 nodes"
+        );
     }
 
     #[test]
