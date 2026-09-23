@@ -998,6 +998,69 @@ mod tests {
     }
 
     #[test]
+    fn rpc_max_http_body_is_two_mebibytes() {
+        assert_eq!(RPC_MAX_HTTP_BODY, 2_097_152);
+    }
+
+    #[tokio::test]
+    async fn waitforblock_positional_hash_returns_current_tip() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-pos").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let (st, body) = post_raw(
+            tcp_addr(&handle),
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getbestblockhash"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        let hash = body.unwrap()["result"].as_str().expect("hash").to_string();
+        let req = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 2,
+            "method": "waitforblock",
+            "params": [hash]
+        });
+        let t0 = std::time::Instant::now();
+        let (st, body) =
+            post_raw(tcp_addr(&handle), &handle.auth, req.to_string().as_bytes()).await;
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert!(
+            body.get("error").is_none() || body["error"].is_null(),
+            "{body}"
+        );
+        assert_eq!(body["result"]["hash"], hash, "{body}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "positional waitforblock slept {:?}",
+            t0.elapsed()
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn waitfor_does_not_hold_the_blocking_pool() {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
