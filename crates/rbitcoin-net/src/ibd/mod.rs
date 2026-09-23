@@ -32,7 +32,7 @@ mod state;
 mod status;
 
 pub use dial::connect_timeout_for;
-pub use perf_log::{format_tip_perf_sizes, read_proc_rss, ProcRss, TipPerfSizes};
+pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
 use assign_plan::want_headers_beyond_soft_cap;
@@ -838,7 +838,7 @@ pub async fn ibd_cancellable(
             conf_pipe.feed_inflight = feed_inflight;
             let work_sizes = st.structure_sizes();
             let owned_sizes = hub.query.process_owned_size_snapshot();
-            let rss = perf_log::read_proc_rss();
+            let rss = perf_log::read_platform_rss();
             let perf = perf_log::sample(
                 &loop_stats,
                 st.inflight.len(),
