@@ -1,8 +1,8 @@
 id: weak-assert-pattern
 language: rust
 severity: error
-message: "Tier1: Assert exact variant — avoid bare is_err/is_ok/matches!(_)"
-note: "Use assert_eq!(res.err().code(), Error::Variant) — see TESTING.md"
+message: "Non-test Rust: bare is_ok/is_err or matches!(Ok(_)|Err(_)) does not name the value"
+note: "Does not scan *tests*.rs, tests/, or benches/. Does scan #[cfg(test)] modules inside other .rs files. tip_accept.rs and script_pool.rs are excluded entirely, with no date check. This is not the mutant-killer gate."
 ignores:
   - "**/*tests*.rs"
   - "**/tests/**"

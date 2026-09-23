@@ -1,8 +1,8 @@
 id: mutant-waiver-missing-date
 language: rust
 severity: error
-message: "MUTANT-WAIVER: add expiry — e.g. expires 2027-01-15"
-note: "See TESTING.md — all waivers need review date"
+message: "MUTANT-WAIVER in a scanned file must include an expires YYYY-MM-DD token"
+note: "The date is not compared to today. Comments in *tests*.rs and tests/ are not scanned."
 rule:
   kind: line_comment
   regex: "MUTANT-WAIVER"
