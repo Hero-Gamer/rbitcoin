@@ -26,3 +26,14 @@ fn multi_byte_pad_and_256() {
     assert_eq!(bip34_height_script(255), vec![0x02, 0xff, 0x00]);
     assert_eq!(bip34_height_script(256), vec![0x02, 0x00, 0x01]);
 }
+
+#[test]
+fn kill_bip34_remaining_edges() {
+    // 32768 = 0x8000 -> little endian 0x00 0x80, high bit set -> needs 0x00 pad
+    // tests high-bit pad path: last & 0x80!=0 => push 0x00
+    assert_eq!(bip34_height_script(32768), vec![0x03, 0x00, 0x80, 0x00]);
+    // 700k = real mainnet height, 3 bytes, last byte 0x0a no pad
+    assert_eq!(bip34_height_script(700_000), vec![0x03, 0x60, 0xae, 0x0a]);
+    // 128 vs 127 distinction kills & with | at last & 0x80
+    assert_ne!(bip34_height_script(127), bip34_height_script(128));
+}
