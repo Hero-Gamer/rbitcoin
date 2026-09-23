@@ -208,11 +208,6 @@ impl Input {
         }
         self.body_end.store(body_at, Ordering::Release);
         self.count.store(base + txs.len() as u64, Ordering::Release);
-        let last = Fk(base + txs.len() as u64);
-        let wrote = self.edges(last)?.map(|v| v.len()).unwrap_or(0);
-        if wrote != txs.last().map(|e| e.len()).unwrap_or(0) {
-            return Err(StoreError::Corrupt("invariant: input n_in"));
-        }
         Ok(())
     }
 
@@ -448,6 +443,26 @@ mod tests {
         assert_eq!(t.count(), 2049);
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
         assert_eq!(t.n_in(Fk(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn input_append_reopen_reads_last_edges() {
+        let dir = TempDir::labeled("input-reopen-last").unwrap();
+        let t = Input::create(dir.path()).unwrap();
+        let mut batch = Vec::with_capacity(1025);
+        for i in 0..1024u32 {
+            batch.push(vec![edge(1, i)]);
+        }
+        batch.push(vec![edge(9, 3), edge(9, 4)]);
+        t.append(&batch).unwrap();
+        drop(t);
+        let t = Input::open(dir.path()).unwrap();
+        assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(2));
+        assert_eq!(
+            t.edges(Fk(1025)).unwrap().unwrap(),
+            vec![edge(9, 3), edge(9, 4)]
+        );
+        assert_eq!(t.edges(Fk(1)).unwrap().unwrap(), vec![edge(1, 0)]);
     }
 
     #[test]
