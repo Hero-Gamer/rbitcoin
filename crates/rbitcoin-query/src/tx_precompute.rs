@@ -339,6 +339,11 @@ fn sighash_midstates(tx: &Transaction) -> [Option<[u8; 32]>; 3] {
     ]
 }
 
+/// A consensus-serialized tx is at least 10 bytes (version, two compact sizes, locktime).
+fn block_tx_count_fits(n: usize, remaining: usize) -> bool {
+    n <= remaining / 10
+}
+
 /// Decode a P2P block payload once: rust-bitcoin `Block` plus per-tx pres from
 /// each tx's **wire slice** (no second consensus_encode into SHA engines).
 ///
@@ -356,8 +361,7 @@ pub fn decode_block_precomputes(
     let n_raw = VarInt::consensus_decode(&mut cur).ok()?.0;
     let n = usize::try_from(n_raw).ok()?;
     let remaining = payload.len().saturating_sub(cur.position() as usize);
-    // A consensus-serialized tx is at least 10 bytes (version, two compact sizes, locktime).
-    if n > remaining / 10 {
+    if !block_tx_count_fits(n, remaining) {
         return None;
     }
     let mut txdata = Vec::with_capacity(n);
@@ -583,6 +587,14 @@ mod tests {
                 assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
             }
         }
+    }
+
+    #[test]
+    fn block_tx_count_fits_uses_ten_byte_floor() {
+        assert!(super::block_tx_count_fits(1, 10));
+        assert!(super::block_tx_count_fits(0, 0));
+        assert!(!super::block_tx_count_fits(2, 15));
+        assert!(!super::block_tx_count_fits(1, 9));
     }
 
     #[test]

@@ -25,5 +25,6 @@ process wrote or checked, and are unchanged:
   `20 + n * 8` and `n == n_shards` before allocating. Worker spans clamp
   `n` to the create-fk span.
 
-**Regression:** `rbitcoin-query` `tx_precompute::tests::decode_block_precomputes_rejects_tx_count_past_payload`,
+**Regression:** `rbitcoin-query` `tx_precompute::tests::block_tx_count_fits_uses_ten_byte_floor`,
+`tx_precompute::tests::decode_block_precomputes_rejects_tx_count_past_payload`,
 `tx_precompute::tests::decode_block_precomputes_accepts_minimum_serialized_tx`
