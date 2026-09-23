@@ -31,8 +31,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# tank1's --connect runs catch-up before RPC listens. Mine on tank0 first.
-"${COMPOSE[@]}" up -d --force-recreate --remove-orphans tank0
+# Genesis --connect enters tip-follow, so tank1 answers RPC while tank0 is
+# down. The 2s redial is what connects once that hostname exists.
+"${COMPOSE[@]}" up -d --force-recreate --remove-orphans tank1
 
 cli() {
   local tank="$1"
@@ -44,12 +45,39 @@ height() {
   cli "$1" getblockcount 2>/dev/null | tr -d '[:space:]' || true
 }
 
+peers() {
+  cli "$1" getconnectioncount 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# bitcoin-cli prints compact JSON (`"addr":"ip:port"`).
+peer_addr() {
+  local raw
+  raw="$(cli "$1" getpeerinfo 2>/dev/null || true)"
+  if [[ "$raw" =~ \"addr\":\"([^\"]+)\" ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
 fail() {
   echo "example.sh: $*" >&2
   "${COMPOSE[@]}" ps -a >&2 || true
   "${COMPOSE[@]}" logs --no-color >&2 || true
   exit 1
 }
+
+deadline=$((SECONDS + 90))
+until [[ "$(height tank1)" == "0" ]]; do
+  if (( SECONDS > deadline )); then
+    fail "tank1 did not answer getblockcount (got '$(height tank1)')"
+  fi
+  sleep 2
+done
+
+if [[ "$(peers tank1)" != "0" ]]; then
+  fail "tank1 had a peer before tank0 existed (peers='$(peers tank1)' addr='$(peer_addr tank1)')"
+fi
+
+"${COMPOSE[@]}" up -d --remove-orphans tank0
 
 deadline=$((SECONDS + 90))
 until [[ "$(height tank0)" == "0" ]]; do
@@ -60,15 +88,24 @@ until [[ "$(height tank0)" == "0" ]]; do
 done
 
 cli tank0 generate 1 >/dev/null
-
-"${COMPOSE[@]}" up -d --remove-orphans tank1
+want="$(height tank0)"
+if [[ "$want" == "" || "$want" == "0" ]]; then
+  fail "tank0 generate did not advance (height='$want')"
+fi
 
 deadline=$((SECONDS + 90))
-until [[ "$(height tank1)" != "" && "$(height tank1)" != "0" ]]; do
+until [[ "$(height tank1)" == "$want" && "$(peers tank1)" != "" && "$(peers tank1)" != "0" ]]; do
   if (( SECONDS > deadline )); then
-    fail "tank1 did not follow tank0 (height='$(height tank1)')"
+    fail "tank1 did not follow tank0 (height='$(height tank1)' want='$want' peers='$(peers tank1)' addr='$(peer_addr tank1)')"
   fi
   sleep 2
 done
 
-echo "ok - tank0=$(height tank0) tank1=$(height tank1)"
+addr="$(peer_addr tank1)"
+case "$addr" in
+  ""|0.0.0.0:*)
+    fail "tank1 peer addr is not the resolved tank0 (addr='$addr')"
+    ;;
+esac
+
+echo "ok - tank0=$want tank1=$(height tank1) peers=$(peers tank1) addr=$addr"

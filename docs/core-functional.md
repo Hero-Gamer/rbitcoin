@@ -313,9 +313,11 @@ cargo build -p rbitcoin-node
 
 The example conf sets `head_scale=tiny` so a tank does not fallocate mainnet
 heads. `example.sh` copies a **bookworm-linked** `rbitcoin-node` into the image
-(a nix devshell binary will not exec: its dynamic loader is not in Debian),
-starts `tank0` and `tank1` (`addnode=tank0`), mines one regtest block, and
-waits until `tank1` `getblockcount` is non-zero. CI builds that binary with
+(a nix devshell binary will not exec: its dynamic loader is not in Debian).
+It starts `tank1` first (`addnode=tank0`), waits until that RPC is up at
+height 0 with no peer, then starts `tank0`, mines one regtest block, and
+waits until `tank1` matches that height with a live peer whose
+`getpeerinfo` addr is the resolved address. CI builds the binary with
 `rust:1.95.0-bookworm`.
 
 `Dockerfile.test.sh` pins the image text and does not need Docker.

@@ -51,7 +51,9 @@ before 1.0).
   thread, and retry until a live session exists. `--connect` does not enable
   seed redial. Incomplete catch-up at genesis still enters tip-follow; a
   non-zero tip stays in IBD. Relay stays gated below `--min-chain-work`.
-  Label `warnet` runs a two-tank Docker example
+  Label `warnet` runs a two-tank Docker example that starts the connecting
+  tank first and waits until its height matches the miner and `getpeerinfo`
+  shows the resolved address
   ([`docs/core-functional.md`](docs/core-functional.md)).
 
 - **Tor cookie HMAC uses `hmac` 0.13 and `sha2` 0.11** (digest 0.11).
