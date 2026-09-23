@@ -1060,6 +1060,23 @@ fn decode_prevout_at_skips_script_and_witness() {
     assert_eq!(cfk, Fk(1));
     assert_eq!(vout, 3);
     assert_eq!(used, legacy.len());
+
+    // Inline prevout with a real script and two witness items. The skip
+    // cursor must land on the end; a shifted length is a short or long read.
+    let mut rich = vec![input_flags::SEQ_FINAL];
+    rich.extend_from_slice(&1u64.to_le_bytes());
+    rich.push(3);
+    rich.push(2);
+    rich.extend_from_slice(&[0xab, 0xcd]);
+    rich.push(2);
+    rich.push(1);
+    rich.push(0x11);
+    rich.push(2);
+    rich.extend_from_slice(&[0x22, 0x33]);
+    let (cfk, vout, used) = InputRecord::decode_prevout_at(&rich).unwrap();
+    assert_eq!(cfk, Fk(1));
+    assert_eq!(vout, 3);
+    assert_eq!(used, rich.len());
 }
 
 /// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).

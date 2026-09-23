@@ -1318,6 +1318,37 @@ mod tests {
             Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
             other => panic!("zero vertex count must be Corrupt, got {other:?}"),
         }
+        // n == 1 does not use the modulus. A `>` → `>=` gate would reject it.
+        hdr[8..12].copy_from_slice(&1u32.to_le_bytes());
+        hdr[12..16].copy_from_slice(&0u32.to_le_bytes());
+        hdr[24..28].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &hdr).unwrap();
+        let one = BdzMphf::read_packed_from(&path).expect("n=1 ignores a zero modulus");
+        assert_eq!(one.index(9).unwrap(), one.index(9).unwrap());
+        let zero_mod = BdzMphf {
+            n: 2,
+            m: 4,
+            seed: 1,
+            modulus: 0,
+            g: GStore::Ram(vec![0u32; 4].into_boxed_slice()),
+            compact: None,
+        };
+        match zero_mod.index_batch(&[1], &mut crate::IoCtx::none()) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("index with modulus 0 must be Corrupt, got {other:?}"),
+        }
+        let zero_m = BdzMphf {
+            n: 2,
+            m: 0,
+            seed: 1,
+            modulus: 1,
+            g: GStore::Ram(vec![0u32; 1].into_boxed_slice()),
+            compact: None,
+        };
+        match zero_m.index_batch(&[1], &mut crate::IoCtx::none()) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("index with m 0 must be Corrupt, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
