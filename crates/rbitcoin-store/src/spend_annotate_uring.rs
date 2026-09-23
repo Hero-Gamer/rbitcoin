@@ -118,7 +118,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
                         epoch,
                         slot as u32,
                     );
-                    session.push_pread_flags(body_fd, abs, &mut s.buf, ud, 0)?;
+                    // SAFETY: `s.buf` lives until this meta-read wave drains.
+                    unsafe { session.push_pread_flags(body_fd, abs, &mut s.buf, ud, 0) }?;
                 }
                 *in_flight += 1;
             }
@@ -205,7 +206,8 @@ pub fn put_spend_batch_by_abs_meta_uring(
                                 epoch,
                                 slot as u32,
                             );
-                            session.push_pwrite_flags(body_fd, abs, &s.buf, ud, 0)?;
+                            // SAFETY: `s.buf` lives until this meta-write wave drains.
+                            unsafe { session.push_pwrite_flags(body_fd, abs, &s.buf, ud, 0) }?;
                         }
                         in_flight += 1;
                     }
@@ -576,7 +578,10 @@ fn put_spend_batch_pure_write_uring(
                         epoch,
                         slot as u32,
                     );
-                    session.push_pread_flags(body_fd, groups[gi].off, &mut s.buf, ud, 0)?;
+                    // SAFETY: `s.buf` lives until this page-read wave drains.
+                    unsafe {
+                        session.push_pread_flags(body_fd, groups[gi].off, &mut s.buf, ud, 0)
+                    }?;
                 }
                 *in_flight += 1;
             }
@@ -636,7 +641,8 @@ fn put_spend_batch_pure_write_uring(
                                 epoch,
                                 slot as u32,
                             );
-                            session.push_pwrite(body_fd, groups[gi].off, &s.buf, ud)?;
+                            // SAFETY: `s.buf` lives until this page-write wave drains.
+                            unsafe { session.push_pwrite(body_fd, groups[gi].off, &s.buf, ud) }?;
                         }
                         in_flight += 1;
                     }

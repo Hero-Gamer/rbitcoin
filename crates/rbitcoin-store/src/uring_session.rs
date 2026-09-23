@@ -139,6 +139,19 @@ pub fn abort_uring_unusable(reason: &str) -> ! {
     std::process::abort();
 }
 
+/// Enter failed. Pending SQEs still own caller buffers, so this matches the
+/// hard cap (abort outside tests) instead of returning into a free.
+///
+/// Linux is the only production caller. Other targets keep the function for
+/// the unit test; a non-Linux lib build must not see it as dead code.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn inflight_enter_failure(pending: usize, err: StoreError) -> Result<(), StoreError> {
+    if pending == 0 {
+        return Err(err);
+    }
+    finish_drain_hard_cap(pending)
+}
+
 fn finish_drain_hard_cap(pending: usize) -> Result<(), StoreError> {
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("unnamed");
@@ -467,19 +480,28 @@ impl UringSession {
         Ok(())
     }
 
-    /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
-    pub fn push_pread(
+    /// Push a pread SQE.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must stay allocated and not be written by anyone else until the
+    /// CQE for `user_data` is harvested or [`Self::drain_all`] has returned.
+    pub unsafe fn push_pread(
         &mut self,
         fd: impl Into<IoHandle>,
         offset: u64,
         buf: &mut [u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.push_pread_flags(fd, offset, buf, user_data, 0)
+        unsafe { self.push_pread_flags(fd, offset, buf, user_data, 0) }
     }
 
     /// Like [`push_pread`] with optional `rw_flags` (honored on Linux uring only).
-    pub fn push_pread_flags(
+    ///
+    /// # Safety
+    ///
+    /// Same buffer contract as [`Self::push_pread`].
+    pub unsafe fn push_pread_flags(
         &mut self,
         fd: impl Into<IoHandle>,
         offset: u64,
@@ -534,19 +556,28 @@ impl UringSession {
         r
     }
 
-    /// Push a pwrite SQE. Buffer must stay live until the CQE is harvested.
-    pub fn push_pwrite(
+    /// Push a pwrite SQE.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must stay allocated and unchanged until the CQE for `user_data`
+    /// is harvested or [`Self::drain_all`] has returned.
+    pub unsafe fn push_pwrite(
         &mut self,
         fd: impl Into<IoHandle>,
         offset: u64,
         buf: &[u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
-        self.push_pwrite_flags(fd, offset, buf, user_data, 0)
+        unsafe { self.push_pwrite_flags(fd, offset, buf, user_data, 0) }
     }
 
     /// Like [`push_pwrite`] with optional `rw_flags` (honored on Linux uring only).
-    pub fn push_pwrite_flags(
+    ///
+    /// # Safety
+    ///
+    /// Same buffer contract as [`Self::push_pwrite`].
+    pub unsafe fn push_pwrite_flags(
         &mut self,
         fd: impl Into<IoHandle>,
         offset: u64,
@@ -940,7 +971,7 @@ impl UringSession {
         }
         if let Some(err) = enter_err {
             self.poisoned = true;
-            return Err(err);
+            return inflight_enter_failure(self.pending.len(), err);
         }
         if unexpected {
             self.poison();
@@ -1366,6 +1397,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enter_failure_with_pending_matches_the_hard_cap() {
+        let idle =
+            inflight_enter_failure(0, StoreError::Corrupt("io_uring submit_and_wait failed"))
+                .unwrap_err();
+        assert!(idle.to_string().contains("submit_and_wait"), "{idle}");
+        let busy =
+            inflight_enter_failure(2, StoreError::Corrupt("io_uring submit_and_wait failed"))
+                .unwrap_err();
+        assert!(busy.to_string().contains("undrained"), "{busy}");
+    }
+
+    #[test]
     fn pack_ud_kinds_are_unique_and_do_not_alias() {
         let kinds = [
             KIND_BULK_PREAD,
@@ -1544,7 +1587,8 @@ mod tests {
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let mut buf = [0u8; 4];
-        session.push_pread(fd, 0, &mut buf, 10).unwrap();
+        // SAFETY: `buf` lives until `drain_all` on this session.
+        unsafe { session.push_pread(fd, 0, &mut buf, 10) }.unwrap();
         session.submit().unwrap();
         session.pending.expect_cqe(10).unwrap();
         match session.drain_all() {
@@ -1708,9 +1752,8 @@ mod tests {
         let mut session = UringSession::try_open(32).expect("uring");
         let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
         for (i, b) in bufs.iter_mut().enumerate() {
-            session
-                .push_pread(fd, 0, b.as_mut_slice(), i as u64)
-                .expect("push");
+            // SAFETY: `bufs` lives until this session drains.
+            unsafe { session.push_pread(fd, 0, b.as_mut_slice(), i as u64) }.expect("push");
         }
         session.sync_submission();
         let _ = session.submit();
@@ -1752,9 +1795,8 @@ mod tests {
 
         let mut session = UringSession::try_open(32).expect("uring");
         let mut buf = vec![0u8; 64];
-        session
-            .push_pread(fd, 0, buf.as_mut_slice(), 1)
-            .expect("push");
+        // SAFETY: `buf` lives until `drain_all` on this session.
+        unsafe { session.push_pread(fd, 0, buf.as_mut_slice(), 1) }.expect("push");
         assert!(session.in_flight() > 0);
         session.drain_all().expect("drain unsynced SQEs");
         assert_eq!(session.in_flight(), 0);
@@ -1795,7 +1837,8 @@ mod tests {
         session.begin_batch().unwrap();
         let epoch0 = session.epoch();
         let ud = pack_ud(KIND_BULK_PREAD, epoch0, 0);
-        session.push_pread(fd, 0, &mut buf, ud).unwrap();
+        // SAFETY: `buf` lives until this session drains.
+        unsafe { session.push_pread(fd, 0, &mut buf, ud) }.unwrap();
         session.submit().unwrap();
         assert!(session.in_flight() > 0);
         session.begin_batch().unwrap();
@@ -1825,7 +1868,8 @@ mod tests {
         }
         assert!(session.is_poisoned());
         let mut buf = [0u8; 1];
-        let r = session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0));
+        // SAFETY: `buf` lives until this function returns.
+        let r = unsafe { session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0)) };
         assert!(
             r.is_err(),
             "push after undrainable leftover must fail, got {r:?}"
@@ -1845,8 +1889,9 @@ mod tests {
         assert_eq!(session.kind(), SessionKind::Pool);
         let mut a = [0u8; 2];
         let mut b = [0u8; 2];
-        session.push_pread(fd, 0, &mut a, 10).expect("push a");
-        session.push_pread(fd, 2, &mut b, 11).expect("push b");
+        // SAFETY: `a` and `b` live until this session drains.
+        unsafe { session.push_pread(fd, 0, &mut a, 10) }.expect("push a");
+        unsafe { session.push_pread(fd, 2, &mut b, 11) }.expect("push b");
         session.submit().unwrap();
         session.submit_and_wait_one().unwrap();
         let mut got = session.harvest_ready().expect("harvest");
@@ -1881,14 +1926,16 @@ mod tests {
         let fd = crate::io_handle::IoHandle::from_file(&f);
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
         let mut buf = [0u8; 8];
-        session.push_pread(fd, 0, &mut buf, 1).unwrap();
+        // SAFETY: `buf` lives until `drain_all` on this session.
+        unsafe { session.push_pread(fd, 0, &mut buf, 1) }.unwrap();
         session.submit().unwrap();
         session.drain_all().unwrap();
         // File is only 2 bytes; pread of 8 returns 2, not a silent full fill.
         // Drain consumed the CQE; re-issue and harvest the result.
         let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool2");
         let mut buf = [0u8; 8];
-        session.push_pread(fd, 0, &mut buf, 7).unwrap();
+        // SAFETY: `buf` lives until this session harvests the CQE.
+        unsafe { session.push_pread(fd, 0, &mut buf, 7) }.unwrap();
         session.submit_and_wait_one().unwrap();
         let got = session.harvest_ready().expect("h");
         assert_eq!(got.len(), 1);
