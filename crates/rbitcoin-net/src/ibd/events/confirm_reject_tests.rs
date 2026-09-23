@@ -52,6 +52,14 @@ fn confirm_reject_class_matches_substring_table() {
             ConfirmRejectClass::SoftWire,
         ),
         (
+            "consensus: bad block: unexpected witness before segwit",
+            ConfirmRejectClass::SoftWire,
+        ),
+        (
+            "consensus: bad block: block weight too large",
+            ConfirmRejectClass::ConsensusInvalid,
+        ),
+        (
             "consensus: bad header: missing retarget first header",
             ConfirmRejectClass::SoftWire,
         ),

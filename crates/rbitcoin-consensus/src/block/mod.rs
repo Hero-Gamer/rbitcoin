@@ -27,8 +27,9 @@ pub struct ValidationContext<'a> {
     /// could not always trust ordered height). That made **signet** reject every
     /// post-genesis block: Core/Inquisition `SegwitHeight = 1`, so height 0 looks
     /// pre-segwit while BIP325 blocks always carry witness. Soft-fork timing is
-    /// enforced at **confirm** with the true height. Merkle / weight / witness
-    /// **commitment** still run here either way.
+    /// enforced at **confirm** with the true height. Merkle, witness
+    /// commitment, and weight still run here either way. Commitment is
+    /// checked before weight so witness padding is not the block hash's fault.
     pub enforce_height_gates: bool,
 }
 
@@ -186,6 +187,19 @@ pub fn validate_block_structure_with_pres(
     if base > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadBlock("block stripped size too large"));
     }
+    // Witness bytes are not in the block hash. Check them before weight so
+    // padding cannot be cached as a failed hash.
+    let has_witness_data = block_has_witness_from_pres(pres.as_ref());
+    let has_commitment = coinbase_has_witness_commitment(block);
+    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
+        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
+    }
+    if (has_witness_data || has_commitment)
+        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
+    {
+        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        check_witness_commitment_with_wtxids(block, &non_cb)?;
+    }
     if weight_wu > MAX_BLOCK_WEIGHT {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
@@ -234,20 +248,6 @@ pub fn validate_block_structure_with_pres(
         }
     }
     let walk_ns = t_walk.elapsed().as_nanos() as u64;
-
-    let has_witness_data = block_has_witness_from_pres(pres.as_ref());
-    let has_commitment = coinbase_has_witness_commitment(block);
-    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
-        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
-    }
-    // Core: BIP141 nonce only after SegWit. Pre-segwit aa21a9ed OP_RETURN is data.
-    // Archive has no reliable height — still check.
-    if (has_witness_data || has_commitment)
-        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
-    {
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
-        check_witness_commitment_with_wtxids(block, &non_cb)?;
-    }
 
     if let Some(stats) = stats {
         stats.note_struct_parts(txid_ns, 0, walk_ns);

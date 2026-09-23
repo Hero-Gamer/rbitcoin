@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **Witness padding:** witness commitment and unexpected-witness checks run
+  before the block weight check. Those two failures are mutations, so the
+  block hash is not cached invalid. A weight failure after a matching
+  commitment may still be cached. One mutation classifier serves connect
+  and both IBD reject paths.
 - **IBD header and body intake:** a headers batch that fails validation
   does not grow the work path or explore lists (each list is capped at
   64). An unsolicited or already-queued body is dropped before the

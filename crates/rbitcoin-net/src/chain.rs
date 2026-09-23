@@ -214,9 +214,11 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
-/// Reconstructed compact/body does not match the header.
-/// Do not cache the hash as permanently failed.
-fn reject_is_mutated(reason: &str) -> bool {
+/// Reconstructed compact/body does not match the header, or witness bytes
+/// that are not committed in the hash. Do not cache the hash as permanently
+/// failed. Weight after a matching commitment is the block's own fault.
+pub(crate) fn reject_is_mutated(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
     reason.contains("merkle")
         || reason.contains("bad-txnmrklroot")
         || reason.contains("bad-txns-duplicate")
@@ -224,6 +226,7 @@ fn reject_is_mutated(reason: &str) -> bool {
         || reason.contains("bad-witness-nonce")
         || reason.contains("missing witness commitment")
         || reason.contains("wtxid count")
+        || reason.contains("unexpected witness")
 }
 
 fn accept_err_is_mutated(e: &NetError) -> bool {
@@ -5505,6 +5508,32 @@ mod tests {
             other => panic!("expected invalidated refuse, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn padded_coinbase_witness_over_weight_is_not_cached_invalid() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let honest = mine(gen, 1_300_070_000, 1);
+        let mut padded = honest.clone();
+        let mut wit = Witness::new();
+        wit.push(vec![0u8; 4_000_000]);
+        padded.txdata[0].input[0].witness = wit;
+        assert_eq!(padded.block_hash(), honest.block_hash());
+        hub.note_asked_block(honest.block_hash());
+        let _err = hub
+            .accept_received_block(padded)
+            .expect_err("witness padding past the weight limit must reject");
+        assert!(
+            !hub.is_block_invalid(&honest.block_hash()),
+            "witness padding must not cache the block hash"
+        );
+        assert!(matches!(
+            hub.accept_received_block(honest).unwrap(),
+            AcceptOutcome::Accepted { height: 1 }
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
