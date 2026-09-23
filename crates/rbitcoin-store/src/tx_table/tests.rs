@@ -2692,6 +2692,103 @@ fn put_full_aligns_record_starts_and_txid_prefix() {
 }
 
 #[test]
+fn span_prevouts_match_per_create() {
+    let dir = tempfile_dir("span-prevouts");
+    let t = create_tiny(&dir);
+    let mut items = Vec::with_capacity(1025);
+    items.push((
+        TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        vec![OutputRecord::unspent(50, vec![0x51])],
+    ));
+    for i in 1u32..1024 {
+        let mut txid = [2u8; 32];
+        txid[0..4].copy_from_slice(&i.to_le_bytes());
+        items.push((
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(1),
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        ));
+    }
+    items.push((
+        TxRecord {
+            txid: [9u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 2,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(1),
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            },
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(2),
+                prev_index: 0,
+                sequence: 1,
+                script_sig: vec![0xaa],
+                witness: vec![vec![0xbb]],
+            },
+        ],
+        vec![OutputRecord::unspent(2, vec![0x51])],
+    ));
+    let fks = t.put_full_batch_indexed(&items, true).unwrap();
+    let first = fks[0].get().unwrap();
+    let last = fks[1024].get().unwrap();
+    let span = t.get_full_span(first, last).unwrap();
+    assert!(span[0].1[0].is_coinbase());
+    assert_eq!(span[1024].1[0].create_fk, Fk(1));
+    assert_eq!(span[1024].1[1].create_fk, Fk(2));
+    assert_eq!(span[1024].1[1].prev_index, 0);
+    let one = t.get_full(fks[1024]).unwrap();
+    assert_eq!(span[1024].1, one.1);
+    let mid = t.get_full_span(2, 2).unwrap();
+    assert_eq!(mid.len(), 1);
+    assert_eq!(mid[0].1.len(), 1);
+    assert_eq!(mid[0].1[0].create_fk, Fk(1));
+    let tail = t.get_full_span(1025, 1025).unwrap();
+    assert_eq!(tail[0].1.len(), 2);
+    assert_eq!(tail[0].1[1].create_fk, Fk(2));
+    assert_eq!(tail[0].1, t.get_full(Fk(1025)).unwrap().1);
+    let early = t.get_full_span(1, 2).unwrap();
+    assert_eq!(early.len(), 2);
+    assert!(early[0].1[0].is_coinbase());
+    assert_eq!(early[1].1[0].create_fk, Fk(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn get_full_span_matches_per_fk_get_full() {
     let dir = tempfile_dir("span-vs-full");
     let t = create_tiny(&dir);

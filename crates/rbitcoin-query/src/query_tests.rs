@@ -2644,6 +2644,86 @@ fn unstamp_txstat(q: &Query, fk: Fk) {
 }
 
 #[test]
+fn confirm_txstat_miss_is_corrupt() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    let (dir, q) = temp_query("txstat-miss-pinned");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let parent_txid = t0.tx.txid;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let parent_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+    let spend = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let txid = spend.compute_txid().to_byte_array();
+    let block = std::sync::Arc::new(Block {
+        header: BlockHeader {
+            version: BlockVersion::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 2,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        },
+        txdata: vec![spend],
+    });
+    let txrec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec);
+    let child_fk = Fk(parent_fk.get().unwrap() + 1);
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        pin,
+        vec![InputRecord {
+            prev_txid: parent_txid,
+            create_fk: parent_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![child_fk];
+    plan.body_est = 256;
+    let err = q
+        .archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("txstat parent not pinned")),
+        "{err}"
+    );
+    assert!(q.store().get_tx_meta_and_outputs(parent_fk).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stamp_txstat_from_block_coinbase_and_spend() {
     use bitcoin::hashes::Hash;
 
@@ -2759,6 +2839,43 @@ fn reorg_through_pruneheight_refuses() {
         "disconnect at/below pruneheight must be Pruned, got {err:?}"
     );
     assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_watermark_unlinks_fallen_height() {
+    let (dir, q) = temp_query("prune-unlink-fallen");
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent_hash);
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let window = q.store.path().join("seqsigwit.window");
+    assert!(window.join("0.bin").is_file());
+    assert!(window.join("1.bin").is_file());
+    assert!(window.join("2.bin").is_file());
+    q.set_pruneheight(Some(Height(1))).unwrap();
+    assert!(!window.join("0.bin").exists(), "jump unlinks height 0");
+    assert!(!window.join("1.bin").exists(), "jump unlinks height 1");
+    assert!(window.join("2.bin").is_file());
+    q.set_pruneheight(Some(Height(2))).unwrap();
+    assert!(
+        !window.join("2.bin").exists(),
+        "a one-height step still unlinks the height that just fell out"
+    );
+    std::fs::write(window.join("0.bin"), b"orphan").unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(2)));
+    assert!(
+        !window.join("0.bin").exists(),
+        "open sweeps a file left below the sidecar"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2910,6 +3027,51 @@ fn spill_symlink_outside_window_is_corrupt() {
     assert!(
         matches!(err, rbitcoin_store::StoreError::Corrupt(msg) if msg.contains("escaped")),
         "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_confirm_owns_seqsigwit_records() {
+    let (dir, q) = temp_query("prune-own-zero");
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0xab, 0xcd]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    assert_eq!(q.seqsigwit_ram_window_stats().0, 0);
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 0);
+    assert_eq!(q.seqsigwit_ram_window_stats().2, 0);
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0xab, 0xcd]]
+    );
+    assert!(q.store.path().join("seqsigwit.window/0.bin").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, q) = temp_query("prune-own-ram");
+    q.set_seqsigwit_ram_threshold_bytes(1 << 20).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0x11, 0x22]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 1);
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0x11, 0x22]]
+    );
+    q.clear_seqsigwit_ram_window();
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0x11, 0x22]],
+        "spill matches the records that were moved into RAM"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

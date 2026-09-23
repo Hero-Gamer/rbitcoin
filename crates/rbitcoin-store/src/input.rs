@@ -137,6 +137,57 @@ impl Input {
         Ok(if n == 0 { None } else { Some(u32::from(n)) })
     }
 
+    /// Parent edges for contiguous creates `first..=last` (1-based ids).
+    ///
+    /// One locator pread for the span and one body pread. `None` is unstamped.
+    pub fn edges_span(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<Option<Vec<InputEdge>>>, StoreError> {
+        if first == 0 || last < first {
+            return Err(StoreError::InvalidFk);
+        }
+        if last > self.count() {
+            return Err(StoreError::NotFound);
+        }
+        let n = (last - first + 1) as usize;
+        let mut loc = vec![0u8; n * LOC_SLOT as usize];
+        self.loc
+            .read_at(FILE_HEADER_LEN as u64 + (first - 1) * LOC_SLOT, &mut loc)?;
+        let mut n_ins = Vec::with_capacity(n);
+        let mut total = 0u64;
+        for chunk in loc.chunks_exact(LOC_SLOT as usize) {
+            let n_in = u16::from_le_bytes([chunk[0], chunk[1]]);
+            n_ins.push(n_in);
+            total = total.saturating_add(u64::from(n_in));
+        }
+        let abs = self.body_abs(first)?;
+        let mut body = vec![0u8; total as usize * REC_LEN as usize];
+        if total > 0 {
+            self.body.read_at(abs, &mut body)?;
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut off = 0usize;
+        for n_in in n_ins {
+            if n_in == 0 {
+                out.push(None);
+                continue;
+            }
+            let len = n_in as usize * REC_LEN as usize;
+            let slice = &body[off..off + len];
+            let mut edges = Vec::with_capacity(n_in as usize);
+            for rec in slice.chunks_exact(REC_LEN as usize) {
+                let mut b = [0u8; REC_LEN as usize];
+                b.copy_from_slice(rec);
+                edges.push(InputEdge::unpack(b)?);
+            }
+            off += len;
+            out.push(Some(edges));
+        }
+        Ok(out)
+    }
+
     /// Parent edges in vin order. `None` when unstamped.
     pub fn edges(&self, fk: Fk) -> Result<Option<Vec<InputEdge>>, StoreError> {
         let Some(n) = self.n_in(fk)? else {
@@ -208,11 +259,6 @@ impl Input {
         }
         self.body_end.store(body_at, Ordering::Release);
         self.count.store(base + txs.len() as u64, Ordering::Release);
-        let last = Fk(base + txs.len() as u64);
-        let wrote = self.edges(last)?.map(|v| v.len()).unwrap_or(0);
-        if wrote != txs.last().map(|e| e.len()).unwrap_or(0) {
-            return Err(StoreError::Corrupt("invariant: input n_in"));
-        }
         Ok(())
     }
 
@@ -448,6 +494,49 @@ mod tests {
         assert_eq!(t.count(), 2049);
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
         assert_eq!(t.n_in(Fk(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn edges_span_bounds_and_mid_create() {
+        let dir = TempDir::labeled("input-span-bounds").unwrap();
+        let t = Input::create(dir.path()).unwrap();
+        t.append(&[
+            vec![edge(1, 0)],
+            vec![edge(4, 1), edge(4, 2)],
+            vec![edge(7, 3)],
+        ])
+        .unwrap();
+        assert!(matches!(t.edges_span(0, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.edges_span(3, 1), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.edges_span(1, 4), Err(StoreError::NotFound)));
+        assert_eq!(
+            t.edges_span(2, 2).unwrap(),
+            vec![Some(vec![edge(4, 1), edge(4, 2)])]
+        );
+        assert_eq!(
+            t.edges_span(1, 2).unwrap(),
+            vec![Some(vec![edge(1, 0)]), Some(vec![edge(4, 1), edge(4, 2)]),]
+        );
+    }
+
+    #[test]
+    fn input_append_reopen_reads_last_edges() {
+        let dir = TempDir::labeled("input-reopen-last").unwrap();
+        let t = Input::create(dir.path()).unwrap();
+        let mut batch = Vec::with_capacity(1025);
+        for i in 0..1024u32 {
+            batch.push(vec![edge(1, i)]);
+        }
+        batch.push(vec![edge(9, 3), edge(9, 4)]);
+        t.append(&batch).unwrap();
+        drop(t);
+        let t = Input::open(dir.path()).unwrap();
+        assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(2));
+        assert_eq!(
+            t.edges(Fk(1025)).unwrap().unwrap(),
+            vec![edge(9, 3), edge(9, 4)]
+        );
+        assert_eq!(t.edges(Fk(1)).unwrap().unwrap(), vec![edge(1, 0)]);
     }
 
     #[test]

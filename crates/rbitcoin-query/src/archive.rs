@@ -771,6 +771,7 @@ fn prevout_value(
             }
             return Ok(val as u64);
         }
+        return Err(StoreError::Corrupt("txstat parent not pinned"));
     }
     let o = query.tx_output_at_fk(inp.create_fk, inp.prev_index)?;
     if o.value < 0 {
@@ -1151,9 +1152,12 @@ impl Query {
             ));
         }
         if self.prune_seqsigwit() {
-            let ins: Vec<Vec<rbitcoin_store::InputRecord>> =
-                plan.packed.iter().map(|(_, v)| v.clone()).collect();
-            self.note_appended_seqsigwit_inputs(&got_tx_fks, &ins);
+            let ins: Vec<Vec<rbitcoin_store::InputRecord>> = plan
+                .packed
+                .iter_mut()
+                .map(|(_, v)| std::mem::take(v))
+                .collect();
+            self.note_appended_seqsigwit_inputs(&got_tx_fks, ins);
         }
         for ((pin, _), pair) in plan.packed.iter().zip(loc.iter()) {
             pin.set_loc(*pair);
