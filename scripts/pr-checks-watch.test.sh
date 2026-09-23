@@ -24,7 +24,7 @@ windows_red_coverage_pending="$(
   printf '%s\t%s\t%s\t%s\n' \
     windows fail 1m4s https://example/windows \
     coverage pending 0 https://example/coverage \
-    fmt pass 18s https://example/fmt
+    qc pass 18s https://example/qc
 )"
 
 rc=0
@@ -37,16 +37,11 @@ assert_ok "windows fail prints start-the-fix with job URL" \
 
 all_green="$(
   printf '%s\t%s\t%s\n' \
-    fmt pass 18s \
-    deny pass 16s \
-    clippy pass 38s \
-    ast-grep pass 13s \
+    qc pass 2m \
     test pass 2m \
     windows pass 1m \
     macos pass 50s \
     coverage pass 2m \
-    nixos-module-eval pass 32s \
-    scripts pass 20s \
     'mutants (1/4)' pass 2m \
     'mutants (2/4)' pass 2m \
     'mutants (3/4)' pass 2m \
@@ -59,16 +54,11 @@ assert_ok "green line is printed" grep -q "required jobs green" <<<"$out"
 
 analyze_pending_windows_green="$(
   printf '%s\t%s\t%s\n' \
-    fmt pass 18s \
-    deny pass 16s \
-    clippy pass 38s \
-    ast-grep pass 13s \
+    qc pass 2m \
     test pass 2m \
     windows pass 1m \
     macos pass 50s \
     coverage pass 2m \
-    nixos-module-eval pass 32s \
-    scripts pass 20s \
     'mutants (1/4)' pass 2m \
     'mutants (2/4)' pass 2m \
     'mutants (3/4)' pass 2m \
@@ -81,7 +71,7 @@ assert_ok "non-required Analyze pending does not block green" test "$rc" -eq 0
 
 required_pending="$(
   printf '%s\t%s\t%s\n' \
-    fmt pass 18s \
+    qc pass 18s \
     windows pending 0
 )"
 rc=0
@@ -90,8 +80,7 @@ assert_ok "required pending with --once exits 2" test "$rc" -eq 2
 
 incomplete="$(
   printf '%s\t%s\t%s\n' \
-    fmt pass 18s \
-    deny pass 16s
+    qc pass 18s
 )"
 rc=0
 out="$(CI_PR_CHECKS_TEXT="$incomplete" "$RUN" --once 2>&1)" || rc=$?
