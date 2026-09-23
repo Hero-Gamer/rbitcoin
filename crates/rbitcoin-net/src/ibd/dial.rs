@@ -148,7 +148,10 @@ pub(crate) fn relative_slow_with_hysteresis(
 }
 
 /// Build mature relative-slow samples from live slots (`active_ms` floor).
-pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSlowSample> {
+pub(crate) fn mature_relative_slow_samples(
+    slots: &[PeerSlot],
+    now_ms: u64,
+) -> Vec<RelativeSlowSample> {
     let mut out = Vec::new();
     for s in slots {
         if !s.alive {
@@ -157,7 +160,7 @@ pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSl
         if s.rate.active_ms < RELSLOW_ACTIVE_MS {
             continue;
         }
-        let Some(bps) = s.rate.bps() else {
+        let Some(bps) = s.rate.eviction_bps(now_ms) else {
             continue;
         };
         if bps == 0 {
@@ -592,12 +595,12 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     }
     let alive = slots.iter().filter(|s| s.alive).count();
     let min_samples = relative_slow_min_samples(alive);
-    let samples = mature_relative_slow_samples(slots);
+    let now_ms = ibd_mono_ms();
+    let samples = mature_relative_slow_samples(slots, now_ms);
     if samples.len() < min_samples {
         *suspect = None;
         return;
     }
-    let now_ms = ibd_mono_ms();
     let (kick, next_suspect) =
         relative_slow_with_hysteresis(&samples, min_samples, now_ms, *suspect, *last_kick_ms);
     *suspect = next_suspect;
@@ -1159,7 +1162,7 @@ mod tests {
             s.rate.sample(5_000, 50_000_000, true);
             s
         };
-        let samples = mature_relative_slow_samples(&[dead, young]);
+        let samples = mature_relative_slow_samples(&[dead, young], RELSLOW_ACTIVE_MS);
         assert!(samples.iter().all(|s| s.peer_id != 0 && s.peer_id != 2));
 
         assert_eq!(global_first_block_ms(&[]), 0);
@@ -1231,9 +1234,39 @@ mod tests {
             .sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 10_000, true);
         mature.in_flight.insert(h);
 
-        let samples = mature_relative_slow_samples(&[young, mature]);
+        let samples = mature_relative_slow_samples(&[young, mature], RELSLOW_ACTIVE_MS);
         assert!(samples.iter().all(|s| s.peer_id != 0));
         assert!(samples.iter().any(|s| s.peer_id == 1));
+    }
+
+    /// Frozen high EWMAs from peers that stopped sending must not make a
+    /// peer that just delivered the relative-slow outlier.
+    #[test]
+    fn stale_high_rates_do_not_evict_a_peer_that_just_sent() {
+        let now = 90_000u64;
+        let quiet_at = 30_000u64;
+        let h = BlockHash::from_byte_array([0x61; 32]);
+        let mut slots = Vec::new();
+        for i in 0..6u8 {
+            let mut s = dummy_slot(i as usize, addr(i), true);
+            s.rate.sample(0, 0, true);
+            // ~1 MB/s EWMA, last rx 60s ago, nothing in flight.
+            s.rate.sample(quiet_at, 45_000_000, true);
+            s.rate.note_rx(quiet_at);
+            slots.push(s);
+        }
+        for i in 6..12u8 {
+            let mut s = dummy_slot(i as usize, addr(i), true);
+            s.rate.sample(0, 0, true);
+            // ~100 KB/s, bytes just arrived, still holding getdata.
+            s.rate.sample(quiet_at, 4_500_000, true);
+            s.rate.note_rx(now);
+            s.in_flight.insert(h);
+            slots.push(s);
+        }
+        let samples = mature_relative_slow_samples(&slots, now);
+        let pick = relative_slow_pick(&samples, relative_slow_min_samples(slots.len()));
+        assert_eq!(pick, None, "samples={samples:?}");
     }
 
     #[test]

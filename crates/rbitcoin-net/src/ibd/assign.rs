@@ -901,7 +901,7 @@ pub(crate) fn tip_hole_owner_to_drop(
             let s = slots.iter().find(|s| s.id == id && s.alive)?;
             Some(RelativeSlowSample {
                 peer_id: id,
-                bps: s.rate.bps().unwrap_or(0),
+                bps: s.rate.eviction_bps(now_ms).unwrap_or(0),
                 has_inflight: true,
             })
         })

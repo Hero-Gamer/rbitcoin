@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **IBD eviction ages a peer's saved speed:** a quiet in-flight gap no
+  longer rewrites the transfer EWMA. Relative-slow and tip-hole eviction
+  score `ewma * 15s / (15s + age)` from the last qualifying rx, so a
+  frozen high rate cannot hold the median up while peers that are still
+  delivering get disconnected.
+
 - **Store I/O lifetimes:** `push_pread` / `push_pwrite` are `unsafe` and
   require the buffer to stay live until the completion is harvested.
   `HeadDrainHandle` borrows the store until join. An `io_uring` enter

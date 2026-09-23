@@ -17,8 +17,9 @@ pub(crate) const PROGRESS_STEP: u64 = 64 * 1024;
 /// the byte cursor so it does not dilute the rate. `progress_ms` is last qualifying
 /// rx (stream ≥ [`PROGRESS_STEP`] or event-path `note_rx`); `work_started_ms` is the
 /// last empty→nonempty getdata. Stall is `now - max(progress, work_started) > stall`
-/// while inflight. Ranking, relative-slow, densify caps, and AddrMan FAST/SLOW
-/// all read [`Self::bps`].
+/// while inflight. A quiet in-flight gap does not rewrite the EWMA. Ranking,
+/// densify caps, and AddrMan FAST/SLOW read [`Self::bps`]. Eviction reads
+/// [`Self::eviction_bps`], which folds silence in as zero throughput.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PeerRate {
     ewma: u64,
@@ -52,6 +53,13 @@ impl PeerRate {
             return;
         }
         let delta = bytes_total.saturating_sub(self.last_bytes);
+        if delta == 0 {
+            // Silence is not a new transfer rate. Eviction applies the age.
+            self.active_ms = self.active_ms.saturating_add(dt);
+            self.last_bytes = bytes_total;
+            self.last_ms = Some(now_ms);
+            return;
+        }
         let inst = delta.saturating_mul(1000) / dt;
         let den = TAU_MS.saturating_add(dt);
         self.ewma = self
@@ -81,6 +89,22 @@ impl PeerRate {
         } else {
             None
         }
+    }
+
+    /// Speed for an eviction decision.
+    ///
+    /// [`Self::bps`] stays at the last real transfer rate, including while the
+    /// peer is idle, so a frozen high sample is not proof the peer is fast
+    /// now. Silence since the last qualifying rx counts as zero throughput:
+    /// `ewma * TAU / (TAU + age)`.
+    pub(crate) fn eviction_bps(&self, now_ms: u64) -> Option<u64> {
+        let bps = self.bps()?;
+        let last = self.progress_ms;
+        if last == 0 || now_ms <= last {
+            return Some(bps);
+        }
+        let age = now_ms - last;
+        Some(bps.saturating_mul(TAU_MS) / TAU_MS.saturating_add(age))
     }
 
     pub(crate) fn stalled(&self, now_ms: u64, stall_ms: u64, inflight: bool) -> bool {
@@ -120,14 +144,20 @@ mod tests {
     }
 
     #[test]
-    fn active_zero_delta_decays_ewma() {
+    fn silence_keeps_saved_bps_and_eviction_scales_with_age() {
         let mut r = PeerRate::default();
         r.sample(0, 0, true);
         r.sample(5_000, 5_000_000, true);
-        let high = r.bps().expect("mature");
+        let saved = r.bps().expect("mature");
+        // In-flight gaps must not rewrite the saved transfer rate.
         r.sample(10_000, 5_000_000, true);
         r.sample(15_000, 5_000_000, true);
-        assert!(r.bps().unwrap() < high);
+        assert_eq!(r.bps(), Some(saved));
+        // Last qualifying rx is the byte sample at 5s. Eviction folds silence
+        // in as zero throughput: age == TAU → half, age == 3*TAU → quarter.
+        assert_eq!(r.eviction_bps(5_000), Some(saved));
+        assert_eq!(r.eviction_bps(5_000 + TAU_MS), Some(saved / 2));
+        assert_eq!(r.eviction_bps(5_000 + 3 * TAU_MS), Some(saved / 4));
     }
 
     #[test]
