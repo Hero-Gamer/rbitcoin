@@ -5,6 +5,7 @@
 
 use rbitcoin_store::StoreError;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -54,14 +55,17 @@ fn recv_job(jobs: &Mutex<VecDeque<Job>>, cv: &Condvar) -> Job {
 
 type HeadInsert = ([u8; 32], rbitcoin_primitives::Fk);
 
-pub(crate) struct HeadDrainHandle {
+pub(crate) struct HeadDrainHandle<'a> {
     rx: Option<Receiver<Result<u64, StoreError>>>,
     restore: Option<Arc<Mutex<Option<Vec<HeadInsert>>>>>,
+    /// The insert job's raw store pointer is only sound while this borrow
+    /// is live. [`Drop`] joins. Do not `mem::forget` the handle.
+    _store: PhantomData<&'a rbitcoin_store::Store>,
     #[cfg(test)]
     named: Arc<Mutex<Option<(ThreadId, String)>>>,
 }
 
-impl HeadDrainHandle {
+impl HeadDrainHandle<'_> {
     /// Join and, on insert failure, return the batch so the write thread can
     /// put it back on pending-head (no clone on the success path).
     pub(crate) fn join_restore(mut self) -> (Result<u64, StoreError>, Vec<HeadInsert>) {
@@ -97,7 +101,7 @@ impl HeadDrainHandle {
     }
 }
 
-impl Drop for HeadDrainHandle {
+impl Drop for HeadDrainHandle<'_> {
     fn drop(&mut self) {
         if self.rx.is_some() {
             let _ = self.recv_result();
@@ -107,7 +111,7 @@ impl Drop for HeadDrainHandle {
 
 /// Run `work` on [`HEAD_DRAIN_THREAD_NAME`]. Caller must join before captured
 /// store pointers go out of scope.
-pub(crate) fn submit_head_drain<F>(work: F) -> HeadDrainHandle
+pub(crate) fn submit_head_drain<F>(work: F) -> HeadDrainHandle<'static>
 where
     F: FnOnce() -> Result<u64, StoreError> + Send + 'static,
 {
@@ -139,6 +143,7 @@ where
     HeadDrainHandle {
         rx: Some(rx),
         restore: None,
+        _store: PhantomData,
         #[cfg(test)]
         named,
     }
@@ -150,7 +155,8 @@ impl SendStorePtr {
         Self(store as *const rbitcoin_store::Store as usize)
     }
     fn insert(self, batch: &[([u8; 32], rbitcoin_primitives::Fk)]) -> Result<u64, StoreError> {
-        // SAFETY: confirm write still borrows `Store` until the drain handle joins.
+        // SAFETY: `HeadDrainHandle` borrows `Store` until join. The handle's
+        // `Drop` waits for this insert. Do not `mem::forget` the handle.
         unsafe {
             (*(self.0 as *const rbitcoin_store::Store))
                 .txs
@@ -160,10 +166,10 @@ impl SendStorePtr {
 }
 
 /// Insert a taken pending-head batch on [`HEAD_DRAIN_THREAD_NAME`].
-pub(crate) fn submit_head_insert(
-    store: &rbitcoin_store::Store,
+pub(crate) fn submit_head_insert<'a>(
+    store: &'a rbitcoin_store::Store,
     batch: Vec<([u8; 32], rbitcoin_primitives::Fk)>,
-) -> HeadDrainHandle {
+) -> HeadDrainHandle<'a> {
     let ptr = SendStorePtr::from_store(store);
     let restore = Arc::new(Mutex::new(None));
     let restore_job = Arc::clone(&restore);

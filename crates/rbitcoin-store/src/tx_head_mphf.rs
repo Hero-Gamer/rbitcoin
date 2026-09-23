@@ -286,9 +286,8 @@ mod tests {
             session.epoch(),
             0,
         );
-        session
-            .push_pread(leftover_fd, 0, &mut leftover_buf, ud)
-            .unwrap();
+        // SAFETY: `leftover_buf` lives until this session drains.
+        unsafe { session.push_pread(leftover_fd, 0, &mut leftover_buf, ud) }.unwrap();
         session.submit().unwrap();
         assert!(
             session.in_flight() > 0,

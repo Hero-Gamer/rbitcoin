@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **Store I/O lifetimes:** `push_pread` / `push_pwrite` are `unsafe` and
+  require the buffer to stay live until the completion is harvested.
+  `HeadDrainHandle` borrows the store until join. An `io_uring` enter
+  failure with completions still in flight aborts, matching the drain
+  hard cap, instead of returning into a buffer free.
+
 - **Mempool script skip requires the wtxid:** a block transaction is not
   treated as already checked just because its txid is in the mempool.
   A script job whose prevout count does not match its inputs fails closed.
