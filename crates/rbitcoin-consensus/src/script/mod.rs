@@ -185,6 +185,11 @@ fn verify_native_witness<'a>(
     if !tx.input[input_index].script_sig.is_empty() {
         return Err(ConsensusError::Script("WITNESS_MALLEATED".into()));
     }
+    // Core runs the scriptPubKey first. A false program is EVAL_FALSE for every
+    // version, including unknown ones, before anyone-can-spend success.
+    if !interpreter::cast_to_bool(program) {
+        return Err(ConsensusError::Script("EVAL_FALSE".into()));
+    }
     match (version, program.len()) {
         (0, 20) => p2wpkh::verify(job, input_index, tx, pre),
         (0, 32) => p2wsh::verify(job, input_index, tx),
@@ -655,6 +660,72 @@ mod verify_routing_tests {
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
+    fn witness_job(spk: Vec<u8>, script_sig: Vec<u8>, witness: Vec<Vec<u8>>) -> ScriptCheckJob {
+        let refs: Vec<&[u8]> = witness.iter().map(|v| v.as_slice()).collect();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::from_slice(&refs),
+            }],
+            output: vec![],
+        };
+        ScriptCheckJob {
+            txid: [0u8; 32],
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            tx: crate::block::JobTx::owned(tx),
+            flags: crate::block::ScriptVerifyFlags {
+                bip65_active: true,
+                bip112_active: true,
+                bip66_active: true,
+                bip16_active: true,
+                taproot_active: true,
+                minimal_if: false,
+                nullfail: false,
+                low_s: false,
+                strictenc: false,
+                null_dummy: false,
+                minimal_data: false,
+                witness_pubkeytype: false,
+                witness_active: true,
+                discourage_upgradable_witness: false,
+                const_scriptcode: false,
+            },
+            pre: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn false_witness_program_is_eval_false() {
+        let native = witness_job(vec![0x52, 0x02, 0x00, 0x00], vec![], vec![]);
+        let err = verify_job_all_inputs(&native).expect_err("zero program");
+        assert!(format!("{err}").contains("EVAL_FALSE"), "{err}");
+
+        let neg = witness_job(vec![0x60, 0x03, 0x00, 0x00, 0x80], vec![], vec![]);
+        let err = verify_job_all_inputs(&neg).expect_err("negative zero");
+        assert!(format!("{err}").contains("EVAL_FALSE"), "{err}");
+
+        let live = witness_job(vec![0x52, 0x02, 0x00, 0x01], vec![], vec![]);
+        verify_job_all_inputs(&live).expect("nonzero unknown version");
+
+        let redeem = vec![0x52, 0x02, 0x00, 0x00];
+        let hash = super::crypto::hash160(&redeem);
+        let mut spk = vec![0xa9, 0x14];
+        spk.extend_from_slice(hash.as_slice());
+        spk.push(0x87);
+        let mut script_sig = vec![redeem.len() as u8];
+        script_sig.extend_from_slice(&redeem);
+        let nested = witness_job(spk, script_sig, vec![]);
+        let err = verify_job_all_inputs(&nested).expect_err("p2sh zero program");
+        assert!(format!("{err}").contains("EVAL_FALSE"), "{err}");
+    }
+
     #[test]
     fn prevout_count_must_match_inputs() {
         let tx = Transaction {
@@ -879,7 +950,8 @@ mod verify_routing_tests {
     #[test]
     fn taproot_inactive_is_anyone_can_spend() {
         let mut spk = vec![0x51, 0x20];
-        spk.extend([0u8; 32]);
+        spk.extend([0u8; 31]);
+        spk.push(1);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![TxOut {

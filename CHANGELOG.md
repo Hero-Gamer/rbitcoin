@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Tapleaf `0x50` and a false witness program:** a future leaf whose
+  version byte is the annex prefix commits and is not executed. An
+  all-zero or negative-zero witness program fails before anyone-can-spend
+  success, including inside P2SH. Tapscript still runs.
 - **Corrupt store lengths:** a uleb128 payload wider than one bit at
   shift 63 is overflow. A seqsigwit script or witness length that does
   not fit the buffer is `Corrupt`, not a capacity panic. A BDZ file with

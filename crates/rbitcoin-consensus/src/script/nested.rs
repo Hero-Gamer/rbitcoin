@@ -56,6 +56,9 @@ pub(crate) fn try_p2sh_nested_segwit(
     {
         return Some(Err(e));
     }
+    if !interpreter::cast_to_bool(program) {
+        return Some(Err(ConsensusError::Script("EVAL_FALSE".into())));
+    }
 
     Some(match (version, program.len()) {
         (0, 20) => {

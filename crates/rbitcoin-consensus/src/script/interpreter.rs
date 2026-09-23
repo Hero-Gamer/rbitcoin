@@ -1477,7 +1477,7 @@ fn require_n(stack: &[Vec<u8>], n: usize) -> Result<(), ConsensusError> {
     Ok(())
 }
 
-fn cast_to_bool(v: &[u8]) -> bool {
+pub(crate) fn cast_to_bool(v: &[u8]) -> bool {
     for (i, &b) in v.iter().enumerate() {
         if b != 0 {
             // Negative zero
