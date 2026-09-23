@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **P2PKH policy flags, RPC token, and inv cap:** `LOW_S`, `STRICTENC`,
+  and `NULLFAIL` on a P2PKH input use the generic interpreter. The RPC
+  token compare does not stop at the first differing byte, and a new
+  token file is created mode 0600. `inv` / `getdata` / `notfound` counts
+  above 50,000 fail decode. Peer command text in a log line cannot
+  insert a raw newline.
 - **Tip-accept lifetime:** the async accept job is `'static` and holds an
   `Arc` of the hub. Dropping a peer session does not free that hub under
   the job. Shutdown waits for the lane to go idle before the store flush.

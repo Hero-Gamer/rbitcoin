@@ -18,8 +18,22 @@ impl RpcAuth {
     }
 
     pub fn matches_token(&self, token: &str) -> bool {
-        self.token == token
+        ct_eq(self.token.as_bytes(), token.as_bytes())
     }
+}
+
+/// Compare two byte strings without returning on the first mismatch.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let n = a.len().max(b.len());
+    let mut i = 0;
+    while i < n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+        i += 1;
+    }
+    diff == 0
 }
 
 pub fn default_token_path(datadir: &Path) -> PathBuf {
@@ -61,12 +75,14 @@ pub fn write_token_file(path: &Path) -> Result<RpcAuth, String> {
         fs::create_dir_all(parent).map_err(|e| format!("token parent: {e}"))?;
     }
     let auth = RpcAuth::new(random_token());
-    let mut f = fs::File::create(path).map_err(|e| format!("token create: {e}"))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut f = opts.open(path).map_err(|e| format!("token create: {e}"))?;
     f.write_all(auth.token.as_bytes())
         .map_err(|e| format!("token write: {e}"))?;
     f.sync_all().map_err(|e| format!("token sync: {e}"))?;
@@ -158,6 +174,13 @@ mod tests {
         let a = RpcAuth::new("s3cret");
         assert!(a.matches_token("s3cret"));
         assert!(!a.matches_token("nope"));
+        assert!(a.matches_token("s3cret"));
+        let mut one_bit = a.token.clone().into_bytes();
+        one_bit[0] ^= 0x01;
+        let one_bit = String::from_utf8(one_bit).unwrap();
+        assert!(!a.matches_token(&one_bit));
+        assert!(ct_eq(b"s3cret", b"s3cret"));
+        assert!(!ct_eq(b"s3cret", one_bit.as_bytes()));
         assert_eq!(
             default_socket_path(Path::new("/d")),
             PathBuf::from("/d/rpc.sock")
@@ -175,6 +198,19 @@ mod tests {
         let path = dir.join("rpc.token");
         fs::write(&path, "  \n").unwrap();
         assert!(read_token_file(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rpc.token");
+        let _ = write_token_file(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "token file mode {mode:o}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -318,7 +318,15 @@ pub fn ping_prior_to_verack_log(peer: u64) -> String {
 }
 
 pub fn unsupported_before_verack_log(cmd: &str, peer: u64) -> String {
+    let cmd = peer_log_text(cmd);
     format!("p2p: Unsupported message \"{cmd}\" prior to verack from peer={peer}")
+}
+
+/// One log line: peer-controlled bytes cannot insert a raw newline.
+fn peer_log_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
 }
 
 /// Disconnect peers advertising protocol version below this.
@@ -382,7 +390,24 @@ pub fn hidden_addr_from() -> Address {
 }
 
 pub fn non_version_before_handshake_log(cmd: &str, peer: u64) -> String {
+    let cmd = peer_log_text(cmd);
     format!("p2p: non-version message before version handshake. Message \"{cmd}\" from peer={peer}")
+}
+
+#[cfg(test)]
+mod log_text_tests {
+    use super::non_version_before_handshake_log;
+    use super::unsupported_before_verack_log;
+
+    #[test]
+    fn peer_command_logs_have_no_raw_newline() {
+        let line = non_version_before_handshake_log("inv\nX", 7);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(!line.contains('\r'), "{line:?}");
+        let line = unsupported_before_verack_log("ping\r\n", 3);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(!line.contains('\r'), "{line:?}");
+    }
 }
 
 /// Tip age in blocks: `(now - tip_time) / pow_target_spacing`.
@@ -2611,9 +2636,13 @@ async fn serve_getdata(
     session: Option<&crate::peers::LivePeer>,
     inv: &[Inventory],
 ) -> Result<(), NetError> {
+    if inv.len() > MAX_INV_SIZE {
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     let inflight = session.map(|s| &s.serve_inflight);
     let mut notfound: Vec<Inventory> = Vec::new();
-    for item in inv.iter().take(MAX_INV_SIZE) {
+    for item in inv {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 serve_getdata_full_block(hub, out_tx, inflight, h).await?;
@@ -2807,6 +2836,10 @@ fn on_inv(
     session: Option<&crate::peers::LivePeer>,
     items: &[Inventory],
 ) -> Result<(), NetError> {
+    if items.len() > MAX_INV_SIZE {
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     let mut want = Vec::new();
     let mut inv_tx_n = 0u64;
     let mut need_headers = false;
@@ -2814,7 +2847,7 @@ fn on_inv(
     let relay = !hub.in_ibd()
         && (hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
             || session.is_some_and(|s| s.session_relay_perm()));
-    for item in items.iter().take(MAX_INV_SIZE) {
+    for item in items {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {

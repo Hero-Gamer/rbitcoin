@@ -130,6 +130,11 @@ pub(crate) fn verify_input<'a>(
 
     match kind {
         ScriptKind::P2pkh => {
+            // LOW_S / STRICTENC / NULLFAIL are interpreter policy. The fast path
+            // does not apply them, so those jobs use the generic interpreter.
+            if job.low_s || job.strictenc || job.nullfail {
+                return verify_bare(job, input_index, tx, prevout);
+            }
             // Fast path: exact `<sig> <pubkey>` scriptSig. Historical mainnet has
             // non-standard P2PKH scriptSigs that still leave a valid stack for
             // scriptPubKey (e.g. height 218596: "p2pkh scriptSig len"). Fall back
