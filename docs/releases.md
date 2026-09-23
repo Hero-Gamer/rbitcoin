@@ -48,7 +48,7 @@ published release notes. Unreleased notes are one file per pull under
 [`changelog.d/`](../changelog.d/), so two open branches never insert at the
 same line.
 
-`changelog.d/<topic>.md` (not `README.md`):
+`changelog.d/<topic>.md` (not `README.md` or `thanks.md`):
 
 ```markdown
 Fixed
@@ -59,6 +59,8 @@ Fixed
 The first non-empty line is the category: `Added`, `Changed`, `Deprecated`,
 `Removed`, `Fixed`, or `Security`. The rest is the Keep a Changelog bullets.
 One fragment per pull. A stack adds one file on each branch.
+`thanks.md` is not a category fragment. It is the one-shot GitHub Release
+thanks, folded into `### Thanks` and deleted by the same cut.
 
 `./scripts/release-cut.sh --minor`, `--major`, and `--patch` fold every
 fragment into `## [Unreleased]` under the matching `###` heading, delete
@@ -162,9 +164,11 @@ From current `origin/master` at `X.Y.99`:
 
 1. Worktree `release/X.(Y+1).0`. `./scripts/release-cut.sh --minor`.
 2. Write **`### Highlights`** (brief, operator-facing; at most ten bullets).
-   `release-notes.sh` appends **`### Thanks`**: `@otaliptus` for the security
-   review, plus every other commit author since the previous tag except
-   `reardencode` and `rearden-grok[bot]`. Edit narrative
+   `release-notes.sh` adds **`### Thanks`** only when this version's
+   changelog has that section, or when a commit since the previous tag
+   is by someone other than `reardencode` and `rearden-grok[bot]`.
+   `changelog.d/thanks.md` is one release: the cut folds it into
+   `### Thanks` and deletes it. Edit narrative
    banners to the new **X.(Y+1).0** (and that `vX.(Y+1).x` will be the
    patch line). Keep the detailed Unreleased body under the new heading.
 3. `./scripts/release-gate.sh` and `./scripts/release-notes.sh` must

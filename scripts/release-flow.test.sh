@@ -200,8 +200,8 @@ GIT_COMMITTER_EMAIL='freedom@reardencode.com' \
 out="$(bash "$NOTES" --root "$MINOR")"
 assert_ok "release-notes include Highlights bullet" \
   grep -q 'operator-facing ship note' <<<"$out"
-assert_ok "release-notes thank @otaliptus" \
-  grep -q '@otaliptus' <<<"$out"
+assert_ok "release-notes without a one-shot file do not thank @otaliptus" \
+  bash -c "! grep -q '@otaliptus' <<<'$out'"
 assert_ok "release-notes thank another external login" \
   grep -q '@Hero-Gamer' <<<"$out"
 assert_ok "release-notes omit the bot and the maintainer" \
@@ -210,6 +210,25 @@ assert_ok "release-notes omit detailed Unreleased body" \
   bash -c "! grep -q 'ship this' <<<'$out'"
 assert_ok "release-notes name CHANGELOG section" \
   grep -q '## \[0.6.0\]' <<<"$out"
+
+# --- one-shot thanks is consumed by the cut ---
+ONCE="$WORKDIR/once"
+mkdir -p "$ONCE"
+seed_dev_tree "$ONCE"
+mkdir -p "$ONCE/changelog.d"
+printf '%s\n' 'Thanks to @otaliptus for the security review, and to @dergoegge, @rob1ham, and @1440000bytes for earlier findings.' \
+  >"$ONCE/changelog.d/thanks.md"
+bash "$CUT" --root "$ONCE" --minor --date 2026-09-06
+assert_ok "cut deletes changelog.d/thanks.md" \
+  bash -c '! test -e "$ONCE/changelog.d/thanks.md"'
+assert_ok "cut keeps one-shot thanks under the shipped version" \
+  grep -q '@dergoegge' "$ONCE/CHANGELOG.md"
+add_highlight "$ONCE" "- **Thing:** operator-facing ship note."
+out="$(bash "$NOTES" --root "$ONCE")"
+assert_ok "release-notes include the one-shot thanks" \
+  bash -c "grep -q '@otaliptus' <<<'$out' && grep -q '@rob1ham' <<<'$out' && grep -q '@1440000bytes' <<<'$out'"
+assert_ok "one-shot @otaliptus appears once" \
+  bash -c "[[ \$(grep -o '@otaliptus' <<<'$out' | wc -l) -eq 1 ]]"
 
 # --- cut: major 0.5.99 → 1.0.0 ---
 MAJOR="$WORKDIR/major"

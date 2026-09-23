@@ -66,6 +66,7 @@ release_login_from_email() {
 }
 
 release_thanks_sentence() {
+  local skip="${1:-}"
   local prev range line email login
   prev="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1 || true)"
   if [[ -n "$prev" ]]; then
@@ -84,7 +85,9 @@ release_thanks_sentence() {
     fi
     login="$(release_login_from_email "$email" || true)"
     [[ -n "$login" ]] || continue
-    [[ "$login" == otaliptus ]] && continue
+    if [[ -n "$skip" ]] && printf '%s' "$skip" | grep -q "@${login}"; then
+      continue
+    fi
     local seen=0 o
     for o in "${others[@]+"${others[@]}"}"; do
       [[ "$o" == "$login" ]] && seen=1
@@ -101,14 +104,35 @@ release_thanks_sentence() {
         joined="${joined}, @${o}"
       fi
     done
-    rest=" and to ${joined} for changes in this release"
+    rest="Thanks to ${joined} for changes in this release."
   fi
-  printf '%s\n' "Thanks to @otaliptus for the security review${rest}."
+  printf '%s\n' "$rest"
+}
+
+release_version_thanks() {
+  awk -v ver="$VER" '
+    $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+    grab && /^## / { exit }
+    grab && /^### Thanks[[:space:]]*$/ { insec = 1; next }
+    grab && insec && /^### / { exit }
+    insec { print }
+  ' "$ROOT/CHANGELOG.md"
 }
 
 hl="$(release_changelog_highlights "$VER" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
-thanks="$(release_thanks_sentence)"
-printf '%s\n' "rbitcoin v${VER}
+once="$(release_version_thanks | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+authors="$(release_thanks_sentence "$once" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+thanks=""
+if [[ -n "$once" && -n "$authors" ]]; then
+  thanks="${once}
+
+${authors}"
+elif [[ -n "$once" ]]; then
+  thanks="$once"
+elif [[ -n "$authors" ]]; then
+  thanks="$authors"
+fi
+note="rbitcoin v${VER}
 
 Linux **musl x86_64** is the operator binary (statically linked).
 Windows is CRT-static PE (no IoRing). Darwin aarch64 is ad-hoc
@@ -117,9 +141,14 @@ codesigned, **not notarized** (\`xattr -d com.apple.quarantine\`).
 ### Highlights
 
 ${hl}
-
+"
+if [[ -n "$thanks" ]]; then
+  note="${note}
 ### Thanks
 
 ${thanks}
-
+"
+fi
+note="${note}
 Full notes: CHANGELOG.md \`## [${VER}]\`."
+printf '%s\n' "$note"
