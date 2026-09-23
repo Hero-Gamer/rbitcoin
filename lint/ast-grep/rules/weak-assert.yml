@@ -1,0 +1,31 @@
+id: weak-assert-pattern
+language: rust
+severity: error
+message: "Non-test Rust: bare is_ok/is_err or matches!(Ok(_)|Err(_)) does not name the value"
+note: "Does not scan *tests*.rs, tests/, or benches/. Does scan #[cfg(test)] modules inside other .rs files. tip_accept.rs and script_pool.rs are excluded entirely, with no date check. This is not the mutant-killer gate."
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
+  - "**/benches/**"
+  - "**/core_vectors.rs"
+  - "**/core_bip341.rs"
+  - "**/rbitcoin-net/src/tip_accept.rs"
+  - "**/rbitcoin-consensus/src/script_pool.rs"
+rule:
+  any:
+    - pattern: assert!($A.is_err())
+    - pattern: assert!($A.is_ok())
+    - pattern: debug_assert!($A.is_err())
+    - pattern: debug_assert!($A.is_ok())
+    - pattern: assert!($A.is_err(), ..)
+    - pattern: assert!($A.is_ok(), ..)
+    - pattern: assert!(matches!($A, Err(_)))
+    - pattern: assert!(matches!($A, Ok(_)))
+    - pattern: assert!(matches!($A, Err(_)), ..)
+    - pattern: assert!(matches!($A, Ok(_)), ..)
+    - pattern: assert_eq!($A.is_err(), true)
+    - pattern: assert_eq!(true, $A.is_err())
+    - pattern: assert_eq!($A.is_ok(), true)
+    - pattern: assert_eq!(true, $A.is_ok())
+    - pattern: assert!($A.is_ok_and(..))
+    - pattern: debug_assert!($A.is_ok_and(..))

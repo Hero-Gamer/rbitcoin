@@ -8,7 +8,7 @@ use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Wtxid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
@@ -1123,6 +1123,13 @@ pub struct PeerHub {
     next_id: AtomicU64,
     live: RwLock<HashMap<u64, Arc<LivePeer>>>,
     added: Mutex<HashSet<crate::NetAddr>>,
+    /// Raw `addnode add` strings. Re-resolved on each redial so a Warnet name
+    /// that is not in DNS yet is kept.
+    manual_hosts: Mutex<HashSet<String>>,
+    /// `--connect` hostnames that are not a [`crate::NetAddr`] (clearnet DNS).
+    connect_hosts: Mutex<Vec<String>>,
+    /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
+    connect_default_port: AtomicU16,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
     /// Peers we asked to send us compact (BIP152 HB, max 3, prefer outbound).
     hb_selected: Mutex<Vec<u64>>,
@@ -1230,6 +1237,9 @@ impl PeerHub {
             next_id: AtomicU64::new(0),
             live: RwLock::new(HashMap::new()),
             added: Mutex::new(HashSet::new()),
+            manual_hosts: Mutex::new(HashSet::new()),
+            connect_hosts: Mutex::new(Vec::new()),
+            connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
             mock_now: AtomicU64::new(0),
@@ -2119,6 +2129,172 @@ impl PeerHub {
         }
     }
 
+    /// `addnode` with the operator string. IP, onion, I2P, and CJDNS parse as
+    /// [`crate::NetAddr`]. Anything else is clearnet DNS, resolved at dial.
+    /// `add` keeps the string when DNS fails so a later redial can succeed.
+    /// `onetry` fails if the name does not resolve now.
+    pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
+        self.note_default_port(default_port);
+        match cmd {
+            "onetry" => self.dial_resolved(node, PeerConnType::Manual),
+            "add" => {
+                self.manual_hosts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(node.to_string());
+                let _ = self.dial_resolved(node, PeerConnType::Manual);
+                Ok(())
+            }
+            "remove" => {
+                self.manual_hosts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(node);
+                if let Ok(target) = self.host_dial_target(node) {
+                    self.disconnect_target(&target);
+                }
+                Ok(())
+            }
+            other => Err(format!("unknown addnode command {other}")),
+        }
+    }
+
+    pub fn set_connect_hosts(&self, hosts: Vec<String>, default_port: u16) {
+        self.note_default_port(default_port);
+        *self.connect_hosts.lock().unwrap_or_else(|e| e.into_inner()) = hosts;
+    }
+
+    fn note_default_port(&self, default_port: u16) {
+        if default_port != 0 && self.connect_default_port.load(Ordering::Relaxed) == 0 {
+            self.connect_default_port
+                .store(default_port, Ordering::Relaxed);
+        }
+    }
+
+    fn default_port_opt(&self) -> Option<u16> {
+        let port = self.connect_default_port.load(Ordering::Relaxed);
+        (port != 0).then_some(port)
+    }
+
+    fn host_dial_target(&self, node: &str) -> Result<DialTarget, String> {
+        let with_port = ensure_host_port(node, self.default_port_opt())?;
+        if let Ok(net) = parse_peer_net(&with_port) {
+            return Ok(DialTarget::from_net(net));
+        }
+        let addr =
+            parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
+        Ok(DialTarget::Socket(addr))
+    }
+
+    fn dial_resolved(&self, node: &str, typ: PeerConnType) -> Result<(), String> {
+        let target = self.host_dial_target(node)?;
+        match &target {
+            DialTarget::Socket(addr) => {
+                self.added
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(crate::NetAddr::from_socket(*addr));
+            }
+            DialTarget::Domain { .. } => {
+                self.added
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(target.net_addr());
+            }
+        }
+        self.dial_target(target, typ)
+    }
+
+    fn dial_target(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
+        match target {
+            DialTarget::Socket(addr) => self.dial(addr, typ),
+            DialTarget::Domain { host, port } => self.dial_domain(host, port, typ),
+        }
+    }
+
+    fn disconnect_target(&self, target: &DialTarget) -> bool {
+        match target {
+            DialTarget::Socket(addr) => {
+                self.added
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&crate::NetAddr::from_socket(*addr));
+                self.disconnect_addr(*addr)
+            }
+            DialTarget::Domain { .. } => {
+                let net = target.net_addr();
+                self.added
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&net);
+                self.disconnect_net(net)
+            }
+        }
+    }
+
+    fn is_target_live(&self, target: &DialTarget) -> bool {
+        let peers = self.snapshot();
+        match target {
+            DialTarget::Socket(addr) => peers.iter().any(|p| p.addr == *addr),
+            DialTarget::Domain { host, port } => peers
+                .iter()
+                .any(|p| p.net.host_str() == *host && p.net.port() == *port),
+        }
+    }
+
+    fn remembered_redials(&self) -> Vec<(String, PeerConnType)> {
+        let mut out = Vec::new();
+        for host in self
+            .manual_hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            out.push((host.clone(), PeerConnType::Manual));
+        }
+        for host in self
+            .connect_hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            out.push((host.clone(), PeerConnType::OutboundFullRelay));
+        }
+        out
+    }
+
+    /// One dial per resolved endpoint in this pass. `addnode add` and
+    /// `--connect` of the same host share that dial (Manual wins). A later
+    /// pass dials again when the session is still not live. DNS lookup is
+    /// synchronous; callers on a Tokio worker use
+    /// [`Self::redial_remembered_off_runtime`].
+    pub fn redial_remembered_with(&self, resolve: impl Fn(&str) -> Result<DialTarget, String>) {
+        let mut seen = HashSet::<String>::new();
+        for (host, typ) in self.remembered_redials() {
+            let Ok(target) = resolve(&host) else {
+                continue;
+            };
+            if !seen.insert(target.to_string()) {
+                continue;
+            }
+            if self.is_target_live(&target) {
+                continue;
+            }
+            let _ = self.dial_target(target, typ);
+        }
+    }
+
+    pub fn redial_remembered(&self) {
+        self.redial_remembered_with(|node| self.host_dial_target(node));
+    }
+
+    /// `ToSocketAddrs` on the blocking pool so a slow resolver cannot stall
+    /// the Tokio worker that owns the retry interval.
+    pub async fn redial_remembered_off_runtime(self: &Arc<Self>) {
+        let peers = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || peers.redial_remembered()).await;
+    }
+
     /// Select `id` as a BIP152 high-bandwidth peer (we send them sendcmpct(1)).
     /// Evicts the oldest inbound if we already have 3; never evict the last outbound
     /// when adding an inbound.
@@ -2391,12 +2567,57 @@ pub fn parse_peer_net(s: &str) -> Result<crate::NetAddr, NetError> {
         .map_err(|_| NetError::Encode(format!("bad peer address {s}")))
 }
 
+fn ensure_host_port(node: &str, default_port: Option<u16>) -> Result<String, String> {
+    if node.parse::<SocketAddr>().is_ok() {
+        return Ok(node.to_string());
+    }
+    if let Some((host, port_s)) = node.rsplit_once(':') {
+        if !host.is_empty() && !host.starts_with('[') && port_s.parse::<u16>().is_ok() {
+            return Ok(node.to_string());
+        }
+    }
+    let port = default_port.ok_or_else(|| format!("bad peer address {node}"))?;
+    if node.is_empty() || node.contains(char::is_whitespace) {
+        return Err(format!("bad peer address {node}"));
+    }
+    Ok(format!("{node}:{port}"))
+}
+
+/// Parse `ip:port`, `[v6]:port`, `host:port`, or `host` (uses `default_port`).
+///
+/// Hostnames resolve at call time (`ToSocketAddrs`). Dual-stack names prefer
+/// IPv4 so `localhost` reaches a `127.0.0.1` listener.
+pub fn parse_peer_addr_with_port(
+    s: &str,
+    default_port: Option<u16>,
+) -> Result<SocketAddr, NetError> {
+    let bad = || NetError::Encode(format!("bad peer address {s}"));
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        let port = default_port.ok_or_else(bad)?;
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let with_port = ensure_host_port(s, default_port).map_err(|_| bad())?;
+    let addrs: Vec<SocketAddr> = with_port.to_socket_addrs().map_err(|_| bad())?.collect();
+    addrs
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first().copied())
+        .ok_or_else(bad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::p2p::address::Address;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn ver(ua: &str) -> VersionMessage {
         VersionMessage {
@@ -3125,6 +3346,91 @@ mod tests {
         let hub = PeerHub::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         assert!(hub.addnode(a, "nope").is_err());
+    }
+
+    fn take_dials(rx: &mut mpsc::UnboundedReceiver<DialRequest>) -> Vec<DialRequest> {
+        let mut out = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            out.push(req);
+        }
+        out
+    }
+
+    #[test]
+    fn parse_peer_addr_localhost_and_default_port() {
+        let with_port = parse_peer_addr_with_port("localhost:18444", None).expect("localhost:port");
+        assert!(with_port.is_ipv4());
+        assert_eq!(with_port.port(), 18444);
+        let bare = parse_peer_addr_with_port("localhost", Some(18444)).expect("localhost default");
+        assert!(bare.is_ipv4());
+        assert_eq!(bare.port(), 18444);
+        let lit = "127.0.0.1:18444".parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            parse_peer_addr_with_port("127.0.0.1:18444", None).unwrap(),
+            lit
+        );
+        assert!(parse_peer_addr_with_port("not-a-real-host.invalid", Some(18444)).is_err());
+    }
+
+    #[test]
+    fn addnode_add_keeps_unresolved_host_for_redial() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        hub.addnode_host("not-a-real-host.invalid", "add", 18444)
+            .expect("unresolved add is remembered");
+        assert!(take_dials(&mut rx).is_empty());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
+        hub.redial_remembered_with(|_| Ok(DialTarget::Socket(addr)));
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "later resolve must dial: {got:?}");
+        assert!(matches!(got[0].target, DialTarget::Socket(a) if a == addr));
+        assert!(hub
+            .addnode_host("not-a-real-host.invalid", "onetry", 18444)
+            .is_err());
+    }
+
+    #[test]
+    fn redial_same_endpoint_in_addnode_and_connect_dials_once() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        hub.addnode_host("127.0.0.1:18444", "add", 18444).unwrap();
+        assert_eq!(take_dials(&mut rx).len(), 1);
+        hub.set_connect_hosts(vec!["127.0.0.1:18444".into()], 18444);
+        hub.redial_remembered();
+        let got = take_dials(&mut rx);
+        assert_eq!(
+            got.len(),
+            1,
+            "addnode and --connect of one endpoint share one dial per pass: {got:?}"
+        );
+        assert!(matches!(got[0].typ, PeerConnType::Manual));
+    }
+
+    #[tokio::test]
+    async fn slow_redial_resolve_does_not_stall_runtime() {
+        let hub = PeerHub::new();
+        hub.set_connect_hosts(vec!["slow.example".into()], 18444);
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = Arc::clone(&flag);
+        let progress = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            flag2.store(true, Ordering::SeqCst);
+        });
+        let hub2 = Arc::clone(&hub);
+        let slow = tokio::task::spawn_blocking(move || {
+            hub2.redial_remembered_with(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Err("slow".into())
+            });
+        });
+        progress.await.unwrap();
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a blocking resolve must not stall other Tokio tasks"
+        );
+        slow.await.unwrap();
     }
 
     #[test]

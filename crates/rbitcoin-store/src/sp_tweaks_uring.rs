@@ -101,7 +101,8 @@ fn run_preads(
                 continue;
             }
             let ud = uring_session::pack_ud(kind, epoch, i as u32);
-            session.push_pread(fd, jobs[i].off, &mut jobs[i].buf, ud)?;
+            // SAFETY: `jobs[i].buf` lives until this pread wave drains.
+            unsafe { session.push_pread(fd, jobs[i].off, &mut jobs[i].buf, ud) }?;
             inflight += 1;
         }
         if n_done >= n {

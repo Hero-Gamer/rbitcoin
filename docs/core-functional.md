@@ -283,3 +283,66 @@ no `store/` (clean-chain starts stay empty).
 python3 scripts/core-functional/create_cache.py --ensure
 ./scripts/core-functional/create_cache.test.sh
 ```
+
+## Warnet lab (all-rbitcoin tanks)
+
+Not an operator musl Release. Image tag `rbitcoin-warnet:local`. Warnet
+stays Core Helm (`bitcoin.conf`, `rpcuser`/`rpcpassword`, `addnode=tank-N`,
+`pidof bitcoind`). The node is not taught Core conf; the Python shim
+translates `addnode=` to `--connect host:18444`, seeds `{datadir}/rpc.token`
+from `rpcpassword`, and binds the test proxy on `rpcbind=0.0.0.0`. Basic
+auth accepts any username whose password matches that token.
+
+Hostname `--connect` / `addnode add` resolve at each dial on a blocking
+thread and retry every 2 seconds until a live session exists. `--connect`
+does not turn DNS seeds back on. If the first catch-up accepts nothing and
+the tip is still 0, the tank enters tip-follow (16 blocks in flight, no
+return to the IBD window) so it can attach when the other tank appears.
+That is the right shape for this one-block example, not for a genesis
+mainnet sync. A non-zero tip that has not finished catch-up stays in IBD.
+Relay stays off while tip work is below `--min-chain-work`. The operator
+note is in [`OPERATOR.md`](../OPERATOR.md).
+
+### CI example (label `warnet`)
+
+Two tanks on one Docker network, not kind or Helm. Unlabeled PRs do not
+run it. `workflow_dispatch` also runs it.
+
+```bash
+cargo build -p rbitcoin-node
+./scripts/core-functional/init-submodule.sh
+./scripts/core-functional/warnet/example.sh
+```
+
+The example conf sets `head_scale=tiny` so a tank does not fallocate mainnet
+heads. `example.sh` copies a **bookworm-linked** `rbitcoin-node` into the image
+(a nix devshell binary will not exec: its dynamic loader is not in Debian).
+It starts `tank1` first (`addnode=tank0`), waits until that RPC is up at
+height 0 with no peer, then starts `tank0`, mines one regtest block, and
+waits until `tank1` matches that height with a live peer whose
+`getpeerinfo` addr is the resolved address. CI builds the binary with
+`rust:1.95.0-bookworm`.
+
+`Dockerfile.test.sh` pins the image text and does not need Docker.
+
+### Operator kind / miner_std
+
+Needs Docker + kind on an operator host. Do not open mainnet. Wallet keys
+are RAM-only.
+
+```bash
+docker build -t rbitcoin-warnet:local \
+  --build-arg NODE_BIN=target/dev/debug/rbitcoin-node \
+  -f scripts/core-functional/warnet/Dockerfile .
+kind load docker-image rbitcoin-warnet:local
+python3 -m venv .venv && source .venv/bin/activate
+pip install warnet
+warnet setup
+warnet new /tmp/rbtc-warnet
+```
+
+Three tanks, ring `addnode`, unique `rpcpassword`, `pullPolicy: Never`.
+Pass when `miner_std.py --interval=10 --mature` leaves all three
+`getblockcount` values equal and greater than 0. Fail classes: CrashLoop
+`pidof`; 401 on RPC; height only on the miner (DNS or bind); ImagePullBackOff
+without `kind load`.

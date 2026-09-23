@@ -75,7 +75,10 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 ## Push and poll
 
 Required jobs: `fmt`, `deny`, `clippy`, `ast-grep`, `test`, `windows`,
-`macos`, `coverage`, `nixos-module-eval`. Structural scan is
+`macos`, `coverage`, `nixos-module-eval`, `scripts`, and `mutants (1/4)`
+through `mutants (4/4)` (`--shard` stays 0–3). A mutants shard killed at
+30 minutes with no `MISSED` warns and passes. `MISSED` before that kill fails the shard. A
+finished non-zero `cargo mutants` exit fails. Structural scan is
 `./scripts/ast-grep.sh`. `windows` / `macos` are native store plus `--smoke`,
 not operator zips.
 
@@ -84,6 +87,9 @@ version-bump PR. Do not label ordinary net or RPC PRs.
 Label `overlay-functional` when the PR touches that harness, and on every
 ship version-bump PR. Poll with `--interest overlay-functional`. It is not
 a required check.
+Label `warnet` to run the two-tank Docker example
+([`docs/core-functional.md`](../../../docs/core-functional.md)). Not a
+required check. Do not label ordinary PRs.
 Label `nixos-module-runtime` when the NixOS module VM test should run (not
 eval). Poll with `--interest nixos-module-runtime`. It is not a required
 check.

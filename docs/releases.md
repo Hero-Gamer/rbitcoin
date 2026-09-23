@@ -103,9 +103,10 @@ Cargo.toml). Those PRs run Core functional even without a label.
 
 | Check | Who |
 |-------|-----|
-| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `coverage` `nixos-module-eval` | Every PR (`ci.yml`) |
+| `fmt` `deny` `clippy` `ast-grep` `test` `windows` `macos` `coverage` `nixos-module-eval` `scripts` `mutants (1/4)`–`(4/4)` | Every PR (`ci.yml`). A 30-minute mutants kill with no `MISSED` warns and passes. `MISSED` before that kill fails. A finished non-zero exit fails. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**, label **`release`**, **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**, label **`release`**, **or** ship version. Not required. Not in `release-extra` yet. |
+| `warnet-example` | Label **`warnet`** or `workflow_dispatch`. Two-tank Docker lab. Not required. Not a ship gate. |
 | `nixos-module-runtime` | Label **`nixos-module-runtime`**, `workflow_dispatch`, **or** GitHub Release tags (`release.yml`). Not required. |
 | `release-extra` | Every PR. **Fails** if the PR is ship and `core-functional` is not success |
 

@@ -11,6 +11,38 @@ before 1.0).
 
 ### Fixed
 
+- **Input backfill reads `seqsigwit.body` in 16 MiB spans.** Open used
+  to `pread` the locator window and the body once per create. A chunk
+  of 16384 creates now shares one locator read, and contiguous bodies
+  share one pread. A partial `input.loc` resumes that walk when the
+  next record still has an inline prevout.
+
+- **Failed connects enter the stall cooldown.** An EOF or timeout takes
+  the same strike ban as a relative-slow kick, so dead seeds stop
+  occupying the only dial slots. Relative-slow does not disconnect
+  while every address outside cooldown failed its last connect.
+
+- **IBD redial breaks an all-cooldown book:** when more peers are
+  needed and every candidate is cooling, dial the one tried least
+  recently anyway. A successful connect clears that cooldown. Never
+  tried sorts ahead of any attempt.
+
+- **IBD eviction ages a peer's saved speed:** a quiet in-flight gap no
+  longer rewrites the transfer EWMA. Relative-slow and tip-hole eviction
+  score `ewma * 15s / (15s + age)` from the last qualifying rx, so a
+  frozen high rate cannot hold the median up while peers that are still
+  delivering get disconnected.
+
+- **Store I/O lifetimes:** `push_pread` / `push_pwrite` are `unsafe` and
+  require the buffer to stay live until the completion is harvested.
+  `HeadDrainHandle` borrows the store until join. An `io_uring` enter
+  failure with completions still in flight aborts, matching the drain
+  hard cap, instead of returning into a buffer free.
+
+- **Mempool script skip requires the wtxid:** a block transaction is not
+  treated as already checked just because its txid is in the mempool.
+  A script job whose prevout count does not match its inputs fails closed.
+
 - **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
   near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the
   Sunday hour, which just clears it. A mute run still fails.
@@ -45,6 +77,18 @@ before 1.0).
   archive-only after `invalidateblock` is not already-known.
 
 ### Changed
+
+- **Hostname `--connect` / `addnode`:** clearnet names resolve at each dial
+  (`localhost` and a missing port use the network P2P default) on a blocking
+  thread, and retry until a live session exists. `--connect` does not enable
+  seed redial. If the first catch-up accepts nothing and the tip is still 0,
+  the node enters tip-follow (16 blocks in flight, no return to the IBD
+  window) so a late short-chain peer can attach. A non-zero tip stays in IBD.
+  Relay stays gated below `--min-chain-work`.
+  Label `warnet` runs a two-tank Docker example that starts the connecting
+  tank first and waits until its height matches the miner and `getpeerinfo`
+  shows the resolved address
+  ([`docs/core-functional.md`](docs/core-functional.md)).
 
 - **Tor cookie HMAC uses `hmac` 0.13 and `sha2` 0.11** (digest 0.11).
   Node `getrandom` is 0.4, matching the rest of the workspace. `bitcoin`
@@ -83,16 +127,17 @@ before 1.0).
   shard lines when each worker finishes. Previous `DONE` / 24 B `NN`
   unsorted is deleted and pass 1 restarts.
 
-- **PR cargo-mutants is 4 in-diff shards:** `ci.yml` `mutants`, after
-  fmt/clippy/test, in parallel with coverage. Advisory
-  (`continue-on-error`), not a merge gate. One 30-minute job was canceled
-  on a ~300-mutant diff (`-j 2` is about 50 minutes). Weekly 8-shard sweep
-  is unchanged.
+- **PR cargo-mutants shards are required.** A finished non-zero
+  `cargo mutants` exit fails the check. A 30-minute kill with no `MISSED`
+  in the log warns and passes. `MISSED` already in that log fails the
+  shard. Under 400 changed lines, check `mutants (1/4)` runs the whole
+  in-diff set (`--shard 0/1`) and the other three exit 0. Check names are
+  `mutants (1/4)` through `mutants (4/4)`; `--shard` stays 0–3. Weekly
+  8-shard sweep is unchanged.
 
-- **CI short gates share one runner:** `fmt` → `deny` → `ast-grep` →
-  `nixos-module-eval`. clippy, test, windows, and macos still start
-  immediately. Concurrent-job slots stay free for coverage and the PR
-  mutants shards.
+- **CI short gates start together.** `fmt`, `deny`, `ast-grep`, and
+  `nixos-module-eval` no longer wait on each other. Script self-tests run
+  beside `cargo test`, so coverage is not stuck behind them.
 
 - **Weekly cargo-mutants:** `mutants.yml` — Sunday 8-shard `--workspace`
   sweep. Must use `--workspace` (`default-members` is node). Snapshot

@@ -330,6 +330,8 @@ pub struct Query {
     uring_recover_tip: AtomicU32,
     /// Highest height whose seqsigwit was dropped (`u32::MAX` = none dropped).
     pruneheight: AtomicU32,
+    /// Highest spill height already unlinked (`u32::MAX` = none yet).
+    spill_unlinked_through: AtomicU32,
     /// Operator `--prune-seqsigwit` (advertise NETWORK_LIMITED even before a drop).
     prune_seqsigwit: AtomicBool,
     /// True while the net IBD engine is active.
@@ -442,6 +444,7 @@ impl Query {
             confirm_stats: Arc::new(ConfirmStats::default()),
             uring_recover_tip: AtomicU32::new(u32::MAX),
             pruneheight: AtomicU32::new(ph),
+            spill_unlinked_through: AtomicU32::new(u32::MAX),
             prune_seqsigwit: AtomicBool::new(prune_on),
             ibd_mode: AtomicBool::new(false),
             seqsigwit_ram_threshold_bytes: AtomicU64::new(
@@ -454,6 +457,7 @@ impl Query {
             let _ = q.ensure_height_by_hash_index(tip);
         }
         q.recover_sh_writebehind()?;
+        q.sweep_spill_at_or_below_pruneheight()?;
         Ok(q)
     }
 
@@ -546,12 +550,78 @@ impl Query {
         if height.is_some() {
             self.prune_seqsigwit.store(true, AtomicOrdering::Release);
             self.persist_pruneheight(v)?;
-            self.prune_seqsigwit_spill_below(v.saturating_add(1))?;
+            self.unlink_spill_through(v)?;
             Ok(())
         } else {
             self.prune_seqsigwit.store(false, AtomicOrdering::Release);
+            self.spill_unlinked_through
+                .store(u32::MAX, AtomicOrdering::Release);
             self.persist_pruneheight_clear()
         }
+    }
+
+    fn unlink_spill_height(&self, height: u32) -> Result<(), QueryError> {
+        let path = self.seqsigwit_spill_file(height)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(path, e)),
+        }
+    }
+
+    /// Unlink `{start}..=new_h` spill files. Heights at or below `new_h` are pruned.
+    fn unlink_spill_through(&self, new_h: u32) -> Result<(), QueryError> {
+        if new_h == u32::MAX {
+            return Ok(());
+        }
+        let last = self.spill_unlinked_through.load(AtomicOrdering::Acquire);
+        let start = if last == u32::MAX {
+            0
+        } else {
+            last.saturating_add(1)
+        };
+        if start > new_h {
+            return Ok(());
+        }
+        let mut h = start;
+        loop {
+            self.unlink_spill_height(h)?;
+            if h == new_h {
+                break;
+            }
+            h += 1;
+        }
+        self.spill_unlinked_through
+            .store(new_h, AtomicOrdering::Release);
+        Ok(())
+    }
+
+    fn sweep_spill_at_or_below_pruneheight(&self) -> Result<(), QueryError> {
+        let Some(ph) = self.pruneheight() else {
+            return Ok(());
+        };
+        let dir = self.seqsigwit_spill_dir();
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            self.spill_unlinked_through
+                .store(ph.0, AtomicOrdering::Release);
+            return Ok(());
+        };
+        for ent in rd {
+            let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
+            let path = ent.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(h) = stem.parse::<u32>() else {
+                continue;
+            };
+            if h <= ph.0 {
+                std::fs::remove_file(&path).map_err(|e| StoreError::io(path, e))?;
+            }
+        }
+        self.spill_unlinked_through
+            .store(ph.0, AtomicOrdering::Release);
+        Ok(())
     }
 
     fn persist_pruneheight(&self, v: u32) -> Result<(), QueryError> {
@@ -672,36 +742,10 @@ impl Query {
         Ok(path)
     }
 
-    fn prune_seqsigwit_spill_below(&self, min_keep_height: u32) -> Result<(), QueryError> {
-        let dir = self.seqsigwit_spill_dir();
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            return Ok(());
-        };
-        for ent in rd {
-            let ent = ent.map_err(|e| StoreError::io(&dir, e))?;
-            let path = ent.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Ok(h) = stem.parse::<u32>() else {
-                continue;
-            };
-            if h < min_keep_height {
-                let path = self.seqsigwit_spill_file(h)?;
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(StoreError::io(path, e)),
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn persist_seqsigwit_spill_height(
         &self,
         height: Height,
-        rows: &[(Fk, Vec<InputRecord>)],
+        rows: &[(Fk, &[InputRecord])],
     ) -> Result<(), QueryError> {
         let dir = self.seqsigwit_spill_dir();
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
@@ -801,11 +845,11 @@ impl Query {
         self.seqsigwit_spill_inputs_with_count(fk, input_count)
     }
 
-    pub(crate) fn note_appended_seqsigwit_inputs(&self, fks: &[Fk], ins: &[Vec<InputRecord>]) {
+    pub(crate) fn note_appended_seqsigwit_inputs(&self, fks: &[Fk], ins: Vec<Vec<InputRecord>>) {
         let mut cache = self.seqsigwit_append_cache.lock().unwrap();
-        for (fk, inputs) in fks.iter().zip(ins.iter()) {
+        for (fk, inputs) in fks.iter().zip(ins) {
             if let Some(id) = fk.get() {
-                cache.insert(id, inputs.clone());
+                cache.insert(id, inputs);
             }
         }
     }
@@ -838,9 +882,9 @@ impl Query {
         }
         drop(appended);
         self.drop_seqsigwit_ram_height(height.0);
-        let spill_rows: Vec<(Fk, Vec<InputRecord>)> = staged
+        let spill_rows: Vec<(Fk, &[InputRecord])> = staged
             .iter()
-            .map(|(fk, ins, _)| (*fk, ins.clone()))
+            .map(|(fk, ins, _)| (*fk, ins.as_slice()))
             .collect();
         self.persist_seqsigwit_spill_height(height, &spill_rows)?;
         if threshold == 0 {

@@ -139,6 +139,7 @@ fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Re
         }
         if key == "connect" && !saw_connect {
             config.listen.connect.clear();
+            config.listen.connect_dns.clear();
             saw_connect = true;
         }
         if key == "seed_node" && !saw_seednode {
@@ -958,6 +959,14 @@ mod tests {
             n.listen.connect[0],
             rbitcoin_net::NetAddr::Onion { port: 8333, .. }
         ));
+    }
+
+    #[test]
+    fn connect_bare_label_stays_config() {
+        let n = ready_config(["rbitcoin-node", "--connect", "bad"]);
+        assert_eq!(n.listen.connect_dns, vec!["bad".to_string()]);
+        assert!(n.listen.connect.is_empty());
+        assert!(operator_config_from_args(["rbitcoin-node", "--connect", "bad host"]).is_err());
     }
 
     #[test]

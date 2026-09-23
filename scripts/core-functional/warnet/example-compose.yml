@@ -1,0 +1,13 @@
+# Two regtest tanks on one Docker network. Not a kind/Helm Warnet deploy.
+# Hostnames are the service names (`addnode=tank0` → `--connect tank0:18444`).
+services:
+  tank0:
+    image: rbitcoin-warnet:local
+    hostname: tank0
+    volumes:
+      - ./example/tank0.conf:/root/.bitcoin/bitcoin.conf:ro
+  tank1:
+    image: rbitcoin-warnet:local
+    hostname: tank1
+    volumes:
+      - ./example/tank1.conf:/root/.bitcoin/bitcoin.conf:ro

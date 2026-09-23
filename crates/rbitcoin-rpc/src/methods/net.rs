@@ -178,9 +178,7 @@ pub(crate) fn addnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     let node = params.req_str(0, "node")?;
     let cmd = params.req_str(1, "command")?;
     let _v2 = params.opt_bool(2, "v2transport")?;
-    let addr = rbitcoin_net::parse_peer_net(node)
-        .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
-    hub.addnode_net(addr, cmd)
+    hub.addnode_host(node, cmd, ctx.network.default_p2p_port())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
     Ok(Value::Null)
 }

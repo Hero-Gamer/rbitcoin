@@ -330,6 +330,21 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# Warnet Helm: addnode=tank name becomes --connect host:port and seeds rpc.token.
+WN_DD="$WORKDIR/warnet-conf"
+mkdir -p "$WN_DD"
+printf 'regtest=1\nrpcuser=warnet\nrpcpassword=secret0\nrpcbind=0.0.0.0\naddnode=tank-0001\nhead_scale=tiny\nport=18444\nrpcport=18443\n' >"$WN_DD/bitcoin.conf"
+OUT_WN="$("$SHIM" --print-cmd -datadir="$WN_DD" -regtest 2>/dev/null)" || OUT_WN=""
+if printf '%s' "$OUT_WN" | grep -q -- "--connect tank-0001:18444" \
+  && printf '%s' "$OUT_WN" | grep -q -- "--head-scale tiny" \
+  && [[ "$(cat "$WN_DD/regtest/rpc.token")" == "secret0" ]]; then
+  echo "ok - addnode= becomes --connect and rpcpassword seeds rpc.token"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - warnet conf translate (got: $OUT_WN token=$(cat "$WN_DD/regtest/rpc.token" 2>/dev/null))"
+  FAIL=$((FAIL + 1))
+fi
+
 assert_fail_msg "port 65536 invalid" "Error: Invalid port specified in -port: '65536'" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=65536
 assert_fail_msg "port 0 invalid" "Error: Invalid port specified in -port: '0'" \

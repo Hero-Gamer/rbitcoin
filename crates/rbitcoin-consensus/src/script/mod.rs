@@ -49,6 +49,9 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
     // JobTx may be shared wire Arc — always take &Transaction (not &JobTx).
     let tx: &Transaction = &job.tx;
     let n = job.prevouts.len();
+    if n != tx.input.len() {
+        return Err(ConsensusError::Script("prevout count".into()));
+    }
     if n == 0 {
         return Ok(());
     }
@@ -651,6 +654,30 @@ mod verify_routing_tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    #[test]
+    fn prevout_count_must_match_inputs() {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        };
+        let job = ScriptCheckJob {
+            txid: [0u8; 32],
+            prevouts: vec![],
+            tx: crate::block::JobTx::owned(tx),
+            flags: crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
+            pre: std::sync::OnceLock::new(),
+        };
+        let err = verify_job_all_inputs(&job).expect_err("empty prevouts");
+        assert!(format!("{err}").contains("prevout count"), "{err}");
+    }
 
     #[test]
     fn empty_prevouts_and_index_errors() {

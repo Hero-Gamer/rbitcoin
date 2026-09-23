@@ -351,7 +351,7 @@ fn pread_batch_on_session_inner(
                 next as u32,
             );
             // SAFETY: caller owns each `buf` until `pread_batch` returns.
-            if session.push_pread(fd, offset, ops[next].buf, ud).is_err() {
+            if unsafe { session.push_pread(fd, offset, ops[next].buf, ud) }.is_err() {
                 if session.in_flight() == 0 {
                     let _ = session.drain_all();
                     return false;
@@ -457,7 +457,8 @@ fn pwrite_batch_on_session(
                 epoch,
                 next as u32,
             );
-            if session.push_pwrite(fd, offset, ops[next].buf, ud).is_err() {
+            // SAFETY: caller owns each `buf` until `pwrite_batch` returns.
+            if unsafe { session.push_pwrite(fd, offset, ops[next].buf, ud) }.is_err() {
                 if session.in_flight() == 0 {
                     let _ = session.drain_all();
                     return false;

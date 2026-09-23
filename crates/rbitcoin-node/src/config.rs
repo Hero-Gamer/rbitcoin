@@ -86,6 +86,8 @@ pub struct ListenOpts {
     pub electrum: Option<SocketAddr>,
     pub esplora: Option<EsploraListen>,
     pub connect: Vec<rbitcoin_net::NetAddr>,
+    /// `--connect` names that are not a `NetAddr` (clearnet DNS, Warnet tanks).
+    pub connect_dns: Vec<String>,
     pub seednodes: Vec<String>,
     pub use_seeds: bool,
     pub max_outbound: u32,
@@ -121,6 +123,7 @@ impl Default for ListenOpts {
             electrum: None,
             esplora: None,
             connect: Vec::new(),
+            connect_dns: Vec::new(),
             seednodes: Vec::new(),
             use_seeds: true,
             max_outbound: 16,
@@ -142,6 +145,10 @@ impl Default for ListenOpts {
 }
 
 impl ListenOpts {
+    pub fn has_pinned_connect(&self) -> bool {
+        !self.connect.is_empty() || !self.connect_dns.is_empty()
+    }
+
     pub fn dialer(&self) -> rbitcoin_net::Dialer {
         rbitcoin_net::Dialer::with_proxies(self.proxy, self.onion, self.proxy_randomize)
     }
@@ -814,10 +821,18 @@ impl NodeConfig {
                 );
             }
             "connect" => {
-                self.listen.connect.push(
-                    val.parse()
-                        .map_err(|e| NodeError::Config(format!("conf connect: {e}")))?,
-                );
+                push_connect(&mut self.listen, val)?;
+            }
+            "head_scale" => {
+                self.head_scale = match val {
+                    "tiny" => HeadScale::Tiny,
+                    "mainnet" => HeadScale::Mainnet,
+                    other => {
+                        return Err(NodeError::Config(format!(
+                            "conf head_scale must be tiny or mainnet, got {other}"
+                        )))
+                    }
+                };
             }
             "proxy" => {
                 self.listen.proxy = Some(parse_required_socket(val, "proxy")?);
@@ -1264,6 +1279,35 @@ pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+fn push_connect(listen: &mut ListenOpts, val: &str) -> Result<(), NodeError> {
+    let val = val.trim();
+    if val.is_empty() {
+        return Err(NodeError::Config(
+            "conf connect requires host[:port]".into(),
+        ));
+    }
+    if let Ok(addr) = val.parse::<rbitcoin_net::NetAddr>() {
+        listen.connect.push(addr);
+        return Ok(());
+    }
+    let host = match val.rsplit_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        _ => val,
+    };
+    let lower = host.to_ascii_lowercase();
+    if lower.ends_with(".onion")
+        || lower.ends_with(".b32.i2p")
+        || val.contains(char::is_whitespace)
+        || val.contains('/')
+    {
+        return Err(NodeError::Config(format!(
+            "conf connect: bad peer address {val}"
+        )));
+    }
+    listen.connect_dns.push(val.to_string());
+    Ok(())
+}
+
 impl NodeConfig {
     /// True when tip work meets `--min-chain-work` (or the flag is unset).
     pub fn meets_minimum_chain_work(&self, tip_work_be: [u8; 32]) -> bool {
@@ -1673,6 +1717,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/ip_asn.dat"))
         );
         assert_eq!(cfg.listen.connect.len(), 1);
+        assert!(cfg.listen.connect_dns.is_empty());
         assert_eq!(
             cfg.datadir.cold.as_deref(),
             Some(std::path::Path::new("/mnt/hdd/rbtc-cold"))
@@ -2127,5 +2172,31 @@ mod tests {
         let mut above = [0u8; 32];
         above[31] = 0x66;
         assert!(cfg.meets_minimum_chain_work(above));
+    }
+
+    #[test]
+    fn connect_hostname_is_dns_not_netaddr() {
+        let mut cfg = NodeConfig::default();
+        cfg.apply_kv("head_scale", "tiny").unwrap();
+        assert_eq!(cfg.head_scale, HeadScale::Tiny);
+        cfg.apply_kv("connect", "tank-0001:18444").unwrap();
+        cfg.apply_kv("connect", "bad").unwrap();
+        cfg.apply_kv("connect", "tank-0").unwrap();
+        cfg.apply_kv("connect", "127.0.0.1:18444").unwrap();
+        assert!(cfg
+            .listen
+            .connect_dns
+            .iter()
+            .any(|h| h == "tank-0001:18444"));
+        assert!(cfg.listen.connect_dns.iter().any(|h| h == "bad"));
+        assert!(cfg.listen.connect_dns.iter().any(|h| h == "tank-0"));
+        assert_eq!(cfg.listen.connect.len(), 1);
+        assert!(cfg.apply_kv("connect", "").is_err());
+        assert!(cfg
+            .apply_kv("connect", "short.onion:8333")
+            .unwrap_err()
+            .to_string()
+            .contains("bad"));
+        assert!(cfg.listen.has_pinned_connect());
     }
 }

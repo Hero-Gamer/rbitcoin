@@ -719,7 +719,8 @@ fn stream_g_pages(
                     epoch,
                     slot as u32,
                 );
-                session.push_pread_flags(fd, off, buf, ud, 0)?;
+                // SAFETY: `bufs[slot]` lives until this g-page wave drains.
+                unsafe { session.push_pread_flags(fd, off, buf, ud, 0) }?;
                 slot_page[slot] = Some(pi);
                 in_flight += 1;
             }
