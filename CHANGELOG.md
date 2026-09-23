@@ -11,6 +11,17 @@ before 1.0).
 
 ### Fixed
 
+- **Scripthash join:** the default `--max-sh-creates` is 10000. An unpaged
+  join above that is refused (`scripthash join exceeds --max-sh-creates
+  (default 10000)`). **0** stays unlimited. A history request that names a
+  page is still served and stops expanding creates once the page is full.
+- **Electrum public surface:** silent-payment subscribe logs do not include
+  the scan secret. The API log file is mode 0600. A missing or zero scan
+  start is the last 256 blocks. The historical scan runs off the connection
+  task, a few hundred heights at a time, behind 3 process-wide permits, and
+  only one scan per connection. Outpoint subscriptions use the scripthash
+  subscription cap. Tip restatus of those outpoints runs off the connection
+  task.
 - **BIP30:** enforced unless the header at BIP34 height is that network's
   BIP34 hash, and always from height 1_983_702. Signet and regtest have no
   BIP34 hash, so every block is checked. The two mainnet repeats stay

@@ -1657,6 +1657,53 @@ fn max_sh_creates_refuses_join_before_class_a() {
 }
 
 #[test]
+fn paged_history_stops_before_the_create_cap() {
+    use crate::scripthash::{HistoryFilter, HistoryOrder};
+    let (dir, q) = temp_query("sh-page-stop");
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..5u32 {
+        let (header, ta) = coinbase_block(h, prev, parent);
+        parent = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let sh = script_hash(&[0x51]);
+    q.set_max_sh_creates(2);
+    let filter = HistoryFilter {
+        limit: Some(1),
+        order: HistoryOrder::HeightAsc,
+        ..HistoryFilter::open()
+    };
+    reset_body_ok_reads();
+    let page = q
+        .scripthash_history_filtered(&sh, &filter)
+        .expect("a page is served above the cap");
+    assert_eq!(page.len(), 1);
+    let paged_reads = body_ok_reads();
+    assert!(
+        paged_reads < 5,
+        "page must not expand every create, reads={paged_reads}"
+    );
+    let err = q.scripthash_history(&sh).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Rejected(m) if m.contains("max-sh-creates")),
+        "{err}"
+    );
+    q.set_max_sh_creates(0);
+    let full = q.scripthash_history(&sh).unwrap();
+    assert_eq!(full.len(), 5);
+    reset_body_ok_reads();
+    let again = q.scripthash_history_filtered(&sh, &filter).unwrap();
+    assert_eq!(again.len(), 1);
+    let unlimited_page_reads = body_ok_reads();
+    assert!(
+        unlimited_page_reads < 5,
+        "unlimited still stops at the page, reads={unlimited_page_reads}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn scripthash_create_count_includes_pending_write_behind() {
     let (dir, q) = temp_query("sh-count-pending");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);

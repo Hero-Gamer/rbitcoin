@@ -355,7 +355,7 @@ impl Default for NodeConfig {
             prune_seqsigwit_ram_threshold_bytes: 256 * 1024 * 1024,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
-            max_sh_creates: 0,
+            max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
             esplora_block_template: false,
             esplora_onion: true,
             milestone_height: 0,
@@ -1381,7 +1381,10 @@ mod tests {
     #[test]
     fn max_sh_creates_and_esplora_block_template_apply_kv() {
         let mut c = NodeConfig::default();
-        assert_eq!(c.max_sh_creates, 0);
+        assert_eq!(
+            c.max_sh_creates,
+            rbitcoin_query::DEFAULT_MAX_SH_CREATES
+        );
         assert!(!c.esplora_block_template);
         assert_eq!(
             c.apply_kv("max_sh_creates", "100").unwrap(),

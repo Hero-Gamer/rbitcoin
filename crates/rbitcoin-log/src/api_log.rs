@@ -24,6 +24,11 @@ pub fn init_api_log(path: impl AsRef<Path>) -> std::io::Result<()> {
         }
     }
     let f = OpenOptions::new().create(true).append(true).open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let mut g = API_LOG.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some(f);
     Ok(())
@@ -150,6 +155,12 @@ mod tests {
             Some("unknown method: no.such"),
         );
         close_api_log();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "api log must be owner-only");
+        }
         let body = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(body.contains("\"method\":\"blockchain.tweaks.subscribe\""));

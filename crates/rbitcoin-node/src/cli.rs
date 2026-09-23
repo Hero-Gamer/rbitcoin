@@ -339,7 +339,7 @@ Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address
   --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
     Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
-  --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
+  --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
@@ -1310,7 +1310,10 @@ mod tests {
     #[test]
     fn max_sh_creates_and_esplora_block_template_cli_hyphens() {
         let omitted = ready_config(["rbitcoin-node"]);
-        assert_eq!(omitted.max_sh_creates, 0);
+        assert_eq!(
+            omitted.max_sh_creates,
+            rbitcoin_query::DEFAULT_MAX_SH_CREATES
+        );
         assert!(!omitted.esplora_block_template);
         let n = ready_config(["rbitcoin-node", "--max-sh-creates", "42"]);
         assert_eq!(n.max_sh_creates, 42);

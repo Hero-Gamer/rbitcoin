@@ -7,6 +7,13 @@ use rbitcoin_primitives::{hex_decode, Height};
 use rbitcoin_query::Query;
 use serde_json::{json, Value};
 
+/// Heights scanned when the client omits a start or passes 0.
+pub const SP_HISTORY_WINDOW: u32 = 256;
+/// Heights held under one scan permit before the next chunk.
+pub const SP_SCAN_CHUNK: u32 = 256;
+/// Process-wide historical scans. Not a knob.
+pub const SP_SCAN_PERMITS: usize = 3;
+
 #[derive(Clone)]
 pub struct SpSub {
     pub scan: SecretKey,
@@ -59,6 +66,12 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
         return Err("too many silent payment labels".into());
     }
     let start = start.min(tip.unwrap_or(start));
+    // A missing or zero start is the whole chain. Bound it to a recent window.
+    let start = if start == 0 {
+        tip.unwrap_or(0).saturating_sub(SP_HISTORY_WINDOW)
+    } else {
+        start
+    };
     let address = encode_sp_address(network, &scan, &spend);
     Ok(SpSub {
         scan,
@@ -183,6 +196,8 @@ mod tests {
         assert_eq!(no_tip.start, 50);
         let null_start = parse_sub(&json!([scan, spend, null]), Network::Regtest, Some(3)).unwrap();
         assert_eq!(null_start.start, 0);
+        let bounded = parse_sub(&json!([scan, spend, 0]), Network::Regtest, Some(1_000)).unwrap();
+        assert_eq!(bounded.start, 1_000 - SP_HISTORY_WINDOW);
         let bad_spend = match parse_sub(&json!([scan, "02"]), Network::Regtest, Some(0)) {
             Err(e) => e,
             Ok(_) => panic!("spend"),

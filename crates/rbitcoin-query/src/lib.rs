@@ -64,6 +64,9 @@ pub type QueryError = StoreError;
 /// Electrum JSON-RPC error / Esplora 503 body when `--sh-index` is off.
 pub const SCRIPTHASH_INDEX_DISABLED: &str = "scripthash index disabled";
 
+/// Default unpaged scripthash join cap. `0` stays unlimited.
+pub const DEFAULT_MAX_SH_CREATES: u32 = 10_000;
+
 /// Result of [`Query::uring_recover`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UringRecover {
@@ -436,7 +439,7 @@ impl Query {
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
             reconstruct_archived: AtomicU64::new(0),
-            max_sh_creates: AtomicU32::new(0),
+            max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(0),
             disconnect_height: AtomicU32::new(0),
@@ -1085,7 +1088,8 @@ impl Query {
         self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
     }
 
-    pub const MAX_SH_CREATES_MSG: &'static str = "scripthash join exceeds --max-sh-creates";
+    pub const MAX_SH_CREATES_MSG: &'static str =
+        "scripthash join exceeds --max-sh-creates (default 10000)";
 
     pub fn set_max_sh_creates(&self, n: u32) {
         self.max_sh_creates.store(n, AtomicOrdering::Relaxed);

@@ -392,7 +392,7 @@ Clean smoke:
 | `--sh-index` | `sh_index=` | **off** — Class B scripthash (address/history; Electrum/Esplora start without it) |
 | `--prune-seqsigwit` | `prune_seqsigwit=` | **off** — unpruned reads `seqsigwit.body`. On: refuse wire reconstruct below tip−288 **heights**, advertise `NETWORK_LIMITED`, and keep those heights as `store/seqsigwit.window/{height}.bin` plus a RAM cache |
 | `--prune-seqsigwit-ram-threshold-bytes N` | `prune_seqsigwit_ram_threshold_bytes=` | `268435456` (256 MiB). `0` keeps nothing in RAM: every height, including tiny IBD blocks, is read from its file |
-| `--max-sh-creates N` | `max_sh_creates=` | **0** — unlimited SH join; `N>0` refuses over-cap Electrum/Esplora (503 / JSON-RPC error) |
+| `--max-sh-creates N` | `max_sh_creates=` | **10000** — unpaged SH join above N is refused (503 / JSON-RPC error). **0** is unlimited. A request that names a page still returns that page. |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`) |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **546** matches Cake electrs) |
 | `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
@@ -893,10 +893,12 @@ Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then
 `GET /block-template` on the Esplora listen (same JSON as RPC
 `getblocktemplate` template mode). Default **off** (404).
 
-`--max-sh-creates N` (conf `max_sh_creates=`) is **0** by default (full join). When
-`N > 0`, Electrum and Esplora refuse a scripthash with more than N creates
+`--max-sh-creates N` (conf `max_sh_creates=`) defaults to **10000**. An unpaged
+Electrum history or full stats join with more than N creates is refused
 before Class A expand: Esplora **503** / Electrum JSON-RPC error
-`scripthash join exceeds --max-sh-creates`.
+`scripthash join exceeds --max-sh-creates (default 10000)`. **0** is unlimited.
+A history request that names a page (Esplora's 25, or any caller that sets a
+limit) is still served: the join stops once that page is full.
 
 Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 
@@ -1076,7 +1078,7 @@ the same POST with `after_txid` reuse. Idle **30s**; **256** clients (evict
 idle-longest). Not an 8-script LRU and not a >5s process whale cache. Extra
 operator RAM is the kernel page cache of Class A `txout` / SH heads. Public
 explorer second-hit of a whale GET is nginx/CDN (`/api/address/` is cacheable).
-`--max-sh-creates N` (`N>0` → Esplora **503**) is the fuse; default **0**.
+`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A paged history request is still served.
 Esplora WS `block-transactions` uses the same posting-list tip probe
 as Electrum subscribe (miss skips Class A).
 
@@ -1187,7 +1189,7 @@ Blockstream Esplora `API.md`); surface: [`COMPAT.md`](./COMPAT.md).
 ```
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
-Leave `--max-sh-creates` at **0** (unlimited join) for explorer backends.
+Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. Paged history still stops at the page.
 
 TCP Esplora does not keep a mempool of `Arc<Transaction>`. `GET /mempool` loads
 the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-tx
@@ -1205,7 +1207,7 @@ rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
 tree is `0700`. TCP `--esplora-listen host:port` is public REST+WS only (no
 `/internal`). Core RPC is `{datadir}/rpc.sock` plus the `bitcoin-client`
 `socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic. Requires
-`--sh-index`. Leave `--max-sh-creates` at 0.
+`--sh-index`. The default `--max-sh-creates` is 10000; set 0 for an unlimited unpaged join.
 
 ```bash
 sudo mkdir -p /run/rbitcoin

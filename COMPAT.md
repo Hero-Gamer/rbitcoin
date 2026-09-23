@@ -44,7 +44,7 @@ is GBT (same JSON as RPC), not explorer search. Block/tx **by full id** and
 address/**exact** scripthash history exist so wallets, APIs, and (after 0.8)
 electrs-shaped explorers can verify and sync.
 
-`--max-sh-creates N` (default **0** = unlimited) refuses Electrum/Esplora SH
+`--max-sh-creates N` (default **10000**; **0** = unlimited) refuses an unpaged Electrum/Esplora SH
 joins with more than N creates: Esplora HTTP **503**, Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates`. Stats stay full when under the cap.
 

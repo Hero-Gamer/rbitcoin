@@ -457,6 +457,79 @@ impl Query {
         self.store.is_confirmed_strong_at(fk, Some(view.height.0))
     }
 
+    fn order_fks_for_page(
+        &self,
+        fks: &mut Vec<Fk>,
+        filter: &HistoryFilter,
+    ) -> Result<(), QueryError> {
+        let heights = self.store.tx_height_get_batch(fks)?;
+        if heights.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create height batch length",
+            ));
+        }
+        let mut keyed: Vec<(u32, Fk)> = fks
+            .iter()
+            .zip(heights)
+            .map(|(fk, h)| (h.unwrap_or(0), *fk))
+            .collect();
+        match filter.order {
+            HistoryOrder::HeightAsc => keyed.sort_by_key(|(h, fk)| (*h, fk.0)),
+            HistoryOrder::NewestFirst => {
+                keyed.sort_by(|a, b| b.0.cmp(&a.0).then(b.1 .0.cmp(&a.1 .0)))
+            }
+        }
+        *fks = keyed.into_iter().map(|(_, fk)| fk).collect();
+        Ok(())
+    }
+
+    /// True when more creates cannot change the already-full page.
+    fn history_page_closed(
+        &self,
+        joined: &[ShJoinedOut],
+        filter: &HistoryFilter,
+        rest: &[Fk],
+    ) -> Result<bool, QueryError> {
+        let Some(limit) = filter.limit else {
+            return Ok(false);
+        };
+        if rest.is_empty() {
+            return Ok(false);
+        }
+        if let Some(after) = filter.after_txid {
+            let open = HistoryFilter {
+                limit: None,
+                after_txid: None,
+                ..filter.clone()
+            };
+            let seen = history_items_from_joined(joined, &open);
+            if !seen.iter().any(|i| i.txid == after) {
+                return Ok(false);
+            }
+        }
+        let page = history_items_from_joined(joined, filter);
+        if page.len() < limit {
+            return Ok(false);
+        }
+        let edge = page.last().map(|i| i.height).unwrap_or(0);
+        let heights = self.store.tx_height_get_batch(rest)?;
+        if heights.len() != rest.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create height batch length",
+            ));
+        }
+        match filter.order {
+            HistoryOrder::HeightAsc => Ok(heights.iter().all(|h| i64::from(h.unwrap_or(0)) > edge)),
+            HistoryOrder::NewestFirst => {
+                let ranges = self.store.tx_spent_range_batch(rest)?;
+                Ok(heights
+                    .iter()
+                    .zip(ranges)
+                    .all(|(h, range)| i64::from(h.unwrap_or(0)) < edge && range.is_none()))
+            }
+        }
+    }
+
     /// Confirmed-strong create outpoints plus confirmed spenders (create_fk join).
     ///
     /// When `to_height` is set, creates with Class C height `>= to_height` are not
@@ -469,8 +542,20 @@ impl Query {
         to_height: Option<i64>,
         view: &ChainView,
     ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        self.sh_join_limited(scripthash, need, to_height, view, None)
+    }
+
+    pub(crate) fn sh_join_limited(
+        &self,
+        scripthash: &[u8; 32],
+        need: ShJoinNeed,
+        to_height: Option<i64>,
+        view: &ChainView,
+        page: Option<&HistoryFilter>,
+    ) -> Result<Vec<ShJoinedOut>, QueryError> {
+        let paging = page.is_some_and(|f| f.limit.is_some());
         let cap = self.max_sh_creates();
-        if cap > 0 {
+        if cap > 0 && !paging {
             let n = self.scripthash_create_count(scripthash)?;
             if n > cap {
                 return Err(StoreError::Rejected(Query::MAX_SH_CREATES_MSG));
@@ -509,16 +594,25 @@ impl Query {
                 })
                 .collect();
         }
+        if paging {
+            self.order_fks_for_page(&mut fks, page.expect("paging"))?;
+        }
+        let wave_n = if paging { 1 } else { SH_JOIN_WAVE };
         let mut out = Vec::new();
         let mut class_a_us = 0u128;
         let mut spends_us = 0u128;
-        for wave in sh_join_waves(&fks, SH_JOIN_WAVE) {
+        let mut offset = 0usize;
+        for wave in sh_join_waves(&fks, wave_n) {
             let t_a = std::time::Instant::now();
             let creates = self.expand_create_fks_wave(scripthash, wave, need)?;
             class_a_us = class_a_us.saturating_add(t_a.elapsed().as_micros());
             let t_s = std::time::Instant::now();
             out.extend(self.join_spends_wave(&creates, need, view)?);
             spends_us = spends_us.saturating_add(t_s.elapsed().as_micros());
+            offset = offset.saturating_add(wave.len());
+            if paging && self.history_page_closed(&out, page.expect("paging"), &fks[offset..])? {
+                break;
+            }
         }
         let total_us = pages_us
             .saturating_add(class_a_us)
@@ -868,7 +962,13 @@ impl Query {
         filter: &HistoryFilter,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let joined = self.sh_join(scripthash, ShJoinNeed::HISTORY, filter.to_height, view)?;
+        let joined = self.sh_join_limited(
+            scripthash,
+            ShJoinNeed::HISTORY,
+            filter.to_height,
+            view,
+            Some(filter),
+        )?;
         Ok(history_items_from_joined(&joined, filter))
     }
 
@@ -926,7 +1026,13 @@ impl Query {
         filter: &HistoryFilter,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
-        let joined = self.sh_join(scripthash, ShJoinNeed::HISTORY, filter.to_height, view)?;
+        let joined = self.sh_join_limited(
+            scripthash,
+            ShJoinNeed::HISTORY,
+            filter.to_height,
+            view,
+            Some(filter),
+        )?;
         Ok(summaries_from_joined(&joined, filter))
     }
 
