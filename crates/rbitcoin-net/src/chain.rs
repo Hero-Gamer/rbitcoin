@@ -2182,9 +2182,6 @@ impl ChainHub {
         }
         let mut works = Vec::with_capacity(blocks.len());
         for b in blocks {
-            if !self.knows_header(&b.block_hash()) {
-                return Err(NetError::Protocol("header not validated"));
-            }
             works.push(
                 crate::most_work::header_work_checked(&b.header)
                     .map_err(|_| NetError::Consensus("zero target".into()))?,
