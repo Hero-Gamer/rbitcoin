@@ -187,6 +187,11 @@ pub fn validate_block_structure_with_pres(
     if base > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadBlock("block stripped size too large"));
     }
+    // CheckBlock tx shape before malleation. An empty vin is "no inputs",
+    // not a missing witness commitment.
+    for (tx, p) in block.txdata.iter().zip(pres.iter()) {
+        check_tx_local(tx, p.base_size)?;
+    }
     // Witness bytes are not in the block hash. Check them before weight so
     // padding cannot be cached as a failed hash.
     let has_witness_data = block_has_witness_from_pres(pres.as_ref());
@@ -225,7 +230,6 @@ pub fn validate_block_structure_with_pres(
 
     // Only money-range gate. `money_range_out_sum` casts a sum that passed here.
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
-        check_tx_local(tx, p.base_size)?;
         for o in &tx.output {
             if exceeds_max_money(o.value.to_sat()) {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
