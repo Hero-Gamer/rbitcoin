@@ -99,6 +99,17 @@ fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LiveP
     }
 }
 
+fn note_accepted_hb(
+    r: &Result<AcceptOutcome, NetError>,
+    hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>,
+) {
+    if matches!(r, Ok(AcceptOutcome::Accepted { .. })) {
+        if let Some((ph, id)) = hb {
+            ph.maybe_select_hb(*id);
+        }
+    }
+}
+
 async fn accept_received_from_peer(
     hub: &ChainHub,
     block: Block,
@@ -110,16 +121,21 @@ async fn accept_received_from_peer(
     } else {
         None
     };
-    crate::tip_accept::run_on_tip_accept_async(move || {
+    if let Some(hub) = hub.shared_arc() {
+        return crate::tip_accept::run_on_tip_accept_async(move || {
+            let r = hub.accept_received_on_lane(block);
+            note_accepted_hb(&r, &hb);
+            r
+        })
+        .await;
+    }
+    // A stack hub (unit tests) has no `Arc`. Join before return so the
+    // borrow outlives the job.
+    crate::tip_accept::run_on_tip_accept(|| {
         let r = hub.accept_received_on_lane(block);
-        if matches!(&r, Ok(AcceptOutcome::Accepted { .. })) {
-            if let Some((ph, id)) = hb.as_ref() {
-                ph.maybe_select_hb(*id);
-            }
-        }
+        note_accepted_hb(&r, &hb);
         r
     })
-    .await
 }
 
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {

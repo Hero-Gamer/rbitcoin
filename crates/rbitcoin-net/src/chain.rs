@@ -277,6 +277,8 @@ pub struct ChainHub {
     ///
     /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
     mempool: std::sync::OnceLock<Arc<crate::tx_relay::MempoolHub>>,
+    /// Filled by [`Self::into_arc`]. Async tip jobs clone it.
+    self_weak: std::sync::OnceLock<std::sync::Weak<ChainHub>>,
     /// Regtest `setmocktime` / generate timestamps. Default is wall clock.
     pub clock: Arc<rbitcoin_consensus::NodeClock>,
     invalidated: Invalidated,
@@ -337,6 +339,7 @@ impl ChainHub {
             connect_lock: std::sync::Mutex::new(()),
             generate_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
+            self_weak: std::sync::OnceLock::new(),
             clock: rbitcoin_consensus::NodeClock::new(),
             invalidated: Invalidated::new(),
             held_bodies: RwLock::new(HeldBodies::new()),
@@ -2345,13 +2348,34 @@ impl ChainHub {
         }
     }
 
+    /// Put this hub in an `Arc` and remember a weak handle for async tip jobs.
+    pub(crate) fn into_arc(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.self_weak.set(Arc::downgrade(&arc));
+        arc
+    }
+
+    /// `Some` after [`Self::into_arc`]. The clone keeps the hub alive for a
+    /// tip job whose session future was dropped.
+    pub(crate) fn shared_arc(&self) -> Option<Arc<Self>> {
+        self.self_weak.get().and_then(|w| w.upgrade())
+    }
+
+    /// Block until the tip-accept thread has no job running.
+    pub fn wait_tip_accept_idle(&self) {
+        crate::tip_accept::wait_idle();
+    }
+
     /// Peer-session accept: same work as [`Self::accept_received_block`], awaited
-    /// so the tokio worker is not parked across confirm.
+    /// so the tokio worker is not parked across confirm. The job holds this
+    /// `Arc`.
     pub async fn accept_received_block_async(
-        &self,
+        self: &Arc<Self>,
         block: Block,
     ) -> Result<AcceptOutcome, NetError> {
-        crate::tip_accept::run_on_tip_accept_async(|| self.accept_received_block_inner(block)).await
+        let hub = Arc::clone(self);
+        crate::tip_accept::run_on_tip_accept_async(move || hub.accept_received_block_inner(block))
+            .await
     }
 
     pub(crate) fn accept_received_on_lane(&self, block: Block) -> Result<AcceptOutcome, NetError> {
@@ -3133,6 +3157,15 @@ mod tests {
     }
 
     #[test]
+    fn into_arc_shares_one_hub() {
+        let (_dir, hub) = tmp_hub();
+        assert!(hub.shared_arc().is_none());
+        let hub = ChainHub::into_arc(hub);
+        let again = hub.shared_arc().expect("weak upgrades");
+        assert!(std::sync::Arc::ptr_eq(&hub, &again));
+    }
+
+    #[test]
     fn reconstruct_prefill_plan_requires_knob_and_tip_child() {
         let (_dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -3482,6 +3515,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accept_received_block_async_connects_off_worker() {
         let (dir, hub) = tmp_hub();
+        let hub = ChainHub::into_arc(hub);
         let task = tokio::spawn(async move {
             {
                 let _g = crate::reactor::BlockingRegion::enter();

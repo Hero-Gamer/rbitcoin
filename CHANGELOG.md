@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Tip-accept lifetime:** the async accept job is `'static` and holds an
+  `Arc` of the hub. Dropping a peer session does not free that hub under
+  the job. Shutdown waits for the lane to go idle before the store flush.
+  Dropping the node still aborts connect-retry.
 - **RPC and Esplora limits:** bearer auth runs before the body is read
   (401 with no body bytes). The HTTP body cap is `RPC_MAX_HTTP_BODY`
   (2 MiB, 413 above it). `--rpc-work-queue` defaults to 16 (HTTP 503 when

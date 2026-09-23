@@ -1146,6 +1146,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
+    // In-flight tip accepts hold the hub. Drain them before the store flush.
+    let hub = std::sync::Arc::clone(&node.hub);
+    tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        hub.wait_tip_accept_idle();
+    })
+    .await
+    .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {

@@ -28,6 +28,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
 | [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 | [023](./023-tapscript-initial-stack-limits.md) | high | Tapscript initial witness stack skipped 1000/520 limits | fixed | `script_path_rejects_initial_stack_over_max_size` |
+| [038](./038-tip-accept-lifetime.md) | high | Async tip-accept job must not borrow a dropped hub | fixed | `owned_job_finishes_after_waiter_abort` |
 | [036](./036-electrum-public-surface.md) | critical | Public Electrum scan secret, join, and subscription caps | fixed | `paged_history_stops_before_the_create_cap` |
 | [035](./035-bip30-bip34-ancestry.md) | low | BIP30 skipped on signet after height 1 | fixed | `bip30_signet_rejects_unspent_overwrite_after_bip34` |
 | [034](./034-witness-padding-not-cached.md) | high | Witness padding cached as an invalid block hash | fixed | `padded_coinbase_witness_over_weight_is_not_cached_invalid` |
