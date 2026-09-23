@@ -1,0 +1,13 @@
+id: mutant-waiver-missing-date
+language: rust
+severity: error
+message: "MUTANT-WAIVER in a scanned file must include an expires YYYY-MM-DD token"
+note: "The date is not compared to today. Comments in *tests*.rs and tests/ are not scanned."
+rule:
+  kind: line_comment
+  regex: "MUTANT-WAIVER"
+  not:
+    regex: "expires\\s+\\b20\\d{2}-\\d{2}-\\d{2}\\b"
+ignores:
+  - "**/*tests*.rs"
+  - "**/tests/**"
