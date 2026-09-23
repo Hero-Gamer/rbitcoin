@@ -120,7 +120,7 @@ fn verify_control_commitment(
     script: &Script,
 ) -> Result<u8, ConsensusError> {
     if control.len() < CONTROL_BASE
-        || (control.len() - CONTROL_BASE) % CONTROL_NODE != 0
+        || !(control.len() - CONTROL_BASE).is_multiple_of(CONTROL_NODE)
         || (control.len() - CONTROL_BASE) / CONTROL_NODE > CONTROL_MAX_NODES
     {
         return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
