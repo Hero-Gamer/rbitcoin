@@ -49,11 +49,11 @@ peers() {
   cli "$1" getconnectioncount 2>/dev/null | tr -d '[:space:]' || true
 }
 
-# bitcoin-cli prints compact JSON (`"addr":"ip:port"`).
+# bitcoin-cli uses json.dumps, which writes `"addr": "ip:port"`.
 peer_addr() {
   local raw
   raw="$(cli "$1" getpeerinfo 2>/dev/null || true)"
-  if [[ "$raw" =~ \"addr\":\"([^\"]+)\" ]]; then
+  if [[ "$raw" =~ \"addr\":[[:space:]]*\"([^\"]+)\" ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
   fi
 }
@@ -94,18 +94,19 @@ if [[ "$want" == "" || "$want" == "0" ]]; then
 fi
 
 deadline=$((SECONDS + 90))
-until [[ "$(height tank1)" == "$want" && "$(peers tank1)" != "" && "$(peers tank1)" != "0" ]]; do
-  if (( SECONDS > deadline )); then
-    fail "tank1 did not follow tank0 (height='$(height tank1)' want='$want' peers='$(peers tank1)' addr='$(peer_addr tank1)')"
+addr=""
+while (( SECONDS <= deadline )); do
+  a="$(peer_addr tank1)"
+  if [[ "$(height tank1)" == "$want" && "$(peers tank1)" != "" && "$(peers tank1)" != "0" ]]; then
+    case "$a" in
+      ""|0.0.0.0:*) ;;
+      *) addr="$a"; break ;;
+    esac
   fi
   sleep 2
 done
-
-addr="$(peer_addr tank1)"
-case "$addr" in
-  ""|0.0.0.0:*)
-    fail "tank1 peer addr is not the resolved tank0 (addr='$addr')"
-    ;;
-esac
+if [[ -z "$addr" ]]; then
+  fail "tank1 did not follow tank0 (height='$(height tank1)' want='$want' peers='$(peers tank1)' addr='$(peer_addr tank1)')"
+fi
 
 echo "ok - tank0=$want tank1=$(height tank1) peers=$(peers tank1) addr=$addr"
