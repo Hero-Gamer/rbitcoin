@@ -28,8 +28,9 @@ operator-facing). `./scripts/release-gate.sh` checks that. Narrative banners
 (README, SECURITY, `docs/road-to-1.0.md`, `docs/experimental-mainnet.md`)
 are edited on the same bump PR; the scripts do not rewrite them.
 
-`./scripts/release-cut.sh` moves `## [Unreleased]` into `## [X.Y.Z] — date`
-and inserts an empty `### Highlights`. The ship PR **writes those bullets**
+`./scripts/release-cut.sh` folds [`changelog.d/`](../changelog.d/) into
+`## [Unreleased]`, moves that section into `## [X.Y.Z] — date`, and inserts
+an empty `### Highlights`. The ship PR **writes those bullets**
 (brief: what an operator should know, not the full Keep a Changelog body).
 `./scripts/release-notes.sh` is the GitHub Release / annotated-tag text:
 platform blurb + Highlights + a pointer at CHANGELOG. `release.yml` calls
@@ -37,6 +38,33 @@ that script. Do not dump Unreleased into the GitHub Release.
 
 Existing line: **`v0.7.x`** (tag `v0.7.0`). Next minor from
 today’s `0.7.99` is **0.8.0**, then **`v0.8.x`**, then master **0.8.99**.
+
+---
+
+## Changelog
+
+Feature pulls do not edit [`CHANGELOG.md`](../CHANGELOG.md). That file is the
+published release notes. Unreleased notes are one file per pull under
+[`changelog.d/`](../changelog.d/), so two open branches never insert at the
+same line.
+
+`changelog.d/<topic>.md` (not `README.md`):
+
+```markdown
+Fixed
+
+- **CI quick checks share one runner.** `qc` runs fmt, then ast-grep.
+```
+
+The first non-empty line is the category: `Added`, `Changed`, `Deprecated`,
+`Removed`, `Fixed`, or `Security`. The rest is the Keep a Changelog bullets.
+One fragment per pull. A stack adds one file on each branch.
+
+`./scripts/release-cut.sh --minor`, `--major`, and `--patch` fold every
+fragment into `## [Unreleased]` under the matching `###` heading, delete
+those files, then move that section under `## [X.Y.Z] — date`. Notes already
+sitting in `## [Unreleased]` stay and are cut with the fragments.
+`--dev-next` does not consume `changelog.d/`.
 
 ---
 
@@ -70,9 +98,9 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 
 | Command | Does |
 |---------|------|
-| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; cuts CHANGELOG |
-| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0` |
-| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x` |
+| `./scripts/release-cut.sh --minor` | `X.Y.99` → `X.(Y+1).0`; folds `changelog.d/` into CHANGELOG, then cuts |
+| `./scripts/release-cut.sh --major` | `X.Y.99` → `(X+1).0.0`; same changelog fold as `--minor` |
+| `./scripts/release-cut.sh --patch` | `X.Y.Z` → `X.Y.(Z+1)` on `vX.Y.x`; same changelog fold |
 | `./scripts/release-cut.sh --dev-next` | just-shipped `X.Y.0` → `X.Y.99` |
 | `./scripts/release-cut.sh --print-plan …` | prints `ship=` / `maint=` / `dev_next=` |
 | `./scripts/release-cut.sh --latest-maint` | highest `vX.Y.x` ref |

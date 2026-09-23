@@ -40,7 +40,7 @@ Counts and procedures stay in the owner doc. A row is the rank and the outcome.
 R-ids were the 2026-08-12 slice. Canonical id is **bold**. Do not start
 **R-11+**. Next unused Q-id is **Q-72**.
 
-Close work by **moving the Open row into CHANGELOG** in the same edit as
+Close work by **writing the Open row into `changelog.d/`** in the same edit as
 the landing change (do not grow a Completed museum here). New item: insert
 at an explicit rank with **Q-63+**.
 

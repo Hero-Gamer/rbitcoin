@@ -122,10 +122,80 @@ release_set_nix_version() {
   mv "$tmp" "$ROOT/nix/rbitcoin.nix"
 }
 
+# Fold changelog.d/*.md into ## [Unreleased], then delete those files.
+# README.md is the pointer, not a note. First non-empty line of a fragment
+# is the Keep a Changelog category; the rest is the bullet text.
+release_changelog_absorb_fragments() {
+  local dir="$ROOT/changelog.d"
+  [[ -d "$dir" ]] || return 0
+  local files=() f base cat scratch categories
+  shopt -s nullglob
+  files=("$dir"/*.md)
+  shopt -u nullglob
+  local pending=()
+  for f in "${files[@]}"; do
+    base="$(basename "$f")"
+    [[ "$base" == "README.md" ]] && continue
+    pending+=("$f")
+  done
+  ((${#pending[@]})) || return 0
+
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/rbitcoin-clfrag.XXXXXX")"
+  categories=(Added Changed Deprecated Removed Fixed Security)
+  for f in "${pending[@]}"; do
+    cat="$(awk 'NF { print; exit }' "$f")"
+    case "$cat" in
+      Added | Changed | Deprecated | Removed | Fixed | Security) ;;
+      *)
+        release_die "changelog.d/$(basename "$f") category must be Added, Changed, Deprecated, Removed, Fixed, or Security (got: ${cat:-empty})"
+        ;;
+    esac
+    awk 'BEGIN { skipped = 0 } !skipped && NF { skipped = 1; next } { print }' "$f" >>"$scratch/$cat.md"
+    printf '\n' >>"$scratch/$cat.md"
+  done
+
+  local c
+  for c in "${categories[@]}"; do
+    [[ -f "$scratch/$c.md" ]] || continue
+    release_changelog_insert_category "$c" "$scratch/$c.md"
+  done
+  rm -f "${pending[@]}"
+  rm -rf "$scratch"
+}
+
+release_changelog_insert_category() {
+  local cat="$1"
+  local bodyfile="$2"
+  local file="$ROOT/CHANGELOG.md"
+  local start end catline next tmp payload
+  start="$(grep -n '^## \[Unreleased\]' "$file" | head -1 | cut -d: -f1)"
+  [[ -n "$start" ]] || release_die "CHANGELOG.md has no ## [Unreleased] heading"
+  end="$(awk -v s="$start" 'NR > s && /^## / { print NR; exit }' "$file")"
+  [[ -n "$end" ]] || end="$(($(wc -l <"$file") + 1))"
+  catline="$(awk -v s="$start" -v e="$end" -v c="### $cat" \
+    'NR > s && NR < e && $0 == c { print NR; exit }' "$file")"
+  if [[ -n "$catline" ]]; then
+    next="$(awk -v s="$catline" -v e="$end" \
+      'NR > s && NR < e && (/^### / || /^## /) { print NR; exit }' "$file")"
+    [[ -n "$next" ]] || next="$end"
+  else
+    next="$end"
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/rbitcoin-clins.XXXXXX")"
+  head -n "$((next - 1))" "$file" >"$tmp"
+  if [[ -z "$catline" ]]; then
+    printf '\n### %s\n\n' "$cat" >>"$tmp"
+  fi
+  cat "$bodyfile" >>"$tmp"
+  tail -n "+$next" "$file" >>"$tmp"
+  mv "$tmp" "$file"
+}
+
 release_cut_changelog_ship() {
   local ver="$1"
   local date="$2"
   local tmp
+  release_changelog_absorb_fragments
   tmp="$(mktemp "${TMPDIR:-/tmp}/rbitcoin-cl.XXXXXX")"
   awk -v ver="$ver" -v date="$date" '
     /^## \[Unreleased\]/ {
