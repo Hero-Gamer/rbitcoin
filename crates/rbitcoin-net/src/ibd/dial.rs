@@ -802,6 +802,43 @@ mod tests {
         let pick = admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &live);
         assert_eq!(pick, Some(crate::NetAddr::from_socket(addr(2))));
         assert!(!exclude.contains(&crate::NetAddr::from_socket(addr(2))));
+
+        // `until == now` has expired. It must not be treated as still cooling.
+        let mut due = AddrMan::new();
+        due.add(addr(4));
+        due.add(addr(5));
+        due.note_attempt_at(addr(5), now - Duration::from_secs(1));
+        let mut due_cd = HashMap::new();
+        due_cd.insert(addr(4), now);
+        due_cd.insert(addr(5), now);
+        let mut due_ex: HashSet<_> = [4u8, 5]
+            .into_iter()
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let pick = admit_cooldown_fallback(&due, &mut due_ex, &[], &due_cd, now, &HashSet::new());
+        assert_eq!(pick, None, "cooldown ending at now is not a fallback");
+        assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(4))));
+        assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(5))));
+
+        // An address in the book that this node will not dial (only-net)
+        // must not win the fallback just because it was never tried.
+        let mut filtered = AddrMan::new();
+        filtered.set_only_net(vec![crate::OnlyNet::Onion]);
+        for o in 6u8..=8 {
+            filtered.add(addr(o));
+        }
+        let mut filt_cd = HashMap::new();
+        for o in 6u8..=8 {
+            filt_cd.insert(addr(o), now + Duration::from_secs(60));
+        }
+        let mut filt_ex: HashSet<_> = (6u8..=8)
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let before = filt_ex.clone();
+        let pick =
+            admit_cooldown_fallback(&filtered, &mut filt_ex, &[], &filt_cd, now, &HashSet::new());
+        assert_eq!(pick, None, "only-net hides clearnet even when cooling");
+        assert_eq!(filt_ex, before);
     }
 
     #[test]
