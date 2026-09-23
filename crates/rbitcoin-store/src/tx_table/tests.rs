@@ -621,6 +621,277 @@ fn open_repairs_body_leading_txid_count() {
 }
 
 #[test]
+fn seqsigwit_backfill_spans_split_on_gap_and_cap() {
+    fn leg_coinbase() -> Vec<u8> {
+        vec![
+            input_flags::NULL_PREV
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS,
+        ]
+    }
+    fn leg_spend(parent: u64, vout: u64) -> Vec<u8> {
+        let mut v =
+            vec![input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS];
+        v.extend_from_slice(&parent.to_le_bytes());
+        write_compact_size(&mut v, vout);
+        v
+    }
+    let a = leg_coinbase();
+    let b = leg_spend(1, 0);
+    let c = leg_spend(2, 4);
+    let mut blob = [0u8; 40];
+    blob[..a.len()].copy_from_slice(&a);
+    blob[a.len()..a.len() + b.len()].copy_from_slice(&b);
+    let c_at = 30usize;
+    blob[c_at..c_at + c.len()].copy_from_slice(&c);
+    let ranges = vec![
+        Some((0u64, a.len() as u64)),
+        Some((a.len() as u64, b.len() as u64)),
+        Some((c_at as u64, c.len() as u64)),
+    ];
+    let reads = std::cell::Cell::new(0u32);
+    let mut buf = Vec::new();
+    let edges = edges_from_seqsigwit_ranges(
+        &mut |off, len, buf| {
+            reads.set(reads.get() + 1);
+            let s = off as usize;
+            let n = len as usize;
+            buf.clear();
+            buf.extend_from_slice(&blob[s..s + n]);
+            Ok(())
+        },
+        &ranges,
+        1024,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(
+        reads.get(),
+        2,
+        "contiguous a+b are one pread; the gap is another"
+    );
+    assert_eq!(edges[0], vec![crate::input::InputEdge::coinbase()]);
+    assert_eq!(
+        edges[1],
+        vec![crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 0
+        }]
+    );
+    assert_eq!(
+        edges[2],
+        vec![crate::input::InputEdge {
+            parent: Fk(2),
+            vout: 4
+        }]
+    );
+    reads.set(0);
+    let edges = edges_from_seqsigwit_ranges(
+        &mut |off, len, buf| {
+            reads.set(reads.get() + 1);
+            let s = off as usize;
+            buf.clear();
+            buf.extend_from_slice(&blob[s..s + len as usize]);
+            Ok(())
+        },
+        &ranges[..2],
+        (a.len() + b.len() - 1) as u64,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(reads.get(), 2, "a span cap splits contiguous records");
+    assert_eq!(edges.len(), 2);
+}
+
+#[test]
+fn reopen_backfills_legacy_seqsigwit_as_spans() {
+    let dir = tempfile_dir("input-backfill-span");
+    let t = create_tiny(&dir);
+    let coinbase = (
+        TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let spend = (
+        TxRecord {
+            txid: [2u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord {
+            prev_txid: [1u8; 32],
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![0xab; 8],
+            witness: vec![vec![0x30; 16]],
+        }],
+        vec![OutputRecord::unspent(2, vec![0x51])],
+    );
+    t.put_full_batch_indexed(&[coinbase, spend.clone(), spend], true)
+        .unwrap();
+    let payloads = [
+        vec![
+            input_flags::NULL_PREV
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS,
+        ],
+        {
+            let mut v = vec![
+                input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS,
+            ];
+            v.extend_from_slice(&1u64.to_le_bytes());
+            write_compact_size(&mut v, 0);
+            v
+        },
+        {
+            let mut v = vec![
+                input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS,
+            ];
+            v.extend_from_slice(&2u64.to_le_bytes());
+            write_compact_size(&mut v, 1);
+            v
+        },
+    ];
+    for (i, payload) in payloads.iter().enumerate() {
+        let (off, len) = t.seqsigwit_range(Fk((i + 1) as u64)).unwrap();
+        assert!(
+            (payload.len() as u64) <= len,
+            "legacy prevout must fit the existing record"
+        );
+        let mut raw = payload.clone();
+        raw.resize(len as usize, 0);
+        t.seqsigwit.write_body_abs(off, &raw).unwrap();
+    }
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        t2.input.edges(Fk(1)).unwrap().unwrap(),
+        vec![crate::input::InputEdge::coinbase()]
+    );
+    assert_eq!(
+        t2.input.edges(Fk(2)).unwrap().unwrap(),
+        vec![crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 0
+        }]
+    );
+    assert_eq!(
+        t2.input.edges(Fk(3)).unwrap().unwrap(),
+        vec![crate::input::InputEdge {
+            parent: Fk(2),
+            vout: 1
+        }]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reopen_resumes_partial_legacy_input_backfill() {
+    let dir = tempfile_dir("input-backfill-resume");
+    let t = create_tiny(&dir);
+    let coinbase = (
+        TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let spend = (
+        TxRecord {
+            txid: [2u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![InputRecord {
+            prev_txid: [1u8; 32],
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![0xab; 8],
+            witness: vec![vec![0x30; 16]],
+        }],
+        vec![OutputRecord::unspent(2, vec![0x51])],
+    );
+    t.put_full_batch_indexed(&[coinbase, spend], true).unwrap();
+    for (i, payload) in [
+        vec![
+            input_flags::NULL_PREV
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS,
+        ],
+        {
+            let mut v = vec![
+                input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS,
+            ];
+            v.extend_from_slice(&1u64.to_le_bytes());
+            write_compact_size(&mut v, 0);
+            v
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (off, len) = t.seqsigwit_range(Fk((i + 1) as u64)).unwrap();
+        assert!((payload.len() as u64) <= len);
+        let mut raw = payload.clone();
+        raw.resize(len as usize, 0);
+        t.seqsigwit.write_body_abs(off, &raw).unwrap();
+    }
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let partial = crate::input::Input::create(&dir).unwrap();
+    partial
+        .append(&[vec![crate::input::InputEdge::coinbase()]])
+        .unwrap();
+    drop(partial);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(
+        t2.input.edges(Fk(1)).unwrap().unwrap(),
+        vec![crate::input::InputEdge::coinbase()]
+    );
+    assert_eq!(
+        t2.input.edges(Fk(2)).unwrap().unwrap(),
+        vec![crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 0
+        }],
+        "resume must read the legacy prevout, not stamp n_in 0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn decode_prevout_at_skips_script_and_witness() {
     let rec = InputRecord {
         prev_txid: [9u8; 32],

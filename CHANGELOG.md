@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **Input backfill reads `seqsigwit.body` in 16 MiB spans.** Open used
+  to `pread` the locator window and the body once per create. A chunk
+  of 16384 creates now shares one locator read, and contiguous bodies
+  share one pread. A partial `input.loc` resumes that walk when the
+  next record still has an inline prevout.
+
 - **Failed connects enter the stall cooldown.** An EOF or timeout takes
   the same strike ban as a relative-slow kick, so dead seeds stop
   occupying the only dial slots. Relative-slow does not disconnect
