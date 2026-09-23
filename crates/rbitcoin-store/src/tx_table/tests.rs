@@ -1061,18 +1061,16 @@ fn decode_prevout_at_skips_script_and_witness() {
     assert_eq!(vout, 3);
     assert_eq!(used, legacy.len());
 
-    // Inline prevout with a real script and two witness items. The skip
-    // cursor must land on the end; a shifted length is a short or long read.
+    // Script length 4 so the cursor must advance. Subtracting that length
+    // lands inside create_fk on a zero compact size and stops short.
     let mut rich = vec![input_flags::SEQ_FINAL];
     rich.extend_from_slice(&1u64.to_le_bytes());
     rich.push(3);
-    rich.push(2);
-    rich.extend_from_slice(&[0xab, 0xcd]);
-    rich.push(2);
+    rich.push(4);
+    rich.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+    rich.push(1);
     rich.push(1);
     rich.push(0x11);
-    rich.push(2);
-    rich.extend_from_slice(&[0x22, 0x33]);
     let (cfk, vout, used) = InputRecord::decode_prevout_at(&rich).unwrap();
     assert_eq!(cfk, Fk(1));
     assert_eq!(vout, 3);
