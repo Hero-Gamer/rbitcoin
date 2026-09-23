@@ -3067,7 +3067,7 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
     }
 }
 
-use crate::most_work::{sum_work, work_better};
+use crate::most_work::work_better;
 
 /// Tiny-head regtest [`ChainHub`] for tests. Not an operator API.
 #[cfg(test)]
@@ -3087,6 +3087,7 @@ pub(crate) fn tiny_regtest_hub_labeled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::most_work::sum_work;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash;
