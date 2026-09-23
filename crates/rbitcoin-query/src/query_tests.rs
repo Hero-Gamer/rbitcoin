@@ -1,6 +1,6 @@
 use super::*;
 use crate::testutil::FixtureChain;
-use rbitcoin_store::{InputRecord, OutputRecord};
+use rbitcoin_store::{InputRecord, OutputRecord, TxRecord, TxStatRow};
 
 #[test]
 fn query_open_clears_strong_above_tip() {
@@ -2108,7 +2108,7 @@ fn connect_chain_query_surface() {
     let out = q.tx_output_at_fk(fks[0], 0).unwrap();
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "tx_output_at_fk is outs-only (no inwit zip)"
+        "tx_output_at_fk is outs-only (no seqsigwit zip)"
     );
     assert_eq!(out.value, 50_0000_0000);
     assert!(!q.is_outpoint_spent(&tx.txid, 0).unwrap());
@@ -2589,6 +2589,389 @@ fn reconstruct_archived_contiguous_skips_get_tx_full() {
 }
 
 #[test]
+fn reconstruct_pruned_returns_pruned_not_corrupt() {
+    let (dir, q) = temp_query("reconstruct-pruned");
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    let mut hashes = Vec::new();
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent_hash);
+        parent_hash = Some(header.hash);
+        hashes.push(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    let fks0 = q.block_tx_fks(Height(0)).unwrap();
+    assert!(
+        !q.seqsigwit_available(fks0[0]).unwrap(),
+        "height 0 must be at/below watermark"
+    );
+    let err = q.reconstruct_archived_block(&hashes[0]).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { height: 0 }),
+        "below watermark must be Pruned, not {err:?}"
+    );
+    let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.witness_block_bytes_by_hash(&hashes[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.tx_wire_bytes(fks0[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let err = q.reconstruct_tx(fks0[0]).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    assert_eq!(q.block_txids(Height(0)).unwrap().len(), 1);
+    assert!(q.tx_output_at_fk(fks0[0], 0).is_ok());
+    let kept = q.reconstruct_archived_block(&hashes[1]).unwrap().unwrap();
+    assert_eq!(kept.txdata.len(), 1);
+    let fks1 = q.block_tx_fks(Height(1)).unwrap();
+    assert!(q.seqsigwit_available(fks1[0]).unwrap());
+    assert!(q.tx_wire_bytes(fks1[0]).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn unstamp_txstat(q: &Query, fk: Fk) {
+    q.store()
+        .write_txstat_row(
+            fk,
+            &TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn stamp_txstat_from_block_coinbase_and_spend() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, q) = temp_query("stamp-txstat-from-block");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    let hfk0 = q
+        .connect_block(Height(0), &h0, std::slice::from_ref(&t0))
+        .unwrap();
+    let fk0 = q.block_tx_fks(Height(0)).unwrap()[0];
+    unstamp_txstat(&q, fk0);
+    assert!(q.txstat_row(fk0).unwrap().is_none());
+
+    let empty = bitcoin::Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![],
+    };
+    let err = q.stamp_txstat_from_block(Height(99), &empty).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat missing header")),
+        "{err:?}"
+    );
+    let err = q.stamp_txstat_from_block(Height(0), &empty).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat fk count")),
+        "{err:?}"
+    );
+
+    let b0 = q.reconstruct_archived_block(&hash0).unwrap().unwrap();
+    q.stamp_txstat_from_block(Height(0), &b0).unwrap();
+    let row0 = q.txstat_row(fk0).unwrap().expect("stamped coinbase");
+    assert_eq!(q.store().input_n_in(fk0).unwrap(), Some(1));
+    assert_eq!(row0.fee_sat, 0);
+    assert_eq!(row0.size() as usize, b0.txdata[0].total_size());
+
+    let (h1, cb1) = coinbase_block(1, hfk0, Some(hash0));
+    let foreign = TxApply {
+        tx: TxRecord {
+            txid: [0x11; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: t0.tx.txid,
+            create_fk: fk0,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+    };
+    q.connect_block(Height(1), &h1, &[cb1, foreign]).unwrap();
+    let fks1 = q.block_tx_fks(Height(1)).unwrap();
+    for &fk in &fks1 {
+        unstamp_txstat(&q, fk);
+    }
+    let b1 = q.reconstruct_archived_block(&h1.hash).unwrap().unwrap();
+    q.stamp_txstat_from_block(Height(1), &b1).unwrap();
+    let foreign_row = q.txstat_row(fks1[1]).unwrap().expect("stamped spend");
+    assert_eq!(q.store().input_n_in(fks1[1]).unwrap(), Some(1));
+    assert_eq!(foreign_row.fee_sat, 1_0000_0000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn txstat_row_merges_overflow_via_header_blob() {
+    let (dir, q) = temp_query("txstat-row-ovf");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hfk = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    assert!(q.store().txstat_row(fk).unwrap().is_some());
+    let fat = TxStatRow {
+        fee_sat: u64::from(u32::MAX),
+        base: 4_000_000,
+        wit_extra: 4_000_000,
+    };
+    q.store()
+        .write_txstat_block(hfk, fk.get().unwrap(), &[fat])
+        .unwrap();
+    assert_eq!(q.store().txstat_row(fk).unwrap(), Some(fat));
+    unstamp_txstat(&q, fk);
+    assert_eq!(q.store().txstat_row(fk).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reorg_through_pruneheight_refuses() {
+    let (dir, q) = temp_query("reorg-pruneheight");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let prev = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev, Some(hash0));
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let err = q.disconnect_tip().unwrap_err();
+    assert!(
+        matches!(err, StoreError::Pruned { height: 0 }),
+        "disconnect at/below pruneheight must be Pruned, got {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_watermark_survives_reopen() {
+    let (dir, q) = temp_query("prune-reopen");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(0)));
+    assert!(q.prune_seqsigwit());
+    let err = q.reconstruct_block_at_height(Height(0)).unwrap_err();
+    assert!(matches!(err, StoreError::Pruned { height: 0 }), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ibd_ram_window_keeps_last_288_heights() {
+    let (dir, q) = temp_query("prune-ibd-ram-window");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_seqsigwit_ram_threshold_bytes(1 << 30).unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..320u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0x44; 96]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let (heights, fks, _bytes, evictions) = q.seqsigwit_ram_window_stats();
+    assert!(heights <= Query::SEQSIGWIT_KEEP_HEIGHTS as usize);
+    assert!(fks <= Query::SEQSIGWIT_KEEP_HEIGHTS as usize);
+    assert!(evictions > 0, "old heights must be evicted");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
+    let (dir, q) = temp_query("prune-ram-replace");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_seqsigwit_ram_threshold_bytes(1 << 30).unwrap();
+    let (h0, mut t0) = coinbase_block(0, Fk::NULL, None);
+    t0.inputs[0].witness = vec![vec![0x11; 16]];
+    let hash0 = h0.hash;
+    let prev = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let (h1, mut t1) = coinbase_block(1, prev, Some(hash0));
+    t1.inputs[0].witness = vec![vec![0x22; 16]];
+    q.connect_block(Height(1), &h1, &[t1]).unwrap();
+    assert_eq!(q.seqsigwit_ram_window_stats().1, 2);
+    q.disconnect_tip().unwrap();
+    assert_eq!(
+        q.seqsigwit_ram_window_stats().1,
+        1,
+        "disconnect must drop that height's seqsigwit"
+    );
+    let (h1b, mut t1b) = coinbase_block(1, prev, Some(hash0));
+    t1b.inputs[0].witness = vec![vec![0x33; 16]];
+    q.connect_block(Height(1), &h1b, &[t1b]).unwrap();
+    let (heights, fks, _, _) = q.seqsigwit_ram_window_stats();
+    assert_eq!(heights, 2);
+    assert_eq!(
+        fks, 2,
+        "replaced height must not keep the disconnected create"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ibd_ram_window_honors_byte_threshold() {
+    let (dir, q) = temp_query("prune-ibd-ram-threshold");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    q.set_seqsigwit_ram_threshold_bytes(80).unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..8u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0x77; 128]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let (_heights, _fks, bytes, evictions) = q.seqsigwit_ram_window_stats();
+    assert!(bytes <= 80, "bytes={bytes}");
+    assert!(evictions > 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
+    let (dir, q) = temp_query("prune-ibd-ram-serve");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..300u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0x99; 48]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    q.apply_prune_seqsigwit_tip().unwrap();
+    let fk0 = q.block_tx_fks(Height(299)).unwrap()[0];
+    let tx0 = q.get_tx(fk0).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk0, &tx0, 0).unwrap().witness.len(),
+        1,
+        "recent witness is served from RAM"
+    );
+    let window = q.store.path().join("seqsigwit.window");
+    for ent in std::fs::read_dir(&window).unwrap() {
+        let p = ent.unwrap().path();
+        assert_eq!(p.parent(), Some(window.as_path()), "{p:?}");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        let stem = name.strip_suffix(".bin").expect(name);
+        assert!(stem.parse::<u32>().is_ok(), "{name}");
+    }
+    drop(q);
+    let q2 = Query::open_or_create_tiny(dir.path()).unwrap();
+    let tx1 = q2.get_tx(fk0).unwrap();
+    assert_eq!(
+        q2.tx_input_at_fk(fk0, &tx1, 0).unwrap().witness.len(),
+        1,
+        "recent witness is served from spill after restart"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn spill_symlink_outside_window_is_corrupt() {
+    let (dir, q) = temp_query("prune-spill-symlink");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0x42; 16]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let spill = q.store.path().join("seqsigwit.window").join("0.bin");
+    let outside = dir.path().join("outside.bin");
+    std::fs::rename(&spill, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &spill).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let tx = q.get_tx(fk).unwrap();
+    let err = q.tx_input_at_fk(fk, &tx, 0).unwrap_err();
+    assert!(
+        matches!(err, rbitcoin_store::StoreError::Corrupt(msg) if msg.contains("escaped")),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_ram_threshold_zero_spills_tiny_blocks() {
+    let (dir, q) = temp_query("prune-ram-zero");
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let (header, mut ta) = coinbase_block(0, Fk::NULL, None);
+    ta.inputs[0].witness = vec![vec![0x11]];
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let (heights, fks, bytes, _) = q.seqsigwit_ram_window_stats();
+    assert_eq!(heights, 0, "threshold 0 keeps no RAM heights");
+    assert_eq!(fks, 0);
+    assert_eq!(bytes, 0);
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fk, &tx, 0).unwrap().witness,
+        vec![vec![0x11]],
+        "tiny block is served from the height file"
+    );
+    assert!(q.store.path().join("seqsigwit.window/0.bin").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enable_prune_after_history_seeds_recent_spill_window() {
+    let (dir, q) = temp_query("prune-enable-seed");
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..300u32 {
+        let (header, mut ta) = coinbase_block(h, prev, parent_hash);
+        ta.inputs[0].witness = vec![vec![0x55; 72]];
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let tip_fk = q.block_tx_fks(Height(299)).unwrap()[0];
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    let tx = q.get_tx(tip_fk).unwrap();
+    assert_eq!(q.tx_input_at_fk(tip_fk, &tx, 0).unwrap().witness.len(), 1);
+    drop(q);
+    let q2 = Query::open_or_create_tiny(dir.path()).unwrap();
+    let tx = q2.get_tx(tip_fk).unwrap();
+    assert_eq!(q2.tx_input_at_fk(tip_fk, &tx, 0).unwrap().witness.len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_mode_refuses_disable() {
+    let (dir, q) = temp_query("prune-disable-refuse");
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    let err = q.set_prune_seqsigwit(false).unwrap_err().to_string();
+    assert!(err.contains("refusing to disable prune-seqsigwit"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn reconstruct_span_batches_foreign_parent_txids() {
     let (dir, q) = temp_query("reconstruct-parent-batch");
     let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
@@ -2933,14 +3316,14 @@ fn sh_collect_and_disconnect_skip_get_tx_full() {
     assert_eq!(recs.len(), 1);
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "cold SH collect must not zip inwit: {:?}",
+        "cold SH collect must not zip seqsigwit: {:?}",
         q.store().tx_full_gets()
     );
     q.store().reset_tx_full_gets();
     q.disconnect_tip().unwrap();
     assert!(
         q.store().tx_full_gets().is_empty(),
-        "disconnect SH unlink must not zip inwit: {:?}",
+        "disconnect SH unlink must not zip seqsigwit: {:?}",
         q.store().tx_full_gets()
     );
 

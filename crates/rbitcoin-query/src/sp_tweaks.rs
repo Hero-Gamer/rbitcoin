@@ -298,7 +298,7 @@ impl Query {
     /// Empty `Ok(vec![])` means the first height is not indexed (caller falls
     /// back per-height). Eligible Class A join is **one sequential `txout`
     /// span** from first..=last eligible fk in the wave (ineligible txout in
-    /// the hole is included; `inwit` is not). `sp_tweaks` mutex is not held
+    /// the hole is included; `seqsigwit` is not). `sp_tweaks` mutex is not held
     /// during Class A IO. `limits.cut_through` drops confirmed-spent P2TR
     /// outs after the join (spent range from the same `create.loc` pair as the
     /// body join, then one spent-body walk per create; txs with none left are
@@ -594,7 +594,7 @@ mod tests {
         (p2wpkh, p2tr, ser.to_vec())
     }
 
-    /// Fat **inwit** between eligible txs must stay out of the `txout` span.
+    /// Fat **seqsigwit** between eligible txs must stay out of the `txout` span.
     #[test]
     fn load_thin_skips_fat_ineligible_between_eligible() {
         let (dir, q) = tmp_q();
@@ -697,12 +697,12 @@ mod tests {
             .unwrap();
 
         let fks = q.block_tx_fks(Height(1)).unwrap();
-        let elig_a = q.store().tx_inwit_range(fks[0]).unwrap();
-        let fat = q.store().tx_inwit_range(fks[1]).unwrap();
-        let elig_b = q.store().tx_inwit_range(fks[2]).unwrap();
+        let elig_a = q.store().tx_seqsigwit_range(fks[0]).unwrap();
+        let fat = q.store().tx_seqsigwit_range(fks[1]).unwrap();
+        let elig_b = q.store().tx_seqsigwit_range(fks[2]).unwrap();
         assert!(
             fat.1 > 8_000,
-            "fat ineligible inwit row too small: {}",
+            "fat ineligible seqsigwit row too small: {}",
             fat.1
         );
         let elig_sum = elig_a.1.saturating_add(elig_b.1);
@@ -738,7 +738,7 @@ mod tests {
 
     /// Notify `output_pubkeys` come from `txout` only. One sequential span from
     /// first..=last eligible in the wave (ineligible txout in the hole is
-    /// included; fat **inwit** stays out).
+    /// included; fat **seqsigwit** stays out).
     #[test]
     fn load_thin_span_reads_ineligible_txout_between_eligible() {
         let (dir, q) = tmp_q();

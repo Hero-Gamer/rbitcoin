@@ -73,7 +73,7 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 4. **CJDNS TUN** — A/B `--cjdns-reachable` on real `fc00::/8`. `getpeerinfo.network=cjdns` on both sides. `getnetworkinfo.localaddresses` lists each TUN address without `--external-ip`. TUN create failure is a hard fail.
 5. **Ephemeral broadcast** — A `--proxy` (real Tor SOCKS); standing onion peer to B; `sendrawtransaction`; standing session must not INV that tx; a one-shot circuit delivers `tx`.
 
-Out of this harness: 09 inwit-prune; public overlays; replacing NixOS
+Out of this harness: 09 seqsigwit-prune; public overlays; replacing NixOS
 module dummy `tor`/`i2pd` units ([`nixos-module-runtime`](../nix/tests/nixos-module-runtime.nix)
 stays argv / `After=` only).
 

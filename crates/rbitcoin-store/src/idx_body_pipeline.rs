@@ -1,4 +1,4 @@
-//! **loc → body** pipeline for confirm load (`txout` / `inwit` stems).
+//! **loc → body** pipeline for confirm load (`txout` / `seqsigwit` stems).
 //!
 //! Ranges from [`crate::create_loc::CreateLoc`] / [`crate::delta_loc::DeltaLoc`]
 //! (FdOnly). Body backend from
@@ -18,7 +18,7 @@ use rbitcoin_primitives::Fk;
 /// What body bytes to fetch after the range is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyMode {
-    /// Full record (txout or inwit).
+    /// Full record (txout or seqsigwit).
     Full,
     /// `txout` outs / pin: starting OS page, or full span if need is likely to spill.
     Outs,
@@ -40,7 +40,7 @@ pub struct IdxBodyJob {
     pub ok: bool,
     /// Sparse Outs need (sorted unique). Empty = all outs (SH / ensure).
     pub need_vouts: Vec<u32>,
-    /// Loc `n_out` (≥ 1) for txout decode. Unused for inwit/full.
+    /// Loc `n_out` (≥ 1) for txout decode. Unused for seqsigwit/full.
     pub n_out: u32,
 }
 
@@ -301,7 +301,7 @@ pub fn run_idx_body_pipeline_backend(
     if jobs.is_empty() {
         return Ok(IdxBodyIoStats::default());
     }
-    // Callers stamp `range` from create.loc / inwit.loc. Missing range → skip.
+    // Callers stamp `range` from create.loc / seqsigwit.loc. Missing range → skip.
 
     let body_fd = table.body_read_fd();
     let body_pub = table.body_published_len();

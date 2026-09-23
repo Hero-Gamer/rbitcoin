@@ -984,7 +984,7 @@ impl Query {
                 }
             }
             if !hit {
-                let (_, prevs) = self.store.get_tx_meta_and_prevouts(*fk)?;
+                let prevs = self.tx_prevouts_for_fk(*fk)?;
                 for (create_fk, _) in prevs {
                     if let Some(id) = create_fk.get() {
                         if posting.binary_search(&id).is_ok() {
@@ -1218,7 +1218,8 @@ impl Query {
         for h in 0..=tip.0 {
             let fks = self.block_tx_fks(Height(h))?;
             for (ti, fk) in fks.into_iter().enumerate() {
-                let (tx, _ins, outs) = self.store.get_tx_full(fk)?;
+                let tx = self.get_tx(fk)?;
+                let (_meta, outs) = self.store.get_tx_meta_and_outputs(fk)?;
                 let coinbase = ti == 0;
                 for (vout, o) in outs.iter().enumerate() {
                     if !scripts.iter().any(|s| s.as_slice() == o.script.as_slice()) {

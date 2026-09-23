@@ -461,7 +461,7 @@ impl LivePeer {
         self.next_local_addr_send
             .compare_exchange(prev, next, Ordering::Relaxed, Ordering::Relaxed)
             .ok()?;
-        let services = crate::peer::local_service_flags();
+        let services = crate::peer::local_service_flags_pruned(hub.is_pruned());
         let t = now as u32;
         if self.wants_addrv2() {
             let mut v = Vec::new();
@@ -1162,6 +1162,7 @@ pub struct PeerHub {
     cjdns_reachable: AtomicBool,
     /// Core `-i2psam`: I2P rows may enter addrman. Off, they are still relayed.
     i2p_reachable: AtomicBool,
+    pruned: AtomicBool,
     asmap: Mutex<Option<Arc<crate::asmap::AsMap>>>,
     /// Tip-mode mempool for Core `EraseForPeer` on disconnect.
     mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
@@ -1251,6 +1252,7 @@ impl PeerHub {
             clearnet_listen: AtomicBool::new(true),
             cjdns_reachable: AtomicBool::new(false),
             i2p_reachable: AtomicBool::new(false),
+            pruned: AtomicBool::new(false),
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
@@ -1347,6 +1349,14 @@ impl PeerHub {
     /// Core sets `NET_I2P` reachable only when `-i2psam` is configured.
     pub fn set_i2p_reachable(&self, on: bool) {
         self.i2p_reachable.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_pruned(&self, on: bool) {
+        self.pruned.store(on, Ordering::Relaxed);
+    }
+
+    pub fn is_pruned(&self) -> bool {
+        self.pruned.load(Ordering::Relaxed)
     }
 
     pub fn set_listen_port(&self, port: u16) {

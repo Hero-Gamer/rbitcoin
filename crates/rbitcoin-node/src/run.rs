@@ -481,6 +481,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     addrman.set_cjdns_reachable(config.listen.cjdns_reachable);
     node.peers
         .set_cjdns_reachable(config.listen.cjdns_reachable);
+    node.peers.set_pruned(config.prune_seqsigwit);
     node.peers.set_asmap(asmap);
     for c in &config.listen.connect {
         addrman.add_addr(*c);
@@ -1252,6 +1253,16 @@ fn apply_startup_index_mode(
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
     query.set_max_sh_creates(config.max_sh_creates);
+    query.set_seqsigwit_ram_threshold_bytes(config.prune_seqsigwit_ram_threshold_bytes)?;
+    if !config.prune_seqsigwit && query.prune_seqsigwit() {
+        return Err(NodeError::Config(
+            "datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled".into(),
+        ));
+    }
+    if config.prune_seqsigwit {
+        query.set_prune_seqsigwit(true)?;
+        query.apply_prune_seqsigwit_tip()?;
+    }
     if let Err(e) =
         query.set_sptweaks_enabled(config.sptweaks, rbitcoin_primitives::Height(taproot_height))
     {
@@ -1921,6 +1932,31 @@ mod tests {
             .with_datadir(dir.as_ref())
             .with_network(rbitcoin_primitives::Network::Regtest)
             .with_tiny_heads()
+    }
+
+    #[test]
+    fn startup_refuses_non_pruned_config_on_pruned_datadir() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-prune-refuse-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("store");
+        let q = Query::open_or_create_tiny(&store).unwrap();
+        q.set_prune_seqsigwit(true).unwrap();
+        q.set_pruneheight(Some(rbitcoin_primitives::Height(0)))
+            .unwrap();
+        let mut cfg = tiny_regtest(&dir);
+        cfg.prune_seqsigwit = false;
+        let err = apply_startup_index_mode(&q, &cfg, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pruned-seqsigwit") || err.contains("--prune-seqsigwit"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale redial.

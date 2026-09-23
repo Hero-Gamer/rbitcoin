@@ -254,6 +254,15 @@ pub async fn ibd_cancellable(
     cfg: IbdConfig,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<u32, NetError> {
+    struct IbdModeGuard(std::sync::Arc<rbitcoin_query::Query>);
+    impl Drop for IbdModeGuard {
+        fn drop(&mut self) {
+            self.0.set_ibd_mode(false);
+        }
+    }
+    hub.query.set_ibd_mode(true);
+    let _ibd_mode_guard = IbdModeGuard(Arc::clone(&hub.query));
+
     if peers.is_empty() {
         return Err(NetError::Protocol("no peers for ibd"));
     }

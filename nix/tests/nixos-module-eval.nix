@@ -45,6 +45,7 @@ let
             acceptIncoming = true;
           };
           cjdns.reachable = true;
+          pruneSeqSigWit = true;
           p2p = {
             address = "127.0.0.1";
             openFirewall = true;
@@ -150,6 +151,7 @@ assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;
 assert builtins.match ".*--i2p-accept-incoming.*" execStart != null;
 assert builtins.match ".*--listen-onion.*" execStart != null;
 assert builtins.match ".*--cjdns-reachable.*" execStart != null;
+assert builtins.match ".*--prune-seqsigwit.*" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
 assert builtins.elem "i2pd.service" service.after;

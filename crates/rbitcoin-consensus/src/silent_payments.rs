@@ -284,7 +284,7 @@ pub fn tweaks_for_height(
 
     let mut jobs: Vec<([u8; 32], bitcoin::Transaction, Vec<TxOut>)> = Vec::new();
     for t in &wave.txs {
-        if !t.need_inwit {
+        if !t.need_seqsigwit {
             continue;
         }
         let Some(inputs) = t.inputs.as_ref() else {
@@ -1398,7 +1398,7 @@ mod tests {
 
     /// Fat non-P2TR sibling must not change the P2TR tweak (txout-first filter).
     #[test]
-    fn tweaks_for_height_skips_inwit_on_non_p2tr_sibling() {
+    fn tweaks_for_height_skips_seqsigwit_on_non_p2tr_sibling() {
         use bitcoin::hashes::hash160;
         use bitcoin::secp256k1::SecretKey;
         let (dir, q) = tmp_store();

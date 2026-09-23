@@ -413,6 +413,7 @@ pub(crate) struct IbdPerfSample {
     pub arch_write_head_ms: u64,
     pub arch_write_spend_ms: u64,
     pub arch_write_htxs_ms: u64,
+    pub arch_write_txstat_ms: u64,
     pub arch_write_flush_ms: u64,
     pub arch_write_blocks: u64,
 
@@ -638,6 +639,7 @@ impl Default for IbdPerfSample {
             arch_write_head_ms: 0,
             arch_write_spend_ms: 0,
             arch_write_htxs_ms: 0,
+            arch_write_txstat_ms: 0,
             arch_write_flush_ms: 0,
             arch_write_blocks: 0,
             rss_kb: 0,
@@ -1094,6 +1096,7 @@ pub(crate) fn sample(
         arch_write_head_ms: ns_ms(w.arch_write_head_ns),
         arch_write_spend_ms: ns_ms(w.arch_write_spend_ns),
         arch_write_htxs_ms: ns_ms(w.arch_write_htxs_ns),
+        arch_write_txstat_ms: ns_ms(w.arch_write_txstat_ns),
         arch_write_flush_ms: ns_ms(w.arch_write_flush_ns),
         arch_write_blocks: w.arch_write_blocks,
         rss_kb: rss.rss_kb,
@@ -1164,6 +1167,7 @@ fn append_write_inventory_info(out: &mut String, s: &IbdPerfSample) {
     for (name, ms, _) in WriteStageSample::INVENTORY {
         let v = ms(&s.write);
         match *name {
+            "class_a" => out.push_str(&format!(" {name}={v}ms(txstat={})", s.arch_write_txstat_ms)),
             "ensure" => out.push_str(&format!(
                 " {name}={v}ms(pin={} cold={})",
                 s.ensure_res_hit, s.ensure_cold_n
@@ -1186,6 +1190,10 @@ fn append_write_inventory_debug(out: &mut String, s: &IbdPerfSample, us: impl Fn
     for (name, _, ns) in WriteStageSample::INVENTORY {
         let v = us(ns(&s.write));
         match *name {
+            "class_a" => out.push_str(&format!(
+                " {name}={v}(txstat={})",
+                us(s.arch_write_txstat_ms.saturating_mul(1_000_000))
+            )),
             "struct" => out.push_str(&format!(
                 " {name}={v} spent={} create_h={} bip68={}",
                 us(s.structural_spent_ns),
@@ -1457,10 +1465,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "ovl_n", s.ovl_n);
     if s.arch_write_body_ms > 0 || s.arch_write_head_ms > 0 || s.arch_write_htxs_ms > 0 {
         out.push_str(&format!(
-            " class_a_sub(body={} head={} htxs={} reserve={})",
+            " class_a_sub(body={} head={} htxs={} txstat={} reserve={})",
             s.arch_write_body_ms,
             s.arch_write_head_ms,
             s.arch_write_htxs_ms,
+            s.arch_write_txstat_ms,
             s.arch_write_reserve_ms,
         ));
     }
@@ -1637,12 +1646,13 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         let ca_head_us_blk = div_or_0(s.arch_write_head_ms * 1000, s.arch_write_blocks);
         let ca_body_us_blk = div_or_0(s.arch_write_body_ms * 1000, s.arch_write_blocks);
         out.push_str(&format!(
-            " | class_a_commit total={} body={} head={} htxs={} reserve={} spend={} flush={} blks={} \
+            " | class_a_commit total={} body={} head={} htxs={} txstat={} reserve={} spend={} flush={} blks={} \
              ca_head_us/blk={} ca_body_us/blk={}",
             s.arch_write_total_ms,
             s.arch_write_body_ms,
             s.arch_write_head_ms,
             s.arch_write_htxs_ms,
+            s.arch_write_txstat_ms,
             s.arch_write_reserve_ms,
             s.arch_write_spend_ms,
             s.arch_write_flush_ms,

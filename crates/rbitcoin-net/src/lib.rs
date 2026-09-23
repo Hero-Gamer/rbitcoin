@@ -51,8 +51,8 @@ pub use net_permissions::{
 pub use netaddr::{is_cjdns_ip, NetAddr, OnlyNet};
 pub use netgroup::netgroup;
 pub use peer::{
-    drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags, run_feeler_timed,
-    PendingBlocks, V2PlainSession, MAX_SERVE_BLOCKS,
+    drain_pending_now, flush_tx_invs, force_announce_txid, local_service_flags,
+    local_service_flags_pruned, run_feeler_timed, PendingBlocks, V2PlainSession, MAX_SERVE_BLOCKS,
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{

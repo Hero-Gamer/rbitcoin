@@ -234,7 +234,7 @@ pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<
     let tx = ctx
         .query
         .reconstruct_tx(fk)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        .map_err(|e| map_query(e, "Transaction not available (pruned data)"))?;
     if !verbose {
         return Ok(json!(serialize_hex(&tx)));
     }

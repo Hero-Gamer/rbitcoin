@@ -171,6 +171,13 @@ pub const ERR_VERIFY_REJECTED: i64 = -26;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 
+pub(crate) fn map_query(e: rbitcoin_query::QueryError, pruned: &'static str) -> Value {
+    match e {
+        rbitcoin_store::StoreError::Pruned { .. } => rpc_error(ERR_INVALID_PARAMETER, pruned),
+        other => rpc_error(ERR_MISC, other.to_string()),
+    }
+}
+
 /// JSON-RPC `params`: positional array or Core named object.
 #[derive(Clone, Debug, Default)]
 pub struct RpcParams {
@@ -641,13 +648,13 @@ const NAMED_HELP: &[(&str, &str)] = &[
          initialblockdownload is relay-inhibited after densify (min-chain-work +\n\
          max-tip-age), not still catching up. chainwork is summed header work\n\
          (regtest 2/block). size_on_disk is a walk of store file lengths (plus\n\
-         cold inwit when split). verificationprogress is blocks/headers (1.0 when\n\
+         cold seqsigwit when split). verificationprogress is blocks/headers (1.0 when\n\
          headers is 0).",
     ),
     (
         "getblockstats",
         "getblockstats hash_or_height ( stats )\n\
-         Reconstruct the block and return fee / UTXO / weight statistics.",
+         Fee / UTXO / weight statistics from stamped txstat rows (reconstruct fallback).",
     ),
     (
         "generatetoaddress",

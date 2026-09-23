@@ -15,7 +15,7 @@ allow = [
   "NodeConfig::apply_kv",
   "StrongTxTable::count_ones_bits",
   "StrongTxTable::set_bits_range",
-  "TxTable::open_inwit",
+  "TxTable::open_seqsigwit",
   "TxTable::put_spend_batch_by_abs_meta",
   "UringSession::submit_and_wait_one",
   "cli_main",

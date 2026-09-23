@@ -297,7 +297,7 @@ fn operator_usage() -> String {
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
-    [--sh-index] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--sh-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -335,13 +335,16 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
+  --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
+    Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
+  --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses Electrum/Esplora joins with more than N creates (0 = unlimited).\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
-Cold files: --datadir-cold PATH puts Class A inwit.body/idx under PATH/store (HDD).\n\
+Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
@@ -377,6 +380,7 @@ fn is_bool_key(key: &str) -> bool {
     matches!(
         key,
         "sh_index"
+            | "prune_seqsigwit"
             | "sp_tweaks"
             | "esplora_block_template"
             | "esplora_onion"
@@ -578,6 +582,7 @@ mod tests {
             "--net-permission-force-relay",
             "--signet-block-time",
             "--sh-index",
+            "--prune-seqsigwit",
             "--sp-tweaks",
             "--sp-tweaks-dust",
             "--esplora-block-template",
@@ -987,6 +992,34 @@ mod tests {
         assert!(
             !h.contains("--onlynet"),
             "help must not advertise concatenated --onlynet"
+        );
+    }
+
+    #[test]
+    fn prune_seqsigwit_is_kebab() {
+        let on = ready_config([
+            "rbitcoin-node",
+            "--prune-seqsigwit",
+            "--prune-seqsigwit-ram-threshold-bytes=4096",
+        ]);
+        assert!(on.prune_seqsigwit);
+        assert_eq!(on.prune_seqsigwit_ram_threshold_bytes, 4096);
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("prune_seqsigwit", "1").unwrap();
+        conf.apply_kv("prune_seqsigwit_ram_threshold_bytes", "8192")
+            .unwrap();
+        assert!(conf.prune_seqsigwit);
+        assert_eq!(conf.prune_seqsigwit_ram_threshold_bytes, 8192);
+        conf.apply_kv("prune_seqsigwit_ram_threshold_bytes", "0")
+            .unwrap();
+        assert_eq!(conf.prune_seqsigwit_ram_threshold_bytes, 0);
+        let h = operator_usage();
+        assert!(h.contains("--prune-seqsigwit"));
+        assert!(h.contains("--prune-seqsigwit-ram-threshold-bytes"));
+        assert!(!h.contains("--pruneseqsigwit"));
+        assert_exit(
+            cli_main(["rbitcoin-node", "--pruneseqsigwit"]),
+            ExitCode::from(2),
         );
     }
 
@@ -1534,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn smoke_datadir_cold_puts_inwit_on_cold_store() {
+    fn smoke_datadir_cold_puts_seqsigwit_on_cold_store() {
         let _g = OPERATOR_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1559,10 +1592,10 @@ mod tests {
         assert_exit(code, ExitCode::SUCCESS);
         assert!(hot.join("store").is_dir());
         assert!(hot.join("store/txout.body").is_file());
-        assert!(!hot.join("store/inwit.body").exists());
-        assert!(cold.join("store/inwit.body").is_file());
-        assert!(cold.join("store/inwit.loc").is_file());
-        assert!(hot.join("store").join("inwit.reloc").is_file());
+        assert!(!hot.join("store/seqsigwit.body").exists());
+        assert!(cold.join("store/seqsigwit.body").is_file());
+        assert!(cold.join("store/seqsigwit.loc").is_file());
+        assert!(hot.join("store").join("seqsigwit.reloc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

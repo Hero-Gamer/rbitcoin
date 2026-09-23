@@ -1,12 +1,12 @@
-# 09 — Prune inputs and witnesses (`inwit`); advertise `NODE_NETWORK_LIMITED`
+# 09 — Prune inputs and witnesses (`seqsigwit`); advertise `NODE_NETWORK_LIMITED`
 
 ## Goal
 
-A home node can drop **Class A `inwit` (scriptSig + witness + input prevout
-encoding)** for creates below a prune watermark, reclaiming the ~486 GiB cold
-stem ([`SCHEMA.md`](../../SCHEMA.md)), while still:
+A home node can stop serving **Class A seqsigwit** (scriptSig + witness + input
+prevout encoding) below a 288-height watermark. Unpruned nodes keep
+`seqsigwit.body`. Pruned nodes serve only the kept window, while still:
 
-1. Confirming new blocks (IBD and tip write `inwit` first, drop later).
+1. Confirming new blocks (each connected height is recorded in the window).
 2. Reorging within the kept window.
 3. Serving the last **288 heights** on P2P (BIP159 **`NODE_NETWORK_LIMITED`**).
 4. Serving wallet **scripthash / UTXO / status / outspend / vout** paths that
@@ -16,11 +16,19 @@ This is **not** Core `-prune` of entire `blk*.dat` files. We keep headers,
 `txout`, `spent`, `txid.body`, SH, tweaks. We drop old **inputs and
 witnesses**.
 
-**Layout:** a **rolling 288-height inwit stem** (append a segment, unlink the
-oldest). Not `FALLOC_FL_PUNCH_HOLE` on the genesis-length `inwit.body`.
-Orphan / stale / side-branch blocks at kept heights mean **more than 288
-inwit blocks** on disk — the pin is 288 **heights** behind tip, not 288
-records.
+**Layout:** two modes, not a rolling `seqsigwit.body`.
+
+- **Unpruned** (default): Class A `seqsigwit.body` is the witness archive.
+  Reconstruct, getdata, and wire RPC read it.
+- **`--prune-seqsigwit`:** witness below the watermark is not served. The last
+  **288 heights** are one file each, `store/seqsigwit.window/{height}.bin`, plus
+  a RAM cache of those heights capped by
+  `--prune-seqsigwit-ram-threshold-bytes` (default 256 MiB). **`0` keeps nothing
+  in RAM** — every height, including tiny IBD blocks, is read back from its
+  file. `pruneheight = tip - 288` once `tip > 288`. Kept heights are
+  `h > pruneheight`. A reorg at a kept height replaces that height's file.
+  Disconnect at or below `pruneheight` fails closed. No `SCHEMA_VERSION`
+  bump: the mode is the `{store}/seqsigwit.prune` sidecar.
 
 **JSON vs wire:** serve **honest partial objects** (vout/status/txids we still
 have). Refuse **wire** (hex/raw/P2P block/tx) rather than invent vin, fee,
@@ -38,7 +46,7 @@ BIP159 / Core:
 They are alternatives: a pruned Core node advertises `NETWORK_LIMITED|WITNESS`,
 **not** `NETWORK`. 288 is `MIN_BLOCKS_TO_KEEP` on the **active chain**. Our
 store window is the same 288 **heights** behind tip; orphan / stale blocks
-at those heights are extra inwit, not a reason to drop below 288 heights.
+at those heights are extra seqsigwit, not a reason to drop below 288 heights.
 A different constant,
 [`NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS` = 144](../../crates/rbitcoin-net/src/peer.rs),
 is only for **outbound selection** (do not IBD-deep from a limited peer). Do
@@ -50,87 +58,26 @@ Today we advertise `NETWORK|WITNESS|P2P_V2` and tests pin **no**
 advertises `NETWORK_LIMITED|WITNESS|P2P_V2`. DNS/seed **desire** for IBD still
 asks `NETWORK` (full) peers; VERSION bits we *offer* are limited.
 
-## Rolling inwit window (not punch)
+## Kept window (288 height files + RAM)
 
-### Why punch is the wrong tool here
+Unpruned nodes read `seqsigwit.body`. Pruned nodes serve witness only from the
+window:
 
-`inwit.body` is one append-only Class A stem. Loc is **stride-8** and records
-are packed (empty inwit is an **8-byte** zero pad;
-[`SCHEMA.md`](../../SCHEMA.md)). `TableFile::zero_range` already has Linux
-`FALLOC_FL_PUNCH_HOLE` (`KEEP_SIZE`).
+- Confirm writes `store/seqsigwit.window/{height}.bin` for the connected height.
+- RAM holds those heights while the encoded input bytes stay under
+  `--prune-seqsigwit-ram-threshold-bytes`. **`0` skips RAM** and every lookup
+  reads the height file.
+- When the tip moves, files with `height <= pruneheight` are removed.
+  `pruneheight` is `tip - 288` (a height, not a count of files).
+- Enabling prune on an archive that already has `seqsigwit.body` copies the kept
+  heights into the window once. After that, serving does not depend on a
+  rolling stem. A datadir that already has `seqsigwit.prune` and is opened
+  without `--prune-seqsigwit` refuses to start.
+- `--datadir-cold` still places `seqsigwit.body` on the cold path. The window
+  stays under the hot store next to `seqsigwit.prune`.
 
-That primitive is a poor reclaim path for this table:
-
-| Fact | Consequence |
-|------|-------------|
-| Punch is **filesystem-block aligned** (4 KiB typical) | A few-hundred-byte inwit record shares a page with neighbors. Per-tx (or even per-small-block) punch **cannot** free one create without eating live bytes next to it, or else no-ops on a sub-block range. |
-| One 486 GiB file, monotone `inwit.loc` abs | Per-record punch would split the extent tree into millions of holes. Journal + `fiemap` bloat; `stat`/`cp`/`tar` see a still-huge sparse file. |
-| SSD cost | Punch is TRIM of those extents, not a rewrite of the payload, so NAND write amp is not “rewrite 486 GiB”. The churn is **FS metadata** (extent map, journal) and FTL mapping updates. Coarse one-shot prefix punch is tolerable; **per-tx punch is not**. |
-| Logical size stays 486 GiB | Sparse `KEEP_SIZE` never shrinks `st_size`. Backups and NAS copies often expand the holes. |
-| Home-node IBD with prune on | We must **never allocate** 486 GiB in the first place. Punching a file we should not have grown is the wrong shape. |
-
-A single aligned prefix punch of `[0, first_kept_off)` **after** a full archive
-would reclaim `st_blocks` in one syscall. That is still a 486 GiB sparse inode
-forever, and it does not help prune-from-genesis. **Do not ship that as the
-production layout.**
-
-### Contract: append tail, unlink head
-
-Keep ≥ **288 connected heights** of inwit as a **small rolling log**
-(watermark is height, not a count of inwit blocks):
-
-- Confirm still encodes full inwit on the Class A write thread and **appends**
-  to the current segment (fallocate grow + pwrite + publish HWM — same
-  `TableFile` discipline as today).
-- When **every** height in a segment is `≤ pruneheight`, **unlink** the file
-  (background; not the confirm hot path). The OS drops the inode and TRIMs
-  the whole object. One create, one sequential write, one unlink per dropped
-  segment. A stale sibling at a still-kept height keeps the file.
-- Window size on disk: ~486 GiB / ~900k blocks × 288 ≈ **150–400 MiB** of
-  inwit on a linear chain (witness era toward the high end). Orphans at kept
-  heights add more (see below). A few files, not a sparse 486 GiB stem.
-
-**288 heights ≠ 288 inwit blocks.** `pruneheight` is
-`tip.saturating_sub(288 + buffer)` — a **height**. BIP159 / reorg need inwit
-for every create whose **connected height** is `> pruneheight`. A reorg
-leaves the disconnected (orphan / stale / side-branch) block’s inwit in
-Class A until that *height* falls out of the window. Two blocks at the same
-kept height are two inwit payloads. The rolling stem therefore often holds
-**more than 288 blocks of inwit** in order to keep **288 heights** behind
-tip. Do **not** unlink because “we already have 288 inwit blocks” while a
-kept height still has a stale sibling. Do not size the window by counting
-active-chain blocks only.
-
-**Segment grain (pin in SCHEMA, not both):** size-capped sealed files
-(**64 MiB** target, or the current height if a single block is larger), not
-one inode per height (288 main-chain heights is fine for the kernel; fewer
-files is less open/stat noise on reconstruct of a whole block). Unlink only
-when **every** height in the file is `≤ pruneheight`, including orphan
-heights in that file (may hold up to ~64 MiB extra).
-
-**Loc:** SCHEMA bump. Global monotone abs into one `inwit.body` cannot
-survive unlink of the prefix. Below watermark: loc **sentinel** (not a live
-span) so `get_tx_full` is `QueryError::Pruned` rather than `Corrupt`. Kept
-window: loc is **segment id + local off** (or height → segment map + per-file
-loc). Unexpected hole **inside** the window → `Corrupt("invariant: …")`.
-
-**Enable on an existing archive:** sequential **copy every inwit whose
-height is `> pruneheight`** (active chain **and** orphans in that height
-window) from the old `inwit.body` into the rolling stem, then **unlink** the
-genesis-length file. Do not punch it. A linear-chain copy is ~200 MiB; extra
-stale blocks in the window add more. Refuse leftover single-stem
-`inwit.body` without the new sidecar/schema (same commit as the format
-code).
-
-**Prune-from-genesis / IBD:** write only the rolling stem; never grow a
-historical body. Peak inwit bytes ≈ height window (plus orphan inwit at
-those heights) + one in-flight segment.
-
-**`--datadir-cold`:** rolling files live with today’s cold inwit, not the hot
-txout/spent dir.
-
-**Non-Linux:** unlink is portable. No punch fallback, no 1 MiB zero-fill of
-old records.
+Do not punch `seqsigwit.body`, and do not replace this window with a rolling
+segment log. The operator choice is the full stem, or the 288-height window.
 
 ## Partial JSON vs 404 / `pruned`
 
@@ -144,9 +91,9 @@ a coinbase; fake hex fails wallet verify.
 
 | Kind | Serve? | Why |
 |------|--------|-----|
-| **Wire** (Electrum hex, Esplora `/hex` `/raw`, RPC `getrawtransaction` / `getblock` v0/v2, P2P `getdata` block/tx, BIP37 merkleblock) | **Refuse** | Not a Bitcoin tx without inwit. |
+| **Wire** (Electrum hex, Esplora `/hex` `/raw`, RPC `getrawtransaction` / `getblock` v0/v2, P2P `getdata` block/tx, BIP37 merkleblock) | **Refuse** | Not a Bitcoin tx without seqsigwit. |
 | **Object fields we still own** (status, vout from txout, txids, outspend from `spent`, header JSON, SH history/utxo) | **Serve** | Independently true; wallets use these more than hex. |
-| **vin / fee / size / weight / sigops / hex** | **Omit** (JSON) or refuse (wire) | Need inwit. Omit the keys; do not null them into `[]` / `0`. |
+| **vin / fee / size / weight / sigops / hex** | **Omit** (JSON) or refuse (wire) | Need seqsigwit. Omit the keys; do not null them into `[]` / `0`. |
 
 Esplora JSON may add `"pruned": true` (extra key, same idea as Electrum
 `chain_tip`). Electrum `transaction.get` has no honest partial: both modes
@@ -158,25 +105,22 @@ vout-only object that still claims to be `transaction.get`.
 - **No silent wipe.** Durable `pruneheight` in store meta / sidecar. Same
   commit as the format code ([`SCHEMA.md`](../../SCHEMA.md) bump **or** a
   named sidecar with refuse-on-mismatch).
-- Keep **≥ 288 heights** of inwit (`tip - pruneheight >= 288`, plus a small
-  reorg buffer — Core keeps extra; pin **288 min heights**, extra is operator
-  `--prune-buffer` default 0 or 144). The **number of inwit blocks** in that
-  window is **≥ 288** and **greater** when orphan / stale blocks share those
-  heights. Watermark and unlink are by height, not by block count.
+- Keep **288 heights** of witness (`pruneheight = tip - 288` once the tip is
+  above that). The window is those height files and the RAM cache, not a
+  count of orphan blocks.
 - Reorg that would disconnect **at or below** `pruneheight` → fail closed
   (Core: cannot reorg pruned). Do not invent undo from `spent` alone.
-- Confirm/IBD still **writes** full inwit. Drop is a background unlink after
-  tip. Named `ibd: perf` timer if the walker joins write — prefer a
-  **non-write-thread** unlink so no timer; if it takes the Class A appender,
-  add the timer in the same commit.
-- COMPAT “Pruning / GUI | Not supported” becomes “inwit prune / NETWORK_LIMITED;
+- Confirm still records the height file (and RAM, unless the cap is 0) as
+  the block connects. Dropping a height is deleting `{height}.bin` once it
+  falls out of the window.
+- COMPAT “Pruning / GUI | Not supported” becomes “seqsigwit prune / NETWORK_LIMITED;
   not Core `-prune` of headers/txout”.
 
 ## Out of scope
 
 Dropping `txout` / `spent` / headers / SH (that would break wallets).
 AssumeUTXO. BIP157. Core GUI. Pruning during IBD before the block is
-connected. Arti/Tor (00–08). Thin-inwit (keep prevout refs, drop
+connected. Arti/Tor (00–08). Thin-seqsigwit (keep prevout refs, drop
 scriptSig/witness) — that would unlock fee/vin-without-witness; not this
 plan.
 
@@ -192,18 +136,18 @@ Heights **above** the watermark behave as today. Below: table.
 | `getblocktxn` | n/a (tip compact only) | Serve if the block is still in the window / cache |
 | Headers / `getheaders` | Unchanged | Unchanged |
 | VERSION `services` | — | Advertise `NETWORK_LIMITED\|WITNESS\|P2P_V2`, **not** `NETWORK` |
-| Compact **receive** / mempool | Unchanged (wire + mempool, not historical inwit) | Unchanged |
+| Compact **receive** / mempool | Unchanged (wire + mempool, not historical seqsigwit) | Unchanged |
 
 ### JSON-RPC ([`docs/rpc.md`](../rpc.md))
 
-| Method | Pruned (inwit gone) | Notes |
+| Method | Pruned (seqsigwit gone) | Notes |
 |--------|---------------------|--------|
 | `getblockchaininfo` | `pruned: true`, `pruneheight: N` | Today hardcoded `pruned: false` |
 | `getblock` verbosity **0** (raw) | `-8` `Block not available (pruned data)` | Core needle |
 | `getblock` verbosity **1** | **Keep** (`block_txids` / `txid.body`) | txid list, no vin |
-| `getblock` verbosity **2** | `-8` pruned | Full txs need inwit |
+| `getblock` verbosity **2** | `-8` pruned | Full txs need seqsigwit |
 | `getblockheader` / `getblockhash` / `getblockcount` | Keep | Headers only |
-| `getblockstats` | `-8` / existing `block body not in store` | Reconstruct |
+| `getblockstats` | serve from `txstat` when stamped, else `-8` | Reconstruct + lazy-stamp if unstamped and seqsigwit remains |
 | `getrawtransaction` | **`-8` `Transaction not available (pruned data)`** | Not `-5` unknown txid |
 | `decoderawtransaction` | n/a (client hex) | |
 | `gettxout` | **Keep** | Class A outs + spent |
@@ -220,7 +164,7 @@ Heights **above** the watermark behave as today. Below: table.
 | `transaction.get_merkle` / `id_from_pos` | **Keep** | Merkle from txids + headers |
 | `scripthash.get_history` / `get_balance` / `listunspent` / subscribe | **Keep** | SH + txout + spent; history rows have no witness |
 | `blockchain.block.header(s)` | Keep | |
-| `tweaks.subscribe` / `silentpayments.subscribe` | **Keep** if serve is txout-only (indexed path). Naive parent-inwit peek below watermark → skip/omit that height’s spend-side fields, do not Corrupt | Pin in tests |
+| `tweaks.subscribe` / `silentpayments.subscribe` | **Keep** if serve is txout-only (indexed path). Naive parent-seqsigwit peek below watermark → skip/omit that height’s spend-side fields, do not Corrupt | Pin in tests |
 | `transaction.broadcast` | Keep | Mempool |
 
 ### Esplora REST (shipped + [#632](https://github.com/reardencode/rbitcoin/pull/632) 0.8 drop-in)
@@ -229,29 +173,30 @@ Heights **above** the watermark behave as today. Below: table.
 (`/internal/*`, `?after_txid=`, `POST /addresses|scripthashes/txs`,
 `GET /broadcast`, `POST /txs/test`, tx JSON `sigops`, unix listen).
 
-**Partial tx object** (when inwit is gone): `txid`, `version`, `locktime`,
-`vout[]` from txout, `status`, `"pruned": true`. **Omit** `vin`, `fee`,
-`size`, `weight`, `sigops`. Same shape on list rows so `/txs` paging matches
-`/txs/summary` (do not drop the txid from the page).
+**Partial tx object** (when seqsigwit is gone): `txid`, `version`, `locktime`,
+`vout[]` from txout, `status`, `"pruned": true`. **Omit** `vin`. Fill `fee` /
+`size` / `weight` from stamped `txstat` when those rows exist;
+unstamped pruned omits those keys too. Same shape on list rows so `/txs`
+paging matches `/txs/summary` (do not drop the txid from the page).
 
 | Route | Pruned confirmed tx/block | Why |
 |-------|---------------------------|-----|
-| `GET /tx/:txid` JSON | **200** partial object | vout+status still true; explorer UIs that require `vin` fail closed on missing key (better than a fake coinbase) |
+| `GET /tx/:txid` JSON | **200** partial object; `fee`/`size`/`weight` from `txstat` when stamped | vout+status still true; still omit `vin` |
 | `GET /tx/:txid/hex`, `/raw` | **404** body `pruned` | Wire |
-| `GET /tx/:txid/status` | **Keep** (200) | Header + fk, no inwit |
+| `GET /tx/:txid/status` | **Keep** (200) | Header + fk, no seqsigwit |
 | `GET /tx/:txid/merkle-proof` | **Keep** | txids |
 | `GET /tx/:txid/merkleblock-proof` | **404** | BIP37 needs full txs |
-| `GET /tx/:txid/outspend(s)` | **Keep** | `spent` slot `vin` index, not inwit of the spent tx |
+| `GET /tx/:txid/outspend(s)` | **Keep** | `spent` slot `vin` index, not seqsigwit of the spent tx |
 | `GET /block/:hash` JSON | **200**; omit `size`/`weight` (or only if we cannot compute them); `"pruned": true` | Header + txids; not a witness size |
 | `GET /block/:hash/raw` | **404** | Full witness block |
 | `GET /block/:hash/header` `/status` `/txids` `/txid/:i` | **Keep** | header + `txid.body` |
-| `GET /block/:hash/txs` (public 25/page and **632** `GET /internal/block/:hash/txs`) | **200** pages of **partial** tx objects | Same omit-vin rule; do not 404 the whole block list |
+| `GET /block/:hash/txs` (public 25/page and **632** `GET /internal/block/:hash/txs`) | **200** pages of **partial** tx objects | Same omit-vin rule; stamped `txstat` fills fee/size/weight |
 | Address `/` stats, `/utxo`, `/txs/summary` | **Keep** | SH + values from txout |
 | Address `/txs`, `/txs/chain`, **632** `POST /addresses/txs` | **200** with partial rows for pruned txs | Keep paging aligned with summary |
 | **632** `?after_txid=` | Keep (txid cursor) | |
 | **632** `POST /internal/txs` | Full JSON when in window; **partial** (not omitted) when pruned; unknown still omitted | Distinct from missing |
 | **632** `POST /internal/txs/outspends/*` | **Keep** | spent table |
-| **632** `GET /broadcast`, `POST /txs/test`, mempool `/internal/mempool/*` | Keep | No archive inwit |
+| **632** `GET /broadcast`, `POST /txs/test`, mempool `/internal/mempool/*` | Keep | No archive seqsigwit |
 | WS `address-transactions` / `block-transactions` | Partial object if reconstruct fails; do not send `vin: []` | Mempool path unchanged |
 
 ## Steps
@@ -264,36 +209,30 @@ Heights **above** the watermark behave as today. Below: table.
   `Corrupt("invariant: …")`. `block_txids` still works. `txout` get still
   works below watermark.
 - **Red:** `cargo test -p rbitcoin-query reconstruct_pruned_returns_pruned_not_corrupt`
-  — tiny `/tmp` chain, set watermark, drop or stub inwit; reconstruct below
+  — tiny `/tmp` chain, set watermark, drop or stub seqsigwit; reconstruct below
   fails Pruned; above succeeds; `block_txids` both sides; outs still readable.
 - **Green:** watermark on Query/store (test stub first, durable in step 2).
-- **Refactor:** one helper `inwit_available(fk) -> Result<bool>`.
+- **Refactor:** one helper `seqsigwit_available(fk) -> Result<bool>`.
 - **Verify:** `cargo test -p rbitcoin-query reconstruct_pruned_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
-### Step 2 — Durable pruneheight + rolling inwit segments
+### Step 2 — Durable pruneheight + 288 height files
 
-- **Contract:** `--prune-inwit` / conf (default **off**). When on, after tip
-  connect, watermark = `tip.saturating_sub(288 + buffer)` (**height**, not
-  a count of inwit blocks). SCHEMA bump: inwit is a rolling segment dir
-  (64 MiB sealed files under cold inwit), loc is window-relative,
-  below-watermark sentinel. Walker **unlinks** segments wholly `≤ pruneheight`
-  (every height in the file, including orphans). Kill-safe: watermark
-  advances only after those unlinks. Reopen restores watermark + open
-  segments. Leftover genesis-length `inwit.body` without the new layout →
-  refuse (OPERATOR: copy-tail then unlink on first pruned open, or refuse
-  and tell the operator). Confirm appends only to the live segment. A kept
-  height with an orphan sibling keeps **both** inwit payloads.
+- **Contract:** `--prune-seqsigwit` / conf (default **off**). `{store}/seqsigwit.prune`
+  is a 4-byte LE `pruneheight` (`u32::MAX` = on, nothing dropped yet; missing
+  file = off). After the tip passes 288 heights, `pruneheight = tip - 288`.
+  Kept witness is `store/seqsigwit.window/{height}.bin` plus the RAM cache.
+  `--prune-seqsigwit-ram-threshold-bytes 0` writes every height and retains none
+  in RAM. No schema bump. Reopen restores the sidecar. A pruned datadir
+  opened without the flag refuses to start. Enabling prune on an existing
+  archive seeds the window from `seqsigwit.body` for the kept heights.
 - **Red:** `prune_watermark_survives_reopen`;
-  `unlink_segment_below_watermark_then_pruned`;
-  `kept_window_inwit_still_reconstructs`;
-  `prune_during_ibd_does_not_grow_historical_inwit_stem`;
-  `kept_288_heights_retains_orphan_inwit` — reorg at a kept height; both
-  blocks reconstruct; inwit block count **>** the height window.
-- **Green:** store meta/sidecar; background unlink (not confirm hot path).
-- **Refactor:** no second inwit encoding; no punch path on this table.
-- **Verify:** `cargo test -p rbitcoin-store prune_inwit_` ;
-  `cargo test -p rbitcoin-query prune_watermark_`
+  `prune_ram_window_drops_fks_on_disconnect_and_replace`;
+  `prune_ram_threshold_zero_spills_tiny_blocks`;
+  spill symlink outside the window is `Corrupt`.
+- **Green:** sidecar + height files + RAM cache.
+- **Refactor:** no rolling `seqsigwit.body`, no punch path on this table.
+- **Verify:** `cargo test -p rbitcoin-query prune_`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ### Step 3 — Reorg below pruneheight fail-closed
@@ -348,35 +287,32 @@ Heights **above** the watermark behave as today. Below: table.
 
 ### Step 6 — OPERATOR / COMPAT / SCHEMA / rpc.md + NixOS module
 
-- **Contract:** OPERATOR `--prune-inwit`, 288-**height** window (orphan
-  inwit can make the block count larger), NETWORK_LIMITED,
-  rolling cold inwit (unlink, not punch), cannot reorg through pruneheight,
-  archive convert = copy tail + unlink old stem. COMPAT prune row.
+- **Contract:** OPERATOR `--prune-seqsigwit`, 288-height files under
+  `seqsigwit.window/`, RAM cap (`0` = files only), `NETWORK_LIMITED`, cannot
+  reorg through pruneheight. COMPAT prune row.
   `getblockchaininfo` fields. SCHEMA/sidecar bytes. Partial Esplora JSON.
   Do not copy this file into quality.md until scheduled. Module:
-  `pruneInwit` (and buffer if the CLI has one); `coldDataDir` already
-  exists. Eval asserts `--prune-inwit`. Runtime label only if tmpfiles /
-  `ReadWritePaths` change.
-- **Red:** eval assert for `--prune-inwit`.
+  `pruneSeqSigWit`; `coldDataDir` already exists. Eval asserts `--prune-seqsigwit`.
+  Runtime label only if tmpfiles / `ReadWritePaths` change.
+- **Red:** eval assert for `--prune-seqsigwit`.
 - **Green:** module + eval + those doc owners.
 - **Verify:** `nix build .#checks.x86_64-linux.nixos-module-eval --no-link`;
-  grep `NETWORK_LIMITED`, `prune-inwit`, `inwit` segment.
+  grep `NETWORK_LIMITED`, `prune-seqsigwit`, `seqsigwit.window`.
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ## Test budget
 
-Tiny `/tmp` chains (keep window 2–4 **heights** in tests, production 288
-heights; include one orphan so inwit block count exceeds the height window).
-No mainnet open. One P2P notfound + reconstruct-serve of a kept tip. Unlink
-tests on all OS (not Linux-only punch).
+Tiny `/tmp` chains (production keep is 288 heights). No mainnet open. One
+P2P notfound + reconstruct-serve of a kept tip. Height-file removal runs on
+every OS.
 
 ## Risks / follow-ups
 
-- Tweaks naive path parent inwit: must not Corrupt on pruned parents.
+- Tweaks naive path parent seqsigwit: must not Corrupt on pruned parents.
 - mempool.space **frontend** may assume `vin` always present on `GET /tx`;
   personal-node wallets (Electrum history/utxo) do not. Partial JSON is for
   honest objects, not a claim that we are a full electrs archive.
 - Core functional prune scripts stay skip until we claim Core `-prune`
   (we do not).
-- Thin-inwit (keep prevout fk+vout, drop scripts) would allow fee + vin
+- Thin-seqsigwit (keep prevout fk+vout, drop scripts) would allow fee + vin
   without witness; separate plan if a wallet needs that.

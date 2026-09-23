@@ -107,6 +107,18 @@ before 1.0).
 - **Lightning chain backends (`Q-69` Open):** [`docs/lightning.md`](docs/lightning.md)
   owns CLN `bcli` and ldk-node Esplora/Electrum.
 
+- **Schema 25 econ stems:** `txstat.body` stays 8 B/create: three ULEBs
+  (`fee_sat`/`base`/`wit_extra`) plus per-header remaining-byte overflow.
+  `n_in` is `input.loc` (u16). `input.body` is the parent edge (create fk
+  and vout) per input. `seqsigwit` is the old `inwit` stem (sequence,
+  scriptSig, witness); open renames those files. `txstat.*` and `input.*`
+  sit next to `seqsigwit` (cold when split). Open with no `input.loc`
+  backfills the edges from `seqsigwit` prevouts. A four-ULEB cell that
+  started with `n_in` is not rewritten; resync that datadir. Occupied 24
+  open rewrites `meta` and zero-extends `txstat.body` (no `txout.body`
+  rewrite). Unreleased leftover `txfixed.body` is unlinked. A 24 binary
+  refuses 25 `meta`.
+
 - **Core functional `mempool_packages.py`:** inventory `run`. Verbose mempool
   `vsize` / ancestor-descendant size use Core ceil-vsize; `wtxid` is on both
   `getmempoolentry` and verbose `getrawmempool`; non-verbose txid list is
@@ -226,7 +238,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
 - **Faster IBD:** loc rides the InFlight pin (load never loc-by-fk); body-queue
   `header_fk` skips header ensure; tip+1 hole racing by drain time; sequential
   `header.body` size/weight; BIP30 same-txid across a load wave.
-- **Smaller store:** schema 22 `create.loc` + `inwit.loc` (no three Class A
+- **Smaller store:** schema 22 `create.loc` + `seqsigwit.loc` (no three Class A
   `*.idx`); compact txout amounts; sealed fuse8 + SH occupancy mmap (heap
   `fuse8=` / `mphf_occ=` only).
 - **Mempool persist:** packed schema 2 — 5 s dirty tail, one-record DEAD
@@ -973,7 +985,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
   `ibd_skips_dead_peer` run in `cargo test --workspace` and `coverage.sh`.
   The separate `multinode` job is gone. [`TESTING.md`](TESTING.md).
 
-- **No loc-count echo:** packed decode already walks loc `n_out` / inwit
+- **No loc-count echo:** packed decode already walks loc `n_out` / seqsigwit
   `input_count`; drop the tautological len==count Corrupt. `spent_record_len(0)`
   is `0×8` (no special case). Delete unused no-op `head_reserve_additional`.
 
@@ -982,7 +994,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
   `two_node_header_and_block_sync` runs under `coverage.sh`.
   [`TESTING.md`](TESTING.md).
 
-- **Schema 22:** `create.loc` + `inwit.loc` (no Class A `{txout,spent,inwit}.idx`).
+- **Schema 22:** `create.loc` + `seqsigwit.loc` (no Class A `{txout,spent,seqsigwit}.idx`).
   LAYOUT17 omits `output_count` (decode `n_out` from loc). Spent slot is flags +
   u40 spend fk + u16 vin. `txout` amount is flags bits 4–7 = decimal
   exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`; canonical compact,
@@ -1531,7 +1543,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
   `notfound`, serve an announced tx from the tip block).
 
 - **IBD `getdata` serve reconstructs from Class A spans:** contiguous
-  `header_txs` loads `txout.body` + `inwit.body` as libc sequential preads
+  `header_txs` loads `txout.body` + `seqsigwit.body` as libc sequential preads
   (not per-tx `get_tx_full`), off the session reactor. Host probe:
   `scripts/ibd-serve-bench.py`.
 
@@ -1739,7 +1751,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
 
 ### Changed
 
-- **IBD `getdata` span IO:** `txout.body` and `inwit.body` span preads run
+- **IBD `getdata` span IO:** `txout.body` and `seqsigwit.body` span preads run
   in parallel (SSD one volume, or `--datadir-cold` split). BIP324
   `write_v2_contents` takes owned bytes (no extra `to_vec` on the serve writer).
 
@@ -2377,12 +2389,12 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   or incomplete row. See [`docs/core-functional.md`](docs/core-functional.md).
   No Core scripts run in default `cargo test` yet.
 
-- **`--datadir-cold PATH`:** Class A `inwit.body` / `inwit.idx/` (cold; ~486 GiB
+- **`--datadir-cold PATH`:** Class A `seqsigwit.body` / `seqsigwit.idx/` (cold; ~486 GiB
   on mainnet) live under `{PATH}/store` when set. `--datadir` still holds every
   other file (`txout`, `spent`, heads, mempool, peers, cookie). Omit the flag
   and both hot and cold files stay in `--datadir`. Conf: `datadir-cold=`.
-  Existing split: move `inwit.body` + `inwit.idx/` yourself; the hot store
-  records `inwit.reloc` so a later open without the flag refuses.
+  Existing split: move `seqsigwit.body` + `seqsigwit.idx/` yourself; the hot store
+  records `seqsigwit.reloc` so a later open without the flag refuses.
 
 - **CI musl artifacts:** after a green `ci` run on `master`/`main`, workflow
   `musl` builds `nix build .#rbitcoin-musl` and uploads
@@ -2526,7 +2538,7 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   graph wtxids.
 
 - **`--sptweaks` backfill:** one-core completion machine (`txout`, then
-  `inwit`/parents only for P2TR) and batched height-blob + idx writes.
+  `seqsigwit`/parents only for P2TR) and batched height-blob + idx writes.
   Mainnet origin→tip on SSD is typically **about 1–2 hours** (was several
   hours at ~15–25 h/s serial `get_tx_full`). INFO every 10 s:
   `sptweaks: backfill next=… tip=… rate=…/s remain=…`.
@@ -2779,7 +2791,7 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   open — wipe `store/scripthash*` and restart with `--shindex`.
 
 - **`getblockchaininfo` disk / progress:** `size_on_disk` is a walk of
-  store file lengths (plus cold inwit when split). `verificationprogress`
+  store file lengths (plus cold seqsigwit when split). `verificationprogress`
   is `blocks / headers` (1.0 when headers is 0), not a dummy 0.5 / 1.0.
 
 - **No soak program.** Signet-first remains ordinary run advice. Q-35 is
@@ -2999,8 +3011,8 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   sleep in the same `select!` was reset by every perf/RPC tick, so a node
   that lost its last follow peer (mainnet 962723) never redialed.
 
-- **Class A idx rolls:** each stem (`txout` / `inwit` / `spent`) rolls its
-  own idx at the soft span. Inwit no longer forces hot idx splits.
+- **Class A idx rolls:** each stem (`txout` / `seqsigwit` / `spent`) rolls its
+  own idx at the soft span. SeqSigWit no longer forces hot idx splits.
 - **`strong_tx`:** always L2 (1 bit/fk). `RBITCOIN_CLASS_C_INRAM_MAX_MB`
   still caps `confirmed` / `header_txs_*` only.
 - **Schema 17 freeze note:** [`SCHEMA.md`](SCHEMA.md)
@@ -3071,12 +3083,12 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   store that already has Class A creates (schema 15/16 16-byte meta /
   9-byte spent) or leftover `key_len=32` SH runs is refused. Empty
   Class A still soft-opens. This is meant to be the last full-datadir
-  reindex for the Class A / B / C layout; later work (inwit Δfk, a new
+  reindex for the Class A / B / C layout; later work (seqsigwit Δfk, a new
   consensus script kind) would be schema 18 and should not require
   another wipe of `txout` / `spent` / heads. Layout in 17: SH runs
   unique `(scripthash, create_fk)` at `key_len=40`; megakey pages are
   uleb fk0+deltas; thin LAYOUT17 `txout` meta; script kinds 0–9; 8-byte
-  spent slots; overflow is `spent.ovf`; reserved inwit bits 4–7 and
+  spent slots; overflow is `spent.ovf`; reserved seqsigwit bits 4–7 and
   spent flags other than `MULTI_SPENDER` are Corrupt. Leftover
   `archive_epoch`, `store/wire`, and single-file `sp_tweaks.idx` /
   `sp_tweaks.body` are unlinked on open. Tweaks (when `--sptweaks`) are
@@ -3096,7 +3108,7 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   lookup wave wall is `lookup_thr wave=`.
 
 - **Confirm write path:** Class C `strong_tx` flush already wrote only the dirty
-  suffix — now pinned. Class A `txout`/`inwit`/`spent` bodies submit as one
+  suffix — now pinned. Class A `txout`/`seqsigwit`/`spent` bodies submit as one
   `pwrite_batch` wave. `tx.head` insert is write-behind (page-grouped drain
   overlaps structural/Class C); resolve hits a pending txid→fk map until drain.
   Crash-open backfills a lagging head from Class A.
@@ -3142,7 +3154,7 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   Tip write-through only when `height == next_height`. Restart resumes
   from `next_height`.
 
-- **Schema 15 Class A split:** `txout.body` (outs) + `inwit.body` (ins+witness)
+- **Schema 15 Class A split:** `txout.body` (outs) + `seqsigwit.body` (ins+witness)
   + `spent.body` (9 B×n_out). Packed `tx.body` with creates is refused. Pin/SH
   read outs only; annotate RMW is `spent_off+9×vout`. Working-set census in
   [`SCHEMA.md`](./SCHEMA.md).

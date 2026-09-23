@@ -80,7 +80,8 @@ impl Query {
         let mut abs_edges: Vec<(u64, Fk, u32, Fk, u32)> = Vec::new();
         for item in items {
             for &spend_fk in &item.tx_fks {
-                let (_tx, ins, _outs) = self.store.get_tx_full(spend_fk)?;
+                let tx = self.get_tx(spend_fk)?;
+                let ins = self.tx_input_run_class_a(spend_fk, &tx)?;
                 for (vin, inp) in ins.into_iter().enumerate() {
                     if inp.is_coinbase() {
                         continue;
@@ -248,8 +249,23 @@ impl Query {
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
         }
+        self.record_confirmed_seqsigwit_window(items)?;
 
         Ok(out)
+    }
+
+    fn record_confirmed_seqsigwit_window(
+        &self,
+        items: &[ConfirmPrepared],
+    ) -> Result<(), QueryError> {
+        self.apply_prune_seqsigwit_tip()?;
+        if !self.prune_seqsigwit() {
+            return Ok(());
+        }
+        for item in items {
+            self.note_seqsigwit_ram_for_confirmed(item.height, &item.tx_fks)?;
+        }
+        Ok(())
     }
 
     fn enqueue_sh_pending(
@@ -666,7 +682,12 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+        let inputs = if let Some(v) = self.seqsigwit_cached_inputs(create_fk, tx.input_count)? {
+            v
+        } else {
+            let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+            inputs
+        };
         if inputs.len() as u32 != tx.input_count {
             return Err(StoreError::Corrupt("packed input count mismatch"));
         }
@@ -675,7 +696,7 @@ impl Query {
 
     /// Output run from store (keyed by known create fk — no txid lookup).
     ///
-    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `inwit`.
+    /// Outs-only Class A (`get_tx_meta_and_outputs`); does not zip `seqsigwit`.
     pub(crate) fn tx_output_run_class_a(
         &self,
         create_fk: Fk,
@@ -712,6 +733,8 @@ impl Query {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
+        self.require_seqsigwit_at(height)?;
+        self.drop_seqsigwit_ram_height(height.0);
         let _appender = self.sh.appender.lock().unwrap();
         if drop_pending {
             self.drop_sh_pending_from(height);

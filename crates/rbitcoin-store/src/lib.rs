@@ -24,6 +24,7 @@ pub mod head_resolve_stats;
 mod header_table;
 mod height_fence;
 mod idx_body_pipeline;
+mod input;
 mod int_map;
 mod integrity;
 mod io_backend;
@@ -55,6 +56,7 @@ pub mod testutil;
 mod tx_head_mphf;
 mod tx_table;
 mod txid_body;
+mod txstat;
 mod uring_session;
 mod var_table;
 
@@ -95,12 +97,13 @@ pub use store::{keep_unspent_vout_subsequence, Store, StoreLayout};
 pub use store_secret::StoreSecret;
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use tx_table::{
-    decode_inwit_secret, decode_packed_tx_outs_with_spender_rels,
-    decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    encode_packed_tx, encode_packed_tx_with_secret, encode_txout_meta_and_outs,
+    decode_packed_tx_outs_with_spender_rels, decode_packed_tx_outs_with_spender_rels_secret,
+    decode_packed_tx_with_spender_rels_secret, decode_seqsigwit_secret, encode_packed_tx,
+    encode_packed_tx_with_secret, encode_seqsigwit_with_secret, encode_txout_meta_and_outs,
     encode_unspent_output_into_secret, spend_meta_backend, spent_abs, InputRecord, OutputRecord,
     PackedCreate, TxRecord,
 };
+pub use txstat::TxStatRow;
 pub(crate) use uring_session::IoCtx;
 pub use uring_session::{
     abort_uring_unusable, note_uring_recover, uring_recover_count, uring_slow_drain_count,

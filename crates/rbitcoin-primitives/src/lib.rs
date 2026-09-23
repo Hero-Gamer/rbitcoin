@@ -78,6 +78,11 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **25:** `txstat.body` 8 B/create (ULEB `n_in`/`fee_sat`/`base`/`wit_extra`,
+///         per-header remaining-byte overflow). Occupied 24 rewrites `meta`
+///         and extends a zeroed `txstat.body` to loc count (no `txout.body`
+///         rewrite). Unreleased leftover `txfixed.body` is unlinked. A 24
+///         binary refuses 25 `meta`.
 /// **24:** `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied 23
 ///         rewrites 88 B rows (`header.body.grow` then rename); zeros until
 ///         confirm stamps. SH extent last-page reserved is create count.
@@ -85,10 +90,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         ~1 MiB consensus-valid txout (and `n_out > 65535`) stores. Occupied
 ///         22 Class A rewrites 12 B ovf rows and `meta`. Occupied 15–21 Class A
 ///         still refused. Empty 13–22 rewrite `meta`.
-/// **22:** `create.loc` + `inwit.loc`; LAYOUT17 omits `output_count`. Spent
+/// **22:** `create.loc` + `seqsigwit.loc`; LAYOUT17 omits `output_count`. Spent
 ///         slot is flags + u40 spend fk + u16 vin. Occupied 21 Class A
 ///         refused (wipe + IBD). Empty 21 rewrites `meta` and unlinks
-///         leftover `spent.off` and `{txout,spent,inwit}.idx`.
+///         leftover `spent.off` and `{txout,spent,seqsigwit}.idx`.
 /// **21:** Drop `spent.idx`; leftover unlinked; rewrite `meta` 20→21. Spent
 ///         ranges are `n_out` prefix of `txout` (sparse `spent.off`).
 /// **20:** Sealed `tx.head` value-assigned packed BDZ (no `.rel`). Occupied
@@ -103,15 +108,16 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         megakey pages are uleb deltas.
 /// **16:** Drop `tx_height.body`; create height is a RAM fence from `confirmed[]` +
 ///         `header_txs_*`. Soft-open schema 15 (unlink leftover file). Class A unchanged.
-/// **15:** Class A split (`txout` / `inwit` / `spent`) + Class B SH slabs / sorted heads.
+/// **15:** Class A split (`txout` / `seqsigwit` / `spent`) + Class B SH slabs / sorted heads.
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 24;
+pub const SCHEMA_VERSION: u16 = 25;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **24** is current (`header.body` 96 B). Occupied **23** rewrites
+/// Schema **25** is current (`txstat.body` 8 B/create). Occupied **24**
+/// rewrites `meta` and zero-extends `txstat.body`. Occupied **23** rewrites
 /// 88 B header rows. Occupied **22** Class A
 /// rewrites 12 B ovf rows. Occupied 21 Class A is refused. Schema **21** empty
 /// Class A rewrites `meta`. Schema **20** table headers still open when Class A
@@ -273,12 +279,22 @@ pub enum TableKind {
     TxidBody = 14,
     /// Optional BIP-352 thin tweak body (`sp_tweaks.body`). Schema 14 side product.
     SpTweaks = 15,
-    /// Class A input-side + witness (`inwit.body`).
-    Inwit = 16,
+    /// Class A input-side + witness (`seqsigwit.body`).
+    SeqSigWit = 16,
     /// Class A sole-spender slots (`spent.body`, 8 B × n_out).
     Spent = 17,
-    /// Create/inwit delta locators (`create.loc` / `inwit.loc` and `.ovf`).
+    /// Create/seqsigwit delta locators (`create.loc` / `seqsigwit.loc` and `.ovf`).
     DeltaLoc = 18,
+    /// Dense create_fk-ordered confirm-time econ (`txstat.body`, 8 B).
+    TxStat = 19,
+    /// Per-header remaining-byte overflow (`txstat.ovf`).
+    TxStatOvf = 20,
+    /// Per-header overflow locator (`txstat.blk`, 16 B/header).
+    TxStatBlk = 21,
+    /// Spender → parent edges (`input.body`, 8 B/input).
+    Input = 22,
+    /// Per-create `n_in` (`input.loc`, 2 B/create).
+    InputLoc = 23,
 }
 
 impl TableKind {
@@ -297,9 +313,14 @@ impl TableKind {
             13 => Some(TableKind::Spender),
             14 => Some(TableKind::TxidBody),
             15 => Some(TableKind::SpTweaks),
-            16 => Some(TableKind::Inwit),
+            16 => Some(TableKind::SeqSigWit),
             17 => Some(TableKind::Spent),
             18 => Some(TableKind::DeltaLoc),
+            19 => Some(TableKind::TxStat),
+            20 => Some(TableKind::TxStatOvf),
+            21 => Some(TableKind::TxStatBlk),
+            22 => Some(TableKind::Input),
+            23 => Some(TableKind::InputLoc),
             _ => None,
         }
     }
@@ -355,7 +376,9 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in [1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18] {
+        for v in [
+            1u16, 2, 3, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+        ] {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
@@ -369,16 +392,22 @@ mod tests {
         assert_eq!(TableKind::Spender.as_u16(), 13);
         assert_eq!(TableKind::TxidBody.as_u16(), 14);
         assert_eq!(TableKind::SpTweaks.as_u16(), 15);
-        assert_eq!(TableKind::Inwit.as_u16(), 16);
+        assert_eq!(TableKind::SeqSigWit.as_u16(), 16);
         assert_eq!(TableKind::Spent.as_u16(), 17);
         assert_eq!(TableKind::DeltaLoc.as_u16(), 18);
+        assert_eq!(TableKind::TxStat.as_u16(), 19);
+        assert_eq!(TableKind::TxStatOvf.as_u16(), 20);
+        assert_eq!(TableKind::TxStatBlk.as_u16(), 21);
+        assert_eq!(TableKind::Input.as_u16(), 22);
+        assert_eq!(TableKind::InputLoc.as_u16(), 23);
     }
 
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 24);
+        assert_eq!(SCHEMA_VERSION, 25);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(25));
         assert!(schema_file_openable(24));
         assert!(schema_file_openable(23));
         assert!(schema_file_openable(22));
@@ -392,8 +421,20 @@ mod tests {
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));
-        assert!(!schema_file_openable(25));
+        assert!(!schema_file_openable(26));
         assert!(!schema_file_openable(0));
+    }
+
+    #[test]
+    fn open_schema25_meta_refused_by_v24_gate() {
+        const SCHEMA24_MAX: u16 = 24;
+        fn schema24_binary_openable(ver: u16) -> bool {
+            (13..=SCHEMA24_MAX).contains(&ver)
+        }
+        assert!(!schema24_binary_openable(25));
+        assert!(schema24_binary_openable(24));
+        assert!(schema_file_openable(24));
+        assert!(schema_file_openable(25));
     }
 
     #[test]

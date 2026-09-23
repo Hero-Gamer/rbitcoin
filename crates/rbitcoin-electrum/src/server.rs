@@ -1770,7 +1770,13 @@ fn dispatch_pinned(
                     true
                 };
                 if confirmed_ok {
-                    let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
+                    let raw = query.tx_wire_bytes(fk).map_err(|e| {
+                        if matches!(e, StoreError::Pruned { .. }) {
+                            "pruned".to_string()
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
                     if verbose {
                         return Ok(verbose_tx_json(query, &raw, &txid, Some(fk), chain.network));
                     }

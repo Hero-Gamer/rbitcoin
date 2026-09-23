@@ -1154,6 +1154,7 @@ pub(crate) fn not_found() -> Response {
 pub(crate) fn store_err(e: rbitcoin_query::QueryError) -> Response {
     match e {
         StoreError::NotFound => not_found(),
+        StoreError::Pruned { .. } => (StatusCode::NOT_FOUND, "pruned").into_response(),
         StoreError::Stale(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         StoreError::Rejected(m) => (StatusCode::SERVICE_UNAVAILABLE, m).into_response(),
         other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()).into_response(),
@@ -3808,6 +3809,59 @@ mod tests {
         assert_eq!(st, 200, "{hex_body}");
         let (st, _) = http_get(addr, &format!("/tx/{txid_hex}/raw")).await;
         assert_eq!(st, 200);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pruned_tx_json_is_partial_but_raw_stays_404() {
+        let (dir, q) = temp_query("pruned-partial-json");
+        let mut prev = Fk::NULL;
+        let mut parent_hash: Option<[u8; 32]> = None;
+        let mut txids = Vec::new();
+        let mut hashes = Vec::new();
+        for h in 0..300u32 {
+            let (header, ta) = coinbase(h, prev, parent_hash);
+            parent_hash = Some(header.hash);
+            txids.push(ta.tx.txid);
+            hashes.push(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        q.set_prune_seqsigwit(true).unwrap();
+        q.apply_prune_seqsigwit_tip().unwrap();
+        let q = Arc::new(q);
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+            .await
+            .expect("listen");
+        let addr = handle.local_addr;
+
+        let tx0 = block_hash_hex(&txids[0]);
+        let (st, body) = http_get(addr, &format!("/tx/{tx0}")).await;
+        assert_eq!(st, 200, "{body}");
+        let row: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(row["txid"], tx0);
+        assert_eq!(row["pruned"], true);
+        assert_eq!(row["vin"][0]["is_coinbase"], true, "{row}");
+        assert!(row["vin"][0].get("witness").is_none(), "{row}");
+        assert!(row.get("vout").is_some());
+
+        let (st, body) = http_get(addr, &format!("/tx/{tx0}/raw")).await;
+        assert_eq!(st, 404, "{body}");
+        assert!(body.contains("pruned"), "{body}");
+
+        let h0 = block_hash_hex(&hashes[0]);
+        let (st, body) = http_get(addr, &format!("/block/{h0}/txs")).await;
+        assert_eq!(st, 200, "{body}");
+        let arr: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            arr.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["txid"] == tx0 && t["pruned"] == true),
+            "{body}"
+        );
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

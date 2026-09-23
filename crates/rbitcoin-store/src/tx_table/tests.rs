@@ -132,10 +132,13 @@ fn open_refuses_txout_without_peer_stems() {
         t.put_full_batch_indexed(&meta_only_items(&[rec]), true)
             .unwrap();
     }
-    let _ = std::fs::remove_file(dir.join("inwit.body"));
+    let _ = std::fs::remove_file(dir.join("seqsigwit.body"));
     match TxTable::open_tiny(&dir) {
-        Ok(_) => panic!("missing inwit must refuse"),
-        Err(err) => assert!(format!("{err}").contains("missing inwit/spent"), "{err}"),
+        Ok(_) => panic!("missing seqsigwit must refuse"),
+        Err(err) => assert!(
+            format!("{err}").contains("missing seqsigwit/spent"),
+            "{err}"
+        ),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -170,7 +173,177 @@ fn put_full_batch_from_pins_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Class A append submits txout+inwit+spent bodies as one pwrite wave (not 3 serial).
+#[test]
+fn put_full_batch_writes_txstat_and_reopen() {
+    let dir = tempfile_dir("txstat-append");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [9u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    let fks = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap();
+    assert_eq!(fks, vec![Fk(1)]);
+    assert_eq!(t.txstat.count(), 1);
+    assert_eq!(
+        crate::txstat::parse_cell(t.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
+        crate::txstat::CellParse::Unstamped
+    );
+    assert_eq!(t.input.n_in(Fk(1)).unwrap(), Some(1));
+    drop(t);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t2.count(), 1);
+    assert_eq!(t2.txid_sidefile().count(), 1);
+    assert_eq!(t2.txstat.count(), 1);
+    assert_eq!(
+        crate::txstat::parse_cell(t2.txstat.get_cell(Fk(1)).unwrap()).unwrap(),
+        crate::txstat::CellParse::Unstamped
+    );
+    assert_eq!(t2.input.n_in(Fk(1)).unwrap(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn two_input_item() -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+    let tx = TxRecord {
+        txid: [0x11u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 2,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![
+        InputRecord::coinbase(u32::MAX, vec![0x01], vec![]),
+        InputRecord {
+            prev_txid: [2u8; 32],
+            create_fk: Fk(1),
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        },
+    ];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    (tx, ins, outs)
+}
+
+#[test]
+fn prevouts_use_txstat_n_in_without_full_txout() {
+    let dir = tempfile_dir("prevouts-txstat");
+    let t = create_tiny(&dir);
+    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    let (off, len) = t.body_range(fk).unwrap();
+    t.body
+        .write_body_abs(off, &vec![0u8; len as usize])
+        .unwrap();
+    assert!(t.get(fk).is_err(), "txout zeros must fail full get");
+    let (meta, prevs) = t.get_meta_and_prevouts(fk).unwrap();
+    assert_eq!(meta.input_count, 2);
+    assert_eq!(prevs.len(), 2);
+    assert_eq!(prevs[0], (Fk::NULL, u32::MAX));
+    assert_eq!(prevs[1], (Fk(1), 0));
+    let edges = t.input.edges(fk).unwrap().unwrap();
+    assert_eq!(edges[0], crate::input::InputEdge::coinbase());
+    assert_eq!(
+        edges[1],
+        crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 0,
+        }
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_create_txout_meta_omits_n_in() {
+    let dir = tempfile_dir("txout-omit-nin");
+    let t = create_tiny(&dir);
+    let tx = TxRecord {
+        txid: [4u8; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+    let outs = vec![OutputRecord::unspent(7, vec![0x51])];
+    let pin = std::sync::Arc::new((tx.clone(), outs.clone()));
+    let mut pin_bytes = Vec::new();
+    pin.encode_txout_body(&mut pin_bytes, None);
+    assert_eq!(
+        pin_bytes[0] & BODY_META_V17_N_IN_TXSTAT,
+        BODY_META_V17_N_IN_TXSTAT,
+        "pin first-wave txout omits n_in"
+    );
+    let fk = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap()[0];
+    let (off, len) = t.body_range(fk).unwrap();
+    let raw = t.with_body_span(off, len, |b| Ok(b.to_vec())).unwrap();
+    assert_eq!(
+        raw[0] & BODY_META_V17_N_IN_TXSTAT,
+        BODY_META_V17_N_IN_TXSTAT
+    );
+    let (meta, n) = decode_body_meta_v17(&raw).unwrap();
+    assert_eq!(n, 1, "v1 locktime 0 omit n_in is one flag byte");
+    assert_eq!(meta.input_count, 0);
+    let (got, gouts) = t.get_meta_and_outputs(fk).unwrap();
+    assert_eq!(got.input_count, 1, "input.loc fills n_in");
+    assert_eq!(gouts.len(), 1);
+    let leftover = [0x89u8, 0x01];
+    let (old, on) = decode_body_meta_v17(&leftover).unwrap();
+    assert_eq!(on, 2);
+    assert_eq!(old.input_count, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reopen_without_inputs_refuses_new_seqsigwit() {
+    let dir = tempfile_dir("input-backfill");
+    let t = create_tiny(&dir);
+    let _fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    match TxTable::open_tiny(&dir) {
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs")) => {}
+        Err(e) => panic!("open without inputs: {e}"),
+        Ok(_) => panic!("open without inputs recovered a new seqsigwit"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn input_n_in_scans_both_prevouts() {
+    let dir = tempfile_dir("input-nin-prevouts");
+    let t = create_tiny(&dir);
+    let fk = t.put_full_batch_indexed(&[two_input_item()], true).unwrap()[0];
+    t.txstat
+        .write_row(
+            fk,
+            &crate::txstat::TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    let (meta, prevs) = t.get_meta_and_prevouts(fk).unwrap();
+    assert_eq!(meta.input_count, 2);
+    assert_eq!(prevs.len(), 2);
+    assert_eq!(t.input.n_in(fk).unwrap(), Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Class A append submits txout+seqsigwit+spent bodies as one pwrite wave (not 3 serial).
 #[test]
 fn put_full_batch_one_body_write_wave() {
     let dir = tempfile_dir("one-wave");
@@ -421,6 +594,7 @@ fn open_repairs_body_leading_txid_count() {
     let t2 = TxTable::open_tiny(&dir).expect("open should repair skew");
     assert_eq!(t2.count(), 3);
     assert_eq!(t2.txid_sidefile().count(), 3);
+    assert_eq!(t2.txstat.count(), 3);
     // Kept prefix still readable.
     let tx = t2.get(Fk(1)).unwrap();
     assert_eq!(tx.txid[0], 1);
@@ -457,14 +631,23 @@ fn decode_prevout_at_skips_script_and_witness() {
         witness: vec![vec![0x30; 70], vec![0x21; 33]],
     };
     let enc = rec.encode();
-    let (cfk, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
+    assert!(matches!(
+        InputRecord::decode_prevout_at(&enc),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
+    let (full, used) = InputRecord::decode_at(&enc).unwrap();
+    assert_eq!(used, enc.len());
+    assert_eq!(full.script_sig.len(), 40);
+    assert_eq!(full.sequence, 0xffff_fffe);
+    assert!(full.create_fk.is_null());
+    let mut legacy =
+        vec![input_flags::SEQ_FINAL | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS];
+    legacy.extend_from_slice(&1u64.to_le_bytes());
+    legacy.push(3);
+    let (cfk, vout, used) = InputRecord::decode_prevout_at(&legacy).unwrap();
     assert_eq!(cfk, Fk(1));
     assert_eq!(vout, 3);
-    assert_eq!(used, enc.len());
-    // Full decode still matches.
-    let (full, used2) = InputRecord::decode_at(&enc).unwrap();
-    assert_eq!(used2, used);
-    assert_eq!(full.script_sig.len(), 40);
+    assert_eq!(used, legacy.len());
 }
 
 /// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).
@@ -479,14 +662,20 @@ fn input_encode_create_fk_not_prev_txid() {
         witness: vec![],
     };
     let enc = rec.encode();
-    // flags(1) + create_fk(8) + compact vout(1 for 7) = 10
-    assert_eq!(enc.len(), 10, "enc={:?}", enc);
-    // v9 would have been flags + 32-byte txid + vout = 34 for same case
-    assert!(enc.len() + 24 <= 34);
+    assert_eq!(
+        enc.len(),
+        1,
+        "seqsigwit stores no parent outpoint, enc={enc:?}"
+    );
+    assert_eq!(
+        enc[0] & input_flags::PREV_ON_INPUTS,
+        input_flags::PREV_ON_INPUTS
+    );
     let dec = InputRecord::decode(&enc).unwrap();
-    assert_eq!(dec.create_fk, Fk(42));
-    assert_eq!(dec.prev_index, 7);
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
     assert_eq!(dec.prev_txid, [0u8; 32]);
+    assert_eq!(dec.sequence, u32::MAX);
 }
 
 #[test]
@@ -523,12 +712,24 @@ fn scan_packed_meta_and_prevouts_no_output_alloc() {
     encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
     let (meta, _) = TxRecord::decode_body_meta(&raw).unwrap();
     assert_eq!(meta.txid, [0u8; 32], "body scan has no leading txid");
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let prevouts = scan_inwit_prevouts(&inwit, meta.input_count).unwrap();
-    assert_eq!(prevouts.len(), 2);
-    assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
-    assert_eq!(prevouts[1], (Fk(1), 1));
+    assert_eq!(meta.input_count, 0, "txout meta omits n_in");
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
+    assert!(matches!(
+        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
+    let edges = vec![
+        crate::input::InputEdge::coinbase(),
+        crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 1,
+        },
+    ];
+    assert_eq!(
+        prevouts_from_edges(&edges),
+        vec![(Fk::NULL, u32::MAX), (Fk(1), 1)]
+    );
 }
 
 #[test]
@@ -754,8 +955,8 @@ fn body_txid_thin_prefix_matches_fat_packed_body() {
         .unwrap()[0];
     let from_thin = t.body_txid(fk).unwrap();
     assert_eq!(from_thin, txid, "sidefile thin identity");
-    let (_off, len) = t.inwit_range(fk).unwrap();
-    assert!(len > 50_000, "inwit should hold the fat witness");
+    let (_off, len) = t.seqsigwit_range(fk).unwrap();
+    assert!(len > 50_000, "seqsigwit should hold the fat witness");
     // Head resolve still works.
     assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(fk));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1236,6 +1437,7 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(guess_full_n, 0);
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, txid);
+    assert_eq!(got.input_count, 1);
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);
@@ -1549,8 +1751,8 @@ fn input_witness_roundtrip() {
     };
     let enc = rec.encode();
     let dec = InputRecord::decode(&enc).unwrap();
-    assert_eq!(dec.create_fk, Fk(1));
-    assert_eq!(dec.prev_index, 2);
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
     assert_eq!(dec.sequence, rec.sequence);
     assert_eq!(dec.script_sig, rec.script_sig);
     assert_eq!(dec.witness, rec.witness);
@@ -1568,15 +1770,27 @@ fn input_flags_roundtrip() {
         witness: vec![],
     };
     let enc = rec.encode();
-    // flags only: null prev + final seq + empty script + empty witness
-    assert_eq!(enc.len(), 1);
-    assert_eq!(InputRecord::decode(&enc).unwrap(), rec);
+    assert_eq!(
+        enc,
+        vec![
+            input_flags::PREV_ON_INPUTS
+                | input_flags::SEQ_FINAL
+                | input_flags::EMPTY_SCRIPT
+                | input_flags::EMPTY_WITNESS
+        ]
+    );
+    let dec = InputRecord::decode(&enc).unwrap();
+    assert_eq!(dec.sequence, rec.sequence);
+    assert!(dec.script_sig.is_empty());
+    assert!(dec.witness.is_empty());
+    assert!(dec.create_fk.is_null());
+    assert_eq!(dec.prev_index, 0);
 }
 
 #[test]
 fn input_rejects_legacy_local_prev() {
     // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
-    let flags = input_flags::RESERVED4
+    let flags = input_flags::PREV_ON_INPUTS
         | input_flags::SEQ_FINAL
         | input_flags::EMPTY_SCRIPT
         | input_flags::EMPTY_WITNESS;
@@ -1616,16 +1830,29 @@ fn input_run_roundtrip() {
     ];
     let mut enc = Vec::new();
     encode_input_run_secret(&run, &mut enc, None);
-    let dec = decode_input_run(&enc, 3).unwrap();
+    let mut dec = decode_input_run(&enc, 3).unwrap();
     assert_eq!(dec.len(), 3);
+    assert!(!dec[0].is_coinbase());
+    assert!(dec[1].create_fk.is_null());
+    assert_eq!(dec[1].witness, vec![vec![0xab]]);
+    assert_eq!(dec[1].prev_txid, [0u8; 32]);
+    let edges = [
+        crate::input::InputEdge::coinbase(),
+        crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 0,
+        },
+        crate::input::InputEdge {
+            parent: Fk(1),
+            vout: 3,
+        },
+    ];
+    apply_input_edges(&mut dec, &edges).unwrap();
     assert!(dec[0].is_coinbase());
     assert_eq!(dec[1].create_fk, Fk(1));
     assert_eq!(dec[1].prev_index, 0);
-    assert_eq!(dec[1].witness, vec![vec![0xab]]);
     assert_eq!(dec[2].create_fk, Fk(1));
     assert_eq!(dec[2].prev_index, 3);
-    // Soft prev_txid not on disk.
-    assert_eq!(dec[1].prev_txid, [0u8; 32]);
 }
 
 #[test]
@@ -1785,7 +2012,10 @@ fn tx_fixed_roundtrip() {
     };
     let enc = rec.encode();
     assert!(enc.len() > 32, "txid + thin meta");
-    assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
+    let mut got = TxRecord::decode(&enc).unwrap();
+    assert_eq!(got.input_count, 0, "encode omits n_in");
+    got.input_count = rec.input_count;
+    assert_eq!(got, rec);
 }
 
 #[test]
@@ -1817,18 +2047,20 @@ fn packed_tx_roundtrip() {
     assert!(enc.len() >= 3, "thin LAYOUT17 meta");
     let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&enc, 2).unwrap();
     assert_eq!(dtx.txid, [0u8; 32], "body decode leaves txid zero");
-    assert_eq!(dtx.input_count, 1);
+    assert_eq!(dtx.input_count, 0, "txout meta omits n_in");
     assert_eq!(dtx.output_count, 2);
     assert!(dtx.input_start_fk.get().is_none());
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
-    let dins = decode_inwit_secret(&inwit, dtx.input_count, None).unwrap();
-    assert_eq!(dins, inputs);
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
+    let dins = decode_seqsigwit_secret(&seqsigwit, tx.input_count, None).unwrap();
+    assert_eq!(dins[0].script_sig, inputs[0].script_sig);
+    assert_eq!(dins[0].sequence, inputs[0].sequence);
+    assert_eq!(dins[0].witness, inputs[0].witness);
     assert_eq!(douts, outputs);
 }
 
 #[test]
-fn inwit_and_txout_secret_xor_roundtrip() {
+fn seqsigwit_and_txout_secret_xor_roundtrip() {
     let secret = crate::store_secret::StoreSecret::from_bytes([0x5au8; 32]);
     let tx = TxRecord {
         txid: [3u8; 32],
@@ -1850,21 +2082,22 @@ fn inwit_and_txout_secret_xor_roundtrip() {
     let outputs = vec![OutputRecord::unspent(42, vec![0x00, 0x14, 0x99])];
     let mut txout = Vec::new();
     encode_packed_tx_with_secret(&tx, &inputs, &outputs, &mut txout, Some(&secret));
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, Some(&secret));
-    assert_ne!(inwit, {
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, Some(&secret));
+    assert_ne!(seqsigwit, {
         let mut plain = Vec::new();
-        encode_inwit_with_secret(&inputs, &mut plain, None);
+        encode_seqsigwit_with_secret(&inputs, &mut plain, None);
         plain
     });
     let (dtx, douts, _) = decode_packed_tx_outs_with_spender_rels(&txout, 1).unwrap();
     // Without secret, script stays obfuscated.
     assert_ne!(douts[0].script, outputs[0].script);
+    assert_eq!(dtx.input_count, 0, "txout meta omits n_in");
     let (dtx2, douts2, _) =
         decode_packed_tx_outs_with_spender_rels_secret(&txout, 1, Some(&secret)).unwrap();
-    assert_eq!(dtx2.input_count, dtx.input_count);
+    assert_eq!(dtx2.input_count, 0, "txout meta omits n_in");
     assert_eq!(douts2[0].script, outputs[0].script);
-    let dins = decode_inwit_secret(&inwit, dtx.input_count, Some(&secret)).unwrap();
+    let dins = decode_seqsigwit_secret(&seqsigwit, tx.input_count, Some(&secret)).unwrap();
     assert_eq!(dins[0].script_sig, inputs[0].script_sig);
     assert_eq!(dins[0].witness, inputs[0].witness);
 }
@@ -2066,15 +2299,16 @@ fn packed_encode_decode_flags_and_error_arms() {
     for r in [&coin, &non_final] {
         let e = r.encode();
         let d = InputRecord::decode(&e).unwrap();
-        assert_eq!(d.create_fk, r.create_fk);
-        assert_eq!(d.prev_index, r.prev_index);
+        assert!(d.create_fk.is_null());
+        assert_eq!(d.prev_index, 0);
         assert_eq!(d.sequence, r.sequence);
         assert_eq!(d.script_sig, r.script_sig);
         assert_eq!(d.witness, r.witness);
-        let (cfk, vout, used) = InputRecord::decode_prevout_at(&e).unwrap();
-        assert_eq!(cfk, r.create_fk);
-        assert_eq!(vout, r.prev_index);
-        assert_eq!(used, e.len());
+        assert!(matches!(
+            InputRecord::decode_prevout_at(&e),
+            Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+        ));
+        assert_eq!(r.encoded_len_exact(), e.len());
         let _ = r.encoded_len();
     }
     assert!(matches!(
@@ -2085,13 +2319,13 @@ fn packed_encode_decode_flags_and_error_arms() {
         InputRecord::decode_at(&[]),
         Err(StoreError::Corrupt(_))
     ));
-    // RESERVED4 flag
+    // PREV_ON_INPUTS without a sequence payload is truncated.
     assert!(matches!(
-        InputRecord::decode_at(&[input_flags::RESERVED4]),
+        InputRecord::decode_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
     assert!(matches!(
-        InputRecord::decode_prevout_at(&[input_flags::RESERVED4]),
+        InputRecord::decode_prevout_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
     // non-coinbase create_fk truncated
@@ -2148,9 +2382,12 @@ fn packed_encode_decode_flags_and_error_arms() {
     assert_eq!(outs.len(), 2);
     let (m2, _) = TxRecord::decode_body_meta(&raw).unwrap();
     assert_eq!(m2.txid, [0u8; 32]);
-    let mut inwit = Vec::new();
-    encode_inwit_with_secret(&inputs, &mut inwit, None);
-    assert_eq!(scan_inwit_prevouts(&inwit, m.input_count).unwrap().len(), 2);
+    let mut seqsigwit = Vec::new();
+    encode_seqsigwit_with_secret(&inputs, &mut seqsigwit, None);
+    assert!(matches!(
+        scan_seqsigwit_prevouts(&seqsigwit, tx.input_count),
+        Err(StoreError::Corrupt("seqsigwit prevout is on inputs"))
+    ));
     let (m4, outs_rels, rels) = decode_packed_tx_outs_with_spender_rels(&raw, 2).unwrap();
     assert_eq!(m4.txid, [0u8; 32]);
     assert_eq!(outs_rels.len(), 2);
@@ -2520,20 +2757,20 @@ fn pread_two_spans_parallel_matches_serial() {
     let first = fks[0].get().unwrap();
     let last = fks[3].get().unwrap();
     let txout_ranges = t.body_ranges(first, last).unwrap();
-    let inwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
-    let inwit_pairs = t.inwit_loc.range_batch(&inwit_fks).unwrap();
-    let inwit_ranges: Vec<(u64, u64)> = inwit_pairs
+    let seqsigwit_fks: Vec<Fk> = (first..=last).map(Fk).collect();
+    let seqsigwit_pairs = t.seqsigwit_loc.range_batch(&seqsigwit_fks).unwrap();
+    let seqsigwit_ranges: Vec<(u64, u64)> = seqsigwit_pairs
         .into_iter()
-        .map(|p| p.expect("inwit range"))
+        .map(|p| p.expect("seqsigwit range"))
         .collect();
     let (t0, _) = txout_ranges[0];
     let (tn, tln) = *txout_ranges.last().unwrap();
     let tspan = tn + tln - t0;
-    let (i0, _) = inwit_ranges[0];
-    let (inn, iln) = *inwit_ranges.last().unwrap();
+    let (i0, _) = seqsigwit_ranges[0];
+    let (inn, iln) = *seqsigwit_ranges.last().unwrap();
     let ispan = inn + iln - i0;
-    let serial = pread_two_spans(&t.body, t0, tspan, &t.inwit, i0, ispan, false).unwrap();
-    let parallel = pread_two_spans(&t.body, t0, tspan, &t.inwit, i0, ispan, true).unwrap();
+    let serial = pread_two_spans(&t.body, t0, tspan, &t.seqsigwit, i0, ispan, false).unwrap();
+    let parallel = pread_two_spans(&t.body, t0, tspan, &t.seqsigwit, i0, ispan, true).unwrap();
     assert_eq!(serial, parallel);
     assert!(!serial.0.is_empty());
     assert!(!serial.1.is_empty());
@@ -3240,20 +3477,20 @@ fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {
 }
 
 #[test]
-fn body_meta_v17_v1_locktime_zero_is_three_bytes() {
+fn body_meta_v17_v1_locktime_zero_is_one_byte() {
     let rec = rec_meta(1, 0, 1, 1);
     let mut buf = Vec::new();
     encode_body_meta_v17(&rec, &mut buf);
     assert_eq!(
         buf,
-        vec![0x89, 0x01],
-        "LAYOUT17|VER_1|LOCKTIME_ZERO + uleb input_count 1"
+        vec![0x89 | BODY_META_V17_N_IN_TXSTAT],
+        "LAYOUT17|VER_1|LOCKTIME_ZERO|N_IN_TXSTAT"
     );
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(n, 1);
     assert_eq!(got.version, 1);
     assert_eq!(got.locktime, 0);
-    assert_eq!(got.input_count, 1);
+    assert_eq!(got.input_count, 0);
     assert_eq!(got.output_count, 0);
 }
 
@@ -3262,7 +3499,11 @@ fn body_meta_v17_v2_locktime_zero() {
     let rec = rec_meta(2, 0, 1, 2);
     let mut buf = Vec::new();
     encode_body_meta_v17(&rec, &mut buf);
-    assert_eq!(buf[0], 0x8A, "LAYOUT17|VER_2|LOCKTIME_ZERO");
+    assert_eq!(
+        buf[0],
+        0x8A | BODY_META_V17_N_IN_TXSTAT,
+        "LAYOUT17|VER_2|LOCKTIME_ZERO|N_IN_TXSTAT"
+    );
     let (got, n) = decode_body_meta_v17(&buf).unwrap();
     assert_eq!(n, buf.len());
     assert_eq!(got.version, 2);
@@ -3305,6 +3546,40 @@ fn body_meta_v17_rejects_missing_layout_bit() {
             assert!(m.contains("LAYOUT17") || m.contains("legacy"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_body_meta_v17_omitted_n_in() {
+    let rec = rec_meta(1, 0, 7, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    assert_eq!(buf, vec![0x89 | BODY_META_V17_N_IN_TXSTAT]);
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(got.version, 1);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 0);
+}
+
+#[test]
+fn decode_body_meta_v17_reserved_bits_still_corrupt() {
+    let rec = rec_meta(1, 0, 1, 1);
+    let mut buf = Vec::new();
+    encode_body_meta_v17(&rec, &mut buf);
+    buf[0] |= 0x20;
+    match decode_body_meta_v17(&buf) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("reserved"), "{m}");
+        }
+        other => panic!("expected reserved Corrupt, got {other:?}"),
+    }
+    buf[0] = (buf[0] & !0x20) | 0x40;
+    match decode_body_meta_v17(&buf) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("reserved"), "{m}");
+        }
+        other => panic!("expected reserved Corrupt, got {other:?}"),
     }
 }
 
@@ -3563,13 +3838,13 @@ fn spent_span_matches_slot_len_times_n_out() {
 }
 
 #[test]
-fn reserved_flag_v17_inwit_high_bits_are_corrupt() {
+fn reserved_flag_v17_seqsigwit_high_bits_are_corrupt() {
     let rec = InputRecord::coinbase(u32::MAX, vec![], vec![]);
     let mut raw = rec.encode();
     raw[0] |= 1 << 5;
     match InputRecord::decode_at(&raw) {
         Err(StoreError::Corrupt(m)) => {
-            assert!(m.contains("reserved") || m.contains("inwit"), "{m}");
+            assert!(m.contains("reserved") || m.contains("seqsigwit"), "{m}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
     }
@@ -3611,11 +3886,11 @@ fn script_kind_v17_kind_ten_is_corrupt() {
     }
 }
 
-/// Fat inwit uses `inwit.loc` (no `{stem}.idx` dirs).
+/// Fat seqsigwit uses `seqsigwit.loc` (no `{stem}.idx` dirs).
 #[test]
-fn fat_inwit_uses_delta_loc_not_idx() {
+fn fat_seqsigwit_uses_delta_loc_not_idx() {
     {
-        let dir = tempfile_dir("inwit-loc");
+        let dir = tempfile_dir("seqsigwit-loc");
         let t = create_tiny(&dir);
         let fat_script = vec![0x6au8; 1800];
         for i in 0..6u8 {
@@ -3636,14 +3911,17 @@ fn fat_inwit_uses_delta_loc_not_idx() {
                 .unwrap();
         }
         assert!(dir.join("create.loc").is_file());
-        assert!(dir.join("inwit.loc").is_file());
+        assert!(dir.join("seqsigwit.loc").is_file());
         assert!(!dir.join("txout.idx").exists());
         assert!(!dir.join("spent.idx").exists());
-        assert!(!dir.join("inwit.idx").exists());
+        assert!(!dir.join("seqsigwit.idx").exists());
         let last = t.get(Fk(6)).unwrap();
         assert_eq!(last.output_count, 1);
-        let (off, len) = t.inwit_range(Fk(6)).unwrap();
-        let raw_in = t.inwit.with_bytes_at(off, len, |b| Ok(b.to_vec())).unwrap();
+        let (off, len) = t.seqsigwit_range(Fk(6)).unwrap();
+        let raw_in = t
+            .seqsigwit
+            .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+            .unwrap();
         assert!(raw_in.len() >= 1800, "len={}", raw_in.len());
         let _ = std::fs::remove_dir_all(&dir);
     }

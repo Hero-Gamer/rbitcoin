@@ -1843,7 +1843,7 @@ fn getblock_verbosity_1_txids_skip_reconstruct() {
     let v1 = dispatch(&ctx, "getblock", vec![first.clone(), json!(1)]).unwrap();
     assert!(
         ctx.query.store().tx_full_gets().is_empty(),
-        "verbosity 1 must not zip inwit: {:?}",
+        "verbosity 1 must not zip seqsigwit: {:?}",
         ctx.query.store().tx_full_gets()
     );
     let txs = v1["tx"].as_array().unwrap();
@@ -1922,6 +1922,41 @@ fn getblock_named_verbose_genesis_and_hex() {
 }
 
 #[test]
+fn getblock_pruned_minus8() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
+    let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    ctx.query.set_pruneheight(Some(Height(0))).unwrap();
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["pruned"], true);
+    assert_eq!(info["pruneheight"], 0);
+    let err = dispatch(&ctx, "getblock", vec![genesis.clone(), json!(0)]).unwrap_err();
+    assert_eq!(err["code"], json!(-8));
+    assert!(err["message"].as_str().unwrap().contains("pruned"), "{err}");
+    let v1 = dispatch(&ctx, "getblock", vec![genesis.clone(), json!(1)]).unwrap();
+    assert_eq!(v1["tx"].as_array().unwrap().len(), 1);
+    let err2 = dispatch(&ctx, "getblock", vec![genesis, json!(2)]).unwrap_err();
+    assert_eq!(err2["code"], json!(-8));
+    let txid = v1["tx"][0].clone();
+    let rerr = dispatch(&ctx, "getrawtransaction", vec![txid]).unwrap_err();
+    assert_eq!(rerr["code"], json!(-8));
+    assert!(
+        rerr["message"].as_str().unwrap().contains("pruned"),
+        "{rerr}"
+    );
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    let names: Vec<&str> = net["localservicesnames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(names.contains(&"NETWORK_LIMITED"), "{names:?}");
+    assert!(!names.contains(&"NETWORK"), "{names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn generateblock_submit_false_returns_hex_without_connecting() {
     let (ctx, dir, hub) = ctx_regtest_hub();
     let tip_before = hub.tip_height();
@@ -1948,7 +1983,7 @@ fn miniwallet_raw_scan_and_gettxout() {
     let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
     assert!(
         ctx.query.store().tx_full_gets().is_empty(),
-        "scantxoutset shindex must not zip inwit: {:?}",
+        "scantxoutset shindex must not zip seqsigwit: {:?}",
         ctx.query.store().tx_full_gets()
     );
     assert_eq!(scan["success"], true);
@@ -3974,9 +4009,9 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
         "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
     );
     assert_eq!(genesis["utxo_increase"], 1);
-    assert_eq!(genesis["utxo_size_inc"], 117);
     assert_eq!(genesis["utxo_increase_actual"], 0);
-    assert_eq!(genesis["utxo_size_inc_actual"], 0);
+    assert!(genesis.get("utxo_size_inc").is_none());
+    assert!(genesis.get("utxo_size_inc_actual").is_none());
 
     dispatch(&ctx, "generate", vec![json!(100)]).unwrap();
     let h1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
@@ -4057,9 +4092,10 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
     assert_eq!(got, want.to_json());
     assert_eq!(got["txs"], 2);
     assert_eq!(got["ins"], 1);
-    assert!(
-        got["utxo_increase_actual"].as_i64().unwrap() < got["utxo_increase"].as_i64().unwrap(),
-        "OP_RETURN excluded from actual: {got}"
+    assert_eq!(got["utxo_increase"], got["outs"].as_i64().unwrap() - 1);
+    assert_eq!(
+        got["utxo_increase_actual"].as_i64(),
+        Some(got["utxo_increase"].as_i64().unwrap() - 1)
     );
     assert_eq!(got["totalfee"], 2_000);
 
@@ -4077,6 +4113,100 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
     );
     assert_eq!(one["minfee"], got["minfee"]);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockstats_uses_txstat_without_reconstruct() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let _ = ctx.query.sample_reset_reconstruct_archived();
+    ctx.query.set_pruneheight(Some(Height(0))).unwrap();
+    let got = dispatch(&ctx, "getblockstats", vec![json!(0)]).unwrap();
+    assert_eq!(got["txs"], 1);
+    assert_eq!(got["ins"], 0);
+    assert_eq!(got["outs"], 1);
+    assert_eq!(got["utxo_increase"], 1);
+    assert_eq!(got["totalfee"], 0);
+    assert_eq!(
+        ctx.query.sample_reset_reconstruct_archived(),
+        0,
+        "stamped getblockstats must not reconstruct"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockstats_reconstructs_when_txstat_unstamped() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::TxStatRow;
+
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let fk = Fk(1);
+    ctx.query
+        .store()
+        .write_txstat_row(
+            fk,
+            &TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    assert!(ctx.query.stamped_txstat_block(Height(0)).unwrap().is_none());
+    let got = dispatch(&ctx, "getblockstats", vec![json!(0)]).unwrap();
+    assert_eq!(got["txs"], 1);
+    assert_eq!(got["outs"], 1);
+    assert_eq!(got["totalfee"], 0);
+    assert!(
+        ctx.query.stamped_txstat_block(Height(0)).unwrap().is_some(),
+        "fallback restamps txstat"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn getblockstats_coinbase_counts_match_core_and_omits_utxo_sizes() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let genesis = dispatch(&ctx, "getblockstats", vec![json!(0)]).unwrap();
+    assert_eq!(genesis["ins"], 0);
+    assert_eq!(genesis["outs"], 1);
+    assert_eq!(genesis["txs"], 1);
+    assert_eq!(genesis["total_size"], 0);
+    assert_eq!(genesis["total_weight"], 0);
+    assert_eq!(genesis["swtxs"], 0);
+    assert_eq!(genesis["utxo_increase"], 1);
+    assert_eq!(genesis["utxo_increase_actual"], 0);
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let got = dispatch(&ctx, "getblockstats", vec![json!(1)]).unwrap();
+    assert_eq!(got["txs"], 1);
+    assert_eq!(got["ins"], 0);
+    assert_eq!(got["outs"], 1);
+    assert_eq!(got["utxo_increase"], 1);
+    assert_eq!(got["utxo_increase_actual"], 1, "{got}");
+    assert_eq!(got["total_size"], 0);
+    assert_eq!(got["total_weight"], 0);
+    assert_eq!(got["avgtxsize"], 0);
+    assert_eq!(got["swtxs"], 0);
+    assert!(got.get("utxo_size_inc").is_none(), "{got}");
+    assert!(got.get("utxo_size_inc_actual").is_none(), "{got}");
+    let e = dispatch(
+        &ctx,
+        "getblockstats",
+        vec![json!(1), json!(["utxo_size_inc"])],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+    assert_eq!(e["message"], "Invalid selected statistic 'utxo_size_inc'");
+    let one = dispatch(
+        &ctx,
+        "getblockstats",
+        vec![json!(1), json!(["utxo_increase_actual"])],
+    )
+    .unwrap();
+    assert_eq!(one["utxo_increase_actual"], 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

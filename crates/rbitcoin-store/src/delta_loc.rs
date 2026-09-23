@@ -1,7 +1,7 @@
 //! Shared delta-locator helpers: 1024-create windows, stride-8, overflow rows.
 //!
 //! [`CreateLoc`](crate::create_loc::CreateLoc) packs txout strides + `n_out`.
-//! [`DeltaLoc`] is the single-plane u16 sibling used by `inwit.loc`.
+//! [`DeltaLoc`] is the single-plane u16 sibling used by `seqsigwit.loc`.
 
 use crate::error::StoreError;
 use crate::file::{
@@ -17,7 +17,7 @@ pub const IDX_STRIDE: u64 = 8;
 /// Creates per loc window / checkpoint grain.
 pub const LOC_WINDOW: u64 = 1024;
 const CREATE_OVF_MISSING: &str = "invariant: create.loc overflow missing";
-const INWIT_OVF_MISSING: &str = "invariant: inwit.loc overflow missing";
+const SEQSIGWIT_OVF_MISSING: &str = "invariant: seqsigwit.loc overflow missing";
 pub(crate) const CREATE_OVF_SLOT: u64 = 16;
 const CREATE_OVF_SLOT_V22: u64 = 12;
 
@@ -81,7 +81,7 @@ fn create_loc_file(path: &Path, kind: TableKind) -> Result<TableFile, StoreError
     Ok(f)
 }
 
-/// Single-plane u16 delta locator (`inwit.loc`: strides, `0` = overflow).
+/// Single-plane u16 delta locator (`seqsigwit.loc`: strides, `0` = overflow).
 pub struct DeltaLoc {
     loc: TableFile,
     ovf: TableFile,
@@ -104,8 +104,8 @@ impl DeltaLoc {
             checkpoints: RwLock::new(Vec::new()),
             ovf_rows: RwLock::new(Vec::new()),
             count: AtomicU64::new(0),
-            missing: if stem == "inwit" {
-                INWIT_OVF_MISSING
+            missing: if stem == "seqsigwit" {
+                SEQSIGWIT_OVF_MISSING
             } else {
                 CREATE_OVF_MISSING
             },
@@ -146,8 +146,8 @@ impl DeltaLoc {
             checkpoints: RwLock::new(checkpoints),
             ovf_rows: RwLock::new(ovf_rows),
             count: AtomicU64::new(count),
-            missing: if stem == "inwit" {
-                INWIT_OVF_MISSING
+            missing: if stem == "seqsigwit" {
+                SEQSIGWIT_OVF_MISSING
             } else {
                 CREATE_OVF_MISSING
             },
@@ -161,7 +161,7 @@ impl DeltaLoc {
     pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
         let cur = self.count.load(Ordering::Acquire);
         if new_count > cur {
-            return Err(StoreError::Corrupt("inwit.loc truncate past count"));
+            return Err(StoreError::Corrupt("seqsigwit.loc truncate past count"));
         }
         if new_count == cur {
             return Ok(());
@@ -212,7 +212,7 @@ impl DeltaLoc {
             if i + 1 < starts.len() && starts[i + 1] != start.saturating_add(len) {
                 return Err(StoreError::Corrupt("invariant: loc starts"));
             }
-            let (disk, ovf) = pack_u16_strides_inwit(strides)?;
+            let (disk, ovf) = pack_u16_strides_seqsigwit(strides)?;
             loc_bytes.extend_from_slice(&disk.to_le_bytes());
             if let Some(true_s) = ovf {
                 let mut row = [0u8; 12];
@@ -335,7 +335,7 @@ impl DeltaLoc {
     }
 }
 
-fn pack_u16_strides_inwit(strides: u32) -> Result<(u16, Option<u32>), StoreError> {
+fn pack_u16_strides_seqsigwit(strides: u32) -> Result<(u16, Option<u32>), StoreError> {
     if strides == 0 {
         return Err(StoreError::Corrupt("invariant: loc strides"));
     }
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn delta_loc_append_and_batch_order() {
         let dir = TempDir::labeled("delta-loc").unwrap();
-        let loc = DeltaLoc::create(dir.path(), "inwit").unwrap();
+        let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
         let starts: Vec<u64> = (0..4).map(|i| FILE_HEADER_LEN as u64 + i * 16).collect();
         loc.append(&starts, &[16, 16, 16, 16]).unwrap();
         assert_eq!(loc.count(), 4);
@@ -595,14 +595,14 @@ mod tests {
     #[test]
     fn delta_loc_u16_overflow_and_missing() {
         let dir = TempDir::labeled("delta-ovf").unwrap();
-        let loc = DeltaLoc::create(dir.path(), "inwit").unwrap();
+        let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
         let fat = 65536 * IDX_STRIDE;
         loc.append(&[FILE_HEADER_LEN as u64], &[fat]).unwrap();
         let got = loc.range_batch(&[Fk(1)]).unwrap();
         assert_eq!(got[0], Some((FILE_HEADER_LEN as u64, fat)));
         drop(loc);
-        std::fs::remove_file(dir.path().join("inwit.loc.ovf")).unwrap();
-        let loc = DeltaLoc::open(dir.path(), "inwit").unwrap();
+        std::fs::remove_file(dir.path().join("seqsigwit.loc.ovf")).unwrap();
+        let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
         match loc.range_batch(&[Fk(1)]) {
             Err(StoreError::Corrupt(m)) => assert!(m.contains("overflow missing"), "{m}"),
             other => panic!("{other:?}"),
@@ -610,12 +610,12 @@ mod tests {
     }
 
     #[test]
-    fn pack_u16_inwit_overflow_at_512kib() {
-        let (d, ovf) = pack_u16_strides_inwit(1).unwrap();
+    fn pack_u16_seqsigwit_overflow_at_512kib() {
+        let (d, ovf) = pack_u16_strides_seqsigwit(1).unwrap();
         assert_eq!((d, ovf), (1, None));
-        let (d, ovf) = pack_u16_strides_inwit(65535).unwrap();
+        let (d, ovf) = pack_u16_strides_seqsigwit(65535).unwrap();
         assert_eq!((d, ovf), (65535, None));
-        let (d, ovf) = pack_u16_strides_inwit(65536).unwrap();
+        let (d, ovf) = pack_u16_strides_seqsigwit(65536).unwrap();
         assert_eq!(d, 0);
         assert_eq!(ovf, Some(65536));
     }

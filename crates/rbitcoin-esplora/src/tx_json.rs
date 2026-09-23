@@ -146,7 +146,13 @@ pub fn history_items_to_tx_json(
 
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
 pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
-    let wire = query.reconstruct_tx(tx_fk)?;
+    let wire = match query.reconstruct_tx(tx_fk) {
+        Ok(w) => w,
+        Err(rbitcoin_store::StoreError::Pruned { .. }) => {
+            return build_tx_json_pruned(query, tx_fk, network);
+        }
+        Err(e) => return Err(e),
+    };
     let status = tx_status_json(query, tx_fk)?;
     let (_meta, stored_inputs, _outs) = query.store().get_tx_full(tx_fk)?;
     let stored_txid = query
@@ -164,6 +170,71 @@ pub fn build_tx_json(query: &Query, tx_fk: Fk, network: Network) -> Result<Value
         None,
         None,
     )
+}
+
+/// Parent txid and vout from `input.body`. No scriptSig, witness, or sequence.
+fn pruned_vin(
+    query: &Query,
+    tx_fk: Fk,
+    network: Network,
+) -> Result<Option<Vec<Value>>, QueryError> {
+    let Some(edges) = query.store().input_edges(tx_fk)? else {
+        return Ok(None);
+    };
+    let mut vin = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if edge.parent.is_null() {
+            vin.push(json!({
+                "txid": "0".repeat(64),
+                "vout": 0xFFFFFFFFu32,
+                "is_coinbase": true,
+            }));
+            continue;
+        }
+        let parent_txid = query.store().txs.body_txid(edge.parent)?;
+        let mut obj = json!({
+            "txid": block_hash_hex(&parent_txid),
+            "vout": edge.vout,
+            "is_coinbase": false,
+        });
+        if let Ok((_meta, outs)) = query.store().get_tx_meta_and_outputs(edge.parent) {
+            if let Some(o) = outs.get(edge.vout as usize) {
+                obj["prevout"] = vout_fields(&o.script, o.value, network);
+            }
+        }
+        vin.push(obj);
+    }
+    Ok(Some(vin))
+}
+
+fn build_tx_json_pruned(query: &Query, tx_fk: Fk, network: Network) -> Result<Value, QueryError> {
+    let tx = query.store().get_tx(tx_fk)?;
+    let (_meta, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
+    let txid = query.store().txs.body_txid(tx_fk).unwrap_or(tx.txid);
+    let status = tx_status_json(query, tx_fk)?;
+    let vout: Vec<Value> = outs
+        .iter()
+        .map(|o| vout_fields(&o.script, o.value, network))
+        .collect();
+    let mut obj = json!({
+        "txid": block_hash_hex(&txid),
+        "version": tx.version,
+        "locktime": tx.locktime,
+        "vout": vout,
+        "status": status,
+        "pruned": true,
+    });
+    if let Some(vin) = pruned_vin(query, tx_fk, network)? {
+        obj["vin"] = json!(vin);
+    }
+    if let Some(row) = query.txstat_row(tx_fk)? {
+        if row.base != 0 || row.wit_extra != 0 {
+            obj["fee"] = json!(row.fee_sat);
+            obj["size"] = json!(row.size());
+            obj["weight"] = json!(row.weight());
+        }
+    }
+    Ok(obj)
 }
 
 /// Esplora tx JSON from a mempool wire body (not in Class A).
@@ -780,7 +851,7 @@ mod tests {
         let parent_id = spend1_fk.get().unwrap();
         assert!(
             !q.store().tx_full_gets().contains(&parent_id),
-            "parent prevout must not zip inwit: {:?}",
+            "parent prevout must not zip seqsigwit: {:?}",
             q.store().tx_full_gets()
         );
         assert_eq!(v["txid"], block_hash_hex(&spend2_txid));
@@ -788,6 +859,129 @@ mod tests {
         assert_eq!(v["sigops"], 4, "OP_CHECKSIG output scaled: {v}");
         assert_eq!(q.store().txs.body_txid(spend2_fk).unwrap(), spend2_txid);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruned_tx_json_has_fee_from_txstat() {
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord, TxStatRow};
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("esplora-pruned-txstat");
+        let mut merkle = [0u8; 32];
+        merkle[0] = 0xaa;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash: merkle,
+            size: 0,
+            weight: 0,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let hfk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+        q.store()
+            .write_txstat_row(
+                fk,
+                &TxStatRow {
+                    fee_sat: 0,
+                    base: 81,
+                    wit_extra: 0,
+                },
+            )
+            .unwrap();
+        let mut spend_txid = [0u8; 32];
+        spend_txid[31] = 0xee;
+        let h1_hash = rbitcoin_store::block_header_hash(1, &merkle, &spend_txid, 2, 0x207fffff, 0);
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: spend_txid,
+            hash: h1_hash,
+            size: 0,
+            weight: 0,
+        };
+        let spend = TxApply {
+            tx: TxRecord {
+                txid: spend_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: txid,
+                create_fk: fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![0x51],
+                witness: vec![vec![0xab]],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        q.connect_block(Height(1), &h1, &[spend]).unwrap();
+        let spend_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+        q.set_pruneheight(Some(Height(1))).unwrap();
+        let v = build_tx_json(&q, fk, Network::Regtest).unwrap();
+        assert_eq!(v["pruned"], true);
+        assert_eq!(v["vin"][0]["is_coinbase"], true);
+        assert!(v["vin"][0].get("witness").is_none(), "{v}");
+        assert!(v["vin"][0].get("scriptsig").is_none(), "{v}");
+        let sv = build_tx_json(&q, spend_fk, Network::Regtest).unwrap();
+        assert_eq!(sv["pruned"], true, "{sv}");
+        assert_eq!(sv["vin"][0]["txid"], block_hash_hex(&txid));
+        assert_eq!(sv["vin"][0]["vout"], 0);
+        assert_eq!(sv["vin"][0]["is_coinbase"], false);
+        assert!(sv["vin"][0].get("witness").is_none(), "{sv}");
+        assert_eq!(sv["vin"][0]["prevout"]["value"], 5_000_000_000i64);
+        q.set_pruneheight(Some(Height(0))).unwrap();
+        assert_eq!(v["fee"], 0);
+        assert_eq!(v["size"], 81);
+        assert_eq!(v["weight"], 324);
+        assert!(v.get("sigops").is_none(), "pruned JSON omits sigops: {v}");
+        assert_eq!(v["vout"].as_array().unwrap().len(), 1);
+        assert_eq!(v["txid"], block_hash_hex(&txid));
+
+        q.store()
+            .write_txstat_row(
+                fk,
+                &TxStatRow {
+                    fee_sat: 0,
+                    base: 0,
+                    wit_extra: 0,
+                },
+            )
+            .unwrap();
+        let raw = build_tx_json(&q, fk, Network::Regtest).unwrap();
+        assert_eq!(raw["pruned"], true);
+        assert_eq!(raw["vin"][0]["is_coinbase"], true, "{raw}");
+        assert!(raw.get("fee").is_none(), "unstamped omits fee: {raw}");
+        assert!(raw.get("size").is_none(), "{raw}");
+        assert!(raw.get("weight").is_none(), "{raw}");
+        assert!(raw.get("sigops").is_none(), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

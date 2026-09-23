@@ -95,7 +95,7 @@ fn apply_archive_plan(
     ns.plan_take_ns = t_take.elapsed().as_nanos() as u64;
     let t_ca = Instant::now();
     let (committed, loc) = query
-        .archive_commit_plan_defer_head(plan)
+        .archive_commit_plan_defer_head_parents(plan, Some(&batch.batch_parents))
         .map_err(ConsensusError::from)?;
     ns.class_a_ns = t_ca.elapsed().as_nanos() as u64;
     if !committed {
@@ -478,7 +478,7 @@ pub(super) fn fill_planned_create_layout_after_commit(
             let mut checked = vouts.clone();
             checked.sort_unstable();
             checked.dedup();
-            let cb = if pin.tx().input_count != 1 {
+            let cb = if pin.tx().input_count > 1 {
                 Some(false)
             } else {
                 None

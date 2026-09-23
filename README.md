@@ -38,7 +38,7 @@ Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electru
 backends are **external indexers** of another node. rbitcoin does neither:
 **no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
-- **~200 GiB** hot pin/annotate set (schema 17); **~700 GiB** with cold `inwit` —
+- **~200 GiB** hot pin/annotate set (schema 17); **~700 GiB** with cold `seqsigwit` —
   census in [`SCHEMA.md`](./SCHEMA.md), `--sh-index` costs in [`OPERATOR.md`](./OPERATOR.md)
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
 - **Modest RAM** during sync — no multi‑GiB `dbcache` pause

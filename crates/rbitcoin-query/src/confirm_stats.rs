@@ -248,6 +248,7 @@ confirm_window! {
     arch_write_head_ns,
     arch_write_spend_ns,
     arch_write_htxs_ns,
+    arch_write_txstat_ns,
     arch_write_flush_ns,
     arch_write_blocks,
     // lookup wave
@@ -518,6 +519,10 @@ impl ConfirmStats {
         add(&self.arch_write_spend_ns, spend_ns);
         add(&self.arch_write_htxs_ns, htxs_ns);
         add(&self.arch_write_blocks, blocks);
+    }
+
+    pub fn note_write_txstat(&self, ns: u64) {
+        add(&self.arch_write_txstat_ns, ns);
     }
 
     pub fn note_write_flush(&self, ns: u64) {
