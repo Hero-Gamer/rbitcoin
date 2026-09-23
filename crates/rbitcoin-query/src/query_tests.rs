@@ -2863,15 +2863,19 @@ fn prune_watermark_unlinks_fallen_height() {
     assert!(!window.join("0.bin").exists(), "jump unlinks height 0");
     assert!(!window.join("1.bin").exists(), "jump unlinks height 1");
     assert!(window.join("2.bin").is_file());
+    q.set_pruneheight(Some(Height(2))).unwrap();
+    assert!(
+        !window.join("2.bin").exists(),
+        "a one-height step still unlinks the height that just fell out"
+    );
     std::fs::write(window.join("0.bin"), b"orphan").unwrap();
     drop(q);
     let q = Query::open_or_create_tiny(dir.path()).unwrap();
-    assert_eq!(q.pruneheight(), Some(Height(1)));
+    assert_eq!(q.pruneheight(), Some(Height(2)));
     assert!(
         !window.join("0.bin").exists(),
         "open sweeps a file left below the sidecar"
     );
-    assert!(window.join("2.bin").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
