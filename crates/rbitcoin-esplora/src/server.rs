@@ -422,7 +422,7 @@ pub(crate) struct AppState {
     pub(crate) max_ws_message_bytes: usize,
     pub(crate) max_track_addresses: usize,
     pub(crate) max_track_txs: usize,
-    /// Per-client last-1 GET + last-bulk POST joins (unix/loopback `X-Rbitcoin-Client`).
+    /// Per-client last-1 GET + last-bulk POST joins (unix or `join_header_trusted`).
     pub(crate) sh_join: Arc<Mutex<JoinCache>>,
     /// Unix listen trusts `X-Rbitcoin-Client` without a TCP peer address.
     pub(crate) join_header_trusted: bool,
@@ -558,12 +558,27 @@ fn retain_join_budget(c: &mut ClientJoins) {
     cap_bulk(c);
 }
 
+#[cfg(test)]
+mod client_id_tests {
+    use super::client_id_from;
+
+    #[test]
+    fn loopback_without_trust_ignores_client_header() {
+        assert!(client_id_from(false, true, Some("wallet".into())).is_none());
+        assert_eq!(
+            client_id_from(true, false, Some("wallet".into())).as_deref(),
+            Some("wallet")
+        );
+        assert!(client_id_from(false, false, Some("wallet".into())).is_none());
+    }
+}
+
 pub(crate) fn client_id_from(
     unix_or_trusted: bool,
-    loopback: bool,
+    _loopback: bool,
     header: Option<String>,
 ) -> Option<String> {
-    if unix_or_trusted || loopback {
+    if unix_or_trusted {
         header
     } else {
         None
@@ -1381,9 +1396,9 @@ mod tests {
     #[test]
     fn client_id_ignored_on_public_tcp() {
         assert!(client_id_from(false, false, Some("x".into())).is_none());
-        assert_eq!(
-            client_id_from(false, true, Some("x".into())).as_deref(),
-            Some("x")
+        assert!(
+            client_id_from(false, true, Some("x".into())).is_none(),
+            "loopback without join_header_trusted ignores X-Rbitcoin-Client"
         );
         assert_eq!(
             client_id_from(true, false, Some("x".into())).as_deref(),
@@ -1911,7 +1926,10 @@ mod tests {
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
         let (st, body) = oneshot_http(&lb_app, req).await;
         assert_eq!(st, 200, "{body}");
-        assert_eq!(loopback.lock().unwrap().last_sh_key("lb"), Some(sh1));
+        assert!(
+            loopback.lock().unwrap().last_sh_key("lb").is_none(),
+            "loopback without join_header_trusted ignores X-Rbitcoin-Client"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

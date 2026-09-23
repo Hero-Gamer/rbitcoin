@@ -11,6 +11,13 @@ before 1.0).
 
 ### Fixed
 
+- **RPC and Esplora limits:** bearer auth runs before the body is read
+  (401 with no body bytes). The HTTP body cap is `RPC_MAX_HTTP_BODY`
+  (2 MiB, 413 above it). `--rpc-work-queue` defaults to 16 (HTTP 503 when
+  full; **0** unlimited). `waitforblock`, `waitforblockheight`,
+  `waitfornewblock`, and `getblocktemplate` longpoll wait off the blocking
+  pool. Esplora `X-Rbitcoin-Client` is a join key only for a unix socket
+  or with join-header trust; loopback alone is not.
 - **Scripthash join:** the default `--max-sh-creates` is 10000. An unpaged
   join above that is refused (`scripthash join exceeds --max-sh-creates
   (default 10000)`). **0** stays unlimited. A history request that names a

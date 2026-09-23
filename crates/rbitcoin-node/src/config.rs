@@ -226,7 +226,7 @@ impl std::fmt::Debug for TorControlOpts {
 }
 
 /// JSON-RPC listen and auth.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcOpts {
     /// TCP bind. Filled from `--rpc-listen` (optional ADDR uses network default port).
     pub listen: Option<SocketAddr>,
@@ -237,6 +237,18 @@ pub struct RpcOpts {
     /// Override `{datadir}/rpc.token`.
     pub token_file: Option<PathBuf>,
     pub work_queue: Option<usize>,
+}
+
+impl Default for RpcOpts {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            listen_default: false,
+            socket: false,
+            token_file: None,
+            work_queue: Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE),
+        }
+    }
 }
 
 /// Node process configuration (CLI + optional conf file).
@@ -1143,10 +1155,7 @@ impl NodeConfig {
                 let n: usize = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf rpc_work_queue: {e}")))?;
-                if n == 0 {
-                    return Err(NodeError::Config("conf rpc_work_queue must be >= 1".into()));
-                }
-                self.rpc.work_queue = Some(n);
+                self.rpc.work_queue = if n == 0 { None } else { Some(n) };
             }
             "max_run_secs" => {
                 self.max_run_secs = Some(
@@ -1333,6 +1342,25 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
+    }
+
+    #[test]
+    fn rpc_work_queue_defaults_finite_and_zero_is_unlimited() {
+        assert_eq!(
+            NodeConfig::default().rpc.work_queue,
+            Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE)
+        );
+        let mut c = NodeConfig::default();
+        assert_eq!(
+            c.apply_kv("rpc_work_queue", "0").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.rpc.work_queue, None);
+        assert_eq!(
+            c.apply_kv("rpc_work_queue", "4").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.rpc.work_queue, Some(4));
     }
 
     #[test]

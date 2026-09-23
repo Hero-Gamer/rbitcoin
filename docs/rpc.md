@@ -25,7 +25,7 @@ Esplora** (with `--sh-index`) for address/script history.
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
 | `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
-| `--rpc-work-queue N` | **unset** | Unlimited in-flight HTTP RPC. When set, occupancy is one HTTP POST (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded` |
+| `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is unlimited. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
 Bearer-authenticated (`{datadir}/rpc.token`). The Core-functional proxy still

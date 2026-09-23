@@ -41,6 +41,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [026](./026-false-witness-program.md) | high | False witness program accepted | fixed | `false_witness_program_is_eval_false` |
 | [027](./027-script-skip-wtxid.md) | critical | Script skip keyed by txid | fixed | `tip_script_pres_skips_only_matching_wtxid` |
 | [028](./028-prevout-count.md) | high | Empty prevouts skipped script checks | fixed | `prevout_count_must_match_inputs` |
+| [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
 
