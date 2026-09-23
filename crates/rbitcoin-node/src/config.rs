@@ -1381,10 +1381,7 @@ mod tests {
     #[test]
     fn max_sh_creates_and_esplora_block_template_apply_kv() {
         let mut c = NodeConfig::default();
-        assert_eq!(
-            c.max_sh_creates,
-            rbitcoin_query::DEFAULT_MAX_SH_CREATES
-        );
+        assert_eq!(c.max_sh_creates, rbitcoin_query::DEFAULT_MAX_SH_CREATES);
         assert!(!c.esplora_block_template);
         assert_eq!(
             c.apply_kv("max_sh_creates", "100").unwrap(),
