@@ -232,6 +232,18 @@ const INPUT_BACKFILL_FKS: u64 = 16_384;
 /// Coalesced `seqsigwit.body` pread. Same bound as [`SCRIPT_HASH_COLLECT_SPAN`].
 const INPUT_BACKFILL_SPAN: u64 = SCRIPT_HASH_COLLECT_SPAN;
 
+fn backfill_chunk_end(id: u64, n: u64) -> u64 {
+    (id + INPUT_BACKFILL_FKS - 1).min(n)
+}
+
+fn backfill_progress_due(end: u64, id: u64) -> bool {
+    end / 1_000_000 != (id - 1) / 1_000_000
+}
+
+fn unstamped_tail(n_bodies: u64, have: u64) -> u64 {
+    n_bodies.saturating_sub(have)
+}
+
 type ReadSeqsigwitSpan<'a> = &'a mut dyn FnMut(u64, u64, &mut Vec<u8>) -> Result<(), StoreError>;
 
 fn edges_from_seqsigwit_ranges(
@@ -257,7 +269,7 @@ fn edges_from_seqsigwit_ranges(
                         "invariant: seqsigwit range missing during input backfill",
                     ));
                 };
-                if off != end || len > span_max {
+                if off != end {
                     break;
                 }
                 let next = end.saturating_add(len);
@@ -1048,10 +1060,12 @@ impl TxTable {
             if legacy {
                 t.backfill_inputs_from_seqsigwit(from)?;
             } else {
-                t.input.append_unstamped(n_bodies - t.input.count())?;
+                t.input
+                    .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
             }
         } else if t.input.count() < n_bodies {
-            t.input.append_unstamped(n_bodies - t.input.count())?;
+            t.input
+                .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
         } else if t.input.count() > n_bodies {
             return Err(StoreError::Corrupt(
                 "invariant: input.loc ahead of create.loc",
@@ -1614,7 +1628,7 @@ impl TxTable {
         rbitcoin_log::info!("store: input backfill from seqsigwit n={n} start={id}");
         let mut buf = Vec::new();
         while id <= n {
-            let end = (id + INPUT_BACKFILL_FKS - 1).min(n);
+            let end = backfill_chunk_end(id, n);
             let fks: Vec<Fk> = (id..=end).map(Fk).collect();
             let ranges = self.seqsigwit_loc.range_batch(&fks)?;
             let edges = edges_from_seqsigwit_ranges(
@@ -1624,7 +1638,7 @@ impl TxTable {
                 &mut buf,
             )?;
             self.input.append(&edges)?;
-            if end / 1_000_000 != (id - 1) / 1_000_000 {
+            if backfill_progress_due(end, id) {
                 rbitcoin_log::info!("store: input backfill progress {end}/{n}");
             }
             id = end + 1;

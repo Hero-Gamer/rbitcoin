@@ -319,6 +319,35 @@ fn reopen_without_inputs_refuses_new_seqsigwit() {
         Ok(_) => panic!("open without inputs recovered a new seqsigwit"),
     }
     let _ = std::fs::remove_dir_all(&dir);
+
+    // New-layout tail: one stamped create, one missing. The gap is exactly
+    // one unstamped row, not a seqsigwit walk.
+    let dir = tempfile_dir("input-unstamped-tail");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&[two_input_item(), two_input_item()], true)
+        .unwrap();
+    drop(t);
+    for name in ["input.loc", "input.off", "input.body"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    let partial = crate::input::Input::create(&dir).unwrap();
+    partial
+        .append(&[vec![
+            crate::input::InputEdge::coinbase(),
+            crate::input::InputEdge {
+                parent: Fk(1),
+                vout: 0,
+            },
+        ]])
+        .unwrap();
+    drop(partial);
+    let t2 = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t2.input.count(), 2);
+    assert!(
+        t2.input.edges(Fk(2)).unwrap().is_none(),
+        "new seqsigwit has no inline prevout to backfill"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -702,6 +731,85 @@ fn seqsigwit_backfill_spans_split_on_gap_and_cap() {
     .unwrap();
     assert_eq!(reads.get(), 2, "a span cap splits contiguous records");
     assert_eq!(edges.len(), 2);
+
+    let cap = (a.len() + b.len()) as u64;
+    reads.set(0);
+    let _ = edges_from_seqsigwit_ranges(
+        &mut |off, len, buf| {
+            reads.set(reads.get() + 1);
+            assert_ne!(len, 0);
+            let s = off as usize;
+            buf.clear();
+            buf.extend_from_slice(&blob[s..s + len as usize]);
+            Ok(())
+        },
+        &ranges[..2],
+        cap,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(
+        reads.get(),
+        1,
+        "a span that lands on the cap stays one pread"
+    );
+
+    let base = 1_000u64;
+    let mut far = [0u8; 1_100];
+    far[base as usize..base as usize + a.len()].copy_from_slice(&a);
+    far[base as usize + a.len()..base as usize + a.len() + b.len()].copy_from_slice(&b);
+    let far_ranges = [
+        Some((base, a.len() as u64)),
+        Some((base + a.len() as u64, b.len() as u64)),
+    ];
+    reads.set(0);
+    let far_edges = edges_from_seqsigwit_ranges(
+        &mut |off, len, buf| {
+            reads.set(reads.get() + 1);
+            assert_ne!(len, 0);
+            let s = off as usize;
+            buf.clear();
+            buf.extend_from_slice(&far[s..s + len as usize]);
+            Ok(())
+        },
+        &far_ranges,
+        64,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(
+        reads.get(),
+        1,
+        "the cap is the span length, not the file offset"
+    );
+    assert_eq!(far_edges[0], vec![crate::input::InputEdge::coinbase()]);
+    assert_eq!(far_edges[1][0].parent, Fk(1));
+
+    reads.set(0);
+    let empty = edges_from_seqsigwit_ranges(
+        &mut |_off, len, buf| {
+            reads.set(reads.get() + 1);
+            assert_ne!(len, 0, "a zero-length record is not a pread");
+            buf.clear();
+            Ok(())
+        },
+        &[Some((5, 0))],
+        1024,
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(reads.get(), 0);
+    assert_eq!(empty, vec![vec![]]);
+
+    assert_eq!(backfill_chunk_end(1, u64::MAX), INPUT_BACKFILL_FKS);
+    assert_eq!(backfill_chunk_end(2, u64::MAX), INPUT_BACKFILL_FKS + 1);
+    assert_eq!(backfill_chunk_end(1, 10), 10);
+    assert!(!backfill_progress_due(500_000, 1));
+    assert!(backfill_progress_due(1_000_000, 1));
+    assert!(!backfill_progress_due(1_500_000, 1_000_001));
+    assert!(backfill_progress_due(1_000_000, 1_000_000));
+    assert_eq!(unstamped_tail(2, 1), 1);
+    assert_eq!(unstamped_tail(1_000, 1), 999);
 }
 
 #[test]
