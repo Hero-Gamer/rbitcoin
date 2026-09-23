@@ -660,9 +660,12 @@ mod tests {
         let mut shifted = vec![0x51, 0x51, 0x51, 0x51, 0x4e, 5, 0, 0, 0];
         shifted.extend_from_slice(&SIGNET_HEADER);
         shifted.push(0x7e);
+        // After the payload. `pc *= n` skips this opcode.
+        shifted.push(0x52);
         let (sol, repl) = fetch_and_clear_signet_section(&shifted).expect("shifted pushdata4");
         assert_eq!(sol, vec![0x7e]);
         assert_eq!(repl.iter().filter(|b| **b == 0x51).count(), 4);
+        assert!(repl.ends_with(&[0x52]), "{repl:?}");
         // Exactly three length bytes: `pc + 3 == len` must not read past the script.
         assert!(fetch_and_clear_signet_section(&[0x51, 0x51, 0x51, 0x51, 0x4e, 0, 0, 0]).is_none());
         // Non-minimal OP_PUSHDATA1 of one byte re-encodes as a direct push.
