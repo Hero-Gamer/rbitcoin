@@ -11,6 +11,9 @@ before 1.0).
 
 ### Fixed
 
+- **Block decode tx count:** `decode_block_precomputes` rejects a count
+  larger than the remaining payload divided by 10 before it allocates.
+  A one-transaction block still decodes.
 - **Signet solution:** a non-minimal CompactSize is a bad block. A witness
   count larger than the remaining bytes fails before allocation.
   PUSHDATA4 is parsed, and non-minimal pushes are re-encoded the way
