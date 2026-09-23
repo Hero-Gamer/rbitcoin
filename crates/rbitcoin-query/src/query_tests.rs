@@ -2648,7 +2648,9 @@ fn confirm_txstat_miss_is_corrupt() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
     use bitcoin::transaction::Version;
-    use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use bitcoin::{
+        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
 
     let (dir, q) = temp_query("txstat-miss-pinned");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
