@@ -2763,6 +2763,41 @@ fn reorg_through_pruneheight_refuses() {
 }
 
 #[test]
+fn prune_watermark_unlinks_fallen_height() {
+    let (dir, q) = temp_query("prune-unlink-fallen");
+    q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_ibd_mode(true);
+    let mut prev = Fk::NULL;
+    let mut parent_hash: Option<[u8; 32]> = None;
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent_hash);
+        parent_hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let window = q.store.path().join("seqsigwit.window");
+    assert!(window.join("0.bin").is_file());
+    assert!(window.join("2.bin").is_file());
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    assert!(!window.join("0.bin").exists(), "height 0 fell out");
+    assert!(window.join("1.bin").is_file());
+    assert!(window.join("2.bin").is_file());
+    q.set_pruneheight(Some(Height(1))).unwrap();
+    assert!(!window.join("1.bin").exists(), "height 1 fell out");
+    assert!(window.join("2.bin").is_file());
+    std::fs::write(window.join("0.bin"), b"orphan").unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert_eq!(q.pruneheight(), Some(Height(1)));
+    assert!(
+        !window.join("0.bin").exists(),
+        "open sweeps a file left below the sidecar"
+    );
+    assert!(window.join("2.bin").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prune_watermark_survives_reopen() {
     let (dir, q) = temp_query("prune-reopen");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
