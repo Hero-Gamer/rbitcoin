@@ -1212,8 +1212,12 @@ fn assemble_non_cb_tx(
     }
     // fee >= 0 is guaranteed by the `value_out > value_in` reject above;
     // redundant `fee < 0` check removed (dead code, unkillable mutant).
-    let fee = value_in.checked_sub(value_out).ok_or(ConsensusError::BadTx("fee overflow"))?;
-    *fees = fees.checked_add(fee).ok_or(ConsensusError::BadTx("fee overflow"))?;
+    let fee = value_in
+        .checked_sub(value_out)
+        .ok_or(ConsensusError::BadTx("fee overflow"))?;
+    *fees = fees
+        .checked_add(fee)
+        .ok_or(ConsensusError::BadTx("fee overflow"))?;
     if build_script_jobs {
         let t_job = Instant::now();
         let mut job = if let Some(w) = wire {
@@ -1248,7 +1252,7 @@ fn assemble_tx_value_out(
                 return Err(ConsensusError::BadTx("value out of range"));
             }
             Ok(p.out_sum as i64) // safe: <= MAX_MONEY < i64::MAX
-        },
+        }
         None => {
             let mut value_out = 0i64;
             for o in &tx.output {
@@ -1257,14 +1261,13 @@ fn assemble_tx_value_out(
                     return Err(ConsensusError::BadTx("output value too large"));
                 }
                 let sats = sats_u64 as i64; // safe: < MAX_MONEY < i64::MAX
-                // sats < 0 is impossible for u64, removed dead code - now check range instead
+                                            // sats < 0 is impossible for u64, removed dead code - now check range instead
                 value_out = value_out
                     .checked_add(sats)
                     .ok_or(ConsensusError::BadTx("value out overflow"))?;
                 if value_out > MAX_MONEY {
                     return Err(ConsensusError::BadTx("tx output sum too large"));
                 }
-
             }
             Ok(value_out)
         }

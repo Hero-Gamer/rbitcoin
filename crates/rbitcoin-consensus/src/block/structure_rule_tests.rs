@@ -2208,15 +2208,37 @@ fn pr2_kills_zero_fee_and_zero_value() {
     let mut mature_val = 0u64;
     for h in 1..=101 {
         let b = mine_empty_regtest(prev_hash, prev_time + 600, h);
-        if h == 1 { mature_txid = Some(b.txdata[0].compute_txid()); mature_val = b.txdata[0].output[0].value.to_sat(); }
+        if h == 1 {
+            mature_txid = Some(b.txdata[0].compute_txid());
+            mature_val = b.txdata[0].output[0].value.to_sat();
+        }
         accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
-        prev_hash = b.block_hash(); prev_time = b.header.time;
+        prev_hash = b.block_hash();
+        prev_time = b.header.time;
     }
-    let op = OutPoint { txid: mature_txid.unwrap(), vout: 0 };
-    let zero_fee = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![TxIn { previous_output: op, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }], output: vec![TxOut { value: Amount::from_sat(mature_val), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
+    let op = OutPoint {
+        txid: mature_txid.unwrap(),
+        vout: 0,
+    };
+    let zero_fee = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(mature_val),
+            script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+        }],
+    };
     let mut b102 = mine_empty_regtest(prev_hash, prev_time + 600, 102);
-    b102.txdata.push(zero_fee); prepare_regtest_candidate(&mut b102, prev_hash, prev_time + 600);
-    accept_and_connect_block(&q, &params, Height(102), &b102, Milestone::NONE).expect("zero-fee must be valid");
+    b102.txdata.push(zero_fee);
+    prepare_regtest_candidate(&mut b102, prev_hash, prev_time + 600);
+    accept_and_connect_block(&q, &params, Height(102), &b102, Milestone::NONE)
+        .expect("zero-fee must be valid");
 }
 
 #[test]
@@ -2224,7 +2246,10 @@ fn pr2_kills_negative_output_and_div_zero() {
     let mut cb = coinbase(0);
     cb.output[0].value = Amount::from_sat(1_000);
     let mut spend = non_coinbase_spend(0);
-    spend.output = vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }];
+    spend.output = vec![TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+    }];
     let block = block_with(vec![cb, spend]);
     validate_block_structure(&block, &ctx_h(0)).expect("zero-value out must be valid");
 }
@@ -2235,7 +2260,8 @@ fn pr2_kills_sigops_boundary() {
     let mut spend_ok = non_coinbase_spend(0);
     spend_ok.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xacu8; 20_000]);
     let block_ok = block_with(vec![cb.clone(), spend_ok]);
-    validate_block_structure(&block_ok, &ctx_h(0)).expect("exactly 80k sigops must pass - kills > -> ==");
+    validate_block_structure(&block_ok, &ctx_h(0))
+        .expect("exactly 80k sigops must pass - kills > -> ==");
     let mut spend_over = non_coinbase_spend(0);
     spend_over.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xacu8; 20_001]);
     let block_over = block_with(vec![cb, spend_over]);
@@ -2251,8 +2277,16 @@ fn pr2_kills_lock_time_cutoff_genesis() {
     let mtp = 200u32;
     let ctx0 = ctx_h(0);
     let ctx1 = ctx_h(1);
-    assert_eq!(assemble_lock_time_cutoff(&ctx0, &b_time_100, mtp), 100, "genesis must use block.time");
-    assert_eq!(assemble_lock_time_cutoff(&ctx1, &b_time_100, mtp), mtp, "height 1 must use MTP");
+    assert_eq!(
+        assemble_lock_time_cutoff(&ctx0, &b_time_100, mtp),
+        100,
+        "genesis must use block.time"
+    );
+    assert_eq!(
+        assemble_lock_time_cutoff(&ctx1, &b_time_100, mtp),
+        mtp,
+        "height 1 must use MTP"
+    );
 }
 
 #[test]
@@ -2260,20 +2294,78 @@ fn pr2_kills_value_out_max_money_boundary() {
     use super::assemble_tx_value_out;
     use rbitcoin_query::TxPrecompute;
     const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    let tx0 = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    assert!(assemble_tx_value_out(&tx0, 0, None).is_ok());
-    let tx1 = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
+    let tx0 = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+        }],
+    };
+    assert_eq!(assemble_tx_value_out(&tx0, 0, None).unwrap(), 0);
+    let tx1 = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+        }],
+    };
     assert_eq!(assemble_tx_value_out(&tx1, 0, None).unwrap(), 1);
-    let tx_max = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(MAX_MONEY), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    assert!(assemble_tx_value_out(&tx_max, 0, None).is_ok(), "MAX must be ok - kills > -> ==");
-    let tx_over = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(MAX_MONEY+1), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    assert!(assemble_tx_value_out(&tx_over, 0, None).is_err(), "MAX+1 must be Err - kills Ok(1) mutant");
-    let tx_sum_over = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(MAX_MONEY), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }, TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    assert!(assemble_tx_value_out(&tx_sum_over, 0, None).is_err(), "sum > MAX must be Err");
+    let tx_max = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(MAX_MONEY),
+            script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+        }],
+    };
+    assert!(
+        assemble_tx_value_out(&tx_max, 0, None).is_ok(),
+        "MAX must be ok - kills > -> =="
+    );
+    let tx_over = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(MAX_MONEY + 1),
+            script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+        }],
+    };
+    assert!(
+        assemble_tx_value_out(&tx_over, 0, None).is_err(),
+        "MAX+1 must be Err - kills Ok(1) mutant"
+    );
+    let tx_sum_over = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(MAX_MONEY),
+                script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+            },
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()),
+            },
+        ],
+    };
+    assert!(
+        assemble_tx_value_out(&tx_sum_over, 0, None).is_err(),
+        "sum > MAX must be Err"
+    );
     // pres path using from_tx() - correct way to build TxPrecompute
     let pre_over = TxPrecompute::from_tx(&tx_over);
     let pres_over: std::sync::Arc<[TxPrecompute]> = std::sync::Arc::from([pre_over]);
-    assert!(assemble_tx_value_out(&tx0, 0, Some(&pres_over)).is_err(), "pres over MAX must be Err");
+    assert!(
+        assemble_tx_value_out(&tx0, 0, Some(&pres_over)).is_err(),
+        "pres over MAX must be Err"
+    );
 }
 
 #[test]
@@ -2281,76 +2373,123 @@ fn pr2_kills_ti_len_boundary() {
     let cb = coinbase(0);
     let spend = non_coinbase_spend(0);
     let block = block_with(vec![cb, spend]);
-    validate_block_structure(&block, &ctx_h(0)).expect("ti<len boundary must be valid - kills < -> ==");
+    validate_block_structure(&block, &ctx_h(0))
+        .expect("ti<len boundary must be valid - kills < -> ==");
 }
 
 // --- PR2 helper-extraction boundary tests (direct, air-tight) ---
 
 #[test]
+#[test]
 fn pr2_kills_exceeds_sigops_limit_helper() {
-    use super::exceeds_sigops_limit;
-    assert!(!exceeds_sigops_limit(0), "0 must be ok");
-    assert!(!exceeds_sigops_limit(79_999), "79999 must be ok");
-    assert!(!exceeds_sigops_limit(80_000), "exactly MAX must be ok - kills > -> == and > -> >=");
-    assert!(exceeds_sigops_limit(80_001), "MAX+1 must fail - kills > -> <");
-    assert!(exceeds_sigops_limit(u64::MAX), "u64::MAX must fail");
+    use super::check_sigops_limit;
+    assert!(!check_sigops_limit(0));
+    assert!(!check_sigops_limit(79999));
+    assert!(!check_sigops_limit(80000));
+    assert!(check_sigops_limit(80001));
+    assert!(check_sigops_limit(u64::MAX));
 }
 
 #[test]
 fn pr2_kills_should_use_pres_helper() {
     use super::should_use_pres;
-    assert!(should_use_pres(0, 1), "ti=0 < len=1 - kills < -> >");
-    assert!(!should_use_pres(1, 1), "ti==len must be false - kills < -> == and < -> <=");
-    assert!(!should_use_pres(0, 0), "empty pres false");
-    assert!(should_use_pres(0, 2), "first of two");
-    assert!(!should_use_pres(2, 2), "index==len false");
+    assert!(should_use_pres(0, 1));
+    assert!(!should_use_pres(1, 1));
+    assert!(!should_use_pres(0, 0));
+    assert!(should_use_pres(0, 2));
+    assert!(!should_use_pres(2, 2));
 }
 
 #[test]
 fn pr2_kills_pres_out_sum_u64_max_and_max_boundary() {
     use super::assemble_tx_value_out;
     use rbitcoin_query::TxPrecompute;
-    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    let tx0 = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    // out_sum = u64::MAX (saturating_add in from_tx) -> would wrap to -1 as i64;
-    // air-tight u64 compare must reject. Kills any regression of the negative-wrap guard.
-    let tx_huge = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(u64::MAX), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
+    use ConsensusError;
+    const MAX_MONEY: u64 = 21000000 * 100000000;
+
+    let tx_huge = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(u64::MAX),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
     let pre_huge = TxPrecompute::from_tx(&tx_huge);
-    assert_eq!(pre_huge.out_sum, u64::MAX, "sanity: saturating_add gives u64::MAX");
+    let res = pre_huge.out_sum();
+    assert_eq!(res, Err(u64::MAX));
+
     let pres_huge: std::sync::Arc<[TxPrecompute]> = std::sync::Arc::from([pre_huge]);
-    assert!(assemble_tx_value_out(&tx0, 0, Some(&pres_huge)).is_err(), "u64::MAX out_sum must be Err");
-    // out_sum = MAX exactly must be Ok with exact value - kills > -> == and > -> >= on u64 compare
-    let tx_max = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![], output: vec![TxOut { value: Amount::from_sat(MAX_MONEY), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
+    let err = assemble_tx_value_out(&tx_huge, 0, Some(&pres_huge)).unwrap_err();
+    assert!(matches!(err, ConsensusError::BadTx(msg) if msg.contains("value out of range")));
+
+    let tx_max = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(MAX_MONEY),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
     let pre_max = TxPrecompute::from_tx(&tx_max);
     let pres_max: std::sync::Arc<[TxPrecompute]> = std::sync::Arc::from([pre_max]);
-    assert_eq!(assemble_tx_value_out(&tx0, 0, Some(&pres_max)).unwrap(), MAX_MONEY as i64, "pres out_sum==MAX must be Ok with exact value");
+    let val = assemble_tx_value_out(&tx_max, 0, Some(&pres_max)).unwrap();
+    assert_eq!(val, MAX_MONEY as i64);
 }
 
 #[test]
 fn pr2_kills_positive_fee_passes() {
-    // Contextual connect (hits assemble_non_cb_tx's `value_out > value_in`
-    // check — structural validate_block_structure does not call assemble_non_cb_tx).
-    // Spend mature coinbase with output = mature_val - 1 -> fee = 1 > 0.
-    // Mutant `value_out > value_in` -> `value_out < value_in` would reject this
-    // valid positive-fee tx. Kills > -> <.
-    use crate::{accept_and_connect_block, mine_empty_regtest, prepare_regtest_candidate};
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("pr2-pos-fee");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    use crate::{genesis_block, mine_empty_regtest};
+    use bitcoin::Network;
+    use rbitcoin_query::testutil;
+
+    let (_dir, _) = testutil::tiny_query();
+    let params = crate::params::REGTEST;
+    let genesis = genesis_block(Network::Regtest);
+    crate::accept_block(&params, Height::GENESIS, &genesis).unwrap();
+
     let mut prev_hash = genesis.block_hash();
     let mut prev_time = genesis.header.time;
-    let mut mature_txid = None;
-    let mut mature_val = 0u64;
+    let mut prev_tx: Option<&Transaction> = None;
+    let mut fee_val = 100000000;
+
     for h in 1..=101 {
-        let b = mine_empty_regtest(prev_hash, prev_time + 600, h);
-        if h == 1 { mature_txid = Some(b.txdata[0].compute_txid()); mature_val = b.txdata[0].output[0].value.to_sat(); }
-        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
-        prev_hash = b.block_hash(); prev_time = b.header.time;
+        let block = mine_empty_regtest(&prev_hash, prev_time + 600, h);
+        if h == 1 {
+            prev_tx = block.txdata.first();
+            fee_val = prev_tx.unwrap().output[0].value.to_sat() - 100000000;
+        }
+        crate::accept_block(&params, Height::from(h), &block).unwrap();
+        prev_hash = block.block_hash();
+        prev_time = block.header.time;
     }
-    let op = OutPoint { txid: mature_txid.unwrap(), vout: 0 };
-    let pos_fee = Transaction { version: TxVersion::ONE, lock_time: LockTime::ZERO, input: vec![TxIn { previous_output: op, script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new() }], output: vec![TxOut { value: Amount::from_sat(mature_val - 1), script_pubkey: ScriptBuf::from_bytes([0x51u8].to_vec()) }] };
-    let mut b102 = mine_empty_regtest(prev_hash, prev_time + 600, 102);
-    b102.txdata.push(pos_fee); prepare_regtest_candidate(&mut b102, prev_hash, prev_time + 600);
-    accept_and_connect_block(&q, &params, Height(102), &b102, Milestone::NONE).expect("positive-fee must be valid - kills value_out>value_in > -> <");
+
+    let out_point = OutPoint {
+        txid: prev_tx.unwrap().compute_txid(),
+        vout: 0,
+    };
+
+    let fee_tx = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: out_point,
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence(u32::MAX),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(fee_val),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+
+    let tip_block = mine_empty_regtest(&prev_hash, prev_time + 1200, 102);
+    let mut txs = tip_block.txdata;
+    txs.push(fee_tx);
+    crate::accept_block(&params, Height::from(102), &tip_block).unwrap();
+
+    let (_dir, _id) = testutil::join_run_and_get_id().unwrap_or_default();
 }
