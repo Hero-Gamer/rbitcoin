@@ -144,7 +144,7 @@ pub(crate) fn reconstruct<T: Borrow<Transaction>>(
     let n_short = hsi.short_ids.len();
     let n_pref = hsi.prefilled_txs.len();
     let total = n_short.saturating_add(n_pref);
-    if total == 0 {
+    if total == 0 || total > rbitcoin_consensus::MAX_BLOCK_TX_COUNT {
         return Reconstruct::Fail;
     }
 
@@ -550,6 +550,22 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn reconstruct_rejects_tx_count_above_weight_ratio() {
+        assert_eq!(
+            rbitcoin_consensus::MAX_BLOCK_TX_COUNT,
+            (rbitcoin_consensus::MAX_BLOCK_WEIGHT / rbitcoin_consensus::MIN_TX_WEIGHT) as usize
+        );
+        assert_eq!(rbitcoin_consensus::MAX_BLOCK_TX_COUNT, 100_000);
+        let block = sealed_block(vec![coinbase()]);
+        let mut hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[]).unwrap();
+        hsi.short_ids = vec![ShortId::from([0u8; 6]); rbitcoin_consensus::MAX_BLOCK_TX_COUNT];
+        assert!(
+            matches!(reconstruct(&hsi, &empty_avail(), 2), Reconstruct::Fail),
+            "count at the cap plus the prefilled coinbase is over"
+        );
     }
 
     #[test]

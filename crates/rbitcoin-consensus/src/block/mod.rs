@@ -55,6 +55,13 @@ impl<'a> ValidationContext<'a> {
 }
 
 const MAX_BLOCK_STRIPPED_SIZE: usize = 1_000_000;
+/// Consensus block weight limit. Compact-block tx count is this divided by
+/// [`MIN_TX_WEIGHT`].
+pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+/// Minimum serializable transaction weight (10 bytes × witness scale 4).
+pub const MIN_TX_WEIGHT: u64 = 10 * 4;
+/// Most transactions a valid block can contain.
+pub const MAX_BLOCK_TX_COUNT: usize = (MAX_BLOCK_WEIGHT / MIN_TX_WEIGHT) as usize;
 
 fn check_tx_local(tx: &Transaction, base_size: usize) -> Result<(), ConsensusError> {
     if tx.input.is_empty() {
@@ -179,7 +186,7 @@ pub fn validate_block_structure_with_pres(
     if base > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadBlock("block stripped size too large"));
     }
-    if weight_wu > 4_000_000 {
+    if weight_wu > MAX_BLOCK_WEIGHT {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 

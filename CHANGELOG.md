@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Compact blocks:** a transaction count above the block weight limit
+  divided by the minimum transaction weight is rejected before the slot
+  vector is built. A peer keeps one partial. Another hash from that peer
+  is a full `getdata`, not a second vector and not a ban.
 - **Block decode tx count:** `decode_block_precomputes` rejects a count
   larger than the remaining payload divided by 10 before it allocates.
   A one-transaction block still decodes.

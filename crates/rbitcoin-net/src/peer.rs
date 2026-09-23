@@ -129,7 +129,7 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
     }
 }
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
-const MAX_PENDING_CMPCT: usize = 8;
+const MAX_PENDING_CMPCT: usize = 1;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
 /// Cap on decoded bodies stashed per session (DoS / process RAM). Must be
@@ -3372,7 +3372,6 @@ fn on_cmpct_need_txn(
     }
     let missing_n = partial.missing().len();
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
-        follow.ban_score = follow.ban_score.saturating_add(10);
         log_cmpct_getdata(hash, missing_n);
         return queue_out(
             out_tx,
