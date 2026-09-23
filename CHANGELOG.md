@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
+  near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the
+  Sunday hour, which just clears it. A mute run still fails.
+
 - **`cmpct_differential` extra `getblocktxn`:** agree whenever Core's
   indexes are a subset of ours, not only recipe `[1, 4]` vs `[1]`.
   Nightly `[0, 251, 229, 55, 51, 13, 10]` is ours `[2, 4]` vs Core `[2]`.

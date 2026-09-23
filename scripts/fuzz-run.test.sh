@@ -369,7 +369,15 @@ assert_ok "skip-heavy 1/10000 fails 0.5%" \
   echo "Done 10000 runs in 120 second(s)"
 } >"$WORKDIR/sv-zero.log"
 assert_ok "skip-heavy still fails on zero comparisons" \
-  bash -c '! '"$RUN"' --check-log '"$WORKDIR/sv-zero.log"' 0.005'
+  bash -c '! '"$RUN"' --check-log '"$WORKDIR/sv-zero.log"' 0.003'
+{
+  echo "script-verify-differential: comparisons=8000"
+  echo "Done 1868610 runs in 601 second(s)"
+} >"$WORKDIR/sv-weekday.log"
+assert_ok "weekday script-verify 8000/1.8M passes 0.3%" \
+  "$RUN" --check-log "$WORKDIR/sv-weekday.log" 0.003
+assert_ok "same night fails the 0.5% bar" \
+  bash -c '! '"$RUN"' --check-log '"$WORKDIR/sv-weekday.log"' 0.005'
 
 mkdir -p "$WORKDIR/corpus"
 echo grown >"$WORKDIR/corpus/height1.bin"
