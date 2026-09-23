@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **IBD redial breaks an all-cooldown book:** when more peers are
+  needed and every candidate is cooling, dial the one tried least
+  recently anyway. A successful connect clears that cooldown. Never
+  tried sorts ahead of any attempt.
+
 - **IBD eviction ages a peer's saved speed:** a quiet in-flight gap no
   longer rewrites the transfer EWMA. Relative-slow and tip-hole eviction
   score `ewma * 15s / (15s + age)` from the last qualifying rx, so a

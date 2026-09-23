@@ -586,6 +586,18 @@ impl AddrMan {
         self.last_attempt.insert(NetAddr::from_socket(addr), when);
     }
 
+    pub(crate) fn last_attempt_of(&self, addr: NetAddr) -> Option<Instant> {
+        self.last_attempt.get(&addr).copied()
+    }
+
+    pub(crate) fn dial_order(&self) -> &[NetAddr] {
+        &self.order
+    }
+
+    pub(crate) fn is_dialable(&self, addr: NetAddr) -> bool {
+        self.by_addr.contains_key(&addr) && self.dialable(addr)
+    }
+
     pub fn note_attempt_addr(&mut self, addr: NetAddr) {
         self.last_attempt.insert(addr, Instant::now());
     }

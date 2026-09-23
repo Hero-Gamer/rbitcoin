@@ -41,7 +41,7 @@ use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFe
 use assign::{assign_work_ordered, bq_pipeline_saturated, AssignDepth};
 use cadence::IbdLoopCadence;
 use dial::{
-    alive_dial_addrs, apply_dial_result, dial_batch, dial_blocked_addrs,
+    admit_cooldown_fallback, alive_dial_addrs, apply_dial_result, dial_batch, dial_blocked_addrs,
     disconnect_relative_slow_block_peers, disconnect_stalled_block_peers, expire_addr_cooldown,
     redial_want, request_headers,
 };
@@ -679,6 +679,13 @@ pub async fn ibd_cancellable(
                 match h.await {
                     Ok(result) => {
                         apply_dial_result(peer_sess.book_mut(), &result);
+                        // A successful dial ends that address's cooldown, including
+                        // the one we admitted while every candidate was cooling.
+                        for s in &result.slots {
+                            if let Some(sock) = s.net.socket_addr() {
+                                st.addr_cooldown.remove(&sock);
+                            }
+                        }
                         let blocked =
                             dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                         let mut n = 0usize;
@@ -738,8 +745,19 @@ pub async fn ibd_cancellable(
             && last_redial.elapsed() >= redial_interval
         {
             let want = redial_want(alive_n, target);
-            let already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
+            let mut already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
             let occupied = alive_dial_addrs(&st.slots);
+            let live: HashSet<_> = st.slots.iter().map(|s| s.net).collect();
+            if let Some(addr) = admit_cooldown_fallback(
+                peer_sess.book(),
+                &mut already,
+                &occupied,
+                &st.addr_cooldown,
+                Instant::now(),
+                &live,
+            ) {
+                info!("ibd: every candidate is cooling; retrying least-recent {addr}");
+            }
             info!(
                 "ibd: redialing up to {want} peers (alive={alive_n}/{target}, book={}, blocked={})…",
                 peer_sess.book().len(),

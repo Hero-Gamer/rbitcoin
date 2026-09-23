@@ -448,6 +448,49 @@ pub(crate) fn release_peer_block_work(
     }
 }
 
+/// When every dialable address is live or cooling, drop the cooling address
+/// we tried least recently from `exclude` so one redial can proceed.
+/// Never-attempted sorts first. A free candidate suppresses this.
+pub(crate) fn admit_cooldown_fallback(
+    book: &AddrMan,
+    exclude: &mut HashSet<crate::NetAddr>,
+    occupied: &[SocketAddr],
+    cooldown: &HashMap<SocketAddr, Instant>,
+    now: Instant,
+    live: &HashSet<crate::NetAddr>,
+) -> Option<crate::NetAddr> {
+    if !book
+        .take_dial_candidates_net(1, exclude, occupied)
+        .is_empty()
+    {
+        return None;
+    }
+    let cooling: Vec<crate::NetAddr> = book
+        .dial_order()
+        .iter()
+        .copied()
+        .filter(|a| book.is_dialable(*a) && !live.contains(a))
+        .filter(|a| {
+            a.socket_addr()
+                .is_some_and(|sock| cooldown.get(&sock).is_some_and(|until| *until > now))
+        })
+        .collect();
+    let pick = cooling
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by_key(|(i, a)| {
+            (
+                book.last_attempt_of(*a).is_some(),
+                book.last_attempt_of(*a).unwrap_or(now),
+                *i,
+            )
+        })
+        .map(|(_, a)| a)?;
+    exclude.remove(&pick);
+    Some(pick)
+}
+
 /// Addrs we must not dial: currently connected/slot-held + still-cooling stall bans.
 pub(crate) fn dial_blocked_addrs(
     slots: &[PeerSlot],
@@ -719,6 +762,46 @@ mod tests {
             classify_dial_err(&NetError::Protocol("misbehavior")),
             DialFailKind::Network
         );
+    }
+
+    #[test]
+    fn cooldown_fallback_retries_least_recent_only_when_all_cooling() {
+        let now = Instant::now();
+        let mut book = AddrMan::new();
+        for o in 1u8..=3 {
+            book.add(addr(o));
+        }
+        book.note_attempt_at(addr(1), now - Duration::from_secs(10));
+        book.note_attempt_at(addr(2), now - Duration::from_secs(100));
+        let mut cooldown = HashMap::new();
+        for o in 1u8..=3 {
+            cooldown.insert(addr(o), now + Duration::from_secs(3600));
+        }
+        let mut exclude: HashSet<_> = (1u8..=3)
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let pick =
+            admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new());
+        let never = crate::NetAddr::from_socket(addr(3));
+        assert_eq!(pick, Some(never));
+        assert!(!exclude.contains(&never));
+        assert!(exclude.contains(&crate::NetAddr::from_socket(addr(1))));
+        assert!(exclude.contains(&crate::NetAddr::from_socket(addr(2))));
+
+        // A free address is enough; cooling peers stay blocked.
+        cooldown.remove(&addr(3));
+        let pick =
+            admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new());
+        assert_eq!(pick, None);
+        assert!(!exclude.contains(&never));
+
+        // Live never-tried peer is not the fallback; oldest attempt is.
+        exclude.insert(never);
+        cooldown.insert(addr(3), now + Duration::from_secs(3600));
+        let live = HashSet::from([never]);
+        let pick = admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &live);
+        assert_eq!(pick, Some(crate::NetAddr::from_socket(addr(2))));
+        assert!(!exclude.contains(&crate::NetAddr::from_socket(addr(2))));
     }
 
     #[test]
