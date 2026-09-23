@@ -141,6 +141,10 @@ pub fn abort_uring_unusable(reason: &str) -> ! {
 
 /// Enter failed. Pending SQEs still own caller buffers, so this matches the
 /// hard cap (abort outside tests) instead of returning into a free.
+///
+/// Linux is the only production caller. Other targets keep the function for
+/// the unit test; a non-Linux lib build must not see it as dead code.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn inflight_enter_failure(pending: usize, err: StoreError) -> Result<(), StoreError> {
     if pending == 0 {
         return Err(err);
