@@ -6,10 +6,14 @@
 
 use bitcoin::Work;
 
+/// Header work could not be summed or read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkOverflow;
+
 /// Sum header work values (Bitcoin most-work accumulation).
 /// Overflow is an error. Addition is byte-wise so a full `Work` does not
 /// hit rust-bitcoin's debug overflow assert.
-pub fn sum_work(iter: impl Iterator<Item = Work>) -> Result<Work, ()> {
+pub fn sum_work(iter: impl Iterator<Item = Work>) -> Result<Work, WorkOverflow> {
     let mut acc: Option<Work> = None;
     for w in iter {
         acc = Some(match acc {
@@ -20,7 +24,7 @@ pub fn sum_work(iter: impl Iterator<Item = Work>) -> Result<Work, ()> {
     Ok(acc.unwrap_or_else(|| Work::from_be_bytes([0u8; 32])))
 }
 
-fn checked_add_work(a: Work, b: Work) -> Result<Work, ()> {
+fn checked_add_work(a: Work, b: Work) -> Result<Work, WorkOverflow> {
     let mut out = a.to_be_bytes();
     let rhs = b.to_be_bytes();
     let mut carry = 0u16;
@@ -30,20 +34,20 @@ fn checked_add_work(a: Work, b: Work) -> Result<Work, ()> {
         carry = s >> 8;
     }
     if carry != 0 {
-        Err(())
+        Err(WorkOverflow)
     } else {
         Ok(Work::from_be_bytes(out))
     }
 }
 
 /// `Header::work` panics in debug when `bits` is a zero target.
-pub fn header_work_checked(header: &bitcoin::block::Header) -> Result<Work, ()> {
+pub fn header_work_checked(header: &bitcoin::block::Header) -> Result<Work, WorkOverflow> {
     if header.bits.to_consensus() == 0 {
-        return Err(());
+        return Err(WorkOverflow);
     }
     let target = bitcoin::Target::from_compact(header.bits);
     if target.to_be_bytes() == [0u8; 32] {
-        return Err(());
+        return Err(WorkOverflow);
     }
     Ok(header.work())
 }
@@ -95,7 +99,7 @@ mod tests {
         assert_eq!(sum_work(std::iter::empty()).unwrap(), z);
         assert_eq!(sum_work([w(1)].into_iter()).unwrap(), w(1));
         let max = Work::from_be_bytes([0xff; 32]);
-        assert!(sum_work([max, w(1)].into_iter()).is_err());
+        assert_eq!(sum_work([max, w(1)].into_iter()), Err(WorkOverflow));
         let mut zero_bits = bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(1),
             prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
