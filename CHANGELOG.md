@@ -98,8 +98,10 @@ before 1.0).
 - **PR cargo-mutants shards are required.** A finished non-zero
   `cargo mutants` exit fails the check. A 30-minute kill with no `MISSED`
   in the log warns and passes. `MISSED` already in that log fails the
-  shard. Under 400 changed lines, shard 0 runs the whole in-diff set and
-  the other three exit 0. Weekly 8-shard sweep is unchanged.
+  shard. Under 400 changed lines, check `mutants (1/4)` runs the whole
+  in-diff set (`--shard 0/1`) and the other three exit 0. Check names are
+  `mutants (1/4)` through `mutants (4/4)`; `--shard` stays 0–3. Weekly
+  8-shard sweep is unchanged.
 
 - **CI short gates start together.** `fmt`, `deny`, `ast-grep`, and
   `nixos-module-eval` no longer wait on each other. Script self-tests run

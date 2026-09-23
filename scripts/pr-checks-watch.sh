@@ -22,10 +22,10 @@ REQUIRED=(
   coverage
   nixos-module-eval
   scripts
-  "mutants (0/4)"
   "mutants (1/4)"
   "mutants (2/4)"
   "mutants (3/4)"
+  "mutants (4/4)"
 )
 
 usage() {

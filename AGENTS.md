@@ -124,7 +124,7 @@ Playbooks:
   Owner playbook: [`docs/releases.md`](docs/releases.md).
 - Core functional harness:
   [`.agents/skills/core-functional/SKILL.md`](.agents/skills/core-functional/SKILL.md).
-- PR `mutants (0/4)` through `mutants (3/4)` are required. A 30-minute
-  kill with no `MISSED` warns and passes. `MISSED` before that kill fails
-  the shard. A finished non-zero `cargo mutants` exit fails. Owner:
-  [`TESTING.md`](TESTING.md).
+- PR `mutants (1/4)` through `mutants (4/4)` are required (`--shard` is
+  0–3). A 30-minute kill with no `MISSED` warns and passes. `MISSED`
+  before that kill fails the shard. A finished non-zero `cargo mutants`
+  exit fails. Owner: [`TESTING.md`](TESTING.md).
