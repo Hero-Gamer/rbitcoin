@@ -95,16 +95,15 @@ before 1.0).
   shard lines when each worker finishes. Previous `DONE` / 24 B `NN`
   unsorted is deleted and pass 1 restarts.
 
-- **PR cargo-mutants is 4 in-diff shards:** `ci.yml` `mutants`, after
-  fmt/clippy/test, in parallel with coverage. Advisory
-  (`continue-on-error`), not a merge gate. One 30-minute job was canceled
-  on a ~300-mutant diff (`-j 2` is about 50 minutes). Weekly 8-shard sweep
-  is unchanged.
+- **PR cargo-mutants shards are required.** A finished non-zero
+  `cargo mutants` exit fails the check. A 30-minute kill with no `MISSED`
+  in the log warns and passes. `MISSED` already in that log fails the
+  shard. Under 400 changed lines, shard 0 runs the whole in-diff set and
+  the other three exit 0. Weekly 8-shard sweep is unchanged.
 
-- **CI short gates share one runner:** `fmt` → `deny` → `ast-grep` →
-  `nixos-module-eval`. clippy, test, windows, and macos still start
-  immediately. Concurrent-job slots stay free for coverage and the PR
-  mutants shards.
+- **CI short gates start together.** `fmt`, `deny`, `ast-grep`, and
+  `nixos-module-eval` no longer wait on each other. Script self-tests run
+  beside `cargo test`, so coverage is not stuck behind them.
 
 - **Weekly cargo-mutants:** `mutants.yml` — Sunday 8-shard `--workspace`
   sweep. Must use `--workspace` (`default-members` is node). Snapshot

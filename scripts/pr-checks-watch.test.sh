@@ -46,6 +46,7 @@ all_green="$(
     macos pass 50s \
     coverage pass 2m \
     nixos-module-eval pass 32s \
+    scripts pass 20s \
     'mutants (0/4)' pass 2m \
     'mutants (1/4)' pass 2m \
     'mutants (2/4)' pass 2m \
@@ -67,6 +68,7 @@ analyze_pending_windows_green="$(
     macos pass 50s \
     coverage pass 2m \
     nixos-module-eval pass 32s \
+    scripts pass 20s \
     'mutants (0/4)' pass 2m \
     'mutants (1/4)' pass 2m \
     'mutants (2/4)' pass 2m \
