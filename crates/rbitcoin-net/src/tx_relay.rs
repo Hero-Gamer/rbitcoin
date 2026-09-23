@@ -1379,7 +1379,12 @@ impl MempoolHub {
         let skip = {
             let g = self.lock_read();
             v.iter()
-                .filter(|p| g.graph.contains(&Txid::from_byte_array(p.txid)))
+                .filter(|p| {
+                    let id = Txid::from_byte_array(p.txid);
+                    g.graph
+                        .get(&id)
+                        .is_some_and(|e| e.wtxid.to_byte_array() == p.wtxid)
+                })
                 .map(|p| p.txid)
                 .collect::<HashSet<_>>()
         };
@@ -3441,6 +3446,57 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
+    }
+
+    #[test]
+    fn tip_script_pres_skips_only_matching_wtxid() {
+        use rbitcoin_mempool::TxEntry;
+        let dir = tmp();
+        let mdir = tmp();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let hub = MempoolHub::open(&mdir, Arc::new(q)).unwrap();
+        let mut good = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([9u8; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x01]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let txid = good.compute_txid();
+        hub.lock_write().graph.insert(
+            TxEntry {
+                txid,
+                wtxid: good.compute_wtxid(),
+                fee_sat: 1,
+                weight: good.weight().to_wu(),
+                slot: 0,
+                parents: BTreeSet::new(),
+                children: BTreeSet::new(),
+            },
+            &good,
+        );
+        let id = txid.to_byte_array();
+        let (_, skip_good) = hub.tip_script_pres(std::slice::from_ref(&good));
+        assert!(skip_good.contains(&id), "same witness is preverified");
+        good.input[0].witness = Witness::from_slice(&[vec![0x02]]);
+        assert_eq!(good.compute_txid(), txid);
+        let (_, skip_bad) = hub.tip_script_pres(std::slice::from_ref(&good));
+        assert!(
+            !skip_bad.contains(&id),
+            "different witness must not skip scripts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mdir);
     }
 
     fn spend_true(cb: Txid, fee: u64, spk: ScriptBuf) -> Transaction {

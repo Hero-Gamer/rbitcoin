@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Mempool script skip requires the wtxid:** a block transaction is not
+  treated as already checked just because its txid is in the mempool.
+  A script job whose prevout count does not match its inputs fails closed.
+
 - **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
   near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the
   Sunday hour, which just clears it. A mute run still fails.
