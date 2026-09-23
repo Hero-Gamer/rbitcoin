@@ -124,7 +124,9 @@ Playbooks:
   Owner playbook: [`docs/releases.md`](docs/releases.md).
 - Core functional harness:
   [`.agents/skills/core-functional/SKILL.md`](.agents/skills/core-functional/SKILL.md).
-- PR `mutants (1/4)` through `mutants (4/4)` are required (`--shard` is
-  0–3). A 30-minute kill with no `MISSED` warns and passes. `MISSED`
+- Required CI jobs are `qc`, `test`, `windows`, `macos`, `coverage`, and
+  `mutants (1/4)` through `mutants (4/4)`. `qc` is fmt, ast-grep, deny,
+  the script self-tests, clippy, then nixos-module-eval. `--shard` is
+  0–3. A 30-minute kill with no `MISSED` warns and passes. `MISSED`
   before that kill fails the shard. A finished non-zero `cargo mutants`
   exit fails. Owner: [`TESTING.md`](TESTING.md).

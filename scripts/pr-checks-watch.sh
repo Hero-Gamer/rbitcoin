@@ -12,16 +12,11 @@ INTEREST=()
 WATCHED=()
 
 REQUIRED=(
-  fmt
-  deny
-  clippy
-  ast-grep
+  qc
   test
   windows
   macos
   coverage
-  nixos-module-eval
-  scripts
   "mutants (1/4)"
   "mutants (2/4)"
   "mutants (3/4)"

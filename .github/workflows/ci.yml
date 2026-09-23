@@ -23,9 +23,9 @@ env:
 # Pin rustc to the nix-shell / crane baseline so fmt/clippy do not drift with
 # every GitHub Actions “stable” bump. Bump intentionally with the toolchain.
 #
-# Each gate is its own check and starts immediately: fmt, deny, ast-grep,
-# nixos-module-eval, clippy, test, windows, macos, and the script self-tests.
-# coverage waits for fmt / clippy / test so a red test does not start it.
+# `qc` is one Ubuntu runner: fmt, ast-grep, deny, scripts, clippy, then
+# nixos-module-eval. test, windows, and macos each have their own runner.
+# coverage waits for qc and test so a red test does not start it.
 # Mutants checks are `mutants (1/4)` through `mutants (4/4)` (`--shard`
 # stays 0–3). They wait for the same three. Under 400 changed lines,
 # `mutants (1/4)` runs once (`--shard 0/1`); the other three exit 0.
@@ -39,34 +39,21 @@ env:
 # GitHub App often cannot push this file; operator `git push` if the branch
 # includes workflow YAML.
 jobs:
-  deny:
+  # Quality checks on one runner, cheap steps first. A red fmt does not
+  # install Nix or compile clippy. Check name is `qc`.
+  qc:
+    name: qc
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-      # Prebuilt cargo-deny — do not cargo install. Pin Action commit (CodeQL).
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
-        with:
-          # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
-          tool: cargo-deny@0.20.2
-      - name: cargo deny check
-        run: cargo deny check
-
-  fmt:
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/dev
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-
-  # Structural lints (Q-51). fmt-class: no rustc. Required.
-  ast-grep:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Not in taiki-e TOOLS.md; install-action falls back to cargo-binstall
       # (GitHub Release prebuilt). Do not cargo install.
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
@@ -78,46 +65,13 @@ jobs:
         run: ./scripts/ast-grep.test.sh
       - name: ast-grep scan crates
         run: ./scripts/ast-grep.sh
-
-  clippy:
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TARGET_DIR: target/dev
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      # Prebuilt cargo-deny — do not cargo install. Pin Action commit (CodeQL).
+      # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: ci-clippy
-          workspaces: ". -> target/dev"
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      # Keep uninstrumented artifacts out of the coverage tree (and vice versa).
-      CARGO_TARGET_DIR: target/dev
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: ci-test
-          workspaces: ". -> target/dev"
-      - name: cargo test
-        run: cargo test --workspace
-
-  # Shell contracts. Parallel with cargo test so coverage is not stuck
-  # behind them. They do not invoke cargo.
-  scripts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          tool: cargo-deny@0.20.2
+      - name: cargo deny check
+        run: cargo deny check
       - name: stage-musl-artifacts self-test
         run: ./scripts/stage-musl-artifacts.test.sh
       - name: stage-native-artifacts self-test
@@ -144,13 +98,12 @@ jobs:
         run: ./scripts/pr-checks-watch.test.sh
       - name: overlay-functional runner self-test
         run: ./scripts/overlay-functional/run.sh.test.sh
-
-  nixos-module-eval:
-    name: nixos-module-eval
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-clippy
+          workspaces: ". -> target/dev"
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           github_access_token: ${{ github.token }}
@@ -162,6 +115,22 @@ jobs:
           gc-max-store-size-linux: 1G
       - name: Evaluate NixOS module
         run: timeout 2m nix build .#checks.x86_64-linux.nixos-module-eval --no-link
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Keep uninstrumented artifacts out of the coverage tree (and vice versa).
+      CARGO_TARGET_DIR: target/dev
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-test
+          workspaces: ". -> target/dev"
+      - name: cargo test
+        run: cargo test --workspace
 
   # Windows IOCP store + mmap fuse + query confirm + --smoke. Required. Not a CRT-static snapshot.
   windows:
@@ -213,11 +182,10 @@ jobs:
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
     name: mutants (${{ matrix.n }}/4)
-    needs: [fmt, clippy, test]
+    needs: [qc, test]
     if: >-
       github.event_name == 'pull_request'
-      && needs.fmt.result == 'success'
-      && needs.clippy.result == 'success'
+      && needs.qc.result == 'success'
       && needs.test.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -355,13 +323,13 @@ jobs:
           retention-days: 5
 
   # Line-coverage 92% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
-  # Slow; waits for the fast gates so a red fmt/clippy/test does not start
+  # Slow; waits for qc and test so a red check does not start
   # this job. Required. Job+step timeouts so a hung llvm-cov test binary
   # cannot sit until the runner's 6h default.
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, clippy, test]
+    needs: [qc, test]
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
       CARGO_TARGET_DIR: target/cov

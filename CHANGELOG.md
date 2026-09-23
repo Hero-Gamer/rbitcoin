@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **CI quick checks share one runner.** Job `qc` runs fmt, ast-grep,
+  deny, the script self-tests, clippy, then nixos-module-eval. `test`,
+  `windows`, and `macos` stay on their own runners. Coverage and mutants
+  wait for `qc` and `test`.
+
 - **Input backfill reads `seqsigwit.body` in 16 MiB spans.** Open used
   to `pread` the locator window and the body once per create. A chunk
   of 16384 creates now shares one locator read, and contiguous bodies
