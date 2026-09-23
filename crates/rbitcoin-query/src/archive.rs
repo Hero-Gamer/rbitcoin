@@ -765,13 +765,11 @@ fn prevout_value(
         return Ok(val as u64);
     }
     if let Some(p) = parents {
-        if let Some(hit) =
-            p.get_parent_txout_parts(inp.create_fk, inp.prev_index, |v, s, _| (v, s.to_vec()))
-        {
-            if hit.0 < 0 {
+        if let Some(val) = p.get_parent_txout_parts(inp.create_fk, inp.prev_index, |v, _, _| v) {
+            if val < 0 {
                 return Err(StoreError::Corrupt("txstat prevout negative"));
             }
-            return Ok(hit.0 as u64);
+            return Ok(val as u64);
         }
     }
     let o = query.tx_output_at_fk(inp.create_fk, inp.prev_index)?;
