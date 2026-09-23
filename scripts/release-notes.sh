@@ -42,7 +42,72 @@ release_parse_semver "$VER" || release_die "version is not X.Y.Z: ${VER:-empty}"
 release_is_ship || release_die "workspace $VER is not a ship version (patch 99 is in-tree only)"
 release_require_highlights "$VER"
 
+# GitHub login for a commit email, or empty when the author is the
+# maintainer, the bot, dependabot, or not a noreply login.
+release_login_from_email() {
+  local email="$1"
+  case "$email" in
+    *rearden-grok*|*reardencode*|*dependabot*)
+      return 0
+      ;;
+  esac
+  case "$email" in
+    Hero-Gamer@users.noreply.github.com) printf '%s\n' Hero-Gamer ;;
+    xstoicunicornx@users.noreply.github.com) printf '%s\n' xstoicunicornx ;;
+    *@users.noreply.github.com)
+      local localpart="${email%%@*}"
+      localpart="${localpart##*+}"
+      case "$localpart" in
+        ''|*[!A-Za-z0-9-]*) ;;
+        *) printf '%s\n' "$localpart" ;;
+      esac
+      ;;
+  esac
+}
+
+release_thanks_sentence() {
+  local prev range line email login
+  prev="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1 || true)"
+  if [[ -n "$prev" ]]; then
+    range="${prev}..HEAD"
+  else
+    range="HEAD"
+  fi
+  local -a others=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" == Co-authored-by:* ]]; then
+      email="${line##*<}"
+      email="${email%>}"
+    else
+      email="$line"
+    fi
+    login="$(release_login_from_email "$email" || true)"
+    [[ -n "$login" ]] || continue
+    [[ "$login" == otaliptus ]] && continue
+    local seen=0 o
+    for o in "${others[@]+"${others[@]}"}"; do
+      [[ "$o" == "$login" ]] && seen=1
+    done
+    [[ "$seen" -eq 0 ]] && others+=("$login")
+  done < <(git log "$range" --format='%ae%n%b')
+  local rest=""
+  if ((${#others[@]})); then
+    local joined=""
+    for o in "${others[@]}"; do
+      if [[ -z "$joined" ]]; then
+        joined="@${o}"
+      else
+        joined="${joined}, @${o}"
+      fi
+    done
+    rest=" and to ${joined} for changes in this release"
+  fi
+  printf '%s\n' "Thanks to @otaliptus for the security review${rest}."
+}
+
 hl="$(release_changelog_highlights "$VER" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+thanks="$(release_thanks_sentence)"
 printf '%s\n' "rbitcoin v${VER}
 
 Linux **musl x86_64** is the operator binary (statically linked).
@@ -52,5 +117,9 @@ codesigned, **not notarized** (\`xattr -d com.apple.quarantine\`).
 ### Highlights
 
 ${hl}
+
+### Thanks
+
+${thanks}
 
 Full notes: CHANGELOG.md \`## [${VER}]\`."

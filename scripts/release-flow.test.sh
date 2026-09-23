@@ -182,9 +182,30 @@ assert_fail_msg "gate fails ship until Highlights has a bullet" \
 add_highlight "$MINOR" "- **Thing:** operator-facing ship note."
 assert_ok "gate passes ship tree after Highlights" \
   bash "$GATE" --root "$MINOR"
+GIT_AUTHOR_NAME='Hero Gamer' \
+GIT_AUTHOR_EMAIL='Hero-Gamer@users.noreply.github.com' \
+GIT_COMMITTER_NAME='Hero Gamer' \
+GIT_COMMITTER_EMAIL='Hero-Gamer@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'external change'
+GIT_AUTHOR_NAME='rearden-grok[bot]' \
+GIT_AUTHOR_EMAIL='317016512+rearden-grok[bot]@users.noreply.github.com' \
+GIT_COMMITTER_NAME='rearden-grok[bot]' \
+GIT_COMMITTER_EMAIL='317016512+rearden-grok[bot]@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'bot change'
+GIT_AUTHOR_NAME='Brandon Black' \
+GIT_AUTHOR_EMAIL='freedom@reardencode.com' \
+GIT_COMMITTER_NAME='Brandon Black' \
+GIT_COMMITTER_EMAIL='freedom@reardencode.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'maintainer change'
 out="$(bash "$NOTES" --root "$MINOR")"
 assert_ok "release-notes include Highlights bullet" \
   grep -q 'operator-facing ship note' <<<"$out"
+assert_ok "release-notes thank @otaliptus" \
+  grep -q '@otaliptus' <<<"$out"
+assert_ok "release-notes thank another external login" \
+  grep -q '@Hero-Gamer' <<<"$out"
+assert_ok "release-notes omit the bot and the maintainer" \
+  bash -c "! grep -q 'rearden-grok' <<<'$out' && ! grep -q 'reardencode' <<<'$out'"
 assert_ok "release-notes omit detailed Unreleased body" \
   bash -c "! grep -q 'ship this' <<<'$out'"
 assert_ok "release-notes name CHANGELOG section" \

@@ -161,7 +161,10 @@ Do not commit the bump on `master`. Do not merge a red PR.
 From current `origin/master` at `X.Y.99`:
 
 1. Worktree `release/X.(Y+1).0`. `./scripts/release-cut.sh --minor`.
-2. Write **`### Highlights`** (brief, operator-facing). Edit narrative
+2. Write **`### Highlights`** (brief, operator-facing; at most ten bullets).
+   `release-notes.sh` appends **`### Thanks`**: `@otaliptus` for the security
+   review, plus every other commit author since the previous tag except
+   `reardencode` and `rearden-grok[bot]`. Edit narrative
    banners to the new **X.(Y+1).0** (and that `vX.(Y+1).x` will be the
    patch line). Keep the detailed Unreleased body under the new heading.
 3. `./scripts/release-gate.sh` and `./scripts/release-notes.sh` must
