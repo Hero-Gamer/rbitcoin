@@ -2644,6 +2644,84 @@ fn unstamp_txstat(q: &Query, fk: Fk) {
 }
 
 #[test]
+fn confirm_txstat_miss_is_corrupt() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let (dir, q) = temp_query("txstat-miss-pinned");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let parent_txid = t0.tx.txid;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let parent_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+    let spend = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let txid = spend.compute_txid().to_byte_array();
+    let block = std::sync::Arc::new(Block {
+        header: BlockHeader {
+            version: BlockVersion::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 2,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        },
+        txdata: vec![spend],
+    });
+    let txrec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec);
+    let child_fk = Fk(parent_fk.get().unwrap() + 1);
+    let mut plan = ArchiveWritePlan::empty();
+    plan.packed = vec![(
+        pin,
+        vec![InputRecord {
+            prev_txid: parent_txid,
+            create_fk: parent_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    plan.planned_fks = vec![child_fk];
+    plan.body_est = 256;
+    let err = q
+        .archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("txstat parent not pinned")),
+        "{err}"
+    );
+    assert!(q.store().get_tx_meta_and_outputs(parent_fk).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stamp_txstat_from_block_coinbase_and_spend() {
     use bitcoin::hashes::Hash;
 
