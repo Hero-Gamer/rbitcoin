@@ -119,6 +119,8 @@ mod tests {
         assert_eq!(Milestone::default(), Milestone::NONE);
         assert!(!Milestone::NONE.skips_scripts_at(0));
         assert!(!Milestone::NONE.skips_scripts_at(1_000_000));
+        assert!(!Milestone::NONE.skips_scripts(0, &[0; 32], |_| None, None));
+        assert!(!Milestone::NONE.skips_scripts(1, &[0; 32], |_| None, None));
     }
 
     #[test]
@@ -162,6 +164,17 @@ mod tests {
         assert!(!m.skips_scripts(50, &honest, |h| headers.get(&h).copied(), Some(low)));
         assert!(!m.skips_scripts(50, &honest, |h| headers.get(&h).copied(), None));
         assert!(m.skips_scripts(50, &honest, |h| headers.get(&h).copied(), Some(enough)));
-        assert!(!m.skips_scripts(101, &honest, |h| headers.get(&h).copied(), Some(enough)));
+        assert!(
+            m.skips_scripts(100, &anchor_hash, |h| headers.get(&h).copied(), Some(enough)),
+            "the anchor block itself is buried"
+        );
+        let above = [0x44u8; 32];
+        headers.insert(101, above);
+        assert!(!m.skips_scripts(
+            101,
+            &above,
+            |h| headers.get(&h).copied(),
+            Some(enough)
+        ));
     }
 }
