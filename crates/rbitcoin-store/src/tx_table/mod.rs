@@ -1976,6 +1976,10 @@ impl TxTable {
         }
         let (txout_span, seqsigwit_span) =
             pread_two_spans(&self.body, t0, tspan, &self.seqsigwit, i0, ispan, true)?;
+        let edge_rows = self.input.edges_span(first, last)?;
+        if edge_rows.len() != n {
+            return Err(StoreError::Corrupt("invariant: input span length"));
+        }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let (toff, tlen) = txout_ranges[i];
@@ -1989,7 +1993,9 @@ impl TxTable {
             } else {
                 decode_seqsigwit_secret(iraw, tx.input_count, Some(&self.secret))?
             };
-            self.stamp_seqsigwit_prevouts(Fk(first + i as u64), &mut ins)?;
+            if let Some(edges) = edge_rows[i].as_ref() {
+                apply_input_edges(&mut ins, edges)?;
+            }
             tx.input_count = ins.len() as u32;
             tx.txid = ids[i];
             out.push((tx, ins, outs));
