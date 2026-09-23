@@ -148,7 +148,10 @@ pub(crate) fn relative_slow_with_hysteresis(
 }
 
 /// Build mature relative-slow samples from live slots (`active_ms` floor).
-pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSlowSample> {
+pub(crate) fn mature_relative_slow_samples(
+    slots: &[PeerSlot],
+    now_ms: u64,
+) -> Vec<RelativeSlowSample> {
     let mut out = Vec::new();
     for s in slots {
         if !s.alive {
@@ -157,7 +160,7 @@ pub(crate) fn mature_relative_slow_samples(slots: &[PeerSlot]) -> Vec<RelativeSl
         if s.rate.active_ms < RELSLOW_ACTIVE_MS {
             continue;
         }
-        let Some(bps) = s.rate.bps() else {
+        let Some(bps) = s.rate.eviction_bps(now_ms) else {
             continue;
         };
         if bps == 0 {
@@ -191,12 +194,12 @@ pub(crate) fn global_first_block_ms(slots: &[PeerSlot]) -> u64 {
 }
 
 /// True when IBD has been receiving block bytes long enough for relative rule.
-pub(crate) fn relative_slow_global_warmup_ok(slots: &[PeerSlot]) -> bool {
+pub(crate) fn relative_slow_global_warmup_at(slots: &[PeerSlot], now_ms: u64) -> bool {
     let first = global_first_block_ms(slots);
     if first == 0 {
         return false;
     }
-    ibd_mono_ms().saturating_sub(first) >= RELATIVE_SLOW_GLOBAL_WARMUP_MS
+    now_ms.saturating_sub(first) >= RELATIVE_SLOW_GLOBAL_WARMUP_MS
 }
 
 /// Classified dial failure for [`AddrMan`] flag updates.
@@ -340,7 +343,17 @@ pub(crate) fn redial_want(alive: usize, target: usize) -> usize {
 }
 
 /// Apply dial successes / failures to the peer book.
-pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
+///
+/// A network failure (EOF, timeout) takes the same strike cooldown as a
+/// stall kick. Incompatible peers stay last-resort without that ban.
+/// A later successful connect clears the cooldown at the call site.
+pub(crate) fn apply_dial_result(
+    book: &mut AddrMan,
+    result: &DialBatchResult,
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
+    now: Instant,
+) {
     for &addr in &result.attempted {
         book.note_attempt_addr(addr);
     }
@@ -348,8 +361,36 @@ pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
         book.note_connected_addr(s.net);
     }
     for &(addr, kind) in &result.failed {
-        book.note_connect_failed_addr(addr, kind == DialFailKind::Incompatible);
+        let incompatible = kind == DialFailKind::Incompatible;
+        book.note_connect_failed_addr(addr, incompatible);
+        if incompatible {
+            continue;
+        }
+        if let Some(sock) = addr.socket_addr() {
+            record_stall_kick(addr_cooldown, addr_strikes, sock, now);
+        }
     }
+}
+
+/// True when some dialable address is neither live nor cooling and did not
+/// fail its last connect. Relative-slow must not drop a peer when this is
+/// false: the only redials would be dead seeds or addresses already banned.
+pub(crate) fn replacement_available(
+    book: &AddrMan,
+    slots: &[PeerSlot],
+    cooldown: &HashMap<SocketAddr, Instant>,
+    now: Instant,
+) -> bool {
+    let live: HashSet<crate::NetAddr> = slots.iter().filter(|s| s.alive).map(|s| s.net).collect();
+    book.dial_order().iter().copied().any(|addr| {
+        if !book.is_dialable(addr) || live.contains(&addr) {
+            return false;
+        }
+        let cooling = addr
+            .socket_addr()
+            .is_some_and(|sock| cooldown.get(&sock).is_some_and(|until| *until > now));
+        !cooling && !book.connect_failed(addr)
+    })
 }
 
 pub(crate) fn request_headers(
@@ -443,6 +484,49 @@ pub(crate) fn release_peer_block_work(
             }
         }
     }
+}
+
+/// When every dialable address is live or cooling, drop the cooling address
+/// we tried least recently from `exclude` so one redial can proceed.
+/// Never-attempted sorts first. A free candidate suppresses this.
+pub(crate) fn admit_cooldown_fallback(
+    book: &AddrMan,
+    exclude: &mut HashSet<crate::NetAddr>,
+    occupied: &[SocketAddr],
+    cooldown: &HashMap<SocketAddr, Instant>,
+    now: Instant,
+    live: &HashSet<crate::NetAddr>,
+) -> Option<crate::NetAddr> {
+    if !book
+        .take_dial_candidates_net(1, exclude, occupied)
+        .is_empty()
+    {
+        return None;
+    }
+    let cooling: Vec<crate::NetAddr> = book
+        .dial_order()
+        .iter()
+        .copied()
+        .filter(|a| book.is_dialable(*a) && !live.contains(a))
+        .filter(|a| {
+            a.socket_addr()
+                .is_some_and(|sock| cooldown.get(&sock).is_some_and(|until| *until > now))
+        })
+        .collect();
+    let pick = cooling
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by_key(|(i, a)| {
+            (
+                book.last_attempt_of(*a).is_some(),
+                book.last_attempt_of(*a).unwrap_or(now),
+                *i,
+            )
+        })
+        .map(|(_, a)| a)?;
+    exclude.remove(&pick);
+    Some(pick)
 }
 
 /// Addrs we must not dial: currently connected/slot-held + still-cooling stall bans.
@@ -577,27 +661,57 @@ pub(crate) fn disconnect_stalled_block_peers_at(
 /// Absolute stall ([`disconnect_stalled_block_peers`]) remains the zero-progress
 /// floor; this only cuts peers that keep making slow progress while the bulk
 /// is dramatically faster.
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(crate) fn disconnect_relative_slow_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
+    book: &AddrMan,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
 ) {
-    if !relative_slow_global_warmup_ok(slots) {
+    disconnect_relative_slow_block_peers_at(
+        slots,
+        inflight,
+        addr_cooldown,
+        addr_strikes,
+        now,
+        book,
+        suspect,
+        last_kick_ms,
+        ibd_mono_ms(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+pub(crate) fn disconnect_relative_slow_block_peers_at(
+    slots: &mut [PeerSlot],
+    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
+    now: Instant,
+    book: &AddrMan,
+    suspect: &mut Option<(usize, u64)>,
+    last_kick_ms: &mut u64,
+    now_ms: u64,
+) {
+    if !relative_slow_global_warmup_at(slots, now_ms) {
+        *suspect = None;
+        return;
+    }
+    if !replacement_available(book, slots, addr_cooldown, now) {
         *suspect = None;
         return;
     }
     let alive = slots.iter().filter(|s| s.alive).count();
     let min_samples = relative_slow_min_samples(alive);
-    let samples = mature_relative_slow_samples(slots);
+    let samples = mature_relative_slow_samples(slots, now_ms);
     if samples.len() < min_samples {
         *suspect = None;
         return;
     }
-    let now_ms = ibd_mono_ms();
     let (kick, next_suspect) =
         relative_slow_with_hysteresis(&samples, min_samples, now_ms, *suspect, *last_kick_ms);
     *suspect = next_suspect;
@@ -716,6 +830,86 @@ mod tests {
             classify_dial_err(&NetError::Protocol("misbehavior")),
             DialFailKind::Network
         );
+    }
+
+    #[test]
+    fn cooldown_fallback_retries_least_recent_only_when_all_cooling() {
+        let now = Instant::now();
+        let mut book = AddrMan::new();
+        for o in 1u8..=3 {
+            book.add(addr(o));
+        }
+        book.note_attempt_at(addr(1), now - Duration::from_secs(10));
+        book.note_attempt_at(addr(2), now - Duration::from_secs(100));
+        let mut cooldown = HashMap::new();
+        for o in 1u8..=3 {
+            cooldown.insert(addr(o), now + Duration::from_secs(3600));
+        }
+        let mut exclude: HashSet<_> = (1u8..=3)
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let pick =
+            admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new());
+        let never = crate::NetAddr::from_socket(addr(3));
+        assert_eq!(pick, Some(never));
+        assert!(!exclude.contains(&never));
+        assert!(exclude.contains(&crate::NetAddr::from_socket(addr(1))));
+        assert!(exclude.contains(&crate::NetAddr::from_socket(addr(2))));
+
+        // A free address is enough; cooling peers stay blocked.
+        cooldown.remove(&addr(3));
+        let pick =
+            admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new());
+        assert_eq!(pick, None);
+        assert!(!exclude.contains(&never));
+
+        // Live never-tried peer is not the fallback; oldest attempt is.
+        exclude.insert(never);
+        cooldown.insert(addr(3), now + Duration::from_secs(3600));
+        let live = HashSet::from([never]);
+        let pick = admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &live);
+        assert_eq!(pick, Some(crate::NetAddr::from_socket(addr(2))));
+        assert!(!exclude.contains(&crate::NetAddr::from_socket(addr(2))));
+
+        // `until == now` has expired. It must not be treated as still cooling.
+        let mut due = AddrMan::new();
+        due.add(addr(4));
+        due.add(addr(5));
+        due.note_attempt_at(addr(5), now - Duration::from_secs(1));
+        let mut due_cd = HashMap::new();
+        due_cd.insert(addr(4), now);
+        due_cd.insert(addr(5), now);
+        let mut due_ex: HashSet<_> = [4u8, 5]
+            .into_iter()
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let pick = admit_cooldown_fallback(&due, &mut due_ex, &[], &due_cd, now, &HashSet::new());
+        assert_eq!(pick, None, "cooldown ending at now is not a fallback");
+        assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(4))));
+        assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(5))));
+
+        // An address already in the book that this node will not dial
+        // (only-net) must not win the fallback just because it was never
+        // tried. `add` drops addresses that fail only-net, so restrict
+        // after they are in the book.
+        let mut filtered = AddrMan::new();
+        for o in 6u8..=8 {
+            filtered.add(addr(o));
+        }
+        assert_eq!(filtered.len(), 3);
+        filtered.set_only_net(vec![crate::OnlyNet::Onion]);
+        let mut filt_cd = HashMap::new();
+        for o in 6u8..=8 {
+            filt_cd.insert(addr(o), now + Duration::from_secs(60));
+        }
+        let mut filt_ex: HashSet<_> = (6u8..=8)
+            .map(|o| crate::NetAddr::from_socket(addr(o)))
+            .collect();
+        let before = filt_ex.clone();
+        let pick =
+            admit_cooldown_fallback(&filtered, &mut filt_ex, &[], &filt_cd, now, &HashSet::new());
+        assert_eq!(pick, None, "only-net hides clearnet even when cooling");
+        assert_eq!(filt_ex, before);
     }
 
     #[test]
@@ -938,10 +1132,27 @@ mod tests {
                 crate::NetAddr::Ip(inc),
             ],
         };
-        apply_dial_result(&mut book, &result);
+        let now = Instant::now();
+        let mut cooldown = HashMap::new();
+        let mut strikes = HashMap::new();
+        apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
         assert!(book.flags(&good).has_connected());
         assert!(book.flags(&bad).failed_last_connect());
         assert!(book.flags(&inc).is_incompatible());
+        assert_eq!(
+            cooldown.get(&bad).copied(),
+            Some(now + STALL_ADDR_COOLDOWN),
+            "EOF/timeout enters the stall cooldown"
+        );
+        assert!(
+            !cooldown.contains_key(&inc),
+            "incompatible is last-resort, not a stall ban"
+        );
+        apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
+        assert_eq!(
+            cooldown.get(&bad).copied(),
+            Some(now + STALL_ADDR_COOLDOWN_2)
+        );
         book.add(addr(8));
         let got = book.take_dial_candidates(8, &HashSet::new(), &[]);
         assert!(
@@ -1159,7 +1370,7 @@ mod tests {
             s.rate.sample(5_000, 50_000_000, true);
             s
         };
-        let samples = mature_relative_slow_samples(&[dead, young]);
+        let samples = mature_relative_slow_samples(&[dead, young], RELSLOW_ACTIVE_MS);
         assert!(samples.iter().all(|s| s.peer_id != 0 && s.peer_id != 2));
 
         assert_eq!(global_first_block_ms(&[]), 0);
@@ -1189,7 +1400,7 @@ mod tests {
             s.first_data_ms = 10;
             s
         };
-        let warm = relative_slow_global_warmup_ok(std::slice::from_ref(&a2));
+        let warm = relative_slow_global_warmup_at(std::slice::from_ref(&a2), ibd_mono_ms());
         if ibd_mono_ms().saturating_sub(10) < RELATIVE_SLOW_GLOBAL_WARMUP_MS {
             assert!(!warm);
         }
@@ -1201,17 +1412,142 @@ mod tests {
         let mut strikes = HashMap::new();
         let mut suspect = Some((1usize, 0u64));
         let mut last_kick_ms = 0u64;
+        let mut book = AddrMan::new();
+        book.add(addr(41));
+        book.note_connect_failed(addr(41), false);
+        let now = Instant::now();
+        assert!(
+            !replacement_available(&book, &slots, &cooldown, now),
+            "a failed last connect is not a replacement"
+        );
+        book.add(addr(42));
+        assert!(
+            replacement_available(&book, &slots, &cooldown, now),
+            "an untried address can replace a kicked peer"
+        );
+        cooldown.insert(addr(42), now + Duration::from_secs(60));
+        assert!(
+            !replacement_available(&book, &slots, &cooldown, now),
+            "cooling the only clean address leaves no replacement"
+        );
+        cooldown.clear();
         disconnect_relative_slow_block_peers(
             &mut slots,
             &mut inflight,
             &mut cooldown,
             &mut strikes,
-            Instant::now(),
+            now,
+            &book,
             &mut suspect,
             &mut last_kick_ms,
         );
         assert!(suspect.is_none());
         assert!(cooldown.is_empty());
+        relative_slow_kick_needs_a_replacement();
+    }
+
+    /// Same journey: expiry at `now`, a live address, and a post-warmup kick.
+    fn relative_slow_kick_needs_a_replacement() {
+        let now = Instant::now();
+        let mut book = AddrMan::new();
+        book.add(addr(41));
+        book.note_connect_failed(addr(41), false);
+        book.add(addr(42));
+        let mut cooldown = HashMap::new();
+        cooldown.insert(addr(42), now);
+        let idle = [dummy_slot(1, addr(40), true)];
+        assert!(
+            replacement_available(&book, &idle, &cooldown, now),
+            "a cooldown that ends at now is not still cooling"
+        );
+        let live_peer = dummy_slot(7, addr(42), true);
+        assert!(
+            !replacement_available(
+                &book,
+                std::slice::from_ref(&live_peer),
+                &HashMap::new(),
+                now
+            ),
+            "the live peer is not its own replacement"
+        );
+
+        let h = BlockHash::from_byte_array([0x71; 32]);
+        let mut pack = Vec::new();
+        for i in 0..8 {
+            let mut s = dummy_slot(i, addr(60 + i as u8), true);
+            s.first_data_ms = 1_000;
+            s.rate.sample(0, 0, true);
+            let bytes = if i == 0 { 4_500_000 } else { 45_000_000 };
+            s.rate.sample(RELSLOW_ACTIVE_MS, bytes, true);
+            s.in_flight.insert(h);
+            pack.push(s);
+        }
+        let slow_addr = addr(60);
+        let mut kicked_book = AddrMan::new();
+        kicked_book.add(addr(80));
+        kicked_book.note_connect_failed(addr(80), false);
+        cooldown.clear();
+        let t_warm = 1_000 + RELATIVE_SLOW_GLOBAL_WARMUP_MS;
+        let mut inflight = HashMap::new();
+        let mut strikes = HashMap::new();
+        let mut suspect = None;
+        let mut last_kick_ms = 0u64;
+        disconnect_relative_slow_block_peers_at(
+            &mut pack,
+            &mut inflight,
+            &mut cooldown,
+            &mut strikes,
+            now,
+            &kicked_book,
+            &mut suspect,
+            &mut last_kick_ms,
+            t_warm,
+        );
+        disconnect_relative_slow_block_peers_at(
+            &mut pack,
+            &mut inflight,
+            &mut cooldown,
+            &mut strikes,
+            now,
+            &kicked_book,
+            &mut suspect,
+            &mut last_kick_ms,
+            t_warm + RELATIVE_SLOW_HYSTERESIS_MS,
+        );
+        assert!(
+            !cooldown.contains_key(&slow_addr),
+            "no clean address outside cooldown, so the outlier stays"
+        );
+        kicked_book.add(addr(81));
+        suspect = None;
+        last_kick_ms = 0;
+        disconnect_relative_slow_block_peers_at(
+            &mut pack,
+            &mut inflight,
+            &mut cooldown,
+            &mut strikes,
+            now,
+            &kicked_book,
+            &mut suspect,
+            &mut last_kick_ms,
+            t_warm,
+        );
+        assert_eq!(suspect.map(|s| s.0), Some(0));
+        disconnect_relative_slow_block_peers_at(
+            &mut pack,
+            &mut inflight,
+            &mut cooldown,
+            &mut strikes,
+            now,
+            &kicked_book,
+            &mut suspect,
+            &mut last_kick_ms,
+            t_warm + RELATIVE_SLOW_HYSTERESIS_MS,
+        );
+        assert!(
+            cooldown.contains_key(&slow_addr),
+            "an untried replacement allows the relative-slow kick"
+        );
     }
 
     #[test]
@@ -1231,9 +1567,39 @@ mod tests {
             .sample(RELSLOW_ACTIVE_MS, RELSLOW_ACTIVE_MS * 10_000, true);
         mature.in_flight.insert(h);
 
-        let samples = mature_relative_slow_samples(&[young, mature]);
+        let samples = mature_relative_slow_samples(&[young, mature], RELSLOW_ACTIVE_MS);
         assert!(samples.iter().all(|s| s.peer_id != 0));
         assert!(samples.iter().any(|s| s.peer_id == 1));
+    }
+
+    /// Frozen high EWMAs from peers that stopped sending must not make a
+    /// peer that just delivered the relative-slow outlier.
+    #[test]
+    fn stale_high_rates_do_not_evict_a_peer_that_just_sent() {
+        let now = 90_000u64;
+        let quiet_at = 30_000u64;
+        let h = BlockHash::from_byte_array([0x61; 32]);
+        let mut slots = Vec::new();
+        for i in 0..6u8 {
+            let mut s = dummy_slot(i as usize, addr(i), true);
+            s.rate.sample(0, 0, true);
+            // ~1 MB/s EWMA, last rx 60s ago, nothing in flight.
+            s.rate.sample(quiet_at, 45_000_000, true);
+            s.rate.note_rx(quiet_at);
+            slots.push(s);
+        }
+        for i in 6..12u8 {
+            let mut s = dummy_slot(i as usize, addr(i), true);
+            s.rate.sample(0, 0, true);
+            // ~100 KB/s, bytes just arrived, still holding getdata.
+            s.rate.sample(quiet_at, 4_500_000, true);
+            s.rate.note_rx(now);
+            s.in_flight.insert(h);
+            slots.push(s);
+        }
+        let samples = mature_relative_slow_samples(&slots, now);
+        let pick = relative_slow_pick(&samples, relative_slow_min_samples(slots.len()));
+        assert_eq!(pick, None, "samples={samples:?}");
     }
 
     #[test]

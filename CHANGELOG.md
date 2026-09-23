@@ -11,6 +11,28 @@ before 1.0).
 
 ### Fixed
 
+- **Input backfill reads `seqsigwit.body` in 16 MiB spans.** Open used
+  to `pread` the locator window and the body once per create. A chunk
+  of 16384 creates now shares one locator read, and contiguous bodies
+  share one pread. A partial `input.loc` resumes that walk when the
+  next record still has an inline prevout.
+
+- **Failed connects enter the stall cooldown.** An EOF or timeout takes
+  the same strike ban as a relative-slow kick, so dead seeds stop
+  occupying the only dial slots. Relative-slow does not disconnect
+  while every address outside cooldown failed its last connect.
+
+- **IBD redial breaks an all-cooldown book:** when more peers are
+  needed and every candidate is cooling, dial the one tried least
+  recently anyway. A successful connect clears that cooldown. Never
+  tried sorts ahead of any attempt.
+
+- **IBD eviction ages a peer's saved speed:** a quiet in-flight gap no
+  longer rewrites the transfer EWMA. Relative-slow and tip-hole eviction
+  score `ewma * 15s / (15s + age)` from the last qualifying rx, so a
+  frozen high rate cannot hold the median up while peers that are still
+  delivering get disconnected.
+
 - **Store I/O lifetimes:** `push_pread` / `push_pwrite` are `unsafe` and
   require the buffer to stay live until the completion is harvested.
   `HeadDrainHandle` borrows the store until join. An `io_uring` enter

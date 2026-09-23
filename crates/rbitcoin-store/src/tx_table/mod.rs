@@ -227,6 +227,119 @@ fn edges_from_seqsigwit_payload(raw: &[u8]) -> Result<Vec<crate::input::InputEdg
     Ok(edges)
 }
 
+/// How many creates to locate per input-backfill step.
+const INPUT_BACKFILL_FKS: u64 = 16_384;
+/// Coalesced `seqsigwit.body` pread. Same bound as [`SCRIPT_HASH_COLLECT_SPAN`].
+const INPUT_BACKFILL_SPAN: u64 = SCRIPT_HASH_COLLECT_SPAN;
+
+fn backfill_chunk_end(id: u64, n: u64) -> u64 {
+    (id + INPUT_BACKFILL_FKS - 1).min(n)
+}
+
+fn backfill_progress_due(end: u64, id: u64) -> bool {
+    end / 1_000_000 != (id - 1) / 1_000_000
+}
+
+fn unstamped_tail(n_bodies: u64, have: u64) -> u64 {
+    n_bodies.saturating_sub(have)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InputOpenTail {
+    Backfill { from: u64 },
+    Unstamped { n: u64 },
+    Ahead,
+    Ready,
+}
+
+fn input_open_tail(input_count: u64, n_bodies: u64, seq_count: u64) -> InputOpenTail {
+    if n_bodies > 0 && seq_count == n_bodies && input_count < n_bodies {
+        InputOpenTail::Backfill {
+            from: input_count + 1,
+        }
+    } else if input_count < n_bodies {
+        InputOpenTail::Unstamped {
+            n: unstamped_tail(n_bodies, input_count),
+        }
+    } else if input_count > n_bodies {
+        InputOpenTail::Ahead
+    } else {
+        InputOpenTail::Ready
+    }
+}
+
+type ReadSeqsigwitSpan<'a> = &'a mut dyn FnMut(u64, u64, &mut Vec<u8>) -> Result<(), StoreError>;
+
+fn edges_from_seqsigwit_ranges(
+    read: ReadSeqsigwitSpan<'_>,
+    ranges: &[Option<(u64, u64)>],
+    span_max: u64,
+    buf: &mut Vec<u8>,
+) -> Result<Vec<Vec<crate::input::InputEdge>>, StoreError> {
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut i = 0usize;
+    while i < ranges.len() {
+        let Some((start, first_len)) = ranges[i] else {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit range missing during input backfill",
+            ));
+        };
+        let mut end = start.saturating_add(first_len);
+        let mut j = i + 1;
+        if first_len <= span_max {
+            while j < ranges.len() {
+                let Some((off, len)) = ranges[j] else {
+                    return Err(StoreError::Corrupt(
+                        "invariant: seqsigwit range missing during input backfill",
+                    ));
+                };
+                if off != end {
+                    break;
+                }
+                let next = end.saturating_add(len);
+                if next - start > span_max {
+                    break;
+                }
+                end = next;
+                j += 1;
+            }
+        }
+        if j <= i {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit span did not advance",
+            ));
+        }
+        if end > start {
+            read(start, end - start, buf)?;
+        } else {
+            buf.clear();
+        }
+        if buf.len() as u64 != end.saturating_sub(start) {
+            return Err(StoreError::Corrupt(
+                "invariant: seqsigwit span short during input backfill",
+            ));
+        }
+        for slot in &ranges[i..j] {
+            let (off, len) = slot.ok_or(StoreError::Corrupt(
+                "invariant: seqsigwit range missing during input backfill",
+            ))?;
+            let rel = usize::try_from(off - start)
+                .map_err(|_| StoreError::Corrupt("invariant: seqsigwit span offset"))?;
+            let n = usize::try_from(len)
+                .map_err(|_| StoreError::Corrupt("invariant: seqsigwit span length"))?;
+            let at = rel + n;
+            if at > buf.len() {
+                return Err(StoreError::Corrupt(
+                    "invariant: seqsigwit span short during input backfill",
+                ));
+            }
+            out.push(edges_from_seqsigwit_payload(&buf[rel..at])?);
+        }
+        i = j;
+    }
+    Ok(out)
+}
+
 fn input_edges(ins: &[InputRecord]) -> Vec<crate::input::InputEdge> {
     ins.iter()
         .map(|inp| {
@@ -967,14 +1080,26 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
         };
-        if t.input.count() == 0 && n_bodies > 0 && t.seqsigwit.count() == n_bodies {
-            t.backfill_inputs_from_seqsigwit()?;
-        } else if t.input.count() < n_bodies {
-            t.input.append_unstamped(n_bodies - t.input.count())?;
-        } else if t.input.count() > n_bodies {
-            return Err(StoreError::Corrupt(
-                "invariant: input.loc ahead of create.loc",
-            ));
+        match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
+            InputOpenTail::Backfill { from } => {
+                // A missing tail on the new layout has no inline prevout. Stamp
+                // those rows empty. A legacy tail (or a fresh backfill) still
+                // walks seqsigwit.
+                let legacy = from == 1 || t.seqsigwit_has_inline_prevout(Fk(from))?;
+                if legacy {
+                    t.backfill_inputs_from_seqsigwit(from)?;
+                } else {
+                    t.input
+                        .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
+                }
+            }
+            InputOpenTail::Unstamped { n } => t.input.append_unstamped(n)?,
+            InputOpenTail::Ahead => {
+                return Err(StoreError::Corrupt(
+                    "invariant: input.loc ahead of create.loc",
+                ));
+            }
+            InputOpenTail::Ready => {}
         }
         if n_bodies > 0 {
             let _ = t.input.n_in(Fk(1))?;
@@ -1518,24 +1643,41 @@ impl TxTable {
             .collect())
     }
 
-    fn backfill_inputs_from_seqsigwit(&self) -> Result<(), StoreError> {
-        let n = self.create_loc.count();
-        rbitcoin_log::info!("store: input backfill from seqsigwit n={n}");
-        let mut batch = Vec::new();
-        for id in 1..=n {
-            let (off, len) = self.seqsigwit_range(Fk(id))?;
-            let raw = self.seqsigwit.with_bytes_at(off, len, |b| Ok(b.to_vec()))?;
-            batch.push(edges_from_seqsigwit_payload(&raw)?);
-            if batch.len() == 1024 {
-                self.input.append(&batch)?;
-                batch.clear();
-            }
-            if id.is_multiple_of(1_000_000) {
-                rbitcoin_log::info!("store: input backfill progress {id}/{n}");
-            }
+    fn seqsigwit_has_inline_prevout(&self, fk: Fk) -> Result<bool, StoreError> {
+        let (off, len) = self.seqsigwit_range(fk)?;
+        if len == 0 {
+            return Ok(false);
         }
-        if !batch.is_empty() {
-            self.input.append(&batch)?;
+        let flags = self.seqsigwit.with_bytes_at(off, 1, |b| Ok(b[0]))?;
+        Ok(flags & input_flags::PREV_ON_INPUTS == 0)
+    }
+
+    fn backfill_inputs_from_seqsigwit(&self, from: u64) -> Result<(), StoreError> {
+        let n = self.create_loc.count();
+        let mut id = from.max(1);
+        rbitcoin_log::info!("store: input backfill from seqsigwit n={n} start={id}");
+        let mut buf = Vec::new();
+        while id <= n {
+            let end = backfill_chunk_end(id, n);
+            let fks: Vec<Fk> = (id..=end).map(Fk).collect();
+            let ranges = self.seqsigwit_loc.range_batch(&fks)?;
+            let edges = edges_from_seqsigwit_ranges(
+                &mut |off, len, buf| self.seqsigwit.with_bytes_at_into(off, len, buf, |_| Ok(())),
+                &ranges,
+                INPUT_BACKFILL_SPAN,
+                &mut buf,
+            )?;
+            self.input.append(&edges)?;
+            if backfill_progress_due(end, id) {
+                rbitcoin_log::info!("store: input backfill progress {end}/{n}");
+            }
+            let next_id = end + 1;
+            if next_id <= id {
+                return Err(StoreError::Corrupt(
+                    "invariant: input backfill did not advance",
+                ));
+            }
+            id = next_id;
         }
         rbitcoin_log::info!("store: input backfill complete n={n}");
         Ok(())
