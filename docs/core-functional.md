@@ -295,10 +295,13 @@ auth accepts any username whose password matches that token.
 
 Hostname `--connect` / `addnode add` resolve at each dial on a blocking
 thread and retry every 2 seconds until a live session exists. `--connect`
-does not turn DNS seeds back on. Incomplete catch-up at **genesis** (tip 0)
-still enters tip-follow so a late tank can attach. A non-zero tip that has
-not finished catch-up stays in IBD. Relay stays off while tip work is below
-`--min-chain-work`.
+does not turn DNS seeds back on. If the first catch-up accepts nothing and
+the tip is still 0, the tank enters tip-follow (16 blocks in flight, no
+return to the IBD window) so it can attach when the other tank appears.
+That is the right shape for this one-block example, not for a genesis
+mainnet sync. A non-zero tip that has not finished catch-up stays in IBD.
+Relay stays off while tip work is below `--min-chain-work`. The operator
+note is in [`OPERATOR.md`](../OPERATOR.md).
 
 ### CI example (label `warnet`)
 

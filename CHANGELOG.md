@@ -49,8 +49,10 @@ before 1.0).
 - **Hostname `--connect` / `addnode`:** clearnet names resolve at each dial
   (`localhost` and a missing port use the network P2P default) on a blocking
   thread, and retry until a live session exists. `--connect` does not enable
-  seed redial. Incomplete catch-up at genesis still enters tip-follow; a
-  non-zero tip stays in IBD. Relay stays gated below `--min-chain-work`.
+  seed redial. If the first catch-up accepts nothing and the tip is still 0,
+  the node enters tip-follow (16 blocks in flight, no return to the IBD
+  window) so a late short-chain peer can attach. A non-zero tip stays in IBD.
+  Relay stays gated below `--min-chain-work`.
   Label `warnet` runs a two-tank Docker example that starts the connecting
   tank first and waits until its height matches the miner and `getpeerinfo`
   shows the resolved address

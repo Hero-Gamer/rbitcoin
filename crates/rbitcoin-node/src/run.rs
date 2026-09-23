@@ -1179,8 +1179,10 @@ fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
         && config.listen.proxy.is_none()
 }
 
-/// `--connect` at genesis still follows: the peer may listen after we dial.
-/// A non-zero tip that has not finished catch-up stays in IBD.
+/// Genesis `--connect` whose first catch-up accepts nothing is treated as
+/// finished so the process stays up. The later dial is a follow session
+/// (16 blocks in flight on the tip index path), not a return to the IBD
+/// window. A non-zero tip that has not finished catch-up stays in IBD.
 pub(crate) fn catch_up_with_connect(
     catch_up: CatchUp,
     has_connect: bool,
