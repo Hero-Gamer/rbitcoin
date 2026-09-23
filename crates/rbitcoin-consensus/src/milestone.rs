@@ -165,16 +165,16 @@ mod tests {
         assert!(!m.skips_scripts(50, &honest, |h| headers.get(&h).copied(), None));
         assert!(m.skips_scripts(50, &honest, |h| headers.get(&h).copied(), Some(enough)));
         assert!(
-            m.skips_scripts(100, &anchor_hash, |h| headers.get(&h).copied(), Some(enough)),
+            m.skips_scripts(
+                100,
+                &anchor_hash,
+                |h| headers.get(&h).copied(),
+                Some(enough)
+            ),
             "the anchor block itself is buried"
         );
         let above = [0x44u8; 32];
         headers.insert(101, above);
-        assert!(!m.skips_scripts(
-            101,
-            &above,
-            |h| headers.get(&h).copied(),
-            Some(enough)
-        ));
+        assert!(!m.skips_scripts(101, &above, |h| headers.get(&h).copied(), Some(enough)));
     }
 }
