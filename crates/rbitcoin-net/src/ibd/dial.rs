@@ -820,13 +820,16 @@ mod tests {
         assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(4))));
         assert!(due_ex.contains(&crate::NetAddr::from_socket(addr(5))));
 
-        // An address in the book that this node will not dial (only-net)
-        // must not win the fallback just because it was never tried.
+        // An address already in the book that this node will not dial
+        // (only-net) must not win the fallback just because it was never
+        // tried. `add` drops addresses that fail only-net, so restrict
+        // after they are in the book.
         let mut filtered = AddrMan::new();
-        filtered.set_only_net(vec![crate::OnlyNet::Onion]);
         for o in 6u8..=8 {
             filtered.add(addr(o));
         }
+        assert_eq!(filtered.len(), 3);
+        filtered.set_only_net(vec![crate::OnlyNet::Onion]);
         let mut filt_cd = HashMap::new();
         for o in 6u8..=8 {
             filt_cd.insert(addr(o), now + Duration::from_secs(60));
