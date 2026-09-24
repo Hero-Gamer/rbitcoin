@@ -25,13 +25,8 @@ impl RpcAuth {
 /// Compare two byte strings without returning on the first mismatch.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
-    let n = a.len().max(b.len());
-    let mut i = 0;
-    while i < n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-        i += 1;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= usize::from(*x ^ *y);
     }
     diff == 0
 }
@@ -181,6 +176,16 @@ mod tests {
         assert!(!a.matches_token(&one_bit));
         assert!(ct_eq(b"s3cret", b"s3cret"));
         assert!(!ct_eq(b"s3cret", one_bit.as_bytes()));
+        assert!(
+            !ct_eq(b"s3cret", b"s3cre"),
+            "shorter equal prefix is not the token"
+        );
+        assert!(
+            !ct_eq(b"s3cret", b"s3cret!"),
+            "longer equal prefix is not the token"
+        );
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"", b"x"));
         assert_eq!(
             default_socket_path(Path::new("/d")),
             PathBuf::from("/d/rpc.sock")

@@ -10367,3 +10367,51 @@ async fn header_reject_punishes_except_temporary_time() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::Txid;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("inv-cap");
+    hub.ensure_genesis().unwrap();
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let block = Inventory::CompactBlock(hub.tip_hash().unwrap());
+    let at_cap = vec![block; MAX_INV_SIZE];
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &out_tx, &mut follow, None, &at_cap).unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "exactly {MAX_INV_SIZE} inv items stay connected"
+    );
+    let mut over = at_cap;
+    over.push(block);
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &out_tx, &mut follow, None, &over).unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "one past the inv cap disconnects"
+    );
+
+    let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x22; 32]));
+    let at_cap = vec![tx; MAX_INV_SIZE];
+    let mut follow = PeerFollowState::new();
+    serve_getdata(&hub, &out_tx, &mut follow, None, &at_cap)
+        .await
+        .unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "exactly {MAX_INV_SIZE} getdata items are served"
+    );
+    let mut over = at_cap;
+    over.push(tx);
+    let mut follow = PeerFollowState::new();
+    serve_getdata(&hub, &out_tx, &mut follow, None, &over)
+        .await
+        .unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "one past the getdata cap disconnects"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
