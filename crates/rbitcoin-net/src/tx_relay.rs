@@ -3160,18 +3160,21 @@ impl MempoolHub {
     }
 
     #[allow(clippy::type_complexity)] // packed row / pin / script-hash tuple is the on-disk shape
-    /// `getmempoolcluster` payload from the live graph.
+    /// `getmempoolcluster` payload from the live graph (weights sigop-adjusted).
     pub fn cluster_rpc(&self, txid: &Txid) -> Option<(u64, usize, Vec<(i64, u64, Vec<Txid>)>)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
         let g = self.lock_read();
         let c = g.graph.cluster_of_delta(txid, d)?;
-        let chunks = c
+        let chunks: Vec<_> = c
             .chunks
             .iter()
             .map(|ch| (ch.fee_sat as i64, ch.weight, ch.txids.clone()))
             .collect();
-        Some((c.total_weight, c.members.len(), chunks))
+        // Core `clusterweight` is sigop-adjusted; `total_weight` is the raw
+        // cluster-limit basis, chunk weights are adjusted.
+        let adjusted = chunks.iter().fold(0u64, |w, ch| w.saturating_add(ch.1));
+        Some((adjusted, c.members.len(), chunks))
     }
 
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
@@ -3896,8 +3899,11 @@ mod tests {
             }
             let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
             assert_eq!(hub.get_live_adjusted_weight(&tid), Some(2_000));
+            // Core `getmempoolcluster` `clusterweight` is sigop-adjusted.
+            assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 2_000);
             hub.set_bytes_per_sigop(0);
             assert_eq!(hub.get_live_adjusted_weight(&tid), Some(400));
+            assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 400);
             assert_eq!(hub.get_live_adjusted_weight(&Txid::all_zeros()), None);
             let _ = std::fs::remove_dir_all(&mp);
         }
