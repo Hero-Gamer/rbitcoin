@@ -106,12 +106,13 @@ pub(super) fn assemble_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
     spend_edges: &rbitcoin_query::SpendEdges,
-) -> Result<Vec<Prepared>, ConsensusError> {
+) -> Result<(Vec<Prepared>, Vec<u64>), ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
     let mut pending_creates = crate::block::PendingCreates::default();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(metas.len());
+    let mut tx_fees: Vec<u64> = Vec::new();
 
     for (i, meta) in metas.into_iter().enumerate() {
         let block = &wire_blocks[i];
@@ -160,7 +161,7 @@ pub(super) fn assemble_run(
             crate::block::bip16_active_from_prev_mtp(params, height.0, &block_hash, prev_mtp);
 
         let t_connect = Instant::now();
-        let (script_jobs, spends, fees) = assemble_block_prevouts(
+        let (script_jobs, spends, fees, block_fees) = assemble_block_prevouts(
             query,
             block.as_ref(),
             &ctx,
@@ -176,6 +177,7 @@ pub(super) fn assemble_run(
             Some(block),
             Some(&meta.pres),
         )?;
+        tx_fees.extend(block_fees);
         rbitcoin_query::note_confirm(
             &query.confirm_stats().connect_ns,
             t_connect.elapsed().as_nanos() as u64,
@@ -202,7 +204,7 @@ pub(super) fn assemble_run(
             prev_mtp,
         });
     }
-    Ok(prepared)
+    Ok((prepared, tx_fees))
 }
 
 /// Durable spentness + maturity + subsidy after scripts (height order).

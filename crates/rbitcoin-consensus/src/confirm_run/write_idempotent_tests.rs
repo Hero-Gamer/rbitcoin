@@ -1879,6 +1879,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
+        tx_fees: Vec::new(),
     };
     // In-flight "parent" with **empty** outs → live.len() != need → cold path;
     // no Class A body either → end pin contract fails.
@@ -1937,6 +1938,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         batch_pin: vec![],
         index_tx: false,
         body_est: 0,
+        tx_fees: Vec::new(),
     };
     let stamp = ParentPinStamp::take_from_plan(&mut plan);
     assert!(plan.external_parents.is_empty());
@@ -2337,6 +2339,7 @@ fn pin_sparse_need_high_vout_only() {
         batch_pin: vec![Arc::clone(&spend_pin)],
         index_tx: false,
         body_est: 0,
+        tx_fees: Vec::new(),
     };
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
@@ -3190,8 +3193,8 @@ fn already_at_height_retries_post_commit_spend_annotate() {
 #[test]
 fn confirm_write_stamps_txstat_fee_size() {
     use crate::{
-        accept_and_connect_block, confirm_wire_run, genesis_block, mine_empty_regtest, ChainParams,
-        Milestone,
+        accept_and_connect_block, confirm_wire_load_phase, confirm_wire_run, genesis_block,
+        mine_empty_regtest, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_primitives::{Fk, Height};
 
@@ -3208,6 +3211,17 @@ fn confirm_write_stamps_txstat_fee_size() {
     assert_eq!(g.weight(), gtx.weight().to_wu());
 
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let loaded = confirm_wire_load_phase(
+        &q,
+        &params,
+        ms,
+        &[(Height(1), b1.clone())],
+        &ScriptPreverified::new(),
+    )
+    .unwrap();
+    let plan = loaded.batch.archive_plan.as_ref().expect("class A plan");
+    assert_eq!(plan.tx_fees, vec![0]);
+    assert_eq!(plan.tx_fees.len(), plan.packed.len());
     confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
     let row = q.get_txstat(Fk(2)).unwrap().expect("height-1 txstat");
     let tx = &b1.txdata[0];

@@ -235,6 +235,24 @@ fn two_input_item() -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
 }
 
 #[test]
+fn range_outs_leave_n_in_unstamped() {
+    let dir = tempfile_dir("range-outs-no-nin");
+    let t = create_tiny(&dir);
+    let (tx, ins, outs) = two_input_item();
+    let txid = tx.txid;
+    let fk = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap()[0];
+    assert_eq!(t.input.n_in(fk).unwrap(), Some(2));
+    let range = t.body_range(fk).unwrap();
+    let (rows, _, _, _, _, _) = t
+        .get_outs_by_range_batch(&[(fk, range, txid, 1, vec![0])])
+        .unwrap();
+    let (got, _, _) = rows[0].as_ref().expect("range outs");
+    assert_eq!(got.input_count, 0);
+    assert_eq!(t.get_meta_and_outputs(fk).unwrap().0.input_count, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn prevouts_use_txstat_n_in_without_full_txout() {
     let dir = tempfile_dir("prevouts-txstat");
     let t = create_tiny(&dir);
@@ -1831,7 +1849,8 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(guess_full_n, 0);
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, txid);
-    assert_eq!(got.input_count, 1);
+    assert_eq!(got.input_count, 0, "range pin does not read input.loc");
+    assert_eq!(t.get_meta_and_outputs(fk).unwrap().0.input_count, 1);
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);

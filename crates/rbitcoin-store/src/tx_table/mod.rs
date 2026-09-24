@@ -1599,8 +1599,7 @@ impl TxTable {
         let secret = self.store_secret();
         let t_dec = Instant::now();
         let mut out = Vec::with_capacity(jobs.len());
-        for (job, (fk, _range, known_txid, n_out, need)) in jobs.into_iter().zip(items.iter()) {
-            let _ = fk;
+        for (job, (_fk, _range, known_txid, n_out, need)) in jobs.into_iter().zip(items.iter()) {
             if !job.ok || job.body.is_empty() {
                 out.push(None);
                 continue;
@@ -1613,7 +1612,7 @@ impl TxTable {
             ) {
                 Ok((mut tx, live, sparse)) => {
                     tx.txid = *known_txid;
-                    self.overlay_stamped_n_in(*fk, &mut tx)?;
+                    // input_count stays 0. Full get overlays n_in from input.loc.
                     out.push(Some((tx, live, sparse)));
                 }
                 Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => out.push(None),

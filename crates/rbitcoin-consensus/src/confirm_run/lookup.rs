@@ -318,7 +318,7 @@ pub fn confirm_wire_load_from_plan(
         t_load.elapsed().as_nanos() as u64,
     );
 
-    let prepared = assemble_run(
+    let (prepared, tx_fees) = assemble_run(
         query,
         params,
         milestone,
@@ -328,6 +328,16 @@ pub fn confirm_wire_load_from_plan(
         &spend_edges,
     )?;
     drop(spend_edges);
+    if let Some(ref mut plan) = plan {
+        if !plan.packed.is_empty() {
+            if tx_fees.len() != plan.packed.len() {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: assemble tx fees length",
+                )));
+            }
+            plan.tx_fees = tx_fees;
+        }
+    }
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {

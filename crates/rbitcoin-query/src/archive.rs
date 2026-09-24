@@ -318,6 +318,11 @@ pub struct ArchiveWritePlan {
     pub batch_pin: Vec<CreatePin>,
     pub index_tx: bool,
     pub body_est: u64,
+    /// Per-tx fee in satoshis, parallel to [`Self::packed`], from assemble.
+    ///
+    /// Empty means commit recomputes the fee from prevouts (connect / tests).
+    /// A non-empty slice must match `packed` and skips that walk.
+    pub tx_fees: Vec<u64>,
 }
 
 impl ArchiveWritePlan {
@@ -334,6 +339,7 @@ impl ArchiveWritePlan {
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
+            tx_fees: Vec::new(),
         }
     }
 
@@ -477,9 +483,12 @@ impl ArchiveWritePlan {
         let old_packed = std::mem::take(&mut self.packed);
         let old_fks = std::mem::take(&mut self.planned_fks);
         let old_pin = std::mem::take(&mut self.batch_pin);
+        let old_fees = std::mem::take(&mut self.tx_fees);
+        let fees_aligned = old_fees.len() == old_packed.len();
         let mut new_packed = Vec::with_capacity(keep_fks.len());
         let mut new_fks = Vec::with_capacity(keep_fks.len());
         let mut new_pin = Vec::with_capacity(keep_fks.len());
+        let mut new_fees = Vec::with_capacity(keep_fks.len());
         for (i, fk) in old_fks.into_iter().enumerate() {
             let Some(id) = fk.get() else {
                 continue;
@@ -494,10 +503,14 @@ impl ArchiveWritePlan {
             if i < old_pin.len() {
                 new_pin.push(std::sync::Arc::clone(&old_pin[i]));
             }
+            if fees_aligned {
+                new_fees.push(old_fees[i]);
+            }
         }
         self.packed = new_packed;
         self.planned_fks = new_fks;
         self.batch_pin = new_pin;
+        self.tx_fees = new_fees;
         self.per_header_ranges = new_ranges;
         self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
@@ -524,7 +537,14 @@ impl ArchiveWritePlan {
         self.external_parents.clear();
         self.external_parent_vouts.clear();
 
+        let fees_aligned =
+            self.tx_fees.len() == self.packed.len() && other.tx_fees.len() == other.packed.len();
         self.packed.append(&mut other.packed);
+        if fees_aligned {
+            self.tx_fees.append(&mut other.tx_fees);
+        } else {
+            self.tx_fees.clear();
+        }
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
         self.per_header_sw.append(&mut other.per_header_sw);
@@ -662,12 +682,18 @@ fn tx_record_from_wire(tx: &bitcoin::Transaction, txid: [u8; 32]) -> TxRecord {
 
 fn stamp_txstat_rows(
     query: &Query,
-    packed: &[(CreatePin, Vec<InputRecord>)],
-    planned: &[Fk],
+    plan: &ArchiveWritePlan,
     parents: Option<&crate::BatchParents>,
 ) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
+    if plan.tx_fees.len() == plan.packed.len() && !plan.tx_fees.is_empty() {
+        return stamp_txstat_from_fees(&plan.packed, &plan.tx_fees);
+    }
+    if !plan.tx_fees.is_empty() {
+        return Err(StoreError::Corrupt("invariant: txstat fee length"));
+    }
+    let packed = &plan.packed;
     let mut idx: crate::U64Map<usize> = crate::U64Map::default();
-    for (i, fk) in planned.iter().enumerate() {
+    for (i, fk) in plan.planned_fks.iter().enumerate() {
         if let Some(id) = fk.get() {
             idx.insert(id, i);
         }
@@ -675,6 +701,26 @@ fn stamp_txstat_rows(
     let mut out = Vec::with_capacity(packed.len());
     for (pin, ins) in packed {
         out.push(stamp_one_txstat(query, packed, &idx, parents, pin, ins)?);
+    }
+    Ok(out)
+}
+
+/// Fee already checked in assemble. Size still comes from the wire tx.
+fn stamp_txstat_from_fees(
+    packed: &[(CreatePin, Vec<InputRecord>)],
+    fees: &[u64],
+) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
+    let mut out = Vec::with_capacity(packed.len());
+    for ((pin, _), fee) in packed.iter().zip(fees.iter()) {
+        let Some(tx) = pin.wire_tx() else {
+            return Err(StoreError::Corrupt("invariant: txstat fee without wire"));
+        };
+        let (base, wit_extra) = txstat_size(tx)?;
+        out.push(rbitcoin_store::TxStatRow {
+            fee_sat: *fee,
+            base,
+            wit_extra,
+        });
     }
     Ok(out)
 }
@@ -708,15 +754,20 @@ fn stamp_one_txstat(
     txstat_row_from_tx(tx, in_sum)
 }
 
-pub(crate) fn txstat_row_from_tx(
-    tx: &bitcoin::Transaction,
-    in_sum: Option<u64>,
-) -> Result<rbitcoin_store::TxStatRow, QueryError> {
+fn txstat_size(tx: &bitcoin::Transaction) -> Result<(u32, u32), QueryError> {
     let base_sz = tx.base_size();
     let total = tx.total_size();
     let base = u32::try_from(base_sz).map_err(|_| StoreError::Corrupt("txstat base"))?;
     let wit_extra = u32::try_from(total.saturating_sub(base_sz))
         .map_err(|_| StoreError::Corrupt("txstat wit_extra"))?;
+    Ok((base, wit_extra))
+}
+
+pub(crate) fn txstat_row_from_tx(
+    tx: &bitcoin::Transaction,
+    in_sum: Option<u64>,
+) -> Result<rbitcoin_store::TxStatRow, QueryError> {
+    let (base, wit_extra) = txstat_size(tx)?;
     let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
     let fee = match in_sum {
         None => 0u64,
@@ -1069,6 +1120,7 @@ impl Query {
             batch_pin,
             index_tx,
             body_est,
+            tx_fees: Vec::new(),
         })
     }
 
@@ -1127,7 +1179,7 @@ impl Query {
 
         let t = Instant::now();
         let overlay = plan.same_batch_spent_overlay();
-        let txstat = stamp_txstat_rows(self, &plan.packed, &plan.planned_fks, parents)?;
+        let txstat = stamp_txstat_rows(self, &plan, parents)?;
         let txstat_ns = t.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_txstat(txstat_ns);
 

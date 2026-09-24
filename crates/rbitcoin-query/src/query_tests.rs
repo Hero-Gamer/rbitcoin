@@ -2724,6 +2724,125 @@ fn confirm_txstat_miss_is_corrupt() {
 }
 
 #[test]
+fn txstat_uses_assemble_fee_without_parent_pin() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    let (dir, q) = temp_query("txstat-assemble-fee");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let parent_txid = t0.tx.txid;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let parent_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    let spend = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let txid = spend.compute_txid().to_byte_array();
+    let block = std::sync::Arc::new(Block {
+        header: BlockHeader {
+            version: BlockVersion::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 2,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        },
+        txdata: vec![spend.clone()],
+    });
+    let txrec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let child_fk = Fk(parent_fk.get().unwrap() + 1);
+    let make = || {
+        let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec.clone());
+        let mut plan = ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            pin,
+            vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: parent_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        )];
+        plan.planned_fks = vec![child_fk];
+        plan.body_est = 256;
+        plan
+    };
+    let mut bad = make();
+    bad.tx_fees = vec![1, 2];
+    let err = q
+        .archive_commit_plan_defer_head_parents(bad, Some(&BatchParents::new()))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("invariant: txstat fee length")),
+        "{err}"
+    );
+    let mut plan = make();
+    plan.tx_fees = vec![42];
+    q.archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
+        .expect("assemble fee skips the parent walk");
+    let row = q.txstat_row(child_fk).unwrap().expect("stamped from fee");
+    assert_eq!(row.fee_sat, 42);
+    assert_eq!(row.size() as usize, spend.total_size());
+
+    let aligned = |fee: u64| {
+        let mut plan = ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            CreatePinInner::records(
+                TxRecord {
+                    txid: [fee as u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
+            Vec::new(),
+        )];
+        plan.tx_fees = vec![fee];
+        plan
+    };
+    let mut joined = aligned(7);
+    joined.append(aligned(9));
+    assert_eq!(joined.tx_fees, vec![7, 9]);
+    let mut partial = aligned(7);
+    let mut bare = aligned(9);
+    bare.tx_fees.clear();
+    partial.append(bare);
+    assert!(partial.tx_fees.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stamp_txstat_from_block_coinbase_and_spend() {
     use bitcoin::hashes::Hash;
 
