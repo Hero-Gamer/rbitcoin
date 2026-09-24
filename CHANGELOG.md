@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **`-blockmintxfee` floors whole chunks:** `getblocktemplate` / `generate`
+  apply the floor to each chunk's modified feerate (Core `BlockAssembler`)
+  instead of filtering txs one by one after selection, which could drop a
+  low-fee CPFP parent and keep its child (`bad-txns-inputs-missingorspent`).
+
 - **Sigop-adjusted policy size:** feerate, RBF, min relay, package min
   relay, chunk ranking, eviction, fee estimation and `-blockmintxfee` use
   Core's `max(weight, sigop_cost × bytes_per_sigop)` (default 20, new

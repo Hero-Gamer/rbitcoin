@@ -108,60 +108,15 @@ pub(crate) fn hashes_json(hashes: &[BlockHash]) -> Value {
 }
 
 pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
-    let txs = ctx
-        .mempool
-        .as_ref()
-        .map(|mp| mp.select_block_txs())
-        .unwrap_or_default();
     let min = ctx
         .chain
         .as_ref()
         .map(|c| c.block_min_tx_fee_sat_kvb())
         .unwrap_or(1);
-    filter_block_min_fee(ctx, txs, min)
-}
-
-/// Whether modified fee meets `-blockmintxfee` as a true sat/kvB floor
-/// (`fee * 1000 >= min * vsize`). Zero min admits free txs.
-/// Whether modified fee meets `-blockmintxfee` as a true sat/kvB floor
-/// (`fee * 1000 >= min * vsize`). Zero min admits free txs.
-pub(crate) fn meets_block_min_feerate(modified_sat: i64, weight_wu: u64, min_sat_kvb: u64) -> bool {
-    if min_sat_kvb == 0 {
-        return true;
-    }
-    if modified_sat <= 0 {
-        return false;
-    }
-    let vsize = weight_wu.saturating_add(3) / 4;
-    if vsize == 0 {
-        return false;
-    }
-    (modified_sat as u64).saturating_mul(1000) >= min_sat_kvb.saturating_mul(vsize)
-}
-
-pub(crate) fn filter_block_min_fee(
-    ctx: &RpcContext,
-    txs: Vec<Transaction>,
-    min_sat_kvb: u64,
-) -> Vec<Transaction> {
-    if min_sat_kvb == 0 {
-        return txs;
-    }
-    let Some(mp) = ctx.mempool.as_ref() else {
-        return txs;
-    };
-    txs.into_iter()
-        .filter(|tx| {
-            let tid = tx.compute_txid();
-            let fee = mp.get_live_meta(&tid).map(|(f, _)| f).unwrap_or(0);
-            let modified = (fee as i64).saturating_add(mp.fee_delta(&tid));
-            // Core `BlockAssembler` compares against the sigop-adjusted size.
-            let weight = mp
-                .get_live_adjusted_weight(&tid)
-                .unwrap_or_else(|| tx.weight().to_wu());
-            meets_block_min_feerate(modified, weight, min_sat_kvb)
-        })
-        .collect()
+    ctx.mempool
+        .as_ref()
+        .map(|mp| mp.select_block_txs(min))
+        .unwrap_or_default()
 }
 
 pub(crate) fn drain_mempool(ctx: &RpcContext, txs: &[Transaction]) {

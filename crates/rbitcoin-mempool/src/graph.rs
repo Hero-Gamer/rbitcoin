@@ -35,6 +35,18 @@ pub(crate) fn sigops_adjusted_weight(weight: u64, sigop_cost: u64, bytes_per_sig
     weight.max(sigop_cost.saturating_mul(bytes_per_sigop))
 }
 
+/// Whether a modified fee meets `-blockmintxfee` on sigop-adjusted weight as
+/// a true sat/kvB floor (Core `CFeeRate::GetFee`: `fee * 1000 >= min * vsize`).
+/// Zero min admits free chunks.
+fn meets_block_min_feerate(modified_sat: i128, adj_weight_wu: u64, min_sat_kvb: u64) -> bool {
+    if min_sat_kvb == 0 {
+        return true;
+    }
+    let vsize = adj_weight_wu.saturating_add(3) / 4;
+    modified_sat > 0
+        && modified_sat.saturating_mul(1000) >= i128::from(min_sat_kvb) * i128::from(vsize)
+}
+
 /// One live mempool entry (RAM index; body lives on disk).
 #[derive(Debug, Clone)]
 pub struct TxEntry {
@@ -940,15 +952,18 @@ impl TxGraph {
     /// block sigop budget (80_000 less the 400 coinbase reserve) is skipped;
     /// later chunks are still tried.
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
-        self.select_block_txids_delta(max_weight_wu, |_| 0)
+        self.select_block_txids_delta(max_weight_wu, 0, |_| 0)
     }
 
     /// Like [`Self::select_block_txids`], ranking by `base_fee + delta(txid)`.
-    /// Chunks whose modified fee is **negative** are skipped. Zero-fee txs stay
-    /// selectable so `-blockmintxfee=0` can include them (GBT filters after).
+    /// Chunks whose modified fee is **negative** are skipped. A chunk whose
+    /// modified feerate is under `min_sat_kvb` (`-blockmintxfee`) is skipped
+    /// whole (Core `BlockAssembler` chunk floor), so a low-fee parent and its
+    /// CPFP child go in or out together. `0` admits zero-fee chunks.
     pub fn select_block_txids_delta(
         &self,
         max_weight_wu: u64,
+        min_sat_kvb: u64,
         delta: impl Fn(Txid) -> i64,
     ) -> Vec<Txid> {
         if max_weight_wu == 0 {
@@ -961,7 +976,7 @@ impl TxGraph {
                 let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
                 mf = mf.saturating_add(base.saturating_add(i128::from(delta(*t))));
             }
-            if mf < 0 {
+            if mf < 0 || !meets_block_min_feerate(mf, ch.weight, min_sat_kvb) {
                 continue;
             }
             let fee = mf as u64;
@@ -1321,7 +1336,7 @@ mod tests {
 
         let hid = hi.compute_txid();
         let lid = lo.compute_txid();
-        let depri = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+        let depri = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
             if id == hid {
                 -10_000
             } else {
@@ -1333,7 +1348,7 @@ mod tests {
             vec![lid, hid],
             "zero modified fee stays selectable; hotter lid ranks first"
         );
-        let depri_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+        let depri_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
             if id == hid {
                 -10_001
             } else {
@@ -1341,7 +1356,7 @@ mod tests {
             }
         });
         assert_eq!(depri_neg, vec![lid], "negative modified fee is not mined");
-        let bump = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+        let bump = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
             if id == lid {
                 86 * 100_000_000
             } else {
@@ -1374,7 +1389,7 @@ mod tests {
         g.insert(entry_for(&child, 1_000, 1), &child);
         let cid = child.compute_txid();
         let pid = parent.compute_txid();
-        let only_p = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+        let only_p = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
             if id == cid {
                 -1_000
             } else {
@@ -1386,7 +1401,7 @@ mod tests {
             vec![pid, cid],
             "zero-modified child stays selectable with parent"
         );
-        let only_p_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), |id| {
+        let only_p_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
             if id == cid {
                 -1_001
             } else {
@@ -1761,6 +1776,39 @@ mod tests {
             g.mining_chunks_best_first()[0].weight,
             heavy.weight().to_wu()
         );
+    }
+
+    #[test]
+    fn block_min_fee_matches_core_getfee() {
+        // 200 vB paying 1 sat meets 1 sat/kvB (1e3 >= 200) and any zero floor.
+        assert!(meets_block_min_feerate(1, 800, 1));
+        assert!(meets_block_min_feerate(0, 800, 0));
+        assert!(!meets_block_min_feerate(0, 800, 1));
+        // 250 vB at 1000 sat/kvB needs 250 sat.
+        assert!(meets_block_min_feerate(250, 1000, 1000));
+        assert!(!meets_block_min_feerate(249, 1000, 1000));
+        // 40 sat/kvB on 111 vB (5 sat) must not meet a 50 sat/kvB floor.
+        assert!(!meets_block_min_feerate(5, 444, 50));
+    }
+
+    /// Core applies `-blockmintxfee` to the chunk feerate: a zero-fee parent
+    /// rides in with its CPFP child (never the child alone), and a lone tx is
+    /// in at exactly the floor and out one sat/kvB above it.
+    #[test]
+    fn block_min_fee_floors_whole_chunk() {
+        let mut g = TxGraph::new();
+        let p = spend_op([0x41u8; 32], 0, 50_000);
+        let pid = p.compute_txid();
+        let c = make_tx(Some((pid, 0)), 1, 0x42);
+        let lone = spend_op([0x43u8; 32], 0, 40_000);
+        let lv = lone.weight().to_wu().div_ceil(4);
+        g.insert(entry_for(&p, 0, 0), &p);
+        g.insert(entry_for(&c, 100_000, 1), &c);
+        g.insert(entry_for(&lone, lv, 2), &lone);
+        let sel = |min| g.select_block_txids_delta(TxGraph::template_tx_weight(), min, |_| 0);
+        let (cid, lid) = (c.compute_txid(), lone.compute_txid());
+        assert_eq!(sel(1_000), vec![pid, cid, lid]);
+        assert_eq!(sel(1_001), vec![pid, cid]);
     }
 
     /// The block weight budget counts raw weight: two sigop-dense txs whose

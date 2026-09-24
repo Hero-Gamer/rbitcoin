@@ -3776,26 +3776,18 @@ fn block_min_fee_uses_sigop_adjusted_vsize() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     // 2_000 sat: 0.5 sat/vB at 4_000 vB, ~9 sat/vB on raw size.
     let (_, tx) = send_sigop_heavy_spend(&ctx, 2_000);
-    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 500);
-    assert_eq!(keep, vec![tx.clone()]);
-    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 501);
-    assert_eq!(keep, Vec::<Transaction>::new());
+    let keep = |min| {
+        ctx.chain
+            .as_ref()
+            .unwrap()
+            .set_block_min_tx_fee_sat_kvb(min);
+        crate::methods::mine::mempool_block_txs(&ctx)
+    };
+    assert_eq!(keep(500), vec![tx.clone()]);
+    assert_eq!(keep(501), Vec::<Transaction>::new());
     ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(0);
-    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 501);
-    assert_eq!(keep, vec![tx]);
+    assert_eq!(keep(501), vec![tx]);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn block_min_fee_matches_core_getfee() {
-    // 200 vB paying 1 sat meets 1 sat/kvB (1e3 >= 200) and any zero floor.
-    assert!(meets_block_min_feerate(1, 800, 1));
-    assert!(meets_block_min_feerate(1, 800, 0));
-    // 250 vB at 1000 sat/kvB needs 250 sat.
-    assert!(meets_block_min_feerate(250, 1000, 1000));
-    assert!(!meets_block_min_feerate(249, 1000, 1000));
-    // 40 sat/kvB on 111 vB (5 sat) must not meet a 50 sat/kvB floor.
-    assert!(!meets_block_min_feerate(5, 444, 50));
 }
 
 #[test]

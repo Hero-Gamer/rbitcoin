@@ -1814,17 +1814,19 @@ impl ActiveMempool {
 
     /// Mining-order live txs that fit in `max_weight_wu` (best chunks first).
     pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<Transaction> {
-        self.select_block_txs_delta(max_weight_wu, |_| 0)
+        self.select_block_txs_delta(max_weight_wu, 0, |_| 0)
     }
 
-    /// Like [`Self::select_block_txs`] with `prioritisetransaction` fee deltas.
+    /// Like [`Self::select_block_txs`] with `prioritisetransaction` fee deltas
+    /// and a `-blockmintxfee` chunk floor (sat/kvB).
     pub fn select_block_txs_delta(
         &self,
         max_weight_wu: u64,
+        min_sat_kvb: u64,
         delta: impl Fn(Txid) -> i64,
     ) -> Vec<Transaction> {
         self.graph
-            .select_block_txids_delta(max_weight_wu, delta)
+            .select_block_txids_delta(max_weight_wu, min_sat_kvb, delta)
             .into_iter()
             .filter_map(|id| self.get_tx(&id).cloned())
             .collect()

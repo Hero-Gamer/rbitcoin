@@ -2747,13 +2747,16 @@ impl MempoolHub {
     }
 
     /// Block template / generate selection: mining-order live txs that fit
-    /// in a block (best chunks first). Same helper GBT will use.
-    pub fn select_block_txs(&self) -> Vec<Transaction> {
+    /// in a block (best chunks first), skipping chunks under `min_sat_kvb`
+    /// (`-blockmintxfee`) on modified fee.
+    pub fn select_block_txs(&self, min_sat_kvb: u64) -> Vec<Transaction> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let g = self.lock_read();
-        g.select_block_txs_delta(rbitcoin_mempool::TxGraph::template_tx_weight(), |id| {
-            deltas.get(&id).copied().unwrap_or(0)
-        })
+        g.select_block_txs_delta(
+            rbitcoin_mempool::TxGraph::template_tx_weight(),
+            min_sat_kvb,
+            |id| deltas.get(&id).copied().unwrap_or(0),
+        )
     }
 
     /// Additive `prioritisetransaction` delta (sat). Zero total drops the entry.
