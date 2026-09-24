@@ -319,6 +319,8 @@ pub struct ChainHub {
     finished_ibd: AtomicBool,
     #[cfg(test)]
     block_at_height_calls: AtomicU64,
+    #[cfg(test)]
+    header_contextual_checks: AtomicU64,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -368,6 +370,8 @@ impl ChainHub {
             finished_ibd: AtomicBool::new(false),
             #[cfg(test)]
             block_at_height_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            header_contextual_checks: AtomicU64::new(0),
         }
     }
 
@@ -1317,6 +1321,9 @@ impl ChainHub {
         header: &Header,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<(), NetError> {
+        #[cfg(test)]
+        self.header_contextual_checks
+            .fetch_add(1, Ordering::Relaxed);
         let parent_hash = header.prev_blockhash;
         let parent_bytes = parent_hash.to_byte_array();
         if let Some(ph) = self.query.height_of_hash(&parent_bytes).ok().flatten() {
@@ -2756,6 +2763,11 @@ impl ChainHub {
     #[cfg(test)]
     pub(crate) fn block_at_height_calls(&self) -> u64 {
         self.block_at_height_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_header_contextual_checks(&self) -> u64 {
+        self.header_contextual_checks.swap(0, Ordering::Relaxed)
     }
 
     #[cfg(test)]

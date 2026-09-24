@@ -10608,6 +10608,63 @@ async fn noban_peer_is_not_punished_for_a_bad_header() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Each `headers` message persists the pending path from the last stored
+/// header, not the whole path again. Re-checking stored fork headers walks
+/// their ancestors on every message, so a long fork made each message slower
+/// (`feature_bip68_sequence.py` took 10 s for one message at 244 pending).
+#[test]
+fn persist_pending_path_starts_after_the_last_stored_header() {
+    use bitcoin::ScriptBuf;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("persist-path");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(20, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let fork_at = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(10))
+        .unwrap();
+    let mut pending = HashMap::new();
+    let mut prev = fork_at.block_hash();
+    let mut time = fork_at.time + 1;
+    let mut last = prev;
+    for height in 11..=50u32 {
+        let h = rbitcoin_consensus::mine_regtest_paying(
+            prev,
+            time,
+            height,
+            ScriptBuf::from_bytes(vec![0x52]),
+            vec![],
+        )
+        .header;
+        prev = h.block_hash();
+        last = prev;
+        time += 1;
+        pending.insert(prev, h);
+    }
+    persist_pending_header_path(&hub, &pending, last);
+    assert!(hub.knows_header(&last), "the fork path is stored");
+
+    let next = rbitcoin_consensus::mine_regtest_paying(
+        last,
+        time,
+        51,
+        ScriptBuf::from_bytes(vec![0x52]),
+        vec![],
+    )
+    .header;
+    pending.insert(next.block_hash(), next);
+    let _ = hub.take_header_contextual_checks();
+    persist_pending_header_path(&hub, &pending, next.block_hash());
+    assert!(hub.knows_header(&next.block_hash()));
+    assert_eq!(
+        hub.take_header_contextual_checks(),
+        1,
+        "only the new header is checked, not the stored fork path"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `feature_cltv.py` / `p2p_invalid_block.py`: a block whose header fails
 /// contextual checks still logs Core's reject reason.
 #[tokio::test]

@@ -4213,6 +4213,8 @@ fn announced_headers_height(
 }
 
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
+/// Store the pending headers from `tip` back to the last stored one. Headers
+/// already stored were checked when they were written.
 fn persist_pending_header_path(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
@@ -4224,6 +4226,9 @@ fn persist_pending_header_path(
         let Some(hdr) = pending.get(&h) else {
             break;
         };
+        if header_is_stored(hub, &h) {
+            break;
+        }
         path.push(*hdr);
         h = hdr.prev_blockhash;
         if is_genesis_hash(&h) {
@@ -4236,6 +4241,14 @@ fn persist_pending_header_path(
             break;
         }
     }
+}
+
+fn header_is_stored(hub: &ChainHub, hash: &BlockHash) -> bool {
+    hub.query
+        .get_header_by_hash(&hash.to_byte_array())
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn header_announcement_connects(
