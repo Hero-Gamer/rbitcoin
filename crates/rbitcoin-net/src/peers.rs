@@ -3716,7 +3716,6 @@ mod tests {
         assert_ne!(a, expired);
     }
 
-    #[test]
     fn learn_addrv2_keeps_tor_v3() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
         use std::net::Ipv4Addr;
@@ -3760,7 +3759,6 @@ mod tests {
         assert_eq!(ents.len(), 2);
     }
 
-    #[test]
     fn dial_target_onion_keeps_net_addr_not_unspecified() {
         let onion: crate::NetAddr =
             "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
@@ -3774,7 +3772,6 @@ mod tests {
         assert_eq!(hint.port(), 8333);
     }
 
-    #[test]
     fn learn_addrv2_drops_i2p_until_reachable() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
         use std::net::Ipv4Addr;
@@ -3812,7 +3809,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn learn_addrv2_keeps_i2p() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
@@ -3836,7 +3832,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn learn_addrv2_keeps_i2p_port_zero() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 
@@ -3860,7 +3855,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn dial_target_cjdns_is_native_socket() {
         use std::net::Ipv6Addr;
         let ip = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
@@ -3872,7 +3866,6 @@ mod tests {
         assert_eq!(DialTarget::from_net(addr).net_addr(), addr);
     }
 
-    #[test]
     fn dial_target_onion_and_i2p_roundtrip() {
         let onion: crate::NetAddr =
             "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
@@ -3891,7 +3884,6 @@ mod tests {
         assert_eq!(t.net_addr(), i2p);
     }
 
-    #[test]
     fn learn_addrv2_keeps_cjdns() {
         use bitcoin::p2p::address::{AddrV2, AddrV2Message};
         use std::net::Ipv6Addr;
@@ -3915,7 +3907,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn inbound_fc00_getpeerinfo_network_is_cjdns() {
         use bitcoin::p2p::address::Address;
         use bitcoin::p2p::message_network::VersionMessage;
@@ -3945,7 +3936,6 @@ mod tests {
         assert_eq!(hub.snapshot()[0].net.network_label(), "cjdns");
     }
 
-    #[test]
     fn fc00_not_advertisable_without_cjdns_reachable() {
         use std::net::Ipv6Addr;
         let hub = PeerHub::new();
@@ -3963,7 +3953,6 @@ mod tests {
         assert_eq!(sock.port(), 8333);
     }
 
-    #[test]
     fn getaddr_sample_keeps_overlay_addrs() {
         use std::net::Ipv6Addr;
 
@@ -4004,7 +3993,6 @@ mod tests {
         assert_eq!(v1, 1);
     }
 
-    #[test]
     fn self_announce_cjdns_uses_addrv2_cjdns() {
         use bitcoin::p2p::address::{AddrV2, Address};
         use bitcoin::p2p::message::NetworkMessage;
@@ -4044,5 +4032,21 @@ mod tests {
             }
             other => panic!("expected AddrV2 CJDNS, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn overlay_config() {
+        learn_addrv2_keeps_tor_v3();
+        dial_target_onion_keeps_net_addr_not_unspecified();
+        learn_addrv2_drops_i2p_until_reachable();
+        learn_addrv2_keeps_i2p();
+        learn_addrv2_keeps_i2p_port_zero();
+        dial_target_cjdns_is_native_socket();
+        dial_target_onion_and_i2p_roundtrip();
+        learn_addrv2_keeps_cjdns();
+        inbound_fc00_getpeerinfo_network_is_cjdns();
+        fc00_not_advertisable_without_cjdns_reachable();
+        getaddr_sample_keeps_overlay_addrs();
+        self_announce_cjdns_uses_addrv2_cjdns();
     }
 }

@@ -675,7 +675,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn proxy_conf_and_cli() {
         let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
         let cfg = ready_config(["rbitcoin-node", "--proxy", "127.0.0.1:9050"]);
@@ -743,7 +742,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn onion_only_dialer_does_not_socks_clearnet() {
         let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
         let split = ready_config([
@@ -786,7 +784,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn proxy_randomize_defaults_on() {
         let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
         assert!(NodeConfig::default().listen.proxy_randomize);
@@ -866,7 +863,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn listen_onion_binds_loopback_when_nolisten() {
         let c = ready_config(["rbitcoin-node", "--no-listen", "--listen-onion"]);
         assert!(c.listen.listen_onion);
@@ -881,7 +877,6 @@ mod tests {
         assert!(conf.listen.listen_onion);
     }
 
-    #[test]
     fn listen_onion_refused_when_max_inbound_zero() {
         let c = ready_config([
             "rbitcoin-node",
@@ -900,7 +895,6 @@ mod tests {
         assert!(err.contains("tor-control"), "{err}");
     }
 
-    #[test]
     fn listen_cjdns_addr_parses() {
         let mut c = NodeConfig::default();
         c.apply_kv("listen", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
@@ -921,7 +915,6 @@ mod tests {
         assert!(off.listen.p2p_bind_addr(Network::Regtest).is_none());
     }
 
-    #[test]
     fn connect_onion_and_ipv4() {
         let mut c = NodeConfig::default();
         c.apply_kv("connect", "1.2.3.4:8333").unwrap();
@@ -976,7 +969,6 @@ mod tests {
         assert!(operator_config_from_args(["rbitcoin-node", "--connect", "bad host"]).is_err());
     }
 
-    #[test]
     fn only_net_onion_without_proxy_is_config_error() {
         let mut c = NodeConfig::default();
         c.apply_kv("only_net", "onion").unwrap();
@@ -1039,7 +1031,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn tor_control_cli_defaults() {
         let omitted = ready_config(["rbitcoin-node", "--tor-control"]);
         assert_eq!(omitted.tor.control, Some("127.0.0.1:9051".parse().unwrap()));
@@ -1069,7 +1060,6 @@ mod tests {
         assert!(!h.contains("--torcontrol"));
     }
 
-    #[test]
     fn i2p_sam_cli() {
         let omitted = ready_config(["rbitcoin-node", "--i2p-sam"]);
         assert_eq!(
@@ -1088,7 +1078,6 @@ mod tests {
         assert!(!h.contains("--i2pacceptincoming"));
     }
 
-    #[test]
     fn i2p_accept_incoming_cli() {
         let c = ready_config(["rbitcoin-node", "--i2p-sam", "--i2p-accept-incoming"]);
         assert!(c.listen.i2p_accept_incoming);
@@ -1100,7 +1089,6 @@ mod tests {
         assert!(conf.listen.i2p_accept_incoming);
     }
 
-    #[test]
     fn i2p_accept_incoming_without_listen_is_config_error() {
         let c = ready_config([
             "rbitcoin-node",
@@ -1188,7 +1176,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     fn only_net_i2p_without_sam_is_config_error() {
         let mut c = NodeConfig::default();
         c.apply_kv("only_net", "i2p").unwrap();
@@ -1202,7 +1189,6 @@ mod tests {
         assert_eq!(ok.listen.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
     }
 
-    #[test]
     fn only_net_cjdns_without_reachable_is_config_error() {
         let mut c = NodeConfig::default();
         c.apply_kv("only_net", "cjdns").unwrap();
@@ -1216,7 +1202,6 @@ mod tests {
         ok.validate().unwrap();
     }
 
-    #[test]
     fn cjdns_connect_without_reachable_is_config_error() {
         let mut c = NodeConfig::default();
         c.apply_kv("connect", "[fc00:1:2:3:4:5:6:7]:8333").unwrap();
@@ -1228,6 +1213,25 @@ mod tests {
         assert!(err.contains("cjdns-reachable"), "{err}");
         c.apply_kv("cjdns_reachable", "1").unwrap();
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn overlay_config() {
+        proxy_conf_and_cli();
+        onion_only_dialer_does_not_socks_clearnet();
+        proxy_randomize_defaults_on();
+        listen_onion_binds_loopback_when_nolisten();
+        listen_onion_refused_when_max_inbound_zero();
+        listen_cjdns_addr_parses();
+        connect_onion_and_ipv4();
+        only_net_onion_without_proxy_is_config_error();
+        tor_control_cli_defaults();
+        i2p_sam_cli();
+        i2p_accept_incoming_cli();
+        i2p_accept_incoming_without_listen_is_config_error();
+        only_net_i2p_without_sam_is_config_error();
+        only_net_cjdns_without_reachable_is_config_error();
+        cjdns_connect_without_reachable_is_config_error();
     }
 
     #[test]

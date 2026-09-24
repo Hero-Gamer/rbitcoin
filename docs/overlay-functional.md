@@ -86,7 +86,10 @@ label **`release`**, or ship version. Ship and `release` runs come from
 unless this job is green. Not required on other PRs.
 
 Unlabeled non-ship PRs stay cargo-only ([`TESTING.md`](../TESTING.md)).
-Label harness PRs and ship version-bump PRs. Reproduce locally with `run.sh`
+The job needs a TUN plus Tor, i2pd, and cjdns and is capped at 45 minutes,
+so it does not run beside the Windows and macOS jobs on every pull request.
+The every-PR pin for these flags is `overlay_config` in `rbitcoin-node` and
+`rbitcoin-net`. Label harness PRs and ship version-bump PRs. Reproduce locally with `run.sh`
 until that script passes; do not push-and-wait on the job as the inner loop.
 
 ```bash

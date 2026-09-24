@@ -281,6 +281,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 
 | ID | Layer | Description |
 |----|-------|-------------|
+| `overlay_config` | Node CLI + net | In-process onion / I2P / cjdns matrix: `onlynet`, proxy, SAM, reachable, accept-incoming, and one parse or learn check per network. Live Tor, i2pd, and cjdns stay in overlay-functional. |
 | `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, `run_node`, config errors, CLI flags (incl. `--conf`, `--peer-timeout=0` refuse / `=1` smoke, unknown conf key ignored, `min_relay_tx_fee=-1` and `network=nope` conf fail), dropped Core `--rpcuser`/`--rpcpassword`/`--rpcport`/`--rpcconnect`/`-rpcport` refuse, help/version. Signet: genesis header plus height-1 BIP325 connect |
 | `three_stage_confirm_and_parent_pin_surface` | Consensus+query | Split load→scripts→write of pad+spend from genesis (header-plan BIP68 MTP); parent pin; load ready timeout/cancel; instance-owned `last_write` / `last_pin` / `take_window` meters; same-run create then spend; 546-shaped 2-vout merge + same-block chain + cross-batch head resolve |
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. `DEFAULT_BODY_DEPTH == 16` stays a unit. |

@@ -45,7 +45,7 @@ I2P, CJDNS, Tor control, `--listen-onion`, wallet onions.
 
 - **Contract:** `learn_addrv2` inserts `NetAddr::Onion` for `AddrV2::TorV3`.
   IPv4/IPv6 still insert `Ip`. I2P/CJDNS still ignored (04/08).
-- **Red:** `learn_addrv2_keeps_tor_v3` — feed one TorV3 row; `entries()`
+- **Red:** `overlay_config` (`learn_addrv2_keeps_tor_v3`) — feed one TorV3 row; `entries()`
   contains the onion. Existing IPv4 learn tests still pass.
 - **Green:** rekey AddrMan to `NetAddr`. Update `take_dial_candidates` to
   return `NetAddr`.
@@ -85,7 +85,7 @@ I2P, CJDNS, Tor control, `--listen-onion`, wallet onions.
 
 - **Contract:** `--connect foo.onion:8333` and `seed_node=` store onion
   `NetAddr`. Invalid onion is a start error. Existing `IP:port` still works.
-- **Red:** `cargo test -p rbitcoin-node connect_onion_and_ipv4`.
+- **Red:** `cargo test -p rbitcoin-node overlay_config` (`connect_onion_and_ipv4`).
 - **Green:** `ListenOpts.connect: Vec<NetAddr>` (or parallel onion list —
   prefer one Vec).
 - **Refactor:** delete `Vec<SocketAddr>`-only connect if fully replaced.
@@ -99,7 +99,7 @@ I2P, CJDNS, Tor control, `--listen-onion`, wallet onions.
   `NodeError::Config` naming SOCKS. `--only-net=i2p` / `cjdns` unknown until
   04/08 (error: unknown network).
 - **Red:** `only_net_onion_filters_ipv4_candidates`;
-  `only_net_onion_without_proxy_is_config_error`.
+  `overlay_config` (`only_net_onion_without_proxy_is_config_error`).
 - **Green:** `apply_kv` `only_net=`; filter in AddrMan take + DNS/fixed seed
   inject.
 - **Refactor:** single `OnlyNet` set on listen opts.

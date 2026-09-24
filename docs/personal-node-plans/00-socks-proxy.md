@@ -94,7 +94,7 @@ I2P SAM (04). Ephemeral broadcast policy (06) — only the dial seam.
 - **Contract:** `--proxy HOST:PORT` and conf `proxy=` set the SOCKS endpoint.
   `--onion HOST:PORT` is the SOCKS used for onion (02); until 02, storing the
   socket is enough. Empty/invalid address is a start error. Default: no proxy.
-- **Red:** `cargo test -p rbitcoin-node proxy_conf_and_cli` — parse
+- **Red:** `cargo test -p rbitcoin-node overlay_config` — parse
   `proxy=127.0.0.1:9050`; reject `proxy=`; `--onion` independent field.
 - **Green:** [`ListenOpts`](../../crates/rbitcoin-node/src/config.rs) fields;
   `apply_kv`; kebab CLI. Pass into `run_p2p` / `P2PNode`.
