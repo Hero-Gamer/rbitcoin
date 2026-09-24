@@ -1800,7 +1800,7 @@ fn history_page_closed_needs_a_full_page_past_the_cursor() {
 }
 
 #[test]
-fn milestone_work_extends_only_the_heavier_contiguous_path() {
+fn buried_rules_and_a_lying_header_path() {
     let (dir, q) = temp_query("ms-work");
     assert!(q.milestone_best_work_be().is_none());
     let mut base_be = [0u8; 32];

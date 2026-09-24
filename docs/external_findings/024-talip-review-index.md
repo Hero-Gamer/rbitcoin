@@ -27,7 +27,7 @@ board. Each fixed row names the regression. No reproduction steps.
 | #14 / C17 / #19 | low | Flag parity, token, inv cap | fixed | `peer_command_logs_have_no_raw_newline` ([041](./041-hygiene.md)) |
 | C14 / M-4 | medium | Milestone hash and signet default | fixed | `low_work_fork_does_not_skip_even_at_the_milestone_height` ([042](./042-milestone-anchor.md)) |
 | L-1 / L-3 / L-12 | low | Local auth and datadir mode | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` ([044](./044-local-auth.md)) |
-| L-9 | low | BIP30 after the exception window | fixed | `bip30_signet_rejects_unspent_overwrite_after_bip34` ([035](./035-bip30-bip34-ancestry.md)) |
+| L-9 | low | BIP30 after the exception window | fixed | `buried_rules_and_a_lying_header_path` ([035](./035-bip30-bip34-ancestry.md)) |
 | C16 | low | Regtest BIP34 height | won't-fix | `s7_regtest_does_not_activate_bip34_early` (`bip34_height` stays rust-bitcoin's value, above 1_000_000). Signet is already height 1. Production networks are unaffected. |
 | #03 / #13 / #16 | — | Witness reserved value, RBFR, admin RPC | rejected | not defects |
 

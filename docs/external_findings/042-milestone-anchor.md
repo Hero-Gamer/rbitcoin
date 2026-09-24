@@ -23,5 +23,5 @@ the IBD state lock.
 
 **Regression:** `rbitcoin-consensus` `milestone::tests::low_work_fork_does_not_skip_even_at_the_milestone_height`,
 `block::structure_rule_tests::p3_default_milestone_heights`,
-`block::structure_rule_tests::anchored_milestone_builds_jobs_until_the_header_path_matches`,
+`block::structure_rule_tests::buried_rules_and_a_lying_header_path`,
 `rbitcoin-node` `cli::tests::default_milestone_is_anchored_and_signet_is_full_scripts`.

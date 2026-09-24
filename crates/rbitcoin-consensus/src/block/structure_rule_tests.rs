@@ -404,7 +404,6 @@ fn bip30_rejects_unspent_connected_sibling() {
 
 /// Signet activates BIP34 at height 1. Core's empty BIP34 hash still enforces
 /// BIP30 on every signet block.
-#[test]
 fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
@@ -545,7 +544,6 @@ fn bip30_message_at_mainnet_above_bip34(
 
 /// Mainnet skips BIP30 only when the header at BIP34 height is the real hash.
 /// A wrong ancestor still rejects an unspent overwrite.
-#[test]
 fn bip30_mainnet_skips_only_when_bip34_ancestor_matches() {
     let (path, q, first) = plant_unspent_coinbase("bip30-ancestor-skip");
     let main = ChainParams::mainnet();
@@ -1630,7 +1628,6 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
 
 /// Anchored skip uses the header path. A height match with a different hash
 /// still builds script jobs.
-#[test]
 fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
     use super::assemble_block_prevouts;
     use crate::milestone::MilestoneAnchor;
@@ -1758,6 +1755,13 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
     q.clear_milestone_path_above(0);
     assert_eq!(run(&q).len(), 1, "cleared path checks scripts again");
     let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn buried_rules_and_a_lying_header_path() {
+    bip30_signet_rejects_unspent_overwrite_after_bip34();
+    bip30_mainnet_skips_only_when_bip34_ancestor_matches();
+    anchored_milestone_builds_jobs_until_the_header_path_matches();
 }
 
 /// N1: Optimistic miss is lookup invariant; pin hit / identity / vout still classified.
