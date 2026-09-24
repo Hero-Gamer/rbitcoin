@@ -194,17 +194,7 @@ pub fn validate_block_structure_with_pres(
     }
     // Witness bytes are not in the block hash. Check them before weight so
     // padding cannot be cached as a failed hash.
-    let has_witness_data = block_has_witness_from_pres(pres.as_ref());
-    let has_commitment = coinbase_has_witness_commitment(block);
-    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
-        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
-    }
-    if (has_witness_data || has_commitment)
-        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
-    {
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
-        check_witness_commitment_with_wtxids(block, &non_cb)?;
-    }
+    reject_witness_malleation(block, ctx, pres.as_ref())?;
     if weight_wu > MAX_BLOCK_WEIGHT {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
@@ -260,6 +250,26 @@ pub fn validate_block_structure_with_pres(
     // BIP325 signet solution is not checked here — tip confirm only.
 
     Ok(pres)
+}
+
+/// Witness commitment before weight. Padding is not the block hash's fault.
+fn reject_witness_malleation(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: &[TxPrecompute],
+) -> Result<(), ConsensusError> {
+    let has_witness_data = block_has_witness_from_pres(pres);
+    let has_commitment = coinbase_has_witness_commitment(block);
+    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
+        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
+    }
+    if (has_witness_data || has_commitment)
+        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
+    {
+        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        check_witness_commitment_with_wtxids(block, &non_cb)?;
+    }
+    Ok(())
 }
 
 fn coinbase_has_witness_commitment(block: &Block) -> bool {
