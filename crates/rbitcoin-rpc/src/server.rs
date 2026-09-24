@@ -27,13 +27,10 @@ use tokio::net::TcpListener;
 
 #[cfg(unix)]
 fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
-    extern "C" {
-        fn umask(mask: u32) -> u32;
-    }
-    let prev = unsafe { umask(0o777 & !mode) };
-    let bound = tokio::net::UnixListener::bind(path);
-    unsafe { umask(prev) };
-    bound
+    use std::os::unix::fs::PermissionsExt;
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(listener)
 }
 use tokio::task::JoinHandle;
 
@@ -1489,6 +1486,62 @@ mod tests {
             "Basic must not authorize TCP RPC, got {text}"
         );
         handle.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_unix_socket_does_not_strip_dir_search() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        let old = unsafe { umask(0o022) };
+        let stop = Arc::new(AtomicBool::new(false));
+        let bare = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let stop = Arc::clone(&stop);
+            let bare = Arc::clone(&bare);
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let path = std::env::temp_dir().join(format!(
+                        "rbitcoin-umask-probe-{}-{}",
+                        std::process::id(),
+                        n
+                    ));
+                    n += 1;
+                    if std::fs::create_dir(&path).is_err() {
+                        continue;
+                    }
+                    let mode = std::fs::metadata(&path).map(|m| m.permissions().mode() & 0o111);
+                    let _ = std::fs::remove_dir(&path);
+                    if mode.is_ok_and(|m| m == 0) {
+                        bare.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            })
+        };
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-umask").expect("temp dir");
+        for i in 0..200 {
+            let sock = dir.path().join(format!("s{i}.sock"));
+            let listener = super::bind_unix_mode(&sock, 0o600).expect("bind");
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "socket mode");
+            drop(listener);
+            let _ = std::fs::remove_file(&sock);
+            if bare.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        unsafe { umask(old) };
+        assert!(
+            !bare.load(Ordering::Relaxed),
+            "unix bind changed umask and a temp dir lost search permission"
+        );
     }
 
     #[cfg(not(unix))]
