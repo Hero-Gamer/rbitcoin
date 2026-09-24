@@ -1658,6 +1658,52 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Spend index off must not write or count annotate slots structural already filled.
+#[test]
+fn post_commit_spend_index_off_leaves_slots_unwritten() {
+    use super::post_commit;
+    use crate::block::AnnotateSlots;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::OutputRecord;
+    use std::sync::atomic::Ordering;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x61, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let (fks, _loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![rbitcoin_store::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    let create_fk = fks[0];
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs = rbitcoin_store::spent_abs(off, 0);
+    q.set_spend_index(false);
+    let mut slots = AnnotateSlots::default();
+    slots.push((abs, create_fk, 0, Fk(9), 0), (Fk::NULL, 0, 0));
+    let ann0 = q.confirm_stats().spend_ann_n.load(Ordering::Relaxed);
+    post_commit(&q, &slots).expect("spend index off skips annotate");
+    assert_eq!(q.confirm_stats().spend_ann_n.load(Ordering::Relaxed), ann0);
+    let (_multi, field, _vin) = q.store().txs.get_output_spender_meta(create_fk, 0).unwrap();
+    assert!(
+        field.is_null(),
+        "spend index off must not write spender meta"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Mainnet 496: lookup TipOnly already covers the child; note stamps
 /// `keep_until = started_hi` and intervening writes must not drop loc.
 #[test]
