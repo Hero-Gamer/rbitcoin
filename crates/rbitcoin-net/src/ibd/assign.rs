@@ -1458,34 +1458,6 @@ pub(in crate::ibd) mod tests {
         assert!(st.slots[0].rate.work_started_ms <= t1);
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    fn issue_batch_reserves_four_mib_per_new_hash() {
-        let (dir, _hub) = tmp_hub();
-        let four_mib = 4 * 1024 * 1024;
-        let mut st = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
-        st.intake_queued = 0;
-        st.intake_stop = four_mib;
-        let mut room = 10usize;
-        let mut issued = 0u64;
-        assert!(
-            issue_one(&mut st, 0, h(31), &mut room, &mut issued),
-            "one new hash fits in exactly 4 MiB"
-        );
-        assert!(st.inflight.contains_key(&h(31)));
-
-        let mut tight = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
-        tight.intake_queued = 0;
-        tight.intake_stop = four_mib - 1;
-        let mut room = 10usize;
-        let mut issued = 0u64;
-        assert!(
-            !issue_one(&mut tight, 0, h(32), &mut room, &mut issued),
-            "one byte under 4 MiB cannot reserve a new hash"
-        );
-        assert!(!tight.inflight.contains_key(&h(32)));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     /// Off-path getdata (mainnet 08:16:23: ordered empty, h2h=0, inflight=7)
     /// must not occupy slots; tip+1 and live awaiting-reorg need stay.
     /// Speculative explore-need at an empty remainder is leftover — drop it.
@@ -3146,8 +3118,8 @@ pub(in crate::ibd) mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    fn assign_does_not_issue_when_queue_plus_reserve_exceeds_stop() {
+    #[test]
+    fn hostile_peer_session() {
         let _g = BQ_ASSIGN_STOP_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3156,11 +3128,37 @@ pub(in crate::ibd) mod tests {
             std::env::var_os("RBITCOIN_BLOCK_QUEUE_GB"),
         );
         std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
-        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "1000");
+        std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES");
 
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
+        let four_mib = GETDATA_RESERVE_BYTES;
         let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
+        st.intake_queued = 0;
+        st.intake_stop = four_mib - 1;
+        let mut room = 10usize;
+        let mut issued = 0u64;
+        assert!(
+            !issue_one(&mut st, 0, h(32), &mut room, &mut issued),
+            "one byte under 4 MiB cannot reserve a new hash"
+        );
+        assert!(st.inflight.is_empty());
+
+        st.intake_stop = four_mib;
+        assert!(
+            issue_one(&mut st, 0, h(31), &mut room, &mut issued),
+            "one new hash fits in exactly 4 MiB"
+        );
+        assert!(st.inflight.contains_key(&h(31)));
+        let before = st.inflight.len();
+        assert!(
+            !issue_one(&mut st, 0, h(33), &mut room, &mut issued),
+            "a second hash would pass the 4 MiB stop"
+        );
+        assert_eq!(st.inflight.len(), before);
+        assert!(!st.inflight.contains_key(&h(33)));
+
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", "1000");
         plant_work_path(&mut st, 1, 2);
         let queued = vec![0u8; 1000];
         hub.query
@@ -3171,16 +3169,11 @@ pub(in crate::ibd) mod tests {
         let cfg = IbdConfig::for_test();
         assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
         assert!(
-            st.inflight.is_empty(),
+            !st.inflight.contains_key(&h(1)) && !st.inflight.contains_key(&h(2)),
             "queue already at the stop: no new getdata; inflight={:?}",
             st.inflight.keys().collect::<Vec<_>>()
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
-    #[test]
-    fn hostile_peer_session() {
-        issue_batch_reserves_four_mib_per_new_hash();
-        assign_does_not_issue_when_queue_plus_reserve_exceeds_stop();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

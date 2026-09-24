@@ -3424,23 +3424,6 @@ mod tests {
         }
         panic!("no distinct pow sibling");
     }
-
-    fn zero_prev_with_live_tip_is_not_held() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let tip = hub.tip_hash().unwrap();
-        let mut block = mine(tip, 1_300_000_100, 1);
-        block.header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0u8; 32]);
-        let err = hub.accept_received_block(block).expect_err("zero prev");
-        assert!(
-            err.to_string().contains("non-genesis prev is zero"),
-            "{err}"
-        );
-        assert_eq!(hub.tip_hash(), Some(tip));
-        assert_eq!(hub.held_body_count(), 0);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn hold_body_caps_fifo() {
         let (dir, hub) = tmp_hub();
@@ -3663,38 +3646,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    fn time_too_new_does_not_cache_block_failed() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let now = 1_700_000_000u32;
-        hub.clock.set_mock(i64::from(now));
-        let far = now + 2 * 3600 + 1;
-        let b = mine(gen, far, 1);
-        hub.note_asked_block(b.block_hash());
-        let err = hub
-            .accept_received_block(b.clone())
-            .expect_err("header more than two hours ahead of mock");
-        let msg = match &err {
-            NetError::Consensus(s) => s.as_str(),
-            other => panic!("expected Consensus time-too-new, got {other:?}"),
-        };
-        assert!(
-            msg.contains("time-too-new") || msg.contains("future"),
-            "got {msg}"
-        );
-        assert!(
-            !hub.is_block_invalid(&b.block_hash()),
-            "time-too-new must not cache BLOCK_FAILED; the same block is valid after mocktime"
-        );
-        assert!(
-            !hub.already_have_or_asked_block(&b.block_hash()),
-            "time-too-new must forget asked_blocks so a later getdata can retry"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn generate_to_script_drains_sh_writebehind() {
         use bitcoin::ScriptBuf;
@@ -5592,12 +5543,23 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    fn padded_coinbase_witness_over_weight_is_not_cached_invalid() {
+    #[test]
+    fn hostile_peer_session() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let honest = mine(gen, 1_300_070_000, 1);
+        let tip = hub.tip_hash().unwrap();
+
+        let mut zero = mine(tip, 1_300_000_100, 1);
+        zero.header.prev_blockhash = BlockHash::from_byte_array([0u8; 32]);
+        let err = hub.accept_received_block(zero).expect_err("zero prev");
+        assert!(
+            err.to_string().contains("non-genesis prev is zero"),
+            "{err}"
+        );
+        assert_eq!(hub.tip_hash(), Some(tip));
+        assert_eq!(hub.held_body_count(), 0);
+
+        let honest = mine(tip, 1_300_070_000, 1);
         let mut padded = honest.clone();
         let mut wit = Witness::new();
         wit.push(vec![0u8; 4_000_000]);
@@ -5612,17 +5574,37 @@ mod tests {
             "witness padding must not cache the block hash"
         );
         assert!(matches!(
-            hub.accept_received_block(honest).unwrap(),
+            hub.accept_received_block(honest.clone()).unwrap(),
             AcceptOutcome::Accepted { height: 1 }
         ));
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
-    #[test]
-    fn hostile_peer_session() {
-        zero_prev_with_live_tip_is_not_held();
-        padded_coinbase_witness_over_weight_is_not_cached_invalid();
-        time_too_new_does_not_cache_block_failed();
+        let now = honest.header.time;
+        hub.clock.set_mock(i64::from(now));
+        let far = now + 2 * 3600 + 1;
+        let future = mine(honest.block_hash(), far, 2);
+        hub.note_asked_block(future.block_hash());
+        let err = hub
+            .accept_received_block(future.clone())
+            .expect_err("header more than two hours ahead of mock");
+        let msg = match &err {
+            NetError::Consensus(s) => s.as_str(),
+            other => panic!("expected Consensus time-too-new, got {other:?}"),
+        };
+        assert!(
+            msg.contains("time-too-new") || msg.contains("future"),
+            "got {msg}"
+        );
+        assert!(
+            !hub.is_block_invalid(&future.block_hash()),
+            "time-too-new must not cache BLOCK_FAILED"
+        );
+        assert!(
+            !hub.already_have_or_asked_block(&future.block_hash()),
+            "time-too-new must forget asked_blocks so a later getdata can retry"
+        );
+        assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
