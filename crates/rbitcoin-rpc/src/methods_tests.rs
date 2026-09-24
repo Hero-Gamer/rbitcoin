@@ -1921,7 +1921,6 @@ fn getblock_named_verbose_genesis_and_hex() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn getblock_pruned_minus8() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
@@ -4116,7 +4115,6 @@ fn getblockstats_coinbase_only_and_op_return_match_helper() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn getblockstats_uses_txstat_without_reconstruct() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
@@ -4136,7 +4134,6 @@ fn getblockstats_uses_txstat_without_reconstruct() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn getblockstats_reconstructs_when_txstat_unstamped() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::TxStatRow;
@@ -4167,7 +4164,6 @@ fn getblockstats_reconstructs_when_txstat_unstamped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn getblockstats_coinbase_counts_match_core_and_omits_utxo_sizes() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let genesis = dispatch(&ctx, "getblockstats", vec![json!(0)]).unwrap();
@@ -4208,6 +4204,14 @@ fn getblockstats_coinbase_counts_match_core_and_omits_utxo_sizes() {
     .unwrap();
     assert_eq!(one["utxo_increase_actual"], 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pruned_seqsigwit_life() {
+    getblock_pruned_minus8();
+    getblockstats_coinbase_counts_match_core_and_omits_utxo_sizes();
+    getblockstats_reconstructs_when_txstat_unstamped();
+    getblockstats_uses_txstat_without_reconstruct();
 }
 
 #[test]

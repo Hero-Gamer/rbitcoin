@@ -2795,7 +2795,6 @@ fn reconstruct_archived_contiguous_skips_get_tx_full() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn reconstruct_pruned_returns_pruned_not_corrupt() {
     let (dir, q) = temp_query("reconstruct-pruned");
     let mut prev = Fk::NULL;
@@ -3148,7 +3147,6 @@ fn txstat_row_merges_overflow_via_header_blob() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn reorg_through_pruneheight_refuses() {
     let (dir, q) = temp_query("reorg-pruneheight");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
@@ -3169,7 +3167,6 @@ fn reorg_through_pruneheight_refuses() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_watermark_unlinks_fallen_height() {
     let (dir, q) = temp_query("prune-unlink-fallen");
     q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
@@ -3206,7 +3203,6 @@ fn prune_watermark_unlinks_fallen_height() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_watermark_survives_reopen() {
     let (dir, q) = temp_query("prune-reopen");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
@@ -3221,7 +3217,6 @@ fn prune_watermark_survives_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_ibd_ram_window_keeps_last_288_heights() {
     let (dir, q) = temp_query("prune-ibd-ram-window");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3242,7 +3237,6 @@ fn prune_ibd_ram_window_keeps_last_288_heights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
     let (dir, q) = temp_query("prune-ram-replace");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3274,7 +3268,6 @@ fn prune_ram_window_drops_fks_on_disconnect_and_replace() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_ibd_ram_window_honors_byte_threshold() {
     let (dir, q) = temp_query("prune-ibd-ram-threshold");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3294,7 +3287,6 @@ fn prune_ibd_ram_window_honors_byte_threshold() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
     let (dir, q) = temp_query("prune-ibd-ram-serve");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3335,7 +3327,6 @@ fn prune_ibd_ram_window_serves_recent_and_restart_uses_spill() {
 }
 
 #[cfg(unix)]
-#[test]
 fn spill_symlink_outside_window_is_corrupt() {
     let (dir, q) = temp_query("prune-spill-symlink");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3358,7 +3349,6 @@ fn spill_symlink_outside_window_is_corrupt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_confirm_owns_seqsigwit_records() {
     let (dir, q) = temp_query("prune-own-zero");
     q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
@@ -3403,7 +3393,6 @@ fn prune_confirm_owns_seqsigwit_records() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_ram_threshold_zero_spills_tiny_blocks() {
     let (dir, q) = temp_query("prune-ram-zero");
     q.set_seqsigwit_ram_threshold_bytes(0).unwrap();
@@ -3427,7 +3416,6 @@ fn prune_ram_threshold_zero_spills_tiny_blocks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn enable_prune_after_history_seeds_recent_spill_window() {
     let (dir, q) = temp_query("prune-enable-seed");
     let mut prev = Fk::NULL;
@@ -3450,7 +3438,6 @@ fn enable_prune_after_history_seeds_recent_spill_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn prune_mode_refuses_disable() {
     let (dir, q) = temp_query("prune-disable-refuse");
     q.set_prune_seqsigwit(true).unwrap();
@@ -3458,6 +3445,23 @@ fn prune_mode_refuses_disable() {
     let err = q.set_prune_seqsigwit(false).unwrap_err().to_string();
     assert!(err.contains("refusing to disable prune-seqsigwit"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pruned_seqsigwit_life() {
+    prune_watermark_unlinks_fallen_height();
+    prune_watermark_survives_reopen();
+    prune_ibd_ram_window_keeps_last_288_heights();
+    prune_ram_window_drops_fks_on_disconnect_and_replace();
+    prune_ibd_ram_window_honors_byte_threshold();
+    prune_ibd_ram_window_serves_recent_and_restart_uses_spill();
+    prune_confirm_owns_seqsigwit_records();
+    prune_ram_threshold_zero_spills_tiny_blocks();
+    prune_mode_refuses_disable();
+    enable_prune_after_history_seeds_recent_spill_window();
+    reorg_through_pruneheight_refuses();
+    spill_symlink_outside_window_is_corrupt();
+    reconstruct_pruned_returns_pruned_not_corrupt();
 }
 
 #[test]
