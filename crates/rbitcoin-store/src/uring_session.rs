@@ -1599,6 +1599,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The thread-pool backend is not the Linux default. Drain must still
+    /// finish a pread that is in flight on that backend.
+    #[test]
+    fn drain_all_pool_completes_a_pread() {
+        use std::io::Write;
+        let (path, mut f) = tmp_rw("drain-pool-pread");
+        f.write_all(&[0xABu8; 8]).unwrap();
+        f.sync_all().unwrap();
+        let fd = crate::io_handle::IoHandle::from_file(&f);
+        let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        let mut buf = [0u8; 8];
+        // SAFETY: `buf` lives until `drain_all` on this session.
+        unsafe { session.push_pread(fd, 0, &mut buf, 1) }.unwrap();
+        session.submit().unwrap();
+        session.drain_all().expect("pool drain");
+        assert_eq!(session.in_flight(), 0);
+        assert_eq!(buf[0], 0xAB);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn harvest_reports_cq_overflow() {
         match cq_overflow_result(1) {

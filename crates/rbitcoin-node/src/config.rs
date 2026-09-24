@@ -1,7 +1,7 @@
 use crate::error::NodeError;
 use bitcoin::hex::FromHex;
 use bitcoin::ScriptBuf;
-use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_consensus::{mainnet_milestone_anchor, ChainParams, Milestone};
 use rbitcoin_esplora::EsploraListen;
 use rbitcoin_primitives::{Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT};
 use rbitcoin_store::HeadScale;
@@ -226,7 +226,7 @@ impl std::fmt::Debug for TorControlOpts {
 }
 
 /// JSON-RPC listen and auth.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpcOpts {
     /// TCP bind. Filled from `--rpc-listen` (optional ADDR uses network default port).
     pub listen: Option<SocketAddr>,
@@ -237,6 +237,18 @@ pub struct RpcOpts {
     /// Override `{datadir}/rpc.token`.
     pub token_file: Option<PathBuf>,
     pub work_queue: Option<usize>,
+}
+
+impl Default for RpcOpts {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            listen_default: false,
+            socket: false,
+            token_file: None,
+            work_queue: Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE),
+        }
+    }
 }
 
 /// Node process configuration (CLI + optional conf file).
@@ -355,7 +367,7 @@ impl Default for NodeConfig {
             prune_seqsigwit_ram_threshold_bytes: 256 * 1024 * 1024,
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
-            max_sh_creates: 0,
+            max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
             esplora_block_template: false,
             esplora_onion: true,
             milestone_height: 0,
@@ -450,11 +462,17 @@ impl NodeConfig {
 
     pub fn milestone(&self) -> Milestone {
         if self.milestone_height == 0 {
-            Milestone::NONE
-        } else {
+            return Milestone::NONE;
+        }
+        // Explicit `--milestone HEIGHT` stays height-only. The omitted mainnet
+        // default also requires the block-840000 hash and min chain work.
+        if !self.milestone_explicit && self.network == Network::Mainnet {
             Milestone {
                 height: self.milestone_height,
+                anchor: Some(mainnet_milestone_anchor()),
             }
+        } else {
+            Milestone::height(self.milestone_height)
         }
     }
 
@@ -648,6 +666,25 @@ impl NodeConfig {
         rbitcoin_rpc::default_socket_path(self.datadir.path())
     }
 
+    /// Owner-only mode for a directory this process just created.
+    fn restrict_new_dir(path: &Path) -> Result<(), NodeError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| NodeError::Datadir {
+                    path: path.to_path_buf(),
+                    source,
+                },
+            )?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
     /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
@@ -657,6 +694,9 @@ impl NodeConfig {
             path: self.datadir.path.clone(),
             source,
         })?;
+        if created_root {
+            Self::restrict_new_dir(root)?;
+        }
         if root.exists() && !root.is_dir() {
             return Err(NodeError::Config(format!(
                 "datadir is not a directory: {}",
@@ -679,6 +719,9 @@ impl NodeConfig {
                 path: cold.clone(),
                 source,
             })?;
+            if created_cold {
+                Self::restrict_new_dir(cold)?;
+            }
             let store = cold.join("store");
             std::fs::create_dir_all(&store).map_err(|source| NodeError::Datadir {
                 path: store,
@@ -1143,10 +1186,7 @@ impl NodeConfig {
                 let n: usize = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf rpc_work_queue: {e}")))?;
-                if n == 0 {
-                    return Err(NodeError::Config("conf rpc_work_queue must be >= 1".into()));
-                }
-                self.rpc.work_queue = Some(n);
+                self.rpc.work_queue = if n == 0 { None } else { Some(n) };
             }
             "max_run_secs" => {
                 self.max_run_secs = Some(
@@ -1336,6 +1376,25 @@ mod tests {
     }
 
     #[test]
+    fn rpc_work_queue_defaults_finite_and_zero_is_unlimited() {
+        assert_eq!(
+            NodeConfig::default().rpc.work_queue,
+            Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE)
+        );
+        let mut c = NodeConfig::default();
+        assert_eq!(
+            c.apply_kv("rpc_work_queue", "0").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.rpc.work_queue, None);
+        assert_eq!(
+            c.apply_kv("rpc_work_queue", "4").unwrap(),
+            ConfApply::Applied
+        );
+        assert_eq!(c.rpc.work_queue, Some(4));
+    }
+
+    #[test]
     fn apply_kv_is_the_conf_setter_and_unknown_is_not_error() {
         let mut c = NodeConfig::default();
         assert_eq!(
@@ -1381,7 +1440,7 @@ mod tests {
     #[test]
     fn max_sh_creates_and_esplora_block_template_apply_kv() {
         let mut c = NodeConfig::default();
-        assert_eq!(c.max_sh_creates, 0);
+        assert_eq!(c.max_sh_creates, rbitcoin_query::DEFAULT_MAX_SH_CREATES);
         assert!(!c.esplora_block_template);
         assert_eq!(
             c.apply_kv("max_sh_creates", "100").unwrap(),
@@ -1663,6 +1722,29 @@ mod tests {
         cfg.ensure_datadir().unwrap();
         assert!(dir.join("store").is_dir());
         assert!(dir.join("mempool").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            extern "C" {
+                fn umask(mask: u32) -> u32;
+            }
+            let fresh = dir.join("umask-fresh");
+            let _ = std::fs::remove_dir_all(&fresh);
+            let prev = unsafe { umask(0o022) };
+            let created = NodeConfig::default().with_datadir(&fresh).with_tiny_heads();
+            created.ensure_datadir().unwrap();
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            created.ensure_datadir().unwrap();
+            let kept = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            unsafe { umask(prev) };
+            assert_eq!(mode, 0o700, "new datadir under umask 0022 is {mode:o}");
+            assert_eq!(
+                kept, 0o755,
+                "an existing datadir is not chmodded, got {kept:o}"
+            );
+            let _ = std::fs::remove_dir_all(&fresh);
+        }
         cfg.ensure_datadir().unwrap();
         let cold = dir.join("cold");
         let mut split = NodeConfig::default().with_datadir(&dir);

@@ -768,7 +768,46 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
     };
     script::verify_job_all_inputs(&job).expect("pre-BIP66 high-bit-S DER must verify");
 
+    fn script_flag_msg(r: Result<(), crate::error::ConsensusError>) -> String {
+        match r {
+            Ok(()) => "OK".into(),
+            Err(crate::error::ConsensusError::Script(m)) => {
+                m.split(" txid=").next().unwrap_or(&m).to_string()
+            }
+            Err(e) => e.to_string(),
+        }
+    }
+    fn same(job: &crate::block::ScriptCheckJob) -> (String, String) {
+        let tx: &bitcoin::Transaction = &job.tx;
+        let bare = script_flag_msg(super::verify_bare(job, 0, tx, &job.prevouts[0]));
+        let shipped = script_flag_msg(super::verify_job_all_inputs(job));
+        (shipped, bare)
+    }
+
+    job.low_s = true;
+    let (shipped, bare) = same(&job);
+    assert_eq!(shipped, bare, "LOW_S");
+    assert_ne!(shipped, "OK", "LOW_S must reject this high-S spend");
+    job.low_s = false;
+
+    job.strictenc = true;
+    let (shipped, bare) = same(&job);
+    assert_eq!(shipped, bare, "STRICTENC");
+    assert_ne!(shipped, "OK", "STRICTENC must reject this non-strict DER");
+    job.strictenc = false;
+
+    let mut bad = job.tx.as_ref().clone();
+    let mut ss = bad.input[0].script_sig.to_bytes();
+    ss[10] ^= 0x01;
+    bad.input[0].script_sig = bitcoin::script::ScriptBuf::from_bytes(ss);
+    job.tx = crate::block::JobTx::owned(bad);
+    job.nullfail = true;
+    let (shipped, bare) = same(&job);
+    assert_eq!(shipped, bare, "NULLFAIL");
+    assert!(shipped.contains("NULLFAIL"), "NULLFAIL got {shipped}");
+
     job.bip66_active = true;
+    job.nullfail = false;
     let err = script::verify_job_all_inputs(&job).expect_err("post-BIP66 must reject");
     assert!(
         err.to_string().contains("der"),

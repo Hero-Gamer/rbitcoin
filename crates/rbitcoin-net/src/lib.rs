@@ -43,7 +43,7 @@ pub use ibd::{
     connect_timeout_for, format_tip_perf_sizes, read_platform_rss, rehydrate_block_queue_residue,
     IbdConfig, ProcessRss, TipPerfSizes, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER, DEFAULT_IBD_WINDOW,
 };
-pub use most_work::sum_work;
+pub use most_work::{sum_work, WorkOverflow};
 pub use net_permissions::{
     apply_implicit, parse_whitebind, parse_whitelist, NetPermTable, NetPermissionFlags,
     WhitebindGrant, WhitelistGrant, DEFAULT_WHITELISTFORCERELAY, DEFAULT_WHITELISTRELAY,

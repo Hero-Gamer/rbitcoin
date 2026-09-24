@@ -128,6 +128,7 @@ confirm_window! {
     // lookup / load / scripts / write (isolation pin)
     load_ns,
     script_ns,
+    milestone_gate_ns,
     class_a_ns,
     connect_ns,
     script_jobs,
@@ -168,6 +169,7 @@ confirm_window! {
     spend_ann_ns,
     spend_ann_n,
     spend_ann_pread_skip,
+    spend_durable_ns,
     spend_meta_ns,
     spend_meta_n,
     spend_overlay_skip_n,

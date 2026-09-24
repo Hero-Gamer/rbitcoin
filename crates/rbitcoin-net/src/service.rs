@@ -144,7 +144,7 @@ impl P2PNode {
         dialer: crate::socks::Dialer,
     ) -> Result<Self, NetError> {
         let magic = magic_for_params(&params);
-        let hub = Arc::new(ChainHub::new(query, params, milestone));
+        let hub = ChainHub::into_arc(ChainHub::new(query, params, milestone));
         hub.ensure_genesis()?;
         let cache = hub.cache.clone();
         let query = hub.query.clone();
@@ -805,6 +805,38 @@ mod tests {
         a.await.unwrap();
         b.await.unwrap();
         assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn drop_does_not_pin_and_hub_is_shared() {
+        let _live = live_p2p_lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-p2p-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
+        let node = P2PNode::start(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+        )
+        .await
+        .unwrap();
+        assert!(node.hub.shared_arc().is_some());
+        let t0 = std::time::Instant::now();
+        drop(node);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "dropping the node must abort connect-retry without waiting out the runtime"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

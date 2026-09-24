@@ -32,6 +32,22 @@ fn create_tiny(dir: &Path) -> TxTable {
     TxTable::create_with_head_layout(dir, tiny_layout()).unwrap()
 }
 
+#[test]
+fn flush_clears_pending_sync_on_replay_stems() {
+    let dir = tempfile_dir("flush-pending");
+    let t = create_tiny(&dir);
+    t.txids.append_batch(0, &[[9u8; 32]]).unwrap();
+    t.input.append_unstamped(1).unwrap();
+    assert!(t.txids.pending_sync());
+    assert!(t.txstat.pending_sync());
+    assert!(t.input.pending_sync());
+    t.flush().unwrap();
+    assert!(!t.txids.pending_sync());
+    assert!(!t.txstat.pending_sync());
+    assert!(!t.input.pending_sync());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn rebuild_opts(bits: u32, workers: usize) -> HeadOpenOpts {
     HeadOpenOpts::TINY
         .with_rebuild_seal_bits(bits)
@@ -1060,6 +1076,21 @@ fn decode_prevout_at_skips_script_and_witness() {
     assert_eq!(cfk, Fk(1));
     assert_eq!(vout, 3);
     assert_eq!(used, legacy.len());
+
+    // Script length 4 so the cursor must advance. Subtracting that length
+    // lands inside create_fk on a zero compact size and stops short.
+    let mut rich = vec![input_flags::SEQ_FINAL];
+    rich.extend_from_slice(&1u64.to_le_bytes());
+    rich.push(3);
+    rich.push(4);
+    rich.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+    rich.push(1);
+    rich.push(1);
+    rich.push(0x11);
+    let (cfk, vout, used) = InputRecord::decode_prevout_at(&rich).unwrap();
+    assert_eq!(cfk, Fk(1));
+    assert_eq!(vout, 3);
+    assert_eq!(used, rich.len());
 }
 
 /// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).
@@ -2737,6 +2768,28 @@ fn packed_encode_decode_flags_and_error_arms() {
         InputRecord::decode_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))
     ));
+    // Hostile CompactSize must be Corrupt, not a capacity or add overflow panic.
+    let flags = input_flags::PREV_ON_INPUTS | input_flags::SEQ_FINAL;
+    let mut huge_script = vec![flags];
+    huge_script.push(0xff);
+    huge_script.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        matches!(
+            InputRecord::decode_at(&huge_script),
+            Err(StoreError::Corrupt(_))
+        ),
+        "hostile script length"
+    );
+    let mut huge_wit = vec![flags | input_flags::EMPTY_SCRIPT];
+    huge_wit.push(0xff);
+    huge_wit.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        matches!(
+            InputRecord::decode_at(&huge_wit),
+            Err(StoreError::Corrupt(_))
+        ),
+        "hostile witness count"
+    );
     assert!(matches!(
         InputRecord::decode_prevout_at(&[input_flags::PREV_ON_INPUTS]),
         Err(StoreError::Corrupt(_))

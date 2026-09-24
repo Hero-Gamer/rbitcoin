@@ -79,24 +79,22 @@ impl TorControl {
                 if info.methods.iter().any(|m| m == "SAFECOOKIE") {
                     self.authenticate_safecookie(path).await
                 } else {
-                    self.authenticate_cookie(path).await
+                    Err(NodeError::Init(
+                        "tor control: SAFECOOKIE is not advertised; refusing plain cookie AUTHENTICATE"
+                            .into(),
+                    ))
                 }
             }
         }
-    }
-
-    async fn authenticate_cookie(&mut self, path: &Path) -> Result<String, NodeError> {
-        let bytes = std::fs::read(path)
-            .map_err(|e| NodeError::Init(format!("tor control cookie {}: {e}", path.display())))?;
-        let line = format!("AUTHENTICATE {}", bytes.to_lower_hex_string());
-        self.command(&line).await
     }
 
     async fn authenticate_safecookie(&mut self, path: &Path) -> Result<String, NodeError> {
         let cookie = std::fs::read(path)
             .map_err(|e| NodeError::Init(format!("tor control cookie {}: {e}", path.display())))?;
         if cookie.len() != 32 {
-            return self.authenticate_cookie(path).await;
+            return Err(NodeError::Init(
+                "tor control: SAFECOOKIE cookie must be 32 bytes".into(),
+            ));
         }
         let mut client_nonce = [0u8; 32];
         getrandom::fill(&mut client_nonce).map_err(|e| {
@@ -468,7 +466,7 @@ mod tests {
                     if cookie.is_some() {
                         w.write_all(
                             format!(
-                                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=COOKIE COOKIEFILE=\"{}\"\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
+                                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=SAFECOOKIE COOKIEFILE=\"{}\"\r\n250-VERSION Tor=\"0.4.8.10\"\r\n250 OK\r\n",
                                 DEFAULT_COOKIE_PATH
                             )
                             .as_bytes(),
@@ -603,6 +601,46 @@ mod tests {
         addr
     }
 
+    async fn fake_control_cookie_only(cookie: Vec<u8>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_task = Arc::clone(&log);
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.split();
+            let mut reader = BufReader::new(r);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let line = line.trim_end_matches(['\r', '\n']).to_string();
+                log_task.lock().unwrap().push(line.clone());
+                if line.eq_ignore_ascii_case("PROTOCOLINFO 1") {
+                    w.write_all(
+                        format!(
+                            "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=COOKIE COOKIEFILE=\"{}\"\r\n250 OK\r\n",
+                            DEFAULT_COOKIE_PATH
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                } else if let Some(rest) = line.strip_prefix("AUTHENTICATE ") {
+                    if rest.eq_ignore_ascii_case(&cookie.to_lower_hex_string()) {
+                        w.write_all(b"250 OK\r\n").await.unwrap();
+                    } else {
+                        w.write_all(b"515 Authentication failed\r\n").await.unwrap();
+                    }
+                } else {
+                    w.write_all(b"510 Unrecognized command\r\n").await.unwrap();
+                }
+            }
+        });
+        (addr, log)
+    }
+
     fn tmp_cookie(bytes: &[u8]) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "rbtc-tor-cookie-{}-{}",
@@ -652,7 +690,9 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(
-            msg.contains("515") || msg.contains("Authentication failed"),
+            msg.contains("515")
+                || msg.contains("Authentication failed")
+                || msg.contains("server hash mismatch"),
             "{msg}"
         );
         let _ = std::fs::remove_file(&bad);
@@ -660,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn tor_add_onion_new_persists_key() {
-        let cookie = vec![0x11, 0x22];
+        let cookie = vec![0x11; 32];
         let (addr, _) = fake_control(Some(cookie.clone()), None).await;
         let cookie_path = tmp_cookie(&cookie);
         let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
@@ -687,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn tor_add_onion_reuse_key_same_id() {
-        let cookie = vec![0x33, 0x44];
+        let cookie = vec![0x33; 32];
         let (addr, log) = fake_control(Some(cookie.clone()), None).await;
         let cookie_path = tmp_cookie(&cookie);
         let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
@@ -728,9 +768,9 @@ mod tests {
 
     #[tokio::test]
     async fn tor_control_auth_fail_is_start_error() {
-        let cookie = vec![0xaa];
+        let cookie = vec![0xaa; 32];
         let (addr, _) = fake_control(Some(cookie.clone()), None).await;
-        let bad = tmp_cookie(&[0x00]);
+        let bad = tmp_cookie(&[0x00; 32]);
         let err =
             match TorControl::connect_if_configured(Some(addr), Some(bad.as_path()), None).await {
                 Err(e) => e,
@@ -766,7 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn electrum_hidden_service_add_onion_when_listening() {
-        let cookie = vec![0x55, 0x66];
+        let cookie = vec![0x55; 32];
         let (addr, log) = fake_control(Some(cookie.clone()), None).await;
         let cookie_path = tmp_cookie(&cookie);
         let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
@@ -797,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn esplora_hidden_service_add_onion() {
-        let cookie = vec![0x77, 0x88];
+        let cookie = vec![0x77; 32];
         let (addr, log) = fake_control(Some(cookie.clone()), None).await;
         let cookie_path = tmp_cookie(&cookie);
         let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
@@ -828,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn p2p_add_onion_persists_key() {
-        let cookie = vec![0x11, 0x22];
+        let cookie = vec![0x21; 32];
         let (addr, log) = fake_control(Some(cookie.clone()), None).await;
         let cookie_path = tmp_cookie(&cookie);
         let mut ctl = TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie_path.clone()))
@@ -857,5 +897,43 @@ mod tests {
         assert_eq!(hs2.service_id, FAKE_SID);
         let _ = std::fs::remove_file(&cookie_path);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tor_plain_cookie_is_not_sent_when_safecookie_is_absent() {
+        let cookie = vec![0xab; 32];
+        let (addr, log) = fake_control_cookie_only(cookie.clone()).await;
+        let path = tmp_cookie(&cookie);
+        let err = match TorControl::connect_and_auth(addr, TorAuth::Cookie(path.clone())).await {
+            Err(e) => e,
+            Ok(_) => panic!("COOKIE without SAFECOOKIE must fail closed"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("SAFECOOKIE"), "{msg}");
+        let cmds = log.lock().unwrap().clone();
+        assert!(
+            cmds.iter().all(|c| !c.starts_with("AUTHENTICATE ")),
+            "must not send the raw cookie: {cmds:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn tor_short_cookie_does_not_fall_back_to_raw_hex() {
+        let cookie = vec![0x11, 0x22];
+        let (addr, log) = fake_control(Some(cookie.clone()), None).await;
+        let path = tmp_cookie(&cookie);
+        let err = match TorControl::connect_and_auth(addr, TorAuth::Cookie(path.clone())).await {
+            Err(e) => e,
+            Ok(_) => panic!("a short SAFECOOKIE cookie must fail closed"),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("32 bytes"), "{msg}");
+        let cmds = log.lock().unwrap().clone();
+        assert!(
+            cmds.iter().all(|c| !c.starts_with("AUTHENTICATE ")),
+            "must not send the raw cookie: {cmds:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

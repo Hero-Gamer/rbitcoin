@@ -101,19 +101,32 @@ impl IbdReorgState {
         self.explore_need.retain(|x| *x != h);
     }
 
+    /// Cap on each explore list. Small enough that membership stays a scan.
+    pub(crate) const EXPLORE_CAP: usize = 64;
+
     /// Register hashes (and optional path tip) for exploration densify / apply.
+    ///
+    /// Each list keeps at most [`Self::EXPLORE_CAP`] hashes. A new hash past
+    /// the cap drops the oldest. The two lists are capped independently.
     pub fn register_explore(
         &mut self,
         need: impl IntoIterator<Item = BlockHash>,
         tip: Option<BlockHash>,
     ) {
         for h in need {
-            if !self.explore_need.contains(&h) {
-                self.explore_need.push(h);
+            if self.explore_need.contains(&h) {
+                continue;
             }
+            if self.explore_need.len() >= Self::EXPLORE_CAP {
+                self.explore_need.remove(0);
+            }
+            self.explore_need.push(h);
         }
         if let Some(t) = tip {
             if !self.explore_tips.contains(&t) {
+                if self.explore_tips.len() >= Self::EXPLORE_CAP {
+                    self.explore_tips.remove(0);
+                }
                 self.explore_tips.push(t);
             }
         }
@@ -245,7 +258,7 @@ fn our_work_from_lca(hub: &ChainHub, lca_height: u32) -> Result<bitcoin::Work, N
             our.push(hdr.work());
         }
     }
-    Ok(sum_work(our.into_iter()))
+    sum_work(our.into_iter()).map_err(|_| NetError::Consensus("work overflow".into()))
 }
 
 /// Index of the last hash in the shortest prefix of `path` (oldest-first)
@@ -592,6 +605,7 @@ pub(crate) fn apply_header_rewind(
         );
     }
     st.clear_path_above(lca_h);
+    hub.query.clear_milestone_path_above(lca_h);
     hub.query.set_lookup_taken_hi(Some(lca_h));
     st.headers_done = false;
     let tip = hub.tip_height().zip(hub.tip_hash());
@@ -1160,5 +1174,29 @@ mod tests {
             "accepted miss: heavier fork only at max_ordered while tip+1 is our child"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explore_need_and_tips_stay_capped() {
+        let mut st = IbdReorgState::new();
+        let mut last = BlockHash::from_byte_array([1u8; 32]);
+        for i in 0..80u32 {
+            let mut raw = [0u8; 32];
+            raw[0..4].copy_from_slice(&i.to_le_bytes());
+            last = BlockHash::from_byte_array(raw);
+            st.register_explore([last], Some(last));
+        }
+        assert!(
+            st.explore_need_hashes().len() <= 64,
+            "explore_need grew to {}",
+            st.explore_need_hashes().len()
+        );
+        assert!(
+            st.explore_tips().len() <= 64,
+            "explore_tips grew to {}",
+            st.explore_tips().len()
+        );
+        assert!(st.explore_need_hashes().contains(&last));
+        assert!(st.explore_tips().contains(&last));
     }
 }

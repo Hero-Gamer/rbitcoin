@@ -59,7 +59,8 @@ pub fn verify_tx_scripts_detached_forks(
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_subsidy, check_block_wire,
     is_final_tx, sequence_locks_satisfied, tx_gbt_sigops, tx_sigop_cost, validate_block_structure,
-    witness_commitment_script, ValidationContext,
+    witness_commitment_script, ValidationContext, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT,
+    MIN_TX_WEIGHT,
 };
 pub(crate) use block::{validate_block_structure_hashed, TxPrecompute};
 pub use clock::{with_now, NodeClock};
@@ -69,8 +70,11 @@ pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, C
 pub use header::{
     expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
 };
-pub use milestone::Milestone;
-pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
+pub use milestone::{Milestone, MilestoneAnchor};
+pub use params::{
+    default_milestone_height, genesis_block, mainnet_milestone_anchor, mainnet_min_chain_work_be,
+    ChainParams, Checkpoint,
+};
 pub use policy::PolicyResult;
 pub use regtest_pad::{
     grind_regtest_pow, mine_empty_regtest, mine_regtest_paying, pad_empty_from,
@@ -157,9 +161,10 @@ pub use confirm_run::{
     confirm_bq_resolve_wave_capped, confirm_scripts_phase, confirm_wire_load_from_plan,
     confirm_wire_load_phase, confirm_wire_load_phase_pipelined, confirm_wire_lookup_stamp,
     confirm_wire_run, confirm_wire_run_preverified, confirm_write_phase, drive_script_waves_with,
-    finish_post_commit_hashes, take_wave_items_for_load, ConfirmLoadOutcome, ConfirmScriptOutcome,
-    LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireBlockIn, WireLoadPipeline,
-    BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
+    finish_post_commit_hashes, replay_spend_annotations, take_wave_items_for_load,
+    ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch, PlanStampOutcome, ScriptOkBatch,
+    ScriptPreverified, WireBlockIn, WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS,
+    BQ_RESOLVE_WAVE_MAX_INPUTS,
 };
 
 /// Wake the IBD scripts publisher (`ibd-confirm`) after `scriptq` send or close.
@@ -488,7 +493,7 @@ mod coverage_tests {
     fn regtest_connect_archive_and_confirm_path() {
         let (path, q) = temp_store();
         let params = ChainParams::regtest();
-        let ms = Milestone { height: 1_000_000 };
+        let ms = Milestone::height(1_000_000);
         let genesis = genesis_block(&params);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 
@@ -506,7 +511,7 @@ mod coverage_tests {
     fn assemble_second_block_rejects_stale_nversion() {
         let (path, q) = temp_store();
         let params = ChainParams::regtest();
-        let ms = Milestone { height: 1_000_000 };
+        let ms = Milestone::height(1_000_000);
         let genesis = genesis_block(&params);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 

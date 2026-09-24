@@ -7,12 +7,28 @@ use rbitcoin_primitives::{
 };
 use rbitcoin_query::Query;
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) use chain::{tip_hash_height, wait_timeout_ms};
+pub(crate) use mine::gbt_longpoll_id;
 pub use mine::{gbt_template, submit_received_block};
+
+thread_local! {
+    static HTTP_WAIT_SATISFIED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The HTTP task already waited. The blocking dispatch must not sleep again.
+pub(crate) fn set_http_wait_satisfied(v: bool) {
+    HTTP_WAIT_SATISFIED.with(|c| c.set(v));
+}
+
+pub(crate) fn http_wait_satisfied() -> bool {
+    HTTP_WAIT_SATISFIED.with(|c| c.get())
+}
 
 pub(crate) fn sat_kvb_to_btc(sat_kvb: u64) -> f64 {
     sat_kvb as f64 / 100_000_000.0

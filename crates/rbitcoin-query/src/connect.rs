@@ -780,6 +780,7 @@ impl Query {
         self.note_disconnect_height(height.0);
         let _ = self.on_load_pack();
         self.store.flush_confirmed_only()?;
+        self.store.clamp_spend_durable()?;
         log_disconnect_tip(height.0, &hash, tx_fks.len());
         if let Some(new_tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(new_tip);

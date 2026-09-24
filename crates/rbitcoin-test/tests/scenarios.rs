@@ -815,7 +815,7 @@ fn resume_tx_head_resolves_external_prev() {
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
     let td = TestDatadir::new().unwrap();
-    let ms = Milestone { height: 1_000_000 };
+    let ms = Milestone::height(1_000_000);
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
 

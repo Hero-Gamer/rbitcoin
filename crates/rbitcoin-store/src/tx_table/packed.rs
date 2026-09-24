@@ -222,10 +222,10 @@ impl InputRecord {
         } else {
             let (slen, n) = read_compact_size(&buf[off..])?;
             off += n;
-            let slen = slen as usize;
-            if buf.len() < off + slen {
+            if !u64_span_fits(buf.len(), off, slen) {
                 return Err(StoreError::Corrupt("input script truncated"));
             }
+            let slen = slen as usize;
             let s = buf[off..off + slen].to_vec();
             off += slen;
             s
@@ -235,14 +235,17 @@ impl InputRecord {
         } else {
             let (nw, n) = read_compact_size(&buf[off..])?;
             off += n;
+            if !u64_span_fits(buf.len(), off, nw) {
+                return Err(StoreError::Corrupt("witness item truncated"));
+            }
             let mut witness = Vec::with_capacity(nw as usize);
             for _ in 0..nw {
                 let (ilen, n) = read_compact_size(&buf[off..])?;
                 off += n;
-                let ilen = ilen as usize;
-                if buf.len() < off + ilen {
+                if !u64_span_fits(buf.len(), off, ilen) {
                     return Err(StoreError::Corrupt("witness item truncated"));
                 }
+                let ilen = ilen as usize;
                 witness.push(buf[off..off + ilen].to_vec());
                 off += ilen;
             }
@@ -347,10 +350,10 @@ pub(super) fn xor_script_regions_in_input(
             return;
         };
         off += n;
-        let slen = slen as usize;
-        if off + slen > buf.len() {
+        if !u64_span_fits(buf.len(), off, slen) {
             return;
         }
+        let slen = slen as usize;
         secret.xor_bytes(0, &mut buf[off..off + slen]);
         off += slen;
     }
@@ -359,15 +362,18 @@ pub(super) fn xor_script_regions_in_input(
             return;
         };
         off += n;
+        if !u64_span_fits(buf.len(), off, nw) {
+            return;
+        }
         for wi in 0..nw {
             let Ok((ilen, n)) = read_compact_size(&buf[off..]) else {
                 return;
             };
             off += n;
-            let ilen = ilen as usize;
-            if off + ilen > buf.len() {
+            if !u64_span_fits(buf.len(), off, ilen) {
                 return;
             }
+            let ilen = ilen as usize;
             secret.xor_bytes(
                 u64::from(wi as u32).saturating_add(1) << 16,
                 &mut buf[off..off + ilen],
@@ -427,8 +433,8 @@ pub(super) fn xor_script_kind_v17_payload(
         }
         SCRIPT_KIND_V17_RAW | SCRIPT_KIND_V17_OP_RETURN_PUSH => {
             if let Ok((slen, n)) = read_compact_size(disk) {
-                let slen = slen as usize;
-                if n + slen <= disk.len() {
+                if u64_span_fits(disk.len(), n, slen) {
+                    let slen = slen as usize;
                     secret.xor_bytes(0, &mut disk[n..n + slen]);
                 }
             }
@@ -543,6 +549,14 @@ pub fn spent_record_len(n_out: u32) -> u64 {
 const SPENT_FK_U40_MAX: u64 = (1u64 << 40) - 1;
 const SPENT_VIN_U16_MAX: u32 = (1u32 << 16) - 1;
 
+/// `n` bytes starting at `off` stay inside `buf_len` without wrapping the end.
+fn u64_span_fits(buf_len: usize, off: usize, n: u64) -> bool {
+    match buf_len.checked_sub(off) {
+        Some(rest) => n <= rest as u64,
+        None => false,
+    }
+}
+
 fn check_seqsigwit_flags(flags: u8) -> Result<(), StoreError> {
     if flags & input_flags::RESERVED_HIGH != 0 {
         return Err(StoreError::Corrupt("seqsigwit reserved flags"));
@@ -573,11 +587,10 @@ fn skip_script(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError>
     }
     let (slen, n) = read_compact_size(&buf[*off..])?;
     *off += n;
-    let slen = slen as usize;
-    if buf.len() < *off + slen {
+    if !u64_span_fits(buf.len(), *off, slen) {
         return Err(StoreError::Corrupt("input script truncated"));
     }
-    *off += slen;
+    *off += slen as usize;
     Ok(())
 }
 
@@ -587,6 +600,9 @@ fn skip_witness(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError
     }
     let (nw, n) = read_compact_size(&buf[*off..])?;
     *off += n;
+    if !u64_span_fits(buf.len(), *off, nw) {
+        return Err(StoreError::Corrupt("witness item truncated"));
+    }
     for _ in 0..nw {
         skip_witness_item(buf, off)?;
     }
@@ -596,11 +612,10 @@ fn skip_witness(buf: &[u8], flags: u8, off: &mut usize) -> Result<(), StoreError
 fn skip_witness_item(buf: &[u8], off: &mut usize) -> Result<(), StoreError> {
     let (ilen, n) = read_compact_size(&buf[*off..])?;
     *off += n;
-    let ilen = ilen as usize;
-    if buf.len() < *off + ilen {
+    if !u64_span_fits(buf.len(), *off, ilen) {
         return Err(StoreError::Corrupt("witness item truncated"));
     }
-    *off += ilen;
+    *off += ilen as usize;
     Ok(())
 }
 

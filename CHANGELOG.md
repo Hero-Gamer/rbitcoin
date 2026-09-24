@@ -11,6 +11,121 @@ before 1.0).
 
 ### Fixed
 
+- **Standard sigop cost is enforced before script execution.** A transaction
+  whose sigop cost exceeds 16_000 is `bad-txns-too-many-sigops` and is not
+  handed to the interpreter. An invalid script from a peer adds 10 to that
+  peer's ban score. Consensus block flags are unchanged.
+- **Full-mempool fee floor follows evicted feerate.** While the mempool is
+  at the weight cap the static bump remains, and an evicted chunk raises
+  the floor one sat/kvB above that chunk so the same-rate transaction cannot
+  re-enter. Below the cap the bump decays by half every 12 hours.
+- **Cluster limits are one walk per insert.** A transaction that spends
+  several mempool parents no longer rebuilds the cluster once per input.
+- **Orphan admission when every parked tx is inside a per-peer reserve.**
+  Eviction still prefers orphans outside that reserve, then drops the
+  oldest reserved one so a newer orphan is not refused. Peer weight is
+  kept per announcer. An orphan older than 20 minutes is dropped on the
+  next insert. Non-standard shape (weight, dust, scriptPubKey, annex) is
+  rejected before the tx is parked.
+- **Spend annotations survive a crash after the tip seal.** A missing
+  spent slot is unspent, so open replays annotations above the
+  `spend_durable` marker (a missing file replays from genesis) and only
+  then advances the marker. The write thread `sync_data`s those stems
+  every 8 batches or 30 seconds, not on every Class C barrier. The tip
+  window stays at least 6 blocks and reaches back to the durable-through
+  height. `tip_seal`, `tx.head` meta, and the marker `fsync` their parent
+  directory after rename.
+- **Addr relay no longer goes to every peer.** Each address is sent to
+  one or two neighbors. A peer can relay 1000 addresses, then the bucket
+  refills at a tenth of an address per second.
+
+- **Tor cookie auth is SAFECOOKIE only.** A control port that does not
+  advertise it, or a cookie that is not 32 bytes, does not send the raw
+  cookie. A new datadir is mode `0700` and is not chmodded if it already
+  exists. `rpc.sock` and the Esplora unix socket take their mode at bind.
+  A loopback `--net-permission` does not cover an onion or I2P address.
+
+- **Per-peer send buffer:** each session stops serving the next request
+  once its outbound queue is past 4 MiB (headers, inv, notfound, tx, addr,
+  and block bodies all count). The reader waits until the writer drains.
+  One block reply may still land past the cap. `getaddr` is answered once
+  per connection.
+- **Milestone anchor:** signet’s default milestone is 0, so signet IBD runs
+  every script (slower on purpose). The mainnet default still names height
+  840000, and it skips scripts only when the header path contains block
+  `0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5` at that
+  height, this block is the path hash at its own height, and header-chain
+  work meets Core `nMinimumChainWork`. A low-work fork that only shares a
+  height does not skip. Explicit `--milestone HEIGHT` stays height-only.
+  Omitted mainnet `--min-chain-work` is that same floor.
+- **P2PKH policy flags, RPC token, and inv cap:** `LOW_S`, `STRICTENC`,
+  and `NULLFAIL` on a P2PKH input use the generic interpreter. The RPC
+  token compare does not stop at the first differing byte, and a new
+  token file is created mode 0600. `inv` / `getdata` / `notfound` counts
+  above 50,000 fail decode. Peer command text in a log line cannot
+  insert a raw newline.
+- **Tip-accept lifetime:** the async accept job is `'static` and holds an
+  `Arc` of the hub. Dropping a peer session does not free that hub under
+  the job. Shutdown waits for the lane to go idle before the store flush.
+  Dropping the node still aborts connect-retry.
+- **RPC and Esplora limits:** bearer auth runs before the body is read
+  (401 with no body bytes). The HTTP body cap is `RPC_MAX_HTTP_BODY`
+  (2 MiB, 413 above it). `--rpc-work-queue` defaults to 16 (HTTP 503 when
+  full; **0** unlimited). `waitforblock`, `waitforblockheight`,
+  `waitfornewblock`, and `getblocktemplate` longpoll wait off the blocking
+  pool. Esplora `X-Rbitcoin-Client` is a join key only for a unix socket
+  or with join-header trust; loopback alone is not.
+- **Scripthash join:** the default `--max-sh-creates` is 10000. An unpaged
+  join above that is refused (`scripthash join exceeds --max-sh-creates
+  (default 10000)`). **0** stays unlimited. A history request that names a
+  page is still served and stops expanding creates once the page is full.
+- **Electrum public surface:** silent-payment subscribe logs do not include
+  the scan secret. The API log file is mode 0600. A missing or zero scan
+  start is the last 256 blocks. The historical scan runs off the connection
+  task, a few hundred heights at a time, behind 3 process-wide permits, and
+  only one scan per connection. Outpoint subscriptions use the scripthash
+  subscription cap. Tip restatus of those outpoints runs off the connection
+  task.
+- **BIP30:** enforced unless the header at BIP34 height is that network's
+  BIP34 hash, and always from height 1_983_702. Signet and regtest have no
+  BIP34 hash, so every block is checked. The two mainnet repeats stay
+  exceptions. The txid batch is inside the structural `spent=` timer.
+- **Witness padding:** witness commitment and unexpected-witness checks run
+  before the block weight check. Those two failures are mutations, so the
+  block hash is not cached invalid. A weight failure after a matching
+  commitment may still be cached. One mutation classifier serves connect
+  and both IBD reject paths.
+- **IBD header and body intake:** a headers batch that fails validation
+  does not grow the work path or explore lists (each list is capped at
+  64). An unsolicited or already-queued body is dropped before the
+  payload copy. Assign does not issue getdata when queue bytes plus
+  outstanding hashes at 4 MiB each would pass the assign-stop. A body
+  that was requested is still queued.
+- **Header accept:** a failed `ensure_header` does not hold the body or
+  enter tip accept. A non-genesis block whose previous hash is all zeros
+  is rejected while a tip exists. Work sums report overflow instead of
+  wrapping, and a zero target is not turned into work.
+- **Compact blocks:** a transaction count above the block weight limit
+  divided by the minimum transaction weight is rejected before the slot
+  vector is built. A peer keeps one partial. Another hash from that peer
+  is a full `getdata`, not a second vector and not a ban.
+- **Block decode tx count:** `decode_block_precomputes` rejects a count
+  larger than the remaining payload divided by 10 before it allocates.
+  A one-transaction block still decodes.
+- **Signet solution:** a non-minimal CompactSize is a bad block. A witness
+  count larger than the remaining bytes fails before allocation.
+  PUSHDATA4 is parsed, and non-minimal pushes are re-encoded the way
+  Core writes the modified coinbase.
+- **Tapleaf `0x50` and a false witness program:** a future leaf whose
+  version byte is the annex prefix commits and is not executed. An
+  all-zero or negative-zero witness program fails before anyone-can-spend
+  success, including inside P2SH. Tapscript still runs.
+- **Corrupt store lengths:** a uleb128 payload wider than one bit at
+  shift 63 is overflow. A seqsigwit script or witness length that does
+  not fit the buffer is `Corrupt`, not a capacity panic. A BDZ file with
+  a zero modulus or zero vertex count is `Corrupt` instead of a divide
+  by zero. Truncating a sealed mmap after it is mapped is fatal external
+  corruption.
 - **CI quick checks share one runner.** Job `qc` runs fmt, ast-grep,
   deny, the script self-tests, clippy, then nixos-module-eval. `test`,
   `windows`, and `macos` stay on their own runners. Coverage and mutants

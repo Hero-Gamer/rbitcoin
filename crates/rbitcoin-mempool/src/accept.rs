@@ -109,6 +109,49 @@ pub const INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB: u64 =
 /// Pure replace-by-fee-rate ratio (Libre Relay v27.1+): **1.25×** = 5/4.
 pub const RBFR_RATIO_NUM: u64 = 5;
 pub const RBFR_RATIO_DEN: u64 = 4;
+/// Half-life of the eviction feerate bump once the mempool is no longer full.
+pub const ROLLING_FEE_HALFLIFE_MS: u64 = 12 * 60 * 60 * 1000;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Eviction bump decays by half toward `min_relay` once per halflife.
+pub(crate) fn decayed_relay_floor(rolling: u64, min_relay: u64, elapsed_ms: u64) -> u64 {
+    let rolling = rolling.max(min_relay);
+    if elapsed_ms < ROLLING_FEE_HALFLIFE_MS {
+        return rolling;
+    }
+    let steps = elapsed_ms / ROLLING_FEE_HALFLIFE_MS;
+    let excess = rolling.saturating_sub(min_relay);
+    let excess = if steps >= 63 { 0 } else { excess >> steps };
+    min_relay.saturating_add(excess)
+}
+
+/// Min fee while full keeps the static bump and any evicted-rate floor.
+/// Below the cap the evicted-rate floor decays.
+pub(crate) fn relay_floor(
+    min_relay: u64,
+    rolling: u64,
+    updated_ms: u64,
+    now_ms: u64,
+    near_full: bool,
+) -> u64 {
+    let bumped = if near_full {
+        min_relay.saturating_add(INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB)
+    } else {
+        min_relay
+    };
+    let rolling_now = if near_full {
+        rolling.max(min_relay)
+    } else {
+        decayed_relay_floor(rolling, min_relay, now_ms.saturating_sub(updated_ms))
+    };
+    bumped.max(rolling_now)
+}
 
 /// Outcome of a successful accept.
 #[derive(Debug, Clone)]
@@ -296,6 +339,9 @@ fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), Accep
     if prevouts.len() != tx.input.len() {
         return Err(AcceptError::Script("prevout count mismatch".into()));
     }
+    if policy::exceeds_standard_sigops(tx, &prevouts) {
+        return Err(AcceptError::Policy("bad-txns-too-many-sigops"));
+    }
     rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx.clone())
         .map_err(|e| AcceptError::Script(e.to_string()))
 }
@@ -355,6 +401,10 @@ pub struct ActiveMempool {
     cluster_size_kvb_overlay: Option<u32>,
     /// Core `-minrelaytxfee` in sat/kvB (default Libre 100).
     min_relay_sat_kvb: u64,
+    /// Highest evicted chunk feerate (sat/kvB). Decays toward min relay when not full.
+    rolling_min_sat_kvb: u64,
+    /// Unix ms when `rolling_min_sat_kvb` was last raised or decayed.
+    rolling_updated_ms: u64,
     /// Txids recently rejected as invalid (not policy-reconsiderable).
     recent_invalid: HashSet<Txid>,
     /// Recent rejects / RBF replacements for compact fill and 1p1c.
@@ -417,6 +467,8 @@ impl ActiveMempool {
             cluster_count_overlay: None,
             cluster_size_kvb_overlay: None,
             min_relay_sat_kvb: rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+            rolling_min_sat_kvb: rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+            rolling_updated_ms: unix_ms(),
             recent_invalid: HashSet::new(),
             extra_compact: VecDeque::new(),
         })
@@ -427,17 +479,31 @@ impl ActiveMempool {
     }
 
     pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
-        let min_r = self.min_relay_sat_kvb;
-        if self
+        let near_full = self
             .graph
             .total_weight()
             .saturating_add(policy::MAX_STANDARD_TX_WEIGHT)
-            > self.max_weight
-        {
-            min_r.saturating_add(policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB)
-        } else {
-            min_r
-        }
+            > self.max_weight;
+        relay_floor(
+            self.min_relay_sat_kvb,
+            self.rolling_min_sat_kvb,
+            self.rolling_updated_ms,
+            unix_ms(),
+            near_full,
+        )
+    }
+
+    fn note_evicted_feerate(&mut self, rate_sat_kvb: u64) {
+        let now = unix_ms();
+        let decayed = decayed_relay_floor(
+            self.rolling_min_sat_kvb,
+            self.min_relay_sat_kvb,
+            now.saturating_sub(self.rolling_updated_ms),
+        );
+        // One sat/kvB above the evicted chunk so that same-rate tx cannot re-enter.
+        let raised = rate_sat_kvb.saturating_add(1);
+        self.rolling_min_sat_kvb = decayed.max(raised);
+        self.rolling_updated_ms = now;
     }
 
     pub fn generation(&self) -> u64 {
@@ -720,6 +786,10 @@ impl ActiveMempool {
                 return Err(AcceptError::MissingPrevout(op));
             }
             if report_orphans {
+                match policy::check_libre_shape(tx, tx.weight().to_wu()) {
+                    policy::PolicyResult::Standard => {}
+                    policy::PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
+                }
                 return Err(AcceptError::Orphaned {
                     txid,
                     missing: missing_parents,
@@ -883,21 +953,6 @@ impl ActiveMempool {
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
-        if let Some(c) = self.graph.cluster_of(&txid) {
-            if c.members.len() > self.graph.cluster_count_limit()
-                || c.total_weight.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
-            {
-                self.graph.remove(&txid, tx);
-                self.bodies.remove(&txid);
-                self.vin_aux.remove(&txid);
-                let _ = self.store.mark_slot_dead(slot);
-                return Err(AcceptError::ClusterTooLarge {
-                    count: c.members.len(),
-                    weight: c.total_weight,
-                });
-            }
-        }
-
         self.evict_to_budget(Some(txid))?;
 
         Ok(AcceptResult {
@@ -987,24 +1042,15 @@ impl ActiveMempool {
             .into_iter()
             .filter(|p| !conflict_set.contains(p))
             .collect();
-
-        let mut members = BTreeSet::new();
-        for p in &parent_txids {
-            if let Some(c) = self.graph.cluster_of(p) {
-                members.extend(c.members);
-            }
-        }
-        members.retain(|m| !conflict_set.contains(m));
-        let base_w: u64 = members
-            .iter()
-            .filter_map(|t| self.graph.get(t).map(|e| e.weight))
-            .sum();
+        let (n_members, base_w) = self
+            .graph
+            .connected_weight_except(&parent_txids, &conflict_set);
         let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
-        if members.len() + 1 > self.graph.cluster_count_limit()
+        if n_members + 1 > self.graph.cluster_count_limit()
             || combined_vsize > self.graph.cluster_vsize_limit()
         {
             return Err(AcceptError::ClusterTooLarge {
-                count: members.len() + 1,
+                count: n_members + 1,
                 weight: base_w.saturating_add(weight),
             });
         }
@@ -1106,6 +1152,8 @@ impl ActiveMempool {
         if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
             return Ok(0);
         }
+        let evicted_rate = chunk.fee_rate_sat_per_kvb();
+        self.note_evicted_feerate(evicted_rate);
         let mut removed = 0usize;
         for t in &chunk.txids {
             if protect == Some(*t) {
@@ -2052,6 +2100,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn relay_floor_decays_when_not_full_and_holds_while_full() {
+        assert_eq!(decayed_relay_floor(5_000, 100, 0), 5_000);
+        assert_eq!(
+            decayed_relay_floor(5_000, 100, ROLLING_FEE_HALFLIFE_MS),
+            100 + ((5_000 - 100) >> 1)
+        );
+        assert_eq!(
+            relay_floor(100, 5_000, 0, ROLLING_FEE_HALFLIFE_MS, true),
+            5_000
+        );
+        assert_eq!(
+            relay_floor(100, 5_000, 0, ROLLING_FEE_HALFLIFE_MS, false),
+            100 + ((5_000 - 100) >> 1)
+        );
+        assert_eq!(
+            decayed_relay_floor(5_000, 100, 2 * ROLLING_FEE_HALFLIFE_MS),
+            100 + ((5_000 - 100) >> 2)
+        );
+        assert_eq!(
+            decayed_relay_floor(u64::MAX, 100, 63 * ROLLING_FEE_HALFLIFE_MS),
+            100
+        );
+        assert_eq!(ROLLING_FEE_HALFLIFE_MS, 43_200_000);
+        assert!(unix_ms() > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn min_fee_decays_when_one_more_standard_tx_would_exactly_fill() {
+        let dir = tmp_dir();
+        let mut mp =
+            ActiveMempool::open_or_create_with_limit(&dir, policy::MAX_STANDARD_TX_WEIGHT).unwrap();
+        mp.rolling_min_sat_kvb = 5_000;
+        mp.rolling_updated_ms = 0;
+        mp.min_relay_sat_kvb = 100;
+        assert_eq!(mp.mempool_min_fee_sat_kvb(), 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(10_000_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(Some(2), None);
+        let tx1 = spend_tx(op, 9_000_000);
+        mp.accept_tx(&tx1, &utxos, TIP_OK).unwrap();
+        let tx2 = spend_tx(
+            OutPoint {
+                txid: tx1.compute_txid(),
+                vout: 0,
+            },
+            8_000_000,
+        );
+        mp.accept_tx(&tx2, &utxos, TIP_OK).unwrap();
+        let tx3 = spend_tx(
+            OutPoint {
+                txid: tx2.compute_txid(),
+                vout: 0,
+            },
+            7_000_000,
+        );
+        let err = mp.accept_tx(&tx3, &utxos, TIP_OK).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { count: 3, .. }),
+            "{err}"
+        );
+
+        let dir2 = tmp_dir();
+        let (op2, _, utxos2) = chain_utxo(10_000_000);
+        let mut mp2 = ActiveMempool::open_or_create(&dir2).unwrap();
+        mp2.set_cluster_limits(Some(50), Some(1));
+        let mut wide = spend_tx(op2, 9_000_000);
+        wide.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = mp2.accept_tx(&wide, &utxos2, TIP_OK).unwrap_err();
+        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn evicted_feerate_raises_the_floor_above_the_static_bump() {
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 800).unwrap();
+        let before = mp.mempool_min_fee_sat_kvb();
+        assert!(before > policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB);
+        for i in 0u8..8 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i.wrapping_add(1); 32]),
+                vout: 0,
+            };
+            let mut map = HashMap::new();
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+            let utxos = MapUtxoProvider { map };
+            let out = 99_000u64 - u64::from(i) * 100;
+            mp.accept_tx(&spend_tx(op, out), &utxos, TIP_OK)
+                .unwrap_or_else(|e| panic!("i={i}: {e}"));
+        }
+        let after = mp.mempool_min_fee_sat_kvb();
+        assert!(
+            after > before,
+            "eviction must raise the floor above the static bump ({before} -> {after})"
+        );
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xee; 32]),
+            vout: 0,
+        };
+        let probe = spend_tx(op, 99_000);
+        let vsize = policy::get_virtual_size(probe.weight().to_wu());
+        let fee = vsize.saturating_mul(before).div_ceil(1_000);
+        let tx = spend_tx(op, 100_000 - fee);
+        let mut map = HashMap::new();
+        map.insert(
+            op,
+            coin(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }),
+        );
+        let err = mp
+            .accept_tx(&tx, &MapUtxoProvider { map }, TIP_OK)
+            .expect_err("same static-bump rate must not re-enter");
+        assert!(
+            matches!(
+                err,
+                AcceptError::Policy("mempool min fee") | AcceptError::Policy("min relay fee")
+            ),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_parent_insert_builds_the_cluster_once() {
+        let dir = tmp_dir();
+        let mut map = HashMap::new();
+        let mut parents = Vec::new();
+        for i in 1u8..=2 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i; 32]),
+                vout: 0,
+            };
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+            parents.push(spend_tx(op, 90_000));
+        }
+        let utxos = MapUtxoProvider { map };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        for p in &parents {
+            mp.accept_tx(p, &utxos, TIP_OK).unwrap();
+        }
+        let _ = mp.graph.take_cluster_builds();
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: parents
+                .iter()
+                .map(|p| TxIn {
+                    previous_output: OutPoint {
+                        txid: p.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        mp.accept_tx(&child, &utxos, TIP_OK)
+            .expect("two-parent child");
+        assert_eq!(
+            mp.graph.take_cluster_builds(),
+            1,
+            "insert linearizes the cluster once, not once per input"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn too_many_sigops_rejected_before_script() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        // 4001 legacy CHECKSIG × witness scale 4 = 16004, over the 16000 standard cap.
+        // The input spends OP_TRUE, so the interpreter would accept this tx.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
+            }],
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp
+            .accept_tx(&tx, &utxos, TIP_OK)
+            .expect_err("standard sigop cap");
+        assert!(
+            matches!(err, AcceptError::Policy("bad-txns-too-many-sigops")),
+            "sigops must fail before the interpreter, got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn spend_tx(op: OutPoint, out_value: u64) -> Transaction {
         Transaction {
             version: Version::TWO,
@@ -2262,7 +2534,10 @@ mod tests {
         let remain = 10_000_000u64 - (MAX_CLUSTER_COUNT as u64 + 1) * 1_000;
         let extra = spend_tx(prev_op, remain);
         let err = mp.accept_tx(&extra, &utxos, TIP_OK).unwrap_err();
-        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { count, .. } if count == MAX_CLUSTER_COUNT + 1),
+            "{err}"
+        );
         assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
         let _ = std::fs::remove_dir_all(&dir);
     }

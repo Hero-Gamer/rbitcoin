@@ -279,6 +279,10 @@ pub struct Store {
     height_fence: std::sync::RwLock<HeightFence>,
     /// BIP113 window at the fence tip (extend O(1); pop rebuilds).
     mtp_ring: std::sync::RwLock<MtpRing>,
+    /// Confirm batches since the last spend/body `sync_data`.
+    spend_batches: std::sync::atomic::AtomicU32,
+    /// Unix ms of that sync. The interval starts at process open.
+    spend_synced_ms: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
@@ -366,6 +370,8 @@ impl Store {
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
+            spend_batches: std::sync::atomic::AtomicU32::new(0),
+            spend_synced_ms: std::sync::atomic::AtomicU64::new(crate::spend_durable::unix_ms()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -427,6 +433,8 @@ impl Store {
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
+            spend_batches: std::sync::atomic::AtomicU32::new(0),
+            spend_synced_ms: std::sync::atomic::AtomicU64::new(crate::spend_durable::unix_ms()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -1555,6 +1563,57 @@ impl Store {
     ///
     /// After confirmed is durable, publish soft [`crate::TIP_SEAL_NAME`] so open
     /// can clamp an incomplete extension that never finished this barrier.
+    /// Height whose spend annotations were `sync_data`'d. Missing means none.
+    pub fn spend_annotated_through(&self) -> Result<Option<u32>, StoreError> {
+        Ok(crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.annotated_through()))
+    }
+
+    /// `sync_data` the stems replay and the tip window read, then publish the marker at `tip`.
+    pub fn sync_spend_durable(&self, tip: u32) -> Result<u64, StoreError> {
+        use std::sync::atomic::Ordering;
+        let t = std::time::Instant::now();
+        let tip = match self.confirmed.tip_height() {
+            Some(h) => tip.min(h.0),
+            None => 0,
+        };
+        self.txs.sync_replay_bodies()?;
+        self.spenders.flush()?;
+        crate::spend_durable::SpendDurable::new(tip, tip).store(self.path())?;
+        self.spend_batches.store(0, Ordering::Release);
+        self.spend_synced_ms
+            .store(crate::spend_durable::unix_ms(), Ordering::Release);
+        Ok(t.elapsed().as_nanos() as u64)
+    }
+
+    /// Count one confirm batch. Returns sync nanoseconds, or 0 when the period has not elapsed.
+    pub fn note_spend_durable_batch(&self, tip: u32) -> Result<u64, StoreError> {
+        use std::sync::atomic::Ordering;
+        let n = self
+            .spend_batches
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let now = crate::spend_durable::unix_ms();
+        let at = self.spend_synced_ms.load(Ordering::Acquire);
+        if !crate::spend_durable::spend_sync_due(n, now.saturating_sub(at)) {
+            return Ok(0);
+        }
+        self.sync_spend_durable(tip)
+    }
+
+    /// A disconnect below the marker lowers both heights to the new tip.
+    pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
+        let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
+            return Ok(());
+        };
+        let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+        let annotated = marker.annotated_through().min(tip);
+        let durable = marker.durable_through().min(tip);
+        if annotated == marker.annotated_through() && durable == marker.durable_through() {
+            return Ok(());
+        }
+        crate::spend_durable::SpendDurable::new(annotated, durable).store(self.path())
+    }
+
     pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
         self.flush_class_c_pre_tip()?;
         // Commit point on disk: tip advance only after strong/header_txs.

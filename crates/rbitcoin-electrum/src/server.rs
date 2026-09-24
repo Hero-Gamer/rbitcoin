@@ -346,6 +346,8 @@ struct ElectrumConn {
     sh_join: Option<Arc<ShJoinSlot>>,
     outpoint_subs: HashSet<([u8; 32], u32)>,
     sp_sub: Option<crate::silent_scan::SpSub>,
+    /// One historical silent-payment scan at a time on this connection.
+    sp_scan_busy: bool,
 }
 
 impl ElectrumConn {
@@ -357,6 +359,7 @@ impl ElectrumConn {
             sh_join: None,
             outpoint_subs: HashSet::new(),
             sp_sub: None,
+            sp_scan_busy: false,
         }
     }
 }
@@ -414,7 +417,7 @@ where
                             emit_outpoint_notes(
                                 &mut writer,
                                 &query,
-                                mempool.as_deref(),
+                                mempool.clone(),
                                 &conn.outpoint_subs,
                             )
                             .await?;
@@ -617,6 +620,7 @@ where
                         sh_join: conn.sh_join.take(),
                         outpoint_subs: conn.outpoint_subs.clone(),
                         sp_sub: conn.sp_sub.clone(),
+                        sp_scan_busy: conn.sp_scan_busy,
                     };
                     let stamp = method_stamps_chain_tip(&method_owned);
                     match tokio::task::spawn_blocking(move || {
@@ -745,19 +749,28 @@ where
             return Ok(());
         }
     };
+    if conn.sp_scan_busy {
+        write_line(
+            writer,
+            &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": "silent payment scan already running"}}),
+        )
+        .await?;
+        return Ok(());
+    }
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
         "electrum",
         &peer.to_string(),
         "blockchain.silentpayments.subscribe",
-        &serde_json::to_string(params_v).unwrap_or_else(|_| "[]".into()),
+        &redact_sp_params(params_v),
         0,
         None,
     );
     write_line(writer, &rpc_result(&id, &result, None)).await?;
+    conn.sp_scan_busy = true;
     let last = tip.unwrap_or(sub.start);
-    let hits =
-        crate::silent_scan::scan_hits(query, chain, &sub, sub.start, last).unwrap_or_default();
+    let hits = scan_sp_off_connection(query, chain, &sub, last).await;
+    conn.sp_scan_busy = false;
     let note = json!({
         "jsonrpc": "2.0",
         "method": "blockchain.silentpayments.subscribe",
@@ -815,15 +828,26 @@ async fn emit_sp_tip<W: AsyncWrite + Unpin>(
 
 async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    query: &Query,
-    mempool: Option<&MempoolHub>,
+    query: &Arc<Query>,
+    mempool: Option<Arc<MempoolHub>>,
     subs: &HashSet<([u8; 32], u32)>,
 ) -> Result<(), std::io::Error> {
-    for &(txid, vout) in subs {
-        let params = json!([txid_hex(&txid), vout]);
-        let Ok(status) = outpoint_status(query, mempool, &params) else {
-            continue;
-        };
+    let keys: Vec<([u8; 32], u32)> = subs.iter().copied().collect();
+    let q = Arc::clone(query);
+    let looked = tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        let mut out = Vec::with_capacity(keys.len());
+        for (txid, vout) in keys {
+            let params = json!([txid_hex(&txid), vout]);
+            if let Ok(status) = outpoint_status(&q, mempool.as_deref(), &params) {
+                out.push((txid, vout, status));
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default();
+    for (txid, vout, status) in looked {
         let note = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.outpoint.subscribe",
@@ -832,6 +856,64 @@ async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
         write_line(writer, &note).await?;
     }
     Ok(())
+}
+
+fn redact_sp_params(params: &Value) -> String {
+    let mut v = params.clone();
+    if let Some(arr) = v.as_array_mut() {
+        if !arr.is_empty() {
+            arr[0] = json!("<redacted>");
+        }
+    }
+    serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
+}
+
+fn sp_scan_ranges(start: u32, last: u32) -> Vec<(u32, u32)> {
+    use crate::silent_scan::SP_SCAN_CHUNK;
+    if start > last {
+        return Vec::new();
+    }
+    let mut from = start;
+    let mut ranges = Vec::new();
+    loop {
+        let end = from
+            .saturating_add(SP_SCAN_CHUNK.saturating_sub(1))
+            .min(last);
+        ranges.push((from, end));
+        if end == last {
+            break;
+        }
+        from = end.saturating_add(1);
+    }
+    ranges
+}
+
+async fn scan_sp_off_connection(
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    sub: &crate::silent_scan::SpSub,
+    last: u32,
+) -> Vec<Value> {
+    use crate::silent_scan::SP_SCAN_PERMITS;
+    static PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SP_SCAN_PERMITS);
+    let mut hits = Vec::new();
+    for (from, end) in sp_scan_ranges(sub.start, last) {
+        let Ok(permit) = PERMITS.acquire().await else {
+            break;
+        };
+        let q = Arc::clone(query);
+        let c = Arc::clone(chain);
+        let piece = sub.clone();
+        let chunk = tokio::task::spawn_blocking(move || {
+            let _g = BlockingRegion::enter();
+            crate::silent_scan::scan_hits(&q, &c, &piece, from, end).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+        drop(permit);
+        hits.extend(chunk);
+    }
+    hits
 }
 
 #[allow(clippy::too_many_arguments)] // matches handle_client call-site
@@ -1377,6 +1459,7 @@ fn dispatch(
         sh_join: None,
         outpoint_subs: HashSet::new(),
         sp_sub: None,
+        sp_scan_busy: false,
     };
     let r = dispatch_with_join(method, params, query, config, chain, mempool, &mut conn);
     *header_sub = conn.header_sub;
@@ -1831,7 +1914,12 @@ fn dispatch_pinned(
         "blockchain.outpoint.get_status" => outpoint_status(query, mempool, params),
         "blockchain.outpoint.subscribe" => {
             let (txid, vout) = param_outpoint(params)?;
-            conn.outpoint_subs.insert((txid, vout));
+            admit_outpoint_sub(
+                &mut conn.outpoint_subs,
+                txid,
+                vout,
+                config.max_scripthash_subs,
+            )?;
             outpoint_status(query, mempool, params)
         }
         "blockchain.outpoint.unsubscribe" => {
@@ -1947,6 +2035,20 @@ fn protocol_ge_1_6(protocol: &str) -> bool {
         Some(v) => v.first() == Some(&1) && v.get(1).copied().unwrap_or(0) >= 6,
         None => false,
     }
+}
+
+fn admit_outpoint_sub(
+    subs: &mut HashSet<([u8; 32], u32)>,
+    txid: [u8; 32],
+    vout: u32,
+    cap: usize,
+) -> Result<(), String> {
+    let key = (txid, vout);
+    if !subs.contains(&key) && subs.len() >= cap {
+        return Err(format!("too many outpoint subscriptions (max {cap})"));
+    }
+    subs.insert(key);
+    Ok(())
 }
 
 fn param_outpoint(params: &Value) -> Result<([u8; 32], u32), String> {
@@ -2370,6 +2472,31 @@ fn scripthash_status_full_slot(
 pub fn electrum_scripthash_hex(script: &[u8]) -> String {
     let h = script_hash(script);
     hash_hex_rev(&h)
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+
+    #[test]
+    fn outpoint_subs_stop_at_the_scripthash_cap() {
+        let mut subs = HashSet::new();
+        assert!(admit_outpoint_sub(&mut subs, [1; 32], 0, 2).is_ok());
+        assert!(admit_outpoint_sub(&mut subs, [2; 32], 0, 2).is_ok());
+        assert!(admit_outpoint_sub(&mut subs, [1; 32], 0, 2).is_ok());
+        let err = admit_outpoint_sub(&mut subs, [3; 32], 0, 2).unwrap_err();
+        assert!(err.contains("max 2"), "{err}");
+        assert!(subs.remove(&([1; 32], 0)));
+        assert!(admit_outpoint_sub(&mut subs, [3; 32], 0, 2).is_ok());
+    }
+
+    #[test]
+    fn silent_payment_log_drops_the_scan_secret() {
+        let secret = "ab".repeat(32);
+        let line = redact_sp_params(&json!([secret, "02ff", 1]));
+        assert!(!line.contains(&secret), "{line}");
+        assert!(line.contains("<redacted>"), "{line}");
+    }
 }
 
 #[cfg(test)]

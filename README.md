@@ -16,8 +16,12 @@ consensus/script** path.
 > the datadir and redo IBD.
 > **Not 1.0:** schema can still refuse a named wipe ([`SCHEMA.md`](./SCHEMA.md),
 > [`OPERATOR.md`](./OPERATOR.md));
-> default mainnet **`--milestone 840000` skips historical script/sig checks**
-> (`--milestone 0` is full scripts); Electrum/Esplora need **`--sh-index`**
+> default mainnet **`--milestone` is block 840000**
+> (`0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`):
+> script/sig checks skip only on that header path once chain work meets
+> the minimum (`--milestone 0` is full scripts; an explicit height is
+> height-only). Signet’s default milestone is **0** (every script).
+> Electrum/Esplora need **`--sh-index`**
 > (default off) after tip. Run **signet first**, then mainnet with monitoring.
 > Report security issues privately: [`SECURITY.md`](./SECURITY.md). Runbook:
 > [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).

@@ -210,10 +210,7 @@ fn save_manifest(dir: &Path, mf: &Manifest) -> Result<(), StoreError> {
         f.sync_all().map_err(|e| io_err(&tmp, e))?;
     }
     fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
-    // Best-effort directory durability for the new dirent.
-    if let Ok(dirf) = File::open(dir) {
-        let _ = dirf.sync_all();
-    }
+    let _ = crate::file::fsync_parent_dir(dir);
     Ok(())
 }
 
@@ -355,9 +352,7 @@ fn write_sorted_run_file(
     fs::rename(&tmp, path).map_err(|e| io_err(path, e))?;
     if policy.durable {
         if let Some(parent) = path.parent() {
-            if let Ok(dirf) = File::open(parent) {
-                let _ = dirf.sync_all();
-            }
+            let _ = crate::file::fsync_parent_dir(parent);
         }
     }
     // Catalog: drop from page cache so multi‑hundred MiB runs do not crowd

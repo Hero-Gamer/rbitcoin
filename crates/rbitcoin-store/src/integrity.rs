@@ -88,6 +88,9 @@ impl TipSeal {
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
         std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+        if let Some(parent) = p.parent() {
+            crate::file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+        }
         Ok(())
     }
 }
@@ -176,6 +179,16 @@ impl Store {
         seal.store(self.path())
     }
 
+    fn effective_checkblocks(&self, n: u32) -> Result<u32, StoreError> {
+        let durable =
+            crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.durable_through());
+        Ok(crate::spend_durable::widen_checkblocks(
+            n,
+            self.confirmed.tip_height().map(|h| h.0),
+            durable,
+        ))
+    }
+
     /// Revalidate the last [`VERIFY_TIP_BLOCKS`] confirmed heights (structure + merkle).
     ///
     /// On failure: clear bad Class A associations and/or shrink tip to the last
@@ -186,8 +199,11 @@ impl Store {
 
     /// Same as [`Self::revalidate_tip_window`] with an explicit window.
     ///
-    /// `n == 0` walks from genesis (Core `-checkblocks=0`).
+    /// `n == 0` walks from genesis (Core `-checkblocks=0`). A durable-through
+    /// marker widens any other window to at least [`VERIFY_TIP_BLOCKS`] and
+    /// far enough to cover heights above that marker.
     pub fn revalidate_tip_window_n(&self, n: u32) -> Result<TipRevalidateReport, StoreError> {
+        let n = self.effective_checkblocks(n)?;
         let mut report = TipRevalidateReport::default();
         if let Some(h) = self.confirmed.tip_height() {
             report.tip_before = Some(h.0);
@@ -812,6 +828,36 @@ mod tests {
         assert!(r0.tip_shrunk, "n=0 must walk from genesis: {r0:?}");
         assert_eq!(r0.first_bad_reason, Some("prev_fk != confirmed parent"));
         assert_eq!(r0.first_bad_height, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_through_widens_past_the_six_block_window() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        let mut genesis_fk = Fk::NULL;
+        for h in 0u32..10 {
+            let rec = hdr(prev, parent_hash, h as u8);
+            parent_hash = rec.hash;
+            let fk = s.put_header(&rec).unwrap();
+            if h == 0 {
+                genesis_fk = fk;
+            }
+            prev = fk;
+            s.confirmed.set(Height(h), fk).unwrap();
+        }
+        s.confirmed.set(Height(1), genesis_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        crate::spend_durable::SpendDurable::new(0, 0)
+            .store(s.path())
+            .unwrap();
+
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(r.first_bad_height, Some(1), "{r:?}");
+        assert!(r.tip_shrunk, "marker at 0 must include height 1: {r:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

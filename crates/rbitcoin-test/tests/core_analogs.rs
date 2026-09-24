@@ -74,8 +74,8 @@ fn analog_milestone_and_mempool_persist() {
     let catchup_tip = h - 1;
     let bad_block = mine_regtest_block(tip, tip_time + 600, h, vec![bad]);
 
-    let ms_skip = Milestone { height: h };
-    let ms_check = Milestone { height: h - 1 };
+    let ms_skip = Milestone::height(h);
+    let ms_check = Milestone::height(h - 1);
     assert!(ms_skip.skips_scripts_at(h));
     assert!(!ms_check.skips_scripts_at(h));
 
@@ -92,7 +92,7 @@ fn analog_milestone_and_mempool_persist() {
         .expect("invalid script below milestone must be skipped");
     assert_eq!(q.tip_height(), Some(Height(h)));
 
-    let ms_hi = Milestone { height: 1_000_000 };
+    let ms_hi = Milestone::height(1_000_000);
     let mut phantom = mine_regtest_block(
         bad_block.block_hash(),
         bad_block.header.time + 600,

@@ -6,7 +6,7 @@ use super::{
     is_p2wsh_program, last_script_push, merkle_root_bytes, script_sigop_count,
     validate_block_structure, validate_block_structure_with_pres, witness_commitment_script,
     ScriptCheckJob, TxPrecompute, ValidationContext, BIP16_EXCEPTION_MAINNET,
-    MAX_BLOCK_STRIPPED_SIZE,
+    MAX_BLOCK_STRIPPED_SIZE, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
 };
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
@@ -400,6 +400,178 @@ fn bip30_rejects_unspent_connected_sibling() {
         "expected BIP30 reject, got {msg}"
     );
     let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Signet activates BIP34 at height 1. Core's empty BIP34 hash still enforces
+/// BIP30 on every signet block.
+#[test]
+fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
+    use crate::block::structural_validate_spends;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("bip30-signet");
+    q.enter_direct_index_mode().unwrap();
+
+    let first = coinbase(1);
+    let txid = first.compute_txid().to_byte_array();
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let fk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+
+    let dup = block_with(vec![first]);
+    let p = Box::leak(Box::new(ChainParams::signet()));
+    let ctx = ValidationContext::at(p, Height(2), Milestone::NONE);
+    let err = structural_validate_spends(
+        &q,
+        &dup,
+        &ctx,
+        Some(&[Fk(2)]),
+        &[],
+        0,
+        &mut OutPointSet::default(),
+        &BatchParents::new(),
+        &mut U32Map::default(),
+        &FkMap::default(),
+        &mut crate::block::StructuralScratch::default(),
+    )
+    .expect_err("signet must enforce BIP30 after height 1");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad-txns-BIP30"),
+        "expected BIP30 reject, got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+fn plant_unspent_coinbase(
+    label: &str,
+) -> (
+    rbitcoin_store::testutil::TempDir,
+    rbitcoin_query::Query,
+    Transaction,
+) {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    q.enter_direct_index_mode().unwrap();
+    let first = coinbase(1);
+    let txid = first.compute_txid().to_byte_array();
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let fk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    (path, q, first)
+}
+
+fn plant_bip34_ancestor(q: &rbitcoin_query::Query, hash: [u8; 32]) {
+    use rbitcoin_store::HeaderRecord;
+    let main = ChainParams::mainnet();
+    let hfk = q
+        .store()
+        .put_header(&HeaderRecord {
+            hash,
+            ..HeaderRecord::default()
+        })
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(Height(main.btc.bip34_height), hfk)
+        .unwrap();
+}
+
+fn bip30_message_at_mainnet_above_bip34(
+    q: &rbitcoin_query::Query,
+    block: &Block,
+) -> Result<(), ConsensusError> {
+    use crate::block::structural_validate_spends;
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    let main = Box::leak(Box::new(ChainParams::mainnet()));
+    let ctx = ValidationContext::at(main, Height(main.btc.bip34_height + 1), Milestone::NONE);
+    structural_validate_spends(
+        q,
+        block,
+        &ctx,
+        Some(&[rbitcoin_primitives::Fk(2)]),
+        &[],
+        0,
+        &mut OutPointSet::default(),
+        &BatchParents::new(),
+        &mut U32Map::default(),
+        &FkMap::default(),
+        &mut crate::block::StructuralScratch::default(),
+    )
+    .map(|_| ())
+}
+
+/// Mainnet skips BIP30 only when the header at BIP34 height is the real hash.
+/// A wrong ancestor still rejects an unspent overwrite.
+#[test]
+fn bip30_mainnet_skips_only_when_bip34_ancestor_matches() {
+    let (path, q, first) = plant_unspent_coinbase("bip30-ancestor-skip");
+    let main = ChainParams::mainnet();
+    let real = main.bip34_hash.expect("mainnet BIP34 hash").to_byte_array();
+    plant_bip34_ancestor(&q, real);
+    let skipped = bip30_message_at_mainnet_above_bip34(&q, &block_with(vec![first.clone()]));
+    let msg = skipped
+        .as_ref()
+        .err()
+        .map(|e| format!("{e}"))
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("bad-txns-BIP30"),
+        "real BIP34 ancestor must skip BIP30 above the activation height, got {msg}"
+    );
+
+    let (path_bad, q_bad, first_bad) = plant_unspent_coinbase("bip30-ancestor-miss");
+    plant_bip34_ancestor(&q_bad, [0x11; 32]);
+    let err = bip30_message_at_mainnet_above_bip34(&q_bad, &block_with(vec![first_bad]))
+        .expect_err("a non-BIP34 ancestor must still enforce BIP30");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad-txns-BIP30"),
+        "expected BIP30 reject, got {msg}"
+    );
+    let _ = (path, path_bad, first);
 }
 
 #[test]
@@ -825,8 +997,15 @@ fn p3_default_milestone_heights() {
     use crate::params::default_milestone_height;
     use rbitcoin_primitives::Network;
     assert_eq!(default_milestone_height(Network::Regtest), 0);
-    assert!(default_milestone_height(Network::Mainnet) > 0);
-    assert!(default_milestone_height(Network::Signet) > 0);
+    assert_eq!(default_milestone_height(Network::Mainnet), 840_000);
+    assert_eq!(default_milestone_height(Network::Testnet), 2_500_000);
+    assert_eq!(default_milestone_height(Network::Signet), 0);
+    let anchor = crate::mainnet_milestone_anchor();
+    assert_eq!(
+        anchor.hash.to_string(),
+        crate::params::MAINNET_MILESTONE_HASH
+    );
+    assert_ne!(anchor.min_work_be, [0u8; 32]);
 }
 
 #[test]
@@ -1202,7 +1381,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let p = Box::leak(Box::new(params));
-    let ctx = ValidationContext::at(p, Height(1), Milestone { height: 840_000 });
+    let ctx = ValidationContext::at(p, Height(1), Milestone::height(840_000));
     let parents = BatchParents::new();
     let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
@@ -1405,7 +1584,7 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     };
     let b = block_with(vec![coinbase(1), spend]);
     let params = Box::leak(Box::new(ChainParams::regtest()));
-    let ctx = ValidationContext::at(params, Height(1), Milestone { height: 100 });
+    let ctx = ValidationContext::at(params, Height(1), Milestone::height(100));
     assert!(ctx.milestone.skips_scripts_at(ctx.height.0));
     let spend_fk = Fk(100);
     let mut thin = SpendEdges::default();
@@ -1446,6 +1625,138 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     .err()
     .expect("over-budget pin P2WSH must reject");
     assert_bad_block(err, "bad-blk-sigops");
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Anchored skip uses the header path. A height match with a different hash
+/// still builds script jobs.
+#[test]
+fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
+    use super::assemble_block_prevouts;
+    use crate::milestone::MilestoneAnchor;
+    use bitcoin::hashes::Hash;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, OutPointSet, SpendEdge, SpendEdges};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("assemble-anchor");
+    let mut parent_txid = [0u8; 32];
+    parent_txid[0] = 0x42;
+    let rec = TxRecord {
+        txid: parent_txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let mut parents = BatchParents::new();
+    parents.insert_owned(
+        Fk(7),
+        rec,
+        vec![(0, OutputRecord::unspent(50_0000_0000, vec![0x51]))],
+        vec![0],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let b = block_with(vec![coinbase(1), spend]);
+    let params = Box::leak(Box::new(ChainParams::regtest()));
+    let anchor_hash = [0xabu8; 32];
+    let mut min = [0u8; 32];
+    min[1] = 1;
+    let ms = Milestone {
+        height: 100,
+        anchor: Some(MilestoneAnchor {
+            hash: bitcoin::BlockHash::from_byte_array(anchor_hash),
+            min_work_be: min,
+        }),
+    };
+    let ctx = ValidationContext::at(params, Height(1), ms);
+    let spend_fk = Fk(100);
+    let mut thin = SpendEdges::default();
+    thin.insert(
+        spend_fk.0,
+        vec![SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk,
+            create_fk: Fk(7),
+            vin: 0,
+        }],
+    );
+    let tids: Vec<[u8; 32]> = b
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = b.header.block_hash().to_byte_array();
+    let run = |q: &rbitcoin_query::Query| {
+        let mut spent = OutPointSet::default();
+        let mut creates = super::PendingCreates::default();
+        assemble_block_prevouts(
+            q,
+            &b,
+            &ctx,
+            Some(&[Fk::NULL, spend_fk]),
+            &mut spent,
+            &mut creates,
+            &parents,
+            &thin,
+            &tids,
+            0,
+            &bh,
+            true,
+            None,
+            None,
+        )
+        .expect("op_true spend assembles")
+        .0
+    };
+    assert_eq!(run(&q).len(), 1, "missing anchor path still checks scripts");
+    assert!(crate::milestone::check_scripts(ms, &q, 1, &bh));
+    let mut base = [0u8; 32];
+    base[1] = 2;
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    q.note_milestone_header(
+        1,
+        bh,
+        [0; 32],
+        bitcoin::Work::from_be_bytes(one),
+        Some(bitcoin::Work::from_be_bytes(base)),
+    );
+    q.note_milestone_header(
+        100,
+        anchor_hash,
+        [0; 32],
+        bitcoin::Work::from_be_bytes(one),
+        None,
+    );
+    assert!(
+        run(&q).is_empty(),
+        "header path through the anchor with enough work skips scripts"
+    );
+    assert!(!crate::milestone::check_scripts(ms, &q, 1, &bh));
+    q.clear_milestone_path_above(0);
+    assert_eq!(run(&q).len(), 1, "cleared path checks scripts again");
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -2273,4 +2584,11 @@ fn structure_rejects_pres_out_sum_above_max_money_before_assemble_casts_it() {
             .unwrap_err();
         assert_bad_block(err, "bad-txns-txouttotal-toolarge");
     }
+}
+
+#[test]
+fn max_block_tx_count_matches_weight_over_ten_byte_tx() {
+    assert_eq!(MIN_TX_WEIGHT, 40, "10-byte tx at witness scale 4");
+    assert_eq!(MAX_BLOCK_TX_COUNT, 100_000);
+    assert_eq!(MAX_BLOCK_TX_COUNT as u64 * MIN_TX_WEIGHT, MAX_BLOCK_WEIGHT);
 }

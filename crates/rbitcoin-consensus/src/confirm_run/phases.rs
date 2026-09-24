@@ -216,7 +216,7 @@ pub(super) fn assemble_run(
             jobs: script_jobs,
             spends,
             fees,
-            check_scripts: !milestone.skips_scripts_at(height.0),
+            check_scripts: crate::milestone::check_scripts(milestone, query, height.0, &block_hash),
             time: block.header.time,
             bits: block.header.bits,
             hash: block_hash,

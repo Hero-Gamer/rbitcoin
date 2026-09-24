@@ -236,7 +236,11 @@ pub(crate) fn chainwork_hex(ctx: &RpcContext, through: Option<Height>) -> String
             works.push(hdr.work());
         }
     }
-    hex_encode(rbitcoin_net::sum_work(works.into_iter()).to_be_bytes())
+    hex_encode(
+        rbitcoin_net::sum_work(works.into_iter())
+            .unwrap_or(bitcoin::Work::from_be_bytes([0xff; 32]))
+            .to_be_bytes(),
+    )
 }
 
 fn version_hex(version: i32) -> String {
@@ -806,6 +810,10 @@ pub(crate) fn wait_for_tip(
     timeout_ms: u64,
     pred: impl Fn(&str, u32) -> bool,
 ) -> Result<Value, Value> {
+    if super::http_wait_satisfied() {
+        let (hash, height) = tip_hash_height(ctx)?;
+        return Ok(json!({ "hash": hash, "height": height }));
+    }
     let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
         if ctx.stop.load(Ordering::SeqCst) {

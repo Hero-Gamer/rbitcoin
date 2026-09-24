@@ -221,6 +221,8 @@ pub(crate) struct IbdPerfSample {
     pub ann_n: u64,
     /// Annotate edges without body pread (should equal annotate edges).
     pub ann_pread_skip: u64,
+    /// Periodic Class A `sync_data` that advances the spend-durable marker.
+    pub ann_sync_ms: u64,
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
@@ -241,6 +243,8 @@ pub(crate) struct IbdPerfSample {
     pub prep_filter_plan_ms: u64,
     pub connect_ns: u64,
     pub script_ns: u64,
+    /// Ancestor + min-work milestone gate (lookup / assemble).
+    pub milestone_gate_ns: u64,
     pub strong_ns: u64,
     pub tip_ns: u64,
     pub structural_spent_ns: u64,
@@ -490,6 +494,7 @@ impl Default for IbdPerfSample {
             ann_ms: 0,
             ann_n: 0,
             ann_pread_skip: 0,
+            ann_sync_ms: 0,
             meta_ms: 0,
             meta_n: 0,
             ovl_n: 0,
@@ -502,6 +507,7 @@ impl Default for IbdPerfSample {
             prep_filter_plan_ms: 0,
             connect_ns: 0,
             script_ns: 0,
+            milestone_gate_ns: 0,
             strong_ns: 0,
             tip_ns: 0,
             structural_spent_ns: 0,
@@ -858,6 +864,7 @@ pub(crate) fn sample(
     let w = stats.take_window();
     let connect_ns = w.connect_ns;
     let script_ns = w.script_ns;
+    let milestone_gate_ns = w.milestone_gate_ns;
     let class_c_ns = w.class_c_ns;
     let strong_ns = w.strong_ns;
     let sh_ns = w.scripthash_ns;
@@ -889,6 +896,7 @@ pub(crate) fn sample(
     let ann_ns = w.spend_ann_ns;
     let ann_n = w.spend_ann_n;
     let ann_pread_skip = w.spend_ann_pread_skip;
+    let ann_sync_ns = w.spend_durable_ns;
     let meta_ns = w.spend_meta_ns;
     let meta_n = w.spend_meta_n;
     let ovl_n = w.spend_overlay_skip_n;
@@ -1000,6 +1008,7 @@ pub(crate) fn sample(
         ann_ms: ns_ms(ann_ns),
         ann_n,
         ann_pread_skip,
+        ann_sync_ms: ns_ms(ann_sync_ns),
         meta_ms: ns_ms(meta_ns),
         meta_n,
         ovl_n,
@@ -1012,6 +1021,7 @@ pub(crate) fn sample(
         prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
         connect_ns,
         script_ns,
+        milestone_gate_ns,
         strong_ns,
         tip_ns,
         structural_spent_ns,
@@ -1502,7 +1512,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_write_inventory_info(&mut out, s);
     out.push_str(&format!(
         " spent_sub(abs={} strong={} cold={} pending={}) other={}ms \
-         ann={}ms/n={} pread_skip={} \
+         ann={}ms/n={} pread_skip={} ann_sync={}ms \
          meta={}ms/n={}",
         s.spent_abs_ms,
         s.spent_strong_ms,
@@ -1512,6 +1522,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.ann_ms,
         s.ann_n,
         s.ann_pread_skip,
+        s.ann_sync_ms,
         s.meta_ms,
         s.meta_n,
     ));
@@ -1574,6 +1585,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.script_ns),
         us(write_ns),
     );
+    append_nz(&mut out, "milestone_us", us(s.milestone_gate_ns));
     append_write_inventory_debug(&mut out, s, us);
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));

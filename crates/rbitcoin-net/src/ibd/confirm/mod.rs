@@ -373,10 +373,7 @@ impl ConfirmRejectClass {
         if super::reorg::is_bad_prev_err(err) {
             return Self::SoftWire;
         }
-        if s.contains("merkle root mismatch")
-            || s.contains("bad-txnmrklroot")
-            || s.contains("witness commitment")
-        {
+        if crate::chain::reject_is_mutated(&s) {
             return Self::SoftWire;
         }
         if s.contains("missing retarget first header") {

@@ -339,6 +339,11 @@ fn sighash_midstates(tx: &Transaction) -> [Option<[u8; 32]>; 3] {
     ]
 }
 
+/// A consensus-serialized tx is at least 10 bytes (version, two compact sizes, locktime).
+fn block_tx_count_fits(n: usize, remaining: usize) -> bool {
+    n <= remaining / 10
+}
+
 /// Decode a P2P block payload once: rust-bitcoin `Block` plus per-tx pres from
 /// each tx's **wire slice** (no second consensus_encode into SHA engines).
 ///
@@ -353,7 +358,12 @@ pub fn decode_block_precomputes(
     use std::time::Instant;
     let mut cur = Cursor::new(payload);
     let header = Header::consensus_decode(&mut cur).ok()?;
-    let n = VarInt::consensus_decode(&mut cur).ok()?.0 as usize;
+    let n_raw = VarInt::consensus_decode(&mut cur).ok()?.0;
+    let n = usize::try_from(n_raw).ok()?;
+    let remaining = payload.len().saturating_sub(cur.position() as usize);
+    if !block_tx_count_fits(n, remaining) {
+        return None;
+    }
     let mut txdata = Vec::with_capacity(n);
     let mut pres = Vec::with_capacity(n);
     let mut hash_ns = 0u64;
@@ -577,6 +587,49 @@ mod tests {
                 assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
             }
         }
+    }
+
+    #[test]
+    fn block_tx_count_fits_uses_ten_byte_floor() {
+        assert!(super::block_tx_count_fits(1, 10));
+        assert!(super::block_tx_count_fits(0, 0));
+        assert!(!super::block_tx_count_fits(2, 15));
+        assert!(!super::block_tx_count_fits(1, 9));
+    }
+
+    #[test]
+    fn decode_block_precomputes_rejects_tx_count_past_payload() {
+        // Header plus a u64 tx count. No transaction bytes follow.
+        let mut payload = vec![0u8; 80];
+        payload.push(0xff);
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(super::decode_block_precomputes(&payload, false).is_none());
+    }
+
+    #[test]
+    fn decode_block_precomputes_accepts_minimum_serialized_tx() {
+        use bitcoin::consensus::encode::serialize;
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let raw_tx = serialize(&tx);
+        assert!(
+            (10..20).contains(&raw_tx.len()),
+            "one tx must sit on the 10-byte floor, got {}",
+            raw_tx.len()
+        );
+        let mut payload = vec![0u8; 80];
+        payload.push(1);
+        payload.extend_from_slice(&raw_tx);
+        let (block, pres, _) =
+            super::decode_block_precomputes(&payload, false).expect("one minimum tx");
+        assert_eq!(block.txdata.len(), 1);
+        assert_eq!(pres.len(), 1);
+        assert!(block.txdata[0].input.is_empty());
+        assert!(block.txdata[0].output.is_empty());
     }
 
     #[test]

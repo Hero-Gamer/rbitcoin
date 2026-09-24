@@ -179,7 +179,7 @@ fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         if (1..=75).contains(&op) {
             let n = op as usize;
             if pc + n > spk.len() {
-                return None;
+                break;
             }
             let data = &spk[pc..pc + n];
             pc += n;
@@ -198,7 +198,7 @@ fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
             let n = spk[pc] as usize;
             pc += 1;
             if pc + n > spk.len() {
-                return None;
+                break;
             }
             let data = &spk[pc..pc + n];
             pc += n;
@@ -209,16 +209,14 @@ fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
                     continue;
                 }
             }
-            replacement.push(0x4c);
-            replacement.push(n as u8);
-            replacement.extend_from_slice(data);
+            push_data(&mut replacement, data);
             continue;
         }
         if op == 0x4d && pc + 1 < spk.len() {
             let n = u16::from_le_bytes([spk[pc], spk[pc + 1]]) as usize;
             pc += 2;
             if pc + n > spk.len() {
-                return None;
+                break;
             }
             let data = &spk[pc..pc + n];
             pc += n;
@@ -229,10 +227,29 @@ fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
                     continue;
                 }
             }
-            replacement.push(0x4d);
-            replacement.extend_from_slice(&(n as u16).to_le_bytes());
-            replacement.extend_from_slice(data);
+            push_data(&mut replacement, data);
             continue;
+        }
+        if op == 0x4e && pc + 3 < spk.len() {
+            let n = u32::from_le_bytes([spk[pc], spk[pc + 1], spk[pc + 2], spk[pc + 3]]) as usize;
+            pc += 4;
+            if pc + n > spk.len() {
+                break;
+            }
+            let data = &spk[pc..pc + n];
+            pc += n;
+            if solution.is_none() {
+                if let Some(sol) = extract_header_payload(data) {
+                    solution = Some(sol);
+                    push_data(&mut replacement, &SIGNET_HEADER);
+                    continue;
+                }
+            }
+            push_data(&mut replacement, data);
+            continue;
+        }
+        if matches!(op, 0x4c..=0x4e) {
+            break;
         }
         replacement.push(op);
     }
@@ -258,9 +275,49 @@ fn parse_signet_solution(solution: &[u8]) -> Result<(ScriptBuf, Witness), Consen
     Ok((script_sig, witness))
 }
 
+fn read_signet_compact(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
+    if rdr.is_empty() {
+        return Err(ConsensusError::BadBlock("signet: compact size"));
+    }
+    let (v, n) = match rdr[0] {
+        tag @ 0..=252 => (u64::from(tag), 1usize),
+        253 => {
+            if rdr.len() < 3 {
+                return Err(ConsensusError::BadBlock("signet: compact size"));
+            }
+            let v = u16::from_le_bytes([rdr[1], rdr[2]]);
+            if v < 253 {
+                return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
+            }
+            (u64::from(v), 3)
+        }
+        254 => {
+            if rdr.len() < 5 {
+                return Err(ConsensusError::BadBlock("signet: compact size"));
+            }
+            let v = u32::from_le_bytes(rdr[1..5].try_into().expect("4 bytes"));
+            if v <= u32::from(u16::MAX) {
+                return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
+            }
+            (u64::from(v), 5)
+        }
+        255 => {
+            if rdr.len() < 9 {
+                return Err(ConsensusError::BadBlock("signet: compact size"));
+            }
+            let v = u64::from_le_bytes(rdr[1..9].try_into().expect("8 bytes"));
+            if v <= u64::from(u32::MAX) {
+                return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
+            }
+            (v, 9)
+        }
+    };
+    *rdr = &rdr[n..];
+    Ok(v)
+}
+
 fn read_script(rdr: &mut &[u8]) -> Result<ScriptBuf, ConsensusError> {
-    let n = rbitcoin_primitives::read_compact_size_from(rdr)
-        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))? as usize;
+    let n = read_signet_compact(rdr)? as usize;
     if rdr.len() < n {
         return Err(ConsensusError::BadBlock("signet: scriptSig short"));
     }
@@ -270,13 +327,13 @@ fn read_script(rdr: &mut &[u8]) -> Result<ScriptBuf, ConsensusError> {
 }
 
 fn read_witness_stack(rdr: &mut &[u8]) -> Result<Witness, ConsensusError> {
-    let count = rbitcoin_primitives::read_compact_size_from(rdr)
-        .map_err(|_| ConsensusError::BadBlock("signet: compact size"))? as usize;
+    let count = read_signet_compact(rdr)? as usize;
+    if count > rdr.len() {
+        return Err(ConsensusError::BadBlock("signet: witness count"));
+    }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        let n = rbitcoin_primitives::read_compact_size_from(rdr)
-            .map_err(|_| ConsensusError::BadBlock("signet: compact size"))?
-            as usize;
+        let n = read_signet_compact(rdr)? as usize;
         if rdr.len() < n {
             return Err(ConsensusError::BadBlock("signet: witness short"));
         }
@@ -516,6 +573,11 @@ mod tests {
         spk2.extend_from_slice(&payload2);
         let (sol2, _) = fetch_and_clear_signet_section(&spk2).unwrap();
         assert_eq!(sol2, vec![0xbe]);
+        // A byte after the push must survive. `pc *= n` skips it.
+        spk2.push(0x51);
+        let (sol2, repl2) = fetch_and_clear_signet_section(&spk2).unwrap();
+        assert_eq!(sol2, vec![0xbe]);
+        assert!(repl2.ends_with(&[0x51]), "{repl2:?}");
 
         // Truncated push → None
         assert!(fetch_and_clear_signet_section(&[0x05, 0x01]).is_none());
@@ -561,6 +623,65 @@ mod tests {
         assert!(parse_signet_solution(&[0x02, 0xaa]).is_err());
         // Short witness item.
         assert!(parse_signet_solution(&[0x00, 0x01, 0x02, 0xaa]).is_err());
+        // Non-minimal witness count 0 (253, 0x0000).
+        let err = parse_signet_solution(&[0x00, 253, 0x00, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("non-minimal"), "{err}");
+        // 253 is the smallest minimal 3-byte encoding. `v <= 253` rejects it.
+        let mut at_253 = vec![253, 253, 0];
+        at_253.extend(vec![0x11u8; 253]);
+        at_253.push(0);
+        let (ss, wit) = parse_signet_solution(&at_253).unwrap();
+        assert_eq!(ss.len(), 253);
+        assert_eq!(wit.len(), 0);
+        // u16::MAX fits in 3 bytes, so a 5-byte form is non-minimal.
+        let err = parse_signet_solution(&[254, 0xff, 0xff, 0x00, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("non-minimal"), "{err}");
+        let err = parse_signet_solution(&[254, 0x00, 0x00, 0x00]).unwrap_err();
+        assert!(err.to_string().contains("compact size"), "{err}");
+        let err = parse_signet_solution(&[255, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("non-minimal"), "{err}");
+        let err = parse_signet_solution(&[255, 0, 0, 0, 0, 0, 0, 0]).unwrap_err();
+        assert!(err.to_string().contains("compact size"), "{err}");
+        // Huge count must fail before allocating the stack.
+        let mut huge = vec![0x00, 255];
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(parse_signet_solution(&huge).is_err());
+    }
+
+    #[test]
+    fn signet_section_pushdata4_and_minimal_reencode() {
+        let mut script = vec![0x4e, 8, 0, 0, 0];
+        script.extend_from_slice(&SIGNET_HEADER);
+        script.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let (sol, repl) = fetch_and_clear_signet_section(&script).expect("pushdata4");
+        assert_eq!(sol, vec![0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(&repl[..5], &[4, 0xec, 0xc7, 0xda, 0xa2]);
+        // Four single-byte opcodes put pc at 5, so `pc * k` is not `pc + k`.
+        let mut shifted = vec![0x51, 0x51, 0x51, 0x51, 0x4e, 5, 0, 0, 0];
+        shifted.extend_from_slice(&SIGNET_HEADER);
+        shifted.push(0x7e);
+        // After the payload. `pc *= n` skips this opcode.
+        shifted.push(0x52);
+        let (sol, repl) = fetch_and_clear_signet_section(&shifted).expect("shifted pushdata4");
+        assert_eq!(sol, vec![0x7e]);
+        assert_eq!(repl.iter().filter(|b| **b == 0x51).count(), 4);
+        assert!(repl.ends_with(&[0x52]), "{repl:?}");
+        // Exactly three length bytes: `pc + 3 == len` must not read past the script.
+        assert!(fetch_and_clear_signet_section(&[0x51, 0x51, 0x51, 0x51, 0x4e, 0, 0, 0]).is_none());
+        // Non-minimal OP_PUSHDATA1 of one byte re-encodes as a direct push.
+        let (sol, repl) = fetch_and_clear_signet_section(&[
+            0x4c, 8, 0xec, 0xc7, 0xda, 0xa2, 1, 2, 3, 4, 0x4c, 1, 0xab,
+        ])
+        .expect("pushdata1");
+        assert_eq!(sol, vec![1, 2, 3, 4]);
+        assert!(repl.ends_with(&[1, 0xab]), "{repl:?}");
+        // Truncation after a parsed section keeps the solution.
+        let mut partial = vec![0x05];
+        partial.extend_from_slice(&SIGNET_HEADER);
+        partial.push(0x11);
+        partial.push(0x4c);
+        let (sol, _) = fetch_and_clear_signet_section(&partial).expect("truncated tail");
+        assert_eq!(sol, vec![0x11]);
     }
 
     #[test]

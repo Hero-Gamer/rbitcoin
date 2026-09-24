@@ -214,9 +214,11 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
-/// Reconstructed compact/body does not match the header.
-/// Do not cache the hash as permanently failed.
-fn reject_is_mutated(reason: &str) -> bool {
+/// Reconstructed compact/body does not match the header, or witness bytes
+/// that are not committed in the hash. Do not cache the hash as permanently
+/// failed. Weight after a matching commitment is the block's own fault.
+pub(crate) fn reject_is_mutated(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
     reason.contains("merkle")
         || reason.contains("bad-txnmrklroot")
         || reason.contains("bad-txns-duplicate")
@@ -224,6 +226,7 @@ fn reject_is_mutated(reason: &str) -> bool {
         || reason.contains("bad-witness-nonce")
         || reason.contains("missing witness commitment")
         || reason.contains("wtxid count")
+        || reason.contains("unexpected witness")
 }
 
 fn accept_err_is_mutated(e: &NetError) -> bool {
@@ -234,10 +237,14 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
-fn accept_err_is_temporary_time(e: &NetError) -> bool {
+pub(crate) fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
-            s.contains("time-too-new") || s.contains("time-too-old")
+            let s = s.to_ascii_lowercase();
+            s.contains("time-too-new")
+                || s.contains("time-too-old")
+                || s.contains("timestamp too far in future")
+                || s.contains("median-time-past")
         }
         _ => false,
     }
@@ -270,6 +277,8 @@ pub struct ChainHub {
     ///
     /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
     mempool: std::sync::OnceLock<Arc<crate::tx_relay::MempoolHub>>,
+    /// Filled by [`Self::into_arc`]. Async tip jobs clone it.
+    self_weak: std::sync::OnceLock<std::sync::Weak<ChainHub>>,
     /// Regtest `setmocktime` / generate timestamps. Default is wall clock.
     pub clock: Arc<rbitcoin_consensus::NodeClock>,
     invalidated: Invalidated,
@@ -330,6 +339,7 @@ impl ChainHub {
             connect_lock: std::sync::Mutex::new(()),
             generate_lock: std::sync::Mutex::new(()),
             mempool: std::sync::OnceLock::new(),
+            self_weak: std::sync::OnceLock::new(),
             clock: rbitcoin_consensus::NodeClock::new(),
             invalidated: Invalidated::new(),
             held_bodies: RwLock::new(HeldBodies::new()),
@@ -483,12 +493,15 @@ impl ChainHub {
     pub fn work_with_header(&self, header: &Header) -> Work {
         let mut extra = Vec::new();
         if self.header_claimed_pow_ok(header) {
-            extra.push(header.work());
+            if let Ok(w) = crate::most_work::header_work_checked(header) {
+                extra.push(w);
+            }
         }
         let mut prev = header.prev_blockhash;
         for _ in 0..10_000 {
             if prev.to_byte_array() == [0u8; 32] {
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             }
             if let Some(h) = self
                 .query
@@ -500,17 +513,21 @@ impl ChainHub {
                     .work_through_height(h.0)
                     .unwrap_or(Work::from_be_bytes([0u8; 32]));
                 extra.push(base);
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             }
             let Some(hdr) = self.header_of(&prev) else {
-                return crate::most_work::sum_work(extra.into_iter());
+                return crate::most_work::sum_work(extra.into_iter())
+                    .unwrap_or(Work::from_be_bytes([0xff; 32]));
             };
             if self.header_claimed_pow_ok(&hdr) {
-                extra.push(hdr.work());
+                if let Ok(w) = crate::most_work::header_work_checked(&hdr) {
+                    extra.push(w);
+                }
             }
             prev = hdr.prev_blockhash;
         }
-        crate::most_work::sum_work(extra.into_iter())
+        crate::most_work::sum_work(extra.into_iter()).unwrap_or(Work::from_be_bytes([0xff; 32]))
     }
 
     /// Unrequested body more than 288 heights above the validated tip.
@@ -1799,7 +1816,9 @@ impl ChainHub {
                 continue;
             }
             let tip = branch.last().map(|b| b.block_hash()).unwrap_or(start);
-            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let Ok(w) = self.branch_header_work(&branch) else {
+                continue;
+            };
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
@@ -2013,6 +2032,9 @@ impl ChainHub {
                 Ok(AcceptOutcome::Accepted { height: 0 })
             }
             Some(tip_h) => {
+                if prev.to_byte_array() == [0u8; 32] {
+                    return Err(NetError::Protocol("non-genesis prev is zero"));
+                }
                 let tip_hash = self
                     .tip_hash()
                     .ok_or(NetError::Protocol("missing tip hash"))?;
@@ -2146,6 +2168,9 @@ impl ChainHub {
     fn accept_branch_fork_height(&self, blocks: &[Block]) -> Result<Option<u32>, NetError> {
         let fork_prev = blocks[0].header.prev_blockhash;
         if fork_prev.to_byte_array() == [0u8; 32] {
+            if self.tip_height().is_some() {
+                return Err(NetError::Protocol("non-genesis prev is zero"));
+            }
             return Ok(None);
         }
         Ok(Some(
@@ -2157,12 +2182,31 @@ impl ChainHub {
         ))
     }
 
+    fn branch_header_work(&self, blocks: &[Block]) -> Result<Work, NetError> {
+        if self.tip_height().is_some()
+            && blocks
+                .iter()
+                .any(|b| b.header.prev_blockhash.to_byte_array() == [0u8; 32])
+        {
+            return Err(NetError::Protocol("non-genesis prev is zero"));
+        }
+        let mut works = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            works.push(
+                crate::most_work::header_work_checked(&b.header)
+                    .map_err(|_| NetError::Consensus("zero target".into()))?,
+            );
+        }
+        crate::most_work::sum_work(works.into_iter())
+            .map_err(|_| NetError::Consensus("work overflow".into()))
+    }
+
     fn accept_branch_weaker(
         &self,
         blocks: &[Block],
         fork_height: Option<u32>,
     ) -> Result<Option<AcceptOutcome>, NetError> {
-        let new_work = sum_work(blocks.iter().map(|b| b.header.work()));
+        let new_work = self.branch_header_work(blocks)?;
         let our_work = self.work_from_fork_to_tip(fork_height)?;
         let branch_tip = blocks.last().map(Block::block_hash);
         let precious = *self.precious.read().unwrap() == branch_tip;
@@ -2304,13 +2348,34 @@ impl ChainHub {
         }
     }
 
+    /// Put this hub in an `Arc` and remember a weak handle for async tip jobs.
+    pub(crate) fn into_arc(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.self_weak.set(Arc::downgrade(&arc));
+        arc
+    }
+
+    /// `Some` after [`Self::into_arc`]. The clone keeps the hub alive for a
+    /// tip job whose session future was dropped.
+    pub(crate) fn shared_arc(&self) -> Option<Arc<Self>> {
+        self.self_weak.get().and_then(|w| w.upgrade())
+    }
+
+    /// Block until the tip-accept thread has no job running.
+    pub fn wait_tip_accept_idle(&self) {
+        crate::tip_accept::wait_idle();
+    }
+
     /// Peer-session accept: same work as [`Self::accept_received_block`], awaited
-    /// so the tokio worker is not parked across confirm.
+    /// so the tokio worker is not parked across confirm. The job holds this
+    /// `Arc`.
     pub async fn accept_received_block_async(
-        &self,
+        self: &Arc<Self>,
         block: Block,
     ) -> Result<AcceptOutcome, NetError> {
-        crate::tip_accept::run_on_tip_accept_async(|| self.accept_received_block_inner(block)).await
+        let hub = Arc::clone(self);
+        crate::tip_accept::run_on_tip_accept_async(move || hub.accept_received_block_inner(block))
+            .await
     }
 
     pub(crate) fn accept_received_on_lane(&self, block: Block) -> Result<AcceptOutcome, NetError> {
@@ -2492,7 +2557,9 @@ impl ChainHub {
             {
                 continue;
             }
-            let w = sum_work(branch.iter().map(|b| b.header.work()));
+            let Ok(w) = self.branch_header_work(&branch) else {
+                continue;
+            };
             let tip = branch.last().map(Block::block_hash);
             let is_p = tip == precious;
             let seq = match tip {
@@ -3028,7 +3095,7 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
     }
 }
 
-use crate::most_work::{sum_work, work_better};
+use crate::most_work::work_better;
 
 /// Tiny-head regtest [`ChainHub`] for tests. Not an operator API.
 #[cfg(test)]
@@ -3048,6 +3115,7 @@ pub(crate) fn tiny_regtest_hub_labeled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::most_work::sum_work;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash;
@@ -3086,6 +3154,42 @@ mod tests {
 
     fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
         super::tiny_regtest_hub_labeled("chain")
+    }
+
+    #[test]
+    fn into_arc_shares_one_hub() {
+        let (_dir, hub) = tmp_hub();
+        assert!(hub.shared_arc().is_none());
+        let hub = ChainHub::into_arc(hub);
+        let again = hub.shared_arc().expect("weak upgrades");
+        assert!(std::sync::Arc::ptr_eq(&hub, &again));
+    }
+
+    #[test]
+    fn wait_tip_accept_idle_blocks_until_the_job_finishes() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (_dir, hub) = tmp_hub();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            crate::tip_accept::run_on_tip_accept(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx.recv().unwrap();
+        let waiter = thread::spawn(move || hub.wait_tip_accept_idle());
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            !waiter.is_finished(),
+            "wait_tip_accept_idle returned while a tip-accept job was running"
+        );
+        release_tx.send(()).unwrap();
+        waiter.join().expect("wait");
+        worker.join().expect("job");
     }
 
     #[test]
@@ -3299,6 +3403,23 @@ mod tests {
     }
 
     #[test]
+    fn zero_prev_with_live_tip_is_not_held() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let tip = hub.tip_hash().unwrap();
+        let mut block = mine(tip, 1_300_000_100, 1);
+        block.header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0u8; 32]);
+        let err = hub.accept_received_block(block).expect_err("zero prev");
+        assert!(
+            err.to_string().contains("non-genesis prev is zero"),
+            "{err}"
+        );
+        assert_eq!(hub.tip_hash(), Some(tip));
+        assert_eq!(hub.held_body_count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn hold_body_caps_fifo() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -3421,6 +3542,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accept_received_block_async_connects_off_worker() {
         let (dir, hub) = tmp_hub();
+        let hub = ChainHub::into_arc(hub);
         let task = tokio::spawn(async move {
             {
                 let _g = crate::reactor::BlockingRegion::enter();
@@ -4891,8 +5013,8 @@ mod tests {
         };
         assert!(work_better(one, z));
         assert!(!work_better(z, one));
-        assert_eq!(sum_work(std::iter::empty()), z);
-        assert_eq!(sum_work([one].into_iter()), one);
+        assert_eq!(sum_work(std::iter::empty()).unwrap(), z);
+        assert_eq!(sum_work([one].into_iter()).unwrap(), one);
     }
 
     /// `feature_chain_tiebreaks.py`: after invalidate, equal-work held tips
@@ -5447,6 +5569,32 @@ mod tests {
             other => panic!("expected invalidated refuse, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn padded_coinbase_witness_over_weight_is_not_cached_invalid() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let honest = mine(gen, 1_300_070_000, 1);
+        let mut padded = honest.clone();
+        let mut wit = Witness::new();
+        wit.push(vec![0u8; 4_000_000]);
+        padded.txdata[0].input[0].witness = wit;
+        assert_eq!(padded.block_hash(), honest.block_hash());
+        hub.note_asked_block(honest.block_hash());
+        let _err = hub
+            .accept_received_block(padded)
+            .expect_err("witness padding past the weight limit must reject");
+        assert!(
+            !hub.is_block_invalid(&honest.block_hash()),
+            "witness padding must not cache the block hash"
+        );
+        assert!(matches!(
+            hub.accept_received_block(honest).unwrap(),
+            AcceptOutcome::Accepted { height: 1 }
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

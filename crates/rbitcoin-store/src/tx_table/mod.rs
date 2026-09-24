@@ -2921,10 +2921,19 @@ impl TxTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        self.sync_replay_bodies()?;
+        self.head.flush()?;
+        Ok(())
+    }
+
+    /// Bodies the tip-window check and spend replay read. Not `tx.head`.
+    pub(crate) fn sync_replay_bodies(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.seqsigwit.flush()?;
         self.spent.flush()?;
-        self.head.flush()?;
+        self.txids.flush()?;
+        self.txstat.flush()?;
+        self.input.flush()?;
         Ok(())
     }
 

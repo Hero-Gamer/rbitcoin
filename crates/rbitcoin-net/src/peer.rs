@@ -99,6 +99,17 @@ fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::LiveP
     }
 }
 
+fn note_accepted_hb(
+    r: &Result<AcceptOutcome, NetError>,
+    hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>,
+) {
+    if matches!(r, Ok(AcceptOutcome::Accepted { .. })) {
+        if let Some((ph, id)) = hb {
+            ph.maybe_select_hb(*id);
+        }
+    }
+}
+
 async fn accept_received_from_peer(
     hub: &ChainHub,
     block: Block,
@@ -110,16 +121,21 @@ async fn accept_received_from_peer(
     } else {
         None
     };
-    crate::tip_accept::run_on_tip_accept_async(move || {
+    if let Some(hub) = hub.shared_arc() {
+        return crate::tip_accept::run_on_tip_accept_async(move || {
+            let r = hub.accept_received_on_lane(block);
+            note_accepted_hb(&r, &hb);
+            r
+        })
+        .await;
+    }
+    // A stack hub (unit tests) has no `Arc`. Join before return so the
+    // borrow outlives the job.
+    crate::tip_accept::run_on_tip_accept(|| {
         let r = hub.accept_received_on_lane(block);
-        if matches!(&r, Ok(AcceptOutcome::Accepted { .. })) {
-            if let Some((ph, id)) = hb.as_ref() {
-                ph.maybe_select_hb(*id);
-            }
-        }
+        note_accepted_hb(&r, &hb);
         r
     })
-    .await
 }
 
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
@@ -129,9 +145,21 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
     }
 }
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
-const MAX_PENDING_CMPCT: usize = 8;
+const MAX_PENDING_CMPCT: usize = 1;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
+
+/// Same cap as a `headers` batch: a new hash at the limit drops the map.
+fn admit_pending_header(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    header: bitcoin::block::Header,
+) {
+    if pending.len() >= MAX_PENDING_HEADERS && !pending.contains_key(&hash) {
+        pending.clear();
+    }
+    pending.insert(hash, header);
+}
 /// Cap on decoded bodies stashed per session (DoS / process RAM). Must be
 /// ≥99 so tip-follow can assemble a 99-block competing branch; apply is
 /// `ChainHub::accept_received_block` (see `docs/architecture.md`).
@@ -271,6 +299,27 @@ pub fn version_handshake_timeout_log(peer: u64) -> String {
 /// Max addresses in one ADDR / addrv2. Interop size — do not change without
 /// a named reason to diverge (see COMPAT.md).
 pub const MAX_ADDR_TO_SEND: usize = 1000;
+/// Addresses one peer may relay before the bucket must refill (~0.1/s).
+pub(crate) const ADDR_RELAY_BURST: f64 = 1000.0;
+pub(crate) const ADDR_RELAY_PER_SEC: f64 = 0.1;
+
+pub(crate) fn addr_relay_tokens(tokens: f64, at_ms: u64, now_ms: u64) -> f64 {
+    if now_ms <= at_ms {
+        return tokens.min(ADDR_RELAY_BURST);
+    }
+    let dt = (now_ms - at_ms) as f64 / 1000.0;
+    (tokens + dt * ADDR_RELAY_PER_SEC).min(ADDR_RELAY_BURST)
+}
+
+fn addr_relay_key(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
+    let raw = bitcoin::consensus::encode::serialize(msg);
+    let mut h = 0xcbf29ce484222325u64;
+    for b in raw {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// GetAddr returns at most this percent of AddrMan (then `MAX_ADDR_TO_SEND`).
 /// Interop size — do not change without a named reason to diverge
@@ -302,7 +351,15 @@ pub fn ping_prior_to_verack_log(peer: u64) -> String {
 }
 
 pub fn unsupported_before_verack_log(cmd: &str, peer: u64) -> String {
+    let cmd = peer_log_text(cmd);
     format!("p2p: Unsupported message \"{cmd}\" prior to verack from peer={peer}")
+}
+
+/// One log line: peer-controlled bytes cannot insert a raw newline.
+fn peer_log_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
 }
 
 /// Disconnect peers advertising protocol version below this.
@@ -317,6 +374,7 @@ pub fn advertising_address_log(addr_port: impl std::fmt::Display, peer: u64) -> 
 }
 
 fn queue_addr_list(
+    session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
     addrs: Vec<(u32, crate::NetAddr)>,
     v2: bool,
@@ -332,7 +390,7 @@ fn queue_addr_list(
                 port: a.port(),
             })
             .collect();
-        queue_out(out, NetworkMessage::AddrV2(list))
+        queue_accounted(session, out, NetworkMessage::AddrV2(list))
     } else {
         let list: Vec<(u32, Address)> = addrs
             .into_iter()
@@ -343,7 +401,7 @@ fn queue_addr_list(
                 | crate::NetAddr::Cjdns { .. } => None,
             })
             .collect();
-        queue_out(out, NetworkMessage::Addr(list))
+        queue_accounted(session, out, NetworkMessage::Addr(list))
     }
 }
 
@@ -366,7 +424,24 @@ pub fn hidden_addr_from() -> Address {
 }
 
 pub fn non_version_before_handshake_log(cmd: &str, peer: u64) -> String {
+    let cmd = peer_log_text(cmd);
     format!("p2p: non-version message before version handshake. Message \"{cmd}\" from peer={peer}")
+}
+
+#[cfg(test)]
+mod log_text_tests {
+    use super::non_version_before_handshake_log;
+    use super::unsupported_before_verack_log;
+
+    #[test]
+    fn peer_command_logs_have_no_raw_newline() {
+        let line = non_version_before_handshake_log("inv\nX", 7);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(!line.contains('\r'), "{line:?}");
+        let line = unsupported_before_verack_log("ping\r\n", 3);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(!line.contains('\r'), "{line:?}");
+    }
 }
 
 /// Tip age in blocks: `(now - tip_time) / pow_target_spacing`.
@@ -1068,6 +1143,7 @@ async fn run_writer_task(
 ) {
     while let Some(first) = out_rx.recv().await {
         for out in take_outbound_write_batch(first, &mut out_rx) {
+            let n = crate::peers::outbound_queued_bytes(&out);
             let (full, err) = match out {
                 PeerOut::Msg(msg) => {
                     let full = matches!(
@@ -1080,6 +1156,9 @@ async fn run_writer_task(
                     (true, write_v2_contents(&mut writer, bytes).await.is_err())
                 }
             };
+            if let Some(s) = &writer_session {
+                s.note_send_written(n);
+            }
             if full {
                 if let Some(s) = &writer_session {
                     note_served_write(&s.serve_inflight);
@@ -1476,6 +1555,11 @@ pub async fn peer_session_with(
                 .is_some_and(|s| s.stop.load(Ordering::Relaxed))
             {
                 return Ok(());
+            }
+            if let Some(s) = session.as_ref() {
+                if s.send_over_budget() {
+                    s.wait_send_budget().await;
+                }
             }
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
             tokio::select! {
@@ -2291,7 +2375,7 @@ fn serve_mempool_getdata(
     let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
     if announced || mp.is_relay_servable(&wtxid, last_inv) {
         mp.mark_broadcast(&tx.compute_txid());
-        queue_out(out_tx, NetworkMessage::Tx(tx))?;
+        queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
         return Ok(true);
     }
     Ok(false)
@@ -2377,6 +2461,11 @@ fn handle_peer_inventory_msg(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    // The reply that crossed the budget is already queued. Do not serve
+    // another request until the writer drains.
+    if session.is_some_and(|s| s.send_over_budget()) {
+        return Ok(());
+    }
     match payload {
         NetworkMessage::Addr(list) => on_addr_list(follow, session, list.len())?,
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
@@ -2513,13 +2602,48 @@ fn on_addrv2(
     if let Some(s) = session {
         if let Some(ph) = s.peer_hub() {
             ph.learn_addrv2(list);
-            for other in ph.live_peers() {
-                if other.id == s.id || !other.wants_addrv2() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let allow = s.take_addr_relay(list.len(), now_ms);
+            let mut neighbors: Vec<_> = ph
+                .live_peers()
+                .into_iter()
+                .filter(|other| {
+                    other.id != s.id && other.wants_addrv2() && other.writer().is_some()
+                })
+                .collect();
+            neighbors.sort_by_key(|other| other.id);
+            for addr in list.iter().take(allow) {
+                let key = addr_relay_key(addr);
+                let n_dest = if neighbors.len() <= 1 {
+                    neighbors.len()
+                } else if key & 1 == 0 {
+                    1
+                } else {
+                    2
+                };
+                if n_dest == 0 {
                     continue;
                 }
-                if let Some(tx) = other.writer() {
-                    rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
-                    queue_out(&tx, NetworkMessage::AddrV2(list.to_vec()))?;
+                let start = (key as usize) % neighbors.len();
+                for step in 0..n_dest {
+                    let idx = match step {
+                        0 => start,
+                        _ => {
+                            if start + 1 == neighbors.len() {
+                                0
+                            } else {
+                                start + 1
+                            }
+                        }
+                    };
+                    let other = &neighbors[idx];
+                    if let Some(tx) = other.writer() {
+                        rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
+                        queue_out(&tx, NetworkMessage::AddrV2(vec![addr.clone()]))?;
+                    }
                 }
             }
         }
@@ -2552,7 +2676,7 @@ fn on_getheaders(
                 s.note_best_header_sent(tip);
             }
         }
-        queue_out(out_tx, NetworkMessage::Headers(headers))?;
+        queue_accounted(session, out_tx, NetworkMessage::Headers(headers))?;
     }
     Ok(())
 }
@@ -2583,7 +2707,7 @@ fn on_getblocks(
         .map(|h| Inventory::WitnessBlock(h.block_hash()))
         .collect();
     if !inv.is_empty() {
-        queue_out(out_tx, NetworkMessage::Inv(inv))?;
+        queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
     }
     Ok(())
 }
@@ -2595,15 +2719,19 @@ async fn serve_getdata(
     session: Option<&crate::peers::LivePeer>,
     inv: &[Inventory],
 ) -> Result<(), NetError> {
+    if inv.len() > MAX_INV_SIZE {
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     let inflight = session.map(|s| &s.serve_inflight);
     let mut notfound: Vec<Inventory> = Vec::new();
-    for item in inv.iter().take(MAX_INV_SIZE) {
+    for item in inv {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                serve_getdata_full_block(hub, out_tx, inflight, h).await?;
+                serve_getdata_full_block(hub, out_tx, session, inflight, h).await?;
             }
             Inventory::CompactBlock(h) => {
-                serve_getdata_compact(hub, out_tx, follow, inflight, h)?;
+                serve_getdata_compact(hub, out_tx, follow, session, inflight, h)?;
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
@@ -2618,7 +2746,7 @@ async fn serve_getdata(
         }
     }
     if !notfound.is_empty() {
-        queue_out(out_tx, NetworkMessage::NotFound(notfound))?;
+        queue_accounted(session, out_tx, NetworkMessage::NotFound(notfound))?;
     }
     Ok(())
 }
@@ -2626,6 +2754,7 @@ async fn serve_getdata(
 async fn serve_getdata_full_block(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
     inflight: Option<&AtomicUsize>,
     h: &bitcoin::BlockHash,
 ) -> Result<(), NetError> {
@@ -2645,7 +2774,7 @@ async fn serve_getdata_full_block(
     .await
     .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
     if let Some(bytes) = encoded {
-        let _ = try_queue_served_encoded(out_tx, inflight, bytes)?;
+        let _ = try_queue_served_encoded(session, out_tx, inflight, bytes)?;
     }
     Ok(())
 }
@@ -2654,6 +2783,7 @@ fn serve_getdata_compact(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
     inflight: Option<&AtomicUsize>,
     h: &bitcoin::BlockHash,
 ) -> Result<(), NetError> {
@@ -2672,7 +2802,7 @@ fn serve_getdata_compact(
         .map(|ht| ht.0)
         .unwrap_or(0);
     if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-        let _ = try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
+        let _ = try_queue_served_block(session, out_tx, inflight, NetworkMessage::Block(block))?;
         return Ok(());
     }
     let ver = follow.cmpct_version.clamp(1, 2);
@@ -2683,12 +2813,13 @@ fn serve_getdata_compact(
             crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
         );
         let _ = try_queue_served_block(
+            session,
             out_tx,
             inflight,
             NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
         )?;
     } else {
-        let _ = try_queue_served_block(out_tx, inflight, NetworkMessage::Block(block))?;
+        let _ = try_queue_served_block(session, out_tx, inflight, NetworkMessage::Block(block))?;
     }
     Ok(())
 }
@@ -2711,7 +2842,7 @@ fn serve_getdata_wtx(
     let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
     if announced {
         if let Some(tx) = tx_from_tip_block(hub, wtxid) {
-            queue_out(out_tx, NetworkMessage::Tx(tx))?;
+            queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
             return Ok(());
         }
     }
@@ -2791,6 +2922,10 @@ fn on_inv(
     session: Option<&crate::peers::LivePeer>,
     items: &[Inventory],
 ) -> Result<(), NetError> {
+    if items.len() > MAX_INV_SIZE {
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     let mut want = Vec::new();
     let mut inv_tx_n = 0u64;
     let mut need_headers = false;
@@ -2798,7 +2933,7 @@ fn on_inv(
     let relay = !hub.in_ibd()
         && (hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
             || session.is_some_and(|s| s.session_relay_perm()));
-    for item in items.iter().take(MAX_INV_SIZE) {
+    for item in items {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {
@@ -2960,12 +3095,7 @@ fn on_headers(
                 s.note_block_from_peer(hash);
                 s.note_best_known(hash);
             }
-            if follow.pending_headers.len() >= MAX_PENDING_HEADERS
-                && !follow.pending_headers.contains_key(&hash)
-            {
-                follow.pending_headers.clear();
-            }
-            follow.pending_headers.insert(hash, *hdr);
+            admit_pending_header(&mut follow.pending_headers, hash, *hdr);
         }
         if !connecting {
             if n < MAX_HEADERS_RESULTS {
@@ -3058,7 +3188,7 @@ async fn on_block(
             let _ = s.take_awaiting_headers();
         }
         let _ = queue_getheaders(out_tx, hub, session, true, None);
-        follow.pending_headers.entry(hash).or_insert(block.header);
+        admit_pending_header(&mut follow.pending_headers, hash, block.header);
         follow.pending_blocks.insert(hash, block.clone());
         hub.forget_asked_block(&hash);
         return Ok(());
@@ -3066,10 +3196,15 @@ async fn on_block(
     if on_block_unrequested_skip(hub, follow, session, block, hash)? {
         return Ok(());
     }
-    let _ = hub.ensure_header(&block.header);
+    if let Err(e) = hub.ensure_header(&block.header) {
+        if !crate::chain::accept_err_is_temporary_time(&e) {
+            punish_disconnect(&mut follow.ban_score, session);
+        }
+        return Ok(());
+    }
     drop_pending_cmpct(follow, session, hash);
     follow.requested_blocks.remove(&hash);
-    follow.pending_headers.entry(hash).or_insert(block.header);
+    admit_pending_header(&mut follow.pending_headers, hash, block.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
         follow.pending_blocks.insert(hash, block.clone());
         return Ok(());
@@ -3088,10 +3223,6 @@ fn on_block_unrequested_skip(
     if follow.requested_blocks.contains(&hash) {
         return Ok(false);
     }
-    if hub.header_below_minwork(&block.header) {
-        rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
-        return Ok(true);
-    }
     let prev = block.header.prev_blockhash;
     if prev.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&prev)
@@ -3101,12 +3232,20 @@ fn on_block_unrequested_skip(
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(true);
     }
+    if let Err(e) = hub.ensure_header(&block.header) {
+        if !crate::chain::accept_err_is_temporary_time(&e) {
+            punish_disconnect(&mut follow.ban_score, session);
+        }
+        return Ok(true);
+    }
+    if hub.header_below_minwork(&block.header) {
+        rbitcoin_log::info!("{}", accept_block_header_nodos_log(hash));
+        return Ok(true);
+    }
     if hub.header_below_anti_dos(&block.header) && !follow.pending_headers.contains_key(&hash) {
-        let _ = hub.ensure_header(&block.header);
         return Ok(true);
     }
     if hub.unrequested_too_far_ahead(&block.header) {
-        let _ = hub.ensure_header(&block.header);
         return Ok(true);
     }
     Ok(false)
@@ -3184,7 +3323,7 @@ async fn on_cmpctblock(
         }
         let _ = queue_getheaders(out_tx, hub, session, true, None);
     }
-    follow.pending_headers.entry(hash).or_insert(hsi.header);
+    admit_pending_header(&mut follow.pending_headers, hash, hsi.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
         return Ok(());
     }
@@ -3372,7 +3511,6 @@ fn on_cmpct_need_txn(
     }
     let missing_n = partial.missing().len();
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
-        follow.ban_score = follow.ban_score.saturating_add(10);
         log_cmpct_getdata(hash, missing_n);
         return queue_out(
             out_tx,
@@ -3560,6 +3698,14 @@ enum TxAcceptLog<'a> {
     Reject,
 }
 
+/// Invalid-script announcements are misbehavior. Policy rejects are not.
+pub(crate) fn tx_reject_ban_score(e: &rbitcoin_mempool::AcceptError) -> u32 {
+    match e {
+        rbitcoin_mempool::AcceptError::Script(_) => 10,
+        _ => 0,
+    }
+}
+
 fn tx_accept_log(e: &rbitcoin_mempool::AcceptError) -> TxAcceptLog<'_> {
     match e {
         rbitcoin_mempool::AcceptError::Duplicate(_) => TxAcceptLog::Silent,
@@ -3712,6 +3858,8 @@ async fn on_tx(
                             }
                         }
                         TxAcceptLog::Reject => {
+                            follow.ban_score =
+                                follow.ban_score.saturating_add(tx_reject_ban_score(&e));
                             let id = session.map(|s| s.id).unwrap_or(0);
                             rbitcoin_log::info!(
                                 "{txid} (wtxid={}) from peer={id} was not accepted: {}",
@@ -3742,6 +3890,9 @@ fn on_getaddr(
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
     if let Some(s) = session {
+        if !s.take_getaddr() {
+            return Ok(());
+        }
         let _ = maybe_queue_local_addr(hub, s, out_tx);
     }
     let bind = session
@@ -3752,7 +3903,7 @@ fn on_getaddr(
         Some(ph) => ph.addr_response_net(bind, v2),
         None => Vec::new(),
     };
-    queue_addr_list(out_tx, addrs, v2)?;
+    queue_addr_list(session, out_tx, addrs, v2)?;
     Ok(())
 }
 
@@ -4175,9 +4326,7 @@ fn work_of_header_path(
                 .0;
             let base = hub.work_through_height(height).ok()?;
             extra.reverse();
-            return Some(crate::most_work::sum_work(
-                std::iter::once(base).chain(extra),
-            ));
+            return crate::most_work::sum_work(std::iter::once(base).chain(extra)).ok();
         }
         let hdr = pending.get(&h).copied().or_else(|| hub.header_of(&h))?;
         if !hub.header_claimed_pow_ok(&hdr) {
@@ -4187,7 +4336,7 @@ fn work_of_header_path(
         h = hdr.prev_blockhash;
         if h.to_byte_array() == [0u8; 32] {
             extra.reverse();
-            return Some(crate::most_work::sum_work(extra.into_iter()));
+            return crate::most_work::sum_work(extra.into_iter()).ok();
         }
     }
     None
@@ -4333,19 +4482,42 @@ pub(crate) fn outbound_feefilter_sats(
 }
 
 fn queue_out(out: &mpsc::UnboundedSender<PeerOut>, msg: NetworkMessage) -> Result<(), NetError> {
-    out.send(PeerOut::Msg(msg))
-        .map_err(|_| NetError::Protocol("peer write half closed"))
+    queue_accounted(None, out, msg)
 }
 
-fn queue_encoded(out: &mpsc::UnboundedSender<PeerOut>, bytes: Vec<u8>) -> Result<(), NetError> {
+fn queue_accounted(
+    session: Option<&crate::peers::LivePeer>,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    msg: NetworkMessage,
+) -> Result<(), NetError> {
+    let n = crate::peers::outbound_msg_bytes(&msg);
+    out.send(PeerOut::Msg(msg))
+        .map_err(|_| NetError::Protocol("peer write half closed"))?;
+    if let Some(s) = session {
+        s.note_send_queued(n);
+    }
+    Ok(())
+}
+
+fn queue_encoded_for(
+    session: Option<&crate::peers::LivePeer>,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    bytes: Vec<u8>,
+) -> Result<(), NetError> {
+    let n = bytes.len();
     out.send(PeerOut::Encoded(bytes))
-        .map_err(|_| NetError::Protocol("peer write half closed"))
+        .map_err(|_| NetError::Protocol("peer write half closed"))?;
+    if let Some(s) = session {
+        s.note_send_queued(n);
+    }
+    Ok(())
 }
 
 /// Queue a reconstructed `Block`/`CmpctBlock` if this session is under the serve cap.
 ///
 /// `None` inflight (tests without a session) always queues.
 pub(crate) fn try_queue_served_block(
+    session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
     inflight: Option<&AtomicUsize>,
     msg: NetworkMessage,
@@ -4355,17 +4527,18 @@ pub(crate) fn try_queue_served_block(
             return Ok(false);
         }
         n.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = queue_out(out, msg) {
+        if let Err(e) = queue_accounted(session, out, msg) {
             note_served_write(n);
             return Err(e);
         }
         return Ok(true);
     }
-    queue_out(out, msg)?;
+    queue_accounted(session, out, msg)?;
     Ok(true)
 }
 
 fn try_queue_served_encoded(
+    session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
     inflight: Option<&AtomicUsize>,
     bytes: Vec<u8>,
@@ -4375,13 +4548,13 @@ fn try_queue_served_encoded(
             return Ok(false);
         }
         n.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = queue_encoded(out, bytes) {
+        if let Err(e) = queue_encoded_for(session, out, bytes) {
             note_served_write(n);
             return Err(e);
         }
         return Ok(true);
     }
-    queue_encoded(out, bytes)?;
+    queue_encoded_for(session, out, bytes)?;
     Ok(true)
 }
 

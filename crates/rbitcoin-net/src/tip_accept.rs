@@ -122,8 +122,8 @@ pub(crate) fn on_tip_accept_thread() -> bool {
 
 fn erase_lifetime(job: Box<dyn FnOnce() + Send + '_>) -> Job {
     // SAFETY: `run_on_tip_accept` blocks on the result channel until `f`
-    // returns, so captured borrows outlive the job. The async path is `'static`
-    // and does not use this transmute.
+    // returns, so captured borrows outlive the job. The async path is
+    // `'static` and does not call this.
     unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) }
 }
 
@@ -174,18 +174,23 @@ fn finish_cell<R>(cell: &JobCell<R>, r: thread::Result<R>) {
 }
 
 /// Same as [`run_on_tip_accept`] but the caller `.await`s (peer session).
-pub(crate) async fn run_on_tip_accept_async<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+///
+/// `f` is `'static`: dropping the session future does not join, so the job
+/// must not borrow the caller's stack.
+pub(crate) async fn run_on_tip_accept_async<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> R {
     let cell = Arc::new(JobCell {
         result: Mutex::new(None),
         waker: Mutex::new(None),
     });
     let cell_w = Arc::clone(&cell);
-    let job = erase_lifetime(Box::new(move || {
+    let job: Job = Box::new(move || {
         begin_job();
         let _end = InflightEnd;
         let r = panic::catch_unwind(AssertUnwindSafe(f));
         finish_cell(&cell_w, r);
-    }));
+    });
     let mut job = job;
     loop {
         match sender().try_send(job) {
@@ -371,5 +376,38 @@ mod tests {
             *lock.lock().unwrap() = true;
             cv.notify_one();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_job_finishes_after_waiter_abort() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let saw = Arc::new(AtomicU8::new(0));
+        let saw_job = Arc::clone(&saw);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let waiter = tokio::spawn(async move {
+            run_on_tip_accept_async(move || {
+                saw_job.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                saw_job.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        });
+        started_rx.recv().expect("job started");
+        waiter.abort();
+        release_tx.send(()).unwrap();
+        let t0 = Instant::now();
+        while saw.load(Ordering::SeqCst) < 2 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "aborted waiter left the tip-accept job unfinished"
+            );
+            tokio::task::yield_now().await;
+        }
+        wait_idle();
     }
 }

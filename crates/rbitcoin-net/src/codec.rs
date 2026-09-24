@@ -82,6 +82,13 @@ impl FramedMessage {
         self.command == *b"notfound\0\0\0\0"
     }
 
+    #[inline]
+    fn is_inv_like(&self) -> bool {
+        self.command == *b"inv\0\0\0\0\0\0\0\0\0"
+            || self.command == *b"getdata\0\0\0\0\0"
+            || self.is_notfound()
+    }
+
     /// Cheap ping nonce extract (8-byte LE payload). No full message deserialize.
     pub fn ping_nonce(&self) -> Option<u64> {
         if !self.is_ping() || self.payload.len() < 8 {
@@ -114,6 +121,15 @@ impl FramedMessage {
             if let Ok(n) = bitcoin::consensus::encode::VarInt::consensus_decode(&mut sl) {
                 let n = n.0 as usize;
                 if n > MAX_HEADERS_RESULTS {
+                    return Err(crate::error::NetError::MessageTooLarge(n));
+                }
+            }
+        }
+        if self.is_inv_like() {
+            let mut sl = self.payload.as_slice();
+            if let Ok(n) = bitcoin::consensus::encode::VarInt::consensus_decode(&mut sl) {
+                let n = n.0 as usize;
+                if n > MAX_INV_SIZE {
                     return Err(crate::error::NetError::MessageTooLarge(n));
                 }
             }
@@ -318,6 +334,54 @@ mod tests {
     fn core_limits_documented() {
         assert_eq!(MAX_PROTOCOL_MESSAGE_LENGTH, 4_000_000);
         assert_eq!(MAX_INV_SIZE, 50_000);
+        let mut payload = vec![0xfd];
+        payload.extend_from_slice(&50_001u16.to_le_bytes());
+        let frame = FramedMessage {
+            magic: Magic::from(bitcoin::Network::Regtest),
+            command: *b"inv\0\0\0\0\0\0\0\0\0",
+            payload: payload.clone(),
+        };
+        match frame.try_decode() {
+            Err(crate::error::NetError::MessageTooLarge(n)) => assert_eq!(n, 50_001),
+            other => panic!("oversize inv must fail decode, got {other:?}"),
+        }
+        let mut at_cap = vec![0xfd];
+        at_cap.extend_from_slice(&50_000u16.to_le_bytes());
+        let at_cap = FramedMessage {
+            magic: Magic::from(bitcoin::Network::Regtest),
+            command: *b"inv\0\0\0\0\0\0\0\0\0",
+            payload: at_cap,
+        };
+        assert!(
+            !matches!(
+                at_cap.try_decode(),
+                Err(crate::error::NetError::MessageTooLarge(_))
+            ),
+            "exactly 50_000 inv entries is still a message"
+        );
+        for command in [*b"getdata\0\0\0\0\0", *b"notfound\0\0\0\0"] {
+            let over = FramedMessage {
+                magic: Magic::from(bitcoin::Network::Regtest),
+                command,
+                payload: payload.clone(),
+            };
+            match over.try_decode() {
+                Err(crate::error::NetError::MessageTooLarge(n)) => assert_eq!(n, 50_001),
+                other => panic!("oversize {command:?} must fail decode, got {other:?}"),
+            }
+        }
+        let tx = FramedMessage {
+            magic: Magic::from(bitcoin::Network::Regtest),
+            command: *b"tx\0\0\0\0\0\0\0\0\0\0",
+            payload,
+        };
+        assert!(
+            !matches!(
+                tx.try_decode(),
+                Err(crate::error::NetError::MessageTooLarge(_))
+            ),
+            "a tx payload is not an inv count"
+        );
         assert_eq!(MAX_HEADERS_RESULTS, 2_000);
         assert_eq!(MAX_LOCATOR_SZ, 101);
         // Stricter than rust-bitcoin's 5MB

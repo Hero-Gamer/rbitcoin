@@ -136,7 +136,7 @@ mod tests {
             StoreError::Unavailable,
             StoreError::Layout("seqsigwit is on a cold datadir".into()),
             StoreError::Stale("chain view moved"),
-            StoreError::Rejected("scripthash join exceeds --max-sh-creates"),
+            StoreError::Rejected("scripthash join exceeds --max-sh-creates (default 10000)"),
             StoreError::Pruned { height: 12 },
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
@@ -153,7 +153,10 @@ mod tests {
         assert_eq!(texts[9], "io_uring unavailable");
         assert_eq!(texts[10], "seqsigwit is on a cold datadir");
         assert_eq!(texts[11], "chain view moved");
-        assert_eq!(texts[12], "scripthash join exceeds --max-sh-creates");
+        assert_eq!(
+            texts[12],
+            "scripthash join exceeds --max-sh-creates (default 10000)"
+        );
         assert_eq!(texts[13], "pruned data at height 12");
         for e in &arms {
             assert!(e.source().is_none());

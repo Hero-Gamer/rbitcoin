@@ -96,7 +96,30 @@ where
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
+    if sync {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// `fsync` the directory so a renamed dirent survives a crash.
+///
+/// Windows denies a directory handle (`ERROR_ACCESS_DENIED`), including with
+/// backup semantics. The file itself was already `sync_all`'d before rename.
+pub(crate) fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Trailing-header tables (`tx.head`): 16-byte store identity + 16-byte layout
@@ -727,6 +750,11 @@ impl TableFile {
             self.persist_hwm(logical)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_sync(&self) -> bool {
+        self.needs_sync.load(Ordering::Acquire)
     }
 
     /// Persist HWM / trailer and `sync_data`.
@@ -1422,6 +1450,17 @@ mod advise_tests {
         assert!(!dest.exists());
         write_synced_tmp_rename(&dest, b"sealed").unwrap();
         assert!(dest.exists());
+        #[cfg(unix)]
+        {
+            let missing = dir.join("no-such-parent");
+            let err = fsync_parent_dir(&missing).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            let bare = std::path::PathBuf::from(format!("rbitcoin-bare-seal-{id}"));
+            let _ = std::fs::remove_file(&bare);
+            write_synced_tmp_rename(&bare, b"x").unwrap();
+            assert_eq!(std::fs::read(&bare).unwrap(), b"x");
+            let _ = std::fs::remove_file(&bare);
+        }
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"sealed");
         let _ = std::fs::remove_dir_all(&dir);

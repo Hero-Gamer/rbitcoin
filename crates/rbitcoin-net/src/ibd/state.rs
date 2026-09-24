@@ -136,6 +136,10 @@ pub(crate) struct IbdWorkState {
     pub confirm_quiesce: bool,
     /// Repeated Cascade at the same tip for the same hash → escalate to halt.
     pub cascade_at: Option<(BlockHash, [u8; 32], u8)>,
+    /// Assign-stop byte budget, snapshotted when assign runs (`u64::MAX` = off).
+    pub(crate) intake_stop: u64,
+    /// Body-queue bytes snapshotted with [`Self::intake_stop`].
+    pub(crate) intake_queued: u64,
 }
 
 impl IbdWorkState {
@@ -192,6 +196,8 @@ impl IbdWorkState {
             confirm_stuck_since: None,
             confirm_quiesce: false,
             cascade_at: None,
+            intake_stop: u64::MAX,
+            intake_queued: 0,
         }
     }
 

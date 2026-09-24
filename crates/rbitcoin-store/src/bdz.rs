@@ -196,6 +196,9 @@ impl BdzMphf {
         if self.n == 1 {
             return Ok(vec![self.one_key_index()?; keys.len()]);
         }
+        if self.modulus == 0 || self.m == 0 {
+            return Err(StoreError::Corrupt("bdz mphf: zero modulus"));
+        }
         match &self.g {
             GStore::Ram(g) => Ok(keys.iter().map(|&k| self.index_from_g(g, k)).collect()),
             GStore::Fd { .. } => self.index_batch_fd(keys, ctx),
@@ -425,6 +428,9 @@ impl BdzMphf {
                 g: GStore::Ram(Box::new([])),
                 compact: None,
             });
+        }
+        if n > 1 && (m == 0 || modulus == 0) {
+            return Err(StoreError::Corrupt("bdz mphf: zero modulus"));
         }
         let n_verts = if n == 1 { 1 } else { m };
         let n_bytes = packed_g_bytes(n_verts, g_bits);
@@ -1278,6 +1284,73 @@ impl CompactRank {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_packed_zero_modulus_or_vertices_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-bdz-zero-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("z.bdz");
+        let mut hdr = vec![0u8; 32];
+        hdr[0..4].copy_from_slice(b"BDZ2");
+        hdr[4..8].copy_from_slice(&1u32.to_le_bytes());
+        hdr[8..12].copy_from_slice(&2u32.to_le_bytes());
+        hdr[12..16].copy_from_slice(&4u32.to_le_bytes());
+        hdr[16..24].copy_from_slice(&1u64.to_le_bytes());
+        hdr[24..28].copy_from_slice(&0u32.to_le_bytes());
+        hdr[28..32].copy_from_slice(&1u32.to_le_bytes());
+        hdr.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&path, &hdr).unwrap();
+        match BdzMphf::read_packed_from(&path) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("zero modulus must be Corrupt, got {other:?}"),
+        }
+        hdr[12..16].copy_from_slice(&0u32.to_le_bytes());
+        hdr[24..28].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &hdr).unwrap();
+        match BdzMphf::read_packed_from(&path) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("zero vertex count must be Corrupt, got {other:?}"),
+        }
+        // n == 1 does not use the modulus. A `>` → `>=` gate would reject it.
+        hdr[8..12].copy_from_slice(&1u32.to_le_bytes());
+        hdr[12..16].copy_from_slice(&0u32.to_le_bytes());
+        hdr[24..28].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &hdr).unwrap();
+        let one = BdzMphf::read_packed_from(&path).expect("n=1 ignores a zero modulus");
+        assert_eq!(one.index(9).unwrap(), one.index(9).unwrap());
+        let zero_mod = BdzMphf {
+            n: 2,
+            m: 4,
+            seed: 1,
+            modulus: 0,
+            g: GStore::Ram(vec![0u32; 4].into_boxed_slice()),
+            compact: None,
+        };
+        match zero_mod.index_batch(&[1], &mut crate::IoCtx::none()) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("index with modulus 0 must be Corrupt, got {other:?}"),
+        }
+        let zero_m = BdzMphf {
+            n: 2,
+            m: 0,
+            seed: 1,
+            modulus: 1,
+            g: GStore::Ram(vec![0u32; 1].into_boxed_slice()),
+            compact: None,
+        };
+        match zero_m.index_batch(&[1], &mut crate::IoCtx::none()) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("modulus"), "{m}"),
+            other => panic!("index with m 0 must be Corrupt, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn bdz_injective_10k() {

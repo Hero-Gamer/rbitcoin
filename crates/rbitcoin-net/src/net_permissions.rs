@@ -295,6 +295,19 @@ pub struct NetPermTable {
 }
 
 impl NetPermTable {
+    pub fn flags_for_net(
+        &self,
+        net: crate::NetAddr,
+        inbound: bool,
+        bind: SocketAddr,
+    ) -> NetPermissionFlags {
+        match net {
+            crate::NetAddr::Onion { .. } | crate::NetAddr::I2p { .. } => NetPermissionFlags::NONE,
+            crate::NetAddr::Ip(s) => self.flags_for(s.ip(), inbound, bind),
+            crate::NetAddr::Cjdns { ip, .. } => self.flags_for(IpAddr::V6(ip), inbound, bind),
+        }
+    }
+
     pub fn flags_for(&self, ip: IpAddr, inbound: bool, bind: SocketAddr) -> NetPermissionFlags {
         let mut flags = NetPermissionFlags::NONE;
         for g in &self.whitelist {
@@ -339,6 +352,31 @@ mod tests {
 
     fn bind() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18444))
+    }
+
+    #[test]
+    fn loopback_grant_does_not_cover_onion_or_i2p() {
+        let mut t = NetPermTable::default();
+        t.whitelist
+            .push(parse_whitelist("noban@127.0.0.1").unwrap());
+        let onion = crate::NetAddr::Onion {
+            pk: [0x11; 32],
+            port: 8333,
+        };
+        let i2p = crate::NetAddr::I2p {
+            dest: [0x22; 32],
+            port: 0,
+        };
+        assert!(!t
+            .flags_for_net(onion, true, bind())
+            .has(NetPermissionFlags::NOBAN));
+        assert!(!t
+            .flags_for_net(i2p, true, bind())
+            .has(NetPermissionFlags::NOBAN));
+        let local = crate::NetAddr::Ip("127.0.0.1:8333".parse().unwrap());
+        assert!(t
+            .flags_for_net(local, true, bind())
+            .has(NetPermissionFlags::NOBAN));
     }
 
     #[test]

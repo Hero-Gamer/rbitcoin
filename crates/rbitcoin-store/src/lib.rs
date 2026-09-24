@@ -49,6 +49,7 @@ mod sorted_run;
 mod sp_tweaks;
 mod sp_tweaks_uring;
 pub mod spend_annotate_uring;
+mod spend_durable;
 mod spender_table;
 mod store;
 mod store_secret;
@@ -93,6 +94,7 @@ pub use sorted_run::{
 pub use sp_tweaks::SpTweaksTable;
 pub use sp_tweaks_uring::load_tweak_wave;
 pub use spend_annotate_uring::spend_ann_backend;
+pub use spend_durable::SPEND_DURABLE_NAME;
 pub use store::{keep_unspent_vout_subsequence, Store, StoreLayout};
 pub use store_secret::StoreSecret;
 pub use tx_table::HeadResizeSizeSnapshot;

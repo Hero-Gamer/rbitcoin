@@ -1,5 +1,6 @@
 use super::*;
 use crate::peers::{CappedSet, PeerOut};
+use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,30 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
         PeerOut::Msg(NetworkMessage::Block(b)) => b,
         other => panic!("expected served block, got {other:?}"),
     }
+}
+
+#[test]
+fn pending_header_insert_past_cap_clears() {
+    let mut pending = HashMap::new();
+    let hdr = bitcoin::block::Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+        nonce: 0,
+    };
+    for i in 0..super::MAX_PENDING_HEADERS {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        super::admit_pending_header(&mut pending, BlockHash::from_byte_array(bytes), hdr);
+    }
+    assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
+    let kept = *pending.keys().next().unwrap();
+    super::admit_pending_header(&mut pending, kept, hdr);
+    assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
+    super::admit_pending_header(&mut pending, BlockHash::from_byte_array([0xff; 32]), hdr);
+    assert_eq!(pending.len(), 1);
 }
 
 #[test]
@@ -6182,7 +6207,8 @@ fn try_queue_served_block_false_at_cap() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let n = AtomicUsize::new(MAX_SERVE_BLOCKS);
     let gen = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let queued = try_queue_served_block(&out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
+    let queued =
+        try_queue_served_block(None, &out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
     assert!(!queued);
     assert!(out_rx.try_recv().is_err());
     assert_eq!(n.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
@@ -10296,4 +10322,644 @@ fn on_tx_announce_none_lagged_closed_are_ok() {
     follow.from_this_peer.insert(txid, FROM_THIS_PEER_CAP);
     assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann))).is_ok());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn header_reject_punishes_except_temporary_time() {
+    use bitcoin::ScriptBuf;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-punish");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let mut bad_pow =
+        rbitcoin_consensus::mine_regtest_paying(gen, 1_300_000_100, 1, script.clone(), vec![]);
+    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+    let pow_err = hub.ensure_header(&bad_pow.header).unwrap_err();
+    assert!(
+        !crate::chain::accept_err_is_temporary_time(&pow_err),
+        "bad pow is not a temporary stamp: {pow_err}"
+    );
+
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, None, &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "a requested header with bad pow must disconnect"
+    );
+
+    let mut follow = PeerFollowState::new();
+    let skipped =
+        on_block_unrequested_skip(&hub, &mut follow, None, &bad_pow, bad_pow.block_hash()).unwrap();
+    assert!(skipped, "unrequested bad pow is not accepted");
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "an unrequested header with bad pow must disconnect"
+    );
+
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future = rbitcoin_consensus::mine_regtest_paying(gen, now + 3 * 3600, 1, script, vec![]);
+    let time_err = hub.ensure_header(&future.header).unwrap_err();
+    assert!(
+        crate::chain::accept_err_is_temporary_time(&time_err),
+        "a stamp past the two-hour window is temporary: {time_err}"
+    );
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(future.block_hash());
+    on_block(&hub, &out_tx, &mut follow, None, &future)
+        .await
+        .unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "time-too-new must not disconnect a requested block"
+    );
+    let mut follow = PeerFollowState::new();
+    let skipped =
+        on_block_unrequested_skip(&hub, &mut follow, None, &future, future.block_hash()).unwrap();
+    assert!(skipped, "a future header is still not applied");
+    assert_eq!(
+        follow.ban_score, 0,
+        "time-too-new must not disconnect an unrequested block"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::Txid;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("inv-cap");
+    hub.ensure_genesis().unwrap();
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let block = Inventory::CompactBlock(hub.tip_hash().unwrap());
+    let at_cap = vec![block; MAX_INV_SIZE];
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &out_tx, &mut follow, None, &at_cap).unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "exactly {MAX_INV_SIZE} inv items stay connected"
+    );
+    let mut over = at_cap;
+    over.push(block);
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &out_tx, &mut follow, None, &over).unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "one past the inv cap disconnects"
+    );
+
+    let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x22; 32]));
+    let at_cap = vec![tx; MAX_INV_SIZE];
+    let mut follow = PeerFollowState::new();
+    serve_getdata(&hub, &out_tx, &mut follow, None, &at_cap)
+        .await
+        .unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "exactly {MAX_INV_SIZE} getdata items are served"
+    );
+    let mut over = at_cap;
+    over.push(tx);
+    let mut follow = PeerFollowState::new();
+    serve_getdata(&hub, &out_tx, &mut follow, None, &over)
+        .await
+        .unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "one past the getdata cap disconnects"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A peer that asks for headers and never reads must not grow the outbound
+/// queue without bound. One getaddr is answered; a second is not.
+#[test]
+fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
+    use crate::peers::{PeerConnType, PeerHub};
+    use bitcoin::hashes::Hash;
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::ScriptBuf;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("send-budget");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let genesis = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(0))
+        .unwrap()
+        .block_hash();
+    let peers = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 7,
+        user_agent: "/rbitcoin:0.1.0(sendbuf)/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, PeerConnType::Inbound);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let gh = GetHeadersMessage::new(vec![genesis], BlockHash::from_byte_array([0u8; 32]));
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetHeaders(gh.clone()),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    let NetworkMessage::Headers(first) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("one getheaders under the budget must be answered");
+    };
+    assert_eq!(first.len(), 200, "locator after genesis walks the tip");
+
+    let mut queued = 1usize;
+    for _ in 0..400 {
+        handle_peer_inventory_msg(
+            &NetworkMessage::GetHeaders(gh.clone()),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(&peer),
+        )
+        .unwrap();
+        match out_rx.try_recv() {
+            Ok(_) => queued += 1,
+            Err(_) => break,
+        }
+    }
+    let batch = first.len().saturating_mul(81);
+    let room = crate::peers::PEER_SEND_BUDGET / batch;
+    assert!(
+        queued <= room + 2,
+        "queued {queued} header batches while the peer read nothing (room {room})"
+    );
+    assert!(
+        queued > 1,
+        "a getheaders under the budget produced no further reply"
+    );
+
+    let before = peer.send_queued();
+    queue_accounted(
+        Some(&peer),
+        &out_tx,
+        NetworkMessage::Inv(vec![Inventory::Block(genesis)]),
+    )
+    .unwrap();
+    assert_eq!(peer.send_queued() - before, 36, "inv rows are 36 bytes");
+    queue_accounted(
+        Some(&peer),
+        &out_tx,
+        NetworkMessage::NotFound(vec![Inventory::Block(genesis)]),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.send_queued() - before,
+        36 + 36,
+        "notfound rows are 36 bytes"
+    );
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let tx_n = tx.total_size();
+    queue_accounted(Some(&peer), &out_tx, NetworkMessage::Tx(tx)).unwrap();
+    let addr_msg = NetworkMessage::Addr(vec![(
+        0,
+        bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+    )]);
+    queue_accounted(Some(&peer), &out_tx, addr_msg).unwrap();
+    assert_eq!(
+        peer.send_queued() - before,
+        36 + 36 + tx_n + 30,
+        "tx total_size and addr rows count toward the same budget"
+    );
+    peer.note_send_written(peer.send_queued());
+    assert!(!peer.send_over_budget());
+
+    while out_rx.try_recv().is_ok() {}
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetAddr,
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    let mut addrs = 0usize;
+    while let Ok(msg) = out_rx.try_recv() {
+        if matches!(
+            msg.expect_msg(),
+            NetworkMessage::Addr(_) | NetworkMessage::AddrV2(_)
+        ) {
+            addrs += 1;
+        }
+    }
+    assert_eq!(addrs, 1, "the first getaddr is answered");
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetAddr,
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a second getaddr is not answered"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+
+    assert_eq!(crate::peers::PEER_SEND_BUDGET, 4 * 1024 * 1024);
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let block_n = block.total_size();
+    assert!(block_n > 64, "a block is not the fallback size");
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::Block(block.clone())),
+        block_n
+    );
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let v2 = NetworkMessage::AddrV2(vec![bitcoin::p2p::address::AddrV2Message {
+        time: 1,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        addr: bitcoin::p2p::address::AddrV2::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+        port: 1,
+    }]);
+    assert_eq!(crate::peers::outbound_msg_bytes(&v2), 61);
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).unwrap();
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: hsi
+        })),
+        1024
+    );
+
+    let peers = crate::peers::PeerHub::new();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    peer.note_send_queued(crate::peers::PEER_SEND_BUDGET);
+    assert!(
+        !peer.send_over_budget(),
+        "the cap itself is still inside the budget"
+    );
+    peer.note_send_queued(1);
+    assert!(peer.send_over_budget());
+}
+
+#[tokio::test]
+async fn over_budget_reader_waits_until_one_byte_is_written() {
+    let peers = crate::peers::PeerHub::new();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    peer.note_send_queued(crate::peers::PEER_SEND_BUDGET + 1);
+    let waiting = std::sync::Arc::clone(&peer);
+    let wait = tokio::spawn(async move { waiting.wait_send_budget().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !wait.is_finished(),
+        "an over-budget reader must be parked before the writer drains"
+    );
+    peer.note_send_written(1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+        .await
+        .expect("writing back to the cap wakes the reader")
+        .unwrap();
+}
+
+#[test]
+fn getblocks_omits_an_empty_inv() {
+    use bitcoin::p2p::message_blockdata::GetBlocksMessage;
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("getblocks-empty");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetBlocks(GetBlocksMessage::new(vec![tip], tip)),
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+    )
+    .unwrap();
+    assert!(out_rx.try_recv().is_err(), "no headers means no inv");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn compact_getdata_at_depth_five_is_compact_and_deeper_is_a_full_block() {
+    use bitcoin::ScriptBuf;
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-depth");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(6, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let hash_at = |h: u32| {
+        hub.query
+            .header_at_height(rbitcoin_primitives::Height(h))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash
+    };
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let near = bitcoin::BlockHash::from_byte_array(hash_at(1));
+    serve_getdata(
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+        &[Inventory::CompactBlock(near)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            out_rx.try_recv().unwrap().expect_msg(),
+            NetworkMessage::CmpctBlock(_)
+        ),
+        "depth 5 is still a compact block"
+    );
+    let deep = bitcoin::BlockHash::from_byte_array(hash_at(0));
+    serve_getdata(
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+        &[Inventory::CompactBlock(deep)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            out_rx.try_recv().unwrap().expect_msg(),
+            NetworkMessage::Block(_)
+        ),
+        "depth 6 is a full block"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst() {
+    use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut rxs = Vec::new();
+    for i in 0..4u16 {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21000 + i);
+        let p = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+        p.set_wants_addrv2();
+        let (tx, rx) = mpsc::unbounded_channel();
+        p.attach_out(tx);
+        rxs.push(rx);
+    }
+    let mut follow = PeerFollowState::new();
+    let msg = |port: u16| bitcoin::p2p::address::AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+        port,
+    };
+    assert_eq!(addr_relay_tokens(0.0, 1_000, 11_000), 1.0);
+    assert!(addr_relay_tokens(0.0, 1_000, 1_000) < 1.0);
+    on_addrv2(&mut follow, Some(src.as_ref()), &[msg(8333)]).unwrap();
+    let mut got = 0usize;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            got += 1;
+        }
+    }
+    assert!(
+        (1..=2).contains(&got),
+        "one address reached {got} neighbors"
+    );
+
+    let burst: Vec<_> = (1..1000u16).map(msg).collect();
+    on_addrv2(&mut follow, Some(src.as_ref()), &burst).unwrap();
+    for rx in &mut rxs {
+        while rx.try_recv().is_ok() {}
+    }
+    on_addrv2(&mut follow, Some(src.as_ref()), &[msg(9_000)]).unwrap();
+    let mut extra = 0usize;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            extra += 1;
+        }
+    }
+    assert_eq!(extra, 0, "past the 1000-address burst nothing is relayed");
+}
+
+/// FNV-1a of the address bytes. Duplicated here so a broken mixer in
+/// `addr_relay_key` cannot satisfy the assertion by changing both sides.
+fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
+    let raw = bitcoin::consensus::encode::serialize(msg);
+    let mut h = 0xcbf29ce484222325u64;
+    for b in raw {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[test]
+fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
+    use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    src.set_wants_addrv2();
+    let (src_tx, mut src_rx) = mpsc::unbounded_channel();
+    src.attach_out(src_tx);
+
+    let mut neigh = Vec::new();
+    for i in 0..4u16 {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000 + i);
+        let p = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+        p.set_wants_addrv2();
+        let (tx, rx) = mpsc::unbounded_channel();
+        p.attach_out(tx);
+        neigh.push((p.id, rx));
+    }
+    let quiet = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000),
+        &ver,
+        true,
+        crate::peers::PeerConnType::Inbound,
+    );
+    let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
+    quiet.attach_out(quiet_tx);
+
+    let n = neigh.len();
+    let address = |port: u16| bitcoin::p2p::address::AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+        port,
+    };
+    // key/n stays in range when key < n*n, so those ports never reach the index.
+    let mut even_port = None;
+    let mut odd_port = None;
+    let mut wrap_port = None;
+    for port in 1..20_000u16 {
+        let key = addr_key_oracle(&address(port));
+        if (key as usize) < n * n {
+            continue;
+        }
+        let start = (key as usize) % n;
+        if key & 1 == 0 {
+            even_port.get_or_insert(port);
+        } else if start + 1 == n {
+            wrap_port.get_or_insert(port);
+        } else if start != 0 {
+            odd_port.get_or_insert(port);
+        }
+        if even_port.is_some() && odd_port.is_some() && wrap_port.is_some() {
+            break;
+        }
+    }
+    let ports = [
+        even_port.expect("an even relay key"),
+        odd_port.expect("an odd relay key whose next neighbor does not wrap"),
+        wrap_port.expect("an odd relay key whose next neighbor wraps"),
+    ];
+
+    let mut follow = PeerFollowState::new();
+    for port in ports {
+        let msg = address(port);
+        on_addrv2(&mut follow, Some(src.as_ref()), std::slice::from_ref(&msg)).unwrap();
+        let key = addr_key_oracle(&msg);
+        let n_dest = if key & 1 == 0 { 1 } else { 2 };
+        let start = (key as usize) % n;
+        let mut expect = Vec::new();
+        for step in 0..n_dest {
+            let idx = match step {
+                0 => start,
+                _ => {
+                    if start + 1 == n {
+                        0
+                    } else {
+                        start + 1
+                    }
+                }
+            };
+            expect.push(neigh[idx].0);
+        }
+        expect.sort_unstable();
+        let mut got = Vec::new();
+        for (id, rx) in &mut neigh {
+            while rx.try_recv().is_ok() {
+                got.push(*id);
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(
+            got, expect,
+            "port {port} key {key:#x} start {start} must select those neighbors"
+        );
+        assert!(
+            src_rx.try_recv().is_err(),
+            "a peer does not relay to itself"
+        );
+        assert!(
+            quiet_rx.try_recv().is_err(),
+            "a peer that did not ask for addrv2 is skipped"
+        );
+    }
+}
+
+#[test]
+fn invalid_script_is_scored_and_policy_is_not() {
+    use rbitcoin_mempool::AcceptError;
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Script("script false".into())),
+        10
+    );
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Policy("bad-txns-too-many-sigops")),
+        0
+    );
 }

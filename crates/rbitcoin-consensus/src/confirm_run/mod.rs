@@ -71,7 +71,7 @@ use phases::{check_bip34, expected_bits_extending, post_commit};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
 pub use scripts::{confirm_scripts_phase, drive_script_waves_with};
 pub(crate) use write::finish_post_commit;
-pub use write::{confirm_write_phase, finish_post_commit_hashes};
+pub use write::{confirm_write_phase, finish_post_commit_hashes, replay_spend_annotations};
 #[cfg(test)]
 use write::{
     fill_planned_create_layout_after_commit, write_batch_vs_tip, write_height_needed,
@@ -393,5 +393,7 @@ impl ScriptOkBatch {
     }
 }
 
+#[cfg(test)]
+mod spend_durable_tests;
 #[cfg(test)]
 mod write_idempotent_tests;

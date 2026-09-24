@@ -56,9 +56,10 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   concern. Wallet clients and electrs HTTP (except address-prefix)
   ([`COMPAT.md`](./COMPAT.md)).
   The node is **internet-facing capable**: application DoS limits
-  (`ServeLimits` — max connections, request size, idle timeout, plus Electrum
-  scripthash-sub / broadcast-hex caps) are **always enforced**, not only when
-  bound to localhost. Esplora WebSocket adds a **separate** socket cap,
+  (`ServeLimits` — REST in-flight semaphore, request size, idle timeout, plus
+  Electrum scripthash-sub / broadcast-hex caps) are **always enforced**, not
+  only when bound to localhost. The REST cap is concurrent requests, not an
+  accepted-socket cap. Esplora WebSocket adds a **separate** socket cap,
   inbound frame size limit, and per-connection address/tx track caps
   (defaults 64/64 KiB/64/64). Excess connections and oversize
   lines/bodies/frames fail closed without hanging accept. Esplora is
@@ -66,7 +67,9 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
 - **Store / archive:** corruption or incorrect spend/scripthash results that
-  mislead a **wallet** backend are in scope.
+  mislead a **wallet** backend are in scope. Truncating a sealed mmap after
+  it is mapped is fatal external corruption (the next read can SIGBUS), not
+  a handled retry.
 - **No wallet keys in this repository:** do **not** send seed phrases or private
   keys in reports.
 

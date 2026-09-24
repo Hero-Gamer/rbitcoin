@@ -27,8 +27,9 @@ pub struct ValidationContext<'a> {
     /// could not always trust ordered height). That made **signet** reject every
     /// post-genesis block: Core/Inquisition `SegwitHeight = 1`, so height 0 looks
     /// pre-segwit while BIP325 blocks always carry witness. Soft-fork timing is
-    /// enforced at **confirm** with the true height. Merkle / weight / witness
-    /// **commitment** still run here either way.
+    /// enforced at **confirm** with the true height. Merkle, witness
+    /// commitment, and weight still run here either way. Commitment is
+    /// checked before weight so witness padding is not the block hash's fault.
     pub enforce_height_gates: bool,
 }
 
@@ -55,6 +56,13 @@ impl<'a> ValidationContext<'a> {
 }
 
 const MAX_BLOCK_STRIPPED_SIZE: usize = 1_000_000;
+/// Consensus block weight limit. Compact-block tx count is this divided by
+/// [`MIN_TX_WEIGHT`].
+pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+/// Minimum serializable transaction weight (10 bytes × witness scale 4).
+pub const MIN_TX_WEIGHT: u64 = 10 * 4;
+/// Most transactions a valid block can contain.
+pub const MAX_BLOCK_TX_COUNT: usize = (MAX_BLOCK_WEIGHT / MIN_TX_WEIGHT) as usize;
 
 fn check_tx_local(tx: &Transaction, base_size: usize) -> Result<(), ConsensusError> {
     if tx.input.is_empty() {
@@ -179,7 +187,15 @@ pub fn validate_block_structure_with_pres(
     if base > MAX_BLOCK_STRIPPED_SIZE {
         return Err(ConsensusError::BadBlock("block stripped size too large"));
     }
-    if weight_wu > 4_000_000 {
+    // CheckBlock tx shape before malleation. An empty vin is "no inputs",
+    // not a missing witness commitment.
+    for (tx, p) in block.txdata.iter().zip(pres.iter()) {
+        check_tx_local(tx, p.base_size)?;
+    }
+    // Witness bytes are not in the block hash. Check them before weight so
+    // padding cannot be cached as a failed hash.
+    reject_witness_malleation(block, ctx, pres.as_ref())?;
+    if weight_wu > MAX_BLOCK_WEIGHT {
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
@@ -204,7 +220,6 @@ pub fn validate_block_structure_with_pres(
 
     // Only money-range gate. `money_range_out_sum` casts a sum that passed here.
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
-        check_tx_local(tx, p.base_size)?;
         for o in &tx.output {
             if exceeds_max_money(o.value.to_sat()) {
                 return Err(ConsensusError::BadBlock("bad-txns-vout-toolarge"));
@@ -228,20 +243,6 @@ pub fn validate_block_structure_with_pres(
     }
     let walk_ns = t_walk.elapsed().as_nanos() as u64;
 
-    let has_witness_data = block_has_witness_from_pres(pres.as_ref());
-    let has_commitment = coinbase_has_witness_commitment(block);
-    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
-        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
-    }
-    // Core: BIP141 nonce only after SegWit. Pre-segwit aa21a9ed OP_RETURN is data.
-    // Archive has no reliable height — still check.
-    if (has_witness_data || has_commitment)
-        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
-    {
-        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
-        check_witness_commitment_with_wtxids(block, &non_cb)?;
-    }
-
     if let Some(stats) = stats {
         stats.note_struct_parts(txid_ns, 0, walk_ns);
     }
@@ -249,6 +250,26 @@ pub fn validate_block_structure_with_pres(
     // BIP325 signet solution is not checked here — tip confirm only.
 
     Ok(pres)
+}
+
+/// Witness commitment before weight. Padding is not the block hash's fault.
+fn reject_witness_malleation(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: &[TxPrecompute],
+) -> Result<(), ConsensusError> {
+    let has_witness_data = block_has_witness_from_pres(pres);
+    let has_commitment = coinbase_has_witness_commitment(block);
+    if has_witness_data && ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
+        return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
+    }
+    if (has_witness_data || has_commitment)
+        && (ctx.params.segwit_active_at(ctx.height.0) || !ctx.enforce_height_gates)
+    {
+        let non_cb: Vec<[u8; 32]> = pres.iter().skip(1).map(|p| p.wtxid).collect();
+        check_witness_commitment_with_wtxids(block, &non_cb)?;
+    }
+    Ok(())
 }
 
 fn coinbase_has_witness_commitment(block: &Block) -> bool {
@@ -1023,7 +1044,8 @@ pub(crate) fn assemble_block_prevouts(
     let mut clk_job = 0u64;
     let mut fees = 0i64;
     let mut tx_fees = vec![0u64; n_tx];
-    let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
+    let build_script_jobs =
+        !crate::milestone::skips_on_query(ctx.milestone, query, ctx.height.0, block_hash);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
     } else {
@@ -1532,8 +1554,9 @@ pub(crate) fn structural_validate_spends(
 
     scratch.begin_block();
     let maturity = ctx.params.coinbase_maturity();
-    reject_bip30_unspent_overwrite(query, block, ctx)?;
+    // BIP30's txid batch is inside `spent_ns` (signet runs it on every block).
     let t_spent = Instant::now();
+    reject_bip30_unspent_overwrite(query, block, ctx)?;
     let t_abs = Instant::now();
     structural_abs_heights(query, spends, batch_parents, run_create_height, scratch)?;
     let tip = query.tip_height().map(|h| h.0);
@@ -1953,16 +1976,18 @@ fn structural_bip68(
 
 /// MTP for write structural. Prefers assemble-carried `prev_mtp` (seeded into
 /// `cache`). Misses go to durable headers only — never `get_header_plan`.
-/// BIP30: after BIP34, skipped. Before that, a connected instance with any
-/// unspent output may not be overwritten — except mainnet 91842 / 91880.
-/// Just-archived self is unconnected (not a hit); only a live sibling is.
+/// BIP30: a connected instance with any unspent output may not be overwritten.
+/// Skipped for the two mainnet repeats, and when the header at BIP34 height
+/// is this network's BIP34 hash and the block is below
+/// [`crate::params::BIP34_IMPLIES_BIP30_LIMIT`]. Signet and regtest have no
+/// BIP34 hash, so every block is checked. Just-archived self is unconnected.
 fn reject_bip30_unspent_overwrite(
     query: &Query,
     block: &Block,
     ctx: &ValidationContext<'_>,
 ) -> Result<(), ConsensusError> {
-    if ctx.params.bip34_active_at(ctx.height.0)
-        || ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
+    if ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
+        || bip34_ancestry_skips_bip30(query, ctx)
     {
         return Ok(());
     }
@@ -2006,6 +2031,23 @@ fn reject_bip30_unspent_overwrite(
         }
     }
     Ok(())
+}
+
+fn bip34_ancestry_skips_bip30(query: &Query, ctx: &ValidationContext<'_>) -> bool {
+    let height = ctx.height.0;
+    if ctx.params.bip34_hash.is_none() {
+        return false;
+    }
+    if height <= ctx.params.btc.bip34_height {
+        return false;
+    }
+    let ancestor = query
+        .header_at_height(Height(ctx.params.btc.bip34_height))
+        .ok()
+        .flatten()
+        .map(|(_, rec)| bitcoin::BlockHash::from_byte_array(rec.hash));
+    ctx.params
+        .bip30_skipped_for_bip34_ancestry(height, ancestor)
 }
 
 fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32, ConsensusError> {

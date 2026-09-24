@@ -166,6 +166,8 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         config.store_layout(),
         config.check_blocks_window(),
     )?;
+    rbitcoin_consensus::replay_spend_annotations(&query)
+        .map_err(|e| NodeError::Init(format!("spend annotation replay: {e}")))?;
     Ok(NodeHandle {
         config,
         query,
@@ -184,7 +186,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     let params = config.chain_params()?;
     let milestone = config.milestone();
-    if milestone.height > 0 {
+    if let Some(anchor) = milestone.anchor {
+        info!(
+            "ibd: milestone height={} hash={} (script/sig skip only when this header path contains that hash and chain work meets the floor; prevouts always)",
+            milestone.height, anchor.hash
+        );
+    } else {
         info!(
             "ibd: milestone height={} (script/sig checks skipped at/below; prevouts always)",
             milestone.height
@@ -1146,6 +1153,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
+    // In-flight tip accepts hold the hub. Drain them before the store flush.
+    let hub = std::sync::Arc::clone(&node.hub);
+    tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        hub.wait_tip_accept_idle();
+    })
+    .await
+    .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {

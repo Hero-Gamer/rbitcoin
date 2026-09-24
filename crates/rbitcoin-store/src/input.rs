@@ -78,6 +78,18 @@ pub struct Input {
 }
 
 impl Input {
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.loc.flush()?;
+        self.off.flush()?;
+        self.body.flush()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_sync(&self) -> bool {
+        self.loc.pending_sync() || self.off.pending_sync() || self.body.pending_sync()
+    }
+
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             loc: TableFile::create(dir.join("input.loc"), TableKind::InputLoc)?,

@@ -1,9 +1,18 @@
+use std::str::FromStr;
+
 use bitcoin::blockdata::constants;
 use bitcoin::consensus::Params as BtcParams;
 use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
 use bitcoin::{BlockHash, Network, Target};
 use rbitcoin_primitives::Height;
+
+/// Height from which BIP34's ancestry no longer turns BIP30 off (Core).
+pub const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
+
+fn bip34_block_hash(display_hex: &str) -> BlockHash {
+    BlockHash::from_str(display_hex).expect("BIP34 block hash")
+}
 
 /// Static chain parameters for validation.
 #[derive(Debug, Clone)]
@@ -22,6 +31,9 @@ pub struct ChainParams {
     segwit_height_overlay: Option<u32>,
     /// Subsidy halving interval overlay (`None` = network default).
     subsidy_halving_overlay: Option<u32>,
+    /// Header hash at BIP34 height that turns BIP30 off. `None` on signet and
+    /// regtest (Core's null hash), so BIP30 stays on at every height.
+    pub bip34_hash: Option<BlockHash>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +70,7 @@ impl ChainParams {
             csv_height_overlay: None,
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
+            bip34_hash: None,
         }
     }
 
@@ -73,6 +86,9 @@ impl ChainParams {
             csv_height_overlay: None,
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
+            bip34_hash: Some(bip34_block_hash(
+                "000000000000024b89b42a942fe0d9fcb078ad50a8c5d6e8e4a0c9d3c3c0c62e",
+            )),
         }
     }
 
@@ -88,6 +104,9 @@ impl ChainParams {
             csv_height_overlay: None,
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
+            bip34_hash: Some(bip34_block_hash(
+                "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+            )),
         }
     }
 
@@ -117,6 +136,7 @@ impl ChainParams {
             csv_height_overlay: None,
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
+            bip34_hash: None,
         })
     }
 
@@ -164,6 +184,27 @@ impl ChainParams {
     #[inline]
     pub fn bip34_active_at(&self, height: u32) -> bool {
         height >= self.btc.bip34_height
+    }
+
+    /// Core skips BIP30 only when this block is above BIP34 height, below
+    /// [`BIP34_IMPLIES_BIP30_LIMIT`], and the header at BIP34 height is
+    /// [`Self::bip34_hash`].
+    #[inline]
+    pub fn bip30_skipped_for_bip34_ancestry(
+        &self,
+        height: u32,
+        ancestor_at_bip34: Option<BlockHash>,
+    ) -> bool {
+        if height >= BIP34_IMPLIES_BIP30_LIMIT {
+            return false;
+        }
+        let Some(expect) = self.bip34_hash else {
+            return false;
+        };
+        if height <= self.btc.bip34_height {
+            return false;
+        }
+        ancestor_at_bip34 == Some(expect)
     }
 
     /// Core `IsBIP30Repeat`: the two mainnet blocks that overwrite an earlier
@@ -384,21 +425,49 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
     ]
 }
 
-/// Default IBD milestone (coarse assumevalid): skip **script/sig** checks
-/// at/below height. Prevouts, double-spend, maturity, and fees still run.
+/// Mainnet assumeutxo block at height 840_000 (Core `kernel/chainparams.cpp`,
+/// display order). The default milestone hash, not Core's later assumevalid.
+pub const MAINNET_MILESTONE_HASH: &str =
+    "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
+
+/// Core mainnet `nMinimumChainWork` (display hex, big-endian). Refresh with
+/// the checkpoint list at release.
+pub const MAINNET_MIN_CHAIN_WORK: &str =
+    "000000000000000000000000000000000000000145ec036acc5ba740052af1a0";
+
+/// Default IBD milestone height. `0` means full script validation.
 ///
-/// `0` means full validation. Operators override with `--milestone HEIGHT`
-/// or disable with `--milestone 0` after CLI applies network defaults.
-/// Raise mainnet as deeper buried tips become the norm.
+/// Signet is 0 on purpose: signet IBD runs every script (slower than a
+/// height skip; that is the dress rehearsal). Mainnet's default height is
+/// 840_000 and is paired with [`mainnet_milestone_anchor`]. Operators still
+/// override with `--milestone HEIGHT` (height-only) or `--milestone 0`.
 pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
     match network {
         rbitcoin_primitives::Network::Mainnet => 840_000,
         rbitcoin_primitives::Network::Testnet => 2_500_000,
-        // Signet tip moves; keep default above typical tip so catch-up stays under
-        // milestone until operators opt into full validation (`--milestone 0`).
-        rbitcoin_primitives::Network::Signet => 2_000_000,
+        rbitcoin_primitives::Network::Signet => 0,
         rbitcoin_primitives::Network::Regtest => 0,
     }
+}
+
+/// Anchor for the default mainnet milestone (block 840_000 + min chain work).
+pub fn mainnet_milestone_anchor() -> crate::milestone::MilestoneAnchor {
+    crate::milestone::MilestoneAnchor {
+        hash: block_hash_from_display_hex(MAINNET_MILESTONE_HASH),
+        min_work_be: min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK),
+    }
+}
+
+/// Mainnet `nMinimumChainWork` as 32 big-endian bytes.
+pub fn mainnet_min_chain_work_be() -> [u8; 32] {
+    min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK)
+}
+
+fn min_work_from_display_hex(hex: &str) -> [u8; 32] {
+    let raw = rbitcoin_primitives::hex_decode(hex).expect("min chain work hex");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    out
 }
 
 /// Verify height-0 block hash matches params genesis.
@@ -450,6 +519,24 @@ mod tests {
         assert!(ChainParams::custom_signet(challenge, 0).is_err());
     }
 
+    #[test]
+    fn bip34_hash_gates_bip30_like_core() {
+        let main = ChainParams::mainnet();
+        assert_eq!(main.btc.bip34_height, 227_931);
+        let hash = main.bip34_hash.expect("mainnet BIP34 hash");
+        assert!(main.bip30_skipped_for_bip34_ancestry(227_932, Some(hash)));
+        assert!(!main.bip30_skipped_for_bip34_ancestry(227_931, Some(hash)));
+        assert!(!main.bip30_skipped_for_bip34_ancestry(BIP34_IMPLIES_BIP30_LIMIT, Some(hash)));
+        assert!(!main.bip30_skipped_for_bip34_ancestry(227_932, None));
+        let tn = ChainParams::testnet();
+        assert_eq!(tn.btc.bip34_height, 21_111);
+        assert!(tn.bip34_hash.is_some());
+        assert!(ChainParams::signet().bip34_hash.is_none());
+        assert!(ChainParams::regtest().bip34_hash.is_none());
+        assert_eq!(ChainParams::regtest().btc.bip34_height, 100_000_000);
+        assert!(!ChainParams::signet().bip30_skipped_for_bip34_ancestry(2, None));
+    }
+
     /// Core `IsBIP30Repeat` — height+hash, mainnet only.
     #[test]
     fn is_bip30_repeat_matches_core() {
@@ -472,6 +559,16 @@ mod tests {
             "batch-first height 91859 is not an exception"
         );
         assert!(!ChainParams::regtest().is_bip30_repeat(91880, h91880));
+    }
+
+    #[test]
+    fn mainnet_min_chain_work_is_core_n_minimum_chain_work() {
+        let work = mainnet_min_chain_work_be();
+        assert_eq!(work, min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK));
+        assert!(
+            work.iter().any(|b| *b != 0),
+            "minimum chain work must not be zero"
+        );
     }
 
     /// Mainnet buried heights (Core + Inquisition).

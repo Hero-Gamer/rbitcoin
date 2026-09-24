@@ -4,11 +4,13 @@
 //! [`bitcoin::taproot::ControlBlock::verify_taproot_commitment`] (merkle path +
 //! `TapTweak` + `tweak_add_check` against the prevout x-only key).
 
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::key::XOnlyPublicKey;
-use bitcoin::secp256k1::Message;
+use bitcoin::script::Script;
+use bitcoin::secp256k1::{Message, Parity};
 use bitcoin::sighash::{Annex, Prevouts, SighashCache, TapSighashType};
-use bitcoin::taproot::ControlBlock;
+use bitcoin::taproot::{TapLeafHash, TapNodeHash, TapTweakHash};
 use bitcoin::{Transaction, Witness};
 
 use super::crypto;
@@ -106,6 +108,60 @@ fn verify_key_path(
     })
 }
 
+const TAPSCRIPT_LEAF: u8 = 0xc0;
+const CONTROL_BASE: usize = 33;
+const CONTROL_NODE: usize = 32;
+const CONTROL_MAX_NODES: usize = 128;
+
+/// BIP341 commitment. Returns the even leaf version byte.
+fn verify_control_commitment(
+    control: &[u8],
+    output_key_bytes: &[u8],
+    script: &Script,
+) -> Result<u8, ConsensusError> {
+    if control.len() < CONTROL_BASE {
+        return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
+    }
+    let extra = control.len() - CONTROL_BASE;
+    let nodes = extra / CONTROL_NODE;
+    if !extra.is_multiple_of(CONTROL_NODE) || nodes > CONTROL_MAX_NODES {
+        return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
+    }
+    let leaf = control[0] & 0xfe;
+    let parity = if control[0] & 1 == 0 {
+        Parity::Even
+    } else {
+        Parity::Odd
+    };
+    let internal = XOnlyPublicKey::from_slice(&control[1..CONTROL_BASE])
+        .map_err(|_| ConsensusError::Script("WITNESS_PROGRAM_MISMATCH".into()))?;
+    let output_key = XOnlyPublicKey::from_slice(output_key_bytes)
+        .map_err(|_| ConsensusError::Script("WITNESS_PROGRAM_MISMATCH".into()))?;
+
+    let mut eng = TapLeafHash::engine();
+    leaf.consensus_encode(&mut eng)
+        .expect("hash engines do not error");
+    script
+        .consensus_encode(&mut eng)
+        .expect("hash engines do not error");
+    let mut curr = TapNodeHash::from_byte_array(TapLeafHash::from_engine(eng).to_byte_array());
+    for i in 0..nodes {
+        let start = CONTROL_BASE + i * CONTROL_NODE;
+        let node = TapNodeHash::from_byte_array(
+            control[start..start + CONTROL_NODE]
+                .try_into()
+                .expect("32-byte merkle node"),
+        );
+        curr = TapNodeHash::from_node_hashes(curr, node);
+    }
+    let tweak = TapTweakHash::from_key_and_tweak(internal, Some(curr)).to_scalar();
+    let ok = crypto::SECP.with(|secp| internal.tweak_add_check(secp, &output_key, parity, tweak));
+    if !ok {
+        return Err(ConsensusError::Script("WITNESS_PROGRAM_MISMATCH".into()));
+    }
+    Ok(leaf)
+}
+
 fn verify_script_path(
     job: &ScriptCheckJob,
     input_index: usize,
@@ -128,25 +184,17 @@ fn verify_script_path(
     let script_bytes = items.pop().unwrap();
     let mut stack = items;
 
-    let control = ControlBlock::decode(&control_bytes)
-        .map_err(|e| ConsensusError::Script(format!("p2tr control block: {e}")))?;
+    let script = Script::from_bytes(&script_bytes);
+    // Leaf byte is raw consensus (`c[0] & 0xfe`). `LeafVersion::from_consensus`
+    // rejects 0x50, which Core accepts as a future leaf.
+    let leaf = verify_control_commitment(&control_bytes, output_key_bytes, script)?;
 
-    let output_key = XOnlyPublicKey::from_slice(output_key_bytes)
-        .map_err(|_| ConsensusError::Script("p2tr output key".into()))?;
-    let script = bitcoin::script::Script::from_bytes(&script_bytes);
-
-    // BIP341: recompute merkle root from leaf + path, apply TapTweak to internal
-    // key, and check it matches the prevout output key (with claimed parity).
-    let ok = crypto::SECP.with(|secp| control.verify_taproot_commitment(secp, output_key, script));
-    if !ok {
-        return Err(ConsensusError::Script("p2tr bip341 tweak mismatch".into()));
-    }
-
-    // BIP341: only tapscript (0xc0) is executed. Any other leaf version is
-    // reserved for future soft forks and **succeeds** after the commitment
-    // check (above). Core rejects unknown leaves only under mempool
-    // SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION — never on blocks.
-    if control.leaf_version != bitcoin::taproot::LeafVersion::TapScript {
+    if leaf != TAPSCRIPT_LEAF {
+        if job.flags.discourage_upgradable_witness {
+            return Err(ConsensusError::Script(
+                "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION".into(),
+            ));
+        }
         return Ok(());
     }
 
@@ -164,7 +212,7 @@ mod bip341_tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::key::{TapTweak, TweakedKeypair};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
-    use bitcoin::taproot::{LeafVersion, TaprootBuilder};
+    use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootBuilder};
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
     fn p2tr_spk(output_key: XOnlyPublicKey) -> ScriptBuf {
@@ -252,6 +300,84 @@ mod bip341_tests {
     fn script_path_accepts_with_valid_bip341_tweak() {
         let (job, _) = make_script_path_spend();
         script::verify_job_all_inputs(&job).expect("p2tr script path");
+    }
+
+    /// Future leaf `0xc2` and annex leaf `0x50` commit and succeed. Tapscript still runs.
+    #[test]
+    fn script_path_accepts_leaf_0x50_with_annex_and_0xc2() {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::key::TapTweak;
+        use bitcoin::secp256k1::Parity;
+
+        fn job_for(leaf_ver: u8, annex: bool) -> ScriptCheckJob {
+            let secp = Secp256k1::new();
+            let internal_sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+            let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
+            let (internal, _) = internal_kp.x_only_public_key();
+            let leaf = ScriptBuf::from_bytes(vec![0x51]);
+            let mut eng = TapLeafHash::engine();
+            leaf_ver.consensus_encode(&mut eng).expect("engine");
+            leaf.as_script().consensus_encode(&mut eng).expect("engine");
+            let node = TapNodeHash::from_byte_array(TapLeafHash::from_engine(eng).to_byte_array());
+            let (tweaked, parity) = internal.tap_tweak(&secp, Some(node));
+            let output_key = tweaked.to_x_only_public_key();
+            let parity_bit = match parity {
+                Parity::Even => 0u8,
+                Parity::Odd => 1,
+            };
+            let mut control = Vec::with_capacity(33);
+            control.push(leaf_ver | parity_bit);
+            control.extend_from_slice(&internal.serialize());
+            let mut wit = vec![leaf.as_bytes().to_vec(), control];
+            if annex {
+                wit.push(vec![0x50, 0x01]);
+            }
+            let refs: Vec<&[u8]> = wit.iter().map(|v| v.as_slice()).collect();
+            let prevout = TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: p2tr_spk(output_key),
+            };
+            let tx = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::from_slice(&refs),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(49_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            ScriptCheckJob {
+                txid: [0u8; 32],
+                prevouts: vec![prevout],
+                tx: crate::block::JobTx::owned(tx),
+                flags: crate::block::ScriptVerifyFlags {
+                    bip65_active: true,
+                    bip112_active: true,
+                    bip66_active: true,
+                    bip16_active: true,
+                    taproot_active: true,
+                    minimal_if: false,
+                    nullfail: false,
+                    low_s: false,
+                    strictenc: false,
+                    null_dummy: false,
+                    minimal_data: false,
+                    witness_pubkeytype: false,
+                    witness_active: true,
+                    discourage_upgradable_witness: false,
+                    const_scriptcode: false,
+                },
+                pre: std::sync::OnceLock::new(),
+            }
+        }
+
+        script::verify_job_all_inputs(&job_for(0xc2, false)).expect("leaf 0xc2");
+        script::verify_job_all_inputs(&job_for(0x50, true)).expect("leaf 0x50 with annex");
     }
 
     /// Core ExecuteWitnessScript (TAPSCRIPT): initial stack > 1000 is
@@ -343,6 +469,86 @@ mod bip341_tests {
         ctrl[5] ^= 0xff;
         job.tx.input[0].witness = Witness::from_slice(&[leaf.as_slice(), ctrl.as_slice()]);
         assert!(script::verify_job_all_inputs(&job).is_err());
+    }
+
+    /// Two merkle nodes, so the path offset `33 + i * 32` is not a no-op.
+    #[test]
+    fn script_path_accepts_two_merkle_nodes() {
+        let secp = Secp256k1::new();
+        let internal_sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
+        let (internal_xonly, _) = internal_kp.x_only_public_key();
+        let leaf = ScriptBuf::from_bytes(vec![0x51]);
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(2, leaf.clone())
+            .expect("leaf")
+            .add_leaf(2, ScriptBuf::from_bytes(vec![0x52]))
+            .expect("sibling")
+            .add_leaf(1, ScriptBuf::from_bytes(vec![0x53]))
+            .expect("side")
+            .finalize(&secp, internal_xonly)
+            .expect("finalize");
+        let output_key = spend_info.output_key().to_x_only_public_key();
+        let control = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("control");
+        let ctrl = control.serialize();
+        assert_eq!(ctrl.len(), 33 + 64, "two merkle nodes");
+        let (mut job, _) = make_script_path_spend();
+        let script = job.tx.input[0].witness.nth(0).unwrap().to_vec();
+        job.tx.input[0].witness = Witness::from_slice(&[script.as_slice(), ctrl.as_slice()]);
+        job.prevouts[0].script_pubkey = p2tr_spk(output_key);
+        script::verify_job_all_inputs(&job).expect("two-node script path");
+    }
+
+    fn control_size_error(control: &[u8]) -> String {
+        let (mut job, _) = make_script_path_spend();
+        let script = job.tx.input[0].witness.nth(0).unwrap().to_vec();
+        job.tx.input[0].witness = Witness::from_slice(&[script.as_slice(), control]);
+        format!(
+            "{}",
+            script::verify_job_all_inputs(&job).expect_err("control")
+        )
+    }
+
+    #[test]
+    fn control_block_size_bounds() {
+        let (job, _) = make_script_path_spend();
+        let base = job.tx.input[0].witness.nth(1).unwrap().to_vec();
+        assert_eq!(base.len(), 33);
+
+        let mut short = base.clone();
+        short.pop();
+        assert!(
+            control_size_error(&short).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "32-byte control"
+        );
+
+        let mut odd = base.clone();
+        odd.push(0);
+        assert!(
+            control_size_error(&odd).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "34-byte control"
+        );
+
+        let mut deep = base.clone();
+        deep.extend(vec![0x11u8; 128 * 32]);
+        let msg = control_size_error(&deep);
+        assert!(
+            msg.contains("WITNESS_PROGRAM_MISMATCH"),
+            "128 nodes are in range, got {msg}"
+        );
+        assert!(
+            !msg.contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "128 nodes are in range, got {msg}"
+        );
+
+        let mut too_deep = base.clone();
+        too_deep.extend(vec![0x11u8; 129 * 32]);
+        assert!(
+            control_size_error(&too_deep).contains("TAPROOT_WRONG_CONTROL_SIZE"),
+            "129 nodes"
+        );
     }
 
     #[test]

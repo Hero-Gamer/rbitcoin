@@ -3,11 +3,17 @@
 use crate::auth::{parse_bearer_auth, resolve_rpc_auth, RpcAuth};
 use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+
+/// Axum's default request-body cap, named so auth and 413 share one limit.
+pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
+/// Core `-rpcworkqueue`. `None` on [`RpcConfig::work_queue`] stays unlimited.
+pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 use rbitcoin_log::info;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::Network;
@@ -18,6 +24,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
+
+#[cfg(unix)]
+fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
+    extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    let prev = unsafe { umask(0o777 & !mode) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { umask(prev) };
+    bound
+}
 use tokio::task::JoinHandle;
 
 /// RPC listen configuration.
@@ -139,7 +156,7 @@ pub async fn run_rpc(
             work_queue: work_queue.clone(),
             require_auth: true,
         };
-        let app = Router::new().route("/", post(rpc_post)).with_state(state);
+        let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
         tasks.push(tokio::spawn(async move {
             axum::serve(listener, app)
@@ -163,19 +180,15 @@ pub async fn run_rpc(
             std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
         }
         let _ = std::fs::remove_file(sock);
-        let listener = tokio::net::UnixListener::bind(sock)
+        let listener = bind_unix_mode(sock, 0o600)
             .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
-        }
         let state = AppState {
             ctx: Arc::clone(&ctx),
             auth: auth.clone(),
             work_queue,
             require_auth: false,
         };
-        let app = Router::new().route("/", post(rpc_post)).with_state(state);
+        let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
         tasks.push(tokio::spawn(async move {
             axum::serve(listener, app)
@@ -221,8 +234,20 @@ pub async fn run_rpc(
     })
 }
 
-async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if state.require_auth && !authorized(&state.auth, &headers) {
+fn rpc_app(state: AppState) -> Router {
+    Router::new()
+        .route("/", post(rpc_post))
+        .layer(DefaultBodyLimit::max(RPC_MAX_HTTP_BODY))
+        .layer(from_fn_with_state(state.clone(), reject_unauthorized))
+        .with_state(state)
+}
+
+async fn reject_unauthorized(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if state.require_auth && !authorized(&state.auth, req.headers()) {
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer realm=\"jsonrpc\"")],
@@ -230,7 +255,141 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         )
             .into_response();
     }
+    next.run(req).await
+}
 
+async fn satisfy_http_wait(
+    ctx: &Arc<crate::methods::RpcContext>,
+    parsed: &serde_json::Value,
+) -> bool {
+    use crate::methods::{gbt_longpoll_id, tip_hash_height, wait_timeout_ms, RpcParams};
+    let Some(method) = parsed.get("method").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    if !matches!(
+        method,
+        "waitforblock" | "waitforblockheight" | "waitfornewblock" | "getblocktemplate"
+    ) {
+        return false;
+    }
+    let params = match parsed.get("params") {
+        Some(serde_json::Value::Array(a)) => RpcParams::positional(a.clone()),
+        Some(serde_json::Value::Object(m)) => RpcParams::named(m.clone()),
+        _ => RpcParams::empty(),
+    };
+    let mut tips = ctx.chain.as_ref().map(|c| c.subscribe_tips());
+    if method == "getblocktemplate" {
+        let Some(want) = params
+            .get(0, "template_request")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|o| o.get("longpollid"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let ctx = Arc::clone(ctx);
+        loop {
+            let ready = {
+                let ctx = Arc::clone(&ctx);
+                let want = want.clone();
+                tokio::task::spawn_blocking(move || {
+                    ctx.stop.load(Ordering::SeqCst) || gbt_longpoll_id(&ctx) != want
+                })
+                .await
+                .unwrap_or(true)
+            };
+            if ready {
+                return true;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                _ = recv_tip(&mut tips) => {}
+            }
+        }
+    }
+    let timeout_ms = match method {
+        "waitfornewblock" => wait_timeout_ms(&params, 0, "timeout"),
+        _ => wait_timeout_ms(&params, 1, "timeout"),
+    };
+    let Ok(timeout_ms) = timeout_ms else {
+        return false;
+    };
+    let kind = match method {
+        "waitforblock" => {
+            let Ok(want) = params.req_str(0, "blockhash") else {
+                return false;
+            };
+            WaitKind::Block(want.to_string())
+        }
+        "waitforblockheight" => {
+            let Ok(h) = params.req_u64(0, "height") else {
+                return false;
+            };
+            WaitKind::Height(h as u32)
+        }
+        "waitfornewblock" => {
+            let ctx_b = Arc::clone(ctx);
+            let start = tokio::task::spawn_blocking(move || tip_hash_height(&ctx_b).ok())
+                .await
+                .unwrap_or(None);
+            let Some((hash, _)) = start else {
+                return true;
+            };
+            WaitKind::New(hash)
+        }
+        _ => return false,
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let ctx = Arc::clone(ctx);
+    loop {
+        if ctx.stop.load(Ordering::SeqCst) || tokio::time::Instant::now() >= deadline {
+            return true;
+        }
+        let ready = {
+            let ctx = Arc::clone(&ctx);
+            let kind = kind.clone();
+            tokio::task::spawn_blocking(move || {
+                let Ok((hash, height)) = tip_hash_height(&ctx) else {
+                    return true;
+                };
+                match kind {
+                    WaitKind::Block(want) => hash == want,
+                    WaitKind::Height(want) => height >= want,
+                    WaitKind::New(start) => hash != start,
+                }
+            })
+            .await
+            .unwrap_or(true)
+        };
+        if ready || tokio::time::Instant::now() >= deadline {
+            return true;
+        }
+        let slice = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let slice = slice.min(std::time::Duration::from_millis(50));
+        tokio::select! {
+            _ = tokio::time::sleep(slice) => {}
+            _ = recv_tip(&mut tips) => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+enum WaitKind {
+    Block(String),
+    Height(u32),
+    New(String),
+}
+
+async fn recv_tip(tips: &mut Option<tokio::sync::broadcast::Receiver<rbitcoin_net::TipEvent>>) {
+    if let Some(rx) = tips.as_mut() {
+        let _ = rx.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
     let _permit = if let Some(sem) = state.work_queue.as_ref() {
         match sem.try_acquire() {
             Ok(p) => Some(p),
@@ -252,9 +411,15 @@ async fn rpc_post(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     };
     let ctx = Arc::clone(&state.ctx);
+    let waited = satisfy_http_wait(&ctx, &parsed).await;
     let joined = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
-        exec_http_rpc(&ctx, parsed)
+        if waited {
+            crate::methods::set_http_wait_satisfied(true);
+        }
+        let out = exec_http_rpc(&ctx, parsed);
+        crate::methods::set_http_wait_satisfied(false);
+        out
     })
     .await;
     match joined {
@@ -745,6 +910,305 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unauthorized_large_content_length_is_401_before_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-auth-body").expect("temp dir");
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap();
+        let headers =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n";
+        stream.write_all(headers).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let n = timeout(Duration::from_millis(400), stream.read(&mut buf))
+            .await
+            .expect("401 before any body bytes")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            text.contains("401") || text.contains("Unauthorized"),
+            "{text}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn oversized_bearer_body_is_413_and_small_body_still_runs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-body-cap").expect("temp dir");
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (st, body) = post_raw(
+            tcp_addr(&handle),
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        assert_eq!(body.unwrap()["result"], 0);
+
+        let mut payload = br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#.to_vec();
+        payload.resize(RPC_MAX_HTTP_BODY + 1, b' ');
+        let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap();
+        let headers = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            handle.auth.token,
+            payload.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        let mut buf = Vec::new();
+        timeout(Duration::from_secs(2), stream.read_to_end(&mut buf))
+            .await
+            .expect("413 for a body over RPC_MAX_HTTP_BODY")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("413"), "{text}");
+        assert!(
+            !text.contains("\"result\""),
+            "oversized getblockcount must not run: {text}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rpc_max_http_body_is_two_mebibytes() {
+        assert_eq!(RPC_MAX_HTTP_BODY, 2_097_152);
+    }
+
+    #[tokio::test]
+    async fn waitforblock_positional_hash_returns_current_tip() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-pos").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let (st, body) = post_raw(
+            tcp_addr(&handle),
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getbestblockhash"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        let hash = body.unwrap()["result"].as_str().expect("hash").to_string();
+        let req = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 2,
+            "method": "waitforblock",
+            "params": [hash]
+        });
+        let t0 = std::time::Instant::now();
+        let (st, body) =
+            post_raw(tcp_addr(&handle), &handle.auth, req.to_string().as_bytes()).await;
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert!(
+            body.get("error").is_none() || body["error"].is_null(),
+            "{body}"
+        );
+        assert_eq!(body["result"]["hash"], hash, "{body}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "positional waitforblock slept {:?}",
+            t0.elapsed()
+        );
+        let named = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 3,
+            "method": "waitfornewblock",
+            "params": [0]
+        });
+        let t1 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                named.to_string().as_bytes(),
+            ),
+        )
+        .await
+        .expect("waitfornewblock timeout 0 must return");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert_eq!(body["result"]["hash"], hash, "{body}");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(1),
+            "waitfornewblock with timeout 0 slept {:?}",
+            t1.elapsed()
+        );
+        let missing = "00".repeat(32);
+        let short = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 4,
+            "method": "waitforblock",
+            "params": [missing, 50]
+        });
+        let t2 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                short.to_string().as_bytes(),
+            ),
+        )
+        .await
+        .expect("short waitforblock must hit its deadline");
+        assert_eq!(st, 200, "{body:?}");
+        assert!(
+            t2.elapsed() < std::time::Duration::from_secs(1),
+            "missing-hash waitforblock ignored the deadline: {:?}",
+            t2.elapsed()
+        );
+        let gbt = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 5,
+            "method": "getblocktemplate",
+            "params": [{"rules": ["segwit"], "longpollid": "00"}]
+        });
+        let t3 = std::time::Instant::now();
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(tcp_addr(&handle), &handle.auth, gbt.to_string().as_bytes()),
+        )
+        .await
+        .expect("stale longpollid must not wait");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json");
+        assert!(body["result"]["height"].is_number(), "{body}");
+        assert!(
+            t3.elapsed() < std::time::Duration::from_secs(1),
+            "stale getblocktemplate longpoll slept {:?}",
+            t3.elapsed()
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waitfor_does_not_hold_the_blocking_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-pool").expect("dir");
+            let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+            let hub = rbitcoin_net::ChainHub::new(
+                q,
+                rbitcoin_consensus::ChainParams::regtest(),
+                rbitcoin_consensus::Milestone::NONE,
+            );
+            hub.ensure_genesis().unwrap();
+            let query = Arc::clone(&hub.query);
+            let cfg = RpcConfig {
+                listen: Some("127.0.0.1:0".parse().unwrap()),
+                socket_path: None,
+                datadir: dir.path().to_path_buf(),
+                network: Network::Regtest,
+                token_path: None,
+                subversion: None,
+                work_queue: None,
+                alert_notify: None,
+            };
+            let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let addr = tcp_addr(&handle);
+            let auth = handle.auth.clone();
+            let waiter = tokio::spawn(async move {
+                let body = serde_json::json!({
+                    "jsonrpc": "1.0",
+                    "id": "w",
+                    "method": "waitforblock",
+                    "params": {
+                        "blockhash": "00".repeat(32),
+                        "timeout": 2000
+                    }
+                })
+                .to_string();
+                let req = format!(
+                    "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    auth.token,
+                    body.len()
+                );
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                stream.write_all(req.as_bytes()).await.unwrap();
+                let mut buf = Vec::new();
+                let _ = stream.read_to_end(&mut buf).await;
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let t0 = std::time::Instant::now();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                t0.elapsed() < std::time::Duration::from_millis(400),
+                "named waitforblock held the blocking pool for {:?}",
+                t0.elapsed()
+            );
+            assert!(
+                !waiter.is_finished(),
+                "named waitforblock returned before the pool probe"
+            );
+            waiter.abort();
+            handle.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[tokio::test]
     async fn rpc_work_queue_exceeded() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wq").expect("temp dir");
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
@@ -1062,6 +1526,11 @@ mod tests {
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert!(sock.exists(), "socket file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "rpc.sock is created owner-only, got {mode:o}");
+        }
         let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
         let req = format!(
             "POST / HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1079,5 +1548,96 @@ mod tests {
             "unix unauthenticated getblockcount: {text}"
         );
         handle.shutdown().await;
+    }
+
+    fn http_wait_ctx() -> (
+        Arc<crate::methods::RpcContext>,
+        rbitcoin_store::testutil::TempDir,
+    ) {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-http-wait").expect("temp dir");
+        let hub = Arc::new(rbitcoin_net::ChainHub::new(
+            Query::open_or_create_tiny(dir.join("store")).unwrap(),
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        ));
+        hub.ensure_genesis().unwrap();
+        let ctx = Arc::new(crate::methods::RpcContext {
+            query: Arc::clone(&hub.query),
+            mempool: None,
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(0)),
+            initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: "/rbitcoin:test/".into(),
+            regtest: None,
+            peers: None,
+            chain: Some(hub),
+            addrman: None,
+            logpath: String::new(),
+            active: Arc::new(std::sync::Mutex::new(crate::methods::RpcActive::default())),
+            alert_notify: None,
+            alert_fired: Arc::new(AtomicBool::new(false)),
+        });
+        (ctx, dir)
+    }
+
+    #[tokio::test]
+    async fn http_wait_stop_returns_before_the_timeout() {
+        let (ctx, _dir) = http_wait_ctx();
+        ctx.stop.store(true, Ordering::SeqCst);
+        let body = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [99, 2_000]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &body).await);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "stop is enough; the deadline is still ahead"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_wait_met_height_does_not_sleep() {
+        let (ctx, _dir) = http_wait_ctx();
+        let body = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [0, 2_000]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &body).await);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "genesis height already meets 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_wait_unmet_height_and_same_tip_use_the_timeout() {
+        let (ctx, _dir) = http_wait_ctx();
+        let height = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [1, 160]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &height).await);
+        let dt = t0.elapsed();
+        assert!(
+            dt >= std::time::Duration::from_millis(100),
+            "height 1 is still ahead of genesis, waited {dt:?}"
+        );
+
+        let fresh = serde_json::json!({
+            "method": "waitfornewblock",
+            "params": [160]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &fresh).await);
+        let dt = t0.elapsed();
+        assert!(
+            dt >= std::time::Duration::from_millis(100),
+            "the tip did not move, waited {dt:?}"
+        );
     }
 }

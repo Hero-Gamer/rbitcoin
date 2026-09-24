@@ -103,9 +103,10 @@ Short sequence:
 |------|--------|
 | 1 | `Store::open` + schema gates |
 | 2 | Soft `tip_seal` clamp (if present) |
-| 3 | Trim trailing null `confirmed[]` slots, then tip-window revalidate last **6** heights; shrink/clear on fail; rebuild fence |
+| 3 | Trim trailing null `confirmed[]` slots, then tip-window revalidate. Default last **6** heights; a `spend_durable` marker widens that to `(D, tip]` (6 stays the floor). `checkblocks=0` still walks from genesis. Shrink/clear on fail; rebuild fence |
 | 4 | One `repair_class_c_above_tip` (fence complement: holes + short suffix) |
-| 5 | Then node may densify / extend tip |
+| 5 | Replay spend annotations above annotated-through, `sync_data` those stems, publish the marker at tip |
+| 6 | Then node may densify / extend tip |
 
 `create.loc` is body-only deltas plus RAM checkpoints; a loc/off size mismatch
 on open is `Corrupt` (wipe + IBD). Historic schema-≤14 idx double-append

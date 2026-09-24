@@ -13,6 +13,36 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 
+/// Per-peer outbound queue cap (a few megabytes). Not a configuration knob.
+///
+/// Core's `-maxsendbuffer` is the same idea. One reply may land past the cap;
+/// the next inbound request from that peer waits until the writer drains.
+pub const PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
+/// legacy addr rows are 30. Encoded block bodies use their buffer length.
+pub(crate) fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
+    match msg {
+        NetworkMessage::Headers(h) => h.len().saturating_mul(81),
+        NetworkMessage::Inv(v) | NetworkMessage::NotFound(v) | NetworkMessage::GetData(v) => {
+            v.len().saturating_mul(36)
+        }
+        NetworkMessage::Tx(tx) => tx.total_size(),
+        NetworkMessage::Block(b) => b.total_size(),
+        NetworkMessage::Addr(a) => a.len().saturating_mul(30),
+        NetworkMessage::AddrV2(a) => a.len().saturating_mul(61),
+        NetworkMessage::CmpctBlock(_) => 1024,
+        _ => 64,
+    }
+}
+
+pub(crate) fn outbound_queued_bytes(out: &PeerOut) -> usize {
+    match out {
+        PeerOut::Msg(m) => outbound_msg_bytes(m),
+        PeerOut::Encoded(b) => b.len(),
+    }
+}
+
 /// Session writer payload: application messages or pre-encoded v2 block bytes.
 #[derive(Debug)]
 pub enum PeerOut {
@@ -221,6 +251,12 @@ pub struct LivePeer {
     pub stop: AtomicBool,
     /// Full `Block`/`CmpctBlock` messages queued to this session's writer.
     pub serve_inflight: AtomicUsize,
+    /// Bytes sitting in this session's outbound queue (estimate).
+    send_queued: AtomicUsize,
+    /// Wakes the reader after the writer drains under [`PEER_SEND_BUDGET`].
+    send_resume: tokio::sync::Notify,
+    /// Inbound `getaddr` is answered once per connection.
+    getaddr_answered: AtomicBool,
     /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
     pub hb_to: AtomicBool,
     /// They announce new tips as `cmpctblock` to us (`sendcmpct` they sent).
@@ -278,6 +314,9 @@ pub struct LivePeer {
     inflight: Mutex<Vec<u32>>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
     out_tx: Mutex<Option<mpsc::UnboundedSender<PeerOut>>>,
+    /// Addr relay tokens still available, and the millisecond they were last filled.
+    addr_tokens: Mutex<f64>,
+    addr_token_ms: AtomicU64,
     /// Unix seconds when this session was registered.
     connected_at: AtomicU64,
     /// Skip INV for mempool txs with `accept_gen < floor` (post-verack privacy).
@@ -767,12 +806,72 @@ impl LivePeer {
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
-        self.writer()
-            .is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok())
+        let n = outbound_msg_bytes(&msg);
+        let ok = self
+            .writer()
+            .is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok());
+        if ok {
+            self.note_send_queued(n);
+        }
+        ok
+    }
+
+    pub(crate) fn send_queued(&self) -> usize {
+        self.send_queued.load(Ordering::Relaxed)
+    }
+
+    /// True after a reply has already pushed this peer past [`PEER_SEND_BUDGET`].
+    pub(crate) fn send_over_budget(&self) -> bool {
+        self.send_queued() > PEER_SEND_BUDGET
+    }
+
+    pub(crate) fn note_send_queued(&self, n: usize) {
+        if n > 0 {
+            self.send_queued.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Writer finished (or dropped) `n` queued bytes. Wakes a paused reader.
+    pub(crate) fn note_send_written(&self, n: usize) {
+        let prev = self
+            .send_queued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            })
+            .unwrap_or(0);
+        if prev.saturating_sub(n) <= PEER_SEND_BUDGET {
+            self.send_resume.notify_waiters();
+        }
+    }
+
+    /// Reader pause. Registers the waiter before the budget check.
+    pub(crate) async fn wait_send_budget(&self) {
+        loop {
+            let notified = self.send_resume.notified();
+            if !self.send_over_budget() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// First inbound `getaddr` wins. Later ones are ignored.
+    pub(crate) fn take_getaddr(&self) -> bool {
+        !self.getaddr_answered.swap(true, Ordering::Relaxed)
     }
 
     pub(crate) fn attach_out(&self, tx: mpsc::UnboundedSender<PeerOut>) {
         *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub(crate) fn take_addr_relay(&self, want: usize, now_ms: u64) -> usize {
+        let mut tokens = self.addr_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let at = self.addr_token_ms.load(Ordering::Relaxed);
+        let filled = crate::peer::addr_relay_tokens(*tokens, at, now_ms);
+        self.addr_token_ms.store(now_ms.max(at), Ordering::Relaxed);
+        let take = (filled.floor() as usize).min(want);
+        *tokens = filled - take as f64;
+        take
     }
 
     pub(crate) fn writer(&self) -> Option<mpsc::UnboundedSender<PeerOut>> {
@@ -836,7 +935,12 @@ impl LivePeer {
     pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
         self.owner
             .upgrade()
-            .map(|h| h.permission_flags(self.addr, self.inbound, self.addrbind))
+            .map(|h| {
+                h.net_perms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .flags_for_net(self.net, self.inbound, self.addrbind)
+            })
             .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
     }
 
@@ -1949,6 +2053,9 @@ impl PeerHub {
             relay: ver.relay,
             stop: AtomicBool::new(false),
             serve_inflight: AtomicUsize::new(0),
+            send_queued: AtomicUsize::new(0),
+            send_resume: tokio::sync::Notify::new(),
+            getaddr_answered: AtomicBool::new(false),
             hb_to: AtomicBool::new(false),
             hb_from: AtomicBool::new(false),
             pending_sendcmpct: std::sync::atomic::AtomicU8::new(0),
@@ -1981,6 +2088,8 @@ impl PeerHub {
             failed_cmpct: Mutex::new(HashSet::new()),
             inflight: Mutex::new(Vec::new()),
             out_tx: Mutex::new(None),
+            addr_tokens: Mutex::new(crate::peer::ADDR_RELAY_BURST),
+            addr_token_ms: AtomicU64::new(0),
             connected_at: AtomicU64::new(connected_at),
             inv_gen_floor: AtomicU64::new(0),
             age_inv_seen_due: AtomicU64::new(0),

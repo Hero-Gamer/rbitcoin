@@ -120,6 +120,8 @@ pub struct TxGraph {
     /// How many times [`Self::mining_chunks_best_first`] built from clusters
     /// (not a cache hit). Hub tests pin refresh does one rebuild per dirty window.
     chunks_rebuilds: AtomicU64,
+    /// Full [`Self::cluster_of`] builds (walk + linearize). Insert should do this once.
+    cluster_builds: AtomicU64,
     /// Best-first chunks; `None` after mutate until next build.
     chunk_cache: Mutex<Option<Vec<Chunk>>>,
     /// Lowest-rate chunk per cluster, ordered by (rate, representative txid).
@@ -144,6 +146,7 @@ impl Default for TxGraph {
             created: HashSet::new(),
             total_weight: 0,
             chunks_rebuilds: AtomicU64::new(0),
+            cluster_builds: AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
             worst_chunks: BTreeMap::new(),
             worst_rep_rate: HashMap::new(),
@@ -197,6 +200,10 @@ impl TxGraph {
     /// Sample-and-reset cluster-linearize count (fee-refresh tests).
     pub fn take_chunks_rebuilds(&self) -> u64 {
         self.chunks_rebuilds.swap(0, Ordering::Relaxed)
+    }
+
+    pub fn take_cluster_builds(&self) -> u64 {
+        self.cluster_builds.swap(0, Ordering::Relaxed)
     }
 
     fn invalidate_chunk_cache(&mut self) {
@@ -440,12 +447,15 @@ impl TxGraph {
     pub fn insert(&mut self, entry: TxEntry, tx: &Transaction) {
         self.invalidate_chunk_cache();
         let txid = entry.txid;
+        let mut seen = BTreeSet::new();
         let mut old_reps = BTreeSet::new();
         for inp in &tx.input {
-            if self.created.contains(&inp.previous_output) {
-                if let Some(r) = self.cluster_rep(&inp.previous_output.txid) {
-                    old_reps.insert(r);
-                }
+            let parent = inp.previous_output.txid;
+            if !self.created.contains(&inp.previous_output) || seen.contains(&parent) {
+                continue;
+            }
+            if let Some(r) = self.component_rep(parent, &mut seen) {
+                old_reps.insert(r);
             }
         }
         for (vout, _) in tx.output.iter().enumerate() {
@@ -453,10 +463,14 @@ impl TxGraph {
                 txid,
                 vout: vout as u32,
             };
-            if let Some(child) = self.conflicts.get(&op).copied() {
-                if let Some(r) = self.cluster_rep(&child) {
-                    old_reps.insert(r);
-                }
+            let Some(child) = self.conflicts.get(&op).copied() else {
+                continue;
+            };
+            if seen.contains(&child) {
+                continue;
+            }
+            if let Some(r) = self.component_rep(child, &mut seen) {
+                old_reps.insert(r);
             }
         }
         for r in old_reps {
@@ -574,8 +588,74 @@ impl TxGraph {
         Some(e)
     }
 
+    /// Membership walk from `start`. Marks every visited tx in `seen`.
+    /// Representative is the least txid in the component. Does not linearize.
+    fn component_rep(&self, start: Txid, seen: &mut BTreeSet<Txid>) -> Option<Txid> {
+        if !self.entries.contains_key(&start) {
+            return None;
+        }
+        let mut rep = start;
+        let mut q = VecDeque::new();
+        q.push_back(start);
+        seen.insert(start);
+        while let Some(cur) = q.pop_front() {
+            rep = rep.min(cur);
+            let Some(e) = self.entries.get(&cur) else {
+                continue;
+            };
+            for n in e.parents.iter().chain(e.children.iter()) {
+                if seen.insert(*n) {
+                    q.push_back(*n);
+                }
+            }
+        }
+        Some(rep)
+    }
+
+    /// One membership walk from every seed. Weight sum of the union.
+    pub fn connected_weight(&self, seeds: &BTreeSet<Txid>) -> (usize, u64) {
+        self.connected_weight_except(seeds, &BTreeSet::new())
+    }
+
+    /// [`connected_weight`] that does not enter `except` (RBF conflicts still linked).
+    pub(crate) fn connected_weight_except(
+        &self,
+        seeds: &BTreeSet<Txid>,
+        except: &BTreeSet<Txid>,
+    ) -> (usize, u64) {
+        let mut seen = BTreeSet::new();
+        let mut q = VecDeque::new();
+        for seed in seeds {
+            if except.contains(seed) {
+                continue;
+            }
+            if self.entries.contains_key(seed) && seen.insert(*seed) {
+                q.push_back(*seed);
+            }
+        }
+        while let Some(cur) = q.pop_front() {
+            let Some(e) = self.entries.get(&cur) else {
+                continue;
+            };
+            for n in e.parents.iter().chain(e.children.iter()) {
+                if except.contains(n) {
+                    continue;
+                }
+                if seen.insert(*n) {
+                    q.push_back(*n);
+                }
+            }
+        }
+        let weight = seen
+            .iter()
+            .filter_map(|t| self.entries.get(t).map(|e| e.weight))
+            .sum();
+        (seen.len(), weight)
+    }
+
     /// Connected component containing `txid` (undirected parent/child).
     pub fn cluster_of(&self, txid: &Txid) -> Option<Cluster> {
+        self.cluster_builds.fetch_add(1, Ordering::Relaxed);
         if !self.entries.contains_key(txid) {
             return None;
         }
@@ -889,6 +969,11 @@ impl TxGraph {
     }
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
+    #[cfg(test)]
+    fn indexed_cluster_count(&self) -> usize {
+        self.worst_chunks.len()
+    }
+
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
         self.worst_chunks
             .iter()
@@ -984,12 +1069,37 @@ mod tests {
     }
 
     #[test]
+    fn component_rep_is_the_least_txid() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let pe = entry_for(&parent, 500, 0);
+        let pid = pe.txid;
+        g.insert(pe, &parent);
+        let child = make_tx(Some((pid, 0)), 1, 1);
+        let ce = entry_for(&child, 500, 1);
+        let cid = ce.txid;
+        g.insert(ce, &child);
+        let least = pid.min(cid);
+        let greater = pid.max(cid);
+        assert_ne!(least, greater);
+        let mut seen = std::collections::BTreeSet::new();
+        assert_eq!(g.component_rep(greater, &mut seen), Some(least));
+        assert_eq!(g.indexed_cluster_count(), 1);
+        let stranger = make_tx(Some((pid, 7)), 1, 9);
+        g.insert(entry_for(&stranger, 500, 2), &stranger);
+        assert_eq!(g.indexed_cluster_count(), 2);
+    }
+
+    #[test]
     fn single_tx_cluster() {
         let mut g = TxGraph::new();
+        assert_eq!(g.take_cluster_builds(), 0);
         let tx = make_tx(None, 1, 1);
         let e = entry_for(&tx, 1000, 0);
         let id = e.txid;
         g.insert(e, &tx);
+        let (n, _) = g.connected_weight(&std::collections::BTreeSet::from([id]));
+        assert_eq!(n, 1);
         let c = g.cluster_of(&id).unwrap();
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.linearization, vec![id]);
