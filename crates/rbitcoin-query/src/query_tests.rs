@@ -1800,6 +1800,59 @@ fn history_page_closed_needs_a_full_page_past_the_cursor() {
 }
 
 #[test]
+fn milestone_work_extends_only_the_heavier_contiguous_path() {
+    let (dir, q) = temp_query("ms-work");
+    assert!(q.milestone_best_work_be().is_none());
+    let mut base_be = [0u8; 32];
+    base_be[30] = 2;
+    let mut one_be = [0u8; 32];
+    one_be[31] = 4;
+    let base = bitcoin::Work::from_be_bytes(base_be);
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let h1 = [0x11u8; 32];
+    q.note_milestone_header(5, h1, [0; 32], one, Some(base));
+    let at_five = (base + one).to_be_bytes();
+    assert_eq!(q.milestone_best_work_be(), Some(at_five));
+
+    let mut tiny_be = [0u8; 32];
+    tiny_be[31] = 1;
+    q.note_milestone_header(
+        1,
+        [0x22; 32],
+        [0; 32],
+        bitcoin::Work::from_be_bytes(tiny_be),
+        Some(base),
+    );
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(at_five),
+        "a lower header must not replace a heavier path"
+    );
+
+    let h6 = [0x33u8; 32];
+    q.note_milestone_header(6, h6, h1, one, None);
+    let at_six = (base + one + one).to_be_bytes();
+    assert_eq!(q.milestone_best_work_be(), Some(at_six));
+    q.note_milestone_header(7, [0x44; 32], [0x55; 32], one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(at_six),
+        "a header whose parent is not the path tip does not add work"
+    );
+
+    q.clear_milestone_path_above(6);
+    assert_eq!(q.milestone_best_work_be(), Some(at_six));
+    assert_eq!(q.milestone_header_at(6), Some(h6));
+    q.clear_milestone_path_above(8);
+    assert_eq!(q.milestone_best_work_be(), Some(at_six));
+    q.clear_milestone_path_above(5);
+    assert!(q.milestone_best_work_be().is_none());
+    assert_eq!(q.milestone_header_at(5), Some(h1));
+    assert_eq!(q.milestone_header_at(6), None);
+    let _ = dir;
+}
+
+#[test]
 fn scripthash_create_count_includes_pending_write_behind() {
     let (dir, q) = temp_query("sh-count-pending");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);

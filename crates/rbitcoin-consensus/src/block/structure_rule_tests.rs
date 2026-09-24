@@ -1731,6 +1731,7 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
         .0
     };
     assert_eq!(run(&q).len(), 1, "missing anchor path still checks scripts");
+    assert!(crate::milestone::check_scripts(ms, &q, 1, &bh));
     let mut base = [0u8; 32];
     base[1] = 2;
     let mut one = [0u8; 32];
@@ -1753,6 +1754,7 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
         run(&q).is_empty(),
         "header path through the anchor with enough work skips scripts"
     );
+    assert!(!crate::milestone::check_scripts(ms, &q, 1, &bh));
     q.clear_milestone_path_above(0);
     assert_eq!(run(&q).len(), 1, "cleared path checks scripts again");
     let _ = std::fs::remove_dir_all(&path);

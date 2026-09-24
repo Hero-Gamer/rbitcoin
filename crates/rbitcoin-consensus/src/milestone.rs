@@ -93,6 +93,15 @@ pub(crate) fn skips_on_query(
     skip
 }
 
+pub(crate) fn check_scripts(
+    milestone: Milestone,
+    query: &rbitcoin_query::Query,
+    height: u32,
+    block: &[u8; 32],
+) -> bool {
+    !skips_on_query(milestone, query, height, block)
+}
+
 impl Default for Milestone {
     fn default() -> Self {
         Self::NONE

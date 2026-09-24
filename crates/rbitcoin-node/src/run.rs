@@ -189,7 +189,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             "ibd: milestone height={} hash={} (script/sig skip only when this header path contains that hash and chain work meets the floor; prevouts always)",
             milestone.height, anchor.hash
         );
-    } else if milestone.height > 0 {
+    } else {
         info!(
             "ibd: milestone height={} (script/sig checks skipped at/below; prevouts always)",
             milestone.height

@@ -91,6 +91,12 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
         st.hash_height.contains_key(&good.block_hash()),
         "a valid header still records path state"
     );
+    let tipped = hub
+        .query
+        .milestone_best_work_be()
+        .expect("a header on the tip passes chain work into the milestone path");
+    let expect = (hub.chain_work().unwrap() + good.header.work()).to_be_bytes();
+    assert_eq!(tipped, expect);
 
     let mut child = mine(good.block_hash(), 1_500_010_600, 2);
     child.header.time = 0;
