@@ -60,7 +60,7 @@ Electrum, Esplora REST, libre mempool) for the **server-side / wallet-client
 backend** role. **0.7 mainnet** is early production / high-scrutiny — not a
 Core or Fulcrum replacement, not a soak badge. Run **signet first**, then
 mainnet with monitoring ([`OPERATOR.md`](./OPERATOR.md)). First hour on
-regtest (mine → Electrum → Esplora): [`OPERATOR.md`](./OPERATOR.md#first-hour-regtest).
+regtest (mine → Electrum → Esplora): [`docs/operator/operations.md`](./docs/operator/operations.md#first-hour-regtest).
 Finishing any one operator’s first full mainnet sync is **not** a gate for
 using or packaging this tree. 1.0 gates:
 [`docs/road-to-1.0.md`](./docs/road-to-1.0.md).
@@ -105,24 +105,10 @@ Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the
 operator binary — that links against the Nix store glibc and fails outside the
 store.
 
-## Crate map
+## Crates
 
-| Crate | Role |
-|-------|------|
-| `rbitcoin-primitives` | Shared types / newtypes |
-| `rbitcoin-store` | Map-free Class A/B/C tables (fd pread/pwrite), scripthash, bulk IO |
-| `rbitcoin-query` | Domain API (archive, confirm, reconstruct, Electrum joins) |
-| `rbitcoin-consensus` | Validation / confirm; pure-Rust scripts; milestone = scripts only |
-| `rbitcoin-net` | P2P + IBD (modular `ibd/`), tip follow, relay |
-| `rbitcoin-mempool` | Cluster graph + libre admission |
-| `rbitcoin-electrum` | Electrum TCP server |
-| `rbitcoin-esplora` | Esplora REST + wallet-scoped WS (opt-in) |
-| `rbitcoin-log` | Leveled stderr logger |
-| `rbitcoin-rpc` | Documented Core-class JSON-RPC subset (not full Core) |
-| `rbitcoin-cli` | CLI client |
-| `rbitcoin-node` | Node binary |
-| `rbitcoin-bench` | Optional Electrum/Esplora **client** benchmark (`--features cli`; not a default/musl product bin) |
-| `rbitcoin-test` | High-level test harness |
+Workspace crate ownership and dependency orientation:
+[`docs/CRATES.md`](./docs/CRATES.md).
 
 ## Documentation
 

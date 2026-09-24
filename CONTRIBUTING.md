@@ -54,7 +54,7 @@ target\dev\debug\rbitcoin-node.exe --smoke --network regtest --datadir %TEMP%\rb
 ```
 
 Do **not** point `--datadir` at a mainnet tree for this. Next: first-hour
-regtest (mine → Electrum → Esplora) in [`OPERATOR.md`](./OPERATOR.md#first-hour-regtest)
+regtest (mine → Electrum → Esplora) in [`docs/operator/operations.md`](./docs/operator/operations.md#first-hour-regtest)
 using this cargo binary (not the musl `target/release/` install).
 
 ### What works on each OS

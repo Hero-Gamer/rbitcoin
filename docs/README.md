@@ -8,7 +8,7 @@ update that file — do not paste a parallel spec.
 
 | Audience | Start | Owns |
 |----------|-------|------|
-| Operator / new human | [`README.md`](../README.md) → [`OPERATOR.md`](../OPERATOR.md) | How to run, flags |
+| Operator / new human | [`README.md`](../README.md) → [`OPERATOR.md`](../OPERATOR.md) | Task routes into setup, operations, storage/indexes, client interfaces, and field notes |
 | Product / interop | [`COMPAT.md`](../COMPAT.md) | Intentional differences, Electrum/RPC surface |
 | Contributor (human) | [`CONTRIBUTING.md`](../CONTRIBUTING.md) | Getting started (any OS, no Nix), principles, review checklist, comments-as-smell, CI commands |
 | Agent | [`AGENTS.md`](../AGENTS.md) | Short hard rules + pointers (not a second design book) |
@@ -18,6 +18,7 @@ update that file — do not paste a parallel spec.
 | Peer full nodes | [`peer-clients.md`](./peer-clients.md) | Hornet / satd comparison; later-consideration tests and ideas |
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
+Workspace crate roles and dependency orientation: [`CRATES.md`](./CRATES.md).
 Home-node (no clearnet listen ports): [`personal-node-plans/`](./personal-node-plans/).
 Releases (tag / `vX.Y.x` / `.99`): [`releases.md`](./releases.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
@@ -33,7 +34,9 @@ into `AGENTS.md`.
 
 | Doc | Owns |
 |-----|------|
-| [`ORIENT.md`](./ORIENT.md) | Agent task router: crate graph and read-first links. Open one matching row. Not a second index of facts. |
+| [`ORIENT.md`](./ORIENT.md) | Agent task router and read-first links. Open one matching row. Not a second index of facts. |
+| [`CRATES.md`](./CRATES.md) | Workspace crate roles and dependency orientation. |
+| [`operator/`](./operator/) | Task guides linked from `OPERATOR.md`: setup, node operations, storage/indexes, client interfaces, and field notes. |
 | [`architecture.md`](./architecture.md) | Why this node is different (Core / Fulcrum contrasts). No stage-IO table copy. |
 | [`concurrency.md`](./concurrency.md) | Writer roles, publish order, body-queue, pins. Links invariants for leftover union. |
 | [`invariants.md`](./invariants.md) | Confirm stage IO (the **only** copy), leftover union, store start states S0–S4, no silent fallbacks. |
