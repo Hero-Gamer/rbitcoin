@@ -107,8 +107,19 @@ where
 }
 
 /// `fsync` the directory so a renamed dirent survives a crash.
+///
+/// Windows denies a directory handle (`ERROR_ACCESS_DENIED`), including with
+/// backup semantics. The file itself was already `sync_all`'d before rename.
 pub(crate) fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Trailing-header tables (`tx.head`): 16-byte store identity + 16-byte layout

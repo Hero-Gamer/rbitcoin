@@ -99,7 +99,7 @@ The write thread `sync_data`s spend annotations and the Class A bodies replay ne
 | Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync` |
 | Mempool sidecar | No. RAM is source of truth | Leave the 5 s path |
 
-`tx.head` meta and the spend marker use the same parent-directory `fsync` as `tip_seal` after tmp+rename. A missing `spend_durable` keeps the checkblocks window (default 6). `checkblocks=0` still walks from genesis.
+`tx.head` meta and the spend marker use the same parent-directory `fsync` as `tip_seal` after tmp+rename. Windows denies that directory handle; the file was already synced. A missing `spend_durable` keeps the checkblocks window (default 6). `checkblocks=0` still walks from genesis.
 
 ## Mempool sidecar (`{datadir}/mempool/`)
 
