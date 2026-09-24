@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-net` (`drain_pending`)
 **Audit pin:** fuzzamoto report 009 / rbitcoin `8f3990f`
 **Severity:** high — sync stall
-**Status:** fixed — `peer_catchup_compact_reorg` (`drain_connects_pending_child_of_new_tip_after_reorg`)
+**Status:** fixed — `peer_catchup_compact_reorg` (pending child connects after the reorg)
 **Found by:** fuzzamoto
 
 ## Summary

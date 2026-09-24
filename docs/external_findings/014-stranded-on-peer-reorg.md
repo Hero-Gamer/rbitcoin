@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-net` (`has_block`, inv/headers download, `drain_pending`)
 **Audit pin:** fuzzamoto report 003 / rbitcoin `8f3990f`
 **Severity:** high — sync stall (not a validation split)
-**Status:** fixed — `peer_catchup_compact_reorg` (`drain_requests_missing_parent_of_pending_branch`)
+**Status:** fixed — `peer_catchup_compact_reorg` (drain asks for the missing parent)
 **Found by:** fuzzamoto
 
 ## Summary
