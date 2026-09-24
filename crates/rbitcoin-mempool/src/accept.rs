@@ -389,9 +389,6 @@ fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), Accep
     if prevouts.len() != tx.input.len() {
         return Err(AcceptError::Script("prevout count mismatch".into()));
     }
-    if policy::exceeds_standard_sigops(tx, &prevouts) {
-        return Err(AcceptError::Policy("bad-txns-too-many-sigops"));
-    }
     rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx.clone())
         .map_err(|e| AcceptError::Script(e.to_string()))
 }
@@ -2328,8 +2325,8 @@ mod tests {
         );
 
         mp.max_weight = policy::MAX_STANDARD_TX_WEIGHT.saturating_mul(64);
-        // 4001 legacy CHECKSIG × witness scale 4 = 16004, over the 16000 standard cap.
-        // The input spends OP_TRUE, so the interpreter would accept this tx.
+        // 4001 legacy CHECKSIG × witness scale 4 = 16004, over Core's 16000
+        // standard cap. The tx fits the mempool's block-template sigop budget.
         let sigops = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -2344,12 +2341,13 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
             }],
         };
-        let err = mp
-            .accept_tx(&sigops, &utxos, TIP_OK)
-            .expect_err("standard sigop cap");
-        assert!(
-            matches!(err, AcceptError::Policy("bad-txns-too-many-sigops")),
-            "sigops must fail before the interpreter, got {err}"
+        mp.accept_tx(&sigops, &utxos, TIP_OK)
+            .expect("16004 sigop cost fits a block");
+        assert_eq!(
+            mp.graph
+                .get(&sigops.compute_txid())
+                .map(|entry| entry.sigop_cost),
+            Some(16_004)
         );
 
         mp.set_cluster_limits(Some(50), Some(1));

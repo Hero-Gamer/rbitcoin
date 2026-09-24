@@ -31,10 +31,10 @@ before 1.0).
   records its full cost. The sidecar is schema 3; schema 2 pools soft-migrate
   on open and the hub recomputes the cost, dropping entries whose inputs no
   longer resolve.
-- **Standard sigop cost is enforced before script execution.** A transaction
-  whose sigop cost exceeds 16_000 is `bad-txns-too-many-sigops` and is not
-  handed to the interpreter. An invalid script from a peer adds 10 to that
-  peer's ban score. Consensus block flags are unchanged.
+- **An invalid script from a peer adds 10 to that peer's ban score.**
+  Consensus block flags are unchanged. There is no 16_000 standard sigop
+  cap (Libre policy); the only sigop reject is the whole-block limit above,
+  checked before the interpreter.
 - **Full-mempool fee floor follows evicted feerate.** While the mempool is
   at the weight cap the static bump remains, and an evicted chunk raises
   the floor one sat/kvB above that chunk so the same-rate transaction cannot
