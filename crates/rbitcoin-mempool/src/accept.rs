@@ -2617,8 +2617,12 @@ mod tests {
 
         mp.remove_for_block(&[pid, child.compute_txid()]).unwrap();
         assert_eq!(mp.live_count(), 0);
-        let res = mp.reorg_disconnect_reaccept(&pkg, &utxos, TIP_OK);
-        assert!(res.iter().all(Result::is_ok), "{res:?}");
+        let readmitted: Vec<Txid> = mp
+            .reorg_disconnect_reaccept(&pkg, &utxos, TIP_OK)
+            .into_iter()
+            .map(|r| r.expect("reorg re-admit").txid)
+            .collect();
+        assert_eq!(readmitted, [pid, child.compute_txid()]);
         assert_eq!(live_sigops(&mp, &parent), 8);
         assert_eq!(live_sigops(&mp, &child), 80);
     }
