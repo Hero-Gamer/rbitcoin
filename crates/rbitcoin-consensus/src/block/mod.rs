@@ -1406,17 +1406,101 @@ pub(crate) struct StructuralPhaseNs {
 /// load does not walk create height for every parent. Heights: bulk fence.
 /// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
-/// Write-path spend annotate: abs + structural meta, no pin `get_spender_abs`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SpendAnnotateJob {
-    pub abs: u64,
-    pub field: rbitcoin_primitives::Fk,
-    pub flags: u8,
-    pub field_vin: u32,
-    pub create_fk: rbitcoin_primitives::Fk,
-    pub vout: u32,
-    pub spend_fk: rbitcoin_primitives::Fk,
-    pub vin: u32,
+/// Write-path spend annotate slots: abs edge plus the meta structural already read.
+///
+/// Filled during spentness and passed to annotate. No second edge copy.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AnnotateSlots {
+    pub abs_edges: Vec<(
+        u64,
+        rbitcoin_primitives::Fk,
+        u32,
+        rbitcoin_primitives::Fk,
+        u32,
+    )>,
+    pub known: Vec<(rbitcoin_primitives::Fk, u8, u32)>,
+}
+
+impl AnnotateSlots {
+    pub(crate) fn push(
+        &mut self,
+        edge: (
+            u64,
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+            u32,
+        ),
+        known: (rbitcoin_primitives::Fk, u8, u32),
+    ) {
+        self.abs_edges.push(edge);
+        self.known.push(known);
+    }
+}
+
+/// Per-block spentness scratch. Capacity stays across blocks in one write batch.
+/// [`AnnotateSlots`] accumulate for the whole batch.
+pub(crate) struct StructuralScratch {
+    abs_jobs: Vec<StructuralAbsJob>,
+    abs_seen: rbitcoin_query::U64Set,
+    unique_fks: Vec<rbitcoin_primitives::Fk>,
+    height_by_id: U64Map<u32>,
+    skip_n: std::collections::HashMap<
+        (u64, u32),
+        u32,
+        BuildHasherDefault<rbitcoin_query::OutPointHasher>,
+    >,
+    skip: OverlayMetaSkip,
+    disk_jobs: Vec<StructuralAbsJob>,
+    abs_offs: Vec<u64>,
+    field_fks: Vec<rbitcoin_primitives::Fk>,
+    field_seen: rbitcoin_query::U64Set,
+    field_h_by_id: U64Map<u32>,
+    durable_spent: DurableSpentSet,
+    height_list: Vec<u32>,
+    create_height_by_fk: FkMap<u32>,
+    pub slots: AnnotateSlots,
+}
+
+impl Default for StructuralScratch {
+    fn default() -> Self {
+        Self {
+            abs_jobs: Vec::new(),
+            abs_seen: rbitcoin_query::U64Set::default(),
+            unique_fks: Vec::new(),
+            height_by_id: U64Map::default(),
+            skip_n: std::collections::HashMap::with_hasher(Default::default()),
+            skip: OverlayMetaSkip::with_hasher(Default::default()),
+            disk_jobs: Vec::new(),
+            abs_offs: Vec::new(),
+            field_fks: Vec::new(),
+            field_seen: rbitcoin_query::U64Set::default(),
+            field_h_by_id: U64Map::default(),
+            durable_spent: DurableSpentSet::with_hasher(Default::default()),
+            height_list: Vec::new(),
+            create_height_by_fk: FkMap::default(),
+            slots: AnnotateSlots::default(),
+        }
+    }
+}
+
+impl StructuralScratch {
+    fn begin_block(&mut self) {
+        self.abs_jobs.clear();
+        self.abs_seen.clear();
+        self.unique_fks.clear();
+        self.height_by_id.clear();
+        self.skip_n.clear();
+        self.skip.clear();
+        self.disk_jobs.clear();
+        self.abs_offs.clear();
+        self.field_fks.clear();
+        self.field_seen.clear();
+        self.field_h_by_id.clear();
+        self.durable_spent.clear();
+        self.height_list.clear();
+        self.create_height_by_fk.clear();
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -1424,7 +1508,7 @@ pub(crate) struct SpendAnnotateJob {
 /// set (not unspent). Missing abs / short meta is hard `Err`. **Multi-list** after
 /// reorg annotate is a protocol cold walk (`has_confirmed_strong_spender_create`)
 /// — not a hard fail (tip-follow reorgs leave multi flags by design). Emits
-/// [`SpendAnnotateJob`] for pure-write annotate.
+/// Annotate slots on `scratch` for pure-write annotate.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1442,48 +1526,43 @@ pub(crate) fn structural_validate_spends(
     batch_parents: &rbitcoin_query::BatchParents,
     mtp_cache: &mut U32Map<u32>,
     run_create_height: &FkMap<u32>,
-    annotate: &mut Vec<SpendAnnotateJob>,
+    scratch: &mut StructuralScratch,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
-    use std::collections::HashSet;
     use std::time::Instant;
 
+    scratch.begin_block();
     let maturity = ctx.params.coinbase_maturity();
     reject_bip30_unspent_overwrite(query, block, ctx)?;
     let t_spent = Instant::now();
     let t_abs = Instant::now();
-    let (abs_jobs, unique_create_fks, height_by_id) =
-        structural_abs_heights(query, spends, batch_parents, run_create_height)?;
+    structural_abs_heights(query, spends, batch_parents, run_create_height, scratch)?;
     let tip = query.tip_height().map(|h| h.0);
     let mut spent_strong_ns = 0u64;
     let mut multi_list_ns = 0u64;
-    let mut durable_spent: HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>> =
-        HashSet::with_hasher(Default::default());
-    if !abs_jobs.is_empty() {
-        let skip = overlay_meta_skip_map(spends, run_create_height);
-        let loaded =
-            structural_load_durable_spent(query, &abs_jobs, &height_by_id, tip, annotate, &skip)?;
-        durable_spent = loaded.0;
-        multi_list_ns = loaded.1;
-        spent_strong_ns = loaded.2;
+    if !scratch.abs_jobs.is_empty() {
+        fill_overlay_skip(spends, run_create_height, scratch);
+        let loaded = structural_load_durable_spent(query, tip, scratch)?;
+        multi_list_ns = loaded.0;
+        spent_strong_ns = loaded.1;
     }
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
     let spent_cold_ns = multi_list_ns;
     let t_pending = Instant::now();
-    structural_mark_pending(spends, pending_spent, &durable_spent)?;
+    structural_mark_pending(spends, pending_spent, &scratch.durable_spent)?;
     let spent_pending_ns = t_pending.elapsed().as_nanos() as u64;
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
     let t_create = Instant::now();
-    let create_height_by_fk = structural_create_heights(
-        query,
-        batch_parents,
-        &unique_create_fks,
-        &height_by_id,
-        ctx.height.0,
-        maturity,
-    )?;
+    structural_create_heights(query, batch_parents, ctx.height.0, maturity, scratch)?;
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
     let t_bip68 = Instant::now();
-    structural_bip68(query, block, ctx, spends, &create_height_by_fk, mtp_cache)?;
+    structural_bip68(
+        query,
+        block,
+        ctx,
+        spends,
+        &scratch.create_height_by_fk,
+        mtp_cache,
+    )?;
     let bip68_ns = t_bip68.elapsed().as_nanos() as u64;
     let _ = archived_tx_fks;
     check_coinbase_subsidy(block, ctx, fees)?;
@@ -1507,7 +1586,7 @@ type OverlayMetaSkip = std::collections::HashMap<
     BuildHasherDefault<rbitcoin_query::OutPointHasher>,
 >;
 
-fn overlay_meta_skip_map(
+fn fill_overlay_skip(
     spends: &[(
         [u8; 32],
         u32,
@@ -1516,13 +1595,8 @@ fn overlay_meta_skip_map(
         u32,
     )],
     run_create_height: &FkMap<u32>,
-) -> OverlayMetaSkip {
-    let mut n: std::collections::HashMap<
-        (u64, u32),
-        u32,
-        BuildHasherDefault<rbitcoin_query::OutPointHasher>,
-    > = std::collections::HashMap::with_hasher(Default::default());
-    let mut first: OverlayMetaSkip = std::collections::HashMap::with_hasher(Default::default());
+    scratch: &mut StructuralScratch,
+) {
     for &(_, vout, sfk, cfk, vin) in spends {
         if !run_create_height.contains_key(&cfk) {
             continue;
@@ -1531,11 +1605,13 @@ fn overlay_meta_skip_map(
             continue;
         };
         let key = (id, vout);
-        *n.entry(key).or_insert(0) += 1;
-        first.entry(key).or_insert((sfk, vin));
+        *scratch.skip_n.entry(key).or_insert(0) += 1;
+        scratch.skip.entry(key).or_insert((sfk, vin));
     }
-    first.retain(|k, _| n.get(k).copied() == Some(1));
-    first
+    let skip_n = &scratch.skip_n;
+    scratch
+        .skip
+        .retain(|k, _| skip_n.get(k).copied() == Some(1));
 }
 
 fn overlay_meta_is_skip(
@@ -1548,12 +1624,6 @@ fn overlay_meta_is_skip(
     skip.get(&(id, vout)) == Some(&(sfk, vin))
 }
 
-type StructuralAbsHeights = (
-    Vec<StructuralAbsJob>,
-    Vec<rbitcoin_primitives::Fk>,
-    U64Map<u32>,
-);
-
 fn structural_abs_heights(
     query: &Query,
     spends: &[(
@@ -1565,82 +1635,80 @@ fn structural_abs_heights(
     )],
     batch_parents: &rbitcoin_query::BatchParents,
     run_create_height: &FkMap<u32>,
-) -> Result<StructuralAbsHeights, ConsensusError> {
-    let abs_jobs = batch_parents
-        .spend_abs_jobs(
+    scratch: &mut StructuralScratch,
+) -> Result<(), ConsensusError> {
+    batch_parents
+        .spend_abs_jobs_into(
             spends
                 .iter()
                 .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+            &mut scratch.abs_jobs,
+            &mut scratch.abs_seen,
         )
         .map_err(ConsensusError::from)?;
-    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = abs_jobs
+    scratch.unique_fks.extend(
+        scratch
+            .abs_jobs
             .iter()
-            .map(|(id, _, _, _, _)| rbitcoin_primitives::Fk(*id))
-            .collect();
-        v.sort_unstable_by_key(|f| f.0);
-        v.dedup();
-        v
-    };
+            .map(|(id, _, _, _, _)| rbitcoin_primitives::Fk(*id)),
+    );
+    scratch.unique_fks.sort_unstable_by_key(|f| f.0);
+    scratch.unique_fks.dedup();
     let durable_heights = query
         .store()
-        .tx_height_get_batch(&unique_create_fks)
+        .tx_height_get_batch(&scratch.unique_fks)
         .map_err(ConsensusError::from)?;
-    let height_by_id: U64Map<u32> = unique_create_fks
-        .iter()
-        .zip(durable_heights)
-        .filter_map(|(fk, h)| {
-            let id = fk.get()?;
-            let h = h.or_else(|| run_create_height.get(fk).copied())?;
-            Some((id, h))
-        })
-        .collect();
-    Ok((abs_jobs, unique_create_fks, height_by_id))
+    for (fk, h) in scratch.unique_fks.iter().zip(durable_heights) {
+        let Some(id) = fk.get() else {
+            continue;
+        };
+        let Some(h) = h.or_else(|| run_create_height.get(fk).copied()) else {
+            continue;
+        };
+        scratch.height_by_id.insert(id, h);
+    }
+    Ok(())
 }
 
 fn structural_load_durable_spent(
     query: &Query,
-    abs_jobs: &[StructuralAbsJob],
-    height_by_id: &U64Map<u32>,
     tip: Option<u32>,
-    annotate: &mut Vec<SpendAnnotateJob>,
-    skip: &OverlayMetaSkip,
-) -> Result<(DurableSpentSet, u64, u64), ConsensusError> {
+    scratch: &mut StructuralScratch,
+) -> Result<(u64, u64), ConsensusError> {
     use std::time::Instant;
-    let mut disk_jobs: Vec<StructuralAbsJob> = Vec::new();
-    let mut abs_offs: Vec<u64> = Vec::new();
     let mut ovl_n = 0u64;
-    for &job in abs_jobs {
+    for &job in &scratch.abs_jobs {
         let (id, vout, abs, sfk, vin) = job;
-        if overlay_meta_is_skip(id, vout, sfk, vin, skip) {
+        if overlay_meta_is_skip(id, vout, sfk, vin, &scratch.skip) {
             ovl_n = ovl_n.saturating_add(1);
             continue;
         }
-        disk_jobs.push(job);
-        abs_offs.push(abs);
+        scratch.disk_jobs.push(job);
+        scratch.abs_offs.push(abs);
     }
     rbitcoin_query::note_confirm(&query.confirm_stats().spend_overlay_skip_n, ovl_n);
-    if abs_offs.is_empty() {
-        return Ok((DurableSpentSet::with_hasher(Default::default()), 0, 0));
+    if scratch.abs_offs.is_empty() {
+        return Ok((0, 0));
     }
     let meta_backend = rbitcoin_store::spend_meta_backend();
     let t_meta = Instant::now();
     let metas = query
         .store()
-        .get_spender_meta_at_abs_batch_backend(&abs_offs, meta_backend)
+        .get_spender_meta_at_abs_batch_backend(&scratch.abs_offs, meta_backend)
         .map_err(ConsensusError::from)?;
     let meta_ns = t_meta.elapsed().as_nanos() as u64;
     rbitcoin_query::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
-    rbitcoin_query::note_confirm(&query.confirm_stats().spend_meta_n, abs_offs.len() as u64);
+    rbitcoin_query::note_confirm(
+        &query.confirm_stats().spend_meta_n,
+        scratch.abs_offs.len() as u64,
+    );
     let _ = meta_backend;
-    if metas.len() != disk_jobs.len() {
+    if metas.len() != scratch.disk_jobs.len() {
         return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta batch length",
         )));
     }
     let t_strong = Instant::now();
-    let mut field_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    let mut field_seen = rbitcoin_query::U64Set::default();
     for row in &metas {
         let Some((field, _, _)) = row else {
             continue;
@@ -1649,43 +1717,37 @@ fn structural_load_durable_spent(
             continue;
         }
         if let Some(fid) = field.get() {
-            if field_seen.insert(fid) {
-                field_fks.push(*field);
+            if scratch.field_seen.insert(fid) {
+                scratch.field_fks.push(*field);
             }
         }
     }
     let field_heights = query
         .store()
-        .tx_height_get_batch(&field_fks)
+        .tx_height_get_batch(&scratch.field_fks)
         .map_err(ConsensusError::from)?;
-    let field_h_by_id: U64Map<u32> = field_fks
-        .iter()
-        .zip(field_heights)
-        .filter_map(|(fk, h)| Some((fk.get()?, h?)))
-        .collect();
-    let mut durable_spent: DurableSpentSet = DurableSpentSet::with_hasher(Default::default());
-    let mut multi_list_ns = 0u64;
-    for (i, &(id, vout, abs, sfk, vin)) in disk_jobs.iter().enumerate() {
-        multi_list_ns = multi_list_ns.saturating_add(structural_apply_one_meta(
-            query,
-            metas[i],
-            id,
-            vout,
-            abs,
-            sfk,
-            vin,
-            tip,
-            height_by_id,
-            &field_h_by_id,
-            annotate,
-            &mut durable_spent,
-        )?);
+    for (fk, h) in scratch.field_fks.iter().zip(field_heights) {
+        if let Some((id, h)) = fk.get().zip(h) {
+            scratch.field_h_by_id.insert(id, h);
+        }
     }
+    let jobs = std::mem::take(&mut scratch.disk_jobs);
+    let applied = jobs
+        .iter()
+        .copied()
+        .zip(metas)
+        .try_fold(0u64, |acc, (job, meta)| {
+            let (id, vout, abs, sfk, vin) = job;
+            let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
+            Ok::<u64, ConsensusError>(acc.saturating_add(ns))
+        });
+    scratch.disk_jobs = jobs;
+    let multi_list_ns = applied?;
     let spent_strong_ns = t_strong
         .elapsed()
         .as_nanos()
         .saturating_sub(multi_list_ns as u128) as u64;
-    Ok((durable_spent, multi_list_ns, spent_strong_ns))
+    Ok((multi_list_ns, spent_strong_ns))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1698,10 +1760,7 @@ fn structural_apply_one_meta(
     sfk: rbitcoin_primitives::Fk,
     vin: u32,
     tip: Option<u32>,
-    height_by_id: &U64Map<u32>,
-    field_h_by_id: &U64Map<u32>,
-    annotate: &mut Vec<SpendAnnotateJob>,
-    durable_spent: &mut DurableSpentSet,
+    scratch: &mut StructuralScratch,
 ) -> Result<u64, ConsensusError> {
     use std::time::Instant;
     let Some((field, flags, field_vin)) = meta else {
@@ -1709,16 +1768,10 @@ fn structural_apply_one_meta(
             "invariant: structural spender meta short/OOB (cold forbidden)",
         )));
     };
-    annotate.push(SpendAnnotateJob {
-        abs,
-        field,
-        flags,
-        field_vin,
-        create_fk: rbitcoin_primitives::Fk(id),
-        vout,
-        spend_fk: sfk,
-        vin,
-    });
+    scratch.slots.push(
+        (abs, rbitcoin_primitives::Fk(id), vout, sfk, vin),
+        (field, flags, field_vin),
+    );
     let multi = flags & rbitcoin_store::output_flags::MULTI_SPENDER != 0;
     if multi {
         let t_m = Instant::now();
@@ -1728,7 +1781,7 @@ fn structural_apply_one_meta(
             .map_err(ConsensusError::from)?;
         let ns = t_m.elapsed().as_nanos() as u64;
         if spent {
-            durable_spent.insert((id, vout));
+            scratch.durable_spent.insert((id, vout));
         }
         return Ok(ns);
     }
@@ -1742,14 +1795,16 @@ fn structural_apply_one_meta(
     if !strong {
         return Ok(0);
     }
-    let create_h = height_by_id.get(&id).copied();
-    let spend_h = field.get().and_then(|fid| field_h_by_id.get(&fid).copied());
+    let create_h = scratch.height_by_id.get(&id).copied();
+    let spend_h = field
+        .get()
+        .and_then(|fid| scratch.field_h_by_id.get(&fid).copied());
     if let (Some(ch), Some(sh)) = (create_h, spend_h) {
         if sh < ch {
             return Ok(0);
         }
     }
-    durable_spent.insert((id, vout));
+    scratch.durable_spent.insert((id, vout));
     Ok(0)
 }
 
@@ -1787,43 +1842,42 @@ fn structural_mark_pending(
 fn structural_create_heights(
     query: &Query,
     batch_parents: &rbitcoin_query::BatchParents,
-    unique_create_fks: &[rbitcoin_primitives::Fk],
-    height_by_id: &U64Map<u32>,
     spend_height: u32,
     maturity: u32,
-) -> Result<FkMap<u32>, ConsensusError> {
-    let mut create_height_by_fk: FkMap<u32> = FkMap::with_capacity_and_hasher(
-        unique_create_fks.len().min(256),
-        BuildHasherDefault::default(),
-    );
-    let mut height_list: Vec<u32> = height_by_id.values().copied().collect();
-    height_list.sort_unstable();
-    height_list.dedup();
+    scratch: &mut StructuralScratch,
+) -> Result<(), ConsensusError> {
+    scratch
+        .height_list
+        .extend(scratch.height_by_id.values().copied());
+    scratch.height_list.sort_unstable();
+    scratch.height_list.dedup();
     let coinbase_fk_by_height = query
         .store()
-        .coinbase_fk_at_heights(&height_list)
+        .coinbase_fk_at_heights(&scratch.height_list)
         .map_err(ConsensusError::from)?;
-    for create_fk in unique_create_fks {
+    let n_unique = scratch.unique_fks.len();
+    for i in 0..n_unique {
+        let create_fk = scratch.unique_fks[i];
         let Some(id) = create_fk.get() else {
             continue;
         };
-        let Some(&durable_h) = height_by_id.get(&id) else {
+        let Some(&durable_h) = scratch.height_by_id.get(&id) else {
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
-        if batch_parents.get_parent_coinbase(*create_fk) == Some(false) {
-            create_height_by_fk.insert(*create_fk, durable_h);
+        if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
+            scratch.create_height_by_fk.insert(create_fk, durable_h);
             continue;
         }
-        let is_cb = batch_parents.get_parent_coinbase(*create_fk) == Some(true)
+        let is_cb = batch_parents.get_parent_coinbase(create_fk) == Some(true)
             || coinbase_fk_by_height
                 .get(&durable_h)
-                .is_some_and(|cb| *cb == *create_fk);
+                .is_some_and(|cb| *cb == create_fk);
         if is_cb && spend_height < durable_h.saturating_add(maturity) {
             return Err(ConsensusError::BadTx("coinbase immature"));
         }
-        create_height_by_fk.insert(*create_fk, durable_h);
+        scratch.create_height_by_fk.insert(create_fk, durable_h);
     }
-    Ok(create_height_by_fk)
+    Ok(())
 }
 
 fn structural_bip68(
@@ -2230,11 +2284,12 @@ mod overlay_meta_skip_tests {
         let mut run = FkMap::default();
         run.insert(Fk(10), 5);
         let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
-        let skip = overlay_meta_skip_map(&spends, &run);
-        assert!(overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
-        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 1, &skip));
-        assert!(!overlay_meta_is_skip(10, 1, Fk(11), 0, &skip));
-        assert!(!overlay_meta_is_skip(99, 0, Fk(11), 0, &skip));
+        let mut scratch = StructuralScratch::default();
+        fill_overlay_skip(&spends, &run, &mut scratch);
+        assert!(overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 1, &scratch.skip));
+        assert!(!overlay_meta_is_skip(10, 1, Fk(11), 0, &scratch.skip));
+        assert!(!overlay_meta_is_skip(99, 0, Fk(11), 0, &scratch.skip));
     }
 
     #[test]
@@ -2242,17 +2297,19 @@ mod overlay_meta_skip_tests {
         let mut run = FkMap::default();
         run.insert(Fk(10), 5);
         let spends = spends(&[(0, Fk(11), Fk(10), 0), (0, Fk(12), Fk(10), 0)]);
-        let skip = overlay_meta_skip_map(&spends, &run);
-        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
-        assert!(!overlay_meta_is_skip(10, 0, Fk(12), 0, &skip));
+        let mut scratch = StructuralScratch::default();
+        fill_overlay_skip(&spends, &run, &mut scratch);
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
+        assert!(!overlay_meta_is_skip(10, 0, Fk(12), 0, &scratch.skip));
     }
 
     #[test]
     fn overlay_meta_skip_historical_create_stays_on_disk() {
         let run = FkMap::default();
         let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
-        let skip = overlay_meta_skip_map(&spends, &run);
-        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &skip));
+        let mut scratch = StructuralScratch::default();
+        fill_overlay_skip(&spends, &run, &mut scratch);
+        assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
     }
 }
 

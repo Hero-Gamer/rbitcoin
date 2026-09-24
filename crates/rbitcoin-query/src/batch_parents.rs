@@ -895,6 +895,18 @@ impl BatchParents {
     ) -> Result<Vec<(u64, u32, u64, Fk, u32)>, StoreError> {
         let mut out = Vec::new();
         let mut seen = U64Set::default();
+        self.spend_abs_jobs_into(edges, &mut out, &mut seen)?;
+        Ok(out)
+    }
+
+    /// Append into caller buffers. `out` and `seen` must already be cleared for this block.
+    #[allow(clippy::type_complexity)]
+    pub fn spend_abs_jobs_into(
+        &self,
+        edges: impl IntoIterator<Item = (Fk, u32, Fk, u32)>,
+        out: &mut Vec<(u64, u32, u64, Fk, u32)>,
+        seen: &mut U64Set,
+    ) -> Result<(), StoreError> {
         for (fk, vout, sfk, vin) in edges {
             if fk.is_null() {
                 continue;
@@ -911,7 +923,7 @@ impl BatchParents {
                 out.push((id, vout, abs, sfk, vin));
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn set_spent_range_only(&mut self, fk: Fk, spent_range: (u64, u64)) {

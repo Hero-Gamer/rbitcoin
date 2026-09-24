@@ -943,7 +943,8 @@ fn pin_and_ensure_journey() {
         "ensure must not pread create.loc"
     );
 
-    post_commit(&q, &[]).expect("empty annotate list does not consult BatchParents");
+    post_commit(&q, &crate::block::AnnotateSlots::default())
+        .expect("empty annotate list does not consult BatchParents");
 
     let parent_tx = rec_tx(0x11, 1);
     let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
@@ -1475,7 +1476,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
     let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
     mtp.insert(0, 1_300_000_000);
-    let mut annotate = Vec::new();
+    let mut scratch = crate::block::StructuralScratch::default();
     let meta0 = q.confirm_stats().spend_meta_n.load(Ordering::Relaxed);
     let ovl0 = q
         .confirm_stats()
@@ -1492,7 +1493,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         &bp,
         &mut mtp,
         &run,
-        &mut annotate,
+        &mut scratch,
     )
     .expect("overlay spend is not durable-spent before tip");
     let meta_n = q
@@ -1508,7 +1509,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
     assert_eq!(meta_n, 0, "overlay abs must not structural-pread");
     assert_eq!(ovl_n, 1);
     assert!(
-        annotate.is_empty(),
+        scratch.slots.abs_edges.is_empty(),
         "Skip annotate job is a no-op write; omit it"
     );
     let (off, _) = q.store().tx_spent_range(fks[0]).unwrap();
@@ -1520,6 +1521,140 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         .unwrap();
     assert_eq!(bulk[0].unwrap().0, fks[1]);
     assert!(bulk[1].unwrap().0.is_null());
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+fn structural_scratch_second_block_does_not_replay_first_slots() {
+    use crate::block::{structural_validate_spends, StructuralScratch};
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet};
+    use rbitcoin_store::{InputRecord, OutputRecord};
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x41, 2),
+        vec![
+            OutputRecord::unspent(1, vec![0x51]),
+            OutputRecord::unspent(1, vec![0x52]),
+        ],
+    );
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        parent_pin,
+        vec![0, 1],
+        Some(false),
+        Some(loc[0].txout),
+        Vec::new(),
+    );
+    bp.set_spent_range_only(fks[0], loc[0].spent);
+    q.store().header_txs.put_range(Fk(100), fks[0], 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(100)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1_300_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![
+            coinbase,
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+        ],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    let params = ChainParams::regtest();
+    let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
+    let mut pending = OutPointSet::default();
+    let mut mtp = rbitcoin_query::U32Map::<u32>::default();
+    mtp.insert(0, 1_300_000_000);
+    let mut scratch = StructuralScratch::default();
+    let run = FkMap::default();
+    for vout in [0u32, 1] {
+        let spends = vec![([0x41u8; 32], vout, Fk(9), fks[0], 0)];
+        structural_validate_spends(
+            &q,
+            &block,
+            &ctx,
+            None,
+            &spends,
+            0,
+            &mut pending,
+            &bp,
+            &mut mtp,
+            &run,
+            &mut scratch,
+        )
+        .unwrap();
+    }
+    assert_eq!(scratch.slots.abs_edges.len(), 2);
+    assert_eq!(scratch.slots.known.len(), 2);
+    assert_ne!(scratch.slots.abs_edges[0].0, scratch.slots.abs_edges[1].0);
+    let (off, _) = q.store().tx_spent_range(fks[0]).unwrap();
+    assert_eq!(
+        scratch.slots.abs_edges[0].0,
+        rbitcoin_store::spent_abs(off, 0)
+    );
+    assert_eq!(
+        scratch.slots.abs_edges[1].0,
+        rbitcoin_store::spent_abs(off, 1)
+    );
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -2955,7 +3090,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &bp,
         &mut mtp,
         &rbitcoin_query::FkMap::default(),
-        &mut Vec::new(),
+        &mut crate::block::StructuralScratch::default(),
     )
     .expect_err("pinned without abs must be invariant");
     let msg = format!("{err}");
