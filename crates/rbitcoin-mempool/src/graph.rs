@@ -69,10 +69,6 @@ impl TxEntry {
     pub fn adjusted_weight(&self, bytes_per_sigop: u64) -> u64 {
         sigops_adjusted_weight(self.weight, self.sigop_cost, bytes_per_sigop)
     }
-
-    pub fn fee_rate_sat_per_kvb(&self) -> u64 {
-        rbitcoin_consensus::policy::fee_rate_sat_per_kvb(self.fee_sat, self.weight)
-    }
 }
 
 /// Contiguous linearization segment used for fee comparison / eviction (P5).

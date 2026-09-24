@@ -2316,9 +2316,15 @@ impl MempoolHub {
         let n = {
             let mut g = self.lock_write();
             let mut block_rates = Vec::new();
+            let bps = g.graph.bytes_per_sigop();
             for tid in txids {
                 if let Some(e) = g.graph.get(tid) {
-                    let rate = e.fee_rate_sat_per_kvb();
+                    // Core `CBlockPolicyEstimator` records fee over the
+                    // sigop-adjusted size, like the chunk frontier.
+                    let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(
+                        e.fee_sat,
+                        e.adjusted_weight(bps),
+                    );
                     self.push_confirm_memory(rate);
                     block_rates.push(rate);
                 }
@@ -3911,6 +3917,11 @@ mod tests {
             assert_eq!(hub.get_live_adjusted_weight(&tid), Some(400));
             assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 400);
             assert_eq!(hub.get_live_adjusted_weight(&Txid::all_zeros()), None);
+            hub.set_bytes_per_sigop(20);
+            // Confirmed feerate memory: 1_000 sat on 500 adjusted vB (raw 100).
+            hub.set_relay_enabled(true);
+            assert_eq!(hub.remove_for_block(&[tid]), 1);
+            assert_eq!(hub.confirm_memory_floor_sat_per_kvb(), Some(2_000));
             let _ = std::fs::remove_dir_all(&mp);
         }
 
