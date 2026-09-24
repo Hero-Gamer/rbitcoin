@@ -978,4 +978,74 @@ mod tests {
         assert_eq!(t.count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 11×96 B is the same byte length as 12×88 B. Occupied 11 must strip.
+    #[test]
+    fn rewrite_v24_ambiguous_96_strips_each_row() {
+        let dir = tmp();
+        let n = 11u64;
+        let recs: Vec<HeaderRecord> = (0..n).map(|i| sample([0xA0 + i as u8; 32])).collect();
+        {
+            let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
+            let mut blob = Vec::with_capacity(n as usize * HEADER_RECORD_LEN_V24);
+            for rec in &recs {
+                let mut raw = [0u8; HEADER_RECORD_LEN_V24];
+                raw[..HEADER_RECORD_LEN].copy_from_slice(&rec.encode());
+                raw[88..92].copy_from_slice(&7u32.to_le_bytes());
+                blob.extend_from_slice(&raw);
+            }
+            body.write_at(FILE_HEADER_LEN as u64, &blob).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)
+                .unwrap();
+            body.flush().unwrap();
+            let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
+            for (i, rec) in recs.iter().enumerate() {
+                h.insert(&rec.hash, Fk(i as u64 + 1)).unwrap();
+            }
+            h.flush().unwrap();
+        }
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+        let t = HeaderTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.count(), n);
+        for (i, rec) in recs.iter().enumerate() {
+            let got = t.get(Fk(i as u64 + 1)).unwrap();
+            assert_eq!(got.hash, rec.hash);
+            assert_eq!(got.size, 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 12×88 B is the same byte length as 11×96 B. Occupied 12 must not strip.
+    #[test]
+    fn rewrite_v24_ambiguous_88_stays() {
+        let dir = tmp();
+        let n = 12u64;
+        let recs: Vec<HeaderRecord> = (0..n).map(|i| sample([0xB0 + i as u8; 32])).collect();
+        {
+            let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
+            let mut blob = Vec::with_capacity(n as usize * HEADER_RECORD_LEN);
+            for rec in &recs {
+                blob.extend_from_slice(&rec.encode());
+            }
+            body.write_at(FILE_HEADER_LEN as u64, &blob).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)
+                .unwrap();
+            body.flush().unwrap();
+            let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
+            for (i, rec) in recs.iter().enumerate() {
+                h.insert(&rec.hash, Fk(i as u64 + 1)).unwrap();
+            }
+            h.flush().unwrap();
+        }
+        let before = std::fs::metadata(dir.join("header.body")).unwrap().len();
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("header.body")).unwrap().len(),
+            before
+        );
+        let t = HeaderTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.count(), n);
+        assert_eq!(t.get(Fk(n)).unwrap().hash, recs[n as usize - 1].hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
