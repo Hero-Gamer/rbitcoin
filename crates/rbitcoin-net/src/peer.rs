@@ -3320,6 +3320,28 @@ fn drop_pending_cmpct(
     }
 }
 
+/// Core `MarkBlockAsReceived` clears every peer's in-flight entry for a
+/// received block. Ours are per session, so a partial whose block connected
+/// through another peer is dropped here before it counts against the cap.
+fn drop_connected_pending_cmpct(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) {
+    let done: Vec<BlockHash> = follow
+        .pending_cmpct
+        .keys()
+        .filter(|h| hub.is_connected(h))
+        .copied()
+        .collect();
+    for hash in done {
+        if let (Some(s), Some(h)) = (session, hub.header_height(&hash)) {
+            s.clear_block_inflight(h);
+        }
+        drop_pending_cmpct(follow, session, hash);
+    }
+}
+
 async fn on_cmpctblock(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -3528,6 +3550,7 @@ fn on_cmpct_need_txn(
         return Ok(());
     }
     let missing_n = partial.missing().len();
+    drop_connected_pending_cmpct(hub, follow, session);
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
         log_cmpct_getdata(hash, missing_n);
         return queue_out(

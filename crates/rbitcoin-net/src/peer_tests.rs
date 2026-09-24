@@ -2620,6 +2620,150 @@ fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
     });
 }
 
+/// `p2p_compactblocks.py` stalling peer: a peer's partial for a block that
+/// connected through another peer must not hold its one pending slot, or the
+/// peer's next compact becomes a full getdata and its blocktxn is ignored.
+/// Core drops every peer's in-flight entry once the block is received.
+#[tokio::test]
+async fn partial_for_a_block_connected_elsewhere_frees_the_slot() {
+    use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-stale-partial");
+    hub.ensure_genesis().unwrap();
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(mp).is_ok());
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mut time = hub.tip_header().unwrap().time + 1;
+    let mut coinbases = Vec::new();
+    for height in 1..=102u32 {
+        let b = rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            height,
+            op_true.clone(),
+            vec![],
+        );
+        coinbases.push(b.txdata[0].compute_txid());
+        hub.accept_block(b).unwrap();
+        time += 1;
+    }
+    let spend = |i: usize| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbases[i],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_0000_0000),
+            script_pubkey: op_true.clone(),
+        }],
+    };
+    let a = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        time,
+        103,
+        op_true.clone(),
+        vec![spend(0)],
+    );
+    let b = rbitcoin_consensus::mine_regtest_paying(
+        a.block_hash(),
+        time + 1,
+        104,
+        op_true.clone(),
+        vec![spend(1)],
+    );
+
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let stalling = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let cmpct = |blk: &bitcoin::Block| CmpctBlock {
+        compact_block: HeaderAndShortIds::from_block(blk, 0xbeef, 2, &[]).unwrap(),
+    };
+
+    on_cmpctblock(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &cmpct(&a),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        out_rx.try_recv().unwrap().expect_msg(),
+        NetworkMessage::GetBlockTxn(_)
+    ));
+    hub.accept_block(a.clone()).unwrap();
+    assert_eq!(
+        hub.tip_hash(),
+        Some(a.block_hash()),
+        "A arrived from another peer"
+    );
+
+    on_cmpctblock(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &cmpct(&b),
+    )
+    .await
+    .unwrap();
+    let mut sent = Vec::new();
+    while let Ok(m) = out_rx.try_recv() {
+        sent.push(m.expect_msg());
+    }
+    assert!(
+        sent.iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlockTxn(g) if g.txs_request.block_hash == b.block_hash())),
+        "the stale partial for A must not turn B into a full getdata: {sent:?}"
+    );
+    on_blocktxn(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &BlockTransactions {
+            block_hash: b.block_hash(),
+            transactions: vec![b.txdata[1].clone()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hub.tip_hash(), Some(b.block_hash()), "blocktxn completes B");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     use bitcoin::absolute::LockTime;
