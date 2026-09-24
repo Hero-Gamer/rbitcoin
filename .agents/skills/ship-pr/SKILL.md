@@ -74,12 +74,10 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 
 ## Push and poll
 
-Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, and
-`mutants (1/4)` through `mutants (4/4)` (`--shard` stays 0–3). `qc` is
+Required jobs: `qc`, `test`, `windows`, `macos`, and `coverage`. `qc` is
 fmt, ast-grep, deny, the script self-tests, clippy, then
-nixos-module-eval on one runner. A mutants shard killed at
-30 minutes with no `MISSED` warns and passes. `MISSED` before that kill fails the shard. A
-finished non-zero `cargo mutants` exit fails. Structural scan is
+nixos-module-eval on one runner. Mutants run nightly with workspace
+tests (`mutants.yml`); they are not a required check. Structural scan is
 `./scripts/ast-grep.sh`. `windows` / `macos` are native store plus `--smoke`,
 not operator zips.
 

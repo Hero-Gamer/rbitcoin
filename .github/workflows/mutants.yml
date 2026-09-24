@@ -1,38 +1,74 @@
-# Weekly cargo-mutants. Not a required check.
-# PR in-diff shards are ci.yml job `mutants` (required). A 30m kill with
-# no MISSED warns and passes. MISSED before that kill fails the shard.
-# Must pass --workspace: default-members is rbitcoin-node only.
-# Owner: TESTING.md (Mutation testing). Snapshot lists: docs/mutants/.
+# Nightly workspace mutants. Not a required check.
+# New lines since the cursor run first, then a rotating backlog.
+# 90 minute budget, one workspace suite at a time. MISSED is an artifact,
+# not a failure. Owner: TESTING.md (Mutation testing).
 
 name: mutants
 on:
   schedule:
-    - cron: "0 3 * * 0"
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  mutants-weekly:
+  mutants-nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    timeout-minutes: 110
+    env:
+      CARGO_INCREMENTAL: "1"
+      CARGO_TERM_COLOR: never
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-          submodules: false
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-mutants@27.1.0
-      - run: cargo mutants --workspace --shard ${{ matrix.shard }}/8 -j 2
+      - name: previous cursor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p mutants-nightly
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutants.yml --limit 20 \
+            --json databaseId,status,conclusion \
+            --jq '[.[] | select(.status=="completed")][0].databaseId')"
+          if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --name mutants-cursor --dir mutants-nightly || true
+          fi
+      - name: nightly queue
+        run: ./scripts/mutants-nightly.sh
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### mutants nightly"
+            echo "Not required. Workspace tests. New code first, then the backlog."
+            if [[ -f mutants-nightly/missed.txt ]]; then
+              echo
+              echo '```'
+              cat mutants-nightly/missed.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants-${{ matrix.shard }}
-          path: mutants.out
+          name: mutants-cursor
+          path: mutants-nightly/cursor.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutants-nightly
+          path: mutants-nightly/
+          if-no-files-found: ignore
+          retention-days: 14

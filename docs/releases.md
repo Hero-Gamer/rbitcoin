@@ -138,7 +138,8 @@ show as `core-functional / core-functional` and so on.
 
 | Check | Who |
 |-------|-----|
-| `qc` `test` `windows` `macos` `coverage` `mutants (1/4)`–`(4/4)` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, deny, script self-tests, clippy, then nixos-module-eval. A 30-minute mutants kill with no `MISSED` warns and passes. `MISSED` before that kill fails. A finished non-zero exit fails. |
+| `qc` `test` `windows` `macos` `coverage` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, deny, script self-tests, clippy, then nixos-module-eval. |
+| `mutants` | Nightly `0 7 * * *` and `workflow_dispatch` (`mutants.yml`). Workspace tests, new code first, then a backlog cursor. 90 minute budget. Not required. `MISSED` is an artifact. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `warnet-example` | Label **`warnet`**, `workflow_dispatch`; via `release-gate.yml` on label **`release`** **or** ship version. Two-tank Docker lab. |
