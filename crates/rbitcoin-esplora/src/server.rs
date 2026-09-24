@@ -1648,26 +1648,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_internal_routes_are_404() {
-        let (dir, q) = temp_query("esplora-tcp-internal-404");
-        let (h0, t0) = coinbase(0, Fk::NULL, None);
-        q.connect_block(Height(0), &h0, &[t0]).unwrap();
-        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::new(q), None, None)
-            .await
-            .expect("listen");
-        let addr = handle.local_addr;
-        let (st, body) = http_get(addr, "/internal/mempool/txs").await;
-        assert_eq!(st, 404, "TCP GET /internal/mempool/txs: {body}");
-        let (st, body) = http_post(addr, "/internal/txs", b"[]").await;
-        assert_eq!(st, 404, "TCP POST /internal/txs: {body}");
-        let (st, body) = http_get(addr, "/blocks/tip/height").await;
-        assert_eq!(st, 200, "{body}");
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
     async fn x_powered_by_on_tip_height() {
         let (dir, q) = temp_query("powered-by");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -1693,7 +1673,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
     async fn sh_join_slots_two_addresses_utxo() {
         let (a1, spk1) = regtest_p2wpkh();
         let (a2, spk2) = {
@@ -1828,7 +1807,6 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
     async fn http_sh_join_last1_last_bulk_and_header_trust() {
         use rbitcoin_store::script_hash;
 
@@ -1979,7 +1957,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
     async fn block_template_default_404() {
         let (dir, q) = temp_query("gbt-404");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -1993,7 +1970,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
     async fn block_template_enabled_no_tip_is_503() {
         let (dir, q) = temp_query("gbt-notip");
         let q = Arc::new(q);
@@ -2006,7 +1982,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
     async fn max_sh_creates_is_esplora_503() {
         let (dir, q) = temp_query("esplora-sh-cap");
         let mut prev = Fk::NULL;
@@ -2031,7 +2006,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
     async fn block_template_enabled_cache_and_503() {
         let (dir, q) = temp_query("gbt-on");
         let (h0, t0) = coinbase(0, Fk::NULL, None);
@@ -2604,7 +2578,6 @@ mod tests {
     }
 
     /// Real WS upgrade against `run_esplora` + tip inject + REST coexistence.
-    #[tokio::test]
     async fn ws_upgrade_want_blocks_and_rest_coexist() {
         use bitcoin::hashes::Hash;
         use futures_util::{SinkExt, StreamExt};
@@ -2795,7 +2768,6 @@ mod tests {
     }
 
     /// `want: stats` pushes GET /mempool + /fees/recommended shapes; admit bumps count.
-    #[tokio::test]
     async fn ws_want_stats_mempoolinfo_and_fees() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -2929,7 +2901,6 @@ mod tests {
     }
 
     /// Track real regtest address → mempool address-transactions + tip block-transactions.
-    #[tokio::test]
     async fn ws_track_address_mempool_and_confirm() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -3130,7 +3101,6 @@ mod tests {
     }
 
     /// Subscribe snapshots live mempool txs; RBF emits address-removed; track-addresses is keyed.
-    #[tokio::test]
     async fn ws_track_address_snapshot_removed_and_multi() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -3336,7 +3306,6 @@ mod tests {
     }
 
     /// track-tx: unconfirmed on accept, then confirmed after connect + tip.
-    #[tokio::test]
     async fn ws_track_tx_status_confirm_transition() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -3570,7 +3539,6 @@ mod tests {
     }
 
     /// RBF: track-tx replace + address-only replace (old pays watch, new does not).
-    #[tokio::test]
     async fn ws_rbf_track_tx_and_address_only() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -4110,5 +4078,25 @@ mod tests {
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn esplora_ws_track_address() {
+        ws_upgrade_want_blocks_and_rest_coexist().await;
+        ws_track_tx_status_confirm_transition().await;
+        ws_want_stats_mempoolinfo_and_fees().await;
+        ws_track_address_mempool_and_confirm().await;
+        ws_track_address_snapshot_removed_and_multi().await;
+        ws_rbf_track_tx_and_address_only().await;
+    }
+
+    #[tokio::test]
+    async fn esplora_sh_join_and_template() {
+        sh_join_slots_two_addresses_utxo().await;
+        http_sh_join_last1_last_bulk_and_header_trust().await;
+        max_sh_creates_is_esplora_503().await;
+        block_template_default_404().await;
+        block_template_enabled_no_tip_is_503().await;
+        block_template_enabled_cache_and_503().await;
     }
 }

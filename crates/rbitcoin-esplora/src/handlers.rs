@@ -2141,7 +2141,6 @@ mod pure_helper_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     fn casa_sh_routes_reuse_last_join_slot() {
         use crate::server::AppState;
         use rbitcoin_query::{body_ok_reads, reset_body_ok_reads};
@@ -2313,7 +2312,6 @@ mod pure_helper_tests {
         (last_hash, prev)
     }
 
-    #[test]
     fn sh_join_last1_two_clients_and_bulk_reuse() {
         use rbitcoin_query::{body_ok_reads, reset_body_ok_reads};
         use rbitcoin_store::script_hash;
@@ -2387,5 +2385,11 @@ mod pure_helper_tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn esplora_sh_join_and_template() {
+        casa_sh_routes_reuse_last_join_slot();
+        sh_join_last1_two_clients_and_bulk_reuse();
     }
 }
