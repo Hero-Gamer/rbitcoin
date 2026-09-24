@@ -12,4 +12,4 @@ reply may cross the cap. Full-block serves that already fit
 `MAX_SERVE_BLOCKS` are still queued; their bytes count. `getaddr` is
 answered once per connection.
 
-**Regression:** `rbitcoin-net` `peer::tests::getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once`.
+**Regression:** `rbitcoin-net` `peer::tests::hostile_peer_session`.

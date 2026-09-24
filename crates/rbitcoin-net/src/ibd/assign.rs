@@ -1457,7 +1457,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     fn issue_batch_reserves_four_mib_per_new_hash() {
         let (dir, _hub) = tmp_hub();
         let four_mib = 4 * 1024 * 1024;
@@ -3126,7 +3125,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     fn assign_does_not_issue_when_queue_plus_reserve_exceeds_stop() {
         let _g = BQ_ASSIGN_STOP_ENV_LOCK
             .lock()
@@ -3156,5 +3154,11 @@ mod tests {
             st.inflight.keys().collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hostile_peer_session() {
+        issue_batch_reserves_four_mib_per_new_hash();
+        assign_does_not_issue_when_queue_plus_reserve_exceeds_stop();
     }
 }

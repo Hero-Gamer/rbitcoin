@@ -22,4 +22,4 @@ a second timer.
 `events::ibd_memory_tests::rejected_header_batch_does_not_grow_path_or_explore`,
 `events::ibd_memory_tests::unsolicited_body_is_not_copied_into_the_queue`,
 `reorg::tests::explore_need_and_tips_stay_capped`,
-`assign::tests::assign_does_not_issue_when_queue_plus_reserve_exceeds_stop`
+`assign::tests::hostile_peer_session`

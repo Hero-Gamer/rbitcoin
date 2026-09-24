@@ -13,4 +13,4 @@ and `cmpctblock`.
 
 **Regression:** `rbitcoin-net`
 `compact::tests::reconstruct_rejects_tx_count_above_weight_ratio`,
-`peer::tests::pending_header_insert_past_cap_clears`
+`peer::tests::hostile_peer_session`

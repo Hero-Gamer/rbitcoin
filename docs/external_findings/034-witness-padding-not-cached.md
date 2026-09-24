@@ -15,4 +15,4 @@ paths. A weight failure after a matching commitment is still cached: the
 commitment is in the coinbase txid, so it is this block.
 
 **Regression:** `rbitcoin-net`
-`chain::tests::padded_coinbase_witness_over_weight_is_not_cached_invalid`
+`chain::tests::hostile_peer_session`
