@@ -10925,3 +10925,16 @@ fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
         );
     }
 }
+
+#[test]
+fn invalid_script_is_scored_and_policy_is_not() {
+    use rbitcoin_mempool::AcceptError;
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Script("script false".into())),
+        10
+    );
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Policy("bad-txns-too-many-sigops")),
+        0
+    );
+}

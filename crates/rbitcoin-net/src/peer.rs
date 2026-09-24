@@ -3691,6 +3691,14 @@ enum TxAcceptLog<'a> {
     Reject,
 }
 
+/// Invalid-script announcements are misbehavior. Policy rejects are not.
+pub(crate) fn tx_reject_ban_score(e: &rbitcoin_mempool::AcceptError) -> u32 {
+    match e {
+        rbitcoin_mempool::AcceptError::Script(_) => 10,
+        _ => 0,
+    }
+}
+
 fn tx_accept_log(e: &rbitcoin_mempool::AcceptError) -> TxAcceptLog<'_> {
     match e {
         rbitcoin_mempool::AcceptError::Duplicate(_) => TxAcceptLog::Silent,
@@ -3843,6 +3851,8 @@ async fn on_tx(
                             }
                         }
                         TxAcceptLog::Reject => {
+                            follow.ban_score =
+                                follow.ban_score.saturating_add(tx_reject_ban_score(&e));
                             let id = session.map(|s| s.id).unwrap_or(0);
                             rbitcoin_log::info!(
                                 "{txid} (wtxid={}) from peer={id} was not accepted: {}",

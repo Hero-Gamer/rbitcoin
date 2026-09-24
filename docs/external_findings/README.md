@@ -47,6 +47,10 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `protected_reserve_does_not_refuse_a_later_orphan` |
+| [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed | `too_many_sigops_rejected_before_script` |
+| [049](./049-rolling-min-fee.md) | medium | Full-mempool fee floor is a static bump | fixed | `evicted_feerate_raises_the_floor_above_the_static_bump` |
+| [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `two_parent_insert_builds_the_cluster_once` |
+| [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
 | [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst` |
 | [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` |

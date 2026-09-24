@@ -1607,6 +1607,12 @@ impl MempoolHub {
             Err(e) => return Err(e),
         };
         let t_script = Instant::now();
+        if rbitcoin_consensus::policy::exceeds_standard_sigops(tx, &prep.prevouts) {
+            stages.script_us = stages
+                .script_us
+                .saturating_add(t_script.elapsed().as_micros() as u64);
+            return Err(AcceptError::Policy("bad-txns-too-many-sigops"));
+        }
         if let Err(e) =
             rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
         {

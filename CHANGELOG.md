@@ -11,6 +11,16 @@ before 1.0).
 
 ### Fixed
 
+- **Standard sigop cost is enforced before script execution.** A transaction
+  whose sigop cost exceeds 16_000 is `bad-txns-too-many-sigops` and is not
+  handed to the interpreter. An invalid script from a peer adds 10 to that
+  peer's ban score. Consensus block flags are unchanged.
+- **Full-mempool fee floor follows evicted feerate.** While the mempool is
+  at the weight cap the static bump remains, and an evicted chunk raises
+  the floor one sat/kvB above that chunk so the same-rate transaction cannot
+  re-enter. Below the cap the bump decays by half every 12 hours.
+- **Cluster limits are one walk per insert.** A transaction that spends
+  several mempool parents no longer rebuilds the cluster once per input.
 - **Orphan admission when every parked tx is inside a per-peer reserve.**
   Eviction still prefers orphans outside that reserve, then drops the
   oldest reserved one so a newer orphan is not refused. Peer weight is

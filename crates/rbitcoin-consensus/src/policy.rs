@@ -18,6 +18,9 @@ pub const MIN_RELAY_FEE_RATE_SAT_PER_KVB: u64 = 100;
 /// Absolute weight cap for a single transaction (4_000_000 = block weight).
 pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
+/// Standard tx sigop cost. Core `MAX_BLOCK_SIGOPS_COST / 5` (80_000 / 5).
+pub const MAX_STANDARD_TX_SIGOPS_COST: u64 = 16_000;
+
 /// Result of a policy check (not consensus).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyResult {
@@ -58,6 +61,16 @@ pub fn meets_min_relay_fee_at(fee_sat: u64, weight: u64, sat_kvb: u64) -> bool {
         return false;
     }
     fee_sat.saturating_mul(1000) >= vsize.saturating_mul(sat_kvb)
+}
+
+/// True when the tx's sigop cost, including prevout P2SH/witness sigops, exceeds
+/// [`MAX_STANDARD_TX_SIGOPS_COST`]. Block validation does not call this.
+pub fn exceeds_standard_sigops(tx: &Transaction, prevouts: &[bitcoin::TxOut]) -> bool {
+    let spks: Vec<&[u8]> = prevouts
+        .iter()
+        .map(|o| o.script_pubkey.as_bytes())
+        .collect();
+    crate::tx_sigop_cost(tx, &spks, true, true) > MAX_STANDARD_TX_SIGOPS_COST
 }
 
 /// Feerate in sat/kvB for diagnostics (floors).
