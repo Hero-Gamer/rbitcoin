@@ -17,5 +17,5 @@ already uses: NULLFAIL and LOW_S are off, and witness programs already
 require a clean true stack. Block validation does not gain those flags.
 
 **Regression:** `rbitcoin-mempool`
-`accept::tests::too_many_sigops_rejected_before_script`,
+`accept::tests::mempool_under_pressure`,
 `rbitcoin-net` `peer::tests::invalid_script_is_scored_and_policy_is_not`.

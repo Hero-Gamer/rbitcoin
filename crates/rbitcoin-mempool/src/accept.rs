@@ -2100,7 +2100,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     fn relay_floor_decays_when_not_full_and_holds_while_full() {
         assert_eq!(decayed_relay_floor(5_000, 100, 0), 5_000);
         assert_eq!(
@@ -2127,7 +2126,6 @@ mod tests {
         assert!(unix_ms() > 1_700_000_000_000);
     }
 
-    #[test]
     fn min_fee_decays_when_one_more_standard_tx_would_exactly_fill() {
         let dir = tmp_dir();
         let mut mp =
@@ -2139,7 +2137,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     fn cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(10_000_000);
@@ -2180,7 +2177,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    #[test]
     fn evicted_feerate_raises_the_floor_above_the_static_bump() {
         let dir = tmp_dir();
         let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 800).unwrap();
@@ -2293,7 +2289,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
     fn too_many_sigops_rejected_before_script() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
@@ -2322,6 +2317,15 @@ mod tests {
             "sigops must fail before the interpreter, got {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mempool_under_pressure() {
+        too_many_sigops_rejected_before_script();
+        evicted_feerate_raises_the_floor_above_the_static_bump();
+        relay_floor_decays_when_not_full_and_holds_while_full();
+        min_fee_decays_when_one_more_standard_tx_would_exactly_fill();
+        cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter();
     }
 
     fn spend_tx(op: OutPoint, out_value: u64) -> Transaction {

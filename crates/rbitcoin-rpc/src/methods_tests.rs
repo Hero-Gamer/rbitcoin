@@ -1549,7 +1549,6 @@ fn getmempoolentry_vsize_ceils_weight() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn testmempoolaccept_package_cluster_limit_is_package_error() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize_hex;
@@ -2567,7 +2566,6 @@ fn rpc_submit_nonstandard_version_is_version() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn submitpackage_multigen_chain_is_sequential_admit() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2634,7 +2632,6 @@ fn submitpackage_multigen_chain_is_sequential_admit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn testmempoolaccept_package_missing_inputs_keeps_earlier_allowed() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2687,7 +2684,6 @@ fn testmempoolaccept_package_missing_inputs_keeps_earlier_allowed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn testmempoolaccept_unsorted_chain_is_package_not_sorted() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2737,7 +2733,6 @@ fn testmempoolaccept_unsorted_chain_is_package_not_sorted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn testmempoolaccept_and_submitpackage_conflict_in_package() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2791,7 +2786,6 @@ fn testmempoolaccept_and_submitpackage_conflict_in_package() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn submitpackage_parent_minfee_child_maxfeerate_reports_both() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2859,6 +2853,16 @@ fn submitpackage_parent_minfee_child_maxfeerate_reports_both() {
         .unwrap()
         .contains(&child.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mempool_under_pressure() {
+    testmempoolaccept_package_cluster_limit_is_package_error();
+    testmempoolaccept_package_missing_inputs_keeps_earlier_allowed();
+    testmempoolaccept_unsorted_chain_is_package_not_sorted();
+    testmempoolaccept_and_submitpackage_conflict_in_package();
+    submitpackage_parent_minfee_child_maxfeerate_reports_both();
+    submitpackage_multigen_chain_is_sequential_admit();
 }
 
 #[test]

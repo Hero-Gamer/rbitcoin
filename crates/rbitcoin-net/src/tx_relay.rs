@@ -4849,7 +4849,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
     fn p2p_orphan_of_min_relay_parent_is_parked_not_1p1c() {
         let (store_dir, q, cbs) = pad_one_cb();
         let dir = tmp();
@@ -5046,7 +5045,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
     fn child_of_txid_rejected_parent_is_not_parked() {
         let (store_dir, q, cbs) = pad_one_cb();
         let dir = tmp();
@@ -5126,6 +5124,12 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn mempool_under_pressure() {
+        p2p_orphan_of_min_relay_parent_is_parked_not_1p1c();
+        child_of_txid_rejected_parent_is_not_parked();
     }
 
     #[test]
