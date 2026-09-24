@@ -3545,6 +3545,7 @@ mod tests {
                 wtxid: good.compute_wtxid(),
                 fee_sat: 1,
                 weight: good.weight().to_wu(),
+                sigop_cost: 0,
                 slot: 0,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
