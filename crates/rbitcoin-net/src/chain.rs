@@ -237,6 +237,17 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
+/// Core logs a contextual header reject (`bad-version`, `time-too-new`) with
+/// its reason. The returned error keeps the store-facing Display string.
+fn header_reject(header: &Header, e: &rbitcoin_consensus::ConsensusError) -> NetError {
+    let reason = rbitcoin_consensus::block_reject_reason(e);
+    rbitcoin_log::info!(
+        "{}",
+        rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+    );
+    NetError::Consensus(e.to_string())
+}
+
 pub(crate) fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
@@ -1315,7 +1326,7 @@ impl ChainHub {
                 Height(ph.0.saturating_add(1)),
                 header,
             )
-            .map_err(|e| NetError::Consensus(e.to_string()));
+            .map_err(|e| header_reject(header, &e));
         }
         let parent = self
             .sync_parent_header(&parent_hash, in_batch)
@@ -1334,7 +1345,7 @@ impl ChainHub {
             mtp,
             expected,
         )
-        .map_err(|e| NetError::Consensus(e.to_string()))
+        .map_err(|e| header_reject(header, &e))
     }
 
     fn sync_parent_header(

@@ -10464,6 +10464,80 @@ async fn noban_peer_is_not_punished_for_a_bad_header() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `feature_cltv.py` / `p2p_invalid_block.py`: a block whose header fails
+/// contextual checks still logs Core's reject reason.
+#[tokio::test]
+async fn block_with_rejected_header_logs_core_reason() {
+    use bitcoin::block::Version;
+    use bitcoin::{ScriptBuf, Target};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("hdr-reject-log");
+    let mut params = ChainParams::regtest();
+    params.apply_test_activation_height("cltv", 111).unwrap();
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(110, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time + 1;
+    let mut v3 = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        time,
+        111,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    v3.header.version = Version::from_consensus(3);
+    let target = Target::from_compact(v3.header.bits);
+    while v3.header.validate_pow(target).is_err() {
+        v3.header.nonce = v3.header.nonce.wrapping_add(1);
+    }
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(v3.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(&hub, &out_tx, &mut follow, None, &v3)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let want = format!("{}, bad-version(0x00000003)", v3.block_hash());
+    assert!(
+        lines.iter().any(|(_, l)| l == &want),
+        "missing {want:?} in {lines:?}"
+    );
+
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        now + 3 * 3600,
+        111,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(future.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(&hub, &out_tx, &mut follow, None, &future)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l == "Block validation error: time-too-new"),
+        "missing time-too-new in {lines:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
     use bitcoin::hashes::Hash;
