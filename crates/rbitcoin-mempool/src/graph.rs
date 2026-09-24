@@ -109,7 +109,7 @@ pub fn weight_above_from_chunks(chunks: &[Chunk], rate_sat_per_kvb: u64) -> u64 
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub members: BTreeSet<Txid>,
-    /// Sum of members' sigop-adjusted weight (cluster size limit basis).
+    /// Sum of members' raw weight (cluster size limit basis).
     pub total_weight: u64,
     /// Mining linearization (topo, high fee-rate first among ready).
     pub linearization: Vec<Txid>,
@@ -219,6 +219,13 @@ impl TxGraph {
             .get(txid)
             .map(|e| e.adjusted_weight(self.bytes_per_sigop))
             .unwrap_or(0)
+    }
+
+    /// Σ raw weight of live `set` members (cluster-limit basis).
+    fn raw_weight_of(&self, set: &BTreeSet<Txid>) -> u64 {
+        set.iter()
+            .filter_map(|t| self.entries.get(t))
+            .fold(0u64, |w, e| w.saturating_add(e.weight))
     }
 
     pub fn cluster_count_limit(&self) -> usize {
@@ -724,9 +731,7 @@ impl TxGraph {
                 }
             }
         }
-        let total_weight = members
-            .iter()
-            .fold(0u64, |w, t| w.saturating_add(self.adjusted_weight_of(t)));
+        let total_weight = self.raw_weight_of(&members);
         self.cluster_from_members(members, total_weight, |_| 0)
     }
 
@@ -756,7 +761,7 @@ impl TxGraph {
     /// Whether adding `extra_weight` and `extra_count` txs that connect to
     /// `seed` members would exceed cluster limits. `seed` = parent txids already
     /// in mempool that the new tx spends (+ the new tx itself counts as 1).
-    /// Live members count at sigop-adjusted weight.
+    /// Live members count at raw weight (Libre: sigops never shrink the cap).
     pub fn cluster_would_exceed(
         &self,
         parent_txids: &BTreeSet<Txid>,
@@ -769,9 +774,7 @@ impl TxGraph {
                 members.extend(c.members);
             }
         }
-        let base_weight: u64 = members
-            .iter()
-            .fold(0u64, |w, t| w.saturating_add(self.adjusted_weight_of(t)));
+        let base_weight = self.raw_weight_of(&members);
         let count = members.len() + extra_count;
         let vsize = base_weight.saturating_add(extra_weight).saturating_add(3) / 4;
         count > self.cluster_count_limit || vsize > self.cluster_vsize_limit
@@ -1778,24 +1781,24 @@ mod tests {
         assert_eq!((ps.ancestorsize, ps.descendantsize), (pv, pv + 345));
     }
 
-    /// Core `test_sigops_package`: a tiny tx whose sigops fill the cluster
-    /// vsize limit blocks any child.
+    /// Libre divergence from Core `test_sigops_package`: cluster limits count
+    /// raw weight, so a tx at 50,000 sigop cost (1,000,000 WU adjusted, far
+    /// past 101 kvB) still takes a child; only feerate uses adjusted size.
     #[test]
-    fn cluster_limits_use_sigop_adjusted_size() {
+    fn cluster_limits_use_raw_weight() {
         let mut g = TxGraph::new();
         let parent = make_tx(None, 1, 2);
         let pid = parent.compute_txid();
         let mut pe = entry_for(&parent, 500, 0);
-        pe.sigop_cost = 20_200; // 404_000 WU = 101_000 vB, the default limit
+        pe.sigop_cost = 50_000;
         g.insert(pe, &parent);
-        assert_eq!(g.cluster_of(&pid).unwrap().total_weight, 404_000);
+        let raw = parent.weight().to_wu();
+        assert_eq!(g.cluster_of(&pid).unwrap().total_weight, raw);
+        assert_eq!(g.mining_chunks_best_first()[0].weight, 1_000_000);
         let parents = BTreeSet::from([pid]);
-        assert!(g.cluster_would_exceed(&parents, 1, 1));
-        g.set_bytes_per_sigop(0);
         assert!(!g.cluster_would_exceed(&parents, 1, 1));
-        assert_eq!(
-            g.cluster_of(&pid).unwrap().total_weight,
-            parent.weight().to_wu()
-        );
+        let room = MAX_CLUSTER_WEIGHT - raw;
+        assert!(!g.cluster_would_exceed(&parents, 1, room));
+        assert!(g.cluster_would_exceed(&parents, 1, room + 4));
     }
 }

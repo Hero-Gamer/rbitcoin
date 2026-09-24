@@ -1126,16 +1126,18 @@ impl ActiveMempool {
             .into_iter()
             .filter(|p| !conflict_set.contains(p))
             .collect();
+        // Cluster limits count raw weight (Libre): at 20 B/sigop an adjusted
+        // cap would reject any tx above ~20,200 sigop cost.
         let (n_members, base_w) = self
             .graph
             .connected_weight_except(&parent_txids, &conflict_set);
-        let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
+        let combined_w = base_w.saturating_add(prep.weight);
         if n_members + 1 > self.graph.cluster_count_limit()
-            || combined_vsize > self.graph.cluster_vsize_limit()
+            || combined_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
         {
             return Err(AcceptError::ClusterTooLarge {
                 count: n_members + 1,
-                weight: base_w.saturating_add(weight),
+                weight: combined_w,
             });
         }
 
@@ -4445,45 +4447,31 @@ mod tests {
         }
     }
 
-    /// Core `test_sigops_package`: at 5000 B/sigop a bare 1-of-1 multisig
-    /// output (legacy cost 80) is 100_000 vB, so parent + child exceed the
-    /// 101 kvB cluster limit though both are tiny.
+    /// Libre divergence from Core `test_sigops_package`: at the default
+    /// 20 B/sigop a 40,000-cost tx is 200 kvB adjusted, yet it and its child
+    /// are admitted because cluster limits count raw weight. The reported
+    /// vsize stays sigop-adjusted.
     #[test]
-    fn cluster_limit_uses_sigop_adjusted_size() {
-        use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1};
-        let bare = bitcoin::script::Builder::new()
-            .push_opcode(OP_PUSHNUM_1)
-            .push_slice([0x02u8; 33])
-            .push_opcode(OP_PUSHNUM_1)
-            .push_opcode(OP_CHECKMULTISIG)
-            .into_script();
-        let with_bare = |mut tx: Transaction| {
-            tx.output.push(TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: bare.clone(),
-            });
-            tx
-        };
+    fn cluster_limit_uses_raw_weight() {
         let (op, _, utxos) = chain_utxo(1_000_000);
-        let parent = with_bare(spend_tx(op, 900_000));
+        let mut parent = multisig_outputs_tx(op, 501);
+        parent.output[0] = TxOut {
+            value: Amount::from_sat(900_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }; // 500 × OP_CHECKMULTISIG left: cost 40,000
         let pid = parent.compute_txid();
-        let child = with_bare(spend_tx(OutPoint { txid: pid, vout: 0 }, 800_000));
-        assert!(parent.weight().to_wu() + child.weight().to_wu() < 2_000);
+        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 800_000);
         let dir = tmp_dir();
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.set_bytes_per_sigop(5_000);
-        let r = mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
-        assert_eq!(policy::get_virtual_size(r.weight), 100_000);
-        assert!(matches!(
-            mp.accept_tx(&child, &utxos, TIP_OK),
-            Err(AcceptError::ClusterTooLarge { count: 2, .. })
-        ));
-        assert!(mp.graph.contains(&pid));
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
-        mp.accept_tx(&child, &utxos, TIP_OK)
-            .expect("default 20 B/sigop fits");
+        let r = mp
+            .accept_tx(&parent, &utxos, TIP_OK)
+            .expect("parent admits");
+        assert_eq!(policy::get_virtual_size(r.weight), 200_000);
+        mp.accept_tx(&child, &utxos, TIP_OK).expect("child admits");
+        assert_eq!(
+            mp.graph.cluster_of(&pid).unwrap().total_weight,
+            parent.weight().to_wu() + child.weight().to_wu()
+        );
     }
 
     /// Zero-fee parent + heavy-sigop child: 200 sat pays the raw package
