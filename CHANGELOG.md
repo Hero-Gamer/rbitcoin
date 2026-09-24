@@ -12,11 +12,14 @@ before 1.0).
 ### Fixed
 
 - **Sigop-adjusted policy size:** feerate, RBF, min relay, package min
-  relay, chunk ranking, eviction, fee estimation, `-blockmintxfee` and
-  cluster size limits use Core's `max(weight, sigop_cost × bytes_per_sigop)`
-  (default 20, new `--bytes-per-sigop`, `0` disables). `getmempoolentry` /
-  `testmempoolaccept` `vsize` report it; `weight` and the block weight
-  budget stay raw. A sigop-dense tx no longer looks cheaper than it is.
+  relay, chunk ranking, eviction, fee estimation and `-blockmintxfee` use
+  Core's `max(weight, sigop_cost × bytes_per_sigop)` (default 20, new
+  `--bytes-per-sigop`, `0` disables). `getmempoolentry` /
+  `testmempoolaccept` `vsize` and `getmempoolcluster` weights report it;
+  `weight` and the block weight budget stay raw. Cluster and package limits
+  also stay raw, unlike Core, so a sigop-dense tx is priced higher but not
+  capped below the block sigop limit. A sigop-dense tx no longer looks
+  cheaper than it is.
 
 - **Mempool sigop cost:** admission rejects a tx whose BIP16+BIP141 sigop
   cost exceeds 80,000 − 400 (no block can hold it), and every live entry
