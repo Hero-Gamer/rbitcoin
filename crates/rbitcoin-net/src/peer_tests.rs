@@ -10855,7 +10855,7 @@ fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
         port: 8333,
     };
-    on_addrv2(&mut follow, Some(src.as_ref()), &[msg.clone()]).unwrap();
+    on_addrv2(&mut follow, Some(src.as_ref()), std::slice::from_ref(&msg)).unwrap();
 
     let key = addr_key_oracle(&msg);
     let n_dest = if key & 1 == 0 { 1 } else { 2 };
