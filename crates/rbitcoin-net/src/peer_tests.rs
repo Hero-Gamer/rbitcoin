@@ -10397,6 +10397,74 @@ async fn header_reject_punishes_except_temporary_time() {
 }
 
 #[tokio::test]
+async fn noban_peer_is_not_punished_for_a_bad_header() {
+    use bitcoin::ScriptBuf;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-noban");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut bad_pow = rbitcoin_consensus::mine_regtest_paying(
+        gen,
+        1_300_000_100,
+        1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+
+    let plain = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, Some(plain.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        plain.stop.load(Ordering::SeqCst),
+        "a plain peer is disconnected"
+    );
+    assert!(misbehavior_disconnects(
+        follow.ban_score,
+        Some(plain.as_ref())
+    ));
+
+    peers.set_noban(true);
+    let kept = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, Some(kept.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        !kept.stop.load(Ordering::SeqCst),
+        "Core never disconnects a noban peer for misbehavior"
+    );
+    assert_eq!(follow.ban_score, 0, "a noban peer gathers no score");
+    assert!(
+        !misbehavior_disconnects(BAN_SCORE_THRESHOLD, Some(kept.as_ref())),
+        "a noban peer at the threshold stays connected"
+    );
+    assert!(misbehavior_disconnects(BAN_SCORE_THRESHOLD, None));
+    assert!(!misbehavior_disconnects(BAN_SCORE_THRESHOLD - 1, None));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
     use bitcoin::hashes::Hash;
     use bitcoin::Txid;

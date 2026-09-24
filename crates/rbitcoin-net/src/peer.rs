@@ -139,10 +139,19 @@ async fn accept_received_from_peer(
 }
 
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
+    if let Some(s) = session.filter(|s| s.session_noban()) {
+        rbitcoin_log::info!("Warning: not punishing noban peer {}!", s.id);
+        return;
+    }
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
     if let Some(s) = session {
         s.request_disconnect();
     }
+}
+
+/// Core `MaybeDiscourageAndDisconnect`: misbehavior never drops a noban peer.
+fn misbehavior_disconnects(ban_score: u32, session: Option<&crate::peers::LivePeer>) -> bool {
+    ban_score >= BAN_SCORE_THRESHOLD && !session.is_some_and(|s| s.session_noban())
 }
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
 const MAX_PENDING_CMPCT: usize = 1;
@@ -1646,7 +1655,7 @@ pub async fn peer_session_with(
                     } else if n_after < n_req || n_req == 0 {
                         requested_since = Some(std::time::Instant::now());
                     }
-                    if follow.ban_score >= BAN_SCORE_THRESHOLD {
+                    if misbehavior_disconnects(follow.ban_score, session.as_deref()) {
                         rbitcoin_log::warn!(
                             "{}",
                             misbehavior_disconnect_log(&peer_s, follow.ban_score)
