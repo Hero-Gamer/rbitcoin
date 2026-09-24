@@ -881,7 +881,9 @@ impl TxGraph {
     ///
     /// Empty pool or zero cap → `[]`. A high-feerate child chunk pulls in
     /// still-unselected in-mempool ancestors so the block is topological.
-    /// A chunk (plus those ancestors) that would overflow drops the tail.
+    /// A chunk (plus those ancestors) that would overflow the weight cap or the
+    /// block sigop budget (80_000 less the 400 coinbase reserve) is skipped;
+    /// later chunks are still tried.
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
         self.select_block_txids_delta(max_weight_wu, |_| 0)
     }
@@ -915,6 +917,7 @@ impl TxGraph {
         let mut selected = HashSet::new();
         let mut out = Vec::new();
         let mut used = 0u64;
+        let mut sigops = COINBASE_SIGOPS_RESERVE;
         for (_, _, ch) in scored {
             let mut add = Vec::new();
             for t in &ch.txids {
@@ -927,18 +930,25 @@ impl TxGraph {
             if add.is_empty() {
                 continue;
             }
-            let extra: u64 = add
+            // `add` holds only unselected txs, so these sums are the exact
+            // growth. Saturating: an unknown cost is `u64::MAX` and never fits.
+            let (extra_w, extra_sigops) = add
                 .iter()
-                .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-                .sum();
-            if used.saturating_add(extra) > max_weight_wu {
-                break;
+                .filter_map(|t| self.entries.get(t))
+                .fold((0u64, 0u64), |(w, s), e| {
+                    (w.saturating_add(e.weight), s.saturating_add(e.sigop_cost))
+                });
+            // Core `TestChunkBlockLimits`: skip this chunk, keep trying smaller ones.
+            if used.saturating_add(extra_w) > max_weight_wu
+                || sigops.saturating_add(extra_sigops) >= MAX_BLOCK_SIGOPS_COST
+            {
+                continue;
             }
+            used = used.saturating_add(extra_w);
+            sigops = sigops.saturating_add(extra_sigops);
             for t in add {
-                if selected.insert(t) {
-                    used = used.saturating_add(self.entries.get(&t).map(|e| e.weight).unwrap_or(0));
-                    out.push(t);
-                }
+                selected.insert(t);
+                out.push(t);
             }
         }
         out
@@ -1332,6 +1342,48 @@ mod tests {
             vec![pid],
             "negative-modified child is not mined with parent"
         );
+    }
+
+    /// Core `TestChunkBlockLimits`: a chunk that would overflow weight is
+    /// skipped and later, smaller chunks still fill the block.
+    #[test]
+    fn select_skips_overweight_chunk_and_continues() {
+        let mut g = TxGraph::new();
+        let hot = spend_op([5u8; 32], 50_000, 40_000);
+        let big = make_tx(Some((txid_n(6), 0)), 40, 6);
+        let cold = spend_op([7u8; 32], 50_000, 49_000);
+        g.insert(entry_for(&hot, 100_000, 0), &hot);
+        g.insert(entry_for(&big, 100_000, 1), &big);
+        g.insert(entry_for(&cold, 100, 2), &cold);
+        let cap = hot.weight().to_wu() + cold.weight().to_wu();
+        assert!(big.weight().to_wu() > cold.weight().to_wu());
+        assert_eq!(
+            g.select_block_txids(cap),
+            vec![hot.compute_txid(), cold.compute_txid()]
+        );
+    }
+
+    /// Sigop budget starts at the 400 coinbase reserve; a chunk reaching
+    /// 80_000 is skipped (Core `>=`) and a later, cheaper chunk still fits.
+    #[test]
+    fn select_budgets_sigops_skip_and_continue() {
+        let heavy = spend_op([8u8; 32], 50_000, 40_000);
+        let light = spend_op([9u8; 32], 50_000, 49_000);
+        let (hid, lid) = (heavy.compute_txid(), light.compute_txid());
+        let pool = |heavy_cost: u64| {
+            let mut g = TxGraph::new();
+            let mut e = entry_for(&heavy, 10_000, 0);
+            e.sigop_cost = heavy_cost;
+            g.insert(e, &heavy);
+            let mut e = entry_for(&light, 1_000, 1);
+            e.sigop_cost = 1;
+            g.insert(e, &light);
+            g.select_block_txids(TxGraph::template_tx_weight())
+        };
+        assert_eq!(pool(79_600), vec![lid], "400 + 79_600 hits the limit");
+        assert_eq!(pool(79_599), vec![hid], "79_999 fits; +1 reaches 80_000");
+        assert_eq!(pool(79_598), vec![hid, lid], "80_000 - 1 total fits");
+        assert_eq!(pool(u64::MAX), vec![lid], "unknown cost never selected");
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

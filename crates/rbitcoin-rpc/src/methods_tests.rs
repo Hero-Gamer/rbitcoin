@@ -2992,6 +2992,127 @@ fn getblocktemplate_requires_segwit_and_shapes_empty_and_one_tx() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `miner_tests.cpp` `CreateBigSigOpsCluster`: 1 parent + 50 children,
+/// 20_001 legacy sigops (cost 80_004). The template must stay under the
+/// block sigop limit and the assembled block must pass proposal checks.
+#[test]
+fn getblocktemplate_big_sigops_cluster_fits_block() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::script::Builder;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{CompactTarget, OutPoint, Sequence, TxIn, TxMerkleNode, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let cb_val = {
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        generated_coinbase_value(&ctx, 1)
+    };
+    let mut parent = spend_generated_coinbase(&ctx, 1, 0, ScriptBuf::new()).1;
+    // OP_0 OP_0 OP_CHECKSIG OP_1: one legacy sigop in the scriptSig.
+    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00, 0xac, 0x51]);
+    parent.output = (0..50)
+        .map(|_| TxOut {
+            value: Amount::from_sat(cb_val / 50),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        })
+        .collect();
+    // Hotter parent: its own chunk, so the children are budgeted one by one.
+    parent.output[0].value -= Amount::from_sat(100_000);
+    let pid = parent.compute_txid();
+    let mut txs = vec![parent];
+    for i in 0..50u32 {
+        let mut out = vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+            };
+            20
+        ];
+        // Distinct child fees keep each child its own chunk (equal feerates
+        // merge into one 80_000-cost chunk). The 19 other outputs hold 1_000.
+        let fee = 10_000 + 100 * u64::from(50 - i);
+        out[0].value = txs[0].output[i as usize].value - Amount::from_sat(fee + 19_000);
+        txs.push(Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: pid, vout: i },
+                script_sig: ScriptBuf::from_bytes(vec![0x51]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: out,
+        });
+    }
+    let legacy: u64 = txs
+        .iter()
+        .map(|t| rbitcoin_consensus::tx_sigop_cost(t, &[], false, false))
+        .sum();
+    assert_eq!(legacy, 20_001 * 4);
+    for t in &txs {
+        dispatch(
+            &ctx,
+            "sendrawtransaction",
+            vec![json!(hex_encode(serialize(t)))],
+        )
+        .unwrap();
+    }
+
+    let tmpl = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let ttxs = tmpl["transactions"].as_array().unwrap();
+    let sigops: u64 = ttxs.iter().map(|t| t["sigops"].as_u64().unwrap()).sum();
+    // Parent + 49 children: 400 + 4 + 49 * 1_600 < 80_000; a 50th reaches 80_404.
+    assert_eq!(ttxs.len(), 50, "{tmpl}");
+    assert_eq!(sigops, 4 + 49 * 1_600);
+    assert!(sigops <= 80_000 - 400);
+
+    let next_h = tmpl["height"].as_u64().unwrap();
+    let coinbase = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: Builder::new()
+                .push_int(next_h as i64)
+                .push_int(1)
+                .into_script(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(tmpl["coinbasevalue"].as_u64().unwrap()),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut txdata = vec![coinbase];
+    for t in ttxs {
+        let raw = rbitcoin_primitives::hex_decode(t["data"].as_str().unwrap()).unwrap();
+        txdata.push(deserialize(&raw).unwrap());
+    }
+    let prev = parse_hash32_display(tmpl["previousblockhash"].as_str().unwrap()).unwrap();
+    let mut block = Block {
+        header: Header {
+            version: BlockVersion::from_consensus(tmpl["version"].as_i64().unwrap() as i32),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array(prev),
+            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            time: tmpl["curtime"].as_u64().unwrap() as u32,
+            bits: CompactTarget::from_consensus(
+                u32::from_str_radix(tmpl["bits"].as_str().unwrap(), 16).unwrap(),
+            ),
+            nonce: 0,
+        },
+        txdata,
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    assert_eq!(
+        crate::methods::mine::gbt_check_proposal(&ctx, &block),
+        Ok(())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn getblocktemplate_proposal_core_needles() {
     use bitcoin::block::{Header, Version as BlockVersion};

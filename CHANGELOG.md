@@ -168,6 +168,12 @@ before 1.0).
   treated as already checked just because its txid is in the mempool.
   A script job whose prevout count does not match its inputs fails closed.
 
+- **Block template sigop budget:** `getblocktemplate` / `generate` selection
+  starts at the 400 coinbase sigop reserve and skips a chunk that would reach
+  80,000 (Core `TestChunkBlockLimits`). Weight overflow also skips and keeps
+  trying later chunks instead of stopping, so a sigop-heavy pool no longer
+  yields a `bad-blk-sigops` template.
+
 - **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
   near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the
   Sunday hour, which just clears it. A mute run still fails.
