@@ -10970,6 +10970,69 @@ fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
     h
 }
 
+/// Core queues relayed addresses per peer and sends them together
+/// (`p2p_addrv2_relay.py` checks the whole list arrives in one message).
+fn addr_relay_batches_one_message_per_neighbor() {
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    src.set_wants_addrv2();
+    let (src_tx, _src_rx) = mpsc::unbounded_channel();
+    src.attach_out(src_tx);
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000);
+    let dst = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+    dst.set_wants_addrv2();
+    let (dst_tx, mut dst_rx) = mpsc::unbounded_channel();
+    dst.attach_out(dst_tx);
+
+    let list: Vec<AddrV2Message> = (1..=3u8)
+        .map(|i| AddrV2Message {
+            time: 1_700_000_000,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(123, 123, 123, i)),
+            port: 8333,
+        })
+        .collect();
+    let mut follow = PeerFollowState::new();
+    rbitcoin_log::capture_logs(true);
+    on_addrv2(&mut follow, Some(src.as_ref()), &list).unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+
+    let got = dst_rx.try_recv().expect("one addrv2").expect_msg();
+    assert!(
+        dst_rx.try_recv().is_err(),
+        "the neighbor gets a single message"
+    );
+    let NetworkMessage::AddrV2(sent) = &got else {
+        panic!("expected addrv2, got {got:?}");
+    };
+    assert_eq!(sent, &list);
+    let nbytes = bitcoin::consensus::encode::serialize(&got).len();
+    let want = sending_addrv2_log(nbytes, dst.id);
+    assert!(
+        lines.iter().any(|(_, l)| l == &want),
+        "missing {want:?} in {lines:?}"
+    );
+}
+
+#[test]
 fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message_network::VersionMessage;
@@ -11110,5 +11173,6 @@ fn hostile_peer_session() {
     send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib();
     addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst();
     addr_relay_follows_the_address_key_and_skips_unwilling_peers();
+    addr_relay_batches_one_message_per_neighbor();
     invalid_script_is_scored_and_policy_is_not();
 }

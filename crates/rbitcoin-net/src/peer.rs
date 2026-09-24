@@ -2624,6 +2624,8 @@ fn on_addrv2(
                 })
                 .collect();
             neighbors.sort_by_key(|other| other.id);
+            let mut batches: Vec<Vec<bitcoin::p2p::address::AddrV2Message>> =
+                vec![Vec::new(); neighbors.len()];
             for addr in list.iter().take(allow) {
                 let key = addr_relay_key(addr);
                 let n_dest = if neighbors.len() <= 1 {
@@ -2648,11 +2650,18 @@ fn on_addrv2(
                             }
                         }
                     };
-                    let other = &neighbors[idx];
-                    if let Some(tx) = other.writer() {
-                        rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
-                        queue_out(&tx, NetworkMessage::AddrV2(vec![addr.clone()]))?;
-                    }
+                    batches[idx].push(addr.clone());
+                }
+            }
+            for (other, batch) in neighbors.iter().zip(batches) {
+                if batch.is_empty() {
+                    continue;
+                }
+                if let Some(tx) = other.writer() {
+                    let msg = NetworkMessage::AddrV2(batch);
+                    let sent = bitcoin::consensus::encode::serialize(&msg).len();
+                    rbitcoin_log::info!("{}", sending_addrv2_log(sent, other.id));
+                    queue_out(&tx, msg)?;
                 }
             }
         }
