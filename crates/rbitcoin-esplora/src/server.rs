@@ -767,6 +767,17 @@ fn internal_routes() -> Router<AppState> {
         )
 }
 
+#[cfg(unix)]
+fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
+    extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    let prev = unsafe { umask(0o777 & !mode) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { umask(prev) };
+    bound
+}
+
 /// Start Esplora **plain HTTP** (+ wallet WebSocket) on `config.listen`.
 ///
 /// TLS is external (reverse proxy). App [`ServeLimits`] always apply to REST
@@ -981,11 +992,7 @@ pub async fn run_esplora(
                 }
             }
             let _ = std::fs::remove_file(&path);
-            let listener = tokio::net::UnixListener::bind(&path)?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
-            }
+            let listener = bind_unix_mode(&path, 0o660)?;
             let task = tokio::spawn(async move {
                 let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !shutdown_c.load(Ordering::SeqCst) {
@@ -1603,6 +1610,14 @@ mod tests {
         let cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock.clone()), Network::Regtest);
         let handle = run_esplora(cfg, q, None, None).await.expect("unix listen");
         assert!(sock.exists(), "socket file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o660,
+                "esplora socket is created group-restricted, got {mode:o}"
+            );
+        }
         let (st, body) = http_get_unix(&sock, "/blocks/tip/height").await;
         assert_eq!(st, 200, "{body}");
         assert_eq!(body, "0");

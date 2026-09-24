@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **Tor cookie auth is SAFECOOKIE only.** A control port that does not
+  advertise it, or a cookie that is not 32 bytes, does not send the raw
+  cookie. A new datadir is mode `0700` and is not chmodded if it already
+  exists. `rpc.sock` and the Esplora unix socket take their mode at bind.
+  A loopback `--net-permission` does not cover an onion or I2P address.
+
 - **Per-peer send buffer:** each session stops serving the next request
   once its outbound queue is past 4 MiB (headers, inv, notfound, tx, addr,
   and block bodies all count). The reader waits until the writer drains.

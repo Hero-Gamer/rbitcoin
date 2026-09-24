@@ -666,6 +666,25 @@ impl NodeConfig {
         rbitcoin_rpc::default_socket_path(self.datadir.path())
     }
 
+    /// Owner-only mode for a directory this process just created.
+    fn restrict_new_dir(path: &Path) -> Result<(), NodeError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |source| NodeError::Datadir {
+                    path: path.to_path_buf(),
+                    source,
+                },
+            )?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+
     /// Create `{datadir}` and standard subdirs (`store`, `mempool`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
@@ -675,6 +694,9 @@ impl NodeConfig {
             path: self.datadir.path.clone(),
             source,
         })?;
+        if created_root {
+            Self::restrict_new_dir(root)?;
+        }
         if root.exists() && !root.is_dir() {
             return Err(NodeError::Config(format!(
                 "datadir is not a directory: {}",
@@ -697,6 +719,9 @@ impl NodeConfig {
                 path: cold.clone(),
                 source,
             })?;
+            if created_cold {
+                Self::restrict_new_dir(cold)?;
+            }
             let store = cold.join("store");
             std::fs::create_dir_all(&store).map_err(|source| NodeError::Datadir {
                 path: store,
@@ -1697,6 +1722,29 @@ mod tests {
         cfg.ensure_datadir().unwrap();
         assert!(dir.join("store").is_dir());
         assert!(dir.join("mempool").is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            extern "C" {
+                fn umask(mask: u32) -> u32;
+            }
+            let fresh = dir.join("umask-fresh");
+            let _ = std::fs::remove_dir_all(&fresh);
+            let prev = unsafe { umask(0o022) };
+            let created = NodeConfig::default().with_datadir(&fresh).with_tiny_heads();
+            created.ensure_datadir().unwrap();
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            created.ensure_datadir().unwrap();
+            let kept = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            unsafe { umask(prev) };
+            assert_eq!(mode, 0o700, "new datadir under umask 0022 is {mode:o}");
+            assert_eq!(
+                kept, 0o755,
+                "an existing datadir is not chmodded, got {kept:o}"
+            );
+            let _ = std::fs::remove_dir_all(&fresh);
+        }
         cfg.ensure_datadir().unwrap();
         let cold = dir.join("cold");
         let mut split = NodeConfig::default().with_datadir(&dir);

@@ -922,7 +922,12 @@ impl LivePeer {
     pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
         self.owner
             .upgrade()
-            .map(|h| h.permission_flags(self.addr, self.inbound, self.addrbind))
+            .map(|h| {
+                h.net_perms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .flags_for_net(self.net, self.inbound, self.addrbind)
+            })
             .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
     }
 

@@ -24,6 +24,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
+
+#[cfg(unix)]
+fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
+    extern "C" {
+        fn umask(mask: u32) -> u32;
+    }
+    let prev = unsafe { umask(0o777 & !mode) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { umask(prev) };
+    bound
+}
 use tokio::task::JoinHandle;
 
 /// RPC listen configuration.
@@ -169,12 +180,8 @@ pub async fn run_rpc(
             std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
         }
         let _ = std::fs::remove_file(sock);
-        let listener = tokio::net::UnixListener::bind(sock)
+        let listener = bind_unix_mode(sock, 0o600)
             .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600));
-        }
         let state = AppState {
             ctx: Arc::clone(&ctx),
             auth: auth.clone(),
@@ -1519,6 +1526,11 @@ mod tests {
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         assert!(sock.exists(), "socket file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "rpc.sock is created owner-only, got {mode:o}");
+        }
         let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
         let req = format!(
             "POST / HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
