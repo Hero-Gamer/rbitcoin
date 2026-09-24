@@ -10848,38 +10848,80 @@ fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
     let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
     quiet.attach_out(quiet_tx);
 
-    let mut follow = PeerFollowState::new();
-    let msg = bitcoin::p2p::address::AddrV2Message {
+    let n = neigh.len();
+    let address = |port: u16| bitcoin::p2p::address::AddrV2Message {
         time: 1_700_000_000,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
-        port: 8333,
+        port,
     };
-    on_addrv2(&mut follow, Some(src.as_ref()), std::slice::from_ref(&msg)).unwrap();
-
-    let key = addr_key_oracle(&msg);
-    let n_dest = if key & 1 == 0 { 1 } else { 2 };
-    let start = (key as usize) % neigh.len();
-    let mut expect = Vec::new();
-    for step in 0..n_dest {
-        expect.push(neigh[(start + step) % neigh.len()].0);
-    }
-    expect.sort_unstable();
-
-    let mut got = Vec::new();
-    for (id, rx) in &mut neigh {
-        if rx.try_recv().is_ok() {
-            got.push(*id);
+    // key/n stays in range when key < n*n, so those ports never reach the index.
+    let mut even_port = None;
+    let mut odd_port = None;
+    let mut wrap_port = None;
+    for port in 1..20_000u16 {
+        let key = addr_key_oracle(&address(port));
+        if (key as usize) < n * n {
+            continue;
+        }
+        let start = (key as usize) % n;
+        if key & 1 == 0 {
+            even_port.get_or_insert(port);
+        } else if start + 1 == n {
+            wrap_port.get_or_insert(port);
+        } else if start != 0 {
+            odd_port.get_or_insert(port);
+        }
+        if even_port.is_some() && odd_port.is_some() && wrap_port.is_some() {
+            break;
         }
     }
-    got.sort_unstable();
-    assert_eq!(got, expect, "key {key:#x} must select those neighbors");
-    assert!(
-        src_rx.try_recv().is_err(),
-        "a peer does not relay to itself"
-    );
-    assert!(
-        quiet_rx.try_recv().is_err(),
-        "a peer that did not ask for addrv2 is skipped"
-    );
+    let ports = [
+        even_port.expect("an even relay key"),
+        odd_port.expect("an odd relay key whose next neighbor does not wrap"),
+        wrap_port.expect("an odd relay key whose next neighbor wraps"),
+    ];
+
+    let mut follow = PeerFollowState::new();
+    for port in ports {
+        let msg = address(port);
+        on_addrv2(&mut follow, Some(src.as_ref()), std::slice::from_ref(&msg)).unwrap();
+        let key = addr_key_oracle(&msg);
+        let n_dest = if key & 1 == 0 { 1 } else { 2 };
+        let start = (key as usize) % n;
+        let mut expect = Vec::new();
+        for step in 0..n_dest {
+            let idx = match step {
+                0 => start,
+                _ => {
+                    if start + 1 == n {
+                        0
+                    } else {
+                        start + 1
+                    }
+                }
+            };
+            expect.push(neigh[idx].0);
+        }
+        expect.sort_unstable();
+        let mut got = Vec::new();
+        for (id, rx) in &mut neigh {
+            while rx.try_recv().is_ok() {
+                got.push(*id);
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(
+            got, expect,
+            "port {port} key {key:#x} start {start} must select those neighbors"
+        );
+        assert!(
+            src_rx.try_recv().is_err(),
+            "a peer does not relay to itself"
+        );
+        assert!(
+            quiet_rx.try_recv().is_err(),
+            "a peer that did not ask for addrv2 is skipped"
+        );
+    }
 }

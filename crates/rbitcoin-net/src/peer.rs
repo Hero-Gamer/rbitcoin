@@ -2617,7 +2617,17 @@ fn on_addrv2(
                 }
                 let start = (key as usize) % neighbors.len();
                 for step in 0..n_dest {
-                    let other = &neighbors[(start + step) % neighbors.len()];
+                    let idx = match step {
+                        0 => start,
+                        _ => {
+                            if start + 1 == neighbors.len() {
+                                0
+                            } else {
+                                start + 1
+                            }
+                        }
+                    };
+                    let other = &neighbors[idx];
                     if let Some(tx) = other.writer() {
                         rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
                         queue_out(&tx, NetworkMessage::AddrV2(vec![addr.clone()]))?;
