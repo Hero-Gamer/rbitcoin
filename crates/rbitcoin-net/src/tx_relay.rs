@@ -3161,7 +3161,7 @@ impl MempoolHub {
         Some(AcceptResult {
             txid: e.txid,
             fee_sat: e.fee_sat,
-            weight: e.weight,
+            weight: e.adjusted_weight(g.graph.bytes_per_sigop()),
             slot: e.slot,
             replaced: Vec::new(),
             replaced_scripthashes: Vec::new(),

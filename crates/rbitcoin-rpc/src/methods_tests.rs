@@ -3751,6 +3751,55 @@ fn send_sigop_heavy_spend(ctx: &RpcContext, fee: u64) -> (Txid, Transaction) {
     (tx.compute_txid(), tx)
 }
 
+/// Core `submitpackage` `vsize` is sigop-adjusted, including members admitted
+/// by the package retry (zero-fee CPFP parent fails min relay alone).
+#[test]
+fn submitpackage_retry_vsize_is_sigop_adjusted() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let cb = generated_coinbase_value(&ctx, 1);
+    let mut parent = spend_generated_coinbase(&ctx, 1, 0, ScriptBuf::new()).1;
+    // Zero fee; ten 20-sigop outputs: cost 800, policy size 4_000 vB.
+    parent.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_000),
+            // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+        };
+        11
+    ];
+    parent.output[0] = TxOut {
+        value: Amount::from_sat(cb - 10_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let mut child = parent.clone();
+    child.input = vec![TxIn {
+        previous_output: OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    }];
+    child.output = vec![TxOut {
+        value: Amount::from_sat(cb - 10_000 - 50_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    }];
+    let hexes = [&parent, &child].map(|t| json!(hex_encode(serialize(t))));
+    let r = dispatch(&ctx, "submitpackage", vec![json!(hexes)]).unwrap();
+    assert_eq!(r["package_msg"], "success", "{r}");
+    let row = |t: &Transaction| {
+        r["tx-results"][hash_hex_display(&t.compute_wtxid().to_byte_array())].clone()
+    };
+    assert!(parent.weight().to_wu() < 16_000);
+    assert_eq!(row(&parent)["vsize"], 4_000, "{r}");
+    assert_eq!(row(&child)["vsize"], child.vsize(), "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `getmempoolentry`: `vsize` is sigop-adjusted, `weight` stays raw.
 #[test]
 fn getmempoolentry_vsize_is_sigop_adjusted() {
