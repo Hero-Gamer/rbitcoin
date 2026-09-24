@@ -15,5 +15,5 @@ bump halves every 12 hours until it is back at min relay. There is no
 new knob.
 
 **Regression:** `rbitcoin-mempool`
-`accept::tests::evicted_feerate_raises_the_floor_above_the_static_bump`,
+`accept::tests::mempool_under_pressure`,
 `accept::tests::relay_floor_decays_when_not_full_and_holds_while_full`.

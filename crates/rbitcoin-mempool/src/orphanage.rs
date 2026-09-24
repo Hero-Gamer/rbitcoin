@@ -422,13 +422,11 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
     fn orphan_expires_after_twenty_minutes() {
         assert_eq!(ORPHAN_EXPIRE_MS, 1_200_000);
         assert!(unix_ms() > 1_700_000_000_000);
     }
 
-    #[test]
     fn removing_one_orphan_keeps_the_rest_of_the_peer_weight() {
         let mut o = Orphanage::new();
         let a = make_orphan(txid_n(1), 1);
@@ -580,7 +578,6 @@ mod tests {
         assert!(o.is_empty());
     }
 
-    #[test]
     fn protected_reserve_does_not_refuse_a_later_orphan() {
         let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 2);
         let p = txid_n(11);
@@ -603,7 +600,6 @@ mod tests {
         assert!(o.len() <= 2);
     }
 
-    #[test]
     fn orphan_expires_after_the_bound() {
         let mut o = Orphanage::new();
         let p = txid_n(12);
@@ -619,5 +615,13 @@ mod tests {
             !o.contains(&old_id),
             "an orphan parked for ORPHAN_EXPIRE_MS is gone"
         );
+    }
+
+    #[test]
+    fn mempool_under_pressure() {
+        protected_reserve_does_not_refuse_a_later_orphan();
+        orphan_expires_after_twenty_minutes();
+        orphan_expires_after_the_bound();
+        removing_one_orphan_keeps_the_rest_of_the_peer_weight();
     }
 }

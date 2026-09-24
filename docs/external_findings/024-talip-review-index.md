@@ -17,7 +17,7 @@ board. Each fixed row names the regression. No reproduction steps.
 | C06 / C04 | critical | Compact partial count, one partial, pending-header cap | fixed | `reconstruct_rejects_tx_count_above_weight_ratio`, `hostile_peer_session` ([029](./029-compact-tx-count.md)) |
 | C03 / C05 | high | Header explore and body-queue bytes | fixed | `rejected_header_batch_does_not_grow_path_or_explore` ([033](./033-ibd-intake-bounds.md)) |
 | C09 / C07 / C08 / C10 | critical | Public Electrum scan, subs, scripthash join | fixed | `paged_history_stops_before_the_create_cap` ([036](./036-electrum-public-surface.md)) |
-| M-2 / M-5 / M-6 / L-8 | medium | Mempool policy and orphanage | fixed | `protected_reserve_does_not_refuse_a_later_orphan` ([047](./047-orphan-reserve.md)–[050](./050-cluster-once.md)) |
+| M-2 / M-5 / M-6 / L-8 | medium | Mempool policy and orphanage | fixed | `mempool_under_pressure` ([047](./047-orphan-reserve.md)–[050](./050-cluster-once.md)) |
 | L-7 | low | RBFR direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` ([051](./051-rbfr-direct-set.md)) |
 | C12 / #09 / #10 / C13 | high | RPC body, waits, client id | fixed | `unauthorized_large_content_length_is_401_before_body` ([037](./037-rpc-esplora-limits.md)) |
 | C11 / M-1 | high | Async tip-accept lifetime | fixed | `owned_job_finishes_after_waiter_abort` ([038](./038-tip-accept-lifetime.md)) |

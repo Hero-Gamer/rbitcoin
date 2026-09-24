@@ -15,5 +15,5 @@ removed on insert. Weight, dust, scriptPubKey size, and annex checks run
 before park.
 
 **Regression:** `rbitcoin-mempool`
-`orphanage::tests::protected_reserve_does_not_refuse_a_later_orphan`,
+`orphanage::tests::mempool_under_pressure`,
 `orphanage::tests::orphan_expires_after_the_bound`.
