@@ -139,10 +139,19 @@ async fn accept_received_from_peer(
 }
 
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
+    if let Some(s) = session.filter(|s| s.session_noban()) {
+        rbitcoin_log::info!("Warning: not punishing noban peer {}!", s.id);
+        return;
+    }
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
     if let Some(s) = session {
         s.request_disconnect();
     }
+}
+
+/// Core `MaybeDiscourageAndDisconnect`: misbehavior never drops a noban peer.
+fn misbehavior_disconnects(ban_score: u32, session: Option<&crate::peers::LivePeer>) -> bool {
+    ban_score >= BAN_SCORE_THRESHOLD && !session.is_some_and(|s| s.session_noban())
 }
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
 const MAX_PENDING_CMPCT: usize = 1;
@@ -1646,7 +1655,7 @@ pub async fn peer_session_with(
                     } else if n_after < n_req || n_req == 0 {
                         requested_since = Some(std::time::Instant::now());
                     }
-                    if follow.ban_score >= BAN_SCORE_THRESHOLD {
+                    if misbehavior_disconnects(follow.ban_score, session.as_deref()) {
                         rbitcoin_log::warn!(
                             "{}",
                             misbehavior_disconnect_log(&peer_s, follow.ban_score)
@@ -2615,6 +2624,8 @@ fn on_addrv2(
                 })
                 .collect();
             neighbors.sort_by_key(|other| other.id);
+            let mut batches: Vec<Vec<bitcoin::p2p::address::AddrV2Message>> =
+                vec![Vec::new(); neighbors.len()];
             for addr in list.iter().take(allow) {
                 let key = addr_relay_key(addr);
                 let n_dest = if neighbors.len() <= 1 {
@@ -2639,11 +2650,18 @@ fn on_addrv2(
                             }
                         }
                     };
-                    let other = &neighbors[idx];
-                    if let Some(tx) = other.writer() {
-                        rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
-                        queue_out(&tx, NetworkMessage::AddrV2(vec![addr.clone()]))?;
-                    }
+                    batches[idx].push(addr.clone());
+                }
+            }
+            for (other, batch) in neighbors.iter().zip(batches) {
+                if batch.is_empty() {
+                    continue;
+                }
+                if let Some(tx) = other.writer() {
+                    let msg = NetworkMessage::AddrV2(batch);
+                    let sent = bitcoin::consensus::encode::serialize(&msg).len();
+                    rbitcoin_log::info!("{}", sending_addrv2_log(sent, other.id));
+                    queue_out(&tx, msg)?;
                 }
             }
         }
@@ -3302,6 +3320,28 @@ fn drop_pending_cmpct(
     }
 }
 
+/// Core `MarkBlockAsReceived` clears every peer's in-flight entry for a
+/// received block. Ours are per session, so a partial whose block connected
+/// through another peer is dropped here before it counts against the cap.
+fn drop_connected_pending_cmpct(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) {
+    let done: Vec<BlockHash> = follow
+        .pending_cmpct
+        .keys()
+        .filter(|h| hub.is_connected(h))
+        .copied()
+        .collect();
+    for hash in done {
+        if let (Some(s), Some(h)) = (session, hub.header_height(&hash)) {
+            s.clear_block_inflight(h);
+        }
+        drop_pending_cmpct(follow, session, hash);
+    }
+}
+
 async fn on_cmpctblock(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -3510,6 +3550,7 @@ fn on_cmpct_need_txn(
         return Ok(());
     }
     let missing_n = partial.missing().len();
+    drop_connected_pending_cmpct(hub, follow, session);
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
         log_cmpct_getdata(hash, missing_n);
         return queue_out(
@@ -4172,6 +4213,8 @@ fn announced_headers_height(
 }
 
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
+/// Store the pending headers from `tip` back to the last stored one. Headers
+/// already stored were checked when they were written.
 fn persist_pending_header_path(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
@@ -4183,6 +4226,9 @@ fn persist_pending_header_path(
         let Some(hdr) = pending.get(&h) else {
             break;
         };
+        if header_is_stored(hub, &h) {
+            break;
+        }
         path.push(*hdr);
         h = hdr.prev_blockhash;
         if is_genesis_hash(&h) {
@@ -4195,6 +4241,14 @@ fn persist_pending_header_path(
             break;
         }
     }
+}
+
+fn header_is_stored(hub: &ChainHub, hash: &BlockHash) -> bool {
+    hub.query
+        .get_header_by_hash(&hash.to_byte_array())
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn header_announcement_connects(

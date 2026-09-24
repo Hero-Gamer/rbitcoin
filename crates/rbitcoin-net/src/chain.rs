@@ -237,6 +237,17 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
     }
 }
 
+/// Core logs a contextual header reject (`bad-version`, `time-too-new`) with
+/// its reason. The returned error keeps the store-facing Display string.
+fn header_reject(header: &Header, e: &rbitcoin_consensus::ConsensusError) -> NetError {
+    let reason = rbitcoin_consensus::block_reject_reason(e);
+    rbitcoin_log::info!(
+        "{}",
+        rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+    );
+    NetError::Consensus(e.to_string())
+}
+
 pub(crate) fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
@@ -308,6 +319,8 @@ pub struct ChainHub {
     finished_ibd: AtomicBool,
     #[cfg(test)]
     block_at_height_calls: AtomicU64,
+    #[cfg(test)]
+    header_contextual_checks: AtomicU64,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -357,6 +370,8 @@ impl ChainHub {
             finished_ibd: AtomicBool::new(false),
             #[cfg(test)]
             block_at_height_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            header_contextual_checks: AtomicU64::new(0),
         }
     }
 
@@ -1306,6 +1321,9 @@ impl ChainHub {
         header: &Header,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<(), NetError> {
+        #[cfg(test)]
+        self.header_contextual_checks
+            .fetch_add(1, Ordering::Relaxed);
         let parent_hash = header.prev_blockhash;
         let parent_bytes = parent_hash.to_byte_array();
         if let Some(ph) = self.query.height_of_hash(&parent_bytes).ok().flatten() {
@@ -1315,7 +1333,7 @@ impl ChainHub {
                 Height(ph.0.saturating_add(1)),
                 header,
             )
-            .map_err(|e| NetError::Consensus(e.to_string()));
+            .map_err(|e| header_reject(header, &e));
         }
         let parent = self
             .sync_parent_header(&parent_hash, in_batch)
@@ -1334,7 +1352,7 @@ impl ChainHub {
             mtp,
             expected,
         )
-        .map_err(|e| NetError::Consensus(e.to_string()))
+        .map_err(|e| header_reject(header, &e))
     }
 
     fn sync_parent_header(
@@ -2745,6 +2763,11 @@ impl ChainHub {
     #[cfg(test)]
     pub(crate) fn block_at_height_calls(&self) -> u64 {
         self.block_at_height_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_header_contextual_checks(&self) -> u64 {
+        self.header_contextual_checks.swap(0, Ordering::Relaxed)
     }
 
     #[cfg(test)]

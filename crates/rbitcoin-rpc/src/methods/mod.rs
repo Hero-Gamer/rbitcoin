@@ -350,17 +350,33 @@ pub fn dispatch(
     method: &str,
     params: impl Into<RpcParams>,
 ) -> Result<Value, Value> {
-    let id = ctx
-        .active
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .enter(method);
-    let out = dispatch_inner(ctx, method, params.into());
-    ctx.active
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .leave(id);
-    out
+    let _active = ActiveCall::enter(&ctx.active, method);
+    dispatch_inner(ctx, method, params.into())
+}
+
+/// One `getrpcinfo.active_commands` entry for the life of the guard.
+pub(crate) struct ActiveCall<'a> {
+    active: &'a std::sync::Mutex<RpcActive>,
+    id: u64,
+}
+
+impl<'a> ActiveCall<'a> {
+    pub(crate) fn enter(active: &'a std::sync::Mutex<RpcActive>, method: &str) -> Self {
+        let id = active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enter(method);
+        Self { active, id }
+    }
+}
+
+impl Drop for ActiveCall<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .leave(self.id);
+    }
 }
 
 pub(crate) fn dispatch_inner(

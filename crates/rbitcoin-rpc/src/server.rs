@@ -291,6 +291,8 @@ async fn satisfy_http_wait(
         else {
             return false;
         };
+        rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
+        let _active = crate::methods::ActiveCall::enter(&ctx.active, method);
         let ctx = Arc::clone(ctx);
         loop {
             let ready = {
@@ -343,6 +345,7 @@ async fn satisfy_http_wait(
         }
         _ => return false,
     };
+    let _active = crate::methods::ActiveCall::enter(&ctx.active, method);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let ctx = Arc::clone(ctx);
     loop {
@@ -603,7 +606,7 @@ fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
             });
         }
     };
-    if method == "getblocktemplate" {
+    if method == "getblocktemplate" && !crate::methods::http_wait_satisfied() {
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
     }
     let params_s = req
@@ -1642,6 +1645,106 @@ mod tests {
             alert_fired: Arc::new(AtomicBool::new(false)),
         });
         (ctx, dir)
+    }
+
+    /// `feature_shutdown.py`: a wait parked on the async side is still an
+    /// active command.
+    #[tokio::test]
+    async fn http_wait_is_an_active_command_while_it_waits() {
+        let (ctx, _dir) = http_wait_ctx();
+        let body = serde_json::json!({ "method": "waitfornewblock", "params": [5_000] });
+        let waiter = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move { satisfy_http_wait(&ctx, &body).await })
+        };
+        let t0 = Instant::now();
+        loop {
+            let names: Vec<String> = ctx
+                .active
+                .lock()
+                .unwrap()
+                .snapshot()
+                .into_iter()
+                .map(|(m, _)| m)
+                .collect();
+            if names.iter().any(|m| m == "waitfornewblock") {
+                break;
+            }
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(2),
+                "waitfornewblock never showed as active: {names:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ctx.stop.store(true, Ordering::SeqCst);
+        assert!(waiter.await.unwrap());
+        assert!(ctx.active.lock().unwrap().is_empty(), "the wait left");
+    }
+
+    /// `mining_getblocktemplate_longpoll.py` sees the request line while the
+    /// longpoll waits, and only once.
+    #[tokio::test]
+    async fn http_longpoll_logs_the_request_once_before_it_waits() {
+        let (ctx, _dir) = http_wait_ctx();
+        let current = crate::methods::gbt_longpoll_id(&ctx);
+        let req = serde_json::json!({
+            "method": "getblocktemplate",
+            "params": [{ "rules": ["segwit"], "longpollid": current }],
+            "id": 1
+        });
+        rbitcoin_log::capture_logs(true);
+        let waiter = {
+            let ctx = Arc::clone(&ctx);
+            let req = req.clone();
+            tokio::spawn(async move { satisfy_http_wait(&ctx, &req).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!waiter.is_finished(), "the longpoll id has not changed");
+        let mut lines = rbitcoin_log::take_logs();
+        let needle = "ThreadRPCServer method=getblocktemplate";
+        assert!(
+            lines.iter().any(|(_, l)| l == needle),
+            "logged before the wait ends: {lines:?}"
+        );
+        ctx.stop.store(true, Ordering::SeqCst);
+        assert!(waiter.await.unwrap());
+        crate::methods::set_http_wait_satisfied(true);
+        let _ = exec_one(&ctx, &req);
+        crate::methods::set_http_wait_satisfied(false);
+        lines.extend(rbitcoin_log::take_logs());
+        rbitcoin_log::capture_logs(false);
+        let n = lines.iter().filter(|(_, l)| l == needle).count();
+        assert_eq!(n, 1, "{lines:?}");
+    }
+
+    /// A plain `getblocktemplate` logs Core's request line once; other
+    /// methods do not.
+    #[test]
+    fn exec_one_logs_the_getblocktemplate_request_line_only() {
+        let (ctx, _dir) = http_wait_ctx();
+        let needle = "ThreadRPCServer method=getblocktemplate";
+        rbitcoin_log::capture_logs(true);
+        let _ = exec_one(
+            &ctx,
+            &serde_json::json!({
+                "method": "getblocktemplate",
+                "params": [{ "rules": ["segwit"] }],
+                "id": 1
+            }),
+        );
+        let gbt = rbitcoin_log::take_logs();
+        let _ = exec_one(
+            &ctx,
+            &serde_json::json!({ "method": "getblockcount", "params": [], "id": 2 }),
+        );
+        let other = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(
+            gbt.iter().filter(|(_, l)| l == needle).count(),
+            1,
+            "{gbt:?}"
+        );
+        assert!(other.iter().all(|(_, l)| l != needle), "{other:?}");
     }
 
     #[tokio::test]

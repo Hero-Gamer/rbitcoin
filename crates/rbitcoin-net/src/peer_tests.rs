@@ -2620,6 +2620,150 @@ fn merkle_mutated_unique_fill_second_cmpct_disconnects() {
     });
 }
 
+/// `p2p_compactblocks.py` stalling peer: a peer's partial for a block that
+/// connected through another peer must not hold its one pending slot, or the
+/// peer's next compact becomes a full getdata and its blocktxn is ignored.
+/// Core drops every peer's in-flight entry once the block is received.
+#[tokio::test]
+async fn partial_for_a_block_connected_elsewhere_frees_the_slot() {
+    use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-stale-partial");
+    hub.ensure_genesis().unwrap();
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(mp).is_ok());
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mut time = hub.tip_header().unwrap().time + 1;
+    let mut coinbases = Vec::new();
+    for height in 1..=102u32 {
+        let b = rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            height,
+            op_true.clone(),
+            vec![],
+        );
+        coinbases.push(b.txdata[0].compute_txid());
+        hub.accept_block(b).unwrap();
+        time += 1;
+    }
+    let spend = |i: usize| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbases[i],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_0000_0000),
+            script_pubkey: op_true.clone(),
+        }],
+    };
+    let a = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        time,
+        103,
+        op_true.clone(),
+        vec![spend(0)],
+    );
+    let b = rbitcoin_consensus::mine_regtest_paying(
+        a.block_hash(),
+        time + 1,
+        104,
+        op_true.clone(),
+        vec![spend(1)],
+    );
+
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let stalling = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let cmpct = |blk: &bitcoin::Block| CmpctBlock {
+        compact_block: HeaderAndShortIds::from_block(blk, 0xbeef, 2, &[]).unwrap(),
+    };
+
+    on_cmpctblock(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &cmpct(&a),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        out_rx.try_recv().unwrap().expect_msg(),
+        NetworkMessage::GetBlockTxn(_)
+    ));
+    hub.accept_block(a.clone()).unwrap();
+    assert_eq!(
+        hub.tip_hash(),
+        Some(a.block_hash()),
+        "A arrived from another peer"
+    );
+
+    on_cmpctblock(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &cmpct(&b),
+    )
+    .await
+    .unwrap();
+    let mut sent = Vec::new();
+    while let Ok(m) = out_rx.try_recv() {
+        sent.push(m.expect_msg());
+    }
+    assert!(
+        sent.iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlockTxn(g) if g.txs_request.block_hash == b.block_hash())),
+        "the stale partial for A must not turn B into a full getdata: {sent:?}"
+    );
+    on_blocktxn(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(stalling.as_ref()),
+        &BlockTransactions {
+            block_hash: b.block_hash(),
+            transactions: vec![b.txdata[1].clone()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(hub.tip_hash(), Some(b.block_hash()), "blocktxn completes B");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     use bitcoin::absolute::LockTime;
@@ -10397,6 +10541,205 @@ async fn header_reject_punishes_except_temporary_time() {
 }
 
 #[tokio::test]
+async fn noban_peer_is_not_punished_for_a_bad_header() {
+    use bitcoin::ScriptBuf;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-noban");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut bad_pow = rbitcoin_consensus::mine_regtest_paying(
+        gen,
+        1_300_000_100,
+        1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+
+    let plain = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, Some(plain.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        plain.stop.load(Ordering::SeqCst),
+        "a plain peer is disconnected"
+    );
+    assert!(misbehavior_disconnects(
+        follow.ban_score,
+        Some(plain.as_ref())
+    ));
+
+    peers.set_noban(true);
+    let kept = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, Some(kept.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        !kept.stop.load(Ordering::SeqCst),
+        "Core never disconnects a noban peer for misbehavior"
+    );
+    assert_eq!(follow.ban_score, 0, "a noban peer gathers no score");
+    assert!(
+        !misbehavior_disconnects(BAN_SCORE_THRESHOLD, Some(kept.as_ref())),
+        "a noban peer at the threshold stays connected"
+    );
+    assert!(misbehavior_disconnects(BAN_SCORE_THRESHOLD, None));
+    assert!(!misbehavior_disconnects(BAN_SCORE_THRESHOLD - 1, None));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Each `headers` message persists the pending path from the last stored
+/// header, not the whole path again. Re-checking stored fork headers walks
+/// their ancestors on every message, so a long fork made each message slower
+/// (`feature_bip68_sequence.py` took 10 s for one message at 244 pending).
+#[test]
+fn persist_pending_path_starts_after_the_last_stored_header() {
+    use bitcoin::ScriptBuf;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("persist-path");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(20, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let fork_at = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(10))
+        .unwrap();
+    let mut pending = HashMap::new();
+    let mut prev = fork_at.block_hash();
+    let mut time = fork_at.time + 1;
+    let mut last = prev;
+    for height in 11..=50u32 {
+        let h = rbitcoin_consensus::mine_regtest_paying(
+            prev,
+            time,
+            height,
+            ScriptBuf::from_bytes(vec![0x52]),
+            vec![],
+        )
+        .header;
+        prev = h.block_hash();
+        last = prev;
+        time += 1;
+        pending.insert(prev, h);
+    }
+    persist_pending_header_path(&hub, &pending, last);
+    assert!(hub.knows_header(&last), "the fork path is stored");
+
+    let next = rbitcoin_consensus::mine_regtest_paying(
+        last,
+        time,
+        51,
+        ScriptBuf::from_bytes(vec![0x52]),
+        vec![],
+    )
+    .header;
+    pending.insert(next.block_hash(), next);
+    let _ = hub.take_header_contextual_checks();
+    persist_pending_header_path(&hub, &pending, next.block_hash());
+    assert!(hub.knows_header(&next.block_hash()));
+    assert_eq!(
+        hub.take_header_contextual_checks(),
+        1,
+        "only the new header is checked, not the stored fork path"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `feature_cltv.py` / `p2p_invalid_block.py`: a block whose header fails
+/// contextual checks still logs Core's reject reason.
+#[tokio::test]
+async fn block_with_rejected_header_logs_core_reason() {
+    use bitcoin::block::Version;
+    use bitcoin::{ScriptBuf, Target};
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("hdr-reject-log");
+    let mut params = ChainParams::regtest();
+    params.apply_test_activation_height("cltv", 111).unwrap();
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(110, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time + 1;
+    let mut v3 = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        time,
+        111,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    v3.header.version = Version::from_consensus(3);
+    let target = Target::from_compact(v3.header.bits);
+    while v3.header.validate_pow(target).is_err() {
+        v3.header.nonce = v3.header.nonce.wrapping_add(1);
+    }
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(v3.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(&hub, &out_tx, &mut follow, None, &v3)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let want = format!("{}, bad-version(0x00000003)", v3.block_hash());
+    assert!(
+        lines.iter().any(|(_, l)| l == &want),
+        "missing {want:?} in {lines:?}"
+    );
+
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        now + 3 * 3600,
+        111,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(future.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(&hub, &out_tx, &mut follow, None, &future)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l == "Block validation error: time-too-new"),
+        "missing time-too-new in {lines:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
     use bitcoin::hashes::Hash;
     use bitcoin::Txid;
@@ -10828,6 +11171,69 @@ fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
     h
 }
 
+/// Core queues relayed addresses per peer and sends them together
+/// (`p2p_addrv2_relay.py` checks the whole list arrives in one message).
+fn addr_relay_batches_one_message_per_neighbor() {
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    src.set_wants_addrv2();
+    let (src_tx, _src_rx) = mpsc::unbounded_channel();
+    src.attach_out(src_tx);
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000);
+    let dst = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+    dst.set_wants_addrv2();
+    let (dst_tx, mut dst_rx) = mpsc::unbounded_channel();
+    dst.attach_out(dst_tx);
+
+    let list: Vec<AddrV2Message> = (1..=3u8)
+        .map(|i| AddrV2Message {
+            time: 1_700_000_000,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(123, 123, 123, i)),
+            port: 8333,
+        })
+        .collect();
+    let mut follow = PeerFollowState::new();
+    rbitcoin_log::capture_logs(true);
+    on_addrv2(&mut follow, Some(src.as_ref()), &list).unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+
+    let got = dst_rx.try_recv().expect("one addrv2").expect_msg();
+    assert!(
+        dst_rx.try_recv().is_err(),
+        "the neighbor gets a single message"
+    );
+    let NetworkMessage::AddrV2(sent) = &got else {
+        panic!("expected addrv2, got {got:?}");
+    };
+    assert_eq!(sent, &list);
+    let nbytes = bitcoin::consensus::encode::serialize(&got).len();
+    let want = sending_addrv2_log(nbytes, dst.id);
+    assert!(
+        lines.iter().any(|(_, l)| l == &want),
+        "missing {want:?} in {lines:?}"
+    );
+}
+
+#[test]
 fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message_network::VersionMessage;
@@ -10968,5 +11374,6 @@ fn hostile_peer_session() {
     send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib();
     addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst();
     addr_relay_follows_the_address_key_and_skips_unwilling_peers();
+    addr_relay_batches_one_message_per_neighbor();
     invalid_script_is_scored_and_policy_is_not();
 }
