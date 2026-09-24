@@ -131,6 +131,7 @@ mod tests {
             assert_eq!(s.note_spend_durable_batch(4).unwrap(), 0);
         }
         assert!(s.spend_annotated_through().unwrap().is_none());
+        assert!(unix_ms() > 1_700_000_000_000);
         assert!(s.note_spend_durable_batch(4).unwrap() > 0);
         assert_eq!(s.spend_annotated_through().unwrap(), Some(0));
 
@@ -138,10 +139,14 @@ mod tests {
             .set(rbitcoin_primitives::Height(0), rbitcoin_primitives::Fk(1))
             .unwrap();
         SpendDurable::new(5, 0).store(s.path()).unwrap();
+        let m = SpendDurable::load(s.path()).unwrap().unwrap();
+        assert_eq!((m.annotated_through(), m.durable_through()), (5, 0));
         s.clamp_spend_durable().unwrap();
         let m = SpendDurable::load(s.path()).unwrap().unwrap();
         assert_eq!((m.annotated_through(), m.durable_through()), (0, 0));
         SpendDurable::new(0, 5).store(s.path()).unwrap();
+        let m = SpendDurable::load(s.path()).unwrap().unwrap();
+        assert_eq!((m.annotated_through(), m.durable_through()), (0, 5));
         s.clamp_spend_durable().unwrap();
         let m = SpendDurable::load(s.path()).unwrap().unwrap();
         assert_eq!((m.annotated_through(), m.durable_through()), (0, 0));

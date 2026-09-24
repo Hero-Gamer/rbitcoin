@@ -32,6 +32,22 @@ fn create_tiny(dir: &Path) -> TxTable {
     TxTable::create_with_head_layout(dir, tiny_layout()).unwrap()
 }
 
+#[test]
+fn flush_clears_pending_sync_on_replay_stems() {
+    let dir = tempfile_dir("flush-pending");
+    let t = create_tiny(&dir);
+    t.txids.append_batch(0, &[[9u8; 32]]).unwrap();
+    t.input.append_unstamped(1).unwrap();
+    assert!(t.txids.pending_sync());
+    assert!(t.txstat.pending_sync());
+    assert!(t.input.pending_sync());
+    t.flush().unwrap();
+    assert!(!t.txids.pending_sync());
+    assert!(!t.txstat.pending_sync());
+    assert!(!t.input.pending_sync());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn rebuild_opts(bits: u32, workers: usize) -> HeadOpenOpts {
     HeadOpenOpts::TINY
         .with_rebuild_seal_bits(bits)

@@ -71,6 +71,11 @@ impl TxidBody {
         self.file.flush()
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_sync(&self) -> bool {
+        self.file.pending_sync()
+    }
+
     pub fn count(&self) -> u64 {
         self.count.load(std::sync::atomic::Ordering::Acquire)
     }

@@ -205,6 +205,11 @@ impl TxStat {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_sync(&self) -> bool {
+        self.body.pending_sync() || self.ovf.pending_sync() || self.blk.pending_sync()
+    }
+
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         let body = TableFile::create(Self::body_path(dir), TableKind::TxStat)?;
         let pad = vec![0u8; (TXSTAT_BODY_HEADER as usize).saturating_sub(FILE_HEADER_LEN)];

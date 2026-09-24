@@ -752,6 +752,11 @@ impl TableFile {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_sync(&self) -> bool {
+        self.needs_sync.load(Ordering::Acquire)
+    }
+
     /// Persist HWM / trailer and `sync_data`.
     ///
     /// Skips entirely when no payload write has occurred since the last
@@ -1445,6 +1450,17 @@ mod advise_tests {
         assert!(!dest.exists());
         write_synced_tmp_rename(&dest, b"sealed").unwrap();
         assert!(dest.exists());
+        #[cfg(unix)]
+        {
+            let missing = dir.join("no-such-parent");
+            let err = fsync_parent_dir(&missing).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+            let bare = std::path::PathBuf::from(format!("rbitcoin-bare-seal-{id}"));
+            let _ = std::fs::remove_file(&bare);
+            write_synced_tmp_rename(&bare, b"x").unwrap();
+            assert_eq!(std::fs::read(&bare).unwrap(), b"x");
+            let _ = std::fs::remove_file(&bare);
+        }
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"sealed");
         let _ = std::fs::remove_dir_all(&dir);
