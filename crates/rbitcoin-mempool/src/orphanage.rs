@@ -421,6 +421,31 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_expires_after_twenty_minutes() {
+        assert_eq!(ORPHAN_EXPIRE_MS, 1_200_000);
+        assert!(unix_ms() > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn removing_one_orphan_keeps_the_rest_of_the_peer_weight() {
+        let mut o = Orphanage::new();
+        let a = make_orphan(txid_n(1), 1);
+        let b = make_orphan(txid_n(2), 2);
+        let mut miss_a = BTreeSet::new();
+        miss_a.insert(txid_n(1));
+        let mut miss_b = BTreeSet::new();
+        miss_b.insert(txid_n(2));
+        assert!(o.insert_from(a, miss_a, Some(7)));
+        let one = o.peer_orphan_weight(7);
+        assert!(one > 0);
+        assert!(o.insert_from(b.clone(), miss_b, Some(7)));
+        assert!(o.peer_orphan_weight(7) > one);
+        o.erase_for_block(&[b.compute_txid()]);
+        assert_eq!(o.peer_orphan_weight(7), one);
+    }
+
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;

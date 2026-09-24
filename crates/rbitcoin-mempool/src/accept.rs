@@ -953,21 +953,6 @@ impl ActiveMempool {
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
-        let seeds = BTreeSet::from([txid]);
-        let (n_members, cluster_w) = self.graph.connected_weight(&seeds);
-        if n_members > self.graph.cluster_count_limit()
-            || cluster_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
-        {
-            self.graph.remove(&txid, tx);
-            self.bodies.remove(&txid);
-            self.vin_aux.remove(&txid);
-            let _ = self.store.mark_slot_dead(slot);
-            return Err(AcceptError::ClusterTooLarge {
-                count: n_members,
-                weight: cluster_w,
-            });
-        }
-
         self.evict_to_budget(Some(txid))?;
 
         Ok(AcceptResult {
@@ -2138,6 +2123,61 @@ mod tests {
             decayed_relay_floor(u64::MAX, 100, 63 * ROLLING_FEE_HALFLIFE_MS),
             100
         );
+        assert_eq!(ROLLING_FEE_HALFLIFE_MS, 43_200_000);
+        assert!(unix_ms() > 1_700_000_000_000);
+    }
+
+    #[test]
+    fn min_fee_decays_when_one_more_standard_tx_would_exactly_fill() {
+        let dir = tmp_dir();
+        let mut mp =
+            ActiveMempool::open_or_create_with_limit(&dir, policy::MAX_STANDARD_TX_WEIGHT).unwrap();
+        mp.rolling_min_sat_kvb = 5_000;
+        mp.rolling_updated_ms = 0;
+        mp.min_relay_sat_kvb = 100;
+        assert_eq!(mp.mempool_min_fee_sat_kvb(), 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(10_000_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_cluster_limits(Some(2), None);
+        let tx1 = spend_tx(op, 9_000_000);
+        mp.accept_tx(&tx1, &utxos, TIP_OK).unwrap();
+        let tx2 = spend_tx(
+            OutPoint {
+                txid: tx1.compute_txid(),
+                vout: 0,
+            },
+            8_000_000,
+        );
+        mp.accept_tx(&tx2, &utxos, TIP_OK).unwrap();
+        let tx3 = spend_tx(
+            OutPoint {
+                txid: tx2.compute_txid(),
+                vout: 0,
+            },
+            7_000_000,
+        );
+        let err = mp.accept_tx(&tx3, &utxos, TIP_OK).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { count: 3, .. }),
+            "{err}"
+        );
+
+        let dir2 = tmp_dir();
+        let (op2, _, utxos2) = chain_utxo(10_000_000);
+        let mut mp2 = ActiveMempool::open_or_create(&dir2).unwrap();
+        mp2.set_cluster_limits(Some(50), Some(1));
+        let mut wide = spend_tx(op2, 9_000_000);
+        wide.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = mp2.accept_tx(&wide, &utxos2, TIP_OK).unwrap_err();
+        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -2494,7 +2534,10 @@ mod tests {
         let remain = 10_000_000u64 - (MAX_CLUSTER_COUNT as u64 + 1) * 1_000;
         let extra = spend_tx(prev_op, remain);
         let err = mp.accept_tx(&extra, &utxos, TIP_OK).unwrap_err();
-        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+        assert!(
+            matches!(err, AcceptError::ClusterTooLarge { count, .. } if count == MAX_CLUSTER_COUNT + 1),
+            "{err}"
+        );
         assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
         let _ = std::fs::remove_dir_all(&dir);
     }

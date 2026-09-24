@@ -599,9 +599,7 @@ impl TxGraph {
         q.push_back(start);
         seen.insert(start);
         while let Some(cur) = q.pop_front() {
-            if cur < rep {
-                rep = cur;
-            }
+            rep = rep.min(cur);
             let Some(e) = self.entries.get(&cur) else {
                 continue;
             };
@@ -971,6 +969,11 @@ impl TxGraph {
     }
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
+    #[cfg(test)]
+    fn indexed_cluster_count(&self) -> usize {
+        self.worst_chunks.len()
+    }
+
     pub fn worst_chunk(&self) -> Option<(Txid, Chunk)> {
         self.worst_chunks
             .iter()
@@ -1081,15 +1084,22 @@ mod tests {
         assert_ne!(least, greater);
         let mut seen = std::collections::BTreeSet::new();
         assert_eq!(g.component_rep(greater, &mut seen), Some(least));
+        assert_eq!(g.indexed_cluster_count(), 1);
+        let stranger = make_tx(Some((pid, 7)), 1, 9);
+        g.insert(entry_for(&stranger, 500, 2), &stranger);
+        assert_eq!(g.indexed_cluster_count(), 2);
     }
 
     #[test]
     fn single_tx_cluster() {
         let mut g = TxGraph::new();
+        assert_eq!(g.take_cluster_builds(), 0);
         let tx = make_tx(None, 1, 1);
         let e = entry_for(&tx, 1000, 0);
         let id = e.txid;
         g.insert(e, &tx);
+        let (n, _) = g.connected_weight(&std::collections::BTreeSet::from([id]));
+        assert_eq!(n, 1);
         let c = g.cluster_of(&id).unwrap();
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.linearization, vec![id]);
