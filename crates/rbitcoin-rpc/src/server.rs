@@ -90,6 +90,14 @@ struct AppState {
     require_auth: bool,
 }
 
+/// Omitted and `0` are [`DEFAULT_RPC_WORK_QUEUE`]. A positive `N` is `N`.
+fn work_queue_permits(configured: Option<usize>) -> usize {
+    match configured {
+        Some(n) if n > 0 => n,
+        _ => DEFAULT_RPC_WORK_QUEUE,
+    }
+}
+
 /// Start JSON-RPC on TCP and/or a unix socket (plain HTTP; TLS via reverse proxy).
 pub async fn run_rpc(
     config: RpcConfig,
@@ -134,10 +142,7 @@ pub async fn run_rpc(
         alert_fired: Arc::new(AtomicBool::new(false)),
     });
 
-    let n = match config.work_queue {
-        Some(n) if n > 0 => n,
-        _ => DEFAULT_RPC_WORK_QUEUE,
-    };
+    let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
@@ -661,6 +666,13 @@ fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
 mod tests {
     use super::*;
     use rbitcoin_primitives::Network;
+
+    #[test]
+    fn work_queue_zero_and_omitted_are_the_default() {
+        assert_eq!(work_queue_permits(None), DEFAULT_RPC_WORK_QUEUE);
+        assert_eq!(work_queue_permits(Some(0)), DEFAULT_RPC_WORK_QUEUE);
+        assert_eq!(work_queue_permits(Some(4)), 4);
+    }
 
     fn auth_header(auth: &RpcAuth) -> String {
         format!("Bearer {}", auth.token)
