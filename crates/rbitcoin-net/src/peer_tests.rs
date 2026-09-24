@@ -10791,3 +10791,95 @@ fn addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst() {
     }
     assert_eq!(extra, 0, "past the 1000-address burst nothing is relayed");
 }
+
+/// FNV-1a of the address bytes. Duplicated here so a broken mixer in
+/// `addr_relay_key` cannot satisfy the assertion by changing both sides.
+fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
+    let raw = bitcoin::consensus::encode::serialize(msg);
+    let mut h = 0xcbf29ce484222325u64;
+    for b in raw {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[test]
+fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
+    use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    src.set_wants_addrv2();
+    let (src_tx, mut src_rx) = mpsc::unbounded_channel();
+    src.attach_out(src_tx);
+
+    let mut neigh = Vec::new();
+    for i in 0..4u16 {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000 + i);
+        let p = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+        p.set_wants_addrv2();
+        let (tx, rx) = mpsc::unbounded_channel();
+        p.attach_out(tx);
+        neigh.push((p.id, rx));
+    }
+    let quiet = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000),
+        &ver,
+        true,
+        crate::peers::PeerConnType::Inbound,
+    );
+    let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
+    quiet.attach_out(quiet_tx);
+
+    let mut follow = PeerFollowState::new();
+    let msg = bitcoin::p2p::address::AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+        port: 8333,
+    };
+    on_addrv2(&mut follow, Some(src.as_ref()), &[msg.clone()]).unwrap();
+
+    let key = addr_key_oracle(&msg);
+    let n_dest = if key & 1 == 0 { 1 } else { 2 };
+    let start = (key as usize) % neigh.len();
+    let mut expect = Vec::new();
+    for step in 0..n_dest {
+        expect.push(neigh[(start + step) % neigh.len()].0);
+    }
+    expect.sort_unstable();
+
+    let mut got = Vec::new();
+    for (id, rx) in &mut neigh {
+        if rx.try_recv().is_ok() {
+            got.push(*id);
+        }
+    }
+    got.sort_unstable();
+    assert_eq!(got, expect, "key {key:#x} must select those neighbors");
+    assert!(
+        src_rx.try_recv().is_err(),
+        "a peer does not relay to itself"
+    );
+    assert!(
+        quiet_rx.try_recv().is_err(),
+        "a peer that did not ask for addrv2 is skipped"
+    );
+}
