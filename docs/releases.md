@@ -75,8 +75,8 @@ sitting in `## [Unreleased]` stay and are cut with the fragments.
 GitHub merge creates the ship SHA. The tag must point at **that** SHA, not
 the topic-branch tip (squash/rebase would move it). Closest sequence:
 
-1. Version-bump PR reaches required checks **plus** `core-functional` /
-   `release-extra` (below).
+1. Version-bump PR reaches required checks **plus** `release-extra`
+   (below).
 2. Merge (`gh pr merge --merge` — merge commit, not squash).
 3. **Immediately** tag `vX.Y.Z` on `mergeCommit.oid` and push **only the
    tag** (`./scripts/release.sh --tag-only` or `./scripts/release-post.sh`).
@@ -129,26 +129,31 @@ An operator with SSH `pushurl` may omit `--no-push`.
 ## CI gates on a ship PR
 
 A **ship PR** is one whose tree version is not `.99` (detect job reads
-Cargo.toml). Those PRs run Core functional even without a label.
+Cargo.toml). Those PRs run Core functional, overlay functional, and the
+Warnet example even without a label. [`release-gate.yml`](../.github/workflows/release-gate.yml)
+owns ship detection. On a ship PR or label **`release`** it calls
+`core-functional.yml`, `overlay-functional.yml`, and `warnet-example.yml`
+(`workflow_call`) so `release-extra` can `needs:` all three. Those checks
+show as `core-functional / core-functional` and so on.
 
 | Check | Who |
 |-------|-----|
 | `qc` `test` `windows` `macos` `coverage` `mutants (1/4)`–`(4/4)` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, deny, script self-tests, clippy, then nixos-module-eval. A 30-minute mutants kill with no `MISSED` warns and passes. `MISSED` before that kill fails. A finished non-zero exit fails. |
-| `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**, label **`release`**, **or** ship version |
-| `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**, label **`release`**, **or** ship version. Not required. Not in `release-extra` yet. |
-| `warnet-example` | Label **`warnet`** or `workflow_dispatch`. Two-tank Docker lab. Not required. Not a ship gate. |
+| `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
+| `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
+| `warnet-example` | Label **`warnet`**, `workflow_dispatch`; via `release-gate.yml` on label **`release`** **or** ship version. Two-tank Docker lab. |
 | `nixos-module-runtime` | Label **`nixos-module-runtime`**, `workflow_dispatch`, **or** GitHub Release tags (`release.yml`). Not required. |
-| `release-extra` | Every PR. **Fails** if the PR is ship and `core-functional` is not success |
+| `release-extra` | Every PR (`release-gate.yml`). **Fails** if the PR is ship and any of `core-functional`, `overlay-functional`, `warnet-example` is not success |
 
-Label ship PRs **`release`** and **`core-functional`**. The detect job is
-the backstop if a label is missing.
+Label ship PRs **`release`**. The detect job is the backstop if the label
+is missing.
 
 Ask the operator to add **`release-extra`** as a **required** status check
 on `master` / `main` / `v*.*.x` (ruleset). Until then, agents still wait
 for it before merge.
 
-Unlabeled non-ship PRs keep cargo gates only (detect=`dev`,
-`core-functional` skipped, `release-extra` green).
+Unlabeled non-ship PRs keep cargo gates only (detect=`dev`, the three
+functional suites skipped, `release-extra` green).
 
 ---
 
@@ -173,8 +178,9 @@ From current `origin/master` at `X.Y.99`:
    patch line). Keep the detailed Unreleased body under the new heading.
 3. `./scripts/release-gate.sh` and `./scripts/release-notes.sh` must
    succeed (preview the GitHub Release text).
-4. PR → `master`. Labels `release` + `core-functional`. Poll **required +
-   `core-functional` + `release-extra`**.
+4. PR → `master`. Label `release`. Poll **required +
+   `core-functional` + `overlay-functional` + `warnet-example` +
+   `release-extra`**.
 5. `gh pr merge --merge`. Fetch. Create a throwaway branch at
    `origin/master` (or `origin/vX.Y.x`) — do not steal `master` from
    another worktree (`git switch -C tag/vX.Y.Z origin/master`).

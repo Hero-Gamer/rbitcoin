@@ -1,0 +1,90 @@
+# Ship-PR gate. `release-extra` always reports on pull_request. It fails
+# when the tree is a ship version (patch != 99) and any of core-functional,
+# overlay-functional, or warnet-example was not success. Ship PRs and
+# label `release` call all three suites here (workflow_call); `needs:`
+# cannot cross workflows. Ask the operator to make `release-extra` a
+# required check on master / v*.*.x. See docs/releases.md.
+name: release-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: release-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: detect-ship
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.v.outputs.run }}
+      ship: ${{ steps.v.outputs.ship }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Classify ship vs .99
+        id: v
+        env:
+          RELEASE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'release') }}
+        run: |
+          set -euo pipefail
+          kind="$(./scripts/release-gate.sh --kind)"
+          ship=false
+          [[ "$kind" == ship ]] && ship=true
+          echo "ship=$ship" >> "$GITHUB_OUTPUT"
+          if [[ "$ship" == true || "$RELEASE_LABEL" == true ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  core-functional:
+    name: core-functional
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    uses: ./.github/workflows/core-functional.yml
+    with:
+      gate: true
+
+  overlay-functional:
+    name: overlay-functional
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    uses: ./.github/workflows/overlay-functional.yml
+    with:
+      gate: true
+
+  warnet-example:
+    name: warnet-example
+    needs: [detect]
+    if: needs.detect.outputs.run == 'true'
+    uses: ./.github/workflows/warnet-example.yml
+    with:
+      gate: true
+
+  release-extra:
+    name: release-extra
+    needs: [detect, core-functional, overlay-functional, warnet-example]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: detect-ship must succeed
+        run: |
+          set -euo pipefail
+          [[ "${{ needs.detect.result }}" == "success" ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ship PRs require core, overlay, and warnet functional
+        env:
+          DETECT_SHIP: ${{ needs.detect.outputs.ship }}
+          CF_RESULT: ${{ needs.core-functional.result }}
+          OF_RESULT: ${{ needs.overlay-functional.result }}
+          WN_RESULT: ${{ needs.warnet-example.result }}
+        run: ./scripts/release-gate.sh --ci-extra
