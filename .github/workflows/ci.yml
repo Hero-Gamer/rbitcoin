@@ -26,13 +26,7 @@ env:
 # `qc` is one Ubuntu runner: fmt, ast-grep, deny, scripts, clippy, then
 # nixos-module-eval. test, windows, and macos each have their own runner.
 # coverage waits for qc and test so a red test does not start it.
-# Mutants checks are `mutants (1/4)` through `mutants (4/4)` (`--shard`
-# stays 0–3). They wait for the same three. Under 400 changed lines,
-# `mutants (1/4)` runs once (`--shard 0/1`); the other three exit 0.
-# A 30m kill with no MISSED in the log passes and posts a warning.
-# MISSED before that kill fails the shard. A finished non-zero
-# cargo-mutants exit fails.
-# Weekly sweep stays mutants.yml.
+# Mutants are not a PR check. Nightly workspace runs live in mutants.yml.
 # nixos-module-runtime is a labeled job (nixos-module-runtime.yml), not this file.
 # Operator binaries are GitHub Releases (release.yml), not this workflow.
 #
@@ -96,6 +90,8 @@ jobs:
         run: ./scripts/ci-os-smoke.test.sh
       - name: pr-checks-watch self-test
         run: ./scripts/pr-checks-watch.test.sh
+      - name: mutants queue self-test
+        run: ./scripts/mutants-queue.test.sh
       - name: overlay-functional runner self-test
         run: ./scripts/overlay-functional/run.sh.test.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -173,154 +169,6 @@ jobs:
           workspaces: ". -> target/dev"
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
-
-  # PR in-diff. Required checks `mutants (1/4)` through `mutants (4/4)`
-  # (`--shard` 0–3). Under 400 changed lines, mutants (1/4) runs the
-  # whole in-diff set (`--shard 0/1`) and the other three exit 0.
-  # A 30m kill with no MISSED passes and posts a warning. MISSED already
-  # in that log fails the shard. A finished non-zero exit fails.
-  # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
-  mutants:
-    name: mutants (${{ matrix.n }}/4)
-    needs: [qc, test]
-    if: >-
-      github.event_name == 'pull_request'
-      && needs.qc.result == 'success'
-      && needs.test.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      # Expressions have no + operator; a `+` in ${{ }} invalidates this file.
-      # n is the check number. shard is the cargo --shard argument.
-      matrix:
-        include:
-          - shard: 0
-            n: 1
-          - shard: 1
-            n: 2
-          - shard: 2
-            n: 3
-          - shard: 3
-            n: 4
-    env:
-      # Workflow env disables incremental for rust-cache and denies warnings.
-      # cargo-mutants rebuilds one mutant at a time; incremental is the point.
-      # Weekly mutants.yml does not pass -D warnings. A warning-only build
-      # failure would look caught here and missed on Sunday.
-      CARGO_INCREMENTAL: "1"
-      CARGO_TERM_COLOR: never
-      RUSTFLAGS: ""
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: rust or workflow diff
-        id: diff
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          set -euo pipefail
-          git diff "origin/${BASE_REF}".. --unified=0 -- \
-            crates Cargo.toml Cargo.lock \
-            .github/workflows/ci.yml .github/workflows/mutants.yml \
-            > git.diff
-          if [[ ! -s git.diff ]]; then
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-            echo "small=false" >> "$GITHUB_OUTPUT"
-            echo "no rust or workflow diff; shard passes"
-            exit 0
-          fi
-          echo "rust=true" >> "$GITHUB_OUTPUT"
-          lines="$(grep -E '^[+-]' git.diff | grep -cvE '^[+-]{3}' || true)"
-          lines="${lines:-0}"
-          if [[ "${lines}" -lt 400 ]]; then
-            echo "small=true" >> "$GITHUB_OUTPUT"
-            echo "small diff (${lines} changed lines); mutants (1/4) runs all of it (--shard 0/1)"
-          else
-            echo "small=false" >> "$GITHUB_OUTPUT"
-            echo "large diff (${lines} changed lines); four shards"
-          fi
-      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
-        if: steps.diff.outputs.rust == 'true' && (steps.diff.outputs.small != 'true' || matrix.shard == 0)
-      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
-        if: steps.diff.outputs.rust == 'true' && (steps.diff.outputs.small != 'true' || matrix.shard == 0)
-        with:
-          tool: cargo-mutants@27.1.0
-      - name: in-diff shard
-        id: run
-        if: steps.diff.outputs.rust == 'true' && (steps.diff.outputs.small != 'true' || matrix.shard == 0)
-        run: |
-          set -euo pipefail
-          if [[ "${{ steps.diff.outputs.small }}" == "true" ]]; then
-            shard_arg="0/1"
-          else
-            shard_arg="${{ matrix.shard }}/4"
-          fi
-          set +e
-          timeout --signal=TERM --kill-after=60s 30m \
-            cargo mutants --workspace --in-diff git.diff \
-              --shard "${shard_arg}" --sharding slice -j 2 \
-            > mutants-shard.log 2>&1
-          ec=$?
-          set -e
-          missed="$(grep -c '^MISSED' mutants-shard.log || true)"
-          echo "missed=${missed}" >> "$GITHUB_OUTPUT"
-          cat mutants-shard.log
-          if [[ "$ec" -eq 124 ]]; then
-            if [[ "$missed" -gt 0 ]]; then
-              echo "::warning::mutants shard hit 30m with ${missed} MISSED already in the log"
-              echo "result=timeout-missed" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-            echo "::warning::mutants shard hit the 30m limit with no MISSED in the partial log; counting as success"
-            echo "result=timeout" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "result=finished" >> "$GITHUB_OUTPUT"
-          exit "$ec"
-      - name: summary
-        if: always()
-        run: |
-          {
-            echo "### mutants ${{ matrix.n }}/4"
-            echo "Required. Outcome: ${{ steps.run.outcome }}. Result: ${{ steps.run.outputs.result }}. Missed: ${{ steps.run.outputs.missed }}."
-            echo "A 30m kill with no MISSED warns and passes. MISSED before that kill fails. A finished non-zero exit fails."
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: fail unless success or clean timeout
-        if: always() && steps.diff.outputs.rust == 'true'
-        run: |
-          set -euo pipefail
-          result="${{ steps.run.outputs.result }}"
-          outcome="${{ steps.run.outcome }}"
-          if [[ "${{ steps.diff.outputs.small }}" == "true" && "${{ matrix.shard }}" != "0" ]]; then
-            echo "small diff; mutants (${{ matrix.n }}/4) does not run cargo mutants"
-            exit 0
-          fi
-          missed=0
-          if [[ -f mutants-shard.log ]]; then
-            missed="$(grep -c '^MISSED' mutants-shard.log || true)"
-          fi
-          if [[ "$result" == "timeout-missed" || ( "$missed" -gt 0 && ( "$result" == "timeout" || "$outcome" == "cancelled" ) ) ]]; then
-            echo "::warning::mutants shard hit the time limit with ${missed} MISSED already in the log"
-            exit 1
-          fi
-          if [[ "$result" == "timeout" || "$outcome" == "cancelled" ]]; then
-            echo "::warning::mutants shard hit the time limit with no MISSED in the partial log; counting as success"
-            exit 0
-          fi
-          if [[ "$outcome" == "success" && "$result" == "finished" ]]; then
-            exit 0
-          fi
-          echo "mutants shard failed (outcome=${outcome} result=${result})"
-          exit 1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: mutants-pr-${{ matrix.n }}
-          path: mutants.out
-          if-no-files-found: ignore
-          retention-days: 5
 
   # Line-coverage 92% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
   # Slow; waits for qc and test so a red check does not start

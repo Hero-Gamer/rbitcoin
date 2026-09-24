@@ -244,8 +244,7 @@ Do not edit [`CHANGELOG.md`](./CHANGELOG.md) on a feature branch. The release
 cut folds those files in. Owner: [`docs/releases.md`](./docs/releases.md).
 
 Required **jobs** match [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
-(`qc`, `test`, `windows`, `macos`, `coverage`, `mutants (1/4)` …
-`mutants (4/4)`). `qc` is fmt, ast-grep, deny, the script self-tests,
+(`qc`, `test`, `windows`, `macos`, `coverage`). `qc` is fmt, ast-grep, deny, the script self-tests,
 clippy, then nixos-module-eval, in that order on one runner.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.

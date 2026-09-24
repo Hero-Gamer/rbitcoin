@@ -254,7 +254,7 @@ matches scalar in default tests). Owner: [`docs/quality.md`](./docs/quality.md).
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). `--fail-above --threshold 30`; `.cargo-crap.toml` allowlists today's production CRAP>30 functions (remove a name when it scores ≤30). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`. No `--fail-regression` (llvm-cov coverage % jitters per function) |
 | **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 92% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
-| **cargo-mutants** | Must pass `--workspace` (`Cargo.toml` `default-members` is `rbitcoin-node` only; without `--workspace` the list is ~7 mutants). PR: `git diff origin/<base>.. --unified=0 -- crates Cargo.toml Cargo.lock .github/workflows/ci.yml .github/workflows/mutants.yml > git.diff` then `cargo mutants --workspace --in-diff git.diff --shard k/4 --sharding slice -j 2` (k is 0–3). Under 400 changed lines the PR job uses `--shard 0/1` once, on check `mutants (1/4)`. Weekly: `cargo mutants --workspace --shard N/8 -j 2`. Snapshot of missed/timeouts: [`docs/mutants/`](docs/mutants/). | PR: `ci.yml` `mutants (1/4)`–`mutants (4/4)` (`--shard` 0–3), required, needs `qc` and `test`. A finished non-zero exit fails. A 30-minute kill with no `MISSED` in the log warns and passes. `MISSED` already in that log fails the shard. No rust or workflow diff: every shard exits 0. Weekly `mutants.yml` Sunday 03:00 UTC, 8 shards, 360min cap (not required). `workflow_dispatch`. |
+| **cargo-mutants** | Nightly, not a PR check. `./scripts/mutants-nightly.sh` lists `--workspace` mutants, runs new diff lines first, then walks a cursor through the rest. Each mutant uses `--test-workspace=true` so a higher journey counts, `--baseline=skip`, `-j 1`, 20 minute mutant timeout, 90 minute budget. Cursor artifact `mutants-cursor`. `MISSED` is uploaded and does not fail the run. Snapshot lists in [`docs/mutants/`](docs/mutants/) are host history, not the gate. | `mutants.yml` daily `0 7 * * *` and `workflow_dispatch`. Job timeout 110 minutes. |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
 not write `target/`. `mutants.out/` is gitignored.
@@ -530,6 +530,14 @@ python3 scripts/core-functional/check_inventory.py
 
 ## What a mutant kill looks like
 
-The PR gate is the four `mutants` shards in [`ci.yml`](.github/workflows/ci.yml), described in the table above. Do not run a different `cargo mutants` command and treat that as the gate.
+Mutants are a nightly oracle, not a pull-request check. The command is
+`./scripts/mutants-nightly.sh` ([`mutants.yml`](.github/workflows/mutants.yml)).
+Do not treat a package-only `cargo mutants` run as the gate: a journey
+outside the mutated crate must be able to catch the mutant.
 
-A new production behavior needs a test that fails when that behavior is removed or inverted. Assert the observable result (the error variant, the bytes, the height), not the test name. Concurrency, ordering, and cancellation are not what `cargo-mutants` models; those need a direct test. A diff that does not touch `crates/`, the Cargo manifests, or the mutants workflows does not run mutants.
+A new production behavior still needs a test that fails when that behavior
+is removed or inverted. Put that assert on a catalog journey, or on a
+store-less unit when the journey cannot see it. `MISSED` in the nightly
+artifact means no workspace test cared. Extend the journey. A same-crate
+twin that only existed to satisfy a package-local mutant is a deletion
+candidate once a workspace run shows the journey catching it.
