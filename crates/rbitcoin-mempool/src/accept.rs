@@ -1,7 +1,9 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{TxEntry, TxGraph, COINBASE_SIGOPS_RESERVE, MAX_BLOCK_SIGOPS_COST};
+use crate::graph::{
+    sigops_adjusted_weight, TxEntry, TxGraph, COINBASE_SIGOPS_RESERVE, MAX_BLOCK_SIGOPS_COST,
+};
 use crate::orphanage::Orphanage;
 use crate::packed::VinAux;
 use crate::store::Mempool;
@@ -158,6 +160,7 @@ pub(crate) fn relay_floor(
 pub struct AcceptResult {
     pub txid: Txid,
     pub fee_sat: u64,
+    /// Sigop-adjusted weight; `vsize = ceil(weight / 4)` is Core's `m_vsize`.
     pub weight: u64,
     pub slot: u32,
     /// Mempool txids removed by full-RBF / RBFR when admitting this tx (empty if no conflict).
@@ -345,6 +348,32 @@ fn block_fit_sigop_cost(tx: &Transaction, prevouts: &[TxOut]) -> Result<u64, Acc
     Ok(cost)
 }
 
+/// Fee and sigop-adjusted weight of `tx` over resolved `prevouts`; `None`
+/// if outputs exceed inputs.
+fn fee_and_adjusted_weight(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    bytes_per_sigop: u64,
+) -> Option<(u64, u64)> {
+    let inn = prevouts
+        .iter()
+        .fold(0u64, |a, o| a.saturating_add(o.value.to_sat()));
+    let out = tx
+        .output
+        .iter()
+        .fold(0u64, |a, o| a.saturating_add(o.value.to_sat()));
+    let fee = inn.checked_sub(out)?;
+    let spks: Vec<&[u8]> = prevouts
+        .iter()
+        .map(|o| o.script_pubkey.as_bytes())
+        .collect();
+    let sigops = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
+    Some((
+        fee,
+        sigops_adjusted_weight(tx.weight().to_wu(), sigops, bytes_per_sigop),
+    ))
+}
+
 fn first_missing_outpoint(
     tx: &Transaction,
     missing: &BTreeSet<Txid>,
@@ -457,6 +486,11 @@ impl ActiveMempool {
         self.graph.set_cluster_limits(count, size_kvb);
     }
 
+    /// Overlay Core `-bytespersigop` (`0` disables sigop-adjusted size).
+    pub fn set_bytes_per_sigop(&mut self, bytes_per_sigop: u64) {
+        self.graph.set_bytes_per_sigop(bytes_per_sigop);
+    }
+
     /// Overlay Core `-minrelaytxfee` (sat/kvB). `0` admits any non-negative fee.
     pub fn set_min_relay_sat_kvb(&mut self, sat_kvb: u64) {
         self.min_relay_sat_kvb = sat_kvb;
@@ -555,6 +589,9 @@ impl ActiveMempool {
         ingested
             .graph
             .set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
+        ingested
+            .graph
+            .set_bytes_per_sigop(self.graph.bytes_per_sigop());
         self.graph = ingested.graph;
         self.bodies = ingested.bodies;
         self.vin_aux = ingested.vin_aux;
@@ -848,12 +885,19 @@ impl ActiveMempool {
 
         let floor = self.mempool_min_fee_sat_kvb();
         let min_relay = min_relay.unwrap_or(floor);
-        match policy::check_libre_admission_at(tx, admit_fee, weight, min_relay) {
-            PolicyResult::Standard => {}
-            PolicyResult::NonStandard("min relay fee") if floor > self.min_relay_sat_kvb => {
-                return Err(AcceptError::Policy("mempool min fee"));
-            }
-            PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
+        // Standardness on raw weight; the fee floor on sigop-adjusted vsize.
+        if let PolicyResult::NonStandard(s) =
+            policy::check_libre_admission_at(tx, admit_fee, weight, 0)
+        {
+            return Err(AcceptError::Policy(s));
+        }
+        let adj = sigops_adjusted_weight(weight, sigop_cost, self.graph.bytes_per_sigop());
+        if !policy::meets_min_relay_fee_at(admit_fee, adj, min_relay) {
+            return Err(AcceptError::Policy(if floor > self.min_relay_sat_kvb {
+                "mempool min fee"
+            } else {
+                "min relay fee"
+            }));
         }
 
         Ok(PreparedAdmit {
@@ -933,8 +977,9 @@ impl ActiveMempool {
         tx: &Transaction,
         prep: PreparedAdmit,
     ) -> Result<AcceptResult, AcceptError> {
-        let (conflict_set, fee_sat, weight) = self.plan_after_script(tx, &prep)?;
+        let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
         let txid = prep.txid;
+        let weight = prep.weight;
 
         let mut replaced_scripthashes: Vec<[u8; 32]> = Vec::new();
         let mut replaced_txs: Vec<Transaction> = Vec::new();
@@ -994,7 +1039,7 @@ impl ActiveMempool {
         Ok(AcceptResult {
             txid,
             fee_sat,
-            weight,
+            weight: adj_weight,
             slot,
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes,
@@ -1003,6 +1048,7 @@ impl ActiveMempool {
     }
 
     /// Prepare + RBF/cluster checks with no graph or store mutation.
+    /// `weight` in the result is sigop-adjusted.
     pub fn evaluate_after_script(
         &self,
         tx: &Transaction,
@@ -1020,6 +1066,7 @@ impl ActiveMempool {
         })
     }
 
+    /// Returns (conflict set, fee, sigop-adjusted weight).
     fn plan_after_script(
         &self,
         tx: &Transaction,
@@ -1048,7 +1095,8 @@ impl ActiveMempool {
         let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins)?;
 
         let fee_sat = prep.fee_sat;
-        let weight = prep.weight;
+        let weight =
+            sigops_adjusted_weight(prep.weight, prep.sigop_cost, self.graph.bytes_per_sigop());
         let admit_fee =
             (i128::from(fee_sat).saturating_add(i128::from(prep.fee_delta))).max(0) as u64;
 
@@ -1283,42 +1331,40 @@ impl ActiveMempool {
         !ancestors.is_empty() && ancestors.len() + 1 == txs.len()
     }
 
-    /// Combined ancestor/CPFP package fee vs total weight against `sat_kvb`.
+    /// Combined ancestor/CPFP package fee vs total sigop-adjusted weight
+    /// against `sat_kvb`.
     pub fn package_meets_min_relay(
         txs: &[Transaction],
         utxos: &impl UtxoProvider,
         sat_kvb: u64,
+        bytes_per_sigop: u64,
     ) -> bool {
         if !Self::package_is_child_with_parents(txs) {
             return false;
         }
-        let mut created: BTreeMap<Txid, Vec<u64>> = BTreeMap::new();
+        let mut created: BTreeMap<Txid, &[TxOut]> = BTreeMap::new();
         let mut fee = 0u64;
         let mut weight = 0u64;
         for tx in txs {
-            let mut inn = 0u64;
+            let mut prevouts = Vec::with_capacity(tx.input.len());
             for inp in &tx.input {
                 let op = inp.previous_output;
-                let val = if let Some(outs) = created.get(&op.txid) {
-                    outs.get(op.vout as usize).copied()
+                let prev = if let Some(outs) = created.get(&op.txid) {
+                    outs.get(op.vout as usize).cloned()
                 } else {
-                    utxos.get_coin(&op).map(|c| c.txout.value.to_sat())
+                    utxos.get_coin(&op).map(|c| c.txout)
                 };
-                let Some(v) = val else {
+                let Some(prev) = prev else {
                     return false;
                 };
-                inn = inn.saturating_add(v);
+                prevouts.push(prev);
             }
-            let out: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-            if out > inn {
+            let Some((f, w)) = fee_and_adjusted_weight(tx, &prevouts, bytes_per_sigop) else {
                 return false;
-            }
-            fee = fee.saturating_add(inn - out);
-            weight = weight.saturating_add(tx.weight().to_wu());
-            created.insert(
-                tx.compute_txid(),
-                tx.output.iter().map(|o| o.value.to_sat()).collect(),
-            );
+            };
+            fee = fee.saturating_add(f);
+            weight = weight.saturating_add(w);
+            created.insert(tx.compute_txid(), &tx.output);
         }
         policy::meets_min_relay_fee_at(fee, weight, sat_kvb)
     }
@@ -1335,7 +1381,12 @@ impl ActiveMempool {
         Self::check_package_shape(txs)?;
 
         self.last_accept_stages = AcceptStageUs::default();
-        let member_min = if Self::package_meets_min_relay(txs, utxos, self.min_relay_sat_kvb) {
+        let member_min = if Self::package_meets_min_relay(
+            txs,
+            utxos,
+            self.min_relay_sat_kvb,
+            self.graph.bytes_per_sigop(),
+        ) {
             Some(0)
         } else {
             None
@@ -1588,44 +1639,39 @@ impl ActiveMempool {
         child: &Transaction,
         utxos: &impl UtxoProvider,
     ) -> bool {
+        let bps = self.graph.bytes_per_sigop();
         let pid = parent.compute_txid();
-        let mut p_in = 0u64;
-        for inp in &parent.input {
-            let Some(coin) = utxos.get_coin(&inp.previous_output) else {
-                return false;
-            };
-            p_in = p_in.saturating_add(coin.txout.value.to_sat());
-        }
-        let p_out: u64 = parent.output.iter().map(|o| o.value.to_sat()).sum();
-        if p_out > p_in {
+        let p_prev: Option<Vec<TxOut>> = parent
+            .input
+            .iter()
+            .map(|i| utxos.get_coin(&i.previous_output).map(|c| c.txout))
+            .collect();
+        let c_prev: Option<Vec<TxOut>> = child
+            .input
+            .iter()
+            .map(|i| {
+                let op = i.previous_output;
+                if op.txid == pid {
+                    parent.output.get(op.vout as usize).cloned()
+                } else {
+                    utxos.get_coin(&op).map(|c| c.txout)
+                }
+            })
+            .collect();
+        let (Some(p_prev), Some(c_prev)) = (p_prev, c_prev) else {
             return false;
-        }
-        let mut c_in = 0u64;
-        for inp in &child.input {
-            let op = inp.previous_output;
-            let val = if op.txid == pid {
-                parent
-                    .output
-                    .get(op.vout as usize)
-                    .map(|o| o.value.to_sat())
-            } else {
-                utxos.get_coin(&op).map(|c| c.txout.value.to_sat())
-            };
-            let Some(v) = val else {
-                return false;
-            };
-            c_in = c_in.saturating_add(v);
-        }
-        let c_out: u64 = child.output.iter().map(|o| o.value.to_sat()).sum();
-        if c_out > c_in {
+        };
+        let (Some((pf, pw)), Some((cf, cw))) = (
+            fee_and_adjusted_weight(parent, &p_prev, bps),
+            fee_and_adjusted_weight(child, &c_prev, bps),
+        ) else {
             return false;
-        }
-        let fee = (p_in - p_out).saturating_add(c_in - c_out);
-        let weight = parent
-            .weight()
-            .to_wu()
-            .saturating_add(child.weight().to_wu());
-        policy::meets_min_relay_fee_at(fee, weight, self.min_relay_sat_kvb)
+        };
+        policy::meets_min_relay_fee_at(
+            pf.saturating_add(cf),
+            pw.saturating_add(cw),
+            self.min_relay_sat_kvb,
+        )
     }
 
     /// Re-accept non-coinbase txs after a reorg disconnect (best-effort).
@@ -2525,6 +2571,8 @@ mod tests {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        // At 20 B/sigop, 79,600 is ~398 kvB adjusted and hits the cluster cap.
+        mp.set_bytes_per_sigop(0);
         let err = mp
             .accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK)
             .unwrap_err();
@@ -3851,7 +3899,8 @@ mod tests {
             !ActiveMempool::package_meets_min_relay(
                 &[extra.clone(), parent.clone(), child.clone()],
                 &utxos,
-                50_000
+                50_000,
+                20
             ),
             "unrelated extra is not a child-with-parents tree"
         );
@@ -4265,5 +4314,224 @@ mod tests {
         assert!(mp.graph.contains(&first.compute_txid()));
         assert!(!mp.graph.contains(&second.compute_txid()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2WSH spend whose witness script holds `n` unexecuted sigops, output an
+    /// OP_RETURN push of `pad` bytes (Core `mempool_sigoplimit.py` fixture).
+    fn witness_sigops_spend(n: usize, pad: usize) -> (MapUtxoProvider, Transaction) {
+        use bitcoin::opcodes::all::{
+            OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHNUM_1, OP_RETURN,
+        };
+        use bitcoin::opcodes::OP_FALSE;
+        let mut b = bitcoin::script::Builder::new()
+            .push_opcode(OP_FALSE)
+            .push_opcode(OP_IF);
+        for _ in 0..n / 20 {
+            b = b.push_opcode(OP_CHECKMULTISIG);
+        }
+        for _ in 0..n % 20 {
+            b = b.push_opcode(OP_CHECKSIG);
+        }
+        let ws = b
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_PUSHNUM_1)
+            .into_script();
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xa3; 32]),
+            vout: 0,
+        };
+        let spk = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+        let map = HashMap::from([(
+            op,
+            coin(TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: spk,
+            }),
+        )]);
+        let mut tx = spend_tx(op, 0);
+        tx.input[0].witness = Witness::from_slice(&[ws.as_bytes()]);
+        let data = bitcoin::script::PushBytesBuf::try_from(vec![b'X'; pad]).unwrap();
+        tx.output[0].script_pubkey = bitcoin::script::Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(data)
+            .into_script();
+        (MapUtxoProvider { map }, tx)
+    }
+
+    fn vsize_of(tx: &Transaction) -> u64 {
+        policy::get_virtual_size(tx.weight().to_wu())
+    }
+
+    /// Core `test_sigops_limit`: admitted vsize is `max(ceil(sigops × bps / 4),
+    /// serialized vsize)`, exact at the sigop-equivalent size and at ±1 byte.
+    #[test]
+    fn sigop_adjusted_vsize_at_boundary() {
+        for (bps, n) in [(20u64, 69usize), (20, 222), (43, 101), (81, 142)] {
+            let target = (n as u64 * bps).div_ceil(4);
+            let base = vsize_of(&witness_sigops_spend(n, 256).1);
+            let pad = 256 + usize::try_from(target - base).unwrap();
+            for (bytes, want) in [(pad, target), (pad + 1, target + 1), (pad - 1, target)] {
+                let (utxos, tx) = witness_sigops_spend(n, bytes);
+                if bytes == pad {
+                    assert_eq!(vsize_of(&tx), target, "padding lands on the boundary");
+                }
+                let dir = tmp_dir();
+                let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+                mp.set_bytes_per_sigop(bps);
+                let r = mp.accept_tx(&tx, &utxos, TIP_OK).expect("admits");
+                assert_eq!(
+                    policy::get_virtual_size(r.weight),
+                    want,
+                    "bps={bps} n={n} pad={bytes}"
+                );
+            }
+        }
+    }
+
+    /// Min relay prices the sigop-adjusted vsize (Core ATMP `m_vsize`).
+    #[test]
+    fn min_relay_uses_sigop_adjusted_vsize() {
+        let (utxos, mut tx) = witness_sigops_spend(222, 1);
+        // 100 sat pays ~10 sat raw at 0.1 sat/vB, not 111 sat for 1_110 adjusted vB.
+        tx.output[0].value = Amount::from_sat(1_000_000 - 100);
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert!(matches!(
+            mp.accept_tx(&tx, &utxos, TIP_OK),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        mp.set_bytes_per_sigop(0);
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
+    }
+
+    /// RBF prices the replacement at its sigop-adjusted vsize.
+    #[test]
+    fn rbf_uses_sigop_adjusted_vsize() {
+        let (op, _, utxos) = chain_utxo(100_000);
+        let old = spend_tx(op, 99_000); // fee 1_000
+        let mut heavy = multisig_outputs_tx(op, 10); // cost 800 → 4_000 adjusted vB
+        heavy.output[0].value = Amount::from_sat(100_000 - 3_000 - 9); // fee 3_000
+        for (bps, replaces) in [(20, false), (0, true)] {
+            let dir = tmp_dir();
+            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+            mp.set_bytes_per_sigop(bps);
+            mp.accept_tx(&old, &utxos, TIP_OK).unwrap();
+            let r = mp.accept_tx(&heavy, &utxos, TIP_OK);
+            if replaces {
+                assert_eq!(r.unwrap().replaced, vec![old.compute_txid()]);
+            } else {
+                assert!(matches!(r, Err(AcceptError::RbfInsufficient)));
+            }
+        }
+    }
+
+    /// Core `test_sigops_package`: at 5000 B/sigop a bare 1-of-1 multisig
+    /// output (legacy cost 80) is 100_000 vB, so parent + child exceed the
+    /// 101 kvB cluster limit though both are tiny.
+    #[test]
+    fn cluster_limit_uses_sigop_adjusted_size() {
+        use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1};
+        let bare = bitcoin::script::Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice([0x02u8; 33])
+            .push_opcode(OP_PUSHNUM_1)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        let with_bare = |mut tx: Transaction| {
+            tx.output.push(TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: bare.clone(),
+            });
+            tx
+        };
+        let (op, _, utxos) = chain_utxo(1_000_000);
+        let parent = with_bare(spend_tx(op, 900_000));
+        let pid = parent.compute_txid();
+        let child = with_bare(spend_tx(OutPoint { txid: pid, vout: 0 }, 800_000));
+        assert!(parent.weight().to_wu() + child.weight().to_wu() < 2_000);
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_bytes_per_sigop(5_000);
+        let r = mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+        assert_eq!(policy::get_virtual_size(r.weight), 100_000);
+        assert!(matches!(
+            mp.accept_tx(&child, &utxos, TIP_OK),
+            Err(AcceptError::ClusterTooLarge { count: 2, .. })
+        ));
+        assert!(mp.graph.contains(&pid));
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+        mp.accept_tx(&child, &utxos, TIP_OK)
+            .expect("default 20 B/sigop fits");
+    }
+
+    /// Zero-fee parent + heavy-sigop child: 200 sat pays the raw package
+    /// vsize, not the sigop-adjusted one.
+    fn cpfp_heavy_child(op: OutPoint) -> (Transaction, Transaction) {
+        let parent = spend_tx(op, 100_000);
+        let mut child = multisig_outputs_tx(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            10,
+        );
+        child.output[0].value = Amount::from_sat(100_000 - 200 - 9);
+        (parent, child)
+    }
+
+    #[test]
+    fn package_min_relay_uses_sigop_adjusted_vsize() {
+        let (op, _, utxos) = chain_utxo(100_000);
+        let (parent, child) = cpfp_heavy_child(op);
+        let pkg = [parent, child];
+        let min = policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+        assert!(!ActiveMempool::package_meets_min_relay(
+            &pkg, &utxos, min, 20
+        ));
+        assert!(ActiveMempool::package_meets_min_relay(&pkg, &utxos, min, 0));
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert!(matches!(
+            mp.accept_package(&pkg, &utxos, TIP_OK),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        mp.set_bytes_per_sigop(0);
+        assert_eq!(mp.accept_package(&pkg, &utxos, TIP_OK).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn one_parent_one_child_min_relay_uses_sigop_adjusted_vsize() {
+        let (op, _, utxos) = chain_utxo(100_000);
+        let (parent, child) = cpfp_heavy_child(op);
+        let pid = parent.compute_txid();
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert!(matches!(
+            mp.accept_tx(&parent, &utxos, TIP_OK),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        let missing = BTreeSet::from([pid]);
+        assert_eq!(mp.try_one_parent_package(&child, &missing, &utxos), None);
+        mp.set_bytes_per_sigop(0);
+        assert_eq!(
+            mp.try_one_parent_package(&child, &missing, &utxos),
+            Some(parent)
+        );
+    }
+
+    /// `-bytespersigop` survives compact (graph rebuild).
+    #[test]
+    fn compact_preserves_bytes_per_sigop_overlay() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.set_bytes_per_sigop(7);
+        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
+        mp.remove_for_block(&[tx.compute_txid()]).unwrap();
+        let _ = mp.maybe_compact().unwrap();
+        assert_eq!(mp.graph.bytes_per_sigop(), 7);
     }
 }

@@ -2185,7 +2185,8 @@ impl MempoolHub {
         let t0 = Instant::now();
         let utxo = self.utxo_provider();
         let sat_kvb = self.min_relay_sat_kvb();
-        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb) {
+        let bps = self.lock_read().graph.bytes_per_sigop();
+        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb, bps) {
             Some(0)
         } else {
             None
@@ -3011,6 +3012,11 @@ impl MempoolHub {
     /// Cluster count/size overlay (`None` = keep default).
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
         self.lock_write().set_cluster_limits(count, size_kvb);
+    }
+
+    /// Core `-bytespersigop` overlay: `0` disables sigop-adjusted sizing.
+    pub fn set_bytes_per_sigop(&self, bytes_per_sigop: u64) {
+        self.lock_write().set_bytes_per_sigop(bytes_per_sigop);
     }
 
     /// Min-relay overlay (sat/kvB). `0` admits any non-negative fee.

@@ -3063,6 +3063,9 @@ fn getblocktemplate_big_sigops_cluster_fits_block() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{CompactTarget, OutPoint, Sequence, TxIn, TxMerkleNode, TxOut, Witness};
     let (ctx, dir, _hub) = ctx_regtest_hub();
+    // This exercises the block sigop budget; at 20 B/sigop the 80k-cost
+    // cluster would exceed the 101 kvB cluster limit before reaching it.
+    ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(0);
     let cb_val = {
         dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
         generated_coinbase_value(&ctx, 1)

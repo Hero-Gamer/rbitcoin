@@ -24,6 +24,16 @@ pub const MAX_CLUSTER_WEIGHT: u64 = MAX_CLUSTER_VSIZE * 4;
 pub(crate) const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 /// Sigop cost reserved for the coinbase (Core `node/miner.cpp` `nBlockSigOpsCost = 400`).
 pub(crate) const COINBASE_SIGOPS_RESERVE: u64 = 400;
+/// Core `DEFAULT_BYTES_PER_SIGOP` (`-bytespersigop`).
+pub(crate) const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
+
+/// Core `GetSigOpsAdjustedWeight`: `max(weight, sigop_cost × bytes_per_sigop)`.
+///
+/// Feerate and cluster-size policy use this; the block weight budget does not.
+/// `bytes_per_sigop = 0` disables the adjustment.
+pub(crate) fn sigops_adjusted_weight(weight: u64, sigop_cost: u64, bytes_per_sigop: u64) -> u64 {
+    weight.max(sigop_cost.saturating_mul(bytes_per_sigop))
+}
 
 /// One live mempool entry (RAM index; body lives on disk).
 #[derive(Debug, Clone)]
@@ -43,6 +53,11 @@ pub struct TxEntry {
 }
 
 impl TxEntry {
+    /// Sigop-adjusted weight (Core `CTxMemPoolEntry::GetAdjustedWeight`).
+    pub fn adjusted_weight(&self, bytes_per_sigop: u64) -> u64 {
+        sigops_adjusted_weight(self.weight, self.sigop_cost, bytes_per_sigop)
+    }
+
     pub fn fee_rate_sat_per_kvb(&self) -> u64 {
         rbitcoin_consensus::policy::fee_rate_sat_per_kvb(self.fee_sat, self.weight)
     }
@@ -54,6 +69,7 @@ pub struct Chunk {
     /// Txids in mining order within this chunk.
     pub txids: Vec<Txid>,
     pub fee_sat: u64,
+    /// Sum of members' sigop-adjusted weight (Core txgraph chunk size).
     pub weight: u64,
 }
 
@@ -93,6 +109,7 @@ pub fn weight_above_from_chunks(chunks: &[Chunk], rate_sat_per_kvb: u64) -> u64 
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub members: BTreeSet<Txid>,
+    /// Sum of members' sigop-adjusted weight (cluster size limit basis).
     pub total_weight: u64,
     /// Mining linearization (topo, high fee-rate first among ready).
     pub linearization: Vec<Txid>,
@@ -139,6 +156,8 @@ pub struct TxGraph {
     cluster_vsize_limit: u64,
     /// Same cap in WU (vsize × 4). Kept for call sites that sum weight.
     cluster_weight_limit: u64,
+    /// Core `-bytespersigop` (default [`DEFAULT_BYTES_PER_SIGOP`]).
+    bytes_per_sigop: u64,
 }
 
 impl Default for TxGraph {
@@ -157,6 +176,7 @@ impl Default for TxGraph {
             cluster_count_limit: MAX_CLUSTER_COUNT,
             cluster_vsize_limit: MAX_CLUSTER_VSIZE,
             cluster_weight_limit: MAX_CLUSTER_WEIGHT,
+            bytes_per_sigop: DEFAULT_BYTES_PER_SIGOP,
         }
     }
 }
@@ -175,6 +195,30 @@ impl TxGraph {
             self.cluster_vsize_limit = (kvb as u64).saturating_mul(1000).max(1);
             self.cluster_weight_limit = self.cluster_vsize_limit.saturating_mul(4);
         }
+    }
+
+    /// Overlay Core `-bytespersigop` and re-rank every live chunk on it.
+    pub fn set_bytes_per_sigop(&mut self, bytes_per_sigop: u64) {
+        self.bytes_per_sigop = bytes_per_sigop;
+        self.invalidate_chunk_cache();
+        self.worst_chunks.clear();
+        self.worst_rep_rate.clear();
+        // ponytail: one cluster walk per live tx, startup-only config.
+        let ids: Vec<Txid> = self.entries.keys().copied().collect();
+        for t in ids {
+            self.index_cluster_of(&t);
+        }
+    }
+
+    pub fn bytes_per_sigop(&self) -> u64 {
+        self.bytes_per_sigop
+    }
+
+    fn adjusted_weight_of(&self, txid: &Txid) -> u64 {
+        self.entries
+            .get(txid)
+            .map(|e| e.adjusted_weight(self.bytes_per_sigop))
+            .unwrap_or(0)
     }
 
     pub fn cluster_count_limit(&self) -> usize {
@@ -426,24 +470,27 @@ impl TxGraph {
         None
     }
 
-    /// Aggregate fee/weight of a set of live txs.
+    /// Aggregate fee / sigop-adjusted weight of a set of live txs.
     pub fn set_fee_weight(&self, set: &BTreeSet<Txid>) -> (u64, u64) {
         let mut fee = 0u64;
         let mut w = 0u64;
         for t in set {
             if let Some(e) = self.entries.get(t) {
                 fee = fee.saturating_add(e.fee_sat);
-                w = w.saturating_add(e.weight);
+                w = w.saturating_add(e.adjusted_weight(self.bytes_per_sigop));
             }
         }
         (fee, w)
     }
 
+    /// Σ per-tx sigop-adjusted vsize (Core `GetTxSize`).
     fn set_vsize(&self, set: &BTreeSet<Txid>) -> u64 {
         let mut n = 0u64;
         for t in set {
-            if let Some(e) = self.entries.get(t) {
-                n = n.saturating_add(rbitcoin_consensus::policy::get_virtual_size(e.weight));
+            if self.entries.contains_key(t) {
+                n = n.saturating_add(rbitcoin_consensus::policy::get_virtual_size(
+                    self.adjusted_weight_of(t),
+                ));
             }
         }
         n
@@ -679,8 +726,7 @@ impl TxGraph {
         }
         let total_weight = members
             .iter()
-            .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-            .sum();
+            .fold(0u64, |w, t| w.saturating_add(self.adjusted_weight_of(t)));
         self.cluster_from_members(members, total_weight, |_| 0)
     }
 
@@ -710,6 +756,7 @@ impl TxGraph {
     /// Whether adding `extra_weight` and `extra_count` txs that connect to
     /// `seed` members would exceed cluster limits. `seed` = parent txids already
     /// in mempool that the new tx spends (+ the new tx itself counts as 1).
+    /// Live members count at sigop-adjusted weight.
     pub fn cluster_would_exceed(
         &self,
         parent_txids: &BTreeSet<Txid>,
@@ -724,8 +771,7 @@ impl TxGraph {
         }
         let base_weight: u64 = members
             .iter()
-            .map(|t| self.entries.get(t).map(|e| e.weight).unwrap_or(0))
-            .sum();
+            .fold(0u64, |w, t| w.saturating_add(self.adjusted_weight_of(t)));
         let count = members.len() + extra_count;
         let vsize = base_weight.saturating_add(extra_weight).saturating_add(3) / 4;
         count > self.cluster_count_limit || vsize > self.cluster_vsize_limit
@@ -763,7 +809,10 @@ impl TxGraph {
                 let rate = if mf <= 0 {
                     0
                 } else {
-                    rbitcoin_consensus::policy::fee_rate_sat_per_kvb(mf as u64, e.weight)
+                    rbitcoin_consensus::policy::fee_rate_sat_per_kvb(
+                        mf as u64,
+                        e.adjusted_weight(self.bytes_per_sigop),
+                    )
                 };
                 let key = (rate, mf, *t);
                 // Maximize rate, then fee; for equal, smaller txid for stability.
@@ -811,7 +860,7 @@ impl TxGraph {
                     continue;
                 };
                 acc_fee = acc_fee.saturating_add(i128::from(self.modified_fee(t, delta)));
-                acc_w = acc_w.saturating_add(e.weight);
+                acc_w = acc_w.saturating_add(e.adjusted_weight(self.bytes_per_sigop));
                 // acc/acc_w >= best/best_w  (longest prefix on a tie).
                 let better = best_w == 0
                     || acc_fee.saturating_mul(i128::from(best_w))
@@ -932,6 +981,7 @@ impl TxGraph {
             }
             // `add` holds only unselected txs, so these sums are the exact
             // growth. Saturating: an unknown cost is `u64::MAX` and never fits.
+            // Block budget is raw weight; only ranking uses adjusted weight.
             let (extra_w, extra_sigops) = add
                 .iter()
                 .filter_map(|t| self.entries.get(t))
@@ -1372,6 +1422,8 @@ mod tests {
         let (hid, lid) = (heavy.compute_txid(), light.compute_txid());
         let pool = |heavy_cost: u64| {
             let mut g = TxGraph::new();
+            // Budget only: keep heavy ranked first by raw feerate.
+            g.set_bytes_per_sigop(0);
             let mut e = entry_for(&heavy, 10_000, 0);
             e.sigop_cost = heavy_cost;
             g.insert(e, &heavy);
@@ -1662,5 +1714,88 @@ mod tests {
         assert!(g.contains(&child.compute_txid()));
         let c = g.cluster_of(&parent.compute_txid()).unwrap();
         assert_eq!(c.members.len(), 2);
+    }
+
+    /// Core `GetSigOpsAdjustedWeight`: `max(weight, sigop_cost × bytes_per_sigop)`.
+    #[test]
+    fn adjusted_weight_is_max_of_weight_and_sigop_bytes() {
+        let tx = make_tx(None, 1, 1);
+        let mut e = entry_for(&tx, 0, 0);
+        e.weight = 400;
+        e.sigop_cost = 21;
+        assert_eq!(e.adjusted_weight(20), 420);
+        e.sigop_cost = 19;
+        assert_eq!(e.adjusted_weight(20), 400);
+        e.sigop_cost = 21;
+        assert_eq!(e.adjusted_weight(0), 400, "0 B/sigop disables");
+        e.sigop_cost = u64::MAX;
+        assert_eq!(e.adjusted_weight(2), u64::MAX);
+    }
+
+    /// Chunk feerate, template order and eviction rank on sigop-adjusted size;
+    /// re-configuring bytes-per-sigop re-ranks the live set.
+    #[test]
+    fn chunk_rank_uses_sigop_adjusted_weight() {
+        let mut g = TxGraph::new();
+        let heavy = spend_op([1u8; 32], 0, 1);
+        let light = spend_op([2u8; 32], 0, 2);
+        let (hid, lid) = (heavy.compute_txid(), light.compute_txid());
+        let mut he = entry_for(&heavy, 2_000, 0);
+        he.sigop_cost = 1_000; // 20_000 WU at 20 B/sigop
+        g.insert(he, &heavy);
+        g.insert(entry_for(&light, 1_000, 1), &light);
+        let order = |g: &TxGraph| g.select_block_txids(TxGraph::template_tx_weight());
+        assert_eq!(order(&g), vec![lid, hid]);
+        assert_eq!(g.worst_chunk().unwrap().1.txids, vec![hid]);
+        assert_eq!(g.mining_chunks_best_first()[1].weight, 20_000);
+        g.set_bytes_per_sigop(0);
+        assert_eq!(order(&g), vec![hid, lid]);
+        assert_eq!(g.worst_chunk().unwrap().1.txids, vec![lid]);
+        assert_eq!(
+            g.mining_chunks_best_first()[0].weight,
+            heavy.weight().to_wu()
+        );
+    }
+
+    /// Core `mempool_sigoplimit.py`: ancestor/descendant sizes sum the
+    /// sigop-adjusted vsize.
+    #[test]
+    fn graph_stats_sizes_use_sigop_adjusted_vsize() {
+        use rbitcoin_consensus::policy::get_virtual_size;
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let pid = parent.compute_txid();
+        let child = make_tx(Some((pid, 0)), 1, 3);
+        let cid = child.compute_txid();
+        let pv = get_virtual_size(parent.weight().to_wu());
+        g.insert(entry_for(&parent, 500, 0), &parent);
+        let mut ce = entry_for(&child, 500, 1);
+        ce.sigop_cost = 69; // 1_380 WU → 345 vB
+        g.insert(ce, &child);
+        let cs = g.graph_stats(&cid).unwrap();
+        assert_eq!((cs.ancestorsize, cs.descendantsize), (pv + 345, 345));
+        let ps = g.graph_stats(&pid).unwrap();
+        assert_eq!((ps.ancestorsize, ps.descendantsize), (pv, pv + 345));
+    }
+
+    /// Core `test_sigops_package`: a tiny tx whose sigops fill the cluster
+    /// vsize limit blocks any child.
+    #[test]
+    fn cluster_limits_use_sigop_adjusted_size() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let pid = parent.compute_txid();
+        let mut pe = entry_for(&parent, 500, 0);
+        pe.sigop_cost = 20_200; // 404_000 WU = 101_000 vB, the default limit
+        g.insert(pe, &parent);
+        assert_eq!(g.cluster_of(&pid).unwrap().total_weight, 404_000);
+        let parents = BTreeSet::from([pid]);
+        assert!(g.cluster_would_exceed(&parents, 1, 1));
+        g.set_bytes_per_sigop(0);
+        assert!(!g.cluster_would_exceed(&parents, 1, 1));
+        assert_eq!(
+            g.cluster_of(&pid).unwrap().total_weight,
+            parent.weight().to_wu()
+        );
     }
 }
