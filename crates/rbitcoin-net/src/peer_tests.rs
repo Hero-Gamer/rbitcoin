@@ -10544,14 +10544,6 @@ fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
         Some(&peer),
     )
     .unwrap();
-    handle_peer_inventory_msg(
-        &NetworkMessage::GetAddr,
-        &hub,
-        &out_tx,
-        &mut follow,
-        Some(&peer),
-    )
-    .unwrap();
     let mut addrs = 0usize;
     while let Ok(msg) = out_rx.try_recv() {
         if matches!(
@@ -10561,6 +10553,177 @@ fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
             addrs += 1;
         }
     }
-    assert_eq!(addrs, 1, "getaddr is answered once per connection");
+    assert_eq!(addrs, 1, "the first getaddr is answered");
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetAddr,
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+    )
+    .unwrap();
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a second getaddr is not answered"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+
+    assert_eq!(crate::peers::PEER_SEND_BUDGET, 4 * 1024 * 1024);
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let block_n = block.total_size();
+    assert!(block_n > 64, "a block is not the fallback size");
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::Block(block.clone())),
+        block_n
+    );
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let v2 = NetworkMessage::AddrV2(vec![bitcoin::p2p::address::AddrV2Message {
+        time: 1,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        addr: bitcoin::p2p::address::AddrV2::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+        port: 1,
+    }]);
+    assert_eq!(crate::peers::outbound_msg_bytes(&v2), 61);
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).unwrap();
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: hsi
+        })),
+        1024
+    );
+
+    let peers = crate::peers::PeerHub::new();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    peer.note_send_queued(crate::peers::PEER_SEND_BUDGET);
+    assert!(
+        !peer.send_over_budget(),
+        "the cap itself is still inside the budget"
+    );
+    peer.note_send_queued(1);
+    assert!(peer.send_over_budget());
+}
+
+#[tokio::test]
+async fn over_budget_reader_waits_until_one_byte_is_written() {
+    let peers = crate::peers::PeerHub::new();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    peer.note_send_queued(crate::peers::PEER_SEND_BUDGET + 1);
+    let waiting = std::sync::Arc::clone(&peer);
+    let wait = tokio::spawn(async move { waiting.wait_send_budget().await });
+    for _ in 0..50 {
+        if !wait.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!wait.is_finished(), "an over-budget reader must wait");
+    peer.note_send_written(1);
+    tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+        .await
+        .expect("writing back to the cap wakes the reader")
+        .unwrap();
+}
+
+#[test]
+fn getblocks_omits_an_empty_inv() {
+    use bitcoin::p2p::message_blockdata::GetBlocksMessage;
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("getblocks-empty");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    handle_peer_inventory_msg(
+        &NetworkMessage::GetBlocks(GetBlocksMessage::new(vec![tip], tip)),
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+    )
+    .unwrap();
+    assert!(out_rx.try_recv().is_err(), "no headers means no inv");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn compact_getdata_at_depth_five_is_compact_and_deeper_is_a_full_block() {
+    use bitcoin::ScriptBuf;
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-depth");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(6, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let hash_at = |h: u32| {
+        hub.query
+            .header_at_height(rbitcoin_primitives::Height(h))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash
+    };
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let near = bitcoin::BlockHash::from_byte_array(hash_at(1));
+    serve_getdata(
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+        &[Inventory::CompactBlock(near)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            out_rx.try_recv().unwrap().expect_msg(),
+            NetworkMessage::CmpctBlock(_)
+        ),
+        "depth 5 is still a compact block"
+    );
+    let deep = bitcoin::BlockHash::from_byte_array(hash_at(0));
+    serve_getdata(
+        &hub,
+        &out_tx,
+        &mut follow,
+        None,
+        &[Inventory::CompactBlock(deep)],
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            out_rx.try_recv().unwrap().expect_msg(),
+            NetworkMessage::Block(_)
+        ),
+        "depth 6 is a full block"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
