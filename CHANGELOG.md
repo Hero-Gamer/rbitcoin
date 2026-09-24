@@ -11,6 +11,14 @@ before 1.0).
 
 ### Fixed
 
+- **Spend annotations survive a crash after the tip seal.** A missing
+  spent slot is unspent, so open replays annotations above the
+  `spend_durable` marker (a missing file replays from genesis) and only
+  then advances the marker. The write thread `sync_data`s those stems
+  every 8 batches or 30 seconds, not on every Class C barrier. The tip
+  window stays at least 6 blocks and reaches back to the durable-through
+  height. `tip_seal`, `tx.head` meta, and the marker `fsync` their parent
+  directory after rename.
 - **Addr relay no longer goes to every peer.** Each address is sent to
   one or two neighbors. A peer can relay 1000 addresses, then the bucket
   refills at a tenth of an address per second.

@@ -78,6 +78,13 @@ pub struct Input {
 }
 
 impl Input {
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.loc.flush()?;
+        self.off.flush()?;
+        self.body.flush()?;
+        Ok(())
+    }
+
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             loc: TableFile::create(dir.join("input.loc"), TableKind::InputLoc)?,

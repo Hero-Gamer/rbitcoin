@@ -161,9 +161,10 @@ pub use confirm_run::{
     confirm_bq_resolve_wave_capped, confirm_scripts_phase, confirm_wire_load_from_plan,
     confirm_wire_load_phase, confirm_wire_load_phase_pipelined, confirm_wire_lookup_stamp,
     confirm_wire_run, confirm_wire_run_preverified, confirm_write_phase, drive_script_waves_with,
-    finish_post_commit_hashes, take_wave_items_for_load, ConfirmLoadOutcome, ConfirmScriptOutcome,
-    LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireBlockIn, WireLoadPipeline,
-    BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
+    finish_post_commit_hashes, replay_spend_annotations, take_wave_items_for_load,
+    ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch, PlanStampOutcome, ScriptOkBatch,
+    ScriptPreverified, WireBlockIn, WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS,
+    BQ_RESOLVE_WAVE_MAX_INPUTS,
 };
 
 /// Wake the IBD scripts publisher (`ibd-confirm`) after `scriptq` send or close.

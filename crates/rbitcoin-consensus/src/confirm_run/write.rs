@@ -222,6 +222,15 @@ pub fn confirm_write_phase(
         }
 
         let spend_ann_ns = post_commit(query, &slots)?;
+        if let Some(tip) = query.tip_height() {
+            let sync_ns = query
+                .store()
+                .note_spend_durable_batch(tip.0)
+                .map_err(ConsensusError::from)?;
+            if sync_ns > 0 {
+                rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
+            }
+        }
         Ok((
             out,
             n_blocks,
@@ -340,6 +349,56 @@ pub fn finish_post_commit_hashes(
         }
     } else {
         annotate_res?;
+    }
+    Ok(())
+}
+
+const REPLAY_BATCH: usize = 8;
+
+/// Rewrite spend annotations above the durable marker, then `sync_data` and advance it.
+///
+/// Idempotent. A missing marker replays every height above genesis. Call this
+/// on process open after tip-window revalidation.
+pub fn replay_spend_annotations(query: &Query) -> Result<(), ConsensusError> {
+    let Some(tip) = query.tip_height().map(|h| h.0) else {
+        return Ok(());
+    };
+    let annotated = query
+        .store()
+        .spend_annotated_through()
+        .map_err(ConsensusError::from)?;
+    let a = annotated.unwrap_or(0).min(tip);
+    if a == tip {
+        return Ok(());
+    }
+    rbitcoin_log::info!("store: replay spend annotations ({a}, {tip}]");
+    let mut heights = Vec::new();
+    for h in 0..=tip {
+        if h > a {
+            heights.push(h);
+        }
+    }
+    for chunk in heights.chunks(REPLAY_BATCH) {
+        let mut items = Vec::with_capacity(chunk.len());
+        for &h in chunk {
+            let Some((_, rec)) = query
+                .header_at_height(rbitcoin_primitives::Height(h))
+                .map_err(ConsensusError::from)?
+            else {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: spend replay missing header",
+                )));
+            };
+            items.push((h, rec.hash));
+        }
+        finish_post_commit_hashes(query, &items)?;
+    }
+    let sync_ns = query
+        .store()
+        .sync_spend_durable(tip)
+        .map_err(ConsensusError::from)?;
+    if sync_ns > 0 {
+        rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
     }
     Ok(())
 }

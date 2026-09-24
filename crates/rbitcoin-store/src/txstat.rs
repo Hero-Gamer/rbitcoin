@@ -198,6 +198,13 @@ pub struct TxStat {
 }
 
 impl TxStat {
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.body.flush()?;
+        self.ovf.flush()?;
+        self.blk.flush()?;
+        Ok(())
+    }
+
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         let body = TableFile::create(Self::body_path(dir), TableKind::TxStat)?;
         let pad = vec![0u8; (TXSTAT_BODY_HEADER as usize).saturating_sub(FILE_HEADER_LEN)];

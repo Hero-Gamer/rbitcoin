@@ -18,15 +18,16 @@ Best-chain views ignore uncommitted Class C state:
 | 3. `confirmed[]` tip advance (L2 RAM) + height-fence extend | In-process commit |
 | 3b. **`flush_class_c_tip`** (complete-or-fail L2 images) | **Durability barrier** |
 | 4. Body-queue dequeue for those heights | Only after confirm-write returns Ok |
-| 5. Spend annotations (Direct) | After tip; spentness filters use strong+fence |
+| 5. Spend annotations (Direct) | After tip. A missing slot is unspent until open replays from the marker |
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ height fence contains the fk. Queries that mean “on best chain” use this (or equivalent). Confirmed-tx **API** readers pin that tip (`Query::pin_chain_view` / `still_live`) and retry on disconnect rather than pausing the writer — [`concurrency.md`](./concurrency.md#confirmed-tx-readers-pin--retry-not-a-lock).
 
 On open (in order):
 
 1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
-2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, and those N runs all-strong. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed.
+2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, and those N runs all-strong. N stays at least 6 unless the caller asked for the whole chain, and a `spend_durable` durable-through height widens N to include `(D, tip]`. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed.
 3. One `repair_class_c_above_tip`: unstrong bits **not on the fence** via complement ranges (holes + suffix until a zero page). Does **not** walk every set bit. Logs `class_c repair cleared= ranges= ms=` even when zero.
+4. Replay spend annotations for every height in `(A, tip]` (`spend_durable` annotated-through; missing file means `A = 0`). `finish_post_commit_hashes` is idempotent. Then `sync_data` the replay inputs and publish `A` and durable-through `D` at the tip.
 
 In-process completion-session recover (IBD write/lookup/load/scripts and tip connect) consumes a 1000-height credit and requeues; it does **not** run `repair_class_c_above_tip` (lookup would race the write thread's strong-before-fence window). Abandoned leftover strong is the same as kill-9 and is repaired on the next open. Does **not** truncate Class A. Tip stays the commit point.
 
@@ -59,7 +60,8 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
 - Class A may write same-batch sole `spend_fk` into the spent stem (creates in that append wave). Historical parents stay zero until annotate **after tip**.
 - Annotations may remain after disconnect / for non-strong spenders.
 - Best-chain spentness: annotation + `is_confirmed_strong(spender)`. Same-batch pre-fill is not strong until this batch's Class C.
-- Kill-safe: stale/non-strong fields do not false-positive if filter is applied.
+- Kill-safe for a stale annotation: non-strong fields do not false-positive if the filter is applied.
+- A missing annotation is not kill-safe. Open replays `(A, tip]` from the block bodies, then advances `A` only after `sync_data`. `A` never exceeds tip. Disconnect below `A` lowers `A`.
 - No `point.head` (v4 open-hash multimap removed).
 - Class A is **three stems** (`txout` / `seqsigwit` / `spent`); bare-meta puts are rejected. Packed `tx.body` with creates is refused on open.
 
@@ -84,8 +86,20 @@ Clean shutdown: `flush_for_shutdown` fsyncs tip/Class C (incl. L2 dirty images) 
 Steady path: payload pwrite + HWM publish; `sync_data` on flush barriers.
 Kill mid-payload before HWM publish: readers never see past previous published length.
 
-Connect barrier (`flush_class_c_tip`): headers (if dirty) → strong → height → header_txs → **confirmed last** → soft `tip_seal`.
-Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_seal`) before unstrong/height clear.
+Connect barrier (`flush_class_c_tip`): headers (if dirty) → strong → height → header_txs → **confirmed last** → soft `tip_seal` (tmp + `sync_all` + rename + parent-directory `fsync`). The barrier does not `sync_data` Class A.
+Disconnect: confirmed truncate + `flush_confirmed_only` (also refreshes `tip_seal`) before unstrong/height clear. If the new tip is below `spend_durable`, that marker is lowered to the tip.
+
+The write thread `sync_data`s spend annotations and the Class A bodies replay needs (`spent.body`, `spenders`, `txid.body`, `txout`, `seqsigwit`, `input`, `txstat`) every 8 confirm batches or 30 seconds, then advances `spend_durable`. That sync is `ann_sync` on `ibd: perf`. It is not inside `flush_class_c_tip`.
+
+| Write | Rebuild from durable tip + bodies? | Fsync |
+|-------|--------------------------------------|-------|
+| Class C barrier (`strong`, `header_txs`, `confirmed`, `tip_seal`) | No. This is the commit point. | Every barrier |
+| Spend annotations (`spent.body`, `spenders`) | Yes, from the block body and parent outputs, when those bytes are durable | Periodic, then advance `A` |
+| Class A bodies replay and the tip window read (`txid.body`, `txout`, `seqsigwit`, `input`, `txstat`) | No. A torn page cannot be rebuilt | Same periodic `sync_data`, which advances durable-through `D`. Open revalidates `(D, tip]` and at least the last 6 |
+| Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync` |
+| Mempool sidecar | No. RAM is source of truth | Leave the 5 s path |
+
+`tx.head` meta and the spend marker use the same parent-directory `fsync` as `tip_seal` after tmp+rename. A missing `spend_durable` keeps the checkblocks window (default 6). `checkblocks=0` still walks from genesis.
 
 ## Mempool sidecar (`{datadir}/mempool/`)
 

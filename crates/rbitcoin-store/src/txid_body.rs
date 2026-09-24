@@ -67,6 +67,10 @@ impl TxidBody {
         dir.join("txid.body")
     }
 
+    pub(crate) fn flush(&self) -> Result<(), StoreError> {
+        self.file.flush()
+    }
+
     pub fn count(&self) -> u64 {
         self.count.load(std::sync::atomic::Ordering::Acquire)
     }

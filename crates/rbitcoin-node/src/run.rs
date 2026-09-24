@@ -166,6 +166,8 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         config.store_layout(),
         config.check_blocks_window(),
     )?;
+    rbitcoin_consensus::replay_spend_annotations(&query)
+        .map_err(|e| NodeError::Init(format!("spend annotation replay: {e}")))?;
     Ok(NodeHandle {
         config,
         query,

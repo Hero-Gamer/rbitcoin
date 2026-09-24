@@ -96,7 +96,19 @@ where
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
+    if sync {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// `fsync` the directory so a renamed dirent survives a crash.
+pub(crate) fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Trailing-header tables (`tx.head`): 16-byte store identity + 16-byte layout
