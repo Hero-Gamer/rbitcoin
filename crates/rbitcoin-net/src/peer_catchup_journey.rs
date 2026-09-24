@@ -1,15 +1,64 @@
+use bitcoin::consensus::encode::serialize;
+use bitcoin::p2p::message::RawNetworkMessage;
+use bitcoin::Network;
+use rbitcoin_primitives::Height;
+
+fn frame_for(msg: NetworkMessage) -> FramedMessage {
+    let magic = Magic::from(Network::Regtest);
+    let raw = RawNetworkMessage::new(magic, msg);
+    let full = serialize(&raw);
+    let command: [u8; 12] = full[4..16].try_into().unwrap();
+    FramedMessage {
+        magic,
+        command,
+        payload: full[24..].to_vec(),
+    }
+}
+
+fn take_msgs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
+    let mut out = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        out.push(item.expect_msg());
+    }
+    out
+}
+
+fn getdata_of(msgs: &[NetworkMessage]) -> Vec<(BlockHash, bool)> {
+    let mut out = Vec::new();
+    for msg in msgs {
+        if let NetworkMessage::GetData(inv) = msg {
+            for i in inv {
+                match i {
+                    Inventory::CompactBlock(h) => out.push((*h, true)),
+                    Inventory::Block(h) | Inventory::WitnessBlock(h) => out.push((*h, false)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+fn block_at(src: &crate::chain::ChainHub, height: u32) -> bitcoin::Block {
+    src.query
+        .reconstruct_block_at_height(Height(height))
+        .unwrap()
+}
+
+fn header_at(src: &crate::chain::ChainHub, height: u32) -> bitcoin::block::Header {
+    src.query.wire_header_at_height(Height(height)).unwrap()
+}
+
 #[tokio::test]
 async fn peer_catchup_compact_reorg() {
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::block::{Header, Version as BlockVersion};
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::p2p::message::RawNetworkMessage;
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{
-        Amount, CompactTarget, Network, OutPoint, Sequence, Target, Transaction, TxIn, TxMerkleNode,
+        Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxMerkleNode,
         TxOut, Witness,
     };
     use rbitcoin_primitives::Height;
@@ -17,51 +66,6 @@ async fn peer_catchup_compact_reorg() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
-
-    fn take_msgs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
-        let mut out = Vec::new();
-        while let Ok(item) = rx.try_recv() {
-            out.push(item.expect_msg());
-        }
-        out
-    }
-
-    fn getdata_of(msgs: &[NetworkMessage]) -> Vec<(BlockHash, bool)> {
-        let mut out = Vec::new();
-        for msg in msgs {
-            if let NetworkMessage::GetData(inv) = msg {
-                for i in inv {
-                    match i {
-                        Inventory::CompactBlock(h) => out.push((*h, true)),
-                        Inventory::Block(h) | Inventory::WitnessBlock(h) => out.push((*h, false)),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn block_at(src: &crate::chain::ChainHub, height: u32) -> bitcoin::Block {
-        src.query
-            .reconstruct_block_at_height(Height(height))
-            .unwrap()
-    }
-
-    fn header_at(src: &crate::chain::ChainHub, height: u32) -> bitcoin::block::Header {
-        src.query.wire_header_at_height(Height(height)).unwrap()
-    }
 
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (src_dir, src) = crate::chain::tiny_regtest_hub_labeled("catchup-journey-src");
@@ -615,10 +619,57 @@ async fn peer_catchup_compact_reorg() {
     assert!(peers.try_cmpct_fill_slot(pending_hash, true));
     assert!(!peers.try_cmpct_fill_slot(pending_hash, true));
 
+    catchup_reorg_and_drain(&src, &hub, &live, &out_tx, &mut out_rx, &mut follow).await;
+    let _ = std::fs::remove_dir_all(src_dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[allow(clippy::cognitive_complexity)] // one reorg chapter; the tokio test owns the story
+async fn catchup_reorg_and_drain(
+    src: &crate::chain::ChainHub,
+    hub: &crate::chain::ChainHub,
+    live: &std::sync::Arc<crate::peers::LivePeer>,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_rx: &mut mpsc::UnboundedReceiver<PeerOut>,
+    follow: &mut PeerFollowState,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxMerkleNode, TxOut,
+        Witness,
+    };
+    use std::time::{Duration, Instant};
+
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let coinbase = |height: u32, tag: u8| {
+        let mut ss = rbitcoin_consensus::bip34_height_script(height);
+        while ss.len() < 2 {
+            ss.push(tag);
+        }
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: op_true.clone(),
+            }],
+        }
+    };
     // Weaker connecting headers drop the stale fork's outstanding asks.
     const FORK_PARENT: u32 = 144;
     let stale_asks: Vec<BlockHash> = ((FORK_PARENT + 1)..=160)
-        .map(|h| block_at(&src, h).block_hash())
+        .map(|h| block_at(src, h).block_hash())
         .collect();
     assert_eq!(stale_asks.len(), MAX_SERVE_BLOCKS);
     let stale_first = stale_asks[0];
@@ -626,7 +677,7 @@ async fn peer_catchup_compact_reorg() {
     src.generate_to_script(MAX_SERVE_BLOCKS as u32 - 2, ScriptBuf::from_bytes(vec![0x52]), vec![])
         .unwrap();
     let weak_headers: Vec<Header> = ((FORK_PARENT + 1)..=(FORK_PARENT + MAX_SERVE_BLOCKS as u32 - 2))
-        .map(|h| header_at(&src, h))
+        .map(|h| header_at(src, h))
         .collect();
     assert!(weak_headers.len() as u32 + FORK_PARENT < 160);
     for hash in &stale_asks {
@@ -635,14 +686,14 @@ async fn peer_catchup_compact_reorg() {
     }
     handle_peer_frame(
         frame_for(NetworkMessage::Headers(weak_headers)),
-        &hub,
-        &out_tx,
-        &mut follow,
+        hub,
+        out_tx,
+        follow,
         Some(live.as_ref()),
     )
     .await
     .unwrap();
-    let _ = take_msgs(&mut out_rx);
+    let _ = take_msgs(out_rx);
     assert!(
         stale_asks
             .iter()
@@ -654,7 +705,7 @@ async fn peer_catchup_compact_reorg() {
 
     src.generate_to_script(10, ScriptBuf::from_bytes(vec![0x52]), vec![]).unwrap();
     let heavy_tip = src.tip_height().unwrap();
-    let stem = block_at(&src, FORK_PARENT + 1);
+    let stem = block_at(src, FORK_PARENT + 1);
     let want = src.tip_hash().unwrap();
     assert!(
         hub.tip_height().unwrap().saturating_sub(FORK_PARENT) > 6,
@@ -668,7 +719,7 @@ async fn peer_catchup_compact_reorg() {
     // A full getdata window must not starve the better header path.
     let mut fork_headers = HashMap::new();
     for h in (FORK_PARENT + 1)..=heavy_tip {
-        let block = block_at(&src, h);
+        let block = block_at(src, h);
         fork_headers.insert(block.block_hash(), block.header);
     }
     let mut dummy_req = HashSet::new();
@@ -680,7 +731,7 @@ async fn peer_catchup_compact_reorg() {
     let (drain_tx, mut drain_rx) = mpsc::unbounded_channel();
     let mut drain_blocks = PendingBlocks::new();
     drain_pending(
-        &hub,
+        hub,
         &drain_tx,
         &mut drain_blocks,
         &mut fork_headers,
@@ -697,7 +748,7 @@ async fn peer_catchup_compact_reorg() {
     );
     assert!(dummy_req.contains(&stem.block_hash()));
     drain_pending(
-        &hub,
+        hub,
         &drain_tx,
         &mut drain_blocks,
         &mut fork_headers,
@@ -714,7 +765,7 @@ async fn peer_catchup_compact_reorg() {
     let t2 = Instant::now();
     let mut since = Some(t2);
     assert!(maybe_expire_block_requests(
-        &hub,
+        hub,
         &mut dummy_req,
         &mut since,
         t2 + BLOCK_GETDATA_TIMEOUT + Duration::from_millis(1),
@@ -729,34 +780,34 @@ async fn peer_catchup_compact_reorg() {
         frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
             compact_block: stem_hsi,
         })),
-        &hub,
-        &out_tx,
-        &mut follow,
+        hub,
+        out_tx,
+        follow,
         Some(live.as_ref()),
     )
     .await
     .unwrap();
-    let _ = take_msgs(&mut out_rx);
+    let _ = take_msgs(out_rx);
     assert!(
         follow.pending_cmpct.is_empty()
             && hub.held_body(&stem.block_hash()).is_none()
             && hub.tip_hash() == stale_tip,
         "weaker-than-tip stem compact is a header, not a reconstruct"
     );
-    let tip_block = block_at(&src, heavy_tip);
+    let tip_block = block_at(src, heavy_tip);
     let tip_hsi = HeaderAndShortIds::from_block(&tip_block, 1, 2, &[0]).unwrap();
     handle_peer_frame(
         frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
             compact_block: tip_hsi,
         })),
-        &hub,
-        &out_tx,
-        &mut follow,
+        hub,
+        out_tx,
+        follow,
         Some(live.as_ref()),
     )
     .await
     .unwrap();
-    let lagged = take_msgs(&mut out_rx);
+    let lagged = take_msgs(out_rx);
     assert!(
         lagged
             .iter()
@@ -772,29 +823,29 @@ async fn peer_catchup_compact_reorg() {
     // witness ask. Delayed witness bodies are what reorg.
     let mut asked: Vec<(BlockHash, bool)> = getdata_of(&lagged);
     for h in (FORK_PARENT + 1)..=heavy_tip {
-        let body = block_at(&src, h);
+        let body = block_at(src, h);
         let hsi = HeaderAndShortIds::from_block(&body, 1, 2, &[0]).unwrap();
         handle_peer_frame(
             frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
                 compact_block: hsi,
             })),
-            &hub,
-            &out_tx,
-            &mut follow,
+            hub,
+            out_tx,
+            follow,
             Some(live.as_ref()),
         )
         .await
         .unwrap();
         handle_peer_frame(
             frame_for(NetworkMessage::Headers(vec![body.header])),
-            &hub,
-            &out_tx,
-            &mut follow,
+            hub,
+            out_tx,
+            follow,
             Some(live.as_ref()),
         )
         .await
         .unwrap();
-        for item in getdata_of(&take_msgs(&mut out_rx)) {
+        for item in getdata_of(&take_msgs(out_rx)) {
             if !asked.iter().any(|(hash, _)| *hash == item.0) {
                 asked.push(item);
             }
@@ -819,7 +870,7 @@ async fn peer_catchup_compact_reorg() {
             break;
         }
         if asks.is_empty() {
-            asks = getdata_of(&take_msgs(&mut out_rx));
+            asks = getdata_of(&take_msgs(out_rx));
             if asks.is_empty() {
                 break;
             }
@@ -840,15 +891,15 @@ async fn peer_catchup_compact_reorg() {
             };
             handle_peer_frame(
                 frame_for(msg),
-                &hub,
-                &out_tx,
-                &mut follow,
+                hub,
+                out_tx,
+                follow,
                 Some(live.as_ref()),
             )
             .await
             .unwrap();
         }
-        asks = getdata_of(&take_msgs(&mut out_rx));
+        asks = getdata_of(&take_msgs(out_rx));
     }
     assert_eq!(
         hub.tip_hash(),
@@ -860,24 +911,24 @@ async fn peer_catchup_compact_reorg() {
     // A later stem that sits two below the tip is still witness, not compact.
     let shallow_tip = hub.tip_height().unwrap();
     let shallow_parent = shallow_tip - 2;
-    let shallow_stale = block_at(&src, shallow_parent + 1).block_hash();
+    let shallow_stale = block_at(src, shallow_parent + 1).block_hash();
     src.invalidate_block(shallow_stale).unwrap();
     src.generate_to_script(6, ScriptBuf::from_bytes(vec![0x53]), vec![]).unwrap();
-    let shallow_stem = block_at(&src, shallow_parent + 1);
+    let shallow_stem = block_at(src, shallow_parent + 1);
     let shallow_want = src.tip_hash().unwrap();
     let shallow_headers: Vec<Header> = ((shallow_parent + 1)..=src.tip_height().unwrap())
-        .map(|h| header_at(&src, h))
+        .map(|h| header_at(src, h))
         .collect();
     handle_peer_frame(
         frame_for(NetworkMessage::Headers(shallow_headers)),
-        &hub,
-        &out_tx,
-        &mut follow,
+        hub,
+        out_tx,
+        follow,
         Some(live.as_ref()),
     )
     .await
     .unwrap();
-    let mut shallow_asks = getdata_of(&take_msgs(&mut out_rx));
+    let mut shallow_asks = getdata_of(&take_msgs(out_rx));
     assert!(
         shallow_asks
             .iter()
@@ -898,15 +949,15 @@ async fn peer_catchup_compact_reorg() {
             };
             handle_peer_frame(
                 frame_for(NetworkMessage::Block(body)),
-                &hub,
-                &out_tx,
-                &mut follow,
+                hub,
+                out_tx,
+                follow,
                 Some(live.as_ref()),
             )
             .await
             .unwrap();
         }
-        shallow_asks = getdata_of(&take_msgs(&mut out_rx));
+        shallow_asks = getdata_of(&take_msgs(out_rx));
     }
     assert_eq!(hub.tip_hash(), Some(shallow_want));
 
@@ -937,7 +988,7 @@ async fn peer_catchup_compact_reorg() {
     miss_blocks.insert(orphan.block_hash(), orphan);
     let mut miss_headers = HashMap::new();
     drain_pending(
-        &hub,
+        hub,
         &miss_tx,
         &mut miss_blocks,
         &mut miss_headers,
@@ -960,6 +1011,4 @@ async fn peer_catchup_compact_reorg() {
     }
     assert!(!hub.is_connected(&missing_parent));
 
-    let _ = std::fs::remove_dir_all(src_dir);
-    let _ = std::fs::remove_dir_all(dir);
 }
