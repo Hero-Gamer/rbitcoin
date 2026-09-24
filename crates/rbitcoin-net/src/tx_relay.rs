@@ -2833,6 +2833,19 @@ impl MempoolHub {
             .collect()
     }
 
+    /// Core `GetTotalTxSize` / `totalFee`: (count, sigop-adjusted vbytes, fee) for `getmempoolinfo`.
+    pub fn live_adjusted_totals(&self) -> (usize, u64, u64) {
+        let g = self.lock_read();
+        let bps = g.graph.bytes_per_sigop();
+        g.graph.iter().fold((0, 0, 0), |(n, vb, fee), (_, e)| {
+            (
+                n + 1,
+                vb + rbitcoin_consensus::policy::get_virtual_size(e.adjusted_weight(bps)),
+                fee + e.fee_sat,
+            )
+        })
+    }
+
     /// Fee/weight for one live mempool txid (no live-set scan).
     pub fn get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
         self.lock_read()

@@ -23,14 +23,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "orphanage": { "size": 0, "bytes": 0 },
         }));
     };
-    let live = mp.list_live_meta();
-    let size = live.len();
-    let mut bytes = 0u64;
-    let mut total_fee = 0u64;
-    for (_, fee, weight) in &live {
-        bytes += rbitcoin_consensus::policy::get_virtual_size(*weight);
-        total_fee += fee;
-    }
+    let (size, bytes, total_fee) = mp.live_adjusted_totals();
     let (orphan_size, orphan_wu) = mp.orphan_stats();
     Ok(json!({
         "loaded": true,

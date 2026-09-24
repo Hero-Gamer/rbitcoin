@@ -3816,6 +3816,13 @@ fn getmempoolentry_vsize_is_sigop_adjusted() {
     assert_eq!(e["vsize"], 4_000);
     assert_eq!(e["weight"], raw_w);
     assert_eq!(e["ancestorsize"], 4_000);
+    // Core `GetTotalTxSize` sums the same adjusted size.
+    let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+    assert_eq!(
+        (info["size"].clone(), info["bytes"].clone()),
+        (json!(1), json!(4_000))
+    );
+    assert_eq!(info["total_fee"], json!(0.00002));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
