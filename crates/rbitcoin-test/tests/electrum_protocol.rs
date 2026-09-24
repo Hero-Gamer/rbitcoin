@@ -120,6 +120,18 @@ async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
         "{note}"
     );
     assert!(note["params"]["history"].as_array().is_some(), "{note}");
+    const OTHER_SCAN: &str = "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+    let mismatch = rpc(
+        stream,
+        56,
+        "blockchain.silentpayments.unsubscribe",
+        json!([OTHER_SCAN, SP_SPEND, 0]),
+    )
+    .await;
+    assert!(
+        mismatch["result"].as_str().unwrap().contains("sp"),
+        "a different scan key must not clear the session: {mismatch}"
+    );
     let unsp = rpc(
         stream,
         46,
@@ -304,6 +316,85 @@ async fn assert_esplora_asof_dead(addr: SocketAddr, path: &str) {
     );
 }
 
+async fn mempool_status_matches_history_row_order(
+    stream: &mut TcpStream,
+    q: &Query,
+    hub: &rbitcoin_net::MempoolHub,
+    chain: &rbitcoin_test::MatureRegtestChain,
+) {
+    use bitcoin::hashes::{sha256, Hash as _};
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_primitives::Height;
+
+    let coinbase = &chain.blocks[2].txdata[0];
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: spk,
+        }],
+    };
+    hub.accept_tx(&tx).expect("mempool accept");
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let hist = rpc(
+        stream,
+        30,
+        "blockchain.scripthash.get_history",
+        json!([sh.clone()]),
+    )
+    .await;
+    let rows = hist["result"].as_array().expect("history");
+    assert!(
+        rows.iter().any(|r| r["height"].as_i64().unwrap() >= 1),
+        "need a confirmed history row"
+    );
+    assert!(
+        rows.last().unwrap()["height"].as_i64().unwrap() <= 0,
+        "get_history must append the mempool row last: {hist}"
+    );
+    let mut preimage = String::new();
+    let mut height_sorted = String::new();
+    let mut ordered: Vec<(i64, String)> = Vec::new();
+    for row in rows {
+        let height = row["height"].as_i64().unwrap();
+        let tx_hash = row["tx_hash"].as_str().unwrap();
+        let piece = if height > 0 {
+            let (_, rec) = q.header_at_height(Height(height as u32)).unwrap().unwrap();
+            let block = rbitcoin_primitives::display_hash_hex(&rec.hash);
+            format!("{tx_hash}:{height}:{block}:")
+        } else {
+            format!("{tx_hash}:{height}:")
+        };
+        preimage.push_str(&piece);
+        ordered.push((height, piece));
+    }
+    ordered.sort_by_key(|(h, _)| *h);
+    for (_, piece) in &ordered {
+        height_sorted.push_str(piece);
+    }
+    let status_of =
+        |s: &str| rbitcoin_primitives::hex_encode(sha256::Hash::hash(s.as_bytes()).to_byte_array());
+    let expected = status_of(&preimage);
+    assert_ne!(
+        status_of(&height_sorted),
+        expected,
+        "height-sort must not match get_history order"
+    );
+    let sub = rpc(stream, 31, "blockchain.scripthash.subscribe", json!([sh])).await;
+    assert_eq!(sub["result"].as_str(), Some(expected.as_str()), "{sub}");
+}
+
 #[allow(clippy::cognitive_complexity)] // one TCP session, many protocol arms
 #[tokio::test]
 async fn electrum_server_version_history_balance() {
@@ -317,9 +408,23 @@ async fn electrum_server_version_history_balance() {
     let (tip_tx, _) = broadcast::channel(4);
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     cfg.limits.max_request_bytes = 2048;
-    let handle = run_electrum(cfg, q.clone(), params.clone(), tip_tx.clone(), None)
-        .await
-        .expect("electrum listen");
+    cfg.onion_tcp
+        .set((
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(),
+            50001,
+        ))
+        .unwrap();
+    let hub = rbitcoin_net::MempoolHub::open(dir.path().join("mempool"), q.clone()).expect("hub");
+    hub.set_relay_enabled(true);
+    let handle = run_electrum(
+        cfg,
+        q.clone(),
+        params.clone(),
+        tip_tx.clone(),
+        Some(hub.clone()),
+    )
+    .await
+    .expect("electrum listen");
 
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
 
@@ -474,6 +579,17 @@ async fn electrum_server_version_history_balance() {
     assert_eq!(v["result"]["protocol_min"].as_str(), Some("1.4"));
     assert_eq!(v["result"]["asof_protocol"].as_str(), Some("1.4.2-asof"));
     assert_eq!(v["result"]["server_version"], ver[0]);
+    assert_eq!(
+        v["result"]["hosts"],
+        json!({
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion": { "tcp_port": 50001 }
+        })
+    );
+    assert!(v["result"]["hosts"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|h| h.get("ssl_port").is_none()));
 
     let v = rpc(&mut stream, 5, "server.peers.subscribe", json!([])).await;
     assert_eq!(v["result"], json!([]));
@@ -484,6 +600,8 @@ async fn electrum_server_version_history_balance() {
     let v = rpc(&mut stream, 7, "blockchain.block.headers", json!([0, 5])).await;
     assert!(v["result"]["count"].as_u64().unwrap() >= 1);
     assert!(!v["result"]["hex"].as_str().unwrap().is_empty());
+
+    mempool_status_matches_history_row_order(&mut stream, &q, &hub, &chain).await;
 
     pin_wallet_protocol_1_6(&mut stream).await;
 
@@ -1602,6 +1720,18 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         .expect("subscribe status")
         .to_string();
     assert_eq!(status_a.len(), 64, "{sub}");
+    let live_hist = rpc(
+        &mut stream,
+        20,
+        "blockchain.scripthash.get_history",
+        json!([sh.clone()]),
+    )
+    .await;
+    assert_eq!(
+        live_hist["chain_tip"].as_str(),
+        Some(asof_spend.as_str()),
+        "history stamps the tip hash: {live_hist}"
+    );
 
     q.disconnect_tip().unwrap();
     q.apply_sh_pending().unwrap();
@@ -1624,6 +1754,20 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         status_a, status_b,
         "same-height replace must change status via confirming blockhash"
     );
+    let live_b = rpc(
+        &mut stream,
+        21,
+        "blockchain.scripthash.get_history",
+        json!([sh.clone()]),
+    )
+    .await;
+    let tip_b = rbitcoin_primitives::display_hash_hex(&spend_blk_b.block_hash().to_byte_array());
+    assert_eq!(
+        live_b["chain_tip"].as_str(),
+        Some(tip_b.as_str()),
+        "replaced tip restamps history: {live_b}"
+    );
+    assert_ne!(asof_spend, tip_b);
     let asof_a = rpc(
         &mut stream,
         16,
