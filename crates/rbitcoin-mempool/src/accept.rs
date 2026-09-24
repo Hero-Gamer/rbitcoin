@@ -2234,61 +2234,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn two_parent_insert_builds_the_cluster_once() {
-        let dir = tmp_dir();
-        let mut map = HashMap::new();
-        let mut parents = Vec::new();
-        for i in 1u8..=2 {
-            let op = OutPoint {
-                txid: Txid::from_byte_array([i; 32]),
-                vout: 0,
-            };
-            map.insert(
-                op,
-                coin(TxOut {
-                    value: Amount::from_sat(100_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-                }),
-            );
-            parents.push(spend_tx(op, 90_000));
-        }
-        let utxos = MapUtxoProvider { map };
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        for p in &parents {
-            mp.accept_tx(p, &utxos, TIP_OK).unwrap();
-        }
-        let _ = mp.graph.take_cluster_builds();
-        let child = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: parents
-                .iter()
-                .map(|p| TxIn {
-                    previous_output: OutPoint {
-                        txid: p.compute_txid(),
-                        vout: 0,
-                    },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    witness: Witness::new(),
-                })
-                .collect(),
-            output: vec![TxOut {
-                value: Amount::from_sat(100_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        mp.accept_tx(&child, &utxos, TIP_OK)
-            .expect("two-parent child");
-        assert_eq!(
-            mp.graph.take_cluster_builds(),
-            1,
-            "insert linearizes the cluster once, not once per input"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     fn too_many_sigops_rejected_before_script() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);

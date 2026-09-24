@@ -49,7 +49,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `mempool_under_pressure` |
 | [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed | `mempool_under_pressure` |
 | [049](./049-rolling-min-fee.md) | medium | Full-mempool fee floor is a static bump | fixed | `mempool_under_pressure` |
-| [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `two_parent_insert_builds_the_cluster_once` |
+| [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `mempool_under_pressure` |
 | [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
 | [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `hostile_peer_session` |

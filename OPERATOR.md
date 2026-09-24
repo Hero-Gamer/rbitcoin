@@ -405,7 +405,7 @@ Clean smoke:
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
 | `--rpc-token-file PATH` | `rpc_token_file=` | `{datadir}/rpc.token` (CSPRNG hex; TCP Bearer) |
-| `--rpc-work-queue N` | `rpc_work_queue=` | **16** in-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (array batches still run). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is unlimited. |
+| `--rpc-work-queue N` | `rpc_work_queue=` | **16** in-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (array batches still run). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 | `--min-relay-tx-fee BTC` | `min_relay_tx_fee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempool-expiry HOURS` | `mempool_expiry=` | unset — hub default; min 1 |
 | `--blocks-only` | `blocks_only=` | off |

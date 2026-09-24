@@ -16,7 +16,7 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
     }
 }
 
-fn pending_header_insert_past_cap_clears() {
+fn pending_header_insert_past_cap_refuses() {
     let mut pending = HashMap::new();
     let hdr = bitcoin::block::Header {
         version: bitcoin::block::Version::TWO,
@@ -35,8 +35,11 @@ fn pending_header_insert_past_cap_clears() {
     let kept = *pending.keys().next().unwrap();
     super::admit_pending_header(&mut pending, kept, hdr);
     assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
-    super::admit_pending_header(&mut pending, BlockHash::from_byte_array([0xff; 32]), hdr);
-    assert_eq!(pending.len(), 1);
+    let extra = BlockHash::from_byte_array([0xff; 32]);
+    super::admit_pending_header(&mut pending, extra, hdr);
+    assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
+    assert!(!pending.contains_key(&extra));
+    assert!(pending.contains_key(&kept));
 }
 
 #[test]
@@ -10960,7 +10963,7 @@ fn invalid_script_is_scored_and_policy_is_not() {
 
 #[test]
 fn hostile_peer_session() {
-    pending_header_insert_past_cap_clears();
+    pending_header_insert_past_cap_refuses();
     getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once();
     send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib();
     addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst();

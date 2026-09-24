@@ -1186,7 +1186,11 @@ impl NodeConfig {
                 let n: usize = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf rpc_work_queue: {e}")))?;
-                self.rpc.work_queue = if n == 0 { None } else { Some(n) };
+                self.rpc.work_queue = Some(if n == 0 {
+                    rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE
+                } else {
+                    n
+                });
             }
             "max_run_secs" => {
                 self.max_run_secs = Some(
@@ -1376,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn rpc_work_queue_defaults_finite_and_zero_is_unlimited() {
+    fn rpc_work_queue_zero_is_the_default_finite_queue() {
         assert_eq!(
             NodeConfig::default().rpc.work_queue,
             Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE)
@@ -1386,7 +1390,7 @@ mod tests {
             c.apply_kv("rpc_work_queue", "0").unwrap(),
             ConfApply::Applied
         );
-        assert_eq!(c.rpc.work_queue, None);
+        assert_eq!(c.rpc.work_queue, Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE));
         assert_eq!(
             c.apply_kv("rpc_work_queue", "4").unwrap(),
             ConfApply::Applied

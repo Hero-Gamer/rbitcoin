@@ -73,7 +73,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
-| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpc-work-queue` defaults to **16** (HTTP occupancy, 503 when full; **0** unlimited); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpc-work-queue` defaults to **16** (HTTP occupancy, 503 when full; **0** is that default); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
 | GetData serve | Reconstruct/serve **16** (`MAX_SERVE_BLOCKS`) hashes per inbound message; leftover hashes in that `getdata` are dropped (RAM cap) | Core `ProcessGetData` can keep serving leftover hashes |
 | Inbound eviction victim | After Core-shaped protect (netgroup / recent block / recent tx / min-ping), disconnect the **longest-connected** remaining inbound | Core `SelectNodeToEvict` youngest in the oldest netgroup |
 | `--sptweaks-dust` | Serve-time floor default **1000** sat (omit P2TR outs `value <=` floor). **546** matches Cake electrs. Not Cake/Electrum protocol | n/a (Electrum tweaks are not Core) |
