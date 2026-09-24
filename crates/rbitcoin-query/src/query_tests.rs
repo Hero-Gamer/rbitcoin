@@ -2775,28 +2775,70 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
         output_start_fk: Fk::NULL,
         output_count: 1,
     };
-    let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec);
     let child_fk = Fk(parent_fk.get().unwrap() + 1);
-    let mut plan = ArchiveWritePlan::empty();
-    plan.packed = vec![(
-        pin,
-        vec![InputRecord {
-            prev_txid: parent_txid,
-            create_fk: parent_fk,
-            prev_index: 0,
-            sequence: u32::MAX,
-            script_sig: vec![],
-            witness: vec![],
-        }],
-    )];
-    plan.planned_fks = vec![child_fk];
-    plan.body_est = 256;
+    let make = || {
+        let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec.clone());
+        let mut plan = ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            pin,
+            vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: parent_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        )];
+        plan.planned_fks = vec![child_fk];
+        plan.body_est = 256;
+        plan
+    };
+    let mut bad = make();
+    bad.tx_fees = vec![1, 2];
+    let err = q
+        .archive_commit_plan_defer_head_parents(bad, Some(&BatchParents::new()))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt("invariant: txstat fee length")),
+        "{err}"
+    );
+    let mut plan = make();
     plan.tx_fees = vec![42];
     q.archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
         .expect("assemble fee skips the parent walk");
     let row = q.txstat_row(child_fk).unwrap().expect("stamped from fee");
     assert_eq!(row.fee_sat, 42);
     assert_eq!(row.size() as usize, spend.total_size());
+
+    let aligned = |fee: u64| {
+        let mut plan = ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            CreatePinInner::records(
+                TxRecord {
+                    txid: [fee as u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ),
+            Vec::new(),
+        )];
+        plan.tx_fees = vec![fee];
+        plan
+    };
+    let mut joined = aligned(7);
+    joined.append(aligned(9));
+    assert_eq!(joined.tx_fees, vec![7, 9]);
+    let mut partial = aligned(7);
+    let mut bare = aligned(9);
+    bare.tx_fees.clear();
+    partial.append(bare);
+    assert!(partial.tx_fees.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

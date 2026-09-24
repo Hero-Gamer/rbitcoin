@@ -3193,8 +3193,8 @@ fn already_at_height_retries_post_commit_spend_annotate() {
 #[test]
 fn confirm_write_stamps_txstat_fee_size() {
     use crate::{
-        accept_and_connect_block, confirm_wire_run, genesis_block, mine_empty_regtest, ChainParams,
-        Milestone,
+        accept_and_connect_block, confirm_wire_load_phase, confirm_wire_run, genesis_block,
+        mine_empty_regtest, ChainParams, Milestone, ScriptPreverified,
     };
     use rbitcoin_primitives::{Fk, Height};
 
@@ -3211,6 +3211,17 @@ fn confirm_write_stamps_txstat_fee_size() {
     assert_eq!(g.weight(), gtx.weight().to_wu());
 
     let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    let loaded = confirm_wire_load_phase(
+        &q,
+        &params,
+        ms,
+        &[(Height(1), b1.clone())],
+        &ScriptPreverified::new(),
+    )
+    .unwrap();
+    let plan = loaded.batch.archive_plan.as_ref().expect("class A plan");
+    assert_eq!(plan.tx_fees, vec![0]);
+    assert_eq!(plan.tx_fees.len(), plan.packed.len());
     confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
     let row = q.get_txstat(Fk(2)).unwrap().expect("height-1 txstat");
     let tx = &b1.txdata[0];
