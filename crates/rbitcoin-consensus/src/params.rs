@@ -561,6 +561,16 @@ mod tests {
         assert!(!ChainParams::regtest().is_bip30_repeat(91880, h91880));
     }
 
+    #[test]
+    fn mainnet_min_chain_work_is_core_n_minimum_chain_work() {
+        let work = mainnet_min_chain_work_be();
+        assert_eq!(work, min_work_from_display_hex(MAINNET_MIN_CHAIN_WORK));
+        assert!(
+            work.iter().any(|b| *b != 0),
+            "minimum chain work must not be zero"
+        );
+    }
+
     /// Mainnet buried heights (Core + Inquisition).
     #[test]
     fn mainnet_buried_deployments_match_core() {
