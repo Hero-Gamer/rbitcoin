@@ -1226,7 +1226,7 @@ pub(crate) fn cover_tip_holes(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::ibd) mod tests {
     use super::super::status::LoopStats;
     use super::*;
     use bitcoin::hashes::Hash;
@@ -1373,6 +1373,7 @@ mod tests {
 
     #[test]
     fn download_gate_stops_getdata_when_tip_plus_one_unconfirmable() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
@@ -1392,6 +1393,7 @@ mod tests {
 
     #[test]
     fn clear_inflight_add_peer_pop_need_and_tip_holes() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
         let hash = h(10);
@@ -1548,6 +1550,7 @@ mod tests {
 
     #[test]
     fn densify_does_not_issue_far_while_tip_plus_one_hole() {
+        let _env = lock_default_assign_stop();
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -2080,6 +2083,7 @@ mod tests {
 
     #[test]
     fn pre_hole_fast_young_owner_stays_solo() {
+        let _env = lock_default_assign_stop();
         use super::super::peer_io::ibd_mono_ms;
         use super::super::state::InflightReq;
         let (dir, hub, mut st, gap_ht, gap) = pre_hole_layout(4);
@@ -2116,6 +2120,7 @@ mod tests {
 
     #[test]
     fn pre_hole_slow_owner_adds_one_racer_not_window() {
+        let _env = lock_default_assign_stop();
         use super::super::peer_io::ibd_mono_ms;
         use super::super::state::InflightReq;
         let (dir, hub, mut st, gap_ht, gap) = pre_hole_layout(4);
@@ -2150,6 +2155,7 @@ mod tests {
 
     #[test]
     fn pre_hole_aged_owner_adds_one_racer() {
+        let _env = lock_default_assign_stop();
         use super::super::peer_io::ibd_mono_ms;
         use super::super::state::InflightReq;
         let (dir, hub, mut st, _gap_ht, gap) = pre_hole_layout(4);
@@ -2174,6 +2180,7 @@ mod tests {
 
     #[test]
     fn prefix_hole_races_tip_plus_one_before_pre_hole() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(
@@ -2216,6 +2223,7 @@ mod tests {
 
     #[test]
     fn cover_tip_batch_races_only_first_hole() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(
@@ -2304,6 +2312,7 @@ mod tests {
 
     #[test]
     fn densify_hung_owner_stolen_to_faster_peer() {
+        let _env = lock_default_assign_stop();
         use super::super::state::InflightReq;
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
@@ -2340,6 +2349,7 @@ mod tests {
 
     #[test]
     fn densify_slow_but_rx_live_not_stolen() {
+        let _env = lock_default_assign_stop();
         use super::super::peer_io::ibd_mono_ms;
         use super::super::state::InflightReq;
         use bitcoin::hashes::Hash as _;
@@ -2378,6 +2388,7 @@ mod tests {
 
     #[test]
     fn densify_hung_no_faster_peer_does_not_steal() {
+        let _env = lock_default_assign_stop();
         use super::super::state::InflightReq;
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
@@ -2408,6 +2419,7 @@ mod tests {
 
     #[test]
     fn densify_hung_no_slot_rewinds_scan_lo() {
+        let _env = lock_default_assign_stop();
         use super::super::peer_io::ibd_mono_ms;
         use super::super::state::InflightReq;
         use bitcoin::hashes::Hash as _;
@@ -2485,6 +2497,7 @@ mod tests {
 
     #[test]
     fn densify_skips_band_walk_when_peers_at_cap() {
+        let _env = lock_default_assign_stop();
         use super::super::state::InflightReq;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -2565,6 +2578,7 @@ mod tests {
     /// heights past tip-batch cover never demoted and conf froze mid-IBD.
     #[test]
     fn densify_zombie_pending_regets_work_path() {
+        let _env = lock_default_assign_stop();
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -2613,6 +2627,7 @@ mod tests {
     /// is requested (`need_hash_at` hash match, not height occupancy).
     #[test]
     fn densify_drops_wrong_bq_hash_and_regets_work_path() {
+        let _env = lock_default_assign_stop();
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -2668,6 +2683,7 @@ mod tests {
     /// is not readiness — only `block_queue_has_hash` of the need).
     #[test]
     fn assign_reorg_need_despite_wrong_height_bq_occupant() {
+        let _env = lock_default_assign_stop();
         use bitcoin::hashes::Hash as _;
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -2916,7 +2932,10 @@ mod tests {
     /// Serialize env mutators — parallel suite races `bq_assign_stop_bytes`.
     static BQ_ASSIGN_STOP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct AssignStopEnvRestore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+    pub(in crate::ibd) struct AssignStopEnvRestore(
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    );
     impl Drop for AssignStopEnvRestore {
         fn drop(&mut self) {
             match self.0.take() {
@@ -2930,7 +2949,8 @@ mod tests {
         }
     }
 
-    fn lock_default_assign_stop() -> (std::sync::MutexGuard<'static, ()>, AssignStopEnvRestore) {
+    pub(in crate::ibd) fn lock_default_assign_stop(
+    ) -> (std::sync::MutexGuard<'static, ()>, AssignStopEnvRestore) {
         let g = BQ_ASSIGN_STOP_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3007,6 +3027,7 @@ mod tests {
     /// Most-work reorg densify: assign issues getdata for need_getdata hashes.
     #[test]
     fn assign_issues_reorg_need_getdata() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
@@ -3028,6 +3049,7 @@ mod tests {
 
     #[test]
     fn assign_depth_densify_cache_and_early_exits() {
+        let _env = lock_default_assign_stop();
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));

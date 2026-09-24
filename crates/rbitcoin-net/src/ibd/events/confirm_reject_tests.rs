@@ -904,6 +904,7 @@ fn multi_hop_bad_prev_densifies_full_path_and_reorgs() {
 /// claim spinning, no reorg until mids load.
 #[test]
 fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
+    let _env = super::super::assign::tests::lock_default_assign_stop();
     use super::super::assign::{assign_work_ordered, AssignDepth};
     use super::super::path::seed_work_path_from_store;
     use super::super::peer_io::{PeerEvent, PeerSlot};
@@ -1107,6 +1108,7 @@ fn confirmed_height_mids_blocked_while_densify_ahead_leaves_tip_hole() {
 /// demote, `skip_download` forever and mids never re-getdata.
 #[test]
 fn zombie_pending_mid_at_confirmed_height_never_reget() {
+    let _env = super::super::assign::tests::lock_default_assign_stop();
     use super::super::assign::{assign_work_ordered, AssignDepth};
     use super::super::path::seed_work_path_from_store;
     use super::super::peer_io::PeerSlot;
