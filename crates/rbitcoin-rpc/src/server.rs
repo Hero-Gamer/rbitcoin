@@ -12,7 +12,7 @@ use axum::Router;
 
 /// Axum's default request-body cap, named so auth and 413 share one limit.
 pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
-/// Core `-rpcworkqueue`. `None` on [`RpcConfig::work_queue`] stays unlimited.
+/// Core `-rpcworkqueue`. Omitted or `0` is this finite queue.
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 use rbitcoin_log::info;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
@@ -50,7 +50,7 @@ pub struct RpcConfig {
     pub token_path: Option<PathBuf>,
     /// `getnetworkinfo.subversion`. Empty → `/rbitcoin:VERSION/`.
     pub subversion: Option<String>,
-    /// HTTP occupancy cap. `None` = unlimited.
+    /// HTTP occupancy cap. `None` and `0` are [`DEFAULT_RPC_WORK_QUEUE`].
     pub work_queue: Option<usize>,
     /// `--alert-notify` (`%s` = warning text).
     pub alert_notify: Option<String>,
@@ -86,7 +86,7 @@ impl RpcHandle {
 struct AppState {
     ctx: Arc<RpcContext>,
     auth: RpcAuth,
-    work_queue: Option<Arc<tokio::sync::Semaphore>>,
+    work_queue: Arc<tokio::sync::Semaphore>,
     require_auth: bool,
 }
 
@@ -134,10 +134,11 @@ pub async fn run_rpc(
         alert_fired: Arc::new(AtomicBool::new(false)),
     });
 
-    let work_queue = config
-        .work_queue
-        .filter(|n| *n > 0)
-        .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+    let n = match config.work_queue {
+        Some(n) if n > 0 => n,
+        _ => DEFAULT_RPC_WORK_QUEUE,
+    };
+    let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     let mut local_addr = None;
@@ -390,19 +391,15 @@ async fn recv_tip(tips: &mut Option<tokio::sync::broadcast::Receiver<rbitcoin_ne
 }
 
 async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
-    let _permit = if let Some(sem) = state.work_queue.as_ref() {
-        match sem.try_acquire() {
-            Ok(p) => Some(p),
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Work queue depth exceeded\n",
-                )
-                    .into_response();
-            }
+    let _permit = match state.work_queue.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Work queue depth exceeded\n",
+            )
+                .into_response();
         }
-    } else {
-        None
     };
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
