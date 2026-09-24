@@ -98,6 +98,13 @@ fn assemble_chained_header(
     Ok(mtp)
 }
 
+pub(super) struct Assembled {
+    pub(super) prepared: Vec<Prepared>,
+    pub(super) tx_fees: Vec<u64>,
+    /// `(base_size, total_size)` parallel to `tx_fees`, from the lookup precompute.
+    pub(super) tx_sizes: Vec<(u32, u32)>,
+}
+
 pub(super) fn assemble_run(
     query: &Query,
     params: &ChainParams,
@@ -106,13 +113,14 @@ pub(super) fn assemble_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
     spend_edges: &rbitcoin_query::SpendEdges,
-) -> Result<(Vec<Prepared>, Vec<u64>), ConsensusError> {
+) -> Result<Assembled, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
     let mut pending_creates = crate::block::PendingCreates::default();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(metas.len());
     let mut tx_fees: Vec<u64> = Vec::new();
+    let mut tx_sizes: Vec<(u32, u32)> = Vec::new();
 
     for (i, meta) in metas.into_iter().enumerate() {
         let block = &wire_blocks[i];
@@ -177,6 +185,18 @@ pub(super) fn assemble_run(
             Some(block),
             Some(&meta.pres),
         )?;
+        if meta.pres.len() != block.txdata.len() {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: txstat size pres",
+            )));
+        }
+        for p in meta.pres.iter() {
+            let base = u32::try_from(p.base_size)
+                .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: txstat size pres"))?;
+            let total = u32::try_from(p.total_size)
+                .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: txstat size pres"))?;
+            tx_sizes.push((base, total));
+        }
         tx_fees.extend(block_fees);
         rbitcoin_query::note_confirm(
             &query.confirm_stats().connect_ns,
@@ -204,7 +224,11 @@ pub(super) fn assemble_run(
             prev_mtp,
         });
     }
-    Ok((prepared, tx_fees))
+    Ok(Assembled {
+        prepared,
+        tx_fees,
+        tx_sizes,
+    })
 }
 
 /// Durable spentness + maturity + subsidy after scripts (height order).

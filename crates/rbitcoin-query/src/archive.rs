@@ -323,6 +323,9 @@ pub struct ArchiveWritePlan {
     /// Empty means commit recomputes the fee from prevouts (connect / tests).
     /// A non-empty slice must match `packed` and skips that walk.
     pub tx_fees: Vec<u64>,
+    /// Per-tx `(base_size, total_size)` from the lookup precompute, parallel
+    /// to [`Self::packed`]. Empty means the fee stamp still walks the wire tx.
+    pub tx_sizes: Vec<(u32, u32)>,
 }
 
 impl ArchiveWritePlan {
@@ -340,6 +343,7 @@ impl ArchiveWritePlan {
             index_tx: false,
             body_est: 0,
             tx_fees: Vec::new(),
+            tx_sizes: Vec::new(),
         }
     }
 
@@ -484,11 +488,14 @@ impl ArchiveWritePlan {
         let old_fks = std::mem::take(&mut self.planned_fks);
         let old_pin = std::mem::take(&mut self.batch_pin);
         let old_fees = std::mem::take(&mut self.tx_fees);
+        let old_sizes = std::mem::take(&mut self.tx_sizes);
         let fees_aligned = old_fees.len() == old_packed.len();
+        let sizes_aligned = old_sizes.len() == old_packed.len();
         let mut new_packed = Vec::with_capacity(keep_fks.len());
         let mut new_fks = Vec::with_capacity(keep_fks.len());
         let mut new_pin = Vec::with_capacity(keep_fks.len());
         let mut new_fees = Vec::with_capacity(keep_fks.len());
+        let mut new_sizes = Vec::with_capacity(keep_fks.len());
         for (i, fk) in old_fks.into_iter().enumerate() {
             let Some(id) = fk.get() else {
                 continue;
@@ -506,11 +513,15 @@ impl ArchiveWritePlan {
             if fees_aligned {
                 new_fees.push(old_fees[i]);
             }
+            if sizes_aligned {
+                new_sizes.push(old_sizes[i]);
+            }
         }
         self.packed = new_packed;
         self.planned_fks = new_fks;
         self.batch_pin = new_pin;
         self.tx_fees = new_fees;
+        self.tx_sizes = new_sizes;
         self.per_header_ranges = new_ranges;
         self.per_header_sw = new_sw;
         self.edges.retain(|id, _| keep_fks.contains(id));
@@ -539,11 +550,18 @@ impl ArchiveWritePlan {
 
         let fees_aligned =
             self.tx_fees.len() == self.packed.len() && other.tx_fees.len() == other.packed.len();
+        let sizes_aligned =
+            self.tx_sizes.len() == self.packed.len() && other.tx_sizes.len() == other.packed.len();
         self.packed.append(&mut other.packed);
         if fees_aligned {
             self.tx_fees.append(&mut other.tx_fees);
         } else {
             self.tx_fees.clear();
+        }
+        if sizes_aligned {
+            self.tx_sizes.append(&mut other.tx_sizes);
+        } else {
+            self.tx_sizes.clear();
         }
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
@@ -686,7 +704,7 @@ fn stamp_txstat_rows(
     parents: Option<&crate::BatchParents>,
 ) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
     if plan.tx_fees.len() == plan.packed.len() && !plan.tx_fees.is_empty() {
-        return stamp_txstat_from_fees(&plan.packed, &plan.tx_fees);
+        return stamp_txstat_from_fees(&plan.tx_fees, &plan.tx_sizes);
     }
     if !plan.tx_fees.is_empty() {
         return Err(StoreError::Corrupt("invariant: txstat fee length"));
@@ -705,21 +723,23 @@ fn stamp_txstat_rows(
     Ok(out)
 }
 
-/// Fee already checked in assemble. Size still comes from the wire tx.
+/// Fee and `(base, total)` already recorded at assemble from the lookup precompute.
 fn stamp_txstat_from_fees(
-    packed: &[(CreatePin, Vec<InputRecord>)],
     fees: &[u64],
+    sizes: &[(u32, u32)],
 ) -> Result<Vec<rbitcoin_store::TxStatRow>, QueryError> {
-    let mut out = Vec::with_capacity(packed.len());
-    for ((pin, _), fee) in packed.iter().zip(fees.iter()) {
-        let Some(tx) = pin.wire_tx() else {
-            return Err(StoreError::Corrupt("invariant: txstat fee without wire"));
-        };
-        let (base, wit_extra) = txstat_size(tx)?;
+    if sizes.len() != fees.len() {
+        return Err(StoreError::Corrupt("invariant: txstat size length"));
+    }
+    let mut out = Vec::with_capacity(fees.len());
+    for (fee, &(base, total)) in fees.iter().zip(sizes.iter()) {
+        if total < base {
+            return Err(StoreError::Corrupt("invariant: txstat size total"));
+        }
         out.push(rbitcoin_store::TxStatRow {
             fee_sat: *fee,
             base,
-            wit_extra,
+            wit_extra: total - base,
         });
     }
     Ok(out)
@@ -1121,6 +1141,7 @@ impl Query {
             index_tx,
             body_est,
             tx_fees: Vec::new(),
+            tx_sizes: Vec::new(),
         })
     }
 
@@ -1309,6 +1330,29 @@ mod tests {
 
     fn temp_query(label: &str) -> (crate::testutil::TempDir, Query) {
         crate::testutil::tiny_query_labeled(label)
+    }
+
+    #[test]
+    fn txstat_stamp_uses_plan_base_total() {
+        let (path, q) = temp_query("txstat-plan-sizes");
+        let tx = TxRecord {
+            txid: [0x61; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.packed = vec![(crate::CreatePinInner::records(tx, Vec::new()), Vec::new())];
+        plan.tx_fees = vec![1];
+        plan.tx_sizes = vec![(80, 100)];
+        let rows = super::stamp_txstat_rows(&q, &plan, None).expect("sizes without wire");
+        assert_eq!(rows[0].fee_sat, 1);
+        assert_eq!(rows[0].base, 80);
+        assert_eq!(rows[0].wit_extra, 20);
+        let _ = path;
     }
 
     fn coinbase_apply(i: u64) -> TxApply {

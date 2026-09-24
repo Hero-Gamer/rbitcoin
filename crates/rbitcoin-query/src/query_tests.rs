@@ -2805,6 +2805,7 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
     );
     let mut plan = make();
     plan.tx_fees = vec![42];
+    plan.tx_sizes = vec![(spend.base_size() as u32, spend.total_size() as u32)];
     q.archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
         .expect("assemble fee skips the parent walk");
     let row = q.txstat_row(child_fk).unwrap().expect("stamped from fee");

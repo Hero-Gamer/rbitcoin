@@ -65,7 +65,7 @@ pub use lookup::{
     confirm_wire_load_from_plan, confirm_wire_lookup_stamp, ParentPinStamp, PlanStampOutcome,
     WireBlockIn,
 };
-use phases::assemble_run;
+use phases::{assemble_run, Assembled};
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
 use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
