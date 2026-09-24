@@ -233,13 +233,14 @@ fn ensure_accepted_prefix(
     let mut lo = 0usize;
     let mut lo_fks = Vec::new();
     let mut hi = headers.len();
-    // A step that does not shrink the window is not a prefix. Bound the
-    // walk by the batch length so a stuck midpoint cannot spin.
+    // A midpoint that does not shrink the window is not a longer prefix.
+    // The batch length caps a stuck step so it returns this `lo`.
     for _ in 0..headers.len() {
-        if lo + 1 >= hi {
+        let width = hi - lo;
+        if width <= 1 {
             break;
         }
-        let mid = lo + (hi - lo) / 2;
+        let mid = lo + width / 2;
         match hub.ensure_headers_batch(&headers[..mid]) {
             Ok(fks) => {
                 lo = mid;
