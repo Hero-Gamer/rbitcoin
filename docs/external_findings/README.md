@@ -34,10 +34,10 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [034](./034-witness-padding-not-cached.md) | high | Witness padding cached as an invalid block hash | fixed | `padded_coinbase_witness_over_weight_is_not_cached_invalid` |
 | [033](./033-ibd-intake-bounds.md) | critical | IBD path state and body bytes before validation | fixed | `rejected_header_batch_does_not_grow_path_or_explore` |
 | [030](./030-header-accept.md) | critical | Invalid header held; zero prev wipes tip | fixed | `zero_prev_with_live_tip_is_not_held` |
-| [029](./029-compact-tx-count.md) | critical | Compact block tx count and one partial per peer | fixed | `reconstruct_rejects_tx_count_above_weight_ratio` |
+| [029](./029-compact-tx-count.md) | critical | Compact block tx count and one partial per peer | fixed | `reconstruct_rejects_tx_count_above_weight_ratio`, `pending_header_insert_past_cap_clears` |
 | [032](./032-block-tx-count-alloc.md) | critical | Block tx count allocated before the payload was checked | fixed | `decode_block_precomputes_rejects_tx_count_past_payload` |
 | [031](./031-signet-solution.md) | high | Signet solution CompactSize and pushes | fixed | `compact_size_and_solution_parse_errors` |
-| [024](./024-talip-review-index.md) | — | Talip review index | open | Q-71 |
+| [024](./024-talip-review-index.md) | — | Talip review index | index | Q-71 |
 | [025](./025-tapleaf-annex-prefix.md) | critical | Tapleaf `0x50` rejected | fixed | `script_path_accepts_leaf_0x50_with_annex_and_0xc2` |
 | [026](./026-false-witness-program.md) | high | False witness program accepted | fixed | `false_witness_program_is_eval_false` |
 | [027](./027-script-skip-wtxid.md) | critical | Script skip keyed by txid | fixed | `tip_script_pres_skips_only_matching_wtxid` |
