@@ -2832,6 +2832,13 @@ impl MempoolHub {
             .map(|e| (e.fee_sat, e.weight))
     }
 
+    /// Core `GetAdjustedWeight`: `max(weight, sigop_cost * bytes_per_sigop)`.
+    pub fn get_live_adjusted_weight(&self, txid: &Txid) -> Option<u64> {
+        let g = self.lock_read();
+        let bps = g.graph.bytes_per_sigop();
+        g.graph.get(txid).map(|e| e.adjusted_weight(bps))
+    }
+
     /// Full BIP16 + BIP141 sigop cost recorded at admission (GBT `sigops`).
     pub fn get_live_sigop_cost(&self, txid: &Txid) -> Option<u64> {
         self.lock_read().graph.get(txid).map(|e| e.sigop_cost)
@@ -3872,6 +3879,26 @@ mod tests {
                 None,
                 "unresolvable input evicted"
             );
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            // Sigop-adjusted weight: max(400, 100 * 20) until bps is 0.
+            let mp = tmp();
+            let tx = spend_true(cbs[0], 1_000, spk.clone());
+            let (tid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+            {
+                let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
+                store
+                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, 100, &[])
+                    .unwrap();
+                store.flush().unwrap();
+            }
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            assert_eq!(hub.get_live_adjusted_weight(&tid), Some(2_000));
+            hub.set_bytes_per_sigop(0);
+            assert_eq!(hub.get_live_adjusted_weight(&tid), Some(400));
+            assert_eq!(hub.get_live_adjusted_weight(&Txid::all_zeros()), None);
             let _ = std::fs::remove_dir_all(&mp);
         }
 

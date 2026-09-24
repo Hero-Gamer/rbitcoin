@@ -3724,6 +3724,71 @@ fn invalidate_reconsider_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Coinbase spend with ten bare 20-sigop outputs: sigop cost 800, so at
+/// 20 B/sigop its policy size is 4_000 vB (raw ~220 vB).
+fn send_sigop_heavy_spend(ctx: &RpcContext, fee: u64) -> (Txid, Transaction) {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::TxOut;
+    dispatch(ctx, "generate", vec![json!(101)]).unwrap();
+    let cb = generated_coinbase_value(ctx, 1);
+    let mut tx = spend_generated_coinbase(ctx, 1, 0, ScriptBuf::new()).1;
+    tx.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_000),
+            // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+        };
+        10
+    ];
+    tx.output[0].value = Amount::from_sat(cb - fee - 9_000);
+    assert_eq!(
+        rbitcoin_consensus::tx_sigop_cost(&tx, &[], false, false),
+        800
+    );
+    dispatch(
+        ctx,
+        "sendrawtransaction",
+        vec![json!(hex_encode(serialize(&tx)))],
+    )
+    .unwrap();
+    (tx.compute_txid(), tx)
+}
+
+/// Core `getmempoolentry`: `vsize` is sigop-adjusted, `weight` stays raw.
+#[test]
+fn getmempoolentry_vsize_is_sigop_adjusted() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (tid, tx) = send_sigop_heavy_spend(&ctx, 2_000);
+    let raw_w = tx.weight().to_wu();
+    assert!(raw_w < 16_000);
+    let e = dispatch(
+        &ctx,
+        "getmempoolentry",
+        vec![json!(hash_hex_display(&tid.to_byte_array()))],
+    )
+    .unwrap();
+    assert_eq!(e["vsize"], 4_000);
+    assert_eq!(e["weight"], raw_w);
+    assert_eq!(e["ancestorsize"], 4_000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `BlockAssembler` gates `-blockmintxfee` on the sigop-adjusted size.
+#[test]
+fn block_min_fee_uses_sigop_adjusted_vsize() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    // 2_000 sat: 0.5 sat/vB at 4_000 vB, ~9 sat/vB on raw size.
+    let (_, tx) = send_sigop_heavy_spend(&ctx, 2_000);
+    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 500);
+    assert_eq!(keep, vec![tx.clone()]);
+    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 501);
+    assert_eq!(keep, Vec::<Transaction>::new());
+    ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(0);
+    let keep = crate::methods::mine::filter_block_min_fee(&ctx, vec![tx.clone()], 501);
+    assert_eq!(keep, vec![tx]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn block_min_fee_matches_core_getfee() {
     // 200 vB paying 1 sat meets 1 sat/kvB (1e3 >= 200) and any zero floor.

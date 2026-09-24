@@ -155,7 +155,11 @@ pub(crate) fn filter_block_min_fee(
             let tid = tx.compute_txid();
             let fee = mp.get_live_meta(&tid).map(|(f, _)| f).unwrap_or(0);
             let modified = (fee as i64).saturating_add(mp.fee_delta(&tid));
-            meets_block_min_feerate(modified, tx.weight().to_wu(), min_sat_kvb)
+            // Core `BlockAssembler` compares against the sigop-adjusted size.
+            let weight = mp
+                .get_live_adjusted_weight(&tid)
+                .unwrap_or_else(|| tx.weight().to_wu());
+            meets_block_min_feerate(modified, weight, min_sat_kvb)
         })
         .collect()
 }
