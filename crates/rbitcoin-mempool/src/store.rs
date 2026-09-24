@@ -1068,6 +1068,40 @@ pub(crate) mod tests {
         assert_eq!(mp.load_live_txs().unwrap()[0].packed.sigop_cost, Some(12));
     }
 
+    /// A legacy LIVE slot whose range runs past the body, or is shorter than
+    /// the 16-byte fee‖weight prefix, refuses open as Corrupt (no panic).
+    #[test]
+    fn schema2_bad_slot_range_is_corrupt() {
+        let tx = tiny_tx();
+        let tid = tx.compute_txid();
+        let range_err = "legacy live slot body range";
+        for (len, want) in [
+            (None, range_err),
+            (Some(V1_BODY_PREFIX - 1), range_err),
+            (Some(V1_BODY_PREFIX), "packed live short"),
+        ] {
+            let dir = tmp_dir();
+            {
+                let mut mp = Mempool::open_or_create(&dir).unwrap();
+                mp.append_live_tx(&tx, &tid, &tx.compute_wtxid(), 55, 400, 12, &[])
+                    .unwrap();
+                mp.flush().unwrap();
+            }
+            downgrade_to_schema2(&dir);
+            let mut slots = fs::read(dir.join("slots")).unwrap();
+            let body_len = fs::metadata(dir.join("tx.body")).unwrap().len() as usize;
+            let off = SLOTS_HEADER + 12;
+            let len = len.unwrap_or(body_len); // body_off > 0, so off+len > logical
+            slots[off..off + 4].copy_from_slice(&(len as u32).to_le_bytes());
+            fs::write(dir.join("slots"), slots).unwrap();
+            let r = Mempool::open_or_create(&dir).err();
+            assert!(
+                matches!(r, Some(MempoolError::Corrupt(m)) if m == want),
+                "len {len}: {r:?}"
+            );
+        }
+    }
+
     /// Crash after the migrate renamed body+slots but before meta (or with a
     /// stale slots header): open restamps the lagging header, keeps the record.
     #[test]
