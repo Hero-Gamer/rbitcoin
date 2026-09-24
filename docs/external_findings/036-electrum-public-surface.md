@@ -19,7 +19,7 @@ Outpoint subscriptions stop at the same per-connection cap as scripthash
 subscriptions. Tip restatus looks up those outpoints off the connection task.
 
 **Regression:** `rbitcoin-query` `tests::paged_history_stops_before_the_create_cap`,
-`rbitcoin-electrum` `surface_tests::outpoint_subs_stop_at_the_scripthash_cap`,
+`rbitcoin-test` `electrum_scripthash_sub_cap_unsubscribe_frees_slot`,
 `surface_tests::silent_payment_log_drops_the_scan_secret`,
 `silent_scan::tests::parse_sub_labels_start_and_networks`,
 `rbitcoin-log` `api_log::tests::api_log_file_records_json_line`.

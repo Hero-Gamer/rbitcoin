@@ -608,7 +608,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
     async fn internal_txs() {
         let pad = pad_hub("internal-txs", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -637,7 +636,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
     async fn internal_mempool_txs_post() {
         let pad = pad_hub("internal-mp-post", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -763,7 +761,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
     async fn internal_block_txs() {
         let pad = pad_hub("internal-block-txs", 1);
         let (handle, sock) = run_unix(pad.dir.as_ref(), Arc::clone(&pad.q), None).await;
@@ -790,7 +787,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
     async fn internal_outspends() {
         let pad = pad_hub("internal-outspends", 3);
         let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -897,5 +893,14 @@ mod tests {
 
         handle.shutdown().await;
         let _ = pad.dir;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn esplora_unix_internal() {
+        internal_txs().await;
+        internal_mempool_txs_post().await;
+        internal_block_txs().await;
+        internal_outspends().await;
     }
 }

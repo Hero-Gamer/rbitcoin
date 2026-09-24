@@ -391,7 +391,6 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn negotiate_protocol_intersection_and_asof_dialect() {
     assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);
     assert_eq!(negotiate_protocol(&json!(["c"])).unwrap(), PROTOCOL_MAX);
@@ -551,7 +550,6 @@ async fn accept_client_ping_and_shutdown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
 async fn chain_view_get_history_stamps_tip_and_changes_on_replace() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
@@ -858,7 +856,6 @@ async fn api_log_records_electrum_method() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn electrum_sh_stamp_follows_pending_before_durable_apply() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
@@ -999,7 +996,6 @@ fn electrum_sh_stamp_follows_pending_before_durable_apply() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn dispatch_casa_sequence_reuses_sh_join_slot() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{body_ok_reads, reset_body_ok_reads, TxApply};
@@ -1116,7 +1112,6 @@ fn dispatch_casa_sequence_reuses_sh_join_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn max_sh_creates_is_electrum_rpc_error_and_ping_still_works() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
@@ -1354,7 +1349,6 @@ fn get_history_height_window_and_status_full() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
 async fn tip_push_and_lagged_client() {
     let (dir, q) = tmp_store();
     // Need a tip for headers.subscribe; empty chain errors on subscribe.
@@ -1447,7 +1441,6 @@ async fn tip_push_and_lagged_client() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn chain_view_status_includes_blockhash() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
@@ -1695,7 +1688,6 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn scripthash_status_matches_get_history_row_order() {
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
@@ -1798,7 +1790,6 @@ fn scripthash_status_matches_get_history_row_order() {
 
 /// Unused scripthash listunspent must not rebuild mempool spentness from
 /// every live body. Confirmed UTXOs spent by the mempool still drop.
-#[test]
 fn listunspent_unused_sh_does_not_load_mempool_bodies() {
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
@@ -1954,7 +1945,6 @@ fn broadcast_hex_cap_enforced() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn features_hosts_onion_tcp() {
     let (dir, q) = tmp_store();
     let params = ChainParams::regtest();
@@ -2020,7 +2010,6 @@ fn serve_limits_public_proxy_defaults() {
     assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
 }
 
-#[test]
 fn tweaks_rpc_result_is_first_height_only() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
@@ -2532,7 +2521,6 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
 fn silentpayments_unsubscribe_clears_session_scan() {
     let (dir, q) = tmp_store();
     let params = ChainParams::regtest();
@@ -2607,4 +2595,24 @@ fn sp_scan_ranges_cover_one_height_and_the_next_chunk() {
     );
     assert_eq!(super::sp_scan_ranges(4, 4), vec![(4, 4)]);
     assert_eq!(super::sp_scan_ranges(0, 1), vec![(0, 1)]);
+}
+
+#[tokio::test]
+async fn electrum_sh_join() {
+    electrum_sh_stamp_follows_pending_before_durable_apply();
+    dispatch_casa_sequence_reuses_sh_join_slot();
+    max_sh_creates_is_electrum_rpc_error_and_ping_still_works();
+    listunspent_unused_sh_does_not_load_mempool_bodies();
+    tip_push_and_lagged_client().await;
+}
+
+#[tokio::test]
+async fn electrum_version_history_and_asof() {
+    negotiate_protocol_intersection_and_asof_dialect();
+    features_hosts_onion_tcp();
+    tweaks_rpc_result_is_first_height_only();
+    chain_view_status_includes_blockhash();
+    scripthash_status_matches_get_history_row_order();
+    silentpayments_unsubscribe_clears_session_scan();
+    chain_view_get_history_stamps_tip_and_changes_on_replace().await;
 }

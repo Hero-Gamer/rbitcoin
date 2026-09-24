@@ -912,6 +912,63 @@ async fn electrum_scripthash_sub_cap_unsubscribe_frees_slot() {
         v.get("error").is_none(),
         "unsubscribe must free a cap slot: {v}"
     );
+    // Outpoint subs are a second set with the same numeric cap.
+    let op = |n: u8| "11".repeat(31) + &format!("{n:02x}");
+    let a = rpc(
+        &mut stream,
+        7,
+        "blockchain.outpoint.subscribe",
+        json!([op(1), 0]),
+    )
+    .await;
+    assert!(a.get("result").is_some(), "{a}");
+    let b = rpc(
+        &mut stream,
+        8,
+        "blockchain.outpoint.subscribe",
+        json!([op(2), 0]),
+    )
+    .await;
+    assert!(b.get("result").is_some(), "{b}");
+    let again = rpc(
+        &mut stream,
+        9,
+        "blockchain.outpoint.subscribe",
+        json!([op(1), 0]),
+    )
+    .await;
+    assert!(
+        again.get("result").is_some(),
+        "resubscribe stays under the cap: {again}"
+    );
+    let third = rpc(
+        &mut stream,
+        10,
+        "blockchain.outpoint.subscribe",
+        json!([op(3), 0]),
+    )
+    .await;
+    let msg = third["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("max 2"), "{third}");
+    let un = rpc(
+        &mut stream,
+        11,
+        "blockchain.outpoint.unsubscribe",
+        json!([op(1), 0]),
+    )
+    .await;
+    assert_eq!(un["result"], json!(true), "{un}");
+    let freed = rpc(
+        &mut stream,
+        12,
+        "blockchain.outpoint.subscribe",
+        json!([op(3), 0]),
+    )
+    .await;
+    assert!(
+        freed.get("error").is_none(),
+        "unsubscribe must free an outpoint cap slot: {freed}"
+    );
     handle.shutdown().await;
 }
 

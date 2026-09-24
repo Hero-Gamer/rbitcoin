@@ -2479,18 +2479,6 @@ mod surface_tests {
     use super::*;
 
     #[test]
-    fn outpoint_subs_stop_at_the_scripthash_cap() {
-        let mut subs = HashSet::new();
-        assert!(admit_outpoint_sub(&mut subs, [1; 32], 0, 2).is_ok());
-        assert!(admit_outpoint_sub(&mut subs, [2; 32], 0, 2).is_ok());
-        assert!(admit_outpoint_sub(&mut subs, [1; 32], 0, 2).is_ok());
-        let err = admit_outpoint_sub(&mut subs, [3; 32], 0, 2).unwrap_err();
-        assert!(err.contains("max 2"), "{err}");
-        assert!(subs.remove(&([1; 32], 0)));
-        assert!(admit_outpoint_sub(&mut subs, [3; 32], 0, 2).is_ok());
-    }
-
-    #[test]
     fn silent_payment_log_drops_the_scan_secret() {
         let secret = "ab".repeat(32);
         let line = redact_sp_params(&json!([secret, "02ff", 1]));
