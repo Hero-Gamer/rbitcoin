@@ -2671,11 +2671,14 @@ mod tests {
         cfg.listen.connect.clear();
         cfg.max_run_secs = Some(0); // exit after catch-up / tip mode
         cfg.smoke = false;
+        cfg.mempool.bytes_per_sigop = Some(0);
+        let mempool_path = cfg.mempool_path();
         // Bound runtime so a hang fails the test suite instead of blocking.
         // max_run_secs=0 should exit immediately after catch-up; keep bound tight.
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p ok with no peers");
+        assert!(mempool_path.exists(), "run_p2p opens the mempool");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

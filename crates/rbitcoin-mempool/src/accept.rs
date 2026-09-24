@@ -3373,6 +3373,7 @@ mod tests {
         let (live_after, body_after) = mp.compact().unwrap();
         assert_eq!(live_after, 1);
         assert!(body_after <= body_before + 256);
+        assert_eq!(body_after, mp.store.body_logical_len().unwrap());
         assert_eq!(mp.live_count(), 1);
         mp.flush().unwrap();
         let mp2 = ActiveMempool::open_or_create(&dir).unwrap();
@@ -4399,6 +4400,25 @@ mod tests {
         assert!(matches!(
             mp.accept_tx(&tx, &utxos, TIP_OK),
             Err(AcceptError::Policy("min relay fee"))
+        ));
+        mp.set_bytes_per_sigop(0);
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
+    }
+
+    /// A full pool's raised floor also prices the sigop-adjusted vsize.
+    #[test]
+    fn mempool_min_fee_uses_sigop_adjusted_vsize() {
+        let (utxos, mut tx) = witness_sigops_spend(222, 1);
+        tx.output[0].value = Amount::from_sat(1_000_000 - 100);
+        let dir = tmp_dir();
+        // Below one standard tx of headroom: floor is min relay + 0.1 sat/vB.
+        let mut mp =
+            ActiveMempool::open_or_create_with_limit(&dir, policy::MAX_STANDARD_TX_WEIGHT - 1)
+                .unwrap();
+        assert!(mp.mempool_min_fee_sat_kvb() > mp.min_relay_sat_kvb);
+        assert!(matches!(
+            mp.accept_tx(&tx, &utxos, TIP_OK),
+            Err(AcceptError::Policy("mempool min fee"))
         ));
         mp.set_bytes_per_sigop(0);
         mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
