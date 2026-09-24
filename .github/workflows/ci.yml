@@ -388,7 +388,11 @@ jobs:
         run: ./scripts/publish-coverage-badge.sh
 
   mutants-baseline-diff:
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, mutants]
+    permissions:
+      issues: write
+      pull-requests: write
+
     runs-on: ubuntu-latest
     if: ${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock') != '' }}
     steps:
@@ -398,7 +402,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: mutants-out-*
-          merge-multiple: true
+          path: mutants-shards
+          merge-multiple: false
       - name: Compare vs baseline
         run: python3 scripts/mutants-diff.py | tee mutants-diff.log
       - name: Comment PR on failure
