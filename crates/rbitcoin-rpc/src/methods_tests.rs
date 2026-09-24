@@ -3823,6 +3823,15 @@ fn getmempoolentry_vsize_is_sigop_adjusted() {
         (json!(1), json!(4_000))
     );
     assert_eq!(info["total_fee"], json!(0.00002));
+    // Esplora `/mempool/recent` vsize is raw (electrs `tx.vsize()`), unlike RPC.
+    let recent = ctx.mempool.as_ref().unwrap().recent_accepts();
+    assert_eq!(
+        recent
+            .iter()
+            .map(|r| (r.txid, r.weight))
+            .collect::<Vec<_>>(),
+        vec![(tid, raw_w)]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

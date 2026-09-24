@@ -309,6 +309,7 @@ fn is_hard_recent_reject(e: &AcceptError) -> bool {
 pub struct RecentAccept {
     pub txid: Txid,
     pub fee_sat: u64,
+    /// Raw BIP141 weight (not sigop-adjusted).
     pub weight: u64,
     /// Sum of output values (sats).
     pub value_sat: u64,
@@ -1005,7 +1006,8 @@ impl MempoolHub {
         let entry = RecentAccept {
             txid: r.txid,
             fee_sat: r.fee_sat,
-            weight: r.weight,
+            // Raw: Esplora `/mempool/recent` vsize is electrs `tx.vsize()`.
+            weight: tx.weight().to_wu(),
             value_sat,
         };
         let mut q = self.recent.lock().unwrap();
