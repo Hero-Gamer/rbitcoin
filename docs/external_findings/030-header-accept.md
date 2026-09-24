@@ -10,5 +10,5 @@ and does not disconnect the tip. Header work is summed with a checked
 add. A zero `nBits` target is not passed to `Header::work`.
 
 **Regression:** `rbitcoin-net`
-`chain::tests::zero_prev_with_live_tip_is_not_held`,
+`chain::tests::hostile_peer_session`,
 `most_work::tests::sum_work_and_work_better`

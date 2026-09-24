@@ -31,10 +31,10 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [038](./038-tip-accept-lifetime.md) | high | Async tip-accept job must not borrow a dropped hub | fixed | `owned_job_finishes_after_waiter_abort` |
 | [036](./036-electrum-public-surface.md) | critical | Public Electrum scan secret, join, and subscription caps | fixed | `paged_history_stops_before_the_create_cap` |
 | [035](./035-bip30-bip34-ancestry.md) | low | BIP30 skipped on signet after height 1 | fixed | `bip30_signet_rejects_unspent_overwrite_after_bip34` |
-| [034](./034-witness-padding-not-cached.md) | high | Witness padding cached as an invalid block hash | fixed | `padded_coinbase_witness_over_weight_is_not_cached_invalid` |
+| [034](./034-witness-padding-not-cached.md) | high | Witness padding cached as an invalid block hash | fixed | `hostile_peer_session` |
 | [033](./033-ibd-intake-bounds.md) | critical | IBD path state and body bytes before validation | fixed | `rejected_header_batch_does_not_grow_path_or_explore` |
-| [030](./030-header-accept.md) | critical | Invalid header held; zero prev wipes tip | fixed | `zero_prev_with_live_tip_is_not_held` |
-| [029](./029-compact-tx-count.md) | critical | Compact block tx count and one partial per peer | fixed | `reconstruct_rejects_tx_count_above_weight_ratio`, `pending_header_insert_past_cap_clears` |
+| [030](./030-header-accept.md) | critical | Invalid header held; zero prev wipes tip | fixed | `hostile_peer_session` |
+| [029](./029-compact-tx-count.md) | critical | Compact block tx count and one partial per peer | fixed | `reconstruct_rejects_tx_count_above_weight_ratio`, `hostile_peer_session` |
 | [032](./032-block-tx-count-alloc.md) | critical | Block tx count allocated before the payload was checked | fixed | `decode_block_precomputes_rejects_tx_count_past_payload` |
 | [031](./031-signet-solution.md) | high | Signet solution CompactSize and pushes | fixed | `compact_size_and_solution_parse_errors` |
 | [024](./024-talip-review-index.md) | — | Talip review index | index | Q-71 |
@@ -52,9 +52,9 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `two_parent_insert_builds_the_cluster_once` |
 | [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
-| [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst` |
+| [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `hostile_peer_session` |
 | [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` |
-| [043](./043-peer-send-buffer.md) | high | Unbounded per-peer outbound queue | fixed | `getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once` |
+| [043](./043-peer-send-buffer.md) | high | Unbounded per-peer outbound queue | fixed | `hostile_peer_session` |
 | [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline

@@ -3402,7 +3402,6 @@ mod tests {
         panic!("no distinct pow sibling");
     }
 
-    #[test]
     fn zero_prev_with_live_tip_is_not_held() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -3642,7 +3641,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     fn time_too_new_does_not_cache_block_failed() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -5572,7 +5570,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
     fn padded_coinbase_witness_over_weight_is_not_cached_invalid() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -5596,6 +5593,13 @@ mod tests {
             AcceptOutcome::Accepted { height: 1 }
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hostile_peer_session() {
+        zero_prev_with_live_tip_is_not_held();
+        padded_coinbase_witness_over_weight_is_not_cached_invalid();
+        time_too_new_does_not_cache_block_failed();
     }
 
     #[test]

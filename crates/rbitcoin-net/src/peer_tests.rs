@@ -16,7 +16,6 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
     }
 }
 
-#[test]
 fn pending_header_insert_past_cap_clears() {
     let mut pending = HashMap::new();
     let hdr = bitcoin::block::Header {
@@ -10444,7 +10443,6 @@ async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
 
 /// A peer that asks for headers and never reads must not grow the outbound
 /// queue without bound. One getaddr is answered; a second is not.
-#[test]
 fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
     use crate::peers::{PeerConnType, PeerHub};
     use bitcoin::hashes::Hash;
@@ -10594,7 +10592,6 @@ fn getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
 fn send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
@@ -10751,7 +10748,6 @@ async fn compact_getdata_at_depth_five_is_compact_and_deeper_is_a_full_block() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
 fn addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst() {
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message_network::VersionMessage;
@@ -10829,7 +10825,6 @@ fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
     h
 }
 
-#[test]
 fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
     use bitcoin::p2p::address::AddrV2;
     use bitcoin::p2p::message_network::VersionMessage;
@@ -10951,7 +10946,6 @@ fn addr_relay_follows_the_address_key_and_skips_unwilling_peers() {
     }
 }
 
-#[test]
 fn invalid_script_is_scored_and_policy_is_not() {
     use rbitcoin_mempool::AcceptError;
     assert_eq!(
@@ -10962,4 +10956,14 @@ fn invalid_script_is_scored_and_policy_is_not() {
         super::tx_reject_ban_score(&AcceptError::Policy("bad-txns-too-many-sigops")),
         0
     );
+}
+
+#[test]
+fn hostile_peer_session() {
+    pending_header_insert_past_cap_clears();
+    getheaders_flood_stops_at_the_send_budget_and_getaddr_is_once();
+    send_budget_counts_block_addrv2_and_cmpct_and_stops_above_four_mib();
+    addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst();
+    addr_relay_follows_the_address_key_and_skips_unwilling_peers();
+    invalid_script_is_scored_and_policy_is_not();
 }
