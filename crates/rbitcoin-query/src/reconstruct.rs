@@ -376,9 +376,6 @@ impl Query {
         let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
             return Ok(None);
         };
-        if n == 0 || first.is_null() {
-            return Ok(None);
-        }
         let last = first.0.saturating_add(u64::from(n) - 1);
         if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
             if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {

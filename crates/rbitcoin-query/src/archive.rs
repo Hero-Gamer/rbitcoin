@@ -1474,6 +1474,21 @@ mod tests {
             0,
             "txstat sum must not reconstruct"
         );
+        let (first, _) = q.store().header_txs.get_range(hfk).unwrap().unwrap();
+        q.store()
+            .write_txstat_row(
+                first,
+                &rbitcoin_store::TxStatRow {
+                    fee_sat: 0,
+                    base: 0,
+                    wit_extra: 0,
+                },
+            )
+            .unwrap();
+        let _ = q.sample_reset_reconstruct_archived();
+        let rebuilt = q.block_size_weight(hfk).unwrap().unwrap();
+        assert_eq!(rebuilt, hit, "a zero txstat cell must not shorten the sum");
+        assert_eq!(q.sample_reset_reconstruct_archived(), 1);
         assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
