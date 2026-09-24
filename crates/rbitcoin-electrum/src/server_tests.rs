@@ -2590,12 +2590,7 @@ fn silentpayments_unsubscribe_clears_session_scan() {
 
 #[test]
 fn sp_scan_ranges_cover_one_height_and_the_next_chunk() {
-    assert!(
-        super::sp_scan_ranges(5, 4).is_empty(),
-        "a start past the tip scans nothing"
-    );
-    assert_eq!(super::sp_scan_ranges(4, 4), vec![(4, 4)]);
-    assert_eq!(super::sp_scan_ranges(0, 1), vec![(0, 1)]);
+    // A span past one chunk must fail a broken stop before a one-height call can spin.
     assert_eq!(
         super::sp_scan_ranges(0, crate::silent_scan::SP_SCAN_CHUNK),
         vec![
@@ -2606,4 +2601,10 @@ fn sp_scan_ranges_cover_one_height_and_the_next_chunk() {
             )
         ]
     );
+    assert!(
+        super::sp_scan_ranges(5, 4).is_empty(),
+        "a start past the tip scans nothing"
+    );
+    assert_eq!(super::sp_scan_ranges(4, 4), vec![(4, 4)]);
+    assert_eq!(super::sp_scan_ranges(0, 1), vec![(0, 1)]);
 }
