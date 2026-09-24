@@ -343,9 +343,6 @@ async fn satisfy_http_wait(
             let ctx = Arc::clone(&ctx);
             let kind = kind.clone();
             tokio::task::spawn_blocking(move || {
-                if ctx.stop.load(Ordering::SeqCst) {
-                    return true;
-                }
                 let Ok((hash, height)) = tip_hash_height(&ctx) else {
                     return true;
                 };
@@ -1539,5 +1536,96 @@ mod tests {
             "unix unauthenticated getblockcount: {text}"
         );
         handle.shutdown().await;
+    }
+
+    fn http_wait_ctx() -> (
+        Arc<crate::methods::RpcContext>,
+        rbitcoin_store::testutil::TempDir,
+    ) {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-http-wait").expect("temp dir");
+        let hub = Arc::new(rbitcoin_net::ChainHub::new(
+            Query::open_or_create_tiny(dir.join("store")).unwrap(),
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        ));
+        hub.ensure_genesis().unwrap();
+        let ctx = Arc::new(crate::methods::RpcContext {
+            query: Arc::clone(&hub.query),
+            mempool: None,
+            network: Network::Regtest,
+            start: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicU64::new(0)),
+            initial_block_download: Arc::new(AtomicBool::new(false)),
+            subversion: "/rbitcoin:test/".into(),
+            regtest: None,
+            peers: None,
+            chain: Some(hub),
+            addrman: None,
+            logpath: String::new(),
+            active: Arc::new(std::sync::Mutex::new(crate::methods::RpcActive::default())),
+            alert_notify: None,
+            alert_fired: Arc::new(AtomicBool::new(false)),
+        });
+        (ctx, dir)
+    }
+
+    #[tokio::test]
+    async fn http_wait_stop_returns_before_the_timeout() {
+        let (ctx, _dir) = http_wait_ctx();
+        ctx.stop.store(true, Ordering::SeqCst);
+        let body = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [99, 2_000]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &body).await);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "stop is enough; the deadline is still ahead"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_wait_met_height_does_not_sleep() {
+        let (ctx, _dir) = http_wait_ctx();
+        let body = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [0, 2_000]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &body).await);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "genesis height already meets 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_wait_unmet_height_and_same_tip_use_the_timeout() {
+        let (ctx, _dir) = http_wait_ctx();
+        let height = serde_json::json!({
+            "method": "waitforblockheight",
+            "params": [1, 160]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &height).await);
+        let dt = t0.elapsed();
+        assert!(
+            dt >= std::time::Duration::from_millis(100),
+            "height 1 is still ahead of genesis, waited {dt:?}"
+        );
+
+        let fresh = serde_json::json!({
+            "method": "waitfornewblock",
+            "params": [160]
+        });
+        let t0 = Instant::now();
+        assert!(satisfy_http_wait(&ctx, &fresh).await);
+        let dt = t0.elapsed();
+        assert!(
+            dt >= std::time::Duration::from_millis(100),
+            "the tip did not move, waited {dt:?}"
+        );
     }
 }

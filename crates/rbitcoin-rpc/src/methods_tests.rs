@@ -5769,3 +5769,16 @@ fn testmempoolaccept_active_known_vs_mempool_vs_archive() {
     dispatch(&ctx, "reconsiderblock", vec![tip]).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn http_wait_satisfied_tracks_the_setter() {
+    set_http_wait_satisfied(false);
+    assert!(
+        !http_wait_satisfied(),
+        "the blocking dispatch has not been told the HTTP task already waited"
+    );
+    set_http_wait_satisfied(true);
+    assert!(http_wait_satisfied());
+    set_http_wait_satisfied(false);
+    assert!(!http_wait_satisfied());
+}
