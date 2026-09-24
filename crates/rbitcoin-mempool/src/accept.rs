@@ -3089,6 +3089,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// testmempoolaccept preview enforces cluster count and raw-weight vsize
+    /// limits itself (only the accept path re-checks after insert): exactly at
+    /// each limit previews Ok, one past is ClusterTooLarge with exact totals.
+    #[test]
+    fn evaluate_after_script_enforces_cluster_limits() {
+        let (op, _, utxos) = chain_utxo(100_000);
+        let parent = spend_tx(op, 99_000);
+        let pw = parent.weight().to_wu();
+        let pad_child = |total_w: u64| {
+            let mut c = spend_tx(
+                OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                98_000,
+            );
+            while pw + c.weight().to_wu() < total_w {
+                c.output[0]
+                    .script_pubkey
+                    .push_opcode(bitcoin::opcodes::OP_TRUE);
+            }
+            assert_eq!(pw + c.weight().to_wu(), total_w);
+            c
+        };
+        let preview = |count: u32, child: &Transaction| {
+            let dir = tmp_dir();
+            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+            mp.set_cluster_limits(Some(count), Some(1)); // 1 kvB = 4_000 WU
+            mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
+            let prep = mp
+                .prepare_admit(child, &utxos, TIP_OK, 0, true, None)
+                .unwrap();
+            mp.evaluate_after_script(child, prep).map(|r| r.txid)
+        };
+        let at = pad_child(4_000);
+        assert_eq!(preview(2, &at).unwrap(), at.compute_txid());
+        let over = pad_child(4_004);
+        assert!(matches!(
+            preview(2, &over),
+            Err(AcceptError::ClusterTooLarge {
+                count: 2,
+                weight: 4_004
+            })
+        ));
+        assert!(matches!(
+            preview(1, &at),
+            Err(AcceptError::ClusterTooLarge {
+                count: 2,
+                weight: 4_000
+            })
+        ));
+    }
+
     #[test]
     fn commit_after_script_does_not_take_utxo_provider() {
         let dir = tmp_dir();
