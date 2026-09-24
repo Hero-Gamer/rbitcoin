@@ -3460,6 +3460,7 @@ fn pruned_seqsigwit_life() {
     prune_mode_refuses_disable();
     enable_prune_after_history_seeds_recent_spill_window();
     reorg_through_pruneheight_refuses();
+    #[cfg(unix)]
     spill_symlink_outside_window_is_corrupt();
     reconstruct_pruned_returns_pruned_not_corrupt();
 }
