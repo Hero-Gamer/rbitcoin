@@ -287,6 +287,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. `DEFAULT_BODY_DEPTH == 16` stays a unit. |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
 | `store_table_header_and_idx_corrupt` | Store | Table header/head corrupt open |
+| `pruned_seqsigwit_life` | Query + RPC (crate) | One `query_tests` entry for the prune watermark, RAM window, reopen, refuse-disable, reorg-through-pruneheight, and corrupt spill. One `methods_tests` entry for pruned `getblock` and `getblockstats` with and without txstat. |
 | `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect to genesis + reconnect suffix (header gen roll). Corrupt merkle in the last 6 confirmed heights: `Query::open` shrinks (`VERIFY_TIP_BLOCKS=6`) |
 | `consensus_mature_chain_spend_reconstruct_and_scripthash` | Consensus+query | **One** mature mine: spend, local prev_fk, double-spend (accept, Class A then accept, and `confirm_wire_run`), reopen reconstruct (`witness_block_bytes` == serialize), SH history/balance. After disconnect, `resume_work_path_after_tip` still sees Class A bodies. Packed create_fk layout stays `input_encode_create_fk_not_prev_txid` |
 | `confirm_load_ahead_of_write_does_not_badprev` | Consensus+query | Pipelined load 11..=20 while 1..=10 is still unwritten; then load 21..=32 after tip-GC (store MTP for confirmed parents) |
