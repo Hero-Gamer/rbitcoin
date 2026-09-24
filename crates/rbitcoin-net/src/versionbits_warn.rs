@@ -159,12 +159,11 @@ mod tests {
     }
 
     /// Regtest-shaped chain of `n` headers; heights in `signal` set bit 27.
-    fn put_chain(q: &Query, n: u32, signal: impl Fn(u32) -> bool, salt: u8) -> Vec<[u8; 32]> {
+    fn put_chain(q: &Query, n: u32, signal: impl Fn(u32) -> bool, salt: u8) {
         use rbitcoin_primitives::Fk;
         use rbitcoin_store::HeaderRecord;
         let mut prev_fk = Fk::NULL;
         let mut prev_hash = [0u8; 32];
-        let mut hashes = Vec::new();
         for h in 0u32..n {
             let mut merkle = [salt; 32];
             merkle[0..4].copy_from_slice(&h.to_le_bytes());
@@ -199,82 +198,35 @@ mod tests {
             prev_fk = q.put_header(&rec).unwrap();
             q.store().confirmed.set(Height(h), prev_fk).unwrap();
             prev_hash = hash;
-            hashes.push(hash);
         }
         q.store().rebuild_height_fence().unwrap();
-        hashes
     }
 
-    /// `getnetworkinfo` / `getblockchaininfo` read every header from genesis
-    /// for each of 29 bits (≈4.7 s on mainnet). The scan keeps its place and
-    /// only reads periods completed since the last call.
+    /// Activation needs a signalling period plus one more; the scan keeps its
+    /// place across calls (`getnetworkinfo` used to re-read every header per
+    /// bit, ≈4.7 s on mainnet) and starts over when the boundary changes.
     #[test]
-    fn scan_reads_only_new_periods_and_restarts_after_a_reorg() {
-        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-scan");
-        let period = 144;
-        put_chain(&q, 3 * period + 10, |h| h < period, 0);
-        let mut scan = UnknownBitsScan::new();
-        assert_eq!(scan.active_bits(&q, Network::Regtest), vec![27]);
-        assert_eq!(scan.scanned_periods, 2);
-
-        assert_eq!(scan.active_bits(&q, Network::Regtest), vec![27]);
-        assert_eq!(scan.scanned_periods, 2, "same tip: nothing new to read");
-
-        let (dir2, q2) = rbitcoin_query::testutil::tiny_query_labeled("vb-scan-reorg");
-        put_chain(&q2, 3 * period + 10, |_| false, 1);
-        assert!(
-            scan.active_bits(&q2, Network::Regtest).is_empty(),
-            "a different chain at the scanned boundary starts over"
-        );
-        assert_eq!(scan.scanned_periods, 2);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    #[test]
-    fn unknown_bit_is_active_two_periods_after_threshold() {
-        use rbitcoin_primitives::{Fk, Height};
-        use rbitcoin_store::HeaderRecord;
-
+    fn unknown_bit_scan_activates_and_keeps_its_place() {
         let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-active");
         assert!(UnknownBitsScan::new().advance(&q, 0, 4, 2).is_empty());
         assert!(UnknownBitsScan::new().advance(&q, 4, 4, 2).is_empty());
 
-        let signal = (VERSIONBITS_TOP_BITS | (1 << 27)) as i32;
-        let mut prev_fk = Fk::NULL;
-        let mut prev_hash = [0u8; 32];
-        for h in 0u32..=8 {
-            let mut merkle = [0u8; 32];
-            merkle[0..4].copy_from_slice(&h.to_le_bytes());
-            let version = if h == 0 || h >= 4 { 1 } else { signal };
-            let timestamp = h + 1;
-            let bits = 0x207fffff;
-            let nonce = h;
-            let hash = if h == 0 {
-                merkle
-            } else {
-                rbitcoin_store::block_header_hash(
-                    version, &prev_hash, &merkle, timestamp, bits, nonce,
-                )
-            };
-            let rec = HeaderRecord {
-                prev_fk,
-                version,
-                timestamp,
-                bits,
-                nonce,
-                merkle_root: merkle,
-                hash,
-                size: 0,
-                weight: 0,
-            };
-            prev_fk = q.put_header(&rec).unwrap();
-            q.store().confirmed.set(Height(h), prev_fk).unwrap();
-            prev_hash = hash;
-        }
-        q.store().rebuild_height_fence().unwrap();
-        assert_eq!(UnknownBitsScan::new().advance(&q, 8, 4, 2), vec![27]);
+        put_chain(&q, 9, |h| h < 4, 0);
+        let mut scan = UnknownBitsScan::new();
+        assert_eq!(scan.advance(&q, 8, 4, 2), vec![27]);
+        assert_eq!(scan.scanned_periods, 1);
+        assert_eq!(scan.advance(&q, 8, 4, 2), vec![27]);
+        assert_eq!(scan.scanned_periods, 1, "same tip: nothing new to read");
         assert!(UnknownBitsScan::new().advance(&q, 8, 4, 4).is_empty());
+
+        let (dir2, other) = rbitcoin_query::testutil::tiny_query_labeled("vb-other");
+        put_chain(&other, 9, |_| false, 1);
+        assert!(
+            scan.advance(&other, 8, 4, 2).is_empty(),
+            "a different header at the counted boundary starts over"
+        );
+        assert_eq!(scan.scanned_periods, 1);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
