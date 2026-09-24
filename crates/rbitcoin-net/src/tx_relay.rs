@@ -2831,6 +2831,11 @@ impl MempoolHub {
             .map(|e| (e.fee_sat, e.weight))
     }
 
+    /// Full BIP16 + BIP141 sigop cost recorded at admission (GBT `sigops`).
+    pub fn get_live_sigop_cost(&self, txid: &Txid) -> Option<u64> {
+        self.lock_read().graph.get(txid).map(|e| e.sigop_cost)
+    }
+
     pub fn try_get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
         self.inner
             .try_read()
@@ -3841,7 +3846,8 @@ mod tests {
             // Unknown sigop cost (schema-2 migrate): open recomputes it from
             // chain coins and drops the entry whose input is not a coin.
             let mp = tmp();
-            let ok = spend_true(cbs[0], 1_000, spk.clone());
+            // OP_CHECKSIG output: one legacy sigop, cost 4.
+            let ok = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0xac]));
             let gone = spend_true(Txid::from_byte_array([0xee; 32]), 1_000, spk.clone());
             {
                 let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
@@ -3854,9 +3860,10 @@ mod tests {
                 store.flush().unwrap();
             }
             let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
-            assert!(hub.contains(&ok.compute_txid()));
-            assert!(
-                !hub.contains(&gone.compute_txid()),
+            assert_eq!(hub.get_live_sigop_cost(&ok.compute_txid()), Some(4));
+            assert_eq!(
+                hub.get_live_sigop_cost(&gone.compute_txid()),
+                None,
                 "unresolvable input evicted"
             );
             let _ = std::fs::remove_dir_all(&mp);

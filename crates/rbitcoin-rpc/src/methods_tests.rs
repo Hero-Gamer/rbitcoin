@@ -2989,6 +2989,65 @@ fn getblocktemplate_requires_segwit_and_shapes_empty_and_one_tx() {
     )
     .unwrap();
     assert_eq!(stale["longpollid"], lp1);
+
+    // P2SH and P2WSH `OP_3 OP_CHECKMULTISIG` spends: Core GBT `sigops` is the
+    // full cost (3 * 4 P2SH + 3 witness = 15); legacy-only counting gives 0.
+    let ms = ScriptBuf::from_bytes(vec![0x53, 0xae]);
+    let cb2 = generated_coinbase_value(&ctx, 2);
+    let mut fund = spend_generated_coinbase(&ctx, 2, 0, ms.to_p2sh()).1;
+    fund.output[0].value = Amount::from_sat(cb2 / 2 - 1_000);
+    fund.output.push(TxOut {
+        value: Amount::from_sat(cb2 / 2 - 1_000),
+        script_pubkey: ms.to_p2wsh(),
+    });
+    dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(hex_encode(serialize(&fund)))],
+    )
+    .unwrap();
+    let pk = [0x02u8; 33];
+    let mut p2sh_sig = bitcoin::script::Builder::new().push_int(0).push_int(0);
+    for _ in 0..3 {
+        p2sh_sig = p2sh_sig.push_slice(pk);
+    }
+    let p2sh_sig = p2sh_sig
+        .push_slice(<&bitcoin::script::PushBytes>::try_from(ms.as_bytes()).unwrap())
+        .into_script();
+    let wit = Witness::from_slice(&[&[][..], &[], &pk, &pk, &pk, ms.as_bytes()]);
+    let fid = fund.compute_txid();
+    let ms_spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint { txid: fid, vout: 0 },
+                script_sig: p2sh_sig,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint { txid: fid, vout: 1 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: wit,
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(cb2 - 4_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let ms_id = dispatch(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(hex_encode(serialize(&ms_spend)))],
+    )
+    .unwrap();
+    let tmpl = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let txs = tmpl["transactions"].as_array().unwrap();
+    let ms_json = txs.iter().find(|t| t["txid"] == ms_id).expect("ms spend");
+    assert_eq!(ms_json["sigops"], 15);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

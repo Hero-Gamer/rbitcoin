@@ -506,14 +506,6 @@ fn prevout_spk_sigops(inp: &bitcoin::TxIn, spk: &[u8], bip16: bool, segwit: bool
     n
 }
 
-/// GBT `sigops`: legacy sigop count × witness scale factor.
-///
-/// Full sigop cost also adds P2SH/witness when prevouts are known; template
-/// rows use this scaled legacy count (P2PK output = 4).
-pub fn tx_gbt_sigops(tx: &Transaction) -> u64 {
-    legacy_sigop_count(tx).saturating_mul(4)
-}
-
 /// Full Core-style sigop cost for one tx given prevout scripts (BIP16 + BIP141).
 pub fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool, segwit: bool) -> u64 {
     const WITNESS_SCALE: u64 = 4;

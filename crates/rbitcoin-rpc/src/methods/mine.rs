@@ -687,7 +687,11 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
             "hash": tx.compute_wtxid().to_string(),
             "depends": depends,
             "fee": fee,
-            "sigops": rbitcoin_consensus::tx_gbt_sigops(tx),
+            "sigops": ctx
+                .mempool
+                .as_ref()
+                .and_then(|mp| mp.get_live_sigop_cost(&txid))
+                .unwrap_or(0),
             "weight": tx.weight().to_wu(),
         }));
     }

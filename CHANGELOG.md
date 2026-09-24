@@ -174,6 +174,11 @@ before 1.0).
   trying later chunks instead of stopping, so a sigop-heavy pool no longer
   yields a `bad-blk-sigops` template.
 
+- **`getblocktemplate` `sigops`:** each row reports the entry's full
+  BIP16+BIP141 sigop cost recorded at admission (Core
+  `GetTransactionSigOpCost`), not legacy sigops × 4. P2SH and P2WSH spends
+  were under-reported.
+
 - **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
   near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the
   Sunday hour, which just clears it. A mute run still fails.
