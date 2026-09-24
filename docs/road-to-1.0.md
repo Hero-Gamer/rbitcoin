@@ -5,7 +5,7 @@ Day-to-day ranked work stays in [`quality.md`](./quality.md).
 
 **Today (0.7.99):** in-tree toward **0.8.0**. Last published tag is **0.7.0**
 (`v0.7.x` patch line). Current bytes and refuse:
-[`SCHEMA.md`](../SCHEMA.md) (`SCHEMA_VERSION = 25`). Occupied 0.6.x
+[`SCHEMA.md`](../SCHEMA.md) (`SCHEMA_VERSION = 26`). Occupied 0.6.x
 (schema 20) Class A refuses (wipe + IBD).
 Electrum/Esplora need `--sh-index` (default off). BIP324 v2-only. Install is
 a GitHub Release (Linux musl; Windows/Darwin snapshots). Nightly

@@ -698,7 +698,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](./SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 25`). This section is
+Live bytes: [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 26`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:

@@ -276,14 +276,6 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
     n
 }
 
-fn block_size_weight(block: &bitcoin::Block) -> Result<(u32, u32), StoreError> {
-    let size = u32::try_from(block.total_size())
-        .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
-    let weight = u32::try_from(block.weight().to_wu())
-        .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
-    Ok((size, weight))
-}
-
 /// Write-ready plan batch from lookup/load to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
@@ -297,7 +289,7 @@ pub struct ArchiveWritePlan {
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
-    /// BIP144 size + BIP141 weight per [`Self::per_header_ranges`] row.
+    /// Empty. Block size and weight are summed from `txstat`, not stored here.
     pub per_header_sw: Vec<(u32, u32)>,
     /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins
     /// are the commit payload (filled at plan).
@@ -924,7 +916,6 @@ impl Query {
         let mut batch_map: crate::TxidMap<Fk> = crate::TxidMap::default();
         let mut work: Vec<PlanRow> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
-        let mut per_header_sw: Vec<(u32, u32)> = Vec::with_capacity(need.len());
 
         for (header_fk, block, txids) in need {
             if block.txdata.is_empty() {
@@ -957,10 +948,9 @@ impl Query {
                 });
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
-            per_header_sw.push(block_size_weight(block)?);
         }
         let assign_ns = t_assign.elapsed().as_nanos() as u64;
-        let mut plan = self.finish_archive_plan(
+        let plan = self.finish_archive_plan(
             work,
             batch_map,
             per_header_ranges,
@@ -970,7 +960,6 @@ impl Query {
             skeleton,
             carried_need,
         )?;
-        plan.per_header_sw = per_header_sw;
         Ok(plan)
     }
 
@@ -1256,18 +1245,6 @@ impl Query {
                 .header_txs
                 .put_ranges_batch(&plan.per_header_ranges)?;
         }
-        if !plan.per_header_sw.is_empty() {
-            if plan.per_header_sw.len() != plan.per_header_ranges.len() {
-                return Err(StoreError::Corrupt("invariant: header size/weight length"));
-            }
-            let rows: Vec<(Fk, u32, u32)> = plan
-                .per_header_ranges
-                .iter()
-                .zip(plan.per_header_sw.iter())
-                .map(|(&(hfk, _, _), &(size, weight))| (hfk, size, weight))
-                .collect();
-            self.store.headers.put_size_weight_run(&rows)?;
-        }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
         let total_ns = t0.elapsed().as_nanos() as u64;
@@ -1444,30 +1421,21 @@ mod tests {
         assert!(q.tip_height().is_none(), "Class A helper must not set tip");
         assert!(q.store().header_txs.has_body(hfk).unwrap());
         let rec = q.store().headers.get(hfk).unwrap();
-        assert_eq!(
-            rec.size,
-            u32::try_from(block.total_size()).unwrap(),
-            "confirm write stamps BIP144 size"
-        );
-        assert_eq!(
-            rec.weight,
-            u32::try_from(block.weight().to_wu()).unwrap(),
-            "confirm write stamps BIP141 weight"
-        );
+        assert_eq!((rec.size, rec.weight), (0, 0));
         let _ = q.sample_reset_reconstruct_archived();
         let hit = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(hit, (rec.size, rec.weight));
+        assert_eq!(
+            hit,
+            (
+                u32::try_from(block.total_size()).unwrap(),
+                u32::try_from(block.weight().to_wu()).unwrap(),
+            )
+        );
         assert_eq!(
             q.sample_reset_reconstruct_archived(),
             0,
-            "stamped size/weight must not reconstruct"
+            "txstat sum must not reconstruct"
         );
-        q.store().headers.set_size_weight(hfk, 0, 0).unwrap();
-        let filled = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(filled, hit);
-        assert_eq!(q.sample_reset_reconstruct_archived(), 1);
-        let _ = q.block_size_weight(hfk).unwrap();
-        assert_eq!(q.sample_reset_reconstruct_archived(), 0);
         assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -78,7 +78,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **25:** `txstat.body` 8 B/create (ULEB `n_in`/`fee_sat`/`base`/`wit_extra`,
+/// **26:** `header.body` is 88 B again. Occupied 24/25 strips the trailing
+///         `size:u32` + `weight:u32`. Block size and weight come from `txstat`.
+///         A 25 binary refuses 26 `meta`.
+/// **25:** `txstat.body` 8 B/create (ULEB `fee_sat`/`base`/`wit_extra`,
 ///         per-header remaining-byte overflow). Occupied 24 rewrites `meta`
 ///         and extends a zeroed `txstat.body` to loc count (no `txout.body`
 ///         rewrite). Unreleased leftover `txfixed.body` is unlinked. A 24
@@ -112,13 +115,14 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
 /// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
 /// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
-pub const SCHEMA_VERSION: u16 = 25;
+pub const SCHEMA_VERSION: u16 = 26;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **25** is current (`txstat.body` 8 B/create). Occupied **24**
-/// rewrites `meta` and zero-extends `txstat.body`. Occupied **23** rewrites
-/// 88 B header rows. Occupied **22** Class A
+/// Schema **26** is current (`header.body` 88 B). Occupied **24/25** strips
+/// the trailing size/weight from 96 B rows. Occupied **25** still rewrites
+/// `meta` and zero-extends `txstat.body`. Occupied **23** header rows are
+/// already 88 B. Occupied **22** Class A
 /// rewrites 12 B ovf rows. Occupied 21 Class A is refused. Schema **21** empty
 /// Class A rewrites `meta`. Schema **20** table headers still open when Class A
 /// is empty. Schema **18/19** with occupied `tx.head` or `scripthash*` are
@@ -405,7 +409,7 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 25);
+        assert_eq!(SCHEMA_VERSION, 26);
         assert!(!VERSION.is_empty());
         assert!(schema_file_openable(25));
         assert!(schema_file_openable(24));
