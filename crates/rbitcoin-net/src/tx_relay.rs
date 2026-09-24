@@ -5557,6 +5557,11 @@ mod tests {
         // Electrum histogram buckets are raw vsize, summing to GET /mempool vsize.
         let hist_vsize: u64 = hub.fee_histogram().iter().map(|(_, v)| v).sum();
         assert_eq!(hist_vsize, expect_vsize);
+        // getmempoolinfo totals: a plain spend's adjusted vsize is its raw vsize.
+        assert_eq!(
+            hub.live_adjusted_totals(),
+            (expect_count, expect_vsize, expect_fee)
+        );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
