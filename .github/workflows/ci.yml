@@ -182,7 +182,7 @@ jobs:
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
     name: mutants (${{ matrix.n }}/4)
-    needs: [qc, test]
+    needs: [fmt, clippy, test]
     if: >-
       github.event_name == 'pull_request'
       && needs.qc.result == 'success'
@@ -329,7 +329,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [qc, test]
+    needs: [fmt, clippy, test]
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
       CARGO_TARGET_DIR: target/cov
@@ -386,91 +386,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PUBLISH_COVERAGE_BADGE: "1"
         run: ./scripts/publish-coverage-badge.sh
-
-  mutants:
-    needs: [qc, test]
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        shard: [0, 1, 2, 3]
-      fail-fast: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Get diff for mutants
-        id: diff
-        run: |
-          git diff origin/master...HEAD > /tmp/git.diff || true
-          if [ $(wc -l < /tmp/git.diff) -lt 50 ]; then
-            echo "small=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "small=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Run mutants shard
-        env:
-          SHARD_INDEX: ${{ matrix.shard }}
-          IS_SMALL: ${{ steps.diff.outputs.small }}
-        run: |
-          set -euo pipefail
-          if [[ "${IS_SMALL}" == "true" ]]; then
-            shard_arg="0/1"
-          else
-            shard_arg="${SHARD_INDEX}/4"
-          fi
-          set +e
-          timeout --signal=TERM --kill-after=60s 30m cargo mutants --workspace --in-diff /tmp/git.diff --shard "$shard_arg" --sharding slice -j 2 > mutants-shard.log 2>&1
-          sec=$?
-          set -e
-          # Also create mutants.out for compatibility - copy log if mutants.out not created by cargo-mutants
-          if [ ! -f mutants.out ] && [ -f mutants-shard.log ]; then
-            cp mutants-shard.log mutants.out || true
-          fi
-          missed=$(grep -c 'MISSED' mutants-shard.log || true)
-          echo "missed=${missed}" >> "$GITHUB_OUTPUT"
-          if [[ "$sec" -eq 124 ]]; then
-            if [[ "$missed" -gt 0 ]]; then
-              echo "::warning::mutants shard hit 30m with ${missed} MISSED already in the log"
-              echo "result=timeout-missed" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-            echo "::warning::mutants shard hit the 30m limit with no MISSED in the partial log; counting as success"
-            echo "result=timeout" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "result=finished" >> "$GITHUB_OUTPUT"
-          exit "$sec"
-      - name: Upload mutants artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mutants-out-${{ matrix.shard }}
-          path: |
-            mutants.out
-            mutants-shard.log
-          if-no-files-found: warn
-          retention-days: 7
-
-  mutants-baseline-diff:
-    needs: [mutants]
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: mutants-out-*
-          path: mutants-shards
-          merge-multiple: false
-      - name: Debug shards
-        if: always()
-        run: |
-          echo "Listing mutants-shards:"
-          ls -R mutants-shards || echo "no shards dir - artifact download found 0"
-          find mutants-shards -type f -ls 2>&1 | head -n 100
-      - name: Compare vs baseline
-        run: python3 scripts/mutants-diff.py mutants-shards docs/mutants/survivors-baseline.list
