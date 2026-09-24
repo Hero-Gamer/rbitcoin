@@ -396,7 +396,7 @@ fn header_getdata_is_compact_after_sendcmpct() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_headers_getdata_compact_only_tip_child() {
     use bitcoin::block::Header;
     use bitcoin::consensus::encode::serialize;
@@ -5066,7 +5066,7 @@ fn sequential_submit_twenty_beats_nineteen() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn drain_requests_missing_parent_of_pending_branch() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
@@ -5135,7 +5135,7 @@ fn drain_requests_missing_parent_of_pending_branch() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn drain_better_header_path_not_starved_by_full_getdata_window() {
     use rbitcoin_primitives::Height;
 
@@ -5242,7 +5242,7 @@ fn drain_better_header_path_not_starved_by_full_getdata_window() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn drain_connects_pending_child_of_new_tip_after_reorg() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
@@ -7300,7 +7300,7 @@ fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
 /// than the serve window. Requesting the whole path left hashes in
 /// `requested` that the peer never sent (overnight `sync_blocks` 60s:
 /// createmultisig 149, minchainwork 50, bip68 CSV 400).
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_headers_getdata_stays_in_serve_window() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;
@@ -7421,7 +7421,7 @@ fn catchup_headers_getdata_stays_in_serve_window() {
 /// Child-before-parent catch-up bodies must still connect. Dropping the child
 /// and leaving it in `asked_blocks` skipped the hash forever
 /// (`feature_bip68_sequence` activateCSV `sync_blocks` 60s).
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_child_before_parent_still_connects() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;
@@ -7529,7 +7529,7 @@ fn catchup_child_before_parent_still_connects() {
 /// invalidate fork while the miner Lagged-announces only the compact tip of a
 /// longer new chain. Catch-up is getheaders + getdata of that fork, not the
 /// 120s headers poll (`sync_blocks` 60s).
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_stale_fork_from_lagged_compact_tip() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::consensus::encode::serialize;
@@ -7747,7 +7747,7 @@ fn catchup_stale_fork_from_lagged_compact_tip() {
 /// anti-DoS window is 144 blocks (`GetAntiDoSWorkThreshold`); a stem 10 below
 /// tip is not low-work. Core still ignores that compact (`nChainWork <= tip`)
 /// and catch-up is headers → getdata.
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_better_fork_stem_compact_then_unsolicited_hb() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::consensus::encode::serialize;
@@ -7939,7 +7939,7 @@ fn catchup_better_fork_stem_compact_then_unsolicited_hb() {
 
 /// Reorg stem 2 below the stale tip used to be `MSG_CMPCT_BLOCK` (depth≤5).
 /// Unsolicited compact with work ≤ tip is ignored, so that ask never fills.
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_reorg_stem_just_below_tip_asks_witness() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;
@@ -8075,7 +8075,7 @@ fn catchup_reorg_stem_just_below_tip_asks_witness() {
 /// bodies arrive only after that flood (writer/serve lag). Reconstruct of
 /// the first two better-than-tip compacts must not drop stem getdata, and
 /// the delayed witness bodies must reorg.
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_stale_tip_hb_compact_flood_then_delayed_witness_reorgs() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::consensus::encode::serialize;
@@ -8272,7 +8272,7 @@ fn catchup_stale_tip_hb_compact_flood_then_delayed_witness_reorgs() {
 
 /// `p2p_compactblocks.test_low_work_compactblocks`: a compact hanging 150
 /// below tip stays header-less (Core 144-block anti-DoS buffer).
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_ignores_compact_150_below_tip() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::consensus::encode::serialize;
@@ -8645,7 +8645,7 @@ fn unsolicited_compact_three_above_tip_is_header_only() {
 /// Same catch-up as above, but the peer answers with `CmpctBlock` (node-to-node
 /// `sendcmpct` / `MSG_CMPCT_BLOCK` getdata). Accepting compact must drop the
 /// hash from `requested` or drain's serve window stays full.
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_compact_getdata_clears_requested_for_next_window() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;
@@ -8772,7 +8772,7 @@ fn catchup_compact_getdata_clears_requested_for_next_window() {
 /// window of a private invalidate fork. Weaker connecting headers of the
 /// miner's new chain must drop those asks so the stem can be fetched once the
 /// new path has more work (`sync_blocks` 60s).
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn catchup_releases_stale_fork_asks_on_weaker_connecting_headers() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::Network;
@@ -9558,7 +9558,7 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     );
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn stale_getdata_requests_expire_so_catchup_can_retry() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("getdata-expire");
     hub.ensure_genesis().unwrap();
@@ -9598,7 +9598,7 @@ fn stale_getdata_requests_expire_so_catchup_can_retry() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn stale_pending_cmpct_expires_to_full_getdata() {
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
@@ -9734,7 +9734,7 @@ fn stale_pending_cmpct_expires_to_full_getdata() {
     });
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn side_fork_compact_weaker_than_tip_is_ignored() {
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
@@ -9861,7 +9861,7 @@ fn side_fork_compact_weaker_than_tip_is_ignored() {
     });
 }
 
-#[test]
+#[allow(clippy::cognitive_complexity)] // catch-up journey arm
 fn stale_getdata_expire_releases_cmpct_fill() {
     use crate::peers::{PeerConnType, PeerHub};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -11376,4 +11376,25 @@ fn hostile_peer_session() {
     addr_relay_follows_the_address_key_and_skips_unwilling_peers();
     addr_relay_batches_one_message_per_neighbor();
     invalid_script_is_scored_and_policy_is_not();
+}
+
+#[test]
+fn peer_catchup_compact_reorg() {
+    catchup_headers_getdata_stays_in_serve_window();
+    catchup_child_before_parent_still_connects();
+    catchup_stale_fork_from_lagged_compact_tip();
+    catchup_better_fork_stem_compact_then_unsolicited_hb();
+    catchup_reorg_stem_just_below_tip_asks_witness();
+    catchup_stale_tip_hb_compact_flood_then_delayed_witness_reorgs();
+    catchup_ignores_compact_150_below_tip();
+    catchup_compact_getdata_clears_requested_for_next_window();
+    catchup_releases_stale_fork_asks_on_weaker_connecting_headers();
+    catchup_headers_getdata_compact_only_tip_child();
+    stale_getdata_requests_expire_so_catchup_can_retry();
+    stale_pending_cmpct_expires_to_full_getdata();
+    stale_getdata_expire_releases_cmpct_fill();
+    side_fork_compact_weaker_than_tip_is_ignored();
+    drain_requests_missing_parent_of_pending_branch();
+    drain_better_header_path_not_starved_by_full_getdata_window();
+    drain_connects_pending_child_of_new_tip_after_reorg();
 }

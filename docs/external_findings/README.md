@@ -18,13 +18,13 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [011](./011-mempool-structural-chain-context.md) | medium | Mempool no structural chain-context validation | fixed | `accept::tests::reject_non_final_locktime_height`, `reject_immature_coinbase` |
 | [012](./012-p2sh-redeem-not-executed.md) | high | P2SH redeem skipped when BIP16 looks off | fixed | `bip16_from_prev_mtp_exception_and_time` |
 | [013](./013-bip68-unresolved-age-fail-open.md) | high | BIP68 unresolved coin age fails open | fixed | `bip68_unresolved_coin_age_fails_closed` |
-| [014](./014-stranded-on-peer-reorg.md) | high | Stranded when peer reorgs (sync) | fixed | `drain_requests_missing_parent_of_pending_branch` |
+| [014](./014-stranded-on-peer-reorg.md) | high | Stranded when peer reorgs (sync) | fixed | `peer_catchup_compact_reorg` |
 | [015](./015-spend-rejected-block-outputs.md) | high | Spend outputs of a rejected block | fixed | cluster 017/019 + structural fail-closed |
 | [016](./016-unknown-taproot-leaf-rejected.md) | critical | Unknown tapleaf version rejected | fixed | `script_path_accepts_unknown_taproot_leaf_version` |
 | [017](./017-duplicate-txid-unconnected-instance.md) | medium | Txid resolve hits unconnected instance | fixed | `resolve_txid_prefers_connected_over_newer_unconnected` |
 | [018](./018-compact-block-duplicate-tx.md) | high | Compact block duplicates a tx | fixed | `repeated_short_id_is_requested_not_duplicated` |
 | [019](./019-bip30-not-enforced.md) | critical | BIP30 not enforced | fixed | cluster 015/017 + BIP34-gated batch |
-| [020](./020-pending-child-after-reorg.md) | high | Pending child not connected after reorg | fixed | `drain_connects_pending_child_of_new_tip_after_reorg` |
+| [020](./020-pending-child-after-reorg.md) | high | Pending child not connected after reorg | fixed | `peer_catchup_compact_reorg` |
 | [021](./021-regtest-activation-heights.md) | low | Regtest BIP65/66 heights stale | fixed | `params::tests::for_network_and_helpers` |
 | [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 | [023](./023-tapscript-initial-stack-limits.md) | high | Tapscript initial witness stack skipped 1000/520 limits | fixed | `script_path_rejects_initial_stack_over_max_size` |
