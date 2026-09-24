@@ -2587,3 +2587,23 @@ fn silentpayments_unsubscribe_clears_session_scan() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sp_scan_ranges_cover_one_height_and_the_next_chunk() {
+    assert!(
+        super::sp_scan_ranges(5, 4).is_empty(),
+        "a start past the tip scans nothing"
+    );
+    assert_eq!(super::sp_scan_ranges(4, 4), vec![(4, 4)]);
+    assert_eq!(super::sp_scan_ranges(0, 1), vec![(0, 1)]);
+    assert_eq!(
+        super::sp_scan_ranges(0, crate::silent_scan::SP_SCAN_CHUNK),
+        vec![
+            (0, crate::silent_scan::SP_SCAN_CHUNK - 1),
+            (
+                crate::silent_scan::SP_SCAN_CHUNK,
+                crate::silent_scan::SP_SCAN_CHUNK
+            )
+        ]
+    );
+}

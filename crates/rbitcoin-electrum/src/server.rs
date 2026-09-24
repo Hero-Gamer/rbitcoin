@@ -868,23 +868,36 @@ fn redact_sp_params(params: &Value) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
 }
 
+fn sp_scan_ranges(start: u32, last: u32) -> Vec<(u32, u32)> {
+    use crate::silent_scan::SP_SCAN_CHUNK;
+    if start > last {
+        return Vec::new();
+    }
+    let mut from = start;
+    let mut ranges = Vec::new();
+    loop {
+        let end = from
+            .saturating_add(SP_SCAN_CHUNK.saturating_sub(1))
+            .min(last);
+        ranges.push((from, end));
+        if end == last {
+            break;
+        }
+        from = end.saturating_add(1);
+    }
+    ranges
+}
+
 async fn scan_sp_off_connection(
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
     sub: &crate::silent_scan::SpSub,
     last: u32,
 ) -> Vec<Value> {
-    use crate::silent_scan::{SP_SCAN_CHUNK, SP_SCAN_PERMITS};
+    use crate::silent_scan::SP_SCAN_PERMITS;
     static PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SP_SCAN_PERMITS);
-    let mut from = sub.start;
     let mut hits = Vec::new();
-    if from > last {
-        return hits;
-    }
-    loop {
-        let end = from
-            .saturating_add(SP_SCAN_CHUNK.saturating_sub(1))
-            .min(last);
+    for (from, end) in sp_scan_ranges(sub.start, last) {
         let Ok(permit) = PERMITS.acquire().await else {
             break;
         };
@@ -899,10 +912,6 @@ async fn scan_sp_off_connection(
         .unwrap_or_default();
         drop(permit);
         hits.extend(chunk);
-        if end == last {
-            break;
-        }
-        from = end.saturating_add(1);
     }
     hits
 }

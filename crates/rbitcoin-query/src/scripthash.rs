@@ -484,7 +484,7 @@ impl Query {
     }
 
     /// True when more creates cannot change the already-full page.
-    fn history_page_closed(
+    pub(crate) fn history_page_closed(
         &self,
         joined: &[ShJoinedOut],
         filter: &HistoryFilter,

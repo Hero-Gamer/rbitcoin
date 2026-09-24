@@ -1704,6 +1704,102 @@ fn paged_history_stops_before_the_create_cap() {
 }
 
 #[test]
+fn history_page_closed_needs_a_full_page_past_the_cursor() {
+    use crate::scripthash::{HistoryFilter, HistoryOrder, ScriptHashOutpoint, ShJoinedOut};
+    let (dir, q) = temp_query("sh-page-closed");
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    let mut fks = Vec::new();
+    for h in 0..4u32 {
+        let (header, ta) = coinbase_block(h, prev, parent);
+        parent = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        fks.push(q.block_tx_fks(Height(h)).unwrap()[0]);
+    }
+    let txid_at = |h: u32| {
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        txid
+    };
+    let joined_at = |h: u32| ShJoinedOut {
+        out: ScriptHashOutpoint {
+            scripthash: [0; 32],
+            create_tx_fk: fks[h as usize],
+            vout: 0,
+            txid: txid_at(h),
+            value: 1,
+            create_height: h,
+        },
+        spent: false,
+        spender_fks: Vec::new(),
+        spenders: Vec::new(),
+    };
+    let a = joined_at(0);
+    let b = joined_at(1);
+    let c = joined_at(2);
+    let asc = |limit| HistoryFilter {
+        limit: Some(limit),
+        order: HistoryOrder::HeightAsc,
+        ..HistoryFilter::open()
+    };
+    assert!(
+        q.history_page_closed(&[a.clone(), b.clone()], &asc(1), &[fks[3]])
+            .unwrap(),
+        "a full ascending page closes when every later create is above the edge"
+    );
+    assert!(
+        !q.history_page_closed(std::slice::from_ref(&a), &asc(1), &[fks[0]])
+            .unwrap(),
+        "a later create at the page edge still belongs in the order"
+    );
+    assert!(
+        !q.history_page_closed(std::slice::from_ref(&a), &asc(2), &[fks[3]])
+            .unwrap(),
+        "a short page stays open"
+    );
+
+    let mut after_b = asc(1);
+    after_b.after_txid = Some(txid_at(1));
+    assert!(
+        q.history_page_closed(&[a.clone(), b.clone(), c.clone()], &after_b, &[fks[3]])
+            .unwrap(),
+        "once the cursor is in hand, a full following page closes"
+    );
+    let mut missing = asc(1);
+    missing.after_txid = Some(txid_at(3));
+    assert!(
+        !q.history_page_closed(&[a.clone(), b.clone()], &missing, &[fks[3]])
+            .unwrap(),
+        "a cursor that is not on the page yet must keep scanning"
+    );
+
+    let newest = HistoryFilter {
+        limit: Some(1),
+        order: HistoryOrder::NewestFirst,
+        ..HistoryFilter::open()
+    };
+    assert!(
+        !q.history_page_closed(std::slice::from_ref(&c), &newest, &[fks[0]])
+            .unwrap(),
+        "an older create with a spent range can still fund a newer row"
+    );
+    let ghost = Fk(9_000_000);
+    assert!(
+        q.history_page_closed(std::slice::from_ref(&c), &newest, &[ghost])
+            .unwrap(),
+        "a create with no spent range below the edge cannot enter the page"
+    );
+    let oldest = newest.clone();
+    assert!(
+        !q.history_page_closed(std::slice::from_ref(&a), &oldest, &[ghost])
+            .unwrap(),
+        "a create at the page edge is not strictly below it"
+    );
+    let _ = dir;
+}
+
+#[test]
 fn scripthash_create_count_includes_pending_write_behind() {
     let (dir, q) = temp_query("sh-count-pending");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
