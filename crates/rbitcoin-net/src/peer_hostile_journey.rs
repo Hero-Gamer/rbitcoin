@@ -1,9 +1,8 @@
-use bitcoin::consensus::encode::serialize;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::{Network, ScriptBuf};
+use bitcoin::ScriptBuf;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn hostile_ver(addr: SocketAddr) -> VersionMessage {

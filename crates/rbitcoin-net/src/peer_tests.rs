@@ -8868,4 +8868,5 @@ fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
     h
 }
 
+include!("peer_catchup_journey.rs");
 include!("peer_hostile_journey.rs");
