@@ -17,6 +17,6 @@ read, and only when this network has a BIP34 hash and the block is above
 that height.
 
 **Regression:** `rbitcoin-consensus`
-`block::structure_rule_tests::bip30_signet_rejects_unspent_overwrite_after_bip34`,
+`block::structure_rule_tests::buried_rules_and_a_lying_header_path`,
 `params::tests::bip34_hash_gates_bip30_like_core`. Finding 019's
 `bip30_rejects_unspent_connected_sibling` still rejects.
