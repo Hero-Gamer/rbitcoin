@@ -237,7 +237,11 @@ fn accept_err_is_mutated(e: &NetError) -> bool {
 pub(crate) fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
-            s.contains("time-too-new") || s.contains("time-too-old")
+            let s = s.to_ascii_lowercase();
+            s.contains("time-too-new")
+                || s.contains("time-too-old")
+                || s.contains("timestamp too far in future")
+                || s.contains("median-time-past")
         }
         _ => false,
     }

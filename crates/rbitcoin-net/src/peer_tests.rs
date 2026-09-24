@@ -10297,3 +10297,73 @@ fn on_tx_announce_none_lagged_closed_are_ok() {
     assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann))).is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn header_reject_punishes_except_temporary_time() {
+    use bitcoin::ScriptBuf;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-punish");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let mut bad_pow =
+        rbitcoin_consensus::mine_regtest_paying(gen, 1_300_000_100, 1, script.clone(), vec![]);
+    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+    let pow_err = hub.ensure_header(&bad_pow.header).unwrap_err();
+    assert!(
+        !crate::chain::accept_err_is_temporary_time(&pow_err),
+        "bad pow is not a temporary stamp: {pow_err}"
+    );
+
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(&hub, &out_tx, &mut follow, None, &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "a requested header with bad pow must disconnect"
+    );
+
+    let mut follow = PeerFollowState::new();
+    let skipped =
+        on_block_unrequested_skip(&hub, &mut follow, None, &bad_pow, bad_pow.block_hash()).unwrap();
+    assert!(skipped, "unrequested bad pow is not accepted");
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "an unrequested header with bad pow must disconnect"
+    );
+
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future = rbitcoin_consensus::mine_regtest_paying(gen, now + 3 * 3600, 1, script, vec![]);
+    let time_err = hub.ensure_header(&future.header).unwrap_err();
+    assert!(
+        crate::chain::accept_err_is_temporary_time(&time_err),
+        "a stamp past the two-hour window is temporary: {time_err}"
+    );
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(future.block_hash());
+    on_block(&hub, &out_tx, &mut follow, None, &future)
+        .await
+        .unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "time-too-new must not disconnect a requested block"
+    );
+    let mut follow = PeerFollowState::new();
+    let skipped =
+        on_block_unrequested_skip(&hub, &mut follow, None, &future, future.block_hash()).unwrap();
+    assert!(skipped, "a future header is still not applied");
+    assert_eq!(
+        follow.ban_score, 0,
+        "time-too-new must not disconnect an unrequested block"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
