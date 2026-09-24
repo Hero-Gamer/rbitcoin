@@ -1717,6 +1717,36 @@ mod tests {
         assert_eq!(n, 1, "{lines:?}");
     }
 
+    /// A plain `getblocktemplate` logs Core's request line once; other
+    /// methods do not.
+    #[test]
+    fn exec_one_logs_the_getblocktemplate_request_line_only() {
+        let (ctx, _dir) = http_wait_ctx();
+        let needle = "ThreadRPCServer method=getblocktemplate";
+        rbitcoin_log::capture_logs(true);
+        let _ = exec_one(
+            &ctx,
+            &serde_json::json!({
+                "method": "getblocktemplate",
+                "params": [{ "rules": ["segwit"] }],
+                "id": 1
+            }),
+        );
+        let gbt = rbitcoin_log::take_logs();
+        let _ = exec_one(
+            &ctx,
+            &serde_json::json!({ "method": "getblockcount", "params": [], "id": 2 }),
+        );
+        let other = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(
+            gbt.iter().filter(|(_, l)| l == needle).count(),
+            1,
+            "{gbt:?}"
+        );
+        assert!(other.iter().all(|(_, l)| l != needle), "{other:?}");
+    }
+
     #[tokio::test]
     async fn http_wait_stop_returns_before_the_timeout() {
         let (ctx, _dir) = http_wait_ctx();
