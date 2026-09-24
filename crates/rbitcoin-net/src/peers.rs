@@ -1001,7 +1001,15 @@ impl LivePeer {
         const TIMEOUT_INTERVAL: u64 = 20 * 60;
         let nonce = self.ping_nonce_sent.load(Ordering::Relaxed);
         let start = self.ping_start_secs.load(Ordering::Relaxed);
-        if nonce != 0 && now_secs > start.saturating_add(TIMEOUT_INTERVAL) {
+        // Core `RunInactivityChecks`: no ping timeout until `-peertimeout`
+        // has passed since connect (both on the mockable clock).
+        let inactivity_checks = self.peer_hub().is_none_or(|h| {
+            now_secs
+                > self
+                    .connected_at_secs()
+                    .saturating_add(h.peer_timeout_secs())
+        });
+        if inactivity_checks && nonce != 0 && now_secs > start.saturating_add(TIMEOUT_INTERVAL) {
             let elapsed = now_secs.saturating_sub(start) as f64;
             return Some(PingAction::Timeout {
                 elapsed_secs: elapsed,
@@ -3540,6 +3548,34 @@ mod tests {
             "a blocking resolve must not stall other Tokio tasks"
         );
         slow.await.unwrap();
+    }
+
+    /// Core runs the ping timeout only once `-peertimeout` has passed since
+    /// connect. Core's functional framework sets `peertimeout=999999999` so a
+    /// `setmocktime` jump cannot drop peers (`feature_bip68_sequence.py`).
+    #[test]
+    fn ping_timeout_waits_for_the_peer_timeout() {
+        let hub = PeerHub::new();
+        hub.set_mock_now(1_700_000_000);
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+        let now = hub.now_secs();
+        let Some(PingAction::Send { .. }) = p.take_ping_action(now) else {
+            panic!("expected send");
+        };
+        hub.set_peer_timeout_secs(999_999_999);
+        assert!(
+            !matches!(
+                p.take_ping_action(now + 6_000),
+                Some(PingAction::Timeout { .. })
+            ),
+            "inside the peer timeout the ping does not time out"
+        );
+        hub.set_peer_timeout_secs(60);
+        assert!(matches!(
+            p.take_ping_action(now + 6_000),
+            Some(PingAction::Timeout { .. })
+        ));
     }
 
     #[test]
