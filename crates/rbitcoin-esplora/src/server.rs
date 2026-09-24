@@ -3,7 +3,7 @@
 use crate::handlers;
 use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json_in};
 use crate::ws;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query as AxumQuery, Request, State};
+use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -558,26 +558,7 @@ fn retain_join_budget(c: &mut ClientJoins) {
     cap_bulk(c);
 }
 
-#[cfg(test)]
-mod client_id_tests {
-    use super::client_id_from;
-
-    #[test]
-    fn loopback_without_trust_ignores_client_header() {
-        assert!(client_id_from(false, true, Some("wallet".into())).is_none());
-        assert_eq!(
-            client_id_from(true, false, Some("wallet".into())).as_deref(),
-            Some("wallet")
-        );
-        assert!(client_id_from(false, false, Some("wallet".into())).is_none());
-    }
-}
-
-pub(crate) fn client_id_from(
-    unix_or_trusted: bool,
-    _loopback: bool,
-    header: Option<String>,
-) -> Option<String> {
+fn trusted_client_id(unix_or_trusted: bool, header: Option<String>) -> Option<String> {
     if unix_or_trusted {
         header
     } else {
@@ -595,20 +576,19 @@ impl FromRequestParts<AppState> for JoinClient {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let header = parts
-            .headers
-            .get("x-rbitcoin-client")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        let loopback = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_some_and(|c| c.0.ip().is_loopback());
-        Ok(JoinClient(client_id_from(
+        let header = if state.join_header_trusted {
+            parts
+                .headers
+                .get("x-rbitcoin-client")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        Ok(JoinClient(trusted_client_id(
             state.join_header_trusted,
-            loopback,
             header,
         )))
     }
@@ -1210,6 +1190,7 @@ fn encode_header_hex(hdr: &bitcoin::block::Header) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::tx_json::tx_status_json;
+    use axum::extract::ConnectInfo;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{Query, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
@@ -1398,20 +1379,6 @@ mod tests {
             ));
         }
         assert!(EsploraListen::parse("not-an-addr", 3000).is_err());
-    }
-
-    #[test]
-    fn client_id_ignored_on_public_tcp() {
-        assert!(client_id_from(false, false, Some("x".into())).is_none());
-        assert!(
-            client_id_from(false, true, Some("x".into())).is_none(),
-            "loopback without join_header_trusted ignores X-Rbitcoin-Client"
-        );
-        assert_eq!(
-            client_id_from(true, false, Some("x".into())).as_deref(),
-            Some("x")
-        );
-        assert!(client_id_from(true, true, None).is_none());
     }
 
     #[test]
@@ -1923,12 +1890,22 @@ mod tests {
 
         let public = Arc::new(Mutex::new(JoinCache::default()));
         let pub_app = app_with_join(Arc::clone(&q), Arc::clone(&public), false);
+        let plain = axum::http::Request::builder()
+            .uri(format!("/scripthash/{h1hex}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (st_plain, body_plain) = oneshot_http(&pub_app, plain).await;
         let (st, body) = oneshot_http(
             &pub_app,
             get_with_client(&format!("/scripthash/{h1hex}"), "ignored"),
         )
         .await;
         assert_eq!(st, 200, "{body}");
+        assert_eq!(st_plain, st);
+        assert_eq!(
+            body_plain, body,
+            "public TCP does not read X-Rbitcoin-Client"
+        );
         assert!(
             public.lock().unwrap().last_sh_key("ignored").is_none(),
             "public TCP ignores X-Rbitcoin-Client"
