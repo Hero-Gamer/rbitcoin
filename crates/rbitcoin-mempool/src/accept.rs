@@ -2573,8 +2573,6 @@ mod tests {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        // At 20 B/sigop, 79,600 is ~398 kvB adjusted and hits the cluster cap.
-        mp.set_bytes_per_sigop(0);
         let err = mp
             .accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK)
             .unwrap_err();
