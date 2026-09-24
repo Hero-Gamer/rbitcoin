@@ -4848,45 +4848,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
-
-    fn p2p_orphan_of_min_relay_parent_is_parked_not_1p1c() {
-        let (store_dir, q, cbs) = pad_one_cb();
-        let dir = tmp();
-        let hub = MempoolHub::open(&dir, q).unwrap();
-        hub.set_relay_enabled(true);
-        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
-        assert!(matches!(
-            hub.accept_tx(&parent),
-            Err(AcceptError::Policy("min relay fee"))
-        ));
-        let child = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: parent.compute_txid(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let err = hub.accept_tx_from(&child, Some(7));
-        assert!(
-            matches!(err, Err(AcceptError::Orphaned { .. })),
-            "P2P child of min-relay parent must orphan, got {err:?}"
-        );
-        assert!(!hub.contains(&child.compute_txid()));
-        assert_eq!(hub.orphan_count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
     #[test]
     fn open_with_weight_and_package_empty() {
         let dir = tmp();
@@ -5044,30 +5005,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
-
-    fn child_of_txid_rejected_parent_is_not_parked() {
+    #[test]
+    fn mempool_under_pressure() {
         let (store_dir, q, cbs) = pad_one_cb();
         let dir = tmp();
         let hub = MempoolHub::open(&dir, q).unwrap();
         hub.set_relay_enabled(true);
-        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x6a; 110_000]));
+        let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
         assert!(matches!(
             hub.accept_tx(&parent),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1 - 50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let err = hub.accept_tx_from(&child, Some(7));
+        assert!(
+            matches!(err, Err(AcceptError::Orphaned { .. })),
+            "P2P child of min-relay parent must orphan, got {err:?}"
+        );
+        assert!(!hub.contains(&child.compute_txid()));
+        assert_eq!(hub.orphan_count(), 1);
+        let parked = hub.orphan_count();
+
+        let heavy = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x6a; 110_000]));
+        assert!(matches!(
+            hub.accept_tx(&heavy),
             Err(AcceptError::Policy("tx weight"))
         ));
         assert_eq!(
-            parent.compute_txid().to_byte_array(),
-            parent.compute_wtxid().to_byte_array()
+            heavy.compute_txid().to_byte_array(),
+            heavy.compute_wtxid().to_byte_array()
         );
-        assert!(hub.try_recent_reject(&parent.compute_wtxid()));
+        assert!(hub.try_recent_reject(&heavy.compute_wtxid()));
         let other = Txid::from_byte_array([0x33; 32]);
-        let child = Transaction {
+        let rejected_child = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![
                 TxIn {
                     previous_output: OutPoint {
-                        txid: parent.compute_txid(),
+                        txid: heavy.compute_txid(),
                         vout: 0,
                     },
                     script_sig: ScriptBuf::new(),
@@ -5089,14 +5081,14 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let child_err = hub.accept_tx(&child);
+        let child_err = hub.accept_tx(&rejected_child);
         assert!(
             matches!(child_err, Err(AcceptError::Orphaned { .. })),
             "missing inputs still orphaned, got {child_err:?}"
         );
         assert_eq!(
             hub.orphan_count(),
-            0,
+            parked,
             "known-invalid parent must not park child"
         );
         let grandchild = Transaction {
@@ -5104,7 +5096,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint {
-                    txid: child.compute_txid(),
+                    txid: rejected_child.compute_txid(),
                     vout: 0,
                 },
                 script_sig: ScriptBuf::new(),
@@ -5119,17 +5111,11 @@ mod tests {
         let _ = hub.accept_tx(&grandchild);
         assert_eq!(
             hub.orphan_count(),
-            0,
+            parked,
             "child of rejected parent must poison descendants"
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    #[test]
-    fn mempool_under_pressure() {
-        p2p_orphan_of_min_relay_parent_is_parked_not_1p1c();
-        child_of_txid_rejected_parent_is_not_parked();
     }
 
     #[test]
