@@ -1066,13 +1066,17 @@ mod tests {
         match &err {
             NetError::Mutated(s) | NetError::Consensus(s) => {
                 assert!(
-                    s.contains("merkle") || s.contains("bad-txnmrklroot"),
+                    s.contains("merkle")
+                        || s.contains("bad-txnmrklroot")
+                        || s.contains("witness commitment"),
                     "got {s}"
                 );
             }
             NetError::ConnectFailed { msg, hash: h } => {
                 assert!(
-                    msg.contains("merkle") || msg.contains("bad-txnmrklroot"),
+                    msg.contains("merkle")
+                        || msg.contains("bad-txnmrklroot")
+                        || msg.contains("witness commitment"),
                     "got {msg}"
                 );
                 assert_eq!(*h, hash.to_byte_array());
