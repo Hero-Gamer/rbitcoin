@@ -1814,6 +1814,17 @@ fn milestone_work_extends_only_the_heavier_contiguous_path() {
     let at_five = (base + one).to_be_bytes();
     assert_eq!(q.milestone_best_work_be(), Some(at_five));
 
+    let mut bigger_be = [0u8; 32];
+    bigger_be[30] = 9;
+    let bigger = bitcoin::Work::from_be_bytes(bigger_be);
+    q.note_milestone_header(9, [0x66; 32], [0; 32], one, Some(bigger));
+    let at_nine = (bigger + one).to_be_bytes();
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(at_nine),
+        "a higher header replaces the running work total"
+    );
+
     let mut tiny_be = [0u8; 32];
     tiny_be[31] = 1;
     q.note_milestone_header(
@@ -1825,30 +1836,30 @@ fn milestone_work_extends_only_the_heavier_contiguous_path() {
     );
     assert_eq!(
         q.milestone_best_work_be(),
-        Some(at_five),
+        Some(at_nine),
         "a lower header must not replace a heavier path"
     );
 
-    let h6 = [0x33u8; 32];
-    q.note_milestone_header(6, h6, h1, one, None);
-    let at_six = (base + one + one).to_be_bytes();
-    assert_eq!(q.milestone_best_work_be(), Some(at_six));
-    q.note_milestone_header(7, [0x44; 32], [0x55; 32], one, None);
+    let h10 = [0x33u8; 32];
+    q.note_milestone_header(10, h10, [0x66; 32], one, None);
+    let at_ten = (bigger + one + one).to_be_bytes();
+    assert_eq!(q.milestone_best_work_be(), Some(at_ten));
+    q.note_milestone_header(11, [0x44; 32], [0x55; 32], one, None);
     assert_eq!(
         q.milestone_best_work_be(),
-        Some(at_six),
+        Some(at_ten),
         "a header whose parent is not the path tip does not add work"
     );
 
-    q.clear_milestone_path_above(6);
-    assert_eq!(q.milestone_best_work_be(), Some(at_six));
-    assert_eq!(q.milestone_header_at(6), Some(h6));
-    q.clear_milestone_path_above(8);
-    assert_eq!(q.milestone_best_work_be(), Some(at_six));
-    q.clear_milestone_path_above(5);
+    q.clear_milestone_path_above(10);
+    assert_eq!(q.milestone_best_work_be(), Some(at_ten));
+    assert_eq!(q.milestone_header_at(10), Some(h10));
+    q.clear_milestone_path_above(12);
+    assert_eq!(q.milestone_best_work_be(), Some(at_ten));
+    q.clear_milestone_path_above(9);
     assert!(q.milestone_best_work_be().is_none());
-    assert_eq!(q.milestone_header_at(5), Some(h1));
-    assert_eq!(q.milestone_header_at(6), None);
+    assert_eq!(q.milestone_header_at(9), Some([0x66; 32]));
+    assert_eq!(q.milestone_header_at(10), None);
     let _ = dir;
 }
 
