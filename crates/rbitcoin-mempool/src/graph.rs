@@ -308,10 +308,13 @@ impl TxGraph {
         self.entries.get(txid)
     }
 
-    /// Set a live entry's sigop cost (post-migrate recompute).
+    /// Set a live entry's sigop cost (post-migrate recompute) and re-rank its
+    /// cluster on the new adjusted weight.
     pub(crate) fn set_sigop_cost(&mut self, txid: &Txid, cost: u64) {
         if let Some(e) = self.entries.get_mut(txid) {
             e.sigop_cost = cost;
+            self.invalidate_chunk_cache();
+            self.index_cluster_of(txid);
         }
     }
 
@@ -1757,6 +1760,31 @@ mod tests {
         assert_eq!(
             g.mining_chunks_best_first()[0].weight,
             heavy.weight().to_wu()
+        );
+    }
+
+    /// Post-migrate recompute: filling an unknown (`u64::MAX`) cost re-ranks
+    /// the cluster, so eviction and mining see the real feerate.
+    #[test]
+    fn set_sigop_cost_reranks_cluster() {
+        let mut g = TxGraph::new();
+        let rich = spend_op([3u8; 32], 0, 1);
+        let poor = spend_op([4u8; 32], 0, 2);
+        let (rid, pid) = (rich.compute_txid(), poor.compute_txid());
+        let mut re = entry_for(&rich, 100_000, 0);
+        re.sigop_cost = u64::MAX;
+        g.insert(re, &rich);
+        g.insert(entry_for(&poor, 100, 1), &poor);
+        assert_eq!(g.worst_chunk().unwrap().1.txids, vec![rid]);
+        assert_eq!(
+            g.select_block_txids(TxGraph::template_tx_weight()),
+            vec![pid]
+        );
+        g.set_sigop_cost(&rid, 0);
+        assert_eq!(g.worst_chunk().unwrap().1.txids, vec![pid]);
+        assert_eq!(
+            g.select_block_txids(TxGraph::template_tx_weight()),
+            vec![rid, pid]
         );
     }
 
