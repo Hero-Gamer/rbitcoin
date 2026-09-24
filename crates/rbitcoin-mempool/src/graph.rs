@@ -120,8 +120,6 @@ pub struct TxGraph {
     /// How many times [`Self::mining_chunks_best_first`] built from clusters
     /// (not a cache hit). Hub tests pin refresh does one rebuild per dirty window.
     chunks_rebuilds: AtomicU64,
-    /// Full [`Self::cluster_of`] builds (walk + linearize). Insert should do this once.
-    cluster_builds: AtomicU64,
     /// Best-first chunks; `None` after mutate until next build.
     chunk_cache: Mutex<Option<Vec<Chunk>>>,
     /// Lowest-rate chunk per cluster, ordered by (rate, representative txid).
@@ -146,7 +144,6 @@ impl Default for TxGraph {
             created: HashSet::new(),
             total_weight: 0,
             chunks_rebuilds: AtomicU64::new(0),
-            cluster_builds: AtomicU64::new(0),
             chunk_cache: Mutex::new(None),
             worst_chunks: BTreeMap::new(),
             worst_rep_rate: HashMap::new(),
@@ -200,10 +197,6 @@ impl TxGraph {
     /// Sample-and-reset cluster-linearize count (fee-refresh tests).
     pub fn take_chunks_rebuilds(&self) -> u64 {
         self.chunks_rebuilds.swap(0, Ordering::Relaxed)
-    }
-
-    pub fn take_cluster_builds(&self) -> u64 {
-        self.cluster_builds.swap(0, Ordering::Relaxed)
     }
 
     fn invalidate_chunk_cache(&mut self) {
@@ -655,7 +648,6 @@ impl TxGraph {
 
     /// Connected component containing `txid` (undirected parent/child).
     pub fn cluster_of(&self, txid: &Txid) -> Option<Cluster> {
-        self.cluster_builds.fetch_add(1, Ordering::Relaxed);
         if !self.entries.contains_key(txid) {
             return None;
         }
@@ -1093,7 +1085,6 @@ mod tests {
     #[test]
     fn single_tx_cluster() {
         let mut g = TxGraph::new();
-        assert_eq!(g.take_cluster_builds(), 0);
         let tx = make_tx(None, 1, 1);
         let e = entry_for(&tx, 1000, 0);
         let id = e.txid;

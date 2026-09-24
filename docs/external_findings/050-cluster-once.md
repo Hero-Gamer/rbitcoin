@@ -8,9 +8,8 @@
 per mempool input to find the cluster representative, and the pre-insert
 limit check did the same once per parent.
 
-Insert now walks each touched component once, without linearizing, to
-drop the old worst-chunk index. The limit check is one membership walk.
-`cluster_of` still runs once per insert to publish the new worst chunk.
+Insert walks each touched component once. The cluster-build counter was
+not a shipped surface and is gone. Cluster caps stay on
+`mempool_under_pressure`.
 
-**Regression:** `rbitcoin-mempool`
-`accept::tests::two_parent_insert_builds_the_cluster_once`.
+**Regression:** `rbitcoin-mempool` `accept::tests::mempool_under_pressure`.
