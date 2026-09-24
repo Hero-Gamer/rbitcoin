@@ -227,9 +227,7 @@ pub fn confirm_write_phase(
                 .store()
                 .note_spend_durable_batch(tip.0)
                 .map_err(ConsensusError::from)?;
-            if sync_ns > 0 {
-                rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
-            }
+            rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
         }
         Ok((
             out,
@@ -357,11 +355,12 @@ const REPLAY_BATCH: usize = 8;
 
 /// Rewrite spend annotations above the durable marker, then `sync_data` and advance it.
 ///
-/// Idempotent. A missing marker replays every height above genesis. Call this
-/// on process open after tip-window revalidation.
-pub fn replay_spend_annotations(query: &Query) -> Result<(), ConsensusError> {
+/// Idempotent. A missing marker replays every height above genesis. Returns how
+/// many heights were rewritten. Call this on process open after tip-window
+/// revalidation.
+pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
     let Some(tip) = query.tip_height().map(|h| h.0) else {
-        return Ok(());
+        return Ok(0);
     };
     let annotated = query
         .store()
@@ -369,15 +368,15 @@ pub fn replay_spend_annotations(query: &Query) -> Result<(), ConsensusError> {
         .map_err(ConsensusError::from)?;
     let a = annotated.unwrap_or(0).min(tip);
     if a == tip {
-        return Ok(());
+        return Ok(0);
     }
+    let start = a + 1;
     rbitcoin_log::info!("store: replay spend annotations ({a}, {tip}]");
     let mut heights = Vec::new();
-    for h in 0..=tip {
-        if h > a {
-            heights.push(h);
-        }
+    for h in start..=tip {
+        heights.push(h);
     }
+    let replayed = heights.len() as u32;
     for chunk in heights.chunks(REPLAY_BATCH) {
         let mut items = Vec::with_capacity(chunk.len());
         for &h in chunk {
@@ -397,10 +396,8 @@ pub fn replay_spend_annotations(query: &Query) -> Result<(), ConsensusError> {
         .store()
         .sync_spend_durable(tip)
         .map_err(ConsensusError::from)?;
-    if sync_ns > 0 {
-        rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
-    }
-    Ok(())
+    rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
+    Ok(replayed)
 }
 
 fn annotate_slots_from_connected_hash(

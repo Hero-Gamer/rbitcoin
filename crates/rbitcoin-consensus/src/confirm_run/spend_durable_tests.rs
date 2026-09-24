@@ -136,8 +136,12 @@ fn zeroed_spend_slot_after_tip_seal_rejects_respend() {
 
     let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
     q.set_spend_index(true);
-    crate::replay_spend_annotations(&q).unwrap();
     let tip_h = q.tip_height().unwrap();
+    let replayed = crate::replay_spend_annotations(&q).unwrap();
+    assert_eq!(
+        replayed, tip_h.0,
+        "a missing marker replays every height above genesis"
+    );
     let tip_hash = q.header_at_height(tip_h).unwrap().unwrap().1.hash;
     let respend = mine(
         bitcoin::BlockHash::from_byte_array(tip_hash),
