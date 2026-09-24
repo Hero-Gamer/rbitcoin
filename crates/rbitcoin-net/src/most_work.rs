@@ -98,6 +98,15 @@ mod tests {
         let z = Work::from_be_bytes([0u8; 32]);
         assert_eq!(sum_work(std::iter::empty()).unwrap(), z);
         assert_eq!(sum_work([w(1)].into_iter()).unwrap(), w(1));
+        let mut ff = [0u8; 32];
+        ff[31] = 0xff;
+        let mut carried = [0u8; 32];
+        carried[30] = 1;
+        assert_eq!(
+            sum_work([Work::from_be_bytes(ff), w(1)].into_iter()).unwrap(),
+            Work::from_be_bytes(carried),
+            "0xff + 1 carries into the next byte"
+        );
         let max = Work::from_be_bytes([0xff; 32]);
         assert_eq!(sum_work([max, w(1)].into_iter()), Err(WorkOverflow));
         let mut zero_bits = bitcoin::block::Header {
