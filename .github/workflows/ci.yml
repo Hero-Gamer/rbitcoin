@@ -182,7 +182,7 @@ jobs:
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
     name: mutants (${{ matrix.n }}/4)
-    needs: [qc, test]
+    needs: [mutants]
     if: >-
       github.event_name == 'pull_request'
       && needs.qc.result == 'success'
@@ -388,7 +388,7 @@ jobs:
         run: ./scripts/publish-coverage-badge.sh
 
   mutants-baseline-diff:
-    needs: [fmt, clippy, test, mutants]
+    needs: [mutants]
     permissions:
       issues: write
       pull-requests: write
