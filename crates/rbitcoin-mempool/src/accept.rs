@@ -2099,8 +2099,8 @@ mod tests {
         assert_eq!(mp.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    fn relay_floor_decays_when_not_full_and_holds_while_full() {
+    #[test]
+    fn mempool_under_pressure() {
         assert_eq!(decayed_relay_floor(5_000, 100, 0), 5_000);
         assert_eq!(
             decayed_relay_floor(5_000, 100, ROLLING_FEE_HALFLIFE_MS),
@@ -2124,23 +2124,105 @@ mod tests {
         );
         assert_eq!(ROLLING_FEE_HALFLIFE_MS, 43_200_000);
         assert!(unix_ms() > 1_700_000_000_000);
-    }
 
-    fn min_fee_decays_when_one_more_standard_tx_would_exactly_fill() {
         let dir = tmp_dir();
-        let mut mp =
-            ActiveMempool::open_or_create_with_limit(&dir, policy::MAX_STANDARD_TX_WEIGHT).unwrap();
+        let (op, _, utxos) = chain_utxo(10_000_000);
+        let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 800).unwrap();
+        let before = mp.mempool_min_fee_sat_kvb();
+        assert!(before > policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB);
+        for i in 0u8..8 {
+            let spend = OutPoint {
+                txid: Txid::from_byte_array([i.wrapping_add(1); 32]),
+                vout: 0,
+            };
+            let mut map = HashMap::new();
+            map.insert(
+                spend,
+                coin(TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+            let out = 99_000u64 - u64::from(i) * 100;
+            mp.accept_tx(&spend_tx(spend, out), &MapUtxoProvider { map }, TIP_OK)
+                .unwrap_or_else(|e| panic!("i={i}: {e}"));
+        }
+        let after = mp.mempool_min_fee_sat_kvb();
+        assert!(
+            after > before,
+            "eviction must raise the floor above the static bump ({before} -> {after})"
+        );
+        let probe_op = OutPoint {
+            txid: Txid::from_byte_array([0xee; 32]),
+            vout: 0,
+        };
+        let probe = spend_tx(probe_op, 99_000);
+        let vsize = policy::get_virtual_size(probe.weight().to_wu());
+        let fee = vsize.saturating_mul(before).div_ceil(1_000);
+        let tx = spend_tx(probe_op, 100_000 - fee);
+        let mut map = HashMap::new();
+        map.insert(
+            probe_op,
+            coin(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }),
+        );
+        let err = mp
+            .accept_tx(&tx, &MapUtxoProvider { map }, TIP_OK)
+            .expect_err("same static-bump rate must not re-enter");
+        assert!(
+            matches!(
+                err,
+                AcceptError::Policy("mempool min fee") | AcceptError::Policy("min relay fee")
+            ),
+            "{err}"
+        );
+
+        mp.max_weight = mp
+            .graph
+            .total_weight()
+            .saturating_add(policy::MAX_STANDARD_TX_WEIGHT);
         mp.rolling_min_sat_kvb = 5_000;
         mp.rolling_updated_ms = 0;
         mp.min_relay_sat_kvb = 100;
-        assert_eq!(mp.mempool_min_fee_sat_kvb(), 100);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+        assert_eq!(
+            mp.mempool_min_fee_sat_kvb(),
+            100,
+            "one more standard tx exactly filling must let the floor decay"
+        );
 
-    fn cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(10_000_000);
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.max_weight = policy::MAX_STANDARD_TX_WEIGHT.saturating_mul(64);
+        // 4001 legacy CHECKSIG × witness scale 4 = 16004, over the 16000 standard cap.
+        // The input spends OP_TRUE, so the interpreter would accept this tx.
+        let sigops = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
+            }],
+        };
+        let err = mp
+            .accept_tx(&sigops, &utxos, TIP_OK)
+            .expect_err("standard sigop cap");
+        assert!(
+            matches!(err, AcceptError::Policy("bad-txns-too-many-sigops")),
+            "sigops must fail before the interpreter, got {err}"
+        );
+
+        mp.set_cluster_limits(Some(50), Some(1));
+        let mut wide = spend_tx(op, 9_000_000);
+        wide.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = mp.accept_tx(&wide, &utxos, TIP_OK).unwrap_err();
+        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+
         mp.set_cluster_limits(Some(2), None);
         let tx1 = spend_tx(op, 9_000_000);
         mp.accept_tx(&tx1, &utxos, TIP_OK).unwrap();
@@ -2164,113 +2246,7 @@ mod tests {
             matches!(err, AcceptError::ClusterTooLarge { count: 3, .. }),
             "{err}"
         );
-
-        let dir2 = tmp_dir();
-        let (op2, _, utxos2) = chain_utxo(10_000_000);
-        let mut mp2 = ActiveMempool::open_or_create(&dir2).unwrap();
-        mp2.set_cluster_limits(Some(50), Some(1));
-        let mut wide = spend_tx(op2, 9_000_000);
-        wide.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
-        let err = mp2.accept_tx(&wide, &utxos2, TIP_OK).unwrap_err();
-        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    fn evicted_feerate_raises_the_floor_above_the_static_bump() {
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 800).unwrap();
-        let before = mp.mempool_min_fee_sat_kvb();
-        assert!(before > policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB);
-        for i in 0u8..8 {
-            let op = OutPoint {
-                txid: Txid::from_byte_array([i.wrapping_add(1); 32]),
-                vout: 0,
-            };
-            let mut map = HashMap::new();
-            map.insert(
-                op,
-                coin(TxOut {
-                    value: Amount::from_sat(100_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-                }),
-            );
-            let utxos = MapUtxoProvider { map };
-            let out = 99_000u64 - u64::from(i) * 100;
-            mp.accept_tx(&spend_tx(op, out), &utxos, TIP_OK)
-                .unwrap_or_else(|e| panic!("i={i}: {e}"));
-        }
-        let after = mp.mempool_min_fee_sat_kvb();
-        assert!(
-            after > before,
-            "eviction must raise the floor above the static bump ({before} -> {after})"
-        );
-        let op = OutPoint {
-            txid: Txid::from_byte_array([0xee; 32]),
-            vout: 0,
-        };
-        let probe = spend_tx(op, 99_000);
-        let vsize = policy::get_virtual_size(probe.weight().to_wu());
-        let fee = vsize.saturating_mul(before).div_ceil(1_000);
-        let tx = spend_tx(op, 100_000 - fee);
-        let mut map = HashMap::new();
-        map.insert(
-            op,
-            coin(TxOut {
-                value: Amount::from_sat(100_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }),
-        );
-        let err = mp
-            .accept_tx(&tx, &MapUtxoProvider { map }, TIP_OK)
-            .expect_err("same static-bump rate must not re-enter");
-        assert!(
-            matches!(
-                err,
-                AcceptError::Policy("mempool min fee") | AcceptError::Policy("min relay fee")
-            ),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn too_many_sigops_rejected_before_script() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        // 4001 legacy CHECKSIG × witness scale 4 = 16004, over the 16000 standard cap.
-        // The input spends OP_TRUE, so the interpreter would accept this tx.
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: op,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
-            }],
-        };
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp
-            .accept_tx(&tx, &utxos, TIP_OK)
-            .expect_err("standard sigop cap");
-        assert!(
-            matches!(err, AcceptError::Policy("bad-txns-too-many-sigops")),
-            "sigops must fail before the interpreter, got {err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mempool_under_pressure() {
-        too_many_sigops_rejected_before_script();
-        evicted_feerate_raises_the_floor_above_the_static_bump();
-        relay_floor_decays_when_not_full_and_holds_while_full();
-        min_fee_decays_when_one_more_standard_tx_would_exactly_fill();
-        cluster_cap_is_one_past_the_members_and_vsize_is_a_quarter();
     }
 
     fn spend_tx(op: OutPoint, out_value: u64) -> Transaction {

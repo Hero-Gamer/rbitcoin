@@ -421,29 +421,6 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn orphan_expires_after_twenty_minutes() {
-        assert_eq!(ORPHAN_EXPIRE_MS, 1_200_000);
-        assert!(unix_ms() > 1_700_000_000_000);
-    }
-
-    fn removing_one_orphan_keeps_the_rest_of_the_peer_weight() {
-        let mut o = Orphanage::new();
-        let a = make_orphan(txid_n(1), 1);
-        let b = make_orphan(txid_n(2), 2);
-        let mut miss_a = BTreeSet::new();
-        miss_a.insert(txid_n(1));
-        let mut miss_b = BTreeSet::new();
-        miss_b.insert(txid_n(2));
-        assert!(o.insert_from(a, miss_a, Some(7)));
-        let one = o.peer_orphan_weight(7);
-        assert!(one > 0);
-        assert!(o.insert_from(b.clone(), miss_b, Some(7)));
-        assert!(o.peer_orphan_weight(7) > one);
-        o.erase_for_block(&[b.compute_txid()]);
-        assert_eq!(o.peer_orphan_weight(7), one);
-    }
-
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::transaction::Version;
@@ -577,51 +554,51 @@ mod tests {
         assert!(!o.contains(&tid));
         assert!(o.is_empty());
     }
-
-    fn protected_reserve_does_not_refuse_a_later_orphan() {
-        let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 2);
-        let p = txid_n(11);
-        for (n, peer) in [(1u8, 1u64), (2, 2)] {
-            let tx = make_orphan(p, n);
-            let mut miss = BTreeSet::new();
-            miss.insert(p);
-            assert!(o.insert_from(tx, miss, Some(peer)));
-        }
-        assert_eq!(o.len(), 2);
-        let tx = make_orphan(p, 3);
-        let tid = tx.compute_txid();
-        let mut miss = BTreeSet::new();
-        miss.insert(p);
-        assert!(
-            o.insert_from(tx, miss, Some(3)),
-            "a full per-peer reserve must still admit a newer orphan"
-        );
-        assert!(o.contains(&tid));
-        assert!(o.len() <= 2);
-    }
-
-    fn orphan_expires_after_the_bound() {
-        let mut o = Orphanage::new();
-        let p = txid_n(12);
-        let old = make_orphan(p, 1);
-        let old_id = old.compute_txid();
-        let mut miss = BTreeSet::new();
-        miss.insert(p);
-        assert!(o.insert_from_at(old, miss.clone(), Some(1), 0));
-        assert!(o.contains(&old_id));
-        let newer = make_orphan(p, 2);
-        assert!(o.insert_from_at(newer, miss, Some(2), ORPHAN_EXPIRE_MS));
-        assert!(
-            !o.contains(&old_id),
-            "an orphan parked for ORPHAN_EXPIRE_MS is gone"
-        );
-    }
-
     #[test]
     fn mempool_under_pressure() {
-        protected_reserve_does_not_refuse_a_later_orphan();
-        orphan_expires_after_twenty_minutes();
-        orphan_expires_after_the_bound();
-        removing_one_orphan_keeps_the_rest_of_the_peer_weight();
+        assert_eq!(ORPHAN_EXPIRE_MS, 1_200_000);
+        assert!(unix_ms() > 1_700_000_000_000);
+
+        let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 2);
+        let parent = txid_n(11);
+        let mut miss = BTreeSet::new();
+        miss.insert(parent);
+
+        let first = make_orphan(parent, 1);
+        let second = make_orphan(parent, 2);
+        assert!(o.insert_from_at(first, miss.clone(), Some(7), 0));
+        let one = o.peer_orphan_weight(7);
+        assert!(one > 0);
+        assert!(o.insert_from_at(second.clone(), miss.clone(), Some(7), 0));
+        assert!(o.peer_orphan_weight(7) > one);
+        o.erase_for_block(&[second.compute_txid()]);
+        assert_eq!(o.peer_orphan_weight(7), one);
+
+        let filler = make_orphan(parent, 4);
+        assert!(o.insert_from_at(filler, miss.clone(), Some(2), 0));
+        assert_eq!(o.len(), 2);
+        let later = make_orphan(parent, 3);
+        let later_id = later.compute_txid();
+        assert!(
+            o.insert_from_at(later, miss.clone(), Some(3), 0),
+            "a full per-peer reserve must still admit a newer orphan"
+        );
+        assert!(o.contains(&later_id));
+        assert!(o.len() <= 2);
+
+        let held = make_orphan(parent, 5);
+        let held_id = held.compute_txid();
+        assert!(o.insert_from_at(held, miss.clone(), Some(7), ORPHAN_EXPIRE_MS));
+        assert!(
+            !o.contains(&later_id),
+            "an orphan parked for ORPHAN_EXPIRE_MS is gone"
+        );
+        assert!(o.contains(&held_id));
+        let tail = make_orphan(parent, 6);
+        assert!(o.insert_from_at(tail, miss, Some(7), ORPHAN_EXPIRE_MS + ORPHAN_EXPIRE_MS));
+        assert!(
+            !o.contains(&held_id),
+            "the next expiry bound drops the orphan that survived the first"
+        );
     }
 }
