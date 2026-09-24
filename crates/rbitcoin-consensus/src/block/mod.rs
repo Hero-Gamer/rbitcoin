@@ -965,7 +965,9 @@ impl AsmPrevoutAcc {
 /// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
 /// [`rbitcoin_query::SpendEdges`]. Optimistic miss is `invariant:` (no head recover).
 ///
-/// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
+/// Returns `(script_jobs, spends, fees, tx_fees)`. `fees` is the block sum
+/// for the coinbase subsidy check. `tx_fees` is one satoshi fee per tx
+/// (coinbase is 0) for the `txstat` stamp.
 ///
 /// `prev_mtp` / `block_hash` / `bip16_active` must be computed **once** by the
 /// caller (assemble_run header window) — no re-walk of headers and no rehash.
@@ -998,6 +1000,7 @@ pub(crate) fn assemble_block_prevouts(
             u32,
         )>,
         i64,
+        Vec<u64>,
     ),
     ConsensusError,
 > {
@@ -1019,6 +1022,7 @@ pub(crate) fn assemble_block_prevouts(
     let mut acc = AsmPrevoutAcc::default();
     let mut clk_job = 0u64;
     let mut fees = 0i64;
+    let mut tx_fees = vec![0u64; n_tx];
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
@@ -1052,7 +1056,7 @@ pub(crate) fn assemble_block_prevouts(
             return Err(ConsensusError::BadTx("no outputs"));
         }
         if ti > 0 {
-            assemble_non_cb_tx(
+            tx_fees[ti] = assemble_non_cb_tx(
                 block,
                 tx,
                 ti,
@@ -1087,7 +1091,7 @@ pub(crate) fn assemble_block_prevouts(
     acc.flush(query.confirm_stats());
     rbitcoin_query::note_confirm(&query.confirm_stats().asm_prevout_ns, clk_prev);
     rbitcoin_query::note_confirm(&query.confirm_stats().asm_job_ns, clk_job);
-    Ok((script_jobs, spends, fees))
+    Ok((script_jobs, spends, fees, tx_fees))
 }
 
 fn assemble_prevout_guards(
@@ -1188,7 +1192,7 @@ fn assemble_non_cb_tx(
     block_sigops_cost: &mut u64,
     build_script_jobs: bool,
     clk_job: &mut u64,
-) -> Result<(), ConsensusError> {
+) -> Result<u64, ConsensusError> {
     if tx.input.is_empty() {
         return Err(ConsensusError::BadTx("no inputs"));
     }
@@ -1226,6 +1230,7 @@ fn assemble_non_cb_tx(
     let fee = value_in
         .checked_sub(value_out)
         .ok_or(ConsensusError::BadTx("fee overflow"))?;
+    let fee_sat = u64::try_from(fee).map_err(|_| ConsensusError::BadTx("fee overflow"))?;
     *fees = fees
         .checked_add(fee)
         .ok_or(ConsensusError::BadTx("fee overflow"))?;
@@ -1244,7 +1249,7 @@ fn assemble_non_cb_tx(
         script_jobs.push(job);
         *clk_job = clk_job.saturating_add(t_job.elapsed().as_nanos() as u64);
     }
-    Ok(())
+    Ok(fee_sat)
 }
 
 fn assemble_tx_value_out(
