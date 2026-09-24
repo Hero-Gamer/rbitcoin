@@ -188,13 +188,15 @@ recent-rejects.
 
 [`.github/workflows/core-functional.yml`](../.github/workflows/core-functional.yml)
 runs `scripts/core-functional/nightly.sh` on a nightly cron, on
-`workflow_dispatch`, and on PRs that are **ship versions**, or labeled
-**`core-functional`** / **`release`**. Unlabeled non-ship PRs keep the cargo
+`workflow_dispatch`, and on PRs labeled **`core-functional`**.
+[`release-gate.yml`](../.github/workflows/release-gate.yml) also calls it on
+**ship versions** and PRs labeled **`release`**. Unlabeled non-ship PRs keep the cargo
 gates only. Do **not** make this job required on all PRs, or on PRs that
 merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ([`TESTING.md`](../TESTING.md)). Label harness PRs and every version-bump
-ship PR (see [`releases.md`](./releases.md)). The `release-extra` job on
-that workflow fails when a ship PR did not get a green `core-functional`.
+ship PR (see [`releases.md`](./releases.md)). The `release-extra` job in
+`release-gate.yml` fails when a ship PR did not get a green
+`core-functional`, `overlay-functional`, and `warnet-example`.
 The `core-functional` job is **30 minutes** (77 `test_runner` jobs: 71
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
@@ -305,8 +307,9 @@ note is in [`OPERATOR.md`](../OPERATOR.md).
 
 ### CI example (label `warnet`)
 
-Two tanks on one Docker network, not kind or Helm. Unlabeled PRs do not
-run it. `workflow_dispatch` also runs it.
+Two tanks on one Docker network, not kind or Helm. Unlabeled non-ship PRs
+do not run it. `workflow_dispatch`, label `release`, and ship versions also
+run it; `release-extra` requires it on ship PRs.
 
 ```bash
 cargo build -p rbitcoin-node

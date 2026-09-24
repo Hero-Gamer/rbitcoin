@@ -1,61 +1,37 @@
-# Overlay functional gate: nightly + dispatch + ship PRs + labels.
-# Unlabeled non-ship PRs do not start the heavy job. Default cargo test
-# never calls run.sh.
+# Overlay functional: nightly + dispatch + label `overlay-functional`.
+# Ship PRs and label `release` run it through release-gate.yml
+# (workflow_call, `gate: true`) so `release-extra` can require it.
+# Default cargo test never calls run.sh.
 name: overlay-functional
 
 on:
   schedule:
     - cron: "42 6 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      gate:
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
-  group: overlay-functional-${{ github.event.pull_request.number || github.ref }}
+  group: overlay-functional-${{ inputs.gate && 'gate-' || '' }}${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  detect:
-    name: detect-ship
-    runs-on: ubuntu-latest
-    outputs:
-      ship: ${{ steps.v.outputs.ship }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'pull_request'
-        with:
-          persist-credentials: false
-      - name: Classify ship vs .99
-        id: v
-        run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            echo "ship=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          kind="$(./scripts/release-gate.sh --kind)"
-          echo "kind=$kind" >> "$GITHUB_OUTPUT"
-          if [[ "$kind" == ship ]]; then
-            echo "ship=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ship=false" >> "$GITHUB_OUTPUT"
-          fi
-
   overlay-functional:
     name: overlay-functional
-    needs: [detect]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >-
-      always() &&
-      needs.detect.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.detect.outputs.ship == 'true' ||
-       contains(github.event.pull_request.labels.*.name, 'overlay-functional') ||
-       contains(github.event.pull_request.labels.*.name, 'release'))
+      inputs.gate ||
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'overlay-functional')
     env:
       CARGO_TARGET_DIR: target/dev
       RUSTFLAGS: -D warnings

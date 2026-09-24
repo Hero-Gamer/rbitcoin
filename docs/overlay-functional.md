@@ -81,9 +81,9 @@ stays argv / `After=` only).
 
 [`.github/workflows/overlay-functional.yml`](../.github/workflows/overlay-functional.yml):
 nightly `42 6 * * *`, `workflow_dispatch`, label **`overlay-functional`**,
-label **`release`**, or ship version (same `if:` as Core functional). **Not**
-a required check. Do not fold into `release-extra` until the suite is green
-for a few nightlies.
+label **`release`**, or ship version. Ship and `release` runs come from
+[`release-gate.yml`](../.github/workflows/release-gate.yml) (`workflow_call`), and `release-extra` fails a ship PR
+unless this job is green. Not required on other PRs.
 
 Unlabeled non-ship PRs stay cargo-only ([`TESTING.md`](../TESTING.md)).
 Label harness PRs and ship version-bump PRs. Reproduce locally with `run.sh`

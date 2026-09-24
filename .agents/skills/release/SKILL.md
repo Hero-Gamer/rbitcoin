@@ -14,9 +14,10 @@ playbook (changelog cut, Highlights, tag, `vX.Y.x`, `.99` bump). Do not copy
 it into this skill.
 
 Ship commands (worktree, HTTPS push, poll) are
-[`ship-pr`](../ship-pr/SKILL.md). A ship PR also needs the
-[`core-functional`](../core-functional/SKILL.md) label and a green
-`release-extra` check. See the CI gates section of `docs/releases.md`.
+[`ship-pr`](../ship-pr/SKILL.md). A ship PR also needs the `release`
+label and a green `release-extra` check (core, overlay, and Warnet
+functional all green).
+See the CI gates section of `docs/releases.md`.
 
 ## Scripts
 

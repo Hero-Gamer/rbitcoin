@@ -1,14 +1,21 @@
 # Two-tank Warnet lab image. Label `warnet` or workflow_dispatch.
-# Not a required check. Not kind/Helm miner_std.
+# Ship PRs and label `release` run it through release-gate.yml
+# (workflow_call, `gate: true`) so `release-extra` can require it.
+# Not kind/Helm miner_std.
 name: warnet-example
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      gate:
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 concurrency:
-  group: warnet-example-${{ github.event.pull_request.number || github.ref }}
+  group: warnet-example-${{ inputs.gate && 'gate-' || '' }}${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -20,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     if: >-
+      inputs.gate ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'warnet')
     env:
