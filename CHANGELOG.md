@@ -11,6 +11,11 @@ before 1.0).
 
 ### Fixed
 
+- **Mempool sigop cost:** admission rejects a tx whose BIP16+BIP141 sigop
+  cost exceeds 80,000 − 400 (no block can hold it), and every live entry
+  records its full cost. The sidecar is schema 3; schema 2 pools soft-migrate
+  on open and the hub recomputes the cost, dropping entries whose inputs no
+  longer resolve.
 - **Standard sigop cost is enforced before script execution.** A transaction
   whose sigop cost exceeds 16_000 is `bad-txns-too-many-sigops` and is not
   handed to the interpreter. An invalid script from a peer adds 10 to that

@@ -712,6 +712,9 @@ impl MempoolHub {
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(HashMap::new()),
         };
+        // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
+        hub.lock_write()
+            .recompute_missing_sigops(&QueryUtxoProvider::new(&hub.query));
         {
             let mut u = hub.unbroadcast.lock().unwrap();
             u.retain(|t| hub.contains(t));
@@ -3817,7 +3820,7 @@ mod tests {
             {
                 let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
                 store
-                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, &[])
+                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, 0, &[])
                     .unwrap();
                 store.flush().unwrap();
             }
@@ -3830,6 +3833,31 @@ mod tests {
             assert!(
                 !hub.scripthash_mempool(&sh).is_empty(),
                 "batch-fill the vin that lacked aux"
+            );
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            // Unknown sigop cost (schema-2 migrate): open recomputes it from
+            // chain coins and drops the entry whose input is not a coin.
+            let mp = tmp();
+            let ok = spend_true(cbs[0], 1_000, spk.clone());
+            let gone = spend_true(Txid::from_byte_array([0xee; 32]), 1_000, spk.clone());
+            {
+                let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
+                for tx in [&ok, &gone] {
+                    let (tid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+                    store
+                        .append_live_tx(tx, &tid, &wtxid, 1_000, 400, u64::MAX, &[])
+                        .unwrap();
+                }
+                store.flush().unwrap();
+            }
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            assert!(hub.contains(&ok.compute_txid()));
+            assert!(
+                !hub.contains(&gone.compute_txid()),
+                "unresolvable input evicted"
             );
             let _ = std::fs::remove_dir_all(&mp);
         }

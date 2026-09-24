@@ -154,7 +154,7 @@ intentional:
 | **Sealed BDZ `g`** | **0 heap** | Header only; 4 KiB `g` pages via uring stream (`KIND_MPHF_G`). Hot pages are kernel `RssFile`. FdOnly because a mapped miss serializes one fault per lookup thread; the ring keeps 128 pages in flight. Do not mmap packed `g`. |
 | **SH BDZ3 occupancy** | **supers heap** (`mphf_occ=`); ~150 MiB `file=` at ~1 B SH keys | Read-only map of the `NN.mphf` prefix through occ (not tags). Rank popcounts mapped bytes. |
 | **Class C L2 `strong_tx`** | **~177 MiB** | 1 bit/create, under the 256 MiB in-RAM cap. Stays process `Vec`: `MAP_SHARED` would write before the tip barrier; `MAP_PRIVATE` COWs `set_bit` back into anon. |
-| **Mempool schema 2** | Slot table ~6 MiB at 128k + body weight | InRam `slots`/`body` Vecs + `pwrite`. Live set is also the graph. Not mapped. |
+| **Mempool schema 3** | Slot table ~6 MiB at 128k + body weight | InRam `slots`/`body` Vecs + `pwrite`. Live set is also the graph. Not mapped. |
 | **`height_by_hash`** | **~60 MiB** | In-process confirmed hash→height map. Incremental on tip extend/shrink; full `0..=tip` walk on open / invalidate only. |
 | **mimalloc arenas** | **anon − accounted** after IBD | Product bins are global mimalloc. IBD allocates/frees GiB-class transients; `free` is not `munmap`. After tip catch-up, `anon=` can stay fat while `accounted=` collapses. That is allocator residue, not a store leak. Fuse mmap does not mean RSS equals fuse. Do not `malloc_trim` a mimalloc process. Optional operator: `MIMALLOC_PURGE_DELAY=0`. The `mimalloc` crate does not expose `mi_collect` on `MiMalloc` (no in-process purge hook). |
 | **Process baseline** | **~90 MiB** | Visible at genesis (`class_a=476`, `residual≈93`). Allocator arenas, rustc runtime, net. |

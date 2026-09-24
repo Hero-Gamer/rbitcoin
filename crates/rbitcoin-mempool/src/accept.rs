@@ -330,6 +330,21 @@ fn tx_has_witness(tx: &Transaction) -> bool {
     tx.input.iter().any(|i| !i.witness.is_empty())
 }
 
+/// Full BIP16 + BIP141 sigop cost (Core ATMP `GetTransactionSigOpCost`; P2SH
+/// and witness flags match `STANDARD_SCRIPT_VERIFY_FLAGS`). Rejects a cost no
+/// block can hold beside the coinbase reserve (consensus-impossible, not policy).
+fn block_fit_sigop_cost(tx: &Transaction, prevouts: &[TxOut]) -> Result<u64, AcceptError> {
+    let spks: Vec<&[u8]> = prevouts
+        .iter()
+        .map(|o| o.script_pubkey.as_bytes())
+        .collect();
+    let cost = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
+    if cost > MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE {
+        return Err(AcceptError::TooManySigops { cost });
+    }
+    Ok(cost)
+}
+
 fn first_missing_outpoint(
     tx: &Transaction,
     missing: &BTreeSet<Txid>,
@@ -560,8 +575,9 @@ impl ActiveMempool {
                 wtxid: p.wtxid,
                 fee_sat: p.fee_sat,
                 weight: p.weight,
-                // Not in the schema-2 packed record; reload reads as zero.
-                sigop_cost: 0,
+                // Migrated from schema ≤ 2: unknown until
+                // [`ActiveMempool::recompute_missing_sigops`]. MAX never fits a block.
+                sigop_cost: p.sigop_cost.unwrap_or(u64::MAX),
                 slot: live.slot,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
@@ -814,15 +830,7 @@ impl ActiveMempool {
 
         check_mempool_structural(tx, &chain_coins, tip)?;
 
-        // P2SH + witness flags match Core ATMP `STANDARD_SCRIPT_VERIFY_FLAGS`.
-        let spks: Vec<&[u8]> = prevouts
-            .iter()
-            .map(|o| o.script_pubkey.as_bytes())
-            .collect();
-        let sigop_cost = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
-        if sigop_cost > MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE {
-            return Err(AcceptError::TooManySigops { cost: sigop_cost });
-        }
+        let sigop_cost = block_fit_sigop_cost(tx, &prevouts)?;
 
         let mut output_value = 0u64;
         for o in &tx.output {
@@ -952,9 +960,15 @@ impl ActiveMempool {
 
         let aux = Self::vin_aux_from_prep(tx, &prep);
         let t_dur = Instant::now();
-        let slot = self
-            .store
-            .append_live_tx(tx, &txid, &prep.wtxid, fee_sat, weight, &aux)?;
+        let slot = self.store.append_live_tx(
+            tx,
+            &txid,
+            &prep.wtxid,
+            fee_sat,
+            weight,
+            prep.sigop_cost,
+            &aux,
+        )?;
         self.last_accept_stages.durable_us = self
             .last_accept_stages
             .durable_us
@@ -1663,6 +1677,55 @@ impl ActiveMempool {
             }
             if !removed {
                 break;
+            }
+        }
+    }
+
+    /// Fill sigop cost for entries migrated from schema ≤ 2 (open-time pass).
+    ///
+    /// Prevouts resolve from live parents or `utxos`. Entries whose prevouts
+    /// no longer resolve, or whose cost cannot fit a block, are evicted
+    /// (with spenders). Filled costs are written back to the durable record.
+    pub fn recompute_missing_sigops(&mut self, utxos: &impl UtxoProvider) {
+        let ids: Vec<Txid> = self
+            .graph
+            .iter()
+            .filter(|(_, e)| e.sigop_cost == u64::MAX)
+            .map(|(t, _)| *t)
+            .collect();
+        for id in ids {
+            let Some(tx) = self.get_tx(&id).cloned() else {
+                continue;
+            };
+            let prevouts: Option<Vec<TxOut>> = tx
+                .input
+                .iter()
+                .map(|inp| {
+                    let op = inp.previous_output;
+                    match self.graph.creator(&op) {
+                        Some(p) => self
+                            .get_tx(&p)
+                            .and_then(|t| t.output.get(op.vout as usize))
+                            .cloned(),
+                        None => utxos.get_coin(&op).map(|c| c.txout),
+                    }
+                })
+                .collect();
+            let slot = self.graph.get(&id).map(|e| e.slot);
+            match (prevouts.map(|p| block_fit_sigop_cost(&tx, &p)), slot) {
+                (Some(Ok(cost)), Some(slot)) => {
+                    self.graph.set_sigop_cost(&id, cost);
+                    if let Err(e) = self.store.set_sigop_cost(slot, cost) {
+                        rbitcoin_log::warn!("mempool: sigops write-back {id}: {e}");
+                    }
+                }
+                _ => {
+                    let gone = self.remove_txid_tree(&id);
+                    rbitcoin_log::info!(
+                        "mempool: sigops recompute evicted {id} ({} with spenders): inputs gone or cost over block budget",
+                        gone.len()
+                    );
+                }
             }
         }
     }
@@ -2557,6 +2620,83 @@ mod tests {
         let res = mp.reorg_disconnect_reaccept(&pkg, &utxos, TIP_OK);
         assert!(res.iter().all(Result::is_ok), "{res:?}");
         assert_eq!(live_sigops(&mp, &parent), 8);
+        assert_eq!(live_sigops(&mp, &child), 80);
+    }
+
+    #[test]
+    fn reopen_preserves_sigop_cost() {
+        let dir = tmp_dir();
+        let (utxos, p2sh, p2wsh) = p2sh_p2wsh_multisig_spends();
+        {
+            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+            mp.accept_tx(&p2sh, &utxos, TIP_OK).unwrap();
+            mp.accept_tx(&p2wsh, &utxos, TIP_OK).unwrap();
+            mp.flush().unwrap();
+        }
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(live_sigops(&mp, &p2sh), 8);
+        assert_eq!(live_sigops(&mp, &p2wsh), 2);
+        mp.compact().unwrap();
+        assert_eq!(live_sigops(&mp, &p2sh), 8, "compact re-ingest");
+    }
+
+    /// Schema-2 pool: costs unknown after migrate; the open-time pass recomputes
+    /// from live parents + chain coins, evicts unresolvable / over-budget
+    /// entries, and writes costs back so the next open needs no pass.
+    #[test]
+    fn schema2_pool_recomputes_sigops_after_open() {
+        let dir = tmp_dir();
+        let (mut utxos, p2sh, p2wsh) = p2sh_p2wsh_multisig_spends();
+        let mut child = spend_tx(
+            OutPoint {
+                txid: p2sh.compute_txid(),
+                vout: 0,
+            },
+            80_000,
+        );
+        child.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0xae]),
+        });
+        let (gone_op, _, extra) = chain_utxo(100_000);
+        utxos.map.extend(extra.map);
+        let gone = spend_tx(gone_op, 90_000);
+        let probe_op = OutPoint {
+            txid: Txid::from_byte_array([0xa3; 32]),
+            vout: 0,
+        };
+        utxos.map.insert(probe_op, utxos.map[&gone_op].clone());
+        let probe = multisig_outputs_tx(probe_op, 1001);
+        {
+            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+            for tx in [&p2sh, &p2wsh, &child, &gone] {
+                mp.accept_tx(tx, &utxos, TIP_OK).unwrap();
+            }
+            // Admitted by a pre-sigop-check build.
+            let (pid, pw) = (probe.compute_txid(), probe.compute_wtxid());
+            mp.store
+                .append_live_tx(&probe, &pid, &pw, 1_000, probe.weight().to_wu(), 0, &[])
+                .unwrap();
+            mp.flush().unwrap();
+        }
+        crate::store::tests::downgrade_to_schema2(dir.as_ref());
+        utxos.map.remove(&gone_op);
+
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 5);
+        assert!(mp.graph.iter().all(|(_, e)| e.sigop_cost == u64::MAX));
+        mp.recompute_missing_sigops(&utxos);
+        assert_eq!(mp.live_count(), 3);
+        assert!(!mp.graph.contains(&gone.compute_txid()), "prevout gone");
+        assert!(!mp.graph.contains(&probe.compute_txid()), "over budget");
+        assert_eq!(live_sigops(&mp, &p2sh), 8);
+        assert_eq!(live_sigops(&mp, &p2wsh), 2);
+        assert_eq!(live_sigops(&mp, &child), 80);
+        drop(mp);
+
+        let mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 3);
+        assert_eq!(live_sigops(&mp, &p2sh), 8, "written back");
         assert_eq!(live_sigops(&mp, &child), 80);
     }
 

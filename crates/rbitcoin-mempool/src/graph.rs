@@ -257,6 +257,13 @@ impl TxGraph {
         self.entries.get(txid)
     }
 
+    /// Set a live entry's sigop cost (post-migrate recompute).
+    pub(crate) fn set_sigop_cost(&mut self, txid: &Txid, cost: u64) {
+        if let Some(e) = self.entries.get_mut(txid) {
+            e.sigop_cost = cost;
+        }
+    }
+
     pub fn contains(&self, txid: &Txid) -> bool {
         self.entries.contains_key(txid)
     }
