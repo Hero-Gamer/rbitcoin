@@ -2194,3 +2194,83 @@ fn pres_has_witness_matches_block_walk() {
         block_has_witness(&block)
     );
 }
+
+#[test]
+fn exceeds_sigops_limit_matches_the_block_cap() {
+    use super::exceeds_sigops_limit;
+    assert!(!exceeds_sigops_limit(0));
+    assert!(!exceeds_sigops_limit(79_999));
+    assert!(!exceeds_sigops_limit(80_000));
+    assert!(exceeds_sigops_limit(80_001));
+    assert!(exceeds_sigops_limit(u64::MAX));
+}
+
+#[test]
+fn should_use_pres_requires_an_index_inside_the_slice() {
+    use super::should_use_pres;
+    assert!(should_use_pres(0, 1));
+    assert!(!should_use_pres(1, 1));
+    assert!(!should_use_pres(0, 0));
+    assert!(should_use_pres(0, 2));
+    assert!(!should_use_pres(2, 2));
+}
+
+#[test]
+fn lock_time_cutoff_uses_block_time_at_height_zero_even_when_csv_is_active() {
+    use super::assemble_lock_time_cutoff;
+    let mut block = block_with(vec![coinbase(0)]);
+    block.header.time = 100;
+    let mtp = 200;
+    assert_eq!(assemble_lock_time_cutoff(&ctx_h(0), &block, mtp), 100);
+    // Regtest CSV height is 1, so height 1 uses the previous median time.
+    assert_eq!(assemble_lock_time_cutoff(&ctx_h(1), &block, mtp), mtp);
+
+    let mut params = ChainParams::regtest();
+    params.apply_test_activation_height("csv", 0).unwrap();
+    let params = Box::leak(Box::new(params));
+    let at_genesis = ValidationContext::at(params, Height(0), Milestone::NONE);
+    assert!(params.csv_active_at(0));
+    assert_eq!(assemble_lock_time_cutoff(&at_genesis, &block, mtp), 100);
+    let after_genesis = ValidationContext::at(params, Height(1), Milestone::NONE);
+    assert_eq!(assemble_lock_time_cutoff(&after_genesis, &block, mtp), mtp);
+
+    let mut late = ChainParams::regtest();
+    late.apply_test_activation_height("csv", 500).unwrap();
+    let late = Box::leak(Box::new(late));
+    let before_csv = ValidationContext::at(late, Height(10), Milestone::NONE);
+    assert!(!late.csv_active_at(10));
+    assert_eq!(assemble_lock_time_cutoff(&before_csv, &block, mtp), 100);
+}
+
+#[test]
+fn max_money_fits_in_i64_so_the_assemble_cast_is_in_range() {
+    use super::{exceeds_max_money, money_range_out_sum};
+    let max_money = Amount::MAX_MONEY.to_sat();
+    assert!(!exceeds_max_money(0));
+    assert!(!exceeds_max_money(max_money));
+    assert!(exceeds_max_money(max_money + 1));
+    assert!(exceeds_max_money(u64::MAX));
+    assert_eq!(money_range_out_sum(max_money), max_money as i64);
+    assert!(i64::try_from(max_money).is_ok());
+    assert!(i64::try_from(u64::MAX).is_err());
+}
+
+#[test]
+fn structure_rejects_pres_out_sum_above_max_money_before_assemble_casts_it() {
+    let max_money = Amount::MAX_MONEY.to_sat();
+    let block = block_with(vec![coinbase(0)]);
+    let mut at_cap: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+    at_cap[0].out_sum = max_money;
+    validate_block_structure_with_pres(&block, &ctx_h(0), Some(at_cap.into()), None)
+        .expect("MAX_MONEY out_sum is inside the range");
+
+    for sum in [max_money + 1, u64::MAX] {
+        let mut pres: Vec<TxPrecompute> = block.txdata.iter().map(TxPrecompute::from_tx).collect();
+        // Outputs stay under the cap. Only the precompute sum is over, including
+        // the saturating `u64::MAX` that would cast to -1.
+        pres[0].out_sum = sum;
+        let err = validate_block_structure_with_pres(&block, &ctx_h(0), Some(pres.into()), None)
+            .unwrap_err();
+        assert_bad_block(err, "bad-txns-txouttotal-toolarge");
+    }
+}
