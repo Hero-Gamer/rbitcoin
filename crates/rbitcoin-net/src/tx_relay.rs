@@ -2847,13 +2847,14 @@ impl MempoolHub {
         self.lock_read().graph.get(txid).map(|e| e.sigop_cost)
     }
 
+    /// Fee + sigop-adjusted weight for the feefilter announce gate (Core
+    /// `txinfo.vsize` is `GetTxSize`). `None` if a writer holds `inner`.
     pub fn try_get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
-        self.inner
-            .try_read()
-            .ok()?
-            .graph
+        let g = self.inner.try_read().ok()?;
+        let bps = g.graph.bytes_per_sigop();
+        g.graph
             .get(txid)
-            .map(|e| (e.fee_sat, e.weight))
+            .map(|e| (e.fee_sat, e.adjusted_weight(bps)))
     }
 
     /// Compact fill: siphash live txid/wtxid, clone **matching** bodies only.
@@ -3904,6 +3905,8 @@ mod tests {
             assert_eq!(hub.get_live_adjusted_weight(&tid), Some(2_000));
             // Core `getmempoolcluster` `clusterweight` is sigop-adjusted.
             assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 2_000);
+            // Feefilter announce gate: Core `txinfo.vsize` is sigop-adjusted.
+            assert_eq!(hub.try_get_live_meta(&tid), Some((1_000, 2_000)));
             hub.set_bytes_per_sigop(0);
             assert_eq!(hub.get_live_adjusted_weight(&tid), Some(400));
             assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 400);
