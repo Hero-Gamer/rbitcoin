@@ -616,9 +616,21 @@ impl TxGraph {
 
     /// One membership walk from every seed. Weight sum of the union.
     pub fn connected_weight(&self, seeds: &BTreeSet<Txid>) -> (usize, u64) {
+        self.connected_weight_except(seeds, &BTreeSet::new())
+    }
+
+    /// [`connected_weight`] that does not enter `except` (RBF conflicts still linked).
+    pub(crate) fn connected_weight_except(
+        &self,
+        seeds: &BTreeSet<Txid>,
+        except: &BTreeSet<Txid>,
+    ) -> (usize, u64) {
         let mut seen = BTreeSet::new();
         let mut q = VecDeque::new();
         for seed in seeds {
+            if except.contains(seed) {
+                continue;
+            }
             if self.entries.contains_key(seed) && seen.insert(*seed) {
                 q.push_back(*seed);
             }
@@ -628,6 +640,9 @@ impl TxGraph {
                 continue;
             };
             for n in e.parents.iter().chain(e.children.iter()) {
+                if except.contains(n) {
+                    continue;
+                }
                 if seen.insert(*n) {
                     q.push_back(*n);
                 }

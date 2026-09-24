@@ -1057,7 +1057,9 @@ impl ActiveMempool {
             .into_iter()
             .filter(|p| !conflict_set.contains(p))
             .collect();
-        let (n_members, base_w) = self.graph.connected_weight(&parent_txids);
+        let (n_members, base_w) = self
+            .graph
+            .connected_weight_except(&parent_txids, &conflict_set);
         let combined_vsize = base_w.saturating_add(weight).saturating_add(3) / 4;
         if n_members + 1 > self.graph.cluster_count_limit()
             || combined_vsize > self.graph.cluster_vsize_limit()
