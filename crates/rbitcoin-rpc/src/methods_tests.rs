@@ -3832,6 +3832,12 @@ fn getmempoolentry_vsize_is_sigop_adjusted() {
             .collect::<Vec<_>>(),
         vec![(tid, raw_w)]
     );
+    // Electrum histogram vsize is raw so it sums to GET `/mempool` `vsize`;
+    // the bucket key stays the (adjusted) mining-chunk rate.
+    let mp = ctx.mempool.as_ref().unwrap();
+    let raw_vb = raw_w.div_ceil(4);
+    assert_eq!(mp.fee_histogram(), vec![(500, raw_vb)]);
+    assert_eq!(mp.mempool_live_totals(), (1, raw_vb, 2_000));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

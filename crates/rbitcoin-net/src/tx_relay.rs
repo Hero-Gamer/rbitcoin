@@ -61,6 +61,8 @@ struct FeeSnapshot {
     by_depth_btc_per_kb: HashMap<u32, f64>,
     /// Best-first mining chunks from the last refresh (histogram / frontier).
     chunks: Vec<Chunk>,
+    /// Per-chunk Σ raw member vsize, parallel to [`Self::chunks`] (histogram).
+    chunk_raw_vsize: Vec<u64>,
     /// Live tx count from the same graph read as [`Self::chunks`].
     count: usize,
     /// Σ `(weight + 3) / 4` over live entries (GET `/mempool` `vsize`).
@@ -75,6 +77,7 @@ impl FeeSnapshot {
         Self {
             by_depth_btc_per_kb: HashMap::new(),
             chunks: Vec::new(),
+            chunk_raw_vsize: Vec::new(),
             count: 0,
             vsize: 0,
             total_fee: 0,
@@ -91,9 +94,9 @@ impl FeeSnapshot {
 
     fn histogram(&self) -> Vec<(u64, u64)> {
         let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        for ch in &self.chunks {
+        // Raw vsize (electrs `tx.vsize()`), so buckets sum to GET `/mempool` `vsize`.
+        for (ch, vsize) in self.chunks.iter().zip(&self.chunk_raw_vsize) {
             let rate = ch.fee_rate_sat_per_kvb();
-            let vsize = rbitcoin_consensus::policy::get_virtual_size(ch.weight);
             *by_rate.entry(rate).or_insert(0) += vsize;
         }
         by_rate.into_iter().rev().collect()
@@ -2001,9 +2004,19 @@ impl MempoolHub {
     /// One graph linearize under short read lock, then pure math off-lock → publish.
     fn refresh_fee_snapshot(&self) {
         let t0 = Instant::now();
-        let (chunks, count, vsize, total_fee) = {
+        let (chunks, chunk_raw_vsize, count, vsize, total_fee) = {
             let g = self.lock_read();
             let chunks = g.graph.mining_chunks_best_first();
+            let chunk_raw_vsize = chunks
+                .iter()
+                .map(|c| {
+                    c.txids
+                        .iter()
+                        .filter_map(|t| g.graph.get(t))
+                        .map(|e| e.weight.saturating_add(3) / 4)
+                        .sum()
+                })
+                .collect();
             let mut count = 0usize;
             let mut vsize = 0u64;
             let mut total_fee = 0u64;
@@ -2012,7 +2025,7 @@ impl MempoolHub {
                 total_fee = total_fee.saturating_add(e.fee_sat);
                 vsize = vsize.saturating_add(e.weight.saturating_add(3) / 4);
             }
-            (chunks, count, vsize, total_fee)
+            (chunks, chunk_raw_vsize, count, vsize, total_fee)
         };
 
         let now = Instant::now();
@@ -2062,6 +2075,7 @@ impl MempoolHub {
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
             by_depth_btc_per_kb: by_depth,
             chunks,
+            chunk_raw_vsize,
             count,
             vsize,
             total_fee,
