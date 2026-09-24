@@ -246,158 +246,7 @@ async fn hostile_peer_session() {
         "a second getaddr is not answered"
     );
 
-    peer.set_wants_addrv2();
-    let (src_tx, mut src_rx) = mpsc::unbounded_channel();
-    peer.attach_out(src_tx);
-    let mut neigh = Vec::new();
-    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000);
-    let dst = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
-    dst.set_wants_addrv2();
-    let (tx, rx) = mpsc::unbounded_channel();
-    dst.attach_out(tx);
-    neigh.push((dst.id, rx));
-    let quiet_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000);
-    let quiet = peers.register(
-        quiet_addr,
-        quiet_addr,
-        &ver,
-        true,
-        crate::peers::PeerConnType::Inbound,
-    );
-    let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
-    quiet.attach_out(quiet_tx);
-
-    assert_eq!(addr_relay_tokens(0.0, 1_000, 11_000), 1.0);
-    assert!(addr_relay_tokens(0.0, 1_000, 1_000) < 1.0);
-
-    let list: Vec<AddrV2Message> = (1..=3u8)
-        .map(|i| AddrV2Message {
-            time: 1_700_000_000,
-            services: ServiceFlags::NETWORK,
-            addr: AddrV2::Ipv4(Ipv4Addr::new(123, 123, 123, i)),
-            port: 8333,
-        })
-        .collect();
-    rbitcoin_log::capture_logs(true);
-    on_addrv2(&mut follow, Some(peer.as_ref()), &list).unwrap();
-    let lines = rbitcoin_log::take_logs();
-    rbitcoin_log::capture_logs(false);
-    let mut batched = None;
-    let mut batched_id = None;
-    for (id, rx) in &mut neigh {
-        if let Ok(msg) = rx.try_recv() {
-            assert!(rx.try_recv().is_err(), "the neighbor gets a single message");
-            batched_id = Some(*id);
-            batched = Some(msg.expect_msg());
-        }
-    }
-    let got = batched.expect("one addrv2");
-    let NetworkMessage::AddrV2(sent) = &got else {
-        panic!("expected addrv2, got {got:?}");
-    };
-    assert_eq!(sent, &list);
-    let nbytes = serialize(&got).len();
-    let want = sending_addrv2_log(nbytes, batched_id.expect("neighbor id"));
-    assert!(
-        lines.iter().any(|(_, l)| l == &want),
-        "missing {want:?} in {lines:?}"
-    );
-
-    for i in 1..4u16 {
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000 + i);
-        let p = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
-        p.set_wants_addrv2();
-        let (tx, rx) = mpsc::unbounded_channel();
-        p.attach_out(tx);
-        neigh.push((p.id, rx));
-    }
-
-    let n = neigh.len();
-    let mut even_port = None;
-    let mut odd_port = None;
-    let mut wrap_port = None;
-    for port in 1..20_000u16 {
-        let key = addr_key_oracle(&hostile_addr(port));
-        if (key as usize) < n * n {
-            continue;
-        }
-        let start = (key as usize) % n;
-        if key & 1 == 0 {
-            even_port.get_or_insert(port);
-        } else if start + 1 == n {
-            wrap_port.get_or_insert(port);
-        } else if start != 0 {
-            odd_port.get_or_insert(port);
-        }
-        if even_port.is_some() && odd_port.is_some() && wrap_port.is_some() {
-            break;
-        }
-    }
-    let ports = [
-        even_port.expect("an even relay key"),
-        odd_port.expect("an odd relay key whose next neighbor does not wrap"),
-        wrap_port.expect("an odd relay key whose next neighbor wraps"),
-    ];
-    for port in ports {
-        let msg = hostile_addr(port);
-        on_addrv2(&mut follow, Some(peer.as_ref()), std::slice::from_ref(&msg)).unwrap();
-        let key = addr_key_oracle(&msg);
-        let n_dest = if key & 1 == 0 { 1 } else { 2 };
-        let start = (key as usize) % n;
-        let mut expect = Vec::new();
-        for step in 0..n_dest {
-            let idx = if step == 0 {
-                start
-            } else if start + 1 == n {
-                0
-            } else {
-                start + 1
-            };
-            expect.push(neigh[idx].0);
-        }
-        expect.sort_unstable();
-        let mut got_ids = Vec::new();
-        for (id, rx) in &mut neigh {
-            while rx.try_recv().is_ok() {
-                got_ids.push(*id);
-            }
-        }
-        got_ids.sort_unstable();
-        assert_eq!(
-            got_ids, expect,
-            "port {port} key {key:#x} start {start} must select those neighbors"
-        );
-        assert!(src_rx.try_recv().is_err(), "a peer does not relay to itself");
-        assert!(
-            quiet_rx.try_recv().is_err(),
-            "a peer that did not ask for addrv2 is skipped"
-        );
-    }
-
-    on_addrv2(&mut follow, Some(peer.as_ref()), &[hostile_addr(8333)]).unwrap();
-    let mut reached = 0usize;
-    for (_, rx) in &mut neigh {
-        if rx.try_recv().is_ok() {
-            reached += 1;
-        }
-    }
-    assert!(
-        (1..=2).contains(&reached),
-        "one address reached {reached} neighbors"
-    );
-    let burst: Vec<_> = (1..1000u16).map(hostile_addr).collect();
-    on_addrv2(&mut follow, Some(peer.as_ref()), &burst).unwrap();
-    for (_, rx) in &mut neigh {
-        while rx.try_recv().is_ok() {}
-    }
-    on_addrv2(&mut follow, Some(peer.as_ref()), &[hostile_addr(9_000)]).unwrap();
-    let mut extra_relay = 0usize;
-    for (_, rx) in &mut neigh {
-        if rx.try_recv().is_ok() {
-            extra_relay += 1;
-        }
-    }
-    assert_eq!(extra_relay, 0, "past the 1000-address burst nothing is relayed");
+    hostile_addr_relay(&peers, &peer, &ver, &mut follow).await;
 
     follow.ban_score = follow
         .ban_score
@@ -411,4 +260,167 @@ async fn hostile_peer_session() {
     assert_eq!(follow.ban_score, 10, "a policy reject does not raise ban score");
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+
+#[allow(clippy::cognitive_complexity)] // address-relay chapter of the same session
+async fn hostile_addr_relay(
+    peers: &std::sync::Arc<crate::peers::PeerHub>,
+    peer: &std::sync::Arc<crate::peers::LivePeer>,
+    ver: &VersionMessage,
+    follow: &mut PeerFollowState,
+) {
+        peer.set_wants_addrv2();
+        let (src_tx, mut src_rx) = mpsc::unbounded_channel();
+        peer.attach_out(src_tx);
+        let mut neigh = Vec::new();
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000);
+        let dst = peers.register(a, a, ver, true, crate::peers::PeerConnType::Inbound);
+        dst.set_wants_addrv2();
+        let (tx, rx) = mpsc::unbounded_channel();
+        dst.attach_out(tx);
+        neigh.push((dst.id, rx));
+        let quiet_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000);
+        let quiet = peers.register(
+            quiet_addr,
+            quiet_addr,
+            ver,
+            true,
+            crate::peers::PeerConnType::Inbound,
+        );
+        let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
+        quiet.attach_out(quiet_tx);
+
+        assert_eq!(addr_relay_tokens(0.0, 1_000, 11_000), 1.0);
+        assert!(addr_relay_tokens(0.0, 1_000, 1_000) < 1.0);
+
+        let list: Vec<AddrV2Message> = (1..=3u8)
+            .map(|i| AddrV2Message {
+                time: 1_700_000_000,
+                services: ServiceFlags::NETWORK,
+                addr: AddrV2::Ipv4(Ipv4Addr::new(123, 123, 123, i)),
+                port: 8333,
+            })
+            .collect();
+        rbitcoin_log::capture_logs(true);
+        on_addrv2(follow, Some(peer.as_ref()), &list).unwrap();
+        let lines = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let mut batched = None;
+        let mut batched_id = None;
+        for (id, rx) in &mut neigh {
+            if let Ok(msg) = rx.try_recv() {
+                assert!(rx.try_recv().is_err(), "the neighbor gets a single message");
+                batched_id = Some(*id);
+                batched = Some(msg.expect_msg());
+            }
+        }
+        let got = batched.expect("one addrv2");
+        let NetworkMessage::AddrV2(sent) = &got else {
+            panic!("expected addrv2, got {got:?}");
+        };
+        assert_eq!(sent, &list);
+        let nbytes = serialize(&got).len();
+        let want = sending_addrv2_log(nbytes, batched_id.expect("neighbor id"));
+        assert!(
+            lines.iter().any(|(_, l)| l == &want),
+            "missing {want:?} in {lines:?}"
+        );
+
+        for i in 1..4u16 {
+            let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000 + i);
+            let p = peers.register(a, a, ver, true, crate::peers::PeerConnType::Inbound);
+            p.set_wants_addrv2();
+            let (tx, rx) = mpsc::unbounded_channel();
+            p.attach_out(tx);
+            neigh.push((p.id, rx));
+        }
+
+        let n = neigh.len();
+        let mut even_port = None;
+        let mut odd_port = None;
+        let mut wrap_port = None;
+        for port in 1..20_000u16 {
+            let key = addr_key_oracle(&hostile_addr(port));
+            if (key as usize) < n * n {
+                continue;
+            }
+            let start = (key as usize) % n;
+            if key & 1 == 0 {
+                even_port.get_or_insert(port);
+            } else if start + 1 == n {
+                wrap_port.get_or_insert(port);
+            } else if start != 0 {
+                odd_port.get_or_insert(port);
+            }
+            if even_port.is_some() && odd_port.is_some() && wrap_port.is_some() {
+                break;
+            }
+        }
+        let ports = [
+            even_port.expect("an even relay key"),
+            odd_port.expect("an odd relay key whose next neighbor does not wrap"),
+            wrap_port.expect("an odd relay key whose next neighbor wraps"),
+        ];
+        for port in ports {
+            let msg = hostile_addr(port);
+            on_addrv2(follow, Some(peer.as_ref()), std::slice::from_ref(&msg)).unwrap();
+            let key = addr_key_oracle(&msg);
+            let n_dest = if key & 1 == 0 { 1 } else { 2 };
+            let start = (key as usize) % n;
+            let mut expect = Vec::new();
+            for step in 0..n_dest {
+                let idx = if step == 0 {
+                    start
+                } else if start + 1 == n {
+                    0
+                } else {
+                    start + 1
+                };
+                expect.push(neigh[idx].0);
+            }
+            expect.sort_unstable();
+            let mut got_ids = Vec::new();
+            for (id, rx) in &mut neigh {
+                while rx.try_recv().is_ok() {
+                    got_ids.push(*id);
+                }
+            }
+            got_ids.sort_unstable();
+            assert_eq!(
+                got_ids, expect,
+                "port {port} key {key:#x} start {start} must select those neighbors"
+            );
+            assert!(src_rx.try_recv().is_err(), "a peer does not relay to itself");
+            assert!(
+                quiet_rx.try_recv().is_err(),
+                "a peer that did not ask for addrv2 is skipped"
+            );
+        }
+
+        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(8333)]).unwrap();
+        let mut reached = 0usize;
+        for (_, rx) in &mut neigh {
+            if rx.try_recv().is_ok() {
+                reached += 1;
+            }
+        }
+        assert!(
+            (1..=2).contains(&reached),
+            "one address reached {reached} neighbors"
+        );
+        let burst: Vec<_> = (1..1000u16).map(hostile_addr).collect();
+        on_addrv2(follow, Some(peer.as_ref()), &burst).unwrap();
+        for (_, rx) in &mut neigh {
+            while rx.try_recv().is_ok() {}
+        }
+        on_addrv2(follow, Some(peer.as_ref()), &[hostile_addr(9_000)]).unwrap();
+        let mut extra_relay = 0usize;
+        for (_, rx) in &mut neigh {
+            if rx.try_recv().is_ok() {
+                extra_relay += 1;
+            }
+        }
+        assert_eq!(extra_relay, 0, "past the 1000-address burst nothing is relayed");
+
 }
