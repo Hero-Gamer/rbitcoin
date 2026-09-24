@@ -464,6 +464,116 @@ fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+fn plant_unspent_coinbase(
+    label: &str,
+) -> (
+    rbitcoin_store::testutil::TempDir,
+    rbitcoin_query::Query,
+    Transaction,
+) {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    q.enter_direct_index_mode().unwrap();
+    let first = coinbase(1);
+    let txid = first.compute_txid().to_byte_array();
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let fk = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    (path, q, first)
+}
+
+fn plant_bip34_ancestor(q: &rbitcoin_query::Query, hash: [u8; 32]) {
+    use rbitcoin_store::HeaderRecord;
+    let main = ChainParams::mainnet();
+    let hfk = q
+        .store()
+        .put_header(&HeaderRecord {
+            hash,
+            ..HeaderRecord::default()
+        })
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(Height(main.btc.bip34_height), hfk)
+        .unwrap();
+}
+
+fn bip30_message_at_mainnet_above_bip34(
+    q: &rbitcoin_query::Query,
+    block: &Block,
+) -> Result<(), ConsensusError> {
+    use crate::block::structural_validate_spends;
+    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    let main = Box::leak(Box::new(ChainParams::mainnet()));
+    let ctx = ValidationContext::at(main, Height(main.btc.bip34_height + 1), Milestone::NONE);
+    structural_validate_spends(
+        q,
+        block,
+        &ctx,
+        Some(&[rbitcoin_primitives::Fk(2)]),
+        &[],
+        0,
+        &mut OutPointSet::default(),
+        &BatchParents::new(),
+        &mut U32Map::default(),
+        &FkMap::default(),
+        &mut crate::block::StructuralScratch::default(),
+    )
+    .map(|_| ())
+}
+
+/// Mainnet skips BIP30 only when the header at BIP34 height is the real hash.
+/// A wrong ancestor still rejects an unspent overwrite.
+#[test]
+fn bip30_mainnet_skips_only_when_bip34_ancestor_matches() {
+    let (path, q, first) = plant_unspent_coinbase("bip30-ancestor-skip");
+    let main = ChainParams::mainnet();
+    let real = main.bip34_hash.expect("mainnet BIP34 hash").to_byte_array();
+    plant_bip34_ancestor(&q, real);
+    let skipped = bip30_message_at_mainnet_above_bip34(&q, &block_with(vec![first.clone()]));
+    let msg = skipped
+        .as_ref()
+        .err()
+        .map(|e| format!("{e}"))
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("bad-txns-BIP30"),
+        "real BIP34 ancestor must skip BIP30 above the activation height, got {msg}"
+    );
+
+    let (path_bad, q_bad, first_bad) = plant_unspent_coinbase("bip30-ancestor-miss");
+    plant_bip34_ancestor(&q_bad, [0x11; 32]);
+    let err = bip30_message_at_mainnet_above_bip34(&q_bad, &block_with(vec![first_bad]))
+        .expect_err("a non-BIP34 ancestor must still enforce BIP30");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("bad-txns-BIP30"),
+        "expected BIP30 reject, got {msg}"
+    );
+    let _ = (path, path_bad, first);
+}
+
 #[test]
 fn s1_rejects_empty_txdata() {
     validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();

@@ -2034,8 +2034,11 @@ fn reject_bip30_unspent_overwrite(
 
 fn bip34_ancestry_skips_bip30(query: &Query, ctx: &ValidationContext<'_>) -> bool {
     let height = ctx.height.0;
-    if ctx.params.bip34_hash.is_none() || height <= ctx.params.btc.bip34_height {
-        return ctx.params.bip30_skipped_for_bip34_ancestry(height, None);
+    if ctx.params.bip34_hash.is_none() {
+        return false;
+    }
+    if height <= ctx.params.btc.bip34_height {
+        return false;
     }
     let ancestor = query
         .header_at_height(Height(ctx.params.btc.bip34_height))
