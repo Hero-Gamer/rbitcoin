@@ -148,6 +148,18 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
 const MAX_PENDING_CMPCT: usize = 1;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
+
+/// Same cap as a `headers` batch: a new hash at the limit drops the map.
+fn admit_pending_header(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    header: bitcoin::block::Header,
+) {
+    if pending.len() >= MAX_PENDING_HEADERS && !pending.contains_key(&hash) {
+        pending.clear();
+    }
+    pending.insert(hash, header);
+}
 /// Cap on decoded bodies stashed per session (DoS / process RAM). Must be
 /// ≥99 so tip-follow can assemble a 99-block competing branch; apply is
 /// `ChainHub::accept_received_block` (see `docs/architecture.md`).
@@ -3083,12 +3095,7 @@ fn on_headers(
                 s.note_block_from_peer(hash);
                 s.note_best_known(hash);
             }
-            if follow.pending_headers.len() >= MAX_PENDING_HEADERS
-                && !follow.pending_headers.contains_key(&hash)
-            {
-                follow.pending_headers.clear();
-            }
-            follow.pending_headers.insert(hash, *hdr);
+            admit_pending_header(&mut follow.pending_headers, hash, *hdr);
         }
         if !connecting {
             if n < MAX_HEADERS_RESULTS {
@@ -3181,7 +3188,7 @@ async fn on_block(
             let _ = s.take_awaiting_headers();
         }
         let _ = queue_getheaders(out_tx, hub, session, true, None);
-        follow.pending_headers.entry(hash).or_insert(block.header);
+        admit_pending_header(&mut follow.pending_headers, hash, block.header);
         follow.pending_blocks.insert(hash, block.clone());
         hub.forget_asked_block(&hash);
         return Ok(());
@@ -3197,7 +3204,7 @@ async fn on_block(
     }
     drop_pending_cmpct(follow, session, hash);
     follow.requested_blocks.remove(&hash);
-    follow.pending_headers.entry(hash).or_insert(block.header);
+    admit_pending_header(&mut follow.pending_headers, hash, block.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
         follow.pending_blocks.insert(hash, block.clone());
         return Ok(());
@@ -3316,7 +3323,7 @@ async fn on_cmpctblock(
         }
         let _ = queue_getheaders(out_tx, hub, session, true, None);
     }
-    follow.pending_headers.entry(hash).or_insert(hsi.header);
+    admit_pending_header(&mut follow.pending_headers, hash, hsi.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
         return Ok(());
     }

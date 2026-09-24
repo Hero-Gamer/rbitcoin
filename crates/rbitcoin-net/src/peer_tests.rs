@@ -1,5 +1,6 @@
 use super::*;
 use crate::peers::{CappedSet, PeerOut};
+use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,30 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
         PeerOut::Msg(NetworkMessage::Block(b)) => b,
         other => panic!("expected served block, got {other:?}"),
     }
+}
+
+#[test]
+fn pending_header_insert_past_cap_clears() {
+    let mut pending = HashMap::new();
+    let hdr = bitcoin::block::Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+        nonce: 0,
+    };
+    for i in 0..super::MAX_PENDING_HEADERS {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        super::admit_pending_header(&mut pending, BlockHash::from_byte_array(bytes), hdr);
+    }
+    assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
+    let kept = *pending.keys().next().unwrap();
+    super::admit_pending_header(&mut pending, kept, hdr);
+    assert_eq!(pending.len(), super::MAX_PENDING_HEADERS);
+    super::admit_pending_header(&mut pending, BlockHash::from_byte_array([0xff; 32]), hdr);
+    assert_eq!(pending.len(), 1);
 }
 
 #[test]
