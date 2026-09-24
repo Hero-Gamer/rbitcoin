@@ -100,7 +100,10 @@ fn decode_packed(buf: &[u8], has_sigops: bool) -> Result<PackedLive, MempoolErro
     let weight = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let sigop_cost = if has_sigops {
         let v = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        (v != SIGOP_COST_UNKNOWN).then_some(v)
+        // Above the block limit is unknown: covers SIGOP_COST_UNKNOWN and a
+        // torn in-place write-back (0xFF.. partly overwritten, see
+        // `Mempool::set_sigop_cost`), which always overestimates.
+        (v <= crate::graph::MAX_BLOCK_SIGOPS_COST).then_some(v)
     } else {
         None
     };
@@ -363,6 +366,12 @@ mod tests {
         let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
         let v3 = encode_packed_live(&tx, &txid, &wtxid, 7, 400, None, &[]).unwrap();
         assert_eq!(decode_packed_live(&v3).unwrap().sigop_cost, None);
+        // A torn 8-byte write-back over 0xFF.. overestimates; any cost no block
+        // can hold reads as unknown so the open-time pass recomputes it.
+        for (stored, want) in [(80_000, Some(80_000)), (80_001, None)] {
+            let rec = encode_packed_live(&tx, &txid, &wtxid, 7, 400, Some(stored), &[]).unwrap();
+            assert_eq!(decode_packed_live(&rec).unwrap().sigop_cost, want);
+        }
         let mut v2 = v3.clone();
         v2.drain(SIGOP_COST_OFF..SIGOP_COST_OFF + 8);
         let got = decode_packed_live_v2(&v2).unwrap();

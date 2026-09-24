@@ -532,9 +532,11 @@ impl Mempool {
 
     /// Fill a LIVE record's sigop cost (post-migrate recompute).
     ///
-    /// RAM image plus an 8-byte `pwrite` (no fsync, like DEAD) so the next open
-    /// does not recompute it. A record still in the unpersisted tail is
-    /// rewritten from RAM by the next tail persist anyway.
+    /// RAM image plus an 8-byte `pwrite` (no fsync) so the next open does not
+    /// recompute it. The field may straddle a sector, so a power-loss tear can
+    /// mix new and old 0xFF bytes; decode treats any cost above the block limit
+    /// as unknown, so a torn value is recomputed. A record still in the
+    /// unpersisted tail is rewritten from RAM by the next tail persist anyway.
     pub(crate) fn set_sigop_cost(&mut self, slot: u32, cost: u64) -> Result<(), MempoolError> {
         if slot >= self.slot_cap {
             return Err(MempoolError::Corrupt("slot OOB"));
