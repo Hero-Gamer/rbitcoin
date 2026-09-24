@@ -10639,13 +10639,11 @@ async fn over_budget_reader_waits_until_one_byte_is_written() {
     peer.note_send_queued(crate::peers::PEER_SEND_BUDGET + 1);
     let waiting = std::sync::Arc::clone(&peer);
     let wait = tokio::spawn(async move { waiting.wait_send_budget().await });
-    for _ in 0..50 {
-        if !wait.is_finished() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(!wait.is_finished(), "an over-budget reader must wait");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !wait.is_finished(),
+        "an over-budget reader must be parked before the writer drains"
+    );
     peer.note_send_written(1);
     tokio::time::timeout(std::time::Duration::from_secs(1), wait)
         .await
