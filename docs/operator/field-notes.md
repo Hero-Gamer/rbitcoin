@@ -48,12 +48,17 @@ sluggish-disk knobs stay in this file (below).
 
 ## 16 GiB RAM / sluggish disk (mainnet)
 
-Full-validation IBD will be **disk-bound** and can freeze the UI if `datadir` shares
-the desktop disk. Prefer a dedicated volume and modest memory knobs:
+Full-validation IBD can be disk-bound and make a shared desktop disk sluggish.
+Prefer a dedicated volume. The example below lowers the mempool weight budget;
+`--mempool-size-mb` is **not** a hard process-RAM limit.
+
+Script validation uses the in-process `rbtc-scripts-*` worker pool, initialized
+from `std::thread::available_parallelism()` (fallback: 4). There is no node
+worker-count option, and `RAYON_NUM_THREADS` does not configure this pool.
 
 ```bash
-export RAYON_NUM_THREADS=4
-# Prefer --milestone 840000 for catch-up, then reindex/full validate later if needed
+# The omitted --milestone uses the anchored mainnet checkpoint at 840000.
+# Use --milestone 0 for full historical script validation.
 nice -n 10 ionice -c 3 ./target/release/rbitcoin-node \
   --datadir /mnt/dedicated/datadir-mainnet \
   --network mainnet \
