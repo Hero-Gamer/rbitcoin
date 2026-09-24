@@ -404,45 +404,15 @@ fn bip30_rejects_unspent_connected_sibling() {
 
 /// Signet activates BIP34 at height 1. Core's empty BIP34 hash still enforces
 /// BIP30 on every signet block.
-fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
+fn signet_rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("bip30-signet");
-    q.enter_direct_index_mode().unwrap();
-
-    let first = coinbase(1);
-    let txid = first.compute_txid().to_byte_array();
-    let rec = TxRecord {
-        txid,
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let fk = q
-        .store()
-        .put_tx_full_batch_indexed(
-            &[(
-                rec,
-                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
-                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
-            )],
-            true,
-        )
-        .unwrap()[0];
-    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
-    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
-    q.store().rebuild_height_fence().unwrap();
-
-    let dup = block_with(vec![first]);
+    let dup = block_with(vec![first.clone()]);
     let p = Box::leak(Box::new(ChainParams::signet()));
     let ctx = ValidationContext::at(p, Height(2), Milestone::NONE);
     let err = structural_validate_spends(
-        &q,
+        q,
         &dup,
         &ctx,
         Some(&[Fk(2)]),
@@ -460,7 +430,6 @@ fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
         msg.contains("bad-txns-BIP30"),
         "expected BIP30 reject, got {msg}"
     );
-    let _ = std::fs::remove_dir_all(&path);
 }
 
 fn plant_unspent_coinbase(
@@ -544,12 +513,11 @@ fn bip30_message_at_mainnet_above_bip34(
 
 /// Mainnet skips BIP30 only when the header at BIP34 height is the real hash.
 /// A wrong ancestor still rejects an unspent overwrite.
-fn bip30_mainnet_skips_only_when_bip34_ancestor_matches() {
-    let (path, q, first) = plant_unspent_coinbase("bip30-ancestor-skip");
+fn mainnet_ancestor_skip_then_miss(q: &rbitcoin_query::Query, first: &Transaction) {
     let main = ChainParams::mainnet();
     let real = main.bip34_hash.expect("mainnet BIP34 hash").to_byte_array();
-    plant_bip34_ancestor(&q, real);
-    let skipped = bip30_message_at_mainnet_above_bip34(&q, &block_with(vec![first.clone()]));
+    plant_bip34_ancestor(q, real);
+    let skipped = bip30_message_at_mainnet_above_bip34(q, &block_with(vec![first.clone()]));
     let msg = skipped
         .as_ref()
         .err()
@@ -560,16 +528,14 @@ fn bip30_mainnet_skips_only_when_bip34_ancestor_matches() {
         "real BIP34 ancestor must skip BIP30 above the activation height, got {msg}"
     );
 
-    let (path_bad, q_bad, first_bad) = plant_unspent_coinbase("bip30-ancestor-miss");
-    plant_bip34_ancestor(&q_bad, [0x11; 32]);
-    let err = bip30_message_at_mainnet_above_bip34(&q_bad, &block_with(vec![first_bad]))
+    plant_bip34_ancestor(q, [0x11; 32]);
+    let err = bip30_message_at_mainnet_above_bip34(q, &block_with(vec![first.clone()]))
         .expect_err("a non-BIP34 ancestor must still enforce BIP30");
     let msg = format!("{err}");
     assert!(
         msg.contains("bad-txns-BIP30"),
         "expected BIP30 reject, got {msg}"
     );
-    let _ = (path, path_bad, first);
 }
 
 #[test]
@@ -1628,14 +1594,13 @@ fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
 
 /// Anchored skip uses the header path. A height match with a different hash
 /// still builds script jobs.
-fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
+fn signet_low_work_fork_runs_scripts(q: &rbitcoin_query::Query) {
     use super::assemble_block_prevouts;
     use crate::milestone::MilestoneAnchor;
     use bitcoin::hashes::Hash;
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, OutPointSet, SpendEdge, SpendEdges};
     use rbitcoin_store::{OutputRecord, TxRecord};
-    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("assemble-anchor");
     let mut parent_txid = [0u8; 32];
     parent_txid[0] = 0x42;
     let rec = TxRecord {
@@ -1675,7 +1640,7 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
         }],
     };
     let b = block_with(vec![coinbase(1), spend]);
-    let params = Box::leak(Box::new(ChainParams::regtest()));
+    let params = Box::leak(Box::new(ChainParams::signet()));
     let anchor_hash = [0xabu8; 32];
     let mut min = [0u8; 32];
     min[1] = 1;
@@ -1727,8 +1692,8 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
         .expect("op_true spend assembles")
         .0
     };
-    assert_eq!(run(&q).len(), 1, "missing anchor path still checks scripts");
-    assert!(crate::milestone::check_scripts(ms, &q, 1, &bh));
+    assert_eq!(run(q).len(), 1, "missing anchor path still checks scripts");
+    assert!(crate::milestone::check_scripts(ms, q, 1, &bh));
     let mut base = [0u8; 32];
     base[1] = 2;
     let mut one = [0u8; 32];
@@ -1748,20 +1713,25 @@ fn anchored_milestone_builds_jobs_until_the_header_path_matches() {
         None,
     );
     assert!(
-        run(&q).is_empty(),
+        run(q).is_empty(),
         "header path through the anchor with enough work skips scripts"
     );
-    assert!(!crate::milestone::check_scripts(ms, &q, 1, &bh));
+    assert!(!crate::milestone::check_scripts(ms, q, 1, &bh));
     q.clear_milestone_path_above(0);
-    assert_eq!(run(&q).len(), 1, "cleared path checks scripts again");
-    let _ = std::fs::remove_dir_all(&path);
+    assert_eq!(run(q).len(), 1, "cleared path checks scripts again");
 }
 
 #[test]
 fn buried_rules_and_a_lying_header_path() {
-    bip30_signet_rejects_unspent_overwrite_after_bip34();
-    bip30_mainnet_skips_only_when_bip34_ancestor_matches();
-    anchored_milestone_builds_jobs_until_the_header_path_matches();
+    let (signet_path, signet_q, signet_tx) = plant_unspent_coinbase("buried-signet");
+    signet_rejects_unspent_overwrite(&signet_q, &signet_tx);
+    signet_low_work_fork_runs_scripts(&signet_q);
+    let (main_path, main_q, main_tx) = plant_unspent_coinbase("buried-mainnet");
+    mainnet_ancestor_skip_then_miss(&main_q, &main_tx);
+    let _ = (
+        std::fs::remove_dir_all(&signet_path),
+        std::fs::remove_dir_all(&main_path),
+    );
 }
 
 /// N1: Optimistic miss is lookup invariant; pin hit / identity / vout still classified.
