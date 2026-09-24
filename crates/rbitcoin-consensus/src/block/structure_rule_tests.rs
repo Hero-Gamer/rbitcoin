@@ -453,7 +453,7 @@ fn bip30_signet_rejects_unspent_overwrite_after_bip34() {
         &BatchParents::new(),
         &mut U32Map::default(),
         &FkMap::default(),
-        &mut Vec::new(),
+        &mut crate::block::StructuralScratch::default(),
     )
     .expect_err("signet must enforce BIP30 after height 1");
     let msg = format!("{err}");
