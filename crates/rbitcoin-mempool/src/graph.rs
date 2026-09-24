@@ -1763,6 +1763,23 @@ mod tests {
         );
     }
 
+    /// The block weight budget counts raw weight: two sigop-dense txs whose
+    /// adjusted weight overflows the cap still both fit on raw weight.
+    #[test]
+    fn select_weight_budget_is_raw_not_adjusted() {
+        let mut g = TxGraph::new();
+        let a = spend_op([0x31u8; 32], 0, 1);
+        let b = spend_op([0x32u8; 32], 0, 2);
+        for (i, tx) in [&a, &b].into_iter().enumerate() {
+            let mut e = entry_for(tx, 10_000, i as u32);
+            e.sigop_cost = 1_000; // 20_000 WU adjusted, far above raw
+            g.insert(e, tx);
+        }
+        let cap = a.weight().to_wu() + b.weight().to_wu();
+        assert!(cap < 20_000);
+        assert_eq!(g.select_block_txids(cap).len(), 2);
+    }
+
     /// Post-migrate recompute: filling an unknown (`u64::MAX`) cost re-ranks
     /// the cluster, so eviction and mining see the real feerate.
     #[test]
