@@ -392,7 +392,6 @@ jobs:
     permissions:
       issues: write
       pull-requests: write
-
     runs-on: ubuntu-latest
     if: ${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock') != '' }}
     steps:
@@ -411,16 +410,13 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const fs=require('fs');
-            const body=fs.readFileSync('mutants-diff.log','utf8').slice(0,6000);
+            const fs = require('fs');
+            const body = fs.readFileSync('mutants-diff.log','utf8').slice(0,6000);
+            const msg = "**Mutants baseline-diff**\n```\n" + body + "\n```\nAdd kill-test or // MUTANT-WAIVER expires YYYY-MM-DD";
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `**Mutants baseline-diff**
-\`\`\`
-${body}
-\`\`\`
-Add kill-test or // MUTANT-WAIVER expires YYYY-MM-DD`
+              body: msg
             });
 
