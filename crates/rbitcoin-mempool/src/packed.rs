@@ -369,13 +369,19 @@ mod tests {
         assert_eq!((got.fee_sat, got.weight, got.sigop_cost), (7, 400, None));
         assert_eq!(got.txid, txid);
         assert_eq!(serialize(&got.tx), serialize(&tx));
-        for (buf, decode) in [
-            (&v3[..87], decode_packed_live as fn(&[u8]) -> _),
-            (&v2[..79], decode_packed_live_v2),
+        // Fixed prefix is 96 B (schema 3) / 88 B (schema 2): one byte short
+        // fails the length guard; exactly the prefix reaches the input count.
+        for (buf, min, decode) in [
+            (&v3, 96, decode_packed_live as fn(&[u8]) -> _),
+            (&v2, 88, decode_packed_live_v2),
         ] {
             assert!(matches!(
-                decode(buf),
+                decode(&buf[..min - 1]),
                 Err(MempoolError::Corrupt("packed live short"))
+            ));
+            assert!(matches!(
+                decode(&buf[..min]),
+                Err(MempoolError::Corrupt("compact size empty"))
             ));
         }
     }
