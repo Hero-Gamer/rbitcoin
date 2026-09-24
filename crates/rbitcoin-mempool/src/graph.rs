@@ -1051,6 +1051,24 @@ mod tests {
     }
 
     #[test]
+    fn component_rep_is_the_least_txid() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 2);
+        let pe = entry_for(&parent, 500, 0);
+        let pid = pe.txid;
+        g.insert(pe, &parent);
+        let child = make_tx(Some((pid, 0)), 1, 1);
+        let ce = entry_for(&child, 500, 1);
+        let cid = ce.txid;
+        g.insert(ce, &child);
+        let least = pid.min(cid);
+        let greater = pid.max(cid);
+        assert_ne!(least, greater);
+        let mut seen = std::collections::BTreeSet::new();
+        assert_eq!(g.component_rep(greater, &mut seen), Some(least));
+    }
+
+    #[test]
     fn single_tx_cluster() {
         let mut g = TxGraph::new();
         let tx = make_tx(None, 1, 1);

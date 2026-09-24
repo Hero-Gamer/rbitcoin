@@ -190,6 +190,27 @@ mod tests {
     use bitcoin::{OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
     #[test]
+    fn standard_sigop_cap_rejects_only_above_the_limit() {
+        let tx = |n: usize| {
+            let mut tx = bare_tx(1);
+            tx.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; n]);
+            tx
+        };
+        let prev = [bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }];
+        assert!(
+            !exceeds_standard_sigops(&tx(4_000), &prev),
+            "4000 legacy CHECKSIG is the 16000 cap"
+        );
+        assert!(
+            exceeds_standard_sigops(&tx(4_001), &prev),
+            "one more CHECKSIG is over the cap"
+        );
+    }
+
+    #[test]
     fn min_relay_fee_point_one_sat_vb() {
         // 1000 vB → weight 4000; 0.1 sat/vB → 100 sat min.
         assert!(meets_min_relay_fee(100, 4000));

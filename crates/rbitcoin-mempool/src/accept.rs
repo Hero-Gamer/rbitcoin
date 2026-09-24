@@ -2128,6 +2128,14 @@ mod tests {
             relay_floor(100, 5_000, 0, ROLLING_FEE_HALFLIFE_MS, false),
             100 + ((5_000 - 100) >> 1)
         );
+        assert_eq!(
+            decayed_relay_floor(5_000, 100, 2 * ROLLING_FEE_HALFLIFE_MS),
+            100 + ((5_000 - 100) >> 2)
+        );
+        assert_eq!(
+            decayed_relay_floor(u64::MAX, 100, 63 * ROLLING_FEE_HALFLIFE_MS),
+            100
+        );
     }
 
     #[test]
