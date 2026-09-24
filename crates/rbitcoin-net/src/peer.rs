@@ -149,14 +149,14 @@ const MAX_PENDING_CMPCT: usize = 1;
 /// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
 const MAX_PENDING_HEADERS: usize = 8_000;
 
-/// Same cap as a `headers` batch: a new hash at the limit drops the map.
+/// A new hash at the cap is refused. The headers already held stay.
 fn admit_pending_header(
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     hash: BlockHash,
     header: bitcoin::block::Header,
 ) {
     if pending.len() >= MAX_PENDING_HEADERS && !pending.contains_key(&hash) {
-        pending.clear();
+        return;
     }
     pending.insert(hash, header);
 }

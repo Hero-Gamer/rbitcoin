@@ -8,8 +8,8 @@
 and a peer could retain eight of those vectors. The ceiling is
 `MAX_BLOCK_WEIGHT / MIN_TX_WEIGHT`. One partial is retained per peer. A
 second hash is fetched as a full block and is not ban-scored.
-`pending_headers` uses the same 8_000-entry clear on `headers`, `block`,
-and `cmpctblock`.
+`pending_headers` refuses a new hash at 8_000 on `headers`, `block`,
+and `cmpctblock`. The headers already held stay.
 
 **Regression:** `rbitcoin-net`
 `compact::tests::reconstruct_rejects_tx_count_above_weight_ratio`,
