@@ -182,7 +182,7 @@ jobs:
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
     name: mutants (${{ matrix.n }}/4)
-    needs: [mutants]
+    needs: [qc, test]
     if: >-
       github.event_name == 'pull_request'
       && needs.qc.result == 'success'
@@ -389,33 +389,19 @@ jobs:
 
   mutants-baseline-diff:
     needs: [mutants]
+    if: github.event_name == 'pull_request'
     permissions:
       issues: write
       pull-requests: write
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: mutants-out-*
           path: mutants-shards
           merge-multiple: false
       - name: Compare vs baseline
-        run: python3 scripts/mutants-diff.py | tee mutants-diff.log
-      - name: Comment PR on failure
-        if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('mutants-diff.log','utf8').slice(0,6000);
-            const msg = "**Mutants baseline-diff**\n```\n" + body + "\n```\nAdd kill-test or // MUTANT-WAIVER expires YYYY-MM-DD";
-            github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: msg
-            });
-
+        run: |
+          python3 scripts/mutants-diff.py mutants-shards docs/mutants/survivors-baseline.list
