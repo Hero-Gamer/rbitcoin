@@ -5554,6 +5554,9 @@ mod tests {
         let _ = hub.take_chunks_rebuilds();
         let _ = hub.fee_histogram();
         assert_eq!(hub.take_chunks_rebuilds(), 0, "totals share fee refresh");
+        // Electrum histogram buckets are raw vsize, summing to GET /mempool vsize.
+        let hist_vsize: u64 = hub.fee_histogram().iter().map(|(_, v)| v).sum();
+        assert_eq!(hist_vsize, expect_vsize);
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
