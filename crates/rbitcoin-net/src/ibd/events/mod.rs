@@ -240,9 +240,6 @@ fn ensure_accepted_prefix(
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        if mid == lo || mid >= hi {
-            return Vec::new();
-        }
         match hub.ensure_headers_batch(&headers[..mid]) {
             Ok(fks) => {
                 lo = mid;
@@ -250,9 +247,6 @@ fn ensure_accepted_prefix(
             }
             Err(_) => hi = mid,
         }
-    }
-    if lo + 1 < hi {
-        return Vec::new();
     }
     headers[..lo].iter().copied().zip(lo_fks).collect()
 }

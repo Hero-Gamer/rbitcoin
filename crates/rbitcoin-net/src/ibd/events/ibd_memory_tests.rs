@@ -123,6 +123,21 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
         !st.hash_height.contains_key(&tail_hash),
         "rejected tail must not be noted"
     );
+
+    let second = mine(fresh.block_hash(), 1_500_012_200, 3);
+    let mut bad_third = mine(second.block_hash(), 1_500_012_800, 4);
+    bad_third.header.time = 0;
+    let second_hash = second.block_hash();
+    on_headers_batch(
+        &mut st,
+        &hub,
+        vec![fresh.header, second.header, bad_third.header],
+    );
+    assert!(
+        st.hash_height.contains_key(&second_hash),
+        "both headers before a rejected tail stay on the path"
+    );
+    assert!(!st.hash_height.contains_key(&bad_third.header.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
