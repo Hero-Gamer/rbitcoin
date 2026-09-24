@@ -3441,11 +3441,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> std::path::PathBuf {
+        // macOS clocks tick in µs: back-to-back calls can share `n`.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
     }
 
     #[test]
