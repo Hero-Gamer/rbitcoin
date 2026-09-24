@@ -215,10 +215,10 @@ pub(super) fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
-    annotate: &mut Vec<crate::block::SpendAnnotateJob>,
-) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
-    use crate::block::StructuralPhaseNs;
+) -> Result<(crate::block::StructuralPhaseNs, crate::block::AnnotateSlots), ConsensusError> {
+    use crate::block::{StructuralPhaseNs, StructuralScratch};
     let t0 = Instant::now();
+    let mut scratch = StructuralScratch::default();
     let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
@@ -246,7 +246,7 @@ pub(super) fn structural_run(
             batch_parents,
             &mut mtp_cache,
             &run_create_height,
-            annotate,
+            &mut scratch,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);
@@ -283,7 +283,7 @@ pub(super) fn structural_run(
         tot.create_h_ns,
     );
     rbitcoin_query::note_confirm(&query.confirm_stats().structural_bip68_ns, tot.bip68_ns);
-    Ok(tot)
+    Ok((tot, scratch.slots))
 }
 
 pub(super) fn class_c_commit(
@@ -330,30 +330,18 @@ pub(super) fn class_c_commit(
 
 /// Returns spend-annotate wall ns measured with a local `Instant`.
 ///
-/// Pure-write annotate from structural abs+meta jobs (no pin `get_spender_abs`).
+/// Pure-write annotate from structural slots (no pin `get_spender_abs`).
 pub(super) fn post_commit(
     query: &Query,
-    annotate: &[crate::block::SpendAnnotateJob],
+    slots: &crate::block::AnnotateSlots,
 ) -> Result<u64, ConsensusError> {
     let t_spent = Instant::now();
-    if query.spend_index_enabled() && !annotate.is_empty() {
-        let mut abs_edges: Vec<(
-            u64,
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-            u32,
-        )> = Vec::with_capacity(annotate.len());
-        let mut known: Vec<(rbitcoin_primitives::Fk, u8, u32)> = Vec::with_capacity(annotate.len());
-        for job in annotate {
-            abs_edges.push((job.abs, job.create_fk, job.vout, job.spend_fk, job.vin));
-            known.push((job.field, job.flags, job.field_vin));
-        }
+    if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
         let backend = spend_ann_backend_next();
         let t_ann = Instant::now();
         let cold = query
             .store()
-            .put_spend_batch_by_abs_meta_known(&abs_edges, &known, backend)
+            .put_spend_batch_by_abs_meta_known(&slots.abs_edges, &slots.known, backend)
             .map_err(ConsensusError::from)?;
         if !cold.is_empty() {
             return Err(ConsensusError::Store(StoreError::Corrupt(
@@ -362,15 +350,18 @@ pub(super) fn post_commit(
         }
         let ann_ns = t_ann.elapsed().as_nanos() as u64;
         rbitcoin_query::note_confirm(&query.confirm_stats().spend_ann_ns, ann_ns);
-        rbitcoin_query::note_confirm(&query.confirm_stats().spend_ann_n, abs_edges.len() as u64);
+        rbitcoin_query::note_confirm(
+            &query.confirm_stats().spend_ann_n,
+            slots.abs_edges.len() as u64,
+        );
         let _ = backend;
         rbitcoin_query::note_confirm(
             &query.confirm_stats().spend_annotate_ranged,
-            abs_edges.len() as u64,
+            slots.abs_edges.len() as u64,
         );
         rbitcoin_query::note_confirm(
             &query.confirm_stats().spend_ann_pread_skip,
-            abs_edges.len() as u64,
+            slots.abs_edges.len() as u64,
         );
     }
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;

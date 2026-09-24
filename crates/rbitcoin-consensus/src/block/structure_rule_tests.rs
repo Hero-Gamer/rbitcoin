@@ -391,7 +391,7 @@ fn bip30_rejects_unspent_connected_sibling() {
         &BatchParents::new(),
         &mut U32Map::default(),
         &FkMap::default(),
-        &mut Vec::new(),
+        &mut crate::block::StructuralScratch::default(),
     )
     .expect_err("unspent sibling must trip BIP30");
     let msg = format!("{err}");
@@ -1888,7 +1888,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &parents,
             &mut mtp,
             &FkMap::default(),
-            &mut Vec::new(),
+            &mut crate::block::StructuralScratch::default(),
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");

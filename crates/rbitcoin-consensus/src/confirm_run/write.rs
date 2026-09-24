@@ -192,16 +192,14 @@ pub fn confirm_write_phase(
 
     let overlap = (|| -> Result<_, ConsensusError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
-        let mut annotate = Vec::new();
         let t_struct = Instant::now();
-        let struct_ph = structural_run(
+        let (struct_ph, slots) = structural_run(
             query,
             params,
             milestone,
             &batch.prepared,
             &batch.wire_blocks,
             &batch.batch_parents,
-            &mut annotate,
         )?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
@@ -223,7 +221,7 @@ pub fn confirm_write_phase(
             );
         }
 
-        let spend_ann_ns = post_commit(query, &annotate)?;
+        let spend_ann_ns = post_commit(query, &slots)?;
         Ok((
             out,
             n_blocks,
@@ -322,11 +320,11 @@ pub fn finish_post_commit_hashes(
         if !query.spend_index_enabled() {
             return Ok(());
         }
-        let mut jobs = Vec::new();
+        let mut slots = crate::block::AnnotateSlots::default();
         for &(height, hash) in items {
-            jobs.extend(annotate_jobs_from_connected_hash(query, height, &hash)?);
+            annotate_slots_from_connected_hash(query, height, &hash, &mut slots)?;
         }
-        post_commit(query, &jobs)?;
+        post_commit(query, &slots)?;
         Ok(())
     })();
 
@@ -346,20 +344,21 @@ pub fn finish_post_commit_hashes(
     Ok(())
 }
 
-fn annotate_jobs_from_connected_hash(
+fn annotate_slots_from_connected_hash(
     query: &Query,
     height: u32,
     hash: &[u8; 32],
-) -> Result<Vec<crate::block::SpendAnnotateJob>, ConsensusError> {
+    slots: &mut crate::block::AnnotateSlots,
+) -> Result<(), ConsensusError> {
     match query.height_of_hash(hash).map_err(ConsensusError::from)? {
         Some(h) if h.0 == height => {}
-        _ => return Ok(Vec::new()),
+        _ => return Ok(()),
     }
     let Some((hfk, _)) = query
         .get_header_by_hash(hash)
         .map_err(ConsensusError::from)?
     else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let Some(tx_fks) = query
         .store()
@@ -367,9 +366,8 @@ fn annotate_jobs_from_connected_hash(
         .get_list(hfk)
         .map_err(ConsensusError::from)?
     else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut jobs = Vec::new();
     for &spend_fk in &tx_fks {
         let (_meta, ins, _outs) = query
             .store()
@@ -413,19 +411,13 @@ fn annotate_jobs_from_connected_hash(
             } else {
                 0
             };
-            jobs.push(crate::block::SpendAnnotateJob {
-                abs,
-                field,
-                flags,
-                field_vin,
-                create_fk,
-                vout: inp.prev_index,
-                spend_fk,
-                vin: inp_i as u32,
-            });
+            slots.push(
+                (abs, create_fk, inp.prev_index, spend_fk, inp_i as u32),
+                (field, flags, field_vin),
+            );
         }
     }
-    Ok(jobs)
+    Ok(())
 }
 
 /// After Class A commit, stamp spend creates from append RAM loc
