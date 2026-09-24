@@ -182,7 +182,7 @@ jobs:
   # Docs-only diffs exit 0. Weekly sweep stays mutants.yml. Owner: TESTING.md.
   mutants:
     name: mutants (${{ matrix.n }}/4)
-    needs: [fmt, clippy, test]
+    needs: [qc, test]
     if: >-
       github.event_name == 'pull_request'
       && needs.qc.result == 'success'
@@ -329,7 +329,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, clippy, test]
+    needs: [qc, test]
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
       CARGO_TARGET_DIR: target/cov
