@@ -314,7 +314,7 @@ fn operator_usage() -> String {
     [--limit-cluster-count N] [--limit-cluster-size KVB] [--peer-timeout SECS] \\\n\
     [--external-ip IP] [--ua-comment STR] \\\n\
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
-    [--block-version N] [--block-min-tx-fee BTC] [--alert-notify CMD] [--startup-notify CMD] \\\n\
+    [--block-version N] [--block-min-tx-fee BTC] [--bytes-per-sigop N] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
     [--no-seeds] [--no-listen] [--no-discover] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
 Networks: mainnet|testnet|signet|regtest.\n\
@@ -574,6 +574,7 @@ mod tests {
             "--mock-time",
             "--block-version",
             "--block-min-tx-fee",
+            "--bytes-per-sigop",
             "--alert-notify",
             "--startup-notify",
             "--test-activation-height",
@@ -656,6 +657,22 @@ mod tests {
         assert!(
             h.contains("[--signet-block-time SECS]"),
             "duration placeholder must be SECS"
+        );
+    }
+
+    #[test]
+    fn bytes_per_sigop_flag_sets_mempool_overlay() {
+        assert_eq!(
+            ready_config(["rbitcoin-node"]).mempool.bytes_per_sigop,
+            None
+        );
+        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop", "0"]);
+        assert_eq!(cfg.mempool.bytes_per_sigop, Some(0));
+        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop=40"]);
+        assert_eq!(cfg.mempool.bytes_per_sigop, Some(40));
+        assert_exit(
+            cli_main(["rbitcoin-node", "--bytes-per-sigop=x"]),
+            ExitCode::from(2),
         );
     }
 
@@ -1315,6 +1332,7 @@ mod tests {
             "--mocktime=1",
             "--blockversion=1",
             "--blockmintxfee=0.00000001",
+            "--bytespersigop=20",
             "--alertnotify=echo",
             "--startupnotify=echo",
             "--testactivationheight=csv@102",

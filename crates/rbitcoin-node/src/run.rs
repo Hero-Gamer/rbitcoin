@@ -293,6 +293,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let persist = config.mempool.persist;
     let cluster_count = config.mempool.limit_cluster_count;
     let cluster_kvb = config.mempool.limit_cluster_size_kvb;
+    let bytes_per_sigop = config.mempool.bytes_per_sigop;
     let min_relay_sat = match config.mempool.min_relay_fee_btc.as_deref() {
         Some(s) => Some(
             parse_btc_to_sat(s)
@@ -308,6 +309,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let _g = BlockingRegion::enter();
         let mp = MempoolHub::open_with_weight_persist(mempool_path, query, max_weight, persist)?;
         mp.set_cluster_limits(cluster_count, cluster_kvb);
+        if let Some(b) = bytes_per_sigop {
+            mp.set_bytes_per_sigop(b);
+        }
         if immediate_relay {
             mp.set_immediate_relay(true);
         }

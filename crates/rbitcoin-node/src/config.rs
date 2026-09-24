@@ -190,6 +190,8 @@ pub struct MempoolOpts {
     pub expiry_hours: Option<u64>,
     pub limit_cluster_count: Option<u32>,
     pub limit_cluster_size_kvb: Option<u32>,
+    /// Core `-bytespersigop` (`None` = 20; `0` disables sigop-adjusted size).
+    pub bytes_per_sigop: Option<u64>,
     pub blocksonly: bool,
 }
 
@@ -202,6 +204,7 @@ impl Default for MempoolOpts {
             expiry_hours: None,
             limit_cluster_count: None,
             limit_cluster_size_kvb: None,
+            bytes_per_sigop: None,
             blocksonly: false,
         }
     }
@@ -1111,6 +1114,12 @@ impl NodeConfig {
                     Some(val.parse().map_err(|e| {
                         NodeError::Config(format!("conf limit_cluster_count: {e}"))
                     })?);
+            }
+            "bytes_per_sigop" => {
+                self.mempool.bytes_per_sigop = Some(
+                    val.parse()
+                        .map_err(|e| NodeError::Config(format!("conf bytes_per_sigop: {e}")))?,
+                );
             }
             "limit_cluster_size" => {
                 self.mempool.limit_cluster_size_kvb = Some(
