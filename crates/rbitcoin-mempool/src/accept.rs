@@ -720,6 +720,10 @@ impl ActiveMempool {
                 return Err(AcceptError::MissingPrevout(op));
             }
             if report_orphans {
+                match policy::check_libre_shape(tx, tx.weight().to_wu()) {
+                    policy::PolicyResult::Standard => {}
+                    policy::PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
+                }
                 return Err(AcceptError::Orphaned {
                     txid,
                     missing: missing_parents,

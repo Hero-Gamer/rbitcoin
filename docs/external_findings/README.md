@@ -46,6 +46,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [041](./041-hygiene.md) | medium | P2PKH policy flags, RPC token, inv cap, log newlines | fixed | `peer_command_logs_have_no_raw_newline` |
 | [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
+| [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `protected_reserve_does_not_refuse_a_later_orphan` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
 | [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst` |
 | [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` |

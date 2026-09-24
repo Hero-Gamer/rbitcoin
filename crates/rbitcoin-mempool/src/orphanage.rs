@@ -18,6 +18,8 @@ pub const DEFAULT_ORPHAN_MAX_WEIGHT: u64 = ORPHAN_RESERVED_WEIGHT_PER_PEER * ORP
 pub const DEFAULT_ORPHAN_MAX_COUNT: usize = 3_000;
 /// Refuse orphans heavier than a standard tx.
 pub const MAX_ORPHAN_TX_WEIGHT: u64 = 404_000;
+/// Drop an orphan this long after it was parked. Not a knob.
+pub const ORPHAN_EXPIRE_MS: u64 = 20 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct OrphanEntry {
@@ -28,6 +30,7 @@ struct OrphanEntry {
     missing: BTreeSet<Txid>,
     /// P2P peer ids that announced this orphan.
     announcers: BTreeSet<u64>,
+    arrived_ms: u64,
 }
 
 /// One parked orphan (txid + announcer peer ids).
@@ -46,6 +49,8 @@ pub struct Orphanage {
     by_parent: HashMap<Txid, HashSet<Txid>>,
     fifo: VecDeque<Txid>,
     total_weight: u64,
+    /// Announced weight per peer. Eviction reads this instead of scanning the set.
+    peer_weight: HashMap<u64, u64>,
     max_weight: u64,
     max_count: usize,
 }
@@ -62,6 +67,7 @@ impl Orphanage {
             by_parent: HashMap::new(),
             fifo: VecDeque::new(),
             total_weight: 0,
+            peer_weight: HashMap::new(),
             max_weight: max_weight.max(MAX_ORPHAN_TX_WEIGHT),
             max_count: max_count.max(1),
         }
@@ -111,9 +117,21 @@ impl Orphanage {
         missing: BTreeSet<Txid>,
         from: Option<u64>,
     ) -> bool {
+        self.insert_from_at(tx, missing, from, unix_ms())
+    }
+
+    /// [`Self::insert_from`] at an explicit unix millisecond clock.
+    pub fn insert_from_at(
+        &mut self,
+        tx: Transaction,
+        missing: BTreeSet<Txid>,
+        from: Option<u64>,
+        now_ms: u64,
+    ) -> bool {
         if missing.is_empty() {
             return false;
         }
+        self.expire(now_ms);
         let txid = tx.compute_txid();
         let wtxid = tx.compute_wtxid();
         if let Some(e) = self.by_txid.get(&txid) {
@@ -158,19 +176,57 @@ impl Orphanage {
                 weight,
                 missing,
                 announcers,
+                arrived_ms: now_ms,
             },
         );
         self.fifo.push_back(txid);
         self.total_weight = self.total_weight.saturating_add(weight);
+        if let Some(peer) = from {
+            self.add_peer_weight(peer, weight);
+        }
         true
     }
 
+    fn expire(&mut self, now_ms: u64) {
+        let stale: Vec<Txid> = self
+            .by_txid
+            .iter()
+            .filter(|(_, e)| now_ms.saturating_sub(e.arrived_ms) >= ORPHAN_EXPIRE_MS)
+            .map(|(txid, _)| *txid)
+            .collect();
+        for txid in stale {
+            self.remove_txid(&txid);
+        }
+    }
+
+    fn add_peer_weight(&mut self, peer: u64, weight: u64) {
+        let w = self.peer_weight.entry(peer).or_default();
+        *w = w.saturating_add(weight);
+    }
+
+    fn sub_peer_weight(&mut self, peer: u64, weight: u64) {
+        let next = self
+            .peer_weight
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(weight);
+        if next == 0 {
+            self.peer_weight.remove(&peer);
+        } else {
+            self.peer_weight.insert(peer, next);
+        }
+    }
+
+    fn unaccount(&mut self, e: &OrphanEntry) {
+        self.total_weight = self.total_weight.saturating_sub(e.weight);
+        for peer in &e.announcers {
+            self.sub_peer_weight(*peer, e.weight);
+        }
+    }
+
     fn peer_orphan_weight(&self, peer: u64) -> u64 {
-        self.by_txid
-            .values()
-            .filter(|e| e.announcers.contains(&peer))
-            .map(|e| e.weight)
-            .sum()
+        self.peer_weight.get(&peer).copied().unwrap_or(0)
     }
 
     fn announcers_within_reserve(&self, txid: &Txid) -> bool {
@@ -186,12 +242,21 @@ impl Orphanage {
     }
 
     fn evict_oldest(&mut self) -> bool {
+        if self.evict_oldest_filtered(true) {
+            return true;
+        }
+        // The reserve is a preference. A set that is entirely protected still
+        // makes room for one newer orphan.
+        self.evict_oldest_filtered(false)
+    }
+
+    fn evict_oldest_filtered(&mut self, honor_reserve: bool) -> bool {
         let mut skipped = VecDeque::new();
         while let Some(txid) = self.fifo.pop_front() {
             if !self.by_txid.contains_key(&txid) {
                 continue;
             }
-            if self.announcers_within_reserve(&txid) {
+            if honor_reserve && self.announcers_within_reserve(&txid) {
                 skipped.push_back(txid);
                 continue;
             }
@@ -209,7 +274,7 @@ impl Orphanage {
             return;
         };
         self.by_wtxid.remove(&e.wtxid);
-        self.total_weight = self.total_weight.saturating_sub(e.weight);
+        self.unaccount(&e);
         for p in &e.missing {
             if let Some(set) = self.by_parent.get_mut(p) {
                 set.remove(txid);
@@ -230,7 +295,7 @@ impl Orphanage {
         for cid in children {
             if let Some(e) = self.by_txid.remove(&cid) {
                 self.by_wtxid.remove(&e.wtxid);
-                self.total_weight = self.total_weight.saturating_sub(e.weight);
+                self.unaccount(&e);
                 for p in &e.missing {
                     if p == parent {
                         continue;
@@ -260,10 +325,17 @@ impl Orphanage {
     }
 
     pub fn add_announcer(&mut self, txid: &Txid, peer: u64) -> bool {
-        let Some(e) = self.by_txid.get_mut(txid) else {
-            return false;
+        let weight = {
+            let Some(e) = self.by_txid.get_mut(txid) else {
+                return false;
+            };
+            if !e.announcers.insert(peer) {
+                return false;
+            }
+            e.weight
         };
-        e.announcers.insert(peer)
+        self.add_peer_weight(peer, weight);
+        true
     }
 
     pub fn add_announcer_wtxid(&mut self, wtxid: &Wtxid, peer: u64) -> bool {
@@ -275,16 +347,26 @@ impl Orphanage {
 
     /// Drop `peer` as announcer; erase orphans with no remaining announcers.
     pub fn erase_for_peer(&mut self, peer: u64) {
-        let drop: Vec<Txid> = self
+        let hit: Vec<(Txid, u64, bool)> = self
             .by_txid
-            .iter_mut()
+            .iter()
             .filter_map(|(txid, e)| {
-                if !e.announcers.remove(&peer) {
+                if !e.announcers.contains(&peer) {
                     return None;
                 }
-                e.announcers.is_empty().then_some(*txid)
+                Some((*txid, e.weight, e.announcers.len() == 1))
             })
             .collect();
+        let mut drop = Vec::new();
+        for (txid, weight, last) in hit {
+            if let Some(e) = self.by_txid.get_mut(&txid) {
+                e.announcers.remove(&peer);
+            }
+            self.sub_peer_weight(peer, weight);
+            if last {
+                drop.push(txid);
+            }
+        }
         for t in drop {
             self.remove_txid(&t);
         }
@@ -327,6 +409,13 @@ impl Orphanage {
         }
         self.fifo.retain(|t| self.by_txid.contains_key(t));
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -464,5 +553,46 @@ mod tests {
         o.erase_for_peer(9);
         assert!(!o.contains(&tid));
         assert!(o.is_empty());
+    }
+
+    #[test]
+    fn protected_reserve_does_not_refuse_a_later_orphan() {
+        let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 2);
+        let p = txid_n(11);
+        for (n, peer) in [(1u8, 1u64), (2, 2)] {
+            let tx = make_orphan(p, n);
+            let mut miss = BTreeSet::new();
+            miss.insert(p);
+            assert!(o.insert_from(tx, miss, Some(peer)));
+        }
+        assert_eq!(o.len(), 2);
+        let tx = make_orphan(p, 3);
+        let tid = tx.compute_txid();
+        let mut miss = BTreeSet::new();
+        miss.insert(p);
+        assert!(
+            o.insert_from(tx, miss, Some(3)),
+            "a full per-peer reserve must still admit a newer orphan"
+        );
+        assert!(o.contains(&tid));
+        assert!(o.len() <= 2);
+    }
+
+    #[test]
+    fn orphan_expires_after_the_bound() {
+        let mut o = Orphanage::new();
+        let p = txid_n(12);
+        let old = make_orphan(p, 1);
+        let old_id = old.compute_txid();
+        let mut miss = BTreeSet::new();
+        miss.insert(p);
+        assert!(o.insert_from_at(old, miss.clone(), Some(1), 0));
+        assert!(o.contains(&old_id));
+        let newer = make_orphan(p, 2);
+        assert!(o.insert_from_at(newer, miss, Some(2), ORPHAN_EXPIRE_MS));
+        assert!(
+            !o.contains(&old_id),
+            "an orphan parked for ORPHAN_EXPIRE_MS is gone"
+        );
     }
 }

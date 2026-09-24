@@ -126,12 +126,8 @@ pub fn check_libre_admission(tx: &Transaction, fee_sat: u64, weight: u64) -> Pol
 }
 
 /// Libre admission with an explicit min-relay floor (Core `-minrelaytxfee`).
-pub fn check_libre_admission_at(
-    tx: &Transaction,
-    fee_sat: u64,
-    weight: u64,
-    min_relay_sat_kvb: u64,
-) -> PolicyResult {
+/// Shape checks that do not need a fee or parent outputs.
+pub fn check_libre_shape(tx: &Transaction, weight: u64) -> PolicyResult {
     if tx.is_coinbase() {
         return PolicyResult::NonStandard("coinbase");
     }
@@ -153,10 +149,23 @@ pub fn check_libre_admission_at(
     if weight > MAX_STANDARD_TX_WEIGHT {
         return PolicyResult::NonStandard("tx weight");
     }
+    check_libre_annex(tx)
+}
+
+pub fn check_libre_admission_at(
+    tx: &Transaction,
+    fee_sat: u64,
+    weight: u64,
+    min_relay_sat_kvb: u64,
+) -> PolicyResult {
+    match check_libre_shape(tx, weight) {
+        PolicyResult::Standard => {}
+        other => return other,
+    }
     if !meets_min_relay_fee_at(fee_sat, weight, min_relay_sat_kvb) {
         return PolicyResult::NonStandard("min relay fee");
     }
-    check_libre_annex(tx)
+    PolicyResult::Standard
 }
 
 #[cfg(test)]

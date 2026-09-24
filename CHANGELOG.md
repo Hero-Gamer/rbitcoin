@@ -11,6 +11,12 @@ before 1.0).
 
 ### Fixed
 
+- **Orphan admission when every parked tx is inside a per-peer reserve.**
+  Eviction still prefers orphans outside that reserve, then drops the
+  oldest reserved one so a newer orphan is not refused. Peer weight is
+  kept per announcer. An orphan older than 20 minutes is dropped on the
+  next insert. Non-standard shape (weight, dust, scriptPubKey, annex) is
+  rejected before the tx is parked.
 - **Spend annotations survive a crash after the tip seal.** A missing
   spent slot is unspent, so open replays annotations above the
   `spend_durable` marker (a missing file replays from genesis) and only
