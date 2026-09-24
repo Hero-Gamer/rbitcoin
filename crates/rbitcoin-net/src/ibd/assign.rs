@@ -1457,6 +1457,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn issue_batch_reserves_four_mib_per_new_hash() {
+        let (dir, _hub) = tmp_hub();
+        let four_mib = 4 * 1024 * 1024;
+        let mut st = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
+        st.intake_queued = 0;
+        st.intake_stop = four_mib;
+        let mut room = 10usize;
+        let mut issued = 0u64;
+        assert!(
+            issue_one(&mut st, 0, h(31), &mut room, &mut issued),
+            "one new hash fits in exactly 4 MiB"
+        );
+        assert!(st.inflight.contains_key(&h(31)));
+
+        let mut tight = IbdWorkState::new(vec![dummy_slot(0)], None, Some(0));
+        tight.intake_queued = 0;
+        tight.intake_stop = four_mib - 1;
+        let mut room = 10usize;
+        let mut issued = 0u64;
+        assert!(
+            !issue_one(&mut tight, 0, h(32), &mut room, &mut issued),
+            "one byte under 4 MiB cannot reserve a new hash"
+        );
+        assert!(!tight.inflight.contains_key(&h(32)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Off-path getdata (mainnet 08:16:23: ordered empty, h2h=0, inflight=7)
     /// must not occupy slots; tip+1 and live awaiting-reorg need stay.
     /// Speculative explore-need at an empty remainder is leftover — drop it.

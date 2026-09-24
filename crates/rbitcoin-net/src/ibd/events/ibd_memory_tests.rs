@@ -104,6 +104,25 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
         !st.hash_height.contains_key(&broken),
         "header after a failed validation must not be noted"
     );
+
+    // `good` was stored before this pair, so a search that returns nothing
+    // still leaves it on the path. A fresh prefix has to be found by the
+    // binary search or it never enters the work path.
+    let fresh = mine(good.block_hash(), 1_500_011_200, 2);
+    let mut bad_tail = mine(fresh.block_hash(), 1_500_011_800, 3);
+    bad_tail.header.time = 0;
+    let fresh_hash = fresh.block_hash();
+    let tail_hash = bad_tail.header.block_hash();
+    let added = on_headers_batch(&mut st, &hub, vec![fresh.header, bad_tail.header]);
+    assert!(
+        st.hash_height.contains_key(&fresh_hash),
+        "binary search must keep the valid prefix of a rejected tail"
+    );
+    assert!(added >= 1, "the valid prefix is enqueued");
+    assert!(
+        !st.hash_height.contains_key(&tail_hash),
+        "rejected tail must not be noted"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
