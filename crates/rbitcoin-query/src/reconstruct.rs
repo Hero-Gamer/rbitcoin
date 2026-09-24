@@ -13,6 +13,27 @@ pub struct StampedTxstatBlock {
     pub n_outs: Vec<u32>,
 }
 
+fn block_size_weight_from_txstat(
+    rows: &[rbitcoin_store::TxStatRow],
+) -> Result<(u32, u32), StoreError> {
+    let n = rows.len() as u64;
+    let vi = bitcoin::consensus::encode::VarInt(n).size() as u64;
+    let overhead = 80u64.saturating_add(vi);
+    let mut tx_size = 0u64;
+    let mut tx_wu = 0u64;
+    for row in rows {
+        tx_size = tx_size.saturating_add(row.size());
+        tx_wu = tx_wu.saturating_add(row.weight());
+    }
+    let total = overhead.saturating_add(tx_size);
+    let weight = overhead.saturating_mul(4).saturating_add(tx_wu);
+    let size =
+        u32::try_from(total).map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+    let weight =
+        u32::try_from(weight).map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+    Ok((size, weight))
+}
+
 impl Query {
     fn load_body_from_store(
         &self,
@@ -341,18 +362,26 @@ impl Query {
             .map(Some)
     }
 
-    /// BIP144 size and BIP141 weight for a header row.
+    /// BIP144 size and BIP141 weight for a header that has a Class A body.
     ///
-    /// Stamped values are a hit (no reconstruct). `(0, 0)` reconstructs once,
-    /// patches the row, and returns the numbers. Unknown `header_fk` is `None`.
+    /// A fully stamped `txstat` range is one sequential read. Otherwise the
+    /// block is reconstructed. Unknown `header_fk` or a header with no body
+    /// is `None`.
     pub fn block_size_weight(&self, header_fk: Fk) -> Result<Option<(u32, u32)>, QueryError> {
         let rec = match self.store.headers.get(header_fk) {
             Ok(r) => r,
             Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => return Ok(None),
             Err(e) => return Err(e),
         };
-        if rec.size != 0 || rec.weight != 0 {
-            return Ok(Some((rec.size, rec.weight)));
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        let last = first.0.saturating_add(u64::from(n) - 1);
+        if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
+            if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {
+                let plain: Vec<_> = rows.into_iter().flatten().collect();
+                return Ok(Some(block_size_weight_from_txstat(&plain)?));
+            }
         }
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
@@ -363,9 +392,6 @@ impl Query {
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
-        self.store
-            .headers
-            .set_size_weight(header_fk, size, weight)?;
         Ok(Some((size, weight)))
     }
 

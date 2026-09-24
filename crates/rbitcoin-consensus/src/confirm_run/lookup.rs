@@ -318,7 +318,11 @@ pub fn confirm_wire_load_from_plan(
         t_load.elapsed().as_nanos() as u64,
     );
 
-    let (prepared, tx_fees) = assemble_run(
+    let Assembled {
+        prepared,
+        tx_fees,
+        tx_sizes,
+    } = assemble_run(
         query,
         params,
         milestone,
@@ -335,7 +339,13 @@ pub fn confirm_wire_load_from_plan(
                     "invariant: assemble tx fees length",
                 )));
             }
+            if tx_sizes.len() != plan.packed.len() {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: txstat size length",
+                )));
+            }
             plan.tx_fees = tx_fees;
+            plan.tx_sizes = tx_sizes;
         }
     }
 

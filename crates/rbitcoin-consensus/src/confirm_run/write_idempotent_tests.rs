@@ -2061,6 +2061,7 @@ fn pin_for_wire_incomplete_outs_is_invariant_error() {
         index_tx: false,
         body_est: 0,
         tx_fees: Vec::new(),
+        tx_sizes: Vec::new(),
     };
     // In-flight "parent" with **empty** outs → live.len() != need → cold path;
     // no Class A body either → end pin contract fails.
@@ -2120,6 +2121,7 @@ fn parent_pin_stamp_take_from_plan_moves_maps() {
         index_tx: false,
         body_est: 0,
         tx_fees: Vec::new(),
+        tx_sizes: Vec::new(),
     };
     let stamp = ParentPinStamp::take_from_plan(&mut plan);
     assert!(plan.external_parents.is_empty());
@@ -2521,6 +2523,7 @@ fn pin_sparse_need_high_vout_only() {
         index_tx: false,
         body_est: 0,
         tx_fees: Vec::new(),
+        tx_sizes: Vec::new(),
     };
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);

@@ -12,10 +12,10 @@ pub const HEADER_HEAD_DIR_REFUSE: &str =
 pub const HEADER_HEAD_EMPTY_REFUSE: &str =
     "header.head is empty at target slots; wipe header.head, header.head.mlt, and header.body and reindex";
 
-/// Schema-23 header body record (consensus fields only).
-pub const HEADER_RECORD_LEN_V23: usize = 88;
-/// Fixed-size header body record (96 bytes). See SCHEMA.md.
-pub const HEADER_RECORD_LEN: usize = 96;
+/// Live `header.body` record: consensus fields only. See SCHEMA.md.
+pub const HEADER_RECORD_LEN: usize = 88;
+/// Schema 24/25 record. Open strips the trailing `size`/`weight` back to 88.
+pub const HEADER_RECORD_LEN_V24: usize = 96;
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct HeaderRecord {
@@ -26,7 +26,9 @@ pub struct HeaderRecord {
     pub nonce: u32,
     pub merkle_root: [u8; 32],
     pub hash: [u8; 32],
+    /// Not written to `header.body`. Block size comes from `txstat`.
     pub size: u32,
+    /// Not written to `header.body`. Block weight comes from `txstat`.
     pub weight: u32,
 }
 
@@ -40,36 +42,11 @@ impl HeaderRecord {
         out[20..24].copy_from_slice(&self.nonce.to_le_bytes());
         out[24..56].copy_from_slice(&self.merkle_root);
         out[56..88].copy_from_slice(&self.hash);
-        out[88..92].copy_from_slice(&self.size.to_le_bytes());
-        out[92..96].copy_from_slice(&self.weight.to_le_bytes());
-        out
-    }
-
-    pub fn encode_v23(&self) -> [u8; HEADER_RECORD_LEN_V23] {
-        let mut out = [0u8; HEADER_RECORD_LEN_V23];
-        out.copy_from_slice(&self.encode()[..HEADER_RECORD_LEN_V23]);
         out
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
         if buf.len() < HEADER_RECORD_LEN {
-            return Err(StoreError::Corrupt("short header record"));
-        }
-        Ok(Self {
-            prev_fk: Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            version: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            timestamp: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-            bits: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            nonce: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            merkle_root: buf[24..56].try_into().unwrap(),
-            hash: buf[56..88].try_into().unwrap(),
-            size: u32::from_le_bytes(buf[88..92].try_into().unwrap()),
-            weight: u32::from_le_bytes(buf[92..96].try_into().unwrap()),
-        })
-    }
-
-    fn decode_v23(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < HEADER_RECORD_LEN_V23 {
             return Err(StoreError::Corrupt("short header record"));
         }
         Ok(Self {
@@ -305,11 +282,12 @@ impl HeaderTable {
         })
     }
 
-    /// Schema 23→24: rewrite 88 B header rows to 96 B (`size`/`weight` = 0).
+    /// Schema 24/25 → 26: strip trailing `size`/`weight` so each row is 88 B.
     ///
-    /// Writes `header.body.grow`, fsyncs, renames over `header.body`. Occupied
-    /// from `header.head` disambiguates lengths that divide both 88 and 96.
-    pub(crate) fn rewrite_v23_body(dir: &Path) -> Result<(), StoreError> {
+    /// Writes `header.body.grow`, fsyncs, renames over `header.body`. A body
+    /// that is already 88 B is left alone. Occupied `header.head` disambiguates
+    /// lengths that divide both 88 and 96.
+    pub(crate) fn rewrite_v24_body_to_88(dir: &Path) -> Result<(), StoreError> {
         let path = dir.join("header.body");
         if !path.is_file() {
             return Ok(());
@@ -325,24 +303,24 @@ impl HeaderTable {
         if body_len == 0 {
             return Ok(());
         }
-        let n88 = body_len / HEADER_RECORD_LEN_V23 as u64;
-        let n96 = body_len / HEADER_RECORD_LEN as u64;
-        let aligned88 = body_len % HEADER_RECORD_LEN_V23 as u64 == 0;
-        let aligned96 = body_len % HEADER_RECORD_LEN as u64 == 0;
+        let n88 = body_len / HEADER_RECORD_LEN as u64;
+        let n96 = body_len / HEADER_RECORD_LEN_V24 as u64;
+        let aligned88 = body_len % HEADER_RECORD_LEN as u64 == 0;
+        let aligned96 = body_len % HEADER_RECORD_LEN_V24 as u64 == 0;
         let n = if aligned96 && aligned88 {
             let occ = header_head_occupied(dir)?;
-            if occ == n96 {
+            if occ == n88 || occ == 0 {
                 return Ok(());
             }
-            if occ == n88 || occ == 0 {
-                n88
+            if occ == n96 {
+                n96
             } else {
                 return Err(StoreError::Corrupt("header body size"));
             }
-        } else if aligned96 {
-            return Ok(());
         } else if aligned88 {
-            n88
+            return Ok(());
+        } else if aligned96 {
+            n96
         } else {
             return Err(StoreError::Corrupt("header body size"));
         };
@@ -351,10 +329,10 @@ impl HeaderTable {
         blob.try_reserve_exact(n as usize * HEADER_RECORD_LEN)
             .map_err(|_| StoreError::Corrupt("header body rewrite OOM"))?;
         for i in 0..n {
-            let off = FILE_HEADER_LEN as u64 + i * HEADER_RECORD_LEN_V23 as u64;
-            let mut raw = [0u8; HEADER_RECORD_LEN_V23];
+            let off = FILE_HEADER_LEN as u64 + i * HEADER_RECORD_LEN_V24 as u64;
+            let mut raw = [0u8; HEADER_RECORD_LEN_V24];
             src.read_at(off, &mut raw)?;
-            blob.extend_from_slice(&HeaderRecord::decode_v23(&raw)?.encode());
+            blob.extend_from_slice(&raw[..HEADER_RECORD_LEN]);
         }
         let new_len = FILE_HEADER_LEN as u64 + n * HEADER_RECORD_LEN as u64;
         dst.write_at(FILE_HEADER_LEN as u64, &blob)?;
@@ -475,63 +453,6 @@ impl HeaderTable {
         let mut buf = [0u8; HEADER_RECORD_LEN];
         self.body.read_at(offset, &mut buf)?;
         HeaderRecord::decode(&buf)
-    }
-
-    /// Patch trailing size/weight on an existing row (query lazy-fill of leftover zeros).
-    ///
-    /// Confirm uses [`Self::put_size_weight_run`] (no insert lock).
-    pub fn set_size_weight(&self, fk: Fk, size: u32, weight: u32) -> Result<(), StoreError> {
-        self.put_size_weight_run(&[(fk, size, weight)])
-    }
-
-    /// Write size/weight for already-published header rows.
-    ///
-    /// Not an insert: does not take [`Self::put_lock`]. Contiguous fk runs are
-    /// one sequential `header.body` rewrite of 96-byte records.
-    pub fn put_size_weight_run(&self, rows: &[(Fk, u32, u32)]) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let count = self.count.load(Ordering::Acquire);
-        let mut items: Vec<(u64, u32, u32)> = Vec::with_capacity(rows.len());
-        for &(fk, size, weight) in rows {
-            let Some(id) = fk.get() else {
-                return Err(StoreError::InvalidFk);
-            };
-            if id == 0 || id > count {
-                continue;
-            }
-            items.push((id, size, weight));
-        }
-        if items.is_empty() {
-            return Ok(());
-        }
-        items.sort_unstable_by_key(|r| r.0);
-        let mut i = 0;
-        while i < items.len() {
-            let mut j = i + 1;
-            while j < items.len() && items[j].0 == items[j - 1].0.saturating_add(1) {
-                j += 1;
-            }
-            self.patch_size_weight_run(&items[i..j])?;
-            i = j;
-        }
-        Ok(())
-    }
-
-    fn patch_size_weight_run(&self, run: &[(u64, u32, u32)]) -> Result<(), StoreError> {
-        let n = run.len();
-        let first = run[0].0;
-        let offset = FILE_HEADER_LEN as u64 + (first - 1) * HEADER_RECORD_LEN as u64;
-        let mut buf = vec![0u8; n.saturating_mul(HEADER_RECORD_LEN)];
-        self.body.read_at(offset, &mut buf)?;
-        for (k, &(_, size, weight)) in run.iter().enumerate() {
-            let rec = k.saturating_mul(HEADER_RECORD_LEN);
-            buf[rec + 88..rec + 92].copy_from_slice(&size.to_le_bytes());
-            buf[rec + 92..rec + 96].copy_from_slice(&weight.to_le_bytes());
-        }
-        self.body.write_at(offset, &buf)
     }
 
     pub fn get_by_hash(&self, hash: &[u8; 32]) -> Result<Option<(Fk, HeaderRecord)>, StoreError> {
@@ -980,37 +901,40 @@ mod tests {
     }
 
     #[test]
-    fn header_record_v24_roundtrip_size_weight() {
+    fn header_record_roundtrip_is_88_bytes() {
         let rec = HeaderRecord {
             size: 285,
             weight: 1140,
             ..sample([1u8; 32])
         };
         let enc = rec.encode();
-        assert_eq!(enc.len(), 96);
+        assert_eq!(enc.len(), HEADER_RECORD_LEN);
         let back = HeaderRecord::decode(&enc).unwrap();
-        assert_eq!(back.size, 285);
-        assert_eq!(back.weight, 1140);
+        assert_eq!(back.size, 0);
+        assert_eq!(back.weight, 0);
         assert_eq!(back.hash, rec.hash);
-        assert!(HeaderRecord::decode(&[0u8; HEADER_RECORD_LEN_V23]).is_err());
+        assert!(HeaderRecord::decode(&[0u8; 40]).is_err());
     }
 
     #[test]
-    fn rewrite_v23_header_body_pads_size_weight_zero() {
+    fn rewrite_v24_header_body_strips_size_weight() {
         let dir = tmp();
         let rec = sample([0x11; 32]);
         {
             let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
-            body.write_at(FILE_HEADER_LEN as u64, &rec.encode_v23())
-                .unwrap();
-            body.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V23 as u64)
+            let mut raw = [0u8; HEADER_RECORD_LEN_V24];
+            raw[..HEADER_RECORD_LEN].copy_from_slice(&rec.encode());
+            raw[88..92].copy_from_slice(&285u32.to_le_bytes());
+            raw[92..96].copy_from_slice(&1140u32.to_le_bytes());
+            body.write_at(FILE_HEADER_LEN as u64, &raw).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + HEADER_RECORD_LEN_V24 as u64)
                 .unwrap();
             body.flush().unwrap();
             let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
             h.insert(&rec.hash, Fk(1)).unwrap();
             h.flush().unwrap();
         }
-        HeaderTable::rewrite_v23_body(&dir).unwrap();
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
         let t = HeaderTable::open_tiny(&dir).unwrap();
         let got = t.get(Fk(1)).unwrap();
         assert_eq!(got.hash, rec.hash);
@@ -1043,63 +967,85 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_v23_already_96_is_nop() {
+    fn rewrite_v24_already_88_is_nop() {
         let dir = tmp();
         let t = HeaderTable::create_tiny(&dir).unwrap();
         t.ensure(&sample([0x22; 32])).unwrap();
         t.flush().unwrap();
         drop(t);
-        HeaderTable::rewrite_v23_body(&dir).unwrap();
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
         let t = HeaderTable::open_tiny(&dir).unwrap();
         assert_eq!(t.count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 11×96 B is the same byte length as 12×88 B. Occupied 11 must strip.
     #[test]
-    fn set_size_weight_patches_trailing_fields() {
+    fn rewrite_v24_ambiguous_96_strips_each_row() {
         let dir = tmp();
-        let t = HeaderTable::create_tiny(&dir).unwrap();
-        let fk = t.ensure(&sample([0x33; 32])).unwrap();
-        t.set_size_weight(fk, 200, 800).unwrap();
-        let got = t.get(fk).unwrap();
-        assert_eq!(got.size, 200);
-        assert_eq!(got.weight, 800);
-        assert_eq!(got.hash, [0x33; 32]);
+        let n = 11u64;
+        let recs: Vec<HeaderRecord> = (0..n).map(|i| sample([0xA0 + i as u8; 32])).collect();
+        {
+            let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
+            let mut blob = Vec::with_capacity(n as usize * HEADER_RECORD_LEN_V24);
+            for rec in &recs {
+                let mut raw = [0u8; HEADER_RECORD_LEN_V24];
+                raw[..HEADER_RECORD_LEN].copy_from_slice(&rec.encode());
+                raw[88..92].copy_from_slice(&7u32.to_le_bytes());
+                blob.extend_from_slice(&raw);
+            }
+            body.write_at(FILE_HEADER_LEN as u64, &blob).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)
+                .unwrap();
+            body.flush().unwrap();
+            let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
+            for (i, rec) in recs.iter().enumerate() {
+                h.insert(&rec.hash, Fk(i as u64 + 1)).unwrap();
+            }
+            h.flush().unwrap();
+        }
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+        let t = HeaderTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.count(), n);
+        for (i, rec) in recs.iter().enumerate() {
+            let got = t.get(Fk(i as u64 + 1)).unwrap();
+            assert_eq!(got.hash, rec.hash);
+            assert_eq!(got.size, 0);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 12×88 B is the same byte length as 11×96 B. Occupied 12 must not strip.
     #[test]
-    fn put_size_weight_run_contiguous_rewrites_records() {
+    fn rewrite_v24_ambiguous_88_stays() {
         let dir = tmp();
-        let t = HeaderTable::create_tiny(&dir).unwrap();
-        let mut fks = Vec::new();
-        for i in 0u8..3 {
-            let fk = t.ensure(&sample([0x40 + i; 32])).unwrap();
-            fks.push(fk);
+        let n = 12u64;
+        let recs: Vec<HeaderRecord> = (0..n).map(|i| sample([0xB0 + i as u8; 32])).collect();
+        {
+            let body = TableFile::create(dir.join("header.body"), TableKind::Header).unwrap();
+            let mut blob = Vec::with_capacity(n as usize * HEADER_RECORD_LEN);
+            for rec in &recs {
+                blob.extend_from_slice(&rec.encode());
+            }
+            body.write_at(FILE_HEADER_LEN as u64, &blob).unwrap();
+            body.set_logical_len(FILE_HEADER_LEN as u64 + blob.len() as u64)
+                .unwrap();
+            body.flush().unwrap();
+            let h = HashHead::create_with_slots(dir.join("header.head"), 64).unwrap();
+            for (i, rec) in recs.iter().enumerate() {
+                h.insert(&rec.hash, Fk(i as u64 + 1)).unwrap();
+            }
+            h.flush().unwrap();
         }
-        t.put_size_weight_run(&[(fks[0], 100, 400), (fks[1], 200, 800), (fks[2], 300, 1200)])
-            .unwrap();
-        for (i, &fk) in fks.iter().enumerate() {
-            let got = t.get(fk).unwrap();
-            let want = ((i as u32 + 1) * 100, (i as u32 + 1) * 400);
-            assert_eq!((got.size, got.weight), want);
-            assert_eq!(got.hash, [0x40 + i as u8; 32]);
-            assert_eq!(t.get_by_hash(&got.hash).unwrap().map(|(f, _)| f), Some(fk));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn put_size_weight_run_splits_noncontiguous_fks() {
-        let dir = tmp();
-        let t = HeaderTable::create_tiny(&dir).unwrap();
-        let a = t.ensure(&sample([0x51; 32])).unwrap();
-        let b = t.ensure(&sample([0x52; 32])).unwrap();
-        let c = t.ensure(&sample([0x53; 32])).unwrap();
-        t.put_size_weight_run(&[(a, 11, 44), (c, 33, 132)]).unwrap();
-        assert_eq!(t.get(a).unwrap().size, 11);
-        assert_eq!(t.get(b).unwrap().size, 0);
-        assert_eq!(t.get(c).unwrap().weight, 132);
+        let before = std::fs::metadata(dir.join("header.body")).unwrap().len();
+        HeaderTable::rewrite_v24_body_to_88(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join("header.body")).unwrap().len(),
+            before
+        );
+        let t = HeaderTable::open_tiny(&dir).unwrap();
+        assert_eq!(t.count(), n);
+        assert_eq!(t.get(Fk(n)).unwrap().hash, recs[n as usize - 1].hash);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

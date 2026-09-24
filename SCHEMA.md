@@ -1,14 +1,17 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 25` (`rbitcoin_primitives`).  
-**Status:** 25 is `txstat.body` 8 B/create (canonical ULEB `fee_sat`/`base`/`wit_extra`; `n_in` is `input.loc`;
+**Version:** `SCHEMA_VERSION = 26` (`rbitcoin_primitives`).  
+**Status:** 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
+the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
+`txstat` for that header's create range. A 25 binary refuses 26 `meta`.
+25 is `txstat.body` 8 B/create (canonical ULEB `fee_sat`/`base`/`wit_extra`; `n_in` is `input.loc`;
 per-header remaining-byte overflow in `txstat.ovf` + `txstat.blk`). Occupied
 24 rewrites `meta` and zero-extends `txstat.body` to `create.loc` count (**no**
 `txout.body` rewrite; leftover LAYOUT17 still has uleb `input_count`). Unreleased
 leftover `txfixed.body` is unlinked. A 24
 binary refuses 25 `meta`. 24 is `header.body` 96 B (trailing `size:u32` + `weight:u32`). Occupied
-23 rewrites 88 B rows via `header.body.grow` then rename (size/weight 0 until
-confirm stamps or lazy fill). SH extent last-page reserved (offset 20) is create
+23 leaves 88 B rows as they are. SH extent last-page reserved (offset 20) is create
 count (`0` = unknown; readers walk, appender stamps on pack/append). 23 is `create.loc.ovf` 16 B (`fk:u64` + strides/`n_out`
 u32) so a consensus-valid ~1 MiB txout (and `n_out > 65535`) stores. Occupied 22
 Class A rewrites 12 B ovf rows and `meta`. 22 is `create.loc` + `seqsigwit.loc` (no
@@ -82,7 +85,8 @@ Empty 21 rewrites `store/meta` to 25 and unlinks leftover `spent.off`.
 Table file headers 13–25 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 25.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
-**23→24 open:** rewrite `header.body` 88 B rows to 96 B (`size:u32` + `weight:u32` = 0) via `header.body.grow` then rename; rewrite `meta` to 25. Class A tx stems kept. Empty 23 rewrites `meta`. A 23 binary refuses 24 `meta`. Crash with leftover `.grow` discards it and retries; 96-byte body with meta 23 only rewrites `meta`.
+**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 26.
+**24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -320,10 +324,12 @@ Used for Class A `txout` / `seqsigwit` / `spent` (and historically packed `tx.bo
 
 ## Class A — headers
 
-### `header.body` record (fixed 96 bytes)
+### `header.body` record (fixed 88 bytes)
 
-Consensus fields are the first 88 bytes (schema 23). Trailing size/weight are 0
-until confirm stamps them (headers are `ensure`d before the block body exists).
+Consensus fields only. Schema 24/25 stored an extra `size:u32` + `weight:u32`;
+open from those versions strips them. Block size and weight are not stored
+here. A reader sums the header's `txstat` rows (`80 + compactsize(n) + Σ size`,
+weight `4 * (80 + compactsize(n)) + Σ weight`).
 
 | Field | Type |
 |-------|------|
@@ -334,8 +340,6 @@ until confirm stamps them (headers are `ensure`d before the block body exists).
 | nonce | u32 |
 | merkle_root | [u8; 32] |
 | hash | [u8; 32] |
-| size | u32 |
-| weight | u32 |
 
 ### `header.head`
 
