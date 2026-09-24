@@ -97,17 +97,41 @@ async fn ws_protocol(
         }
     }
     assert!(saw_block, "want blocks pushes the tip");
-    ws_reject_bad_address(ws).await;
     let (st, body) = http_get(addr, "/blocks/tip/height").await;
     assert_eq!(st, 200, "{body}");
 }
 
 async fn ws_reject_bad_address(ws: &mut Ws) {
+    let id = "ab".repeat(32);
+    ws.send(WsMsg::Text(r#"{"foo":1}"#.into())).await.unwrap();
+    ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Text(r#"{"stop-track-addresses":true}"#.into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Text(r#"{"stop-track-txs":true}"#.into()))
+        .await
+        .unwrap();
     ws.send(WsMsg::Text(r#"{"track-address":"not-an-address"}"#.into()))
         .await
         .unwrap();
     let err = ws_recv_json(ws, 2).await;
     assert!(err.to_string().contains("invalid address"), "{err}");
+    ws.send(WsMsg::Text(format!(r#"{{"stop-track-tx":"{id}"}}"#).into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Text(
+        r#"{"stop-track-address":"bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz8z5y2"}"#.into(),
+    ))
+    .await
+    .unwrap();
+    ws.send(WsMsg::Text(format!(r#"{{"track-tx":"{id}"}}"#).into()))
+        .await
+        .unwrap();
+    ws.send(WsMsg::Text(format!(r#"{{"track-txs":["{id}"]}}"#).into()))
+        .await
+        .unwrap();
     ws.send(WsMsg::Text(
         r#"{"track-addresses":["not-an-address"]}"#.into(),
     ))
@@ -492,6 +516,7 @@ async fn esplora_ws_track_address() {
     };
     ws_protocol(&mut ws, &q, &tip_tx, addr, 109).await;
     ws_stats_bump(&mut ws, &hub, coins[0]).await;
+    ws_reject_bad_address(&mut ws).await;
     ws_address_confirm(&mut ws, addr, &watch_addr, &watch_spk, &chain).await;
     ws_snapshot_and_multi(&mut ws, &hub, &watch_addr, &watch_spk, &addr_b, &spk_b, &coins).await;
     ws_track_tx_confirm(&mut ws, &q, &hub, &tip_tx, coins[7]).await;
