@@ -1807,6 +1807,7 @@ mod tests {
             .unwrap()
     }
 
+    #[allow(clippy::cognitive_complexity)] // one listener, last1/bulk/header-trust asserts
     async fn http_sh_join_last1_last_bulk_and_header_trust() {
         use rbitcoin_store::script_hash;
 
@@ -2578,6 +2579,7 @@ mod tests {
     }
 
     /// Real WS upgrade against `run_esplora` + tip inject + REST coexistence.
+    #[allow(clippy::cognitive_complexity)] // one socket, WS upgrade plus REST
     async fn ws_upgrade_want_blocks_and_rest_coexist() {
         use bitcoin::hashes::Hash;
         use futures_util::{SinkExt, StreamExt};
@@ -2901,6 +2903,7 @@ mod tests {
     }
 
     /// Track real regtest address → mempool address-transactions + tip block-transactions.
+    #[allow(clippy::cognitive_complexity)] // one pad, mempool then confirm
     async fn ws_track_address_mempool_and_confirm() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -3101,6 +3104,7 @@ mod tests {
     }
 
     /// Subscribe snapshots live mempool txs; RBF emits address-removed; track-addresses is keyed.
+    #[allow(clippy::cognitive_complexity)] // one pad, snapshot then multi-address
     async fn ws_track_address_snapshot_removed_and_multi() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
@@ -3539,6 +3543,7 @@ mod tests {
     }
 
     /// RBF: track-tx replace + address-only replace (old pays watch, new does not).
+    #[allow(clippy::cognitive_complexity)] // one pad, RBF track-tx and address
     async fn ws_rbf_track_tx_and_address_only() {
         use bitcoin::absolute::LockTime;
         use bitcoin::hashes::Hash;
