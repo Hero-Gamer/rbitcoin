@@ -11,3 +11,10 @@ Fixed
 - **Parked RPC waits show in `getrpcinfo`.** `waitfor*` and a
   `getblocktemplate` longpoll are listed in `active_commands` while they
   wait, and a longpoll logs its request when it arrives.
+- **A compact-block peer is not stuck on an old partial.** A peer's pending
+  partial for a block that connected through another peer is dropped, so
+  the peer's next compact block still gets `getblocktxn`.
+- **Header sync on a fork no longer slows down with its length.** Each
+  `headers` message stores only headers not already stored.
+- **Ping timeouts wait for `--peer-timeout`, as in Core.** A mock-clock
+  jump inside the peer timeout no longer drops a peer.
