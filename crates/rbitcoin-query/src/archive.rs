@@ -1332,6 +1332,44 @@ mod tests {
         let _ = path;
     }
 
+    fn size_plan(tag: u8, with_size: bool) -> super::ArchiveWritePlan {
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            crate::CreatePinInner::records(
+                TxRecord {
+                    txid: [tag; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                },
+                Vec::new(),
+            ),
+            Vec::new(),
+        )];
+        if with_size {
+            plan.tx_sizes = vec![(u32::from(tag), u32::from(tag) + 10)];
+        }
+        plan
+    }
+
+    #[test]
+    fn append_tx_sizes_only_when_both_sides_match_packed() {
+        let mut both = size_plan(1, true);
+        both.append(size_plan(2, true));
+        assert_eq!(both.tx_sizes, vec![(1, 11), (2, 12)]);
+
+        let mut left_only = size_plan(1, true);
+        left_only.append(size_plan(2, false));
+        assert!(left_only.tx_sizes.is_empty());
+
+        let mut right_only = size_plan(1, false);
+        right_only.append(size_plan(2, true));
+        assert!(right_only.tx_sizes.is_empty());
+    }
+
     fn coinbase_apply(i: u64) -> TxApply {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&i.to_le_bytes());
