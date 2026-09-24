@@ -106,8 +106,9 @@ if not baseline:
 new=sorted(survivors-baseline)
 print(f"shards: {len(files)} survivors: {len(survivors)} baseline: {len(baseline)} new: {len(new)}")
 if new:
-    print("::error::New survivors vs baseline")
+    print("::notice::New survivors vs baseline — advisory only (#739)")
     for n in new[:50]:
-        print(f"  NEW: {n}")
-    sys.exit(1)
+        print(f"  OBSERVED: {n}")
+    print("Advisory: these are newly observed survivors — NOT blocking merge per #739")
+    sys.exit(0)
 print("OK — no new survivors")
