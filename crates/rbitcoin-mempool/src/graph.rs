@@ -43,8 +43,7 @@ fn meets_block_min_feerate(modified_sat: i128, adj_weight_wu: u64, min_sat_kvb: 
         return true;
     }
     let vsize = adj_weight_wu.saturating_add(3) / 4;
-    modified_sat > 0
-        && modified_sat.saturating_mul(1000) >= i128::from(min_sat_kvb) * i128::from(vsize)
+    modified_sat.saturating_mul(1000) >= i128::from(min_sat_kvb) * i128::from(vsize)
 }
 
 /// One live mempool entry (RAM index; body lives on disk).
