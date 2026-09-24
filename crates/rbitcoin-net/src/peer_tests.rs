@@ -10725,3 +10725,69 @@ async fn compact_getdata_at_depth_five_is_compact_and_deeper_is_a_full_block() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn addrv2_reaches_one_or_two_neighbors_and_stops_at_the_burst() {
+    use bitcoin::p2p::address::AddrV2;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let peers = crate::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let src = peers.register(bind, bind, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut rxs = Vec::new();
+    for i in 0..4u16 {
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21000 + i);
+        let p = peers.register(a, a, &ver, true, crate::peers::PeerConnType::Inbound);
+        p.set_wants_addrv2();
+        let (tx, rx) = mpsc::unbounded_channel();
+        p.attach_out(tx);
+        rxs.push(rx);
+    }
+    let mut follow = PeerFollowState::new();
+    let msg = |port: u16| bitcoin::p2p::address::AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+        port,
+    };
+    assert_eq!(addr_relay_tokens(0.0, 1_000, 11_000), 1.0);
+    assert!(addr_relay_tokens(0.0, 1_000, 1_000) < 1.0);
+    on_addrv2(&mut follow, Some(src.as_ref()), &[msg(8333)]).unwrap();
+    let mut got = 0usize;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            got += 1;
+        }
+    }
+    assert!(
+        (1..=2).contains(&got),
+        "one address reached {got} neighbors"
+    );
+
+    let burst: Vec<_> = (1..1000u16).map(msg).collect();
+    on_addrv2(&mut follow, Some(src.as_ref()), &burst).unwrap();
+    for rx in &mut rxs {
+        while rx.try_recv().is_ok() {}
+    }
+    on_addrv2(&mut follow, Some(src.as_ref()), &[msg(9_000)]).unwrap();
+    let mut extra = 0usize;
+    for rx in &mut rxs {
+        if rx.try_recv().is_ok() {
+            extra += 1;
+        }
+    }
+    assert_eq!(extra, 0, "past the 1000-address burst nothing is relayed");
+}

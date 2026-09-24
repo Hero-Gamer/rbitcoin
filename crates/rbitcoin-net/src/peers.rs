@@ -314,6 +314,9 @@ pub struct LivePeer {
     inflight: Mutex<Vec<u32>>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
     out_tx: Mutex<Option<mpsc::UnboundedSender<PeerOut>>>,
+    /// Addr relay tokens still available, and the millisecond they were last filled.
+    addr_tokens: Mutex<f64>,
+    addr_token_ms: AtomicU64,
     /// Unix seconds when this session was registered.
     connected_at: AtomicU64,
     /// Skip INV for mempool txs with `accept_gen < floor` (post-verack privacy).
@@ -859,6 +862,16 @@ impl LivePeer {
 
     pub(crate) fn attach_out(&self, tx: mpsc::UnboundedSender<PeerOut>) {
         *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    pub(crate) fn take_addr_relay(&self, want: usize, now_ms: u64) -> usize {
+        let mut tokens = self.addr_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let at = self.addr_token_ms.load(Ordering::Relaxed);
+        let filled = crate::peer::addr_relay_tokens(*tokens, at, now_ms);
+        self.addr_token_ms.store(now_ms.max(at), Ordering::Relaxed);
+        let take = (filled.floor() as usize).min(want);
+        *tokens = filled - take as f64;
+        take
     }
 
     pub(crate) fn writer(&self) -> Option<mpsc::UnboundedSender<PeerOut>> {
@@ -2075,6 +2088,8 @@ impl PeerHub {
             failed_cmpct: Mutex::new(HashSet::new()),
             inflight: Mutex::new(Vec::new()),
             out_tx: Mutex::new(None),
+            addr_tokens: Mutex::new(crate::peer::ADDR_RELAY_BURST),
+            addr_token_ms: AtomicU64::new(0),
             connected_at: AtomicU64::new(connected_at),
             inv_gen_floor: AtomicU64::new(0),
             age_inv_seen_due: AtomicU64::new(0),

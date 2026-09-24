@@ -287,6 +287,27 @@ pub fn version_handshake_timeout_log(peer: u64) -> String {
 /// Max addresses in one ADDR / addrv2. Interop size — do not change without
 /// a named reason to diverge (see COMPAT.md).
 pub const MAX_ADDR_TO_SEND: usize = 1000;
+/// Addresses one peer may relay before the bucket must refill (~0.1/s).
+pub(crate) const ADDR_RELAY_BURST: f64 = 1000.0;
+pub(crate) const ADDR_RELAY_PER_SEC: f64 = 0.1;
+
+pub(crate) fn addr_relay_tokens(tokens: f64, at_ms: u64, now_ms: u64) -> f64 {
+    if now_ms <= at_ms {
+        return tokens.min(ADDR_RELAY_BURST);
+    }
+    let dt = (now_ms - at_ms) as f64 / 1000.0;
+    (tokens + dt * ADDR_RELAY_PER_SEC).min(ADDR_RELAY_BURST)
+}
+
+fn addr_relay_key(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
+    let raw = bitcoin::consensus::encode::serialize(msg);
+    let mut h = 0xcbf29ce484222325u64;
+    for b in raw {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// GetAddr returns at most this percent of AddrMan (then `MAX_ADDR_TO_SEND`).
 /// Interop size — do not change without a named reason to diverge
@@ -2569,13 +2590,38 @@ fn on_addrv2(
     if let Some(s) = session {
         if let Some(ph) = s.peer_hub() {
             ph.learn_addrv2(list);
-            for other in ph.live_peers() {
-                if other.id == s.id || !other.wants_addrv2() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let allow = s.take_addr_relay(list.len(), now_ms);
+            let mut neighbors: Vec<_> = ph
+                .live_peers()
+                .into_iter()
+                .filter(|other| {
+                    other.id != s.id && other.wants_addrv2() && other.writer().is_some()
+                })
+                .collect();
+            neighbors.sort_by_key(|other| other.id);
+            for addr in list.iter().take(allow) {
+                let key = addr_relay_key(addr);
+                let n_dest = if neighbors.len() <= 1 {
+                    neighbors.len()
+                } else if key & 1 == 0 {
+                    1
+                } else {
+                    2
+                };
+                if n_dest == 0 {
                     continue;
                 }
-                if let Some(tx) = other.writer() {
-                    rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
-                    queue_out(&tx, NetworkMessage::AddrV2(list.to_vec()))?;
+                let start = (key as usize) % neighbors.len();
+                for step in 0..n_dest {
+                    let other = &neighbors[(start + step) % neighbors.len()];
+                    if let Some(tx) = other.writer() {
+                        rbitcoin_log::info!("{}", sending_addrv2_log(nbytes, other.id));
+                        queue_out(&tx, NetworkMessage::AddrV2(vec![addr.clone()]))?;
+                    }
                 }
             }
         }

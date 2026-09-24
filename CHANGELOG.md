@@ -11,6 +11,10 @@ before 1.0).
 
 ### Fixed
 
+- **Addr relay no longer goes to every peer.** Each address is sent to
+  one or two neighbors. A peer can relay 1000 addresses, then the bucket
+  refills at a tenth of an address per second.
+
 - **Tor cookie auth is SAFECOOKIE only.** A control port that does not
   advertise it, or a cookie that is not 32 bytes, does not send the raw
   cookie. A new datadir is mode `0700` and is not chmodded if it already
