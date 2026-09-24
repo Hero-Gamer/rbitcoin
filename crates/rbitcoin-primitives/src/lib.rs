@@ -411,6 +411,7 @@ mod tests {
         assert_eq!(STORE_MAGIC, *b"RBT1");
         assert_eq!(SCHEMA_VERSION, 26);
         assert!(!VERSION.is_empty());
+        assert!(schema_file_openable(26));
         assert!(schema_file_openable(25));
         assert!(schema_file_openable(24));
         assert!(schema_file_openable(23));
@@ -425,8 +426,20 @@ mod tests {
         assert!(schema_file_openable(14));
         assert!(schema_file_openable(13));
         assert!(!schema_file_openable(12));
-        assert!(!schema_file_openable(26));
+        assert!(!schema_file_openable(27));
         assert!(!schema_file_openable(0));
+    }
+
+    #[test]
+    fn open_schema26_meta_refused_by_v25_gate() {
+        const SCHEMA25_MAX: u16 = 25;
+        fn schema25_binary_openable(ver: u16) -> bool {
+            (13..=SCHEMA25_MAX).contains(&ver)
+        }
+        assert!(!schema25_binary_openable(26));
+        assert!(schema25_binary_openable(25));
+        assert!(schema_file_openable(25));
+        assert!(schema_file_openable(26));
     }
 
     #[test]
