@@ -6,16 +6,8 @@ Open the one row that matches the change. Leave the other owners closed.
 
 ## Crate graph
 
-`rbitcoin-primitives` and `rbitcoin-log` sit under the rest.
-`rbitcoin-store` is the map-free relational archive (Class A append, Class B hash heads, Class C tip-mutable).
-`rbitcoin-query` is the confirm and query layer over that store.
-`rbitcoin-consensus` validates headers, blocks, and scripts.
-`rbitcoin-mempool` is the live transaction graph.
-`rbitcoin-net` is P2P and IBD (query, store, consensus, mempool).
-`rbitcoin-rpc`, `rbitcoin-electrum`, and `rbitcoin-esplora` serve query and net.
-`rbitcoin-node` composes those crates into one process.
-`rbitcoin-cli` is the RPC client (primitives only).
-`rbitcoin-test` and `rbitcoin-bench` are harnesses, not the product graph.
+For workspace crate roles, see [`CRATES.md`](./CRATES.md). Crate-specific
+read-first links and local rules are in `crates/<name>/AGENTS.md` when present.
 
 Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file exists.
 

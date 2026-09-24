@@ -1426,7 +1426,7 @@ musl (operator) + Windows CRT-static PE + Darwin aarch64.
   **Paged** (mode 10) fail closed with a one-line wipe/rebuild message (Class A
   kept). No always-probe fuse rewrite, no flat-idx/head rename, no Shared body
   read. Shared SH read/write arms deleted.
-  [`SCHEMA.md`](SCHEMA.md) / [`OPERATOR.md`](OPERATOR.md#schema-upgrade).
+  [`SCHEMA.md`](SCHEMA.md) / [`docs/operator/storage.md`](docs/operator/storage.md#schema-upgrade).
 - **CLI and conf share one setter:** `--key[=value]` and conf `key=value` both
   run `NodeConfig::apply_kv` (conf then CLI). `CliAccum` and the field copy
   are gone. `--smoke` / `--help` / `--version` / `--conf` / `--log-level` stay
@@ -2590,7 +2590,7 @@ nightly job (not a required PR check). P2P DoS is not Core-parity.
   methods whose unmodified script still fails on type-check / field zoo.
   `rpc-missing` is only “method not implemented.” Analog required.
 
-- **Schema upgrade one-pager:** [`OPERATOR.md`](OPERATOR.md#schema-upgrade)
+- **Schema upgrade one-pager:** [`docs/operator/storage.md`](docs/operator/storage.md#schema-upgrade)
   copy-paste for 17 populated `tx.head` / `scripthash*` (wipe those dirs, keep
   Class A), 18→19 `meta` rewrite, and kill-9 → crash-recovery. Byte layout
   stays [`SCHEMA.md`](SCHEMA.md).

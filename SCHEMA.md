@@ -30,7 +30,38 @@ from Class A; SH rematerializes with `--sh-index`. An 19 binary refuses 20+
 Class A is **refused**. Empty 17 indexes rewrite `meta` to 25.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
-[`OPERATOR.md`](./OPERATOR.md#schema-upgrade).
+[`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
+
+## Find it fast
+
+| Question | Go to |
+|----------|-------|
+| Can this datadir open, migrate, or must it be refused? | [Changing durable bytes](#changing-durable-bytes), then [schema history](./SCHEMA_HISTORY.md) for earlier releases |
+| What do I need to wipe or rebuild as an operator? | [Schema upgrade](./docs/operator/storage.md#schema-upgrade) |
+| Which files make up a datadir? | [Datadir layout](#datadir-layout) |
+| Where is a transaction, header, or scripthash lookup stored? | [Class A transactions](#class-a--transactions), [hash heads](#hash-heads-headerhead--generic), [Class B scripthash](#class-b--scripthash-electrum) |
+| What is the current encoding or table geometry? | Pick the table in [Design at a glance](#design-at-a-glance), then follow its section below |
+| Does this change require a schema bump? | [What forces a schema bump](#what-forces-a-schema-bump) |
+| How large is the reference mainnet store? | [Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13) |
+
+## Contents
+
+- [Changing durable bytes](#changing-durable-bytes)
+- [Schema 17 freeze](#schema-17-freeze)
+- [Design at a glance](#design-at-a-glance)
+- [Datadir layout](#datadir-layout)
+- [Common file header](#common-file-header-16-bytes)
+- [Identity](#identity)
+- [Growable var records](#growable-var-records-body--loc)
+- [Class A headers](#class-a--headers)
+- [Class A transactions](#class-a--transactions)
+- [Tx address head](#tx-address-head-segmented-txhead)
+- [Hash heads](#hash-heads-headerhead--generic)
+- [Class B scripthash](#class-b--scripthash-electrum)
+- [Class C chain tip](#class-c--chain-tip)
+- [Mainnet census](#mainnet-census-this-trees-reference-datadir-2026-08-13)
+- [Query-layer notes](#query-layer-notes)
+- [Related docs](#related-docs)
 
 ### Changing durable bytes
 
