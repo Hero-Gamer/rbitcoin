@@ -2,16 +2,13 @@
 
 use crate::error::NodeError;
 use bitcoin::hex::DisplayHex;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use bitcoin_hashes::{hmac, sha256, Hash, HashEngine};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SAFECOOKIE_SERVER_KEY: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
 const SAFECOOKIE_CLIENT_KEY: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
@@ -401,12 +398,9 @@ fn hex_nybble(b: u8) -> Option<u8> {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let out = mac.finalize().into_bytes();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&out);
-    arr
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(key);
+    engine.input(data);
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
 }
 
 fn write_key_file(path: &Path, key: &str) -> Result<(), NodeError> {
