@@ -51,7 +51,10 @@ let
             openFirewall = true;
             listenOnion = true;
           };
-          rpc.enable = true;
+          rpc = {
+            enable = true;
+            socketPath = "/run/rbitcoin/rpc.sock";
+          };
           electrum = {
             enable = true;
             openFirewall = true;
@@ -105,6 +108,7 @@ assert defaultCfg.p2p.maxInbound == 125;
 assert defaultCfg.p2p.discover == true;
 assert defaultCfg.p2p.listenOnion == false;
 assert defaultCfg.rpc.port == 8332;
+assert defaultCfg.rpc.socketPath == null;
 assert defaultCfg.proxy == null;
 assert defaultCfg.onionProxy == null;
 assert defaultCfg.proxyRandomize == true;
@@ -133,6 +137,9 @@ assert builtins.match ".*--datadir-cold /srv/rbitcoin-cold.*" execStart != null;
 assert builtins.match ".*--network regtest.*" execStart != null;
 assert builtins.match ".*--listen 127.0.0.1:18444.*" execStart != null;
 assert builtins.match ".*--rpc-listen 127.0.0.1:18443.*" execStart != null;
+assert builtins.match ".*--rpc-socket /run/rbitcoin/rpc.sock.*" execStart != null;
+assert builtins.elem "/run/rbitcoin" service.serviceConfig.ReadWritePaths;
+assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
 assert builtins.match ".*--esplora-onion.*" execStart != null;
@@ -159,6 +166,7 @@ assert builtins.elem "i2pd.service" service.wants;
 assert builtins.elem "cjdns.service" service.after;
 assert builtins.elem "cjdns.service" service.wants;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
+assert builtins.match ".*--rpc-socket.*" listenOffExec == null;
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
 assert builtins.match ".*--no-discover.*" listenOffExec != null;

@@ -304,7 +304,7 @@ fn operator_usage() -> String {
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
     [--sh-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
-    [--rpc] [--rpc-listen [ADDR]] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
@@ -597,6 +597,7 @@ mod tests {
             "--esplora-onion",
             "--rpc",
             "--rpc-listen",
+            "--rpc-socket",
             "--rpc-token-file",
             "--proxy",
             "--onion",

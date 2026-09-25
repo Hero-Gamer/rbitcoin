@@ -78,6 +78,8 @@ let
   ++ optional (cfg.coldDataDir != null) cfg.coldDataDir
   ++ optional cfg.rpc.enable "--rpc-listen"
   ++ optional cfg.rpc.enable (socket cfg.rpc.address cfg.rpc.port)
+  ++ optional (cfg.rpc.socketPath != null) "--rpc-socket"
+  ++ optional (cfg.rpc.socketPath != null) cfg.rpc.socketPath
   ++ optional cfg.electrum.enable "--electrum-listen"
   ++ optional cfg.electrum.enable (socket cfg.electrum.address cfg.electrum.port)
   ++ optional cfg.esplora.enable "--esplora-listen"
@@ -324,6 +326,17 @@ in
         default = rpcPorts.${cfg.network};
         description = "JSON-RPC listen port.";
       };
+
+      socketPath = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/rbitcoin/rpc.sock";
+        description = ''
+          Bind the unix JSON-RPC socket here (mode 0660) instead of {dataDir}/rpc.sock (0600).
+          Its directory is created mode 0750, so members of `group` (for example mempool's
+          backend) can connect without reading the datadir. Independent of `enable` (TCP).
+        '';
+      };
     };
 
     electrum = {
@@ -423,6 +436,13 @@ in
         user = cfg.user;
         group = cfg.group;
       };
+    }
+    // lib.optionalAttrs (cfg.rpc.socketPath != null) {
+      "${dirOf cfg.rpc.socketPath}".d = {
+        mode = "0750";
+        user = cfg.user;
+        group = cfg.group;
+      };
     };
 
     systemd.services.rbitcoin = {
@@ -455,7 +475,11 @@ in
         PrivateTmp = true;
         ProtectHome = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.dataDir ] ++ optional (cfg.coldDataDir != null) cfg.coldDataDir;
+        ReadWritePaths = [
+          cfg.dataDir
+        ]
+        ++ optional (cfg.coldDataDir != null) cfg.coldDataDir
+        ++ optional (cfg.rpc.socketPath != null) (dirOf cfg.rpc.socketPath);
       }
       // lib.optionalAttrs (cfg.tor.controlCookie != null) {
         SupplementaryGroups = [ "tor" ];

@@ -41,6 +41,8 @@ pub struct RpcConfig {
     pub listen: Option<SocketAddr>,
     /// Unix socket path. `None` = no socket.
     pub socket_path: Option<PathBuf>,
+    /// Socket mode 0660 (the process group may connect) instead of owner-only 0600.
+    pub socket_shared: bool,
     pub datadir: PathBuf,
     pub network: Network,
     /// Override token path (default `{datadir}/rpc.token`).
@@ -183,7 +185,8 @@ pub async fn run_rpc(
             std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
         }
         let _ = std::fs::remove_file(sock);
-        let listener = bind_unix_mode(sock, 0o600)
+        let mode = if config.socket_shared { 0o660 } else { 0o600 };
+        let listener = bind_unix_mode(sock, mode)
             .map_err(|e| format!("rpc unix bind {}: {e}", sock.display()))?;
         let state = AppState {
             ctx: Arc::clone(&ctx),
@@ -729,6 +732,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -848,6 +852,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -927,6 +932,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -965,6 +971,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1029,6 +1036,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1165,6 +1173,7 @@ mod tests {
             let cfg = RpcConfig {
                 listen: Some("127.0.0.1:0".parse().unwrap()),
                 socket_path: None,
+                socket_shared: false,
                 datadir: dir.path().to_path_buf(),
                 network: Network::Regtest,
                 token_path: None,
@@ -1226,6 +1235,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1306,6 +1316,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1456,6 +1467,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1556,6 +1568,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: None,
             socket_path: Some(sock),
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
@@ -1581,6 +1594,7 @@ mod tests {
         let cfg = RpcConfig {
             listen: None,
             socket_path: Some(sock.clone()),
+            socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,

@@ -797,6 +797,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             } else {
                 None
             },
+            socket_shared: config.rpc.socket_path.is_some(),
             datadir: config.datadir.path.clone(),
             network: config.network,
             token_path: Some(config.rpc_token_path()),
