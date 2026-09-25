@@ -7,6 +7,8 @@ let
     set -eu
     printf '%s\n' "$@" > /var/lib/rbitcoin-test/args
     trap 'touch /var/lib/rbitcoin-test/stopped; exit 0' TERM
+    # stands in for binding --rpc-socket under ProtectSystem=strict
+    touch /run/rbitcoin/rpc.sock
     touch /var/lib/rbitcoin-test/started
     while true; do
       sleep 1
@@ -31,7 +33,10 @@ pkgs.testers.runNixOSTest {
           port = 18445;
           listenOnion = true;
         };
-        rpc.enable = true;
+        rpc = {
+          enable = true;
+          socketPath = "/run/rbitcoin/rpc.sock";
+        };
         tor.control = "127.0.0.1:9051";
         i2p.sam = "127.0.0.1:7656";
         cjdns.reachable = true;
@@ -79,6 +84,10 @@ pkgs.testers.runNixOSTest {
     machine.succeed("grep -Fx -- '--i2p-sam' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '--cjdns-reachable' /var/lib/rbitcoin-test/args")
     machine.succeed("grep -Fx -- '127.0.0.1:7656' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '--rpc-socket' /var/lib/rbitcoin-test/args")
+    machine.succeed("grep -Fx -- '/run/rbitcoin/rpc.sock' /var/lib/rbitcoin-test/args")
+    machine.succeed("test -e /run/rbitcoin/rpc.sock")
+    machine.succeed("test \"$(stat -c '%a %U %G' /run/rbitcoin)\" = '750 rbitcoin rbitcoin'")
     machine.succeed("systemctl show -p After rbitcoin.service | grep -F tor.service")
     machine.succeed("systemctl show -p After rbitcoin.service | grep -F i2pd.service")
     machine.succeed("systemctl stop rbitcoin.service")
