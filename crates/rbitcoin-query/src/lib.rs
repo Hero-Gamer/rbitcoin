@@ -302,6 +302,8 @@ pub struct Query {
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
     sh_index_enabled: std::sync::atomic::AtomicBool,
     block_filter_enabled: std::sync::atomic::AtomicBool,
+    /// BIP158 basic filter table, opened when the index is first turned on.
+    block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
     /// Optional BIP-352 thin tweak index (`--sptweaks`). Files may exist when off.
     sp_tweaks: Mutex<Option<SpTweaksTable>>,
     sptweaks_enabled: AtomicBool,
@@ -451,6 +453,7 @@ impl Query {
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
+            block_filters: std::sync::OnceLock::new(),
             sp_tweaks: Mutex::new(sp_tweaks),
             sptweaks_enabled: AtomicBool::new(false),
             sptweaks_origin: AtomicU32::new(sptweaks_origin),

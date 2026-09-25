@@ -528,4 +528,35 @@ fn analog_block_filters_from_class_a() {
     assert!(q.reconstruct_block_at_height(Height(h_mixed)).is_err());
     let (built, _) = q.build_basic_filter(Height(h_mixed)).unwrap();
     assert_eq!(built, reference(&blocks[h_mixed as usize]));
+
+    // Reorg the tip while the index is off: reopening with it on must not
+    // serve the stale-branch slot.
+    q.set_block_filter_index(true).unwrap();
+    q.backfill_block_filters().unwrap();
+    assert_eq!(q.basic_filter_hwm().unwrap(), Some(last));
+    drop(q);
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    q.disconnect_tip().unwrap();
+    let (_, parent) = q.header_at_height(Height(last - 1)).unwrap().unwrap();
+    let mut alt = mine_regtest_block(
+        BlockHash::from_byte_array(parent.hash),
+        parent.timestamp + 601,
+        last,
+        vec![],
+    );
+    alt.txdata[0].output[0].value = Amount::from_sat(1_0000_0000);
+    alt.header.merkle_root = alt.compute_merkle_root().unwrap();
+    grind_regtest_pow(&mut alt.header);
+    accept_and_connect_block(&q, &params, Height(last), &alt, Milestone::NONE).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    q.set_block_filter_index(true).unwrap();
+    assert_eq!(
+        q.basic_filter_hwm().unwrap(),
+        Some(last - 1),
+        "open drops the slot whose block left the best chain"
+    );
+    q.backfill_block_filters().unwrap();
+    let (bytes, _) = q.basic_filter_at(last).unwrap().unwrap();
+    assert_eq!(bytes, reference(&alt).content);
 }

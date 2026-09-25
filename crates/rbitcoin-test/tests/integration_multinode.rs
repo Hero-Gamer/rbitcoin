@@ -69,7 +69,7 @@ fn open_padded_query(dir: &TempDir) -> Query {
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
-    q.set_block_filter_index(true);
+    q.set_block_filter_index(true).unwrap();
     q.backfill_block_filters_through(1)
         .expect("filters through height 1");
     rbitcoin_net::set_compact_filters_service(true);

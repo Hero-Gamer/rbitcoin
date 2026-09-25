@@ -1352,7 +1352,7 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
-    query.set_block_filter_index(config.block_filter_index);
+    query.set_block_filter_index(config.block_filter_index)?;
     // Advertised for the process lifetime of the flag. The watermark may lag.
     rbitcoin_net::set_compact_filters_service(config.block_filter_index);
     query.set_max_sh_creates(config.max_sh_creates);
