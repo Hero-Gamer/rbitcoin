@@ -210,8 +210,6 @@ fn path_never_pins(path: &str) -> bool {
         ["mempool"]
             | ["mempool", _]
             | ["fee-estimates"]
-            | ["fees", "recommended"]
-            | ["v1", "fees", "recommended"]
             | ["tx"]
             | ["txs", "package"]
             | ["address", _, "txs", "mempool"]
@@ -905,9 +903,7 @@ pub async fn run_esplora(
         )
         .route("/mempool/txids", get(handlers::mempool_txids))
         .route("/mempool/recent", get(handlers::mempool_recent))
-        .route("/fee-estimates", get(handlers::fee_estimates))
-        .route("/fees/recommended", get(handlers::fees_recommended))
-        .route("/v1/fees/recommended", get(handlers::fees_recommended));
+        .route("/fee-estimates", get(handlers::fee_estimates));
     #[cfg(unix)]
     let rest = if matches!(config.listen, EsploraListen::Unix(_)) {
         rest.merge(internal_routes())
@@ -2030,8 +2026,6 @@ mod tests {
         assert!(path_never_pins("/mempool"));
         assert!(path_never_pins("/mempool/txids"));
         assert!(path_never_pins("/fee-estimates"));
-        assert!(path_never_pins("/fees/recommended"));
-        assert!(path_never_pins("/v1/fees/recommended"));
         assert!(path_never_pins("/tx"));
         assert!(!path_never_pins("/tx/ab"));
         assert!(parse_asof_param(&AsOfQuery { asof: None })
@@ -2068,13 +2062,15 @@ mod tests {
         let mem: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(mem["count"], 0);
 
+        // No mempool, no estimate: 503, not an invented 1 sat/vB.
         let (st, body) = http_get(addr, "/fee-estimates").await;
-        assert_eq!(st, 200, "{body}");
-        let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
-        for t in [
-            "1", "2", "3", "4", "5", "6", "10", "20", "144", "504", "1008",
-        ] {
-            assert_eq!(fees[t].as_f64(), Some(1.0), "{t}: {body}");
+        assert_eq!(st, 503, "{body}");
+        assert!(body.contains("fee estimates unavailable"), "{body}");
+
+        // mempool.space's tiers are its backend's /api/v1 surface, not Esplora's.
+        for path in ["/fees/recommended", "/v1/fees/recommended"] {
+            let (st, body) = http_get(addr, path).await;
+            assert_eq!(st, 404, "{path}: {body}");
         }
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
