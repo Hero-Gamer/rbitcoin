@@ -1458,8 +1458,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "economyFee",
         "minimumFee",
     ] {
-        let n = rec[key].as_u64().unwrap_or(0);
-        assert!(n >= 1, "{key} sat/vB: {body}");
+        let v = rec[key].as_f64().unwrap_or(0.0);
+        assert!(v > 0.0, "{key} sat/vB: {body}");
     }
     let (st, body) = http_get(esplora_addr, "/v1/fees/recommended").await;
     assert_eq!(st, 200, "GET /v1/fees/recommended: {body}");

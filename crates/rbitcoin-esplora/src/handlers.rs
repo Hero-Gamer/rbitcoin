@@ -1502,58 +1502,64 @@ pub async fn fees_recommended(State(st): State<AppState>) -> Response {
     spawn_join(move || fees_recommended_sync(&st)).await
 }
 
-fn sat_vb_for_target(pairs: &[(u32, f64)], target: u32) -> u32 {
-    pairs
-        .iter()
-        .find(|(t, _)| *t == target)
-        .map(|(_, btc_kb)| {
-            let sat_vb = if *btc_kb < 0.0 {
-                1.0
-            } else {
-                *btc_kb * 100_000.0
-            };
-            sat_vb.round().max(1.0) as u32
-        })
-        .unwrap_or(1)
+/// Esplora sat/vB from the estimator's BTC/kvB, keeping its 1 sat/kvB (0.001
+/// sat/vB) resolution. No estimate (negative) answers 1 sat/vB.
+fn sat_vb(btc_kb: f64) -> f64 {
+    if btc_kb < 0.0 {
+        1.0
+    } else {
+        (btc_kb * 100_000_000.0).round() / 1_000.0
+    }
+}
+
+/// mempool.space tiers from the 1/3/6/144-block estimates.
+fn fees_recommended_from(pairs: &[(u32, f64)]) -> Value {
+    let tier = |target: u32| {
+        pairs
+            .iter()
+            .find(|(t, _)| *t == target)
+            .map_or(1.0, |(_, btc_kb)| sat_vb(*btc_kb))
+    };
+    json!({
+        "fastestFee": tier(1),
+        "halfHourFee": tier(3),
+        "hourFee": tier(6),
+        "economyFee": tier(144),
+        "minimumFee": 1,
+    })
 }
 
 pub(crate) fn fees_recommended_json(mp: Option<&MempoolHub>) -> Value {
-    let pairs: Vec<(u32, f64)> = mp.map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default();
-    json!({
-        "fastestFee": sat_vb_for_target(&pairs, 1),
-        "halfHourFee": sat_vb_for_target(&pairs, 3),
-        "hourFee": sat_vb_for_target(&pairs, 6),
-        "economyFee": sat_vb_for_target(&pairs, 144),
-        "minimumFee": 1,
-    })
+    fees_recommended_from(&mp.map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default())
 }
 
 fn fees_recommended_sync(st: &AppState) -> Response {
     Json(fees_recommended_json(st.mempool.as_deref())).into_response()
 }
 
+/// Esplora `/fee-estimates`: confirm target → sat/vB.
+fn fee_estimates_from(pairs: &[(u32, f64)]) -> Value {
+    if pairs.is_empty() {
+        return json!({
+            "1": 1.0, "2": 1.0, "3": 1.0, "4": 1.0, "5": 1.0, "6": 1.0,
+            "10": 1.0, "20": 1.0, "144": 1.0, "504": 1.0, "1008": 1.0,
+        });
+    }
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(t, btc_kb)| (t.to_string(), json!(sat_vb(*btc_kb))))
+            .collect(),
+    )
+}
+
 fn fee_estimates_sync(st: &AppState) -> Response {
-    let mut obj = serde_json::Map::new();
-    let pairs: Vec<(u32, f64)> = st
+    let pairs = st
         .mempool
         .as_ref()
         .map(|m| m.fee_estimates_btc_per_kb())
         .unwrap_or_default();
-    if pairs.is_empty() {
-        for t in [1u32, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008] {
-            obj.insert(t.to_string(), json!(1.0));
-        }
-    } else {
-        for (t, btc_kb) in pairs {
-            let sat_vb = if btc_kb < 0.0 {
-                1.0
-            } else {
-                (btc_kb * 1_000_000.0).round() / 10.0
-            };
-            obj.insert(t.to_string(), json!(sat_vb));
-        }
-    }
-    Json(Value::Object(obj)).into_response()
+    Json(fee_estimates_from(&pairs)).into_response()
 }
 
 pub async fn mempool_txids(State(st): State<AppState>) -> Response {
@@ -1975,12 +1981,16 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
 
 #[cfg(test)]
 mod pure_helper_tests {
-    use super::{block_summary_json, outspend_json, resolve_address_sh, sat_vb_for_target};
+    use super::{
+        block_summary_json, fee_estimates_from, fees_recommended_from, outspend_json,
+        resolve_address_sh,
+    };
     use bitcoin::Network;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::testutil::FixtureChain;
     use rbitcoin_query::{Query, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use serde_json::json;
 
     fn temp_query() -> (rbitcoin_query::testutil::TempDir, Query) {
         rbitcoin_query::testutil::tiny_query_labeled("esplora-pure")
@@ -2025,11 +2035,33 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn sat_vb_for_target_negative_positive_and_missing() {
-        assert_eq!(sat_vb_for_target(&[], 1), 1);
-        assert_eq!(sat_vb_for_target(&[(1, -1.0)], 1), 1);
-        assert_eq!(sat_vb_for_target(&[(1, 0.00002)], 1), 2);
-        assert_eq!(sat_vb_for_target(&[(6, 0.00005)], 1), 1);
+    fn fee_routes_keep_the_estimator_resolution() {
+        // BTC/kvB as the estimator publishes it: whole sat/kvB
+        let pairs = [
+            (1, 0.000_012_34),
+            (3, 0.000_009_87),
+            (6, 0.000_003_1),
+            (144, 0.000_001_01),
+        ];
+        let est = fee_estimates_from(&pairs);
+        assert_eq!(est["1"], json!(1.234));
+        assert_eq!(est["3"], json!(0.987));
+        assert_eq!(est["144"], json!(0.101));
+        let rec = fees_recommended_from(&pairs);
+        assert_eq!(rec["fastestFee"], json!(1.234));
+        assert_eq!(rec["halfHourFee"], json!(0.987));
+        assert_eq!(rec["hourFee"], json!(0.31));
+        assert_eq!(rec["economyFee"], json!(0.101));
+    }
+
+    #[test]
+    fn fee_routes_without_an_estimate() {
+        assert_eq!(fee_estimates_from(&[(1, -1.0)])["1"], json!(1.0));
+        assert_eq!(fee_estimates_from(&[])["1008"], json!(1.0));
+        assert_eq!(
+            fees_recommended_from(&[(1, -1.0)])["fastestFee"],
+            json!(1.0)
+        );
     }
 
     #[test]
