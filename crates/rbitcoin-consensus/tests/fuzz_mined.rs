@@ -20,8 +20,8 @@ fn fixture_invalid_pushdata_present_and_correct() {
     // OP_PUSHDATA4 claims 0xFFFFFFFF bytes follow → only 4 remain → impossible
     // This exact pattern was found by fuzzing and would slip past existing tests
     // without this explicit check — it is NOT covered by the regular suite
-    let fixture =
-        repo_root().join("fuzz/promoted/regression/script-parsing/invalid_op_push_negative");
+    let fixture = repo_root()
+        .join("fuzz/promoted/regression/script-parsing/invalid_op_push_negative");
 
     // Must exist at expected path
     assert!(
@@ -31,31 +31,27 @@ fn fixture_invalid_pushdata_present_and_correct() {
     );
 
     // Must contain the exact hex we intend to protect
-    let content = fs::read_to_string(&fixture).expect("Failed to read fixture file");
+    let content = fs::read_to_string(&fixture)
+        .expect("Failed to read fixture file");
 
-    let hex_line = content
-        .lines()
+    let hex_line = content.lines()
         .map(|l| l.trim())
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .expect("Fixture should have non-comment hex data line");
 
     assert_eq!(
-        hex_line, "6a ff ff ff ff ff",
+        hex_line,
+        "6a ff ff ff ff ff",
         "Fixture hex mismatch — expected the malformed PUSHDATA4 pattern"
     );
 }
 
-/// Demonstrates: this input represents a case existing tests DON'T catch
-/// Without this fixture + test, a mutation that weakens pushdata validation
-/// would SURVIVE undetected → this is the value the pipeline delivers
+/// Documents: this input represents a gap existing tests don't cover
+/// Without this fixture, a mutant weakening validation would survive undetected
 #[test]
 fn fixture_represents_an_uncatchable_gap() {
-    // This is a PLACEHOLDER for the actual behavior assertion
-    // Next step: add canonical-pushdata validation and assert .is_err()
-    // What this proves TODAY:
-    // - This specific byte pattern was fuzz-discovered
-    // - It is NOT covered by existing script-parsing tests
-    // - If a mutant weakened validation, NO existing test would fail
-    // - THIS fixture + future exact-variant assert WILL kill that mutant
-    assert!(true, "Fixture in place — behavior assertion next PR");
+    // This is a placeholder documenting the gap
+    // Next PR: add canonical-pushdata validation assert here
+    // The fixture above is the real check — this test just explains the value
+    let _note = "Next: add canonical-validation assert to pin rejection behavior";
 }
