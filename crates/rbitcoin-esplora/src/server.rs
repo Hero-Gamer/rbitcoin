@@ -2062,14 +2062,10 @@ mod tests {
         let mem: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(mem["count"], 0);
 
+        // No mempool, no estimate: 503, not an invented 1 sat/vB.
         let (st, body) = http_get(addr, "/fee-estimates").await;
-        assert_eq!(st, 200, "{body}");
-        let fees: serde_json::Value = serde_json::from_str(&body).unwrap();
-        for t in [
-            "1", "2", "3", "4", "5", "6", "10", "20", "144", "504", "1008",
-        ] {
-            assert_eq!(fees[t].as_f64(), Some(1.0), "{t}: {body}");
-        }
+        assert_eq!(st, 503, "{body}");
+        assert!(body.contains("fee estimates unavailable"), "{body}");
 
         // mempool.space's tiers are its backend's /api/v1 surface, not Esplora's.
         for path in ["/fees/recommended", "/v1/fees/recommended"] {

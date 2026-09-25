@@ -1498,51 +1498,45 @@ pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     spawn_join(move || fee_estimates_sync(&st)).await
 }
 
-/// Esplora sat/vB from the estimator's BTC/kvB, keeping its 1 sat/kvB (0.001
-/// sat/vB) resolution. No estimate (negative) answers 1 sat/vB.
-fn sat_vb(btc_kb: f64) -> f64 {
-    if btc_kb < 0.0 {
-        1.0
-    } else {
-        (btc_kb * 100_000_000.0).round() / 1_000.0
-    }
+/// sat/vB from the estimator's BTC/kvB, keeping its 1 sat/kvB (0.001 sat/vB)
+/// resolution. `None` when the estimator has no answer (negative).
+fn sat_vb(btc_kb: f64) -> Option<f64> {
+    (btc_kb >= 0.0).then(|| (btc_kb * 100_000_000.0).round() / 1_000.0)
 }
 
 /// Wallet WS `fees`: mempool.space tiers from the 1/3/6/144-block estimates.
-fn fees_recommended_from(pairs: &[(u32, f64)]) -> Value {
+/// A tier with no estimate is `null`; `minimumFee` is the mempool min fee.
+fn fees_recommended_from(pairs: &[(u32, f64)], min_fee_sat_kvb: u64) -> Value {
     let tier = |target: u32| {
         pairs
             .iter()
             .find(|(t, _)| *t == target)
-            .map_or(1.0, |(_, btc_kb)| sat_vb(*btc_kb))
+            .and_then(|(_, btc_kb)| sat_vb(*btc_kb))
     };
     json!({
         "fastestFee": tier(1),
         "halfHourFee": tier(3),
         "hourFee": tier(6),
         "economyFee": tier(144),
-        "minimumFee": 1,
+        "minimumFee": min_fee_sat_kvb as f64 / 1_000.0,
     })
 }
 
+/// `null` without a mempool.
 pub(crate) fn fees_recommended_json(mp: Option<&MempoolHub>) -> Value {
-    fees_recommended_from(&mp.map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default())
+    mp.map_or(Value::Null, |m| {
+        fees_recommended_from(&m.fee_estimates_btc_per_kb(), m.mempool_min_fee_sat_kvb())
+    })
 }
 
-/// Esplora `/fee-estimates`: confirm target → sat/vB.
-fn fee_estimates_from(pairs: &[(u32, f64)]) -> Value {
-    if pairs.is_empty() {
-        return json!({
-            "1": 1.0, "2": 1.0, "3": 1.0, "4": 1.0, "5": 1.0, "6": 1.0,
-            "10": 1.0, "20": 1.0, "144": 1.0, "504": 1.0, "1008": 1.0,
-        });
-    }
-    Value::Object(
-        pairs
-            .iter()
-            .map(|(t, btc_kb)| (t.to_string(), json!(sat_vb(*btc_kb))))
-            .collect(),
-    )
+/// Esplora `/fee-estimates`: confirm target → sat/vB. Targets without an
+/// estimate are left out (electrs); `None` when no target has one.
+fn fee_estimates_from(pairs: &[(u32, f64)]) -> Option<Value> {
+    let map: serde_json::Map<String, Value> = pairs
+        .iter()
+        .filter_map(|(t, btc_kb)| sat_vb(*btc_kb).map(|v| (t.to_string(), json!(v))))
+        .collect();
+    (!map.is_empty()).then_some(Value::Object(map))
 }
 
 fn fee_estimates_sync(st: &AppState) -> Response {
@@ -1551,7 +1545,10 @@ fn fee_estimates_sync(st: &AppState) -> Response {
         .as_ref()
         .map(|m| m.fee_estimates_btc_per_kb())
         .unwrap_or_default();
-    Json(fee_estimates_from(&pairs)).into_response()
+    match fee_estimates_from(&pairs) {
+        Some(v) => Json(v).into_response(),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "fee estimates unavailable").into_response(),
+    }
 }
 
 pub async fn mempool_txids(State(st): State<AppState>) -> Response {
@@ -2035,25 +2032,29 @@ mod pure_helper_tests {
             (6, 0.000_003_1),
             (144, 0.000_001_01),
         ];
-        let est = fee_estimates_from(&pairs);
+        let est = fee_estimates_from(&pairs).expect("estimates");
         assert_eq!(est["1"], json!(1.234));
         assert_eq!(est["3"], json!(0.987));
         assert_eq!(est["144"], json!(0.101));
-        let rec = fees_recommended_from(&pairs);
+        let rec = fees_recommended_from(&pairs, 100);
         assert_eq!(rec["fastestFee"], json!(1.234));
         assert_eq!(rec["halfHourFee"], json!(0.987));
         assert_eq!(rec["hourFee"], json!(0.31));
         assert_eq!(rec["economyFee"], json!(0.101));
+        assert_eq!(rec["minimumFee"], json!(0.1));
     }
 
     #[test]
-    fn fee_routes_without_an_estimate() {
-        assert_eq!(fee_estimates_from(&[(1, -1.0)])["1"], json!(1.0));
-        assert_eq!(fee_estimates_from(&[])["1008"], json!(1.0));
-        assert_eq!(
-            fees_recommended_from(&[(1, -1.0)])["fastestFee"],
-            json!(1.0)
-        );
+    fn fee_routes_do_not_invent_an_estimate() {
+        // A target the estimator cannot answer is left out, as electrs does.
+        let est = fee_estimates_from(&[(1, -1.0), (6, 0.000_002)]).expect("one target");
+        assert!(est.get("1").is_none(), "{est}");
+        assert_eq!(est["6"], json!(0.2));
+        assert!(fee_estimates_from(&[(1, -1.0)]).is_none());
+        assert!(fee_estimates_from(&[]).is_none());
+        let rec = fees_recommended_from(&[(1, -1.0)], 2_500);
+        assert!(rec["fastestFee"].is_null(), "{rec}");
+        assert_eq!(rec["minimumFee"], json!(2.5));
     }
 
     #[test]

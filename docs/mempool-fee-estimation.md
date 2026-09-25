@@ -59,9 +59,10 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
 **Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits),
 `R_flow` is frontier, or min-relay on an under-full **near** depth with live
 stock. If **no** depth has a defined rate (empty pool, no hist), APIs return
-insufficient (`-1` / Esplora `1.0`). If a nearer depth is defined and later
+insufficient (RPC / Electrum `-1`; Esplora leaves the target out and
+answers **503** when no target has a rate). If a nearer depth is defined and later
 N is not (pool thinner than N, no hist), **hold the last defined rate**
-so Esplora does not bounce to `1.0` sat/vB.
+so far targets do not drop out while a nearer one has a rate.
 
 ### Parameters (code constants, not env)
 
