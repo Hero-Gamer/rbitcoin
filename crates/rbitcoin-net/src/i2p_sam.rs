@@ -73,6 +73,9 @@ fn installed() -> Result<I2pDialer, NetError> {
 }
 
 fn session_dead(err: &NetError) -> bool {
+    if stream_socket_dead(err) {
+        return true;
+    }
     match err {
         NetError::Io(_) | NetError::Disconnected => true,
         NetError::Encode(s) => {
@@ -80,6 +83,18 @@ fn session_dead(err: &NetError) -> bool {
             up.contains("INVALID_ID")
                 || up.contains("CONNECTION CLOSED")
                 || up.contains("STREAM CONNECT:")
+        }
+        _ => false,
+    }
+}
+
+/// i2pd closed the SAM TCP socket. The session id is gone; retrying
+/// STREAM CONNECT on it only repeats the reset.
+fn stream_socket_dead(err: &NetError) -> bool {
+    match err {
+        NetError::Encode(s) => {
+            let l = s.to_ascii_lowercase();
+            l.contains("broken pipe") || l.contains("connection reset")
         }
         _ => false,
     }
@@ -244,6 +259,12 @@ impl I2pSam {
                     self._forward = Some(s);
                     return Ok(());
                 }
+                Err(e) if stream_socket_dead(&e) => {
+                    last = Some(e);
+                    let (sam, _) =
+                        Self::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+                    *self = sam;
+                }
                 Err(e) if stream_retry(&e) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -281,6 +302,7 @@ impl I2pDialer {
         for _ in 0..24 {
             match self.stream_connect_once(dest_b32).await {
                 Ok(s) => return Ok(s),
+                Err(e) if stream_socket_dead(&e) => return Err(e),
                 Err(e) if stream_retry(&e) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -505,6 +527,8 @@ mod tests {
             dest_log,
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(0)),
+            false,
+            Arc::new(Mutex::new(0)),
         )
         .await
     }
@@ -514,6 +538,8 @@ mod tests {
         dest_log: Arc<Mutex<Vec<String>>>,
         stream_drops: Arc<Mutex<usize>>,
         forward_drops: Arc<Mutex<usize>>,
+        rst_unknown: bool,
+        forward_rst: Arc<Mutex<usize>>,
     ) -> (SocketAddr, Arc<Mutex<HashSet<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -529,6 +555,8 @@ mod tests {
                 let drops = Arc::clone(&stream_drops);
                 let fwd_drops = Arc::clone(&forward_drops);
                 let ok = ok_hello;
+                let rst = rst_unknown;
+                let fwd_rst = Arc::clone(&forward_rst);
                 tokio::spawn(async move {
                     let mut created_id: Option<String> = None;
                     loop {
@@ -576,6 +604,19 @@ mod tests {
                             if drop_n {
                                 break;
                             }
+                            let reset = {
+                                let mut n = fwd_rst.lock().unwrap();
+                                if *n > 0 {
+                                    *n -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if reset {
+                                rst_sam_socket(s);
+                                return;
+                            }
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                         } else if up.starts_with("STREAM CONNECT") {
                             log.lock().unwrap().push(line.clone());
@@ -595,6 +636,38 @@ mod tests {
                             let known = live.lock().unwrap().contains(id);
                             if known {
                                 let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
+                            } else if rst {
+                                // i2pd drops the SAM socket instead of INVALID_ID
+                                // when the session is already gone.
+                                #[cfg(unix)]
+                                {
+                                    if let Ok(std) = s.into_std() {
+                                        use std::os::fd::AsRawFd;
+                                        let linger = libc::linger {
+                                            l_onoff: 1,
+                                            l_linger: 0,
+                                        };
+                                        // SAFETY: fd is the accepted SAM socket; SO_LINGER 0 resets it.
+                                        unsafe {
+                                            libc::setsockopt(
+                                                std.as_raw_fd(),
+                                                libc::SOL_SOCKET,
+                                                libc::SO_LINGER,
+                                                &linger as *const libc::linger
+                                                    as *const libc::c_void,
+                                                std::mem::size_of::<libc::linger>()
+                                                    as libc::socklen_t,
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = rst;
+                                    let _ =
+                                        write_line(&mut s, "STREAM STATUS RESULT=INVALID_ID").await;
+                                }
                             } else {
                                 let _ = write_line(&mut s, "STREAM STATUS RESULT=INVALID_ID").await;
                             }
@@ -625,8 +698,15 @@ mod tests {
     async fn i2p_sam_stream_connect_retries_early_eof() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let drops = Arc::new(Mutex::new(2));
-        let (addr, _live) =
-            fake_sam_opts(true, Arc::clone(&log), drops, Arc::new(Mutex::new(0))).await;
+        let (addr, _live) = fake_sam_opts(
+            true,
+            Arc::clone(&log),
+            drops,
+            Arc::new(Mutex::new(0)),
+            false,
+            Arc::new(Mutex::new(0)),
+        )
+        .await;
         let sam = I2pSam::connect(addr).await.unwrap();
         let dest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p";
         sam.stream_connect(dest).await.unwrap();
@@ -638,12 +718,69 @@ mod tests {
     async fn i2p_sam_stream_forward_retries_early_eof() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let drops = Arc::new(Mutex::new(2));
-        let (addr, _live) =
-            fake_sam_opts(true, Arc::clone(&log), Arc::new(Mutex::new(0)), drops).await;
+        let (addr, _live) = fake_sam_opts(
+            true,
+            Arc::clone(&log),
+            Arc::new(Mutex::new(0)),
+            drops,
+            false,
+            Arc::new(Mutex::new(0)),
+        )
+        .await;
         let mut sam = I2pSam::connect(addr).await.unwrap();
         sam.stream_forward(18444).await.unwrap();
         let got = stream_lines(&log, "STREAM FORWARD");
         assert_eq!(got.len(), 3, "{got:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i2p_sam_forward_recreates_session_on_reset() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, _live) = fake_sam_opts(
+            true,
+            Arc::clone(&log),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(0)),
+            false,
+            Arc::new(Mutex::new(1)),
+        )
+        .await;
+        let mut sam = I2pSam::connect(addr).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert_eq!(creates.len(), 2, "{creates:?}");
+        assert!(
+            creates[1].contains(&format!("DESTINATION={FAKE_DEST}")),
+            "{creates:?}"
+        );
+    }
+
+    fn rst_sam_socket(s: TcpStream) {
+        #[cfg(unix)]
+        {
+            if let Ok(std) = s.into_std() {
+                use std::os::fd::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                // SAFETY: fd is the accepted SAM socket; SO_LINGER 0 resets it.
+                unsafe {
+                    libc::setsockopt(
+                        std.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        &linger as *const libc::linger as *const libc::c_void,
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(s);
+        }
     }
 
     #[tokio::test]
@@ -793,6 +930,43 @@ mod tests {
             2,
             "published dialer must keep the new session id"
         );
+        clear_installed();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i2p_sam_recreates_session_when_router_resets_stream() {
+        let _gate = INSTALL_GATE.lock().await;
+        clear_installed();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, live) = fake_sam_opts(
+            true,
+            Arc::clone(&log),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(0)),
+            true,
+            Arc::new(Mutex::new(0)),
+        )
+        .await;
+        let sam = I2pSam::connect(addr).await.unwrap();
+        crate::socks::install_i2p_dialer(sam.dialer());
+        let peer = crate::NetAddr::I2p {
+            dest: [0u8; 32],
+            port: 0,
+        };
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .unwrap();
+        assert_eq!(stream_lines(&log, "SESSION CREATE").len(), 1);
+
+        live.lock().unwrap().clear();
+        crate::socks::Dialer::Direct
+            .connect_net(peer)
+            .await
+            .expect("SAM reset must recreate the session and retry");
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert_eq!(creates.len(), 2, "{creates:?}");
         clear_installed();
     }
 

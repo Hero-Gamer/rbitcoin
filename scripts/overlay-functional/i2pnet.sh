@@ -103,19 +103,46 @@ with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED) as z:
 print(zpath)
 PY
 
+wait_dead() {
+  local pid="$1" i
+  for i in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  sleep 0.2
+}
+
+port_open() {
+  python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.2); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); sys.exit(0 if r==0 else 1)' "$1"
+}
+
 for i in $(seq 0 $((N - 1))); do
   if [[ -f "$ROOT/n$i/i2pd.pid" ]]; then
-    kill "$(cat "$ROOT/n$i/i2pd.pid")" 2>/dev/null || true
+    pid="$(cat "$ROOT/n$i/i2pd.pid")"
+    kill "$pid" 2>/dev/null || true
+    wait_dead "$pid"
   fi
 done
-sleep 1
+for port in "${SAMS[@]}"; do
+  for _ in $(seq 1 50); do
+    if ! port_open "$port"; then
+      break
+    fi
+    sleep 0.2
+  done
+done
 for i in $(seq 0 $((N - 1))); do
   ipv4="127.0.0.$((i + 2))"
   i2pd --datadir "$ROOT/n$i" --conf "$ROOT/n$i/i2pd.conf" \
     --address4 "$ipv4" --reseed.zipfile "$ROOT/reseed.zip" --daemon
 done
-sleep 3
 
+# HELLO returns before SESSION CREATE is stable. Do not probe SESSION
+# CREATE here: a short recv closes the socket and i2pd logs EOF instead
+# of finishing the session.
 sam_hello() {
   local port="$1" wall="$2"
   python3 - "$port" "$wall" <<'PY'
@@ -142,7 +169,6 @@ PY
 
 sam_hello "${SAMS[0]}" 180
 sam_hello "${SAMS[1]}" 180
-# HELLO can succeed before SESSION CREATE is stable on a tiny net.
 sleep 2
 
 cat >"$ROOT/env" <<EOF
