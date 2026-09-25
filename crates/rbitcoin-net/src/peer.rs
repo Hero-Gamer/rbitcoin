@@ -28,7 +28,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -248,12 +248,27 @@ pub fn local_service_flags() -> ServiceFlags {
     local_service_flags_pruned(false)
 }
 
+static COMPACT_FILTERS_ADVERTISED: AtomicBool = AtomicBool::new(false);
+
+/// Version messages include `NODE_COMPACT_FILTERS` while this is set.
+///
+/// The bit follows `--block-filter-index`, not the watermark. A peer that
+/// handshakes during catch-up keeps the bit; a later flip never reaches it.
+pub fn set_compact_filters_service(on: bool) {
+    COMPACT_FILTERS_ADVERTISED.store(on, Ordering::Release);
+}
+
 /// BIP159: a pruned node offers `NETWORK_LIMITED`, not `NETWORK`.
 pub fn local_service_flags_pruned(pruned: bool) -> ServiceFlags {
-    if pruned {
+    let base = if pruned {
         ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
     } else {
         crate::seeds::required_seed_services()
+    };
+    if COMPACT_FILTERS_ADVERTISED.load(Ordering::Acquire) {
+        base | ServiceFlags::COMPACT_FILTERS
+    } else {
+        base
     }
 }
 
@@ -2463,6 +2478,153 @@ fn handle_peer_control_msg(
     Ok(true)
 }
 
+fn filter_q<T>(r: Result<T, rbitcoin_store::StoreError>) -> Result<T, NetError> {
+    r.map_err(|e| NetError::Consensus(e.to_string()))
+}
+
+fn on_compact_filters(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+) -> Result<(), NetError> {
+    match payload {
+        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, m),
+        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
+        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
+        _ => Ok(()),
+    }
+}
+
+/// `Some(stop height)` when this basic-filter request is inside the watermark.
+/// Silence (not a short batch, not an empty filter) when it is not.
+fn compact_filter_stop(
+    hub: &ChainHub,
+    filter_type: u8,
+    stop_hash: &[u8; 32],
+) -> Result<Option<u32>, NetError> {
+    if filter_type != 0 || !hub.query.block_filter_enabled() {
+        return Ok(None);
+    }
+    let Some(stop) = filter_q(hub.query.height_of_hash(stop_hash))? else {
+        return Ok(None);
+    };
+    let Some(hwm) = filter_q(hub.query.basic_filter_hwm())? else {
+        return Ok(None);
+    };
+    if stop.0 > hwm {
+        return Ok(None);
+    }
+    Ok(Some(stop.0))
+}
+
+fn on_getcfilters(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    m: &bitcoin::p2p::message_filter::GetCFilters,
+) -> Result<(), NetError> {
+    use bitcoin::hashes::Hash;
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
+        return Ok(());
+    };
+    if m.start_height > stop {
+        return Ok(());
+    }
+    let end = stop.min(m.start_height.saturating_add(999));
+    for h in m.start_height..=end {
+        let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
+            return Ok(());
+        };
+        let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
+        else {
+            return Ok(());
+        };
+        queue_out(
+            out_tx,
+            NetworkMessage::CFilter(bitcoin::p2p::message_filter::CFilter {
+                filter_type: 0,
+                block_hash: bitcoin::BlockHash::from_byte_array(rec.hash),
+                filter: body,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn on_getcfheaders(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    m: &bitcoin::p2p::message_filter::GetCFHeaders,
+) -> Result<(), NetError> {
+    use bitcoin::bip158::{FilterHash, FilterHeader};
+    use bitcoin::hashes::Hash;
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
+        return Ok(());
+    };
+    if m.start_height > stop {
+        return Ok(());
+    }
+    let end = stop.min(m.start_height.saturating_add(1999));
+    let previous = if m.start_height == 0 {
+        FilterHeader::from_byte_array([0u8; 32])
+    } else {
+        match filter_q(hub.query.basic_filter_at(m.start_height - 1))? {
+            Some((_, h)) => h,
+            None => return Ok(()),
+        }
+    };
+    let mut filter_hashes = Vec::new();
+    for h in m.start_height..=end {
+        let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
+            return Ok(());
+        };
+        filter_hashes.push(FilterHash::hash(&body));
+    }
+    let Some((_, stop_rec)) =
+        filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(end)))?
+    else {
+        return Ok(());
+    };
+    queue_out(
+        out_tx,
+        NetworkMessage::CFHeaders(bitcoin::p2p::message_filter::CFHeaders {
+            filter_type: 0,
+            stop_hash: bitcoin::BlockHash::from_byte_array(stop_rec.hash),
+            previous_filter_header: previous,
+            filter_hashes,
+        }),
+    )?;
+    Ok(())
+}
+
+fn on_getcfcheckpt(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    m: &bitcoin::p2p::message_filter::GetCFCheckpt,
+) -> Result<(), NetError> {
+    use bitcoin::hashes::Hash;
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
+        return Ok(());
+    };
+    let mut filter_headers = Vec::new();
+    let mut h = 1000u32;
+    while h <= stop {
+        let Some((_, header)) = filter_q(hub.query.basic_filter_at(h))? else {
+            return Ok(());
+        };
+        filter_headers.push(header);
+        h = h.saturating_add(1000);
+    }
+    queue_out(
+        out_tx,
+        NetworkMessage::CFCheckpt(bitcoin::p2p::message_filter::CFCheckpt {
+            filter_type: 0,
+            stop_hash: m.stop_hash,
+            filter_headers,
+        }),
+    )?;
+    Ok(())
+}
+
 fn handle_peer_inventory_msg(
     payload: &NetworkMessage,
     hub: &ChainHub,
@@ -2490,6 +2652,9 @@ fn handle_peer_inventory_msg(
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
+        NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx)?,
         NetworkMessage::Unknown { .. }
         | NetworkMessage::GetData(_)
         | NetworkMessage::Block(_)

@@ -896,10 +896,17 @@ fn waitforblock_and_height_return_on_stop() {
 #[test]
 fn unsupported_methods_error() {
     let (ctx, dir) = ctx_empty();
-    let e = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
-    assert_eq!(e["code"], ERR_METHOD_NOT_FOUND);
     let e2 = dispatch(&ctx, "combinerawtransaction", vec![]).unwrap_err();
     assert_eq!(e2["code"], ERR_METHOD_NOT_FOUND);
+    let utxo = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
+    assert_eq!(utxo["code"], ERR_METHOD_NOT_FOUND);
+    assert!(
+        utxo["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not supported"),
+        "{utxo}"
+    );
     let e3 = dispatch(&ctx, "syncwithvalidationinterfacequeue", vec![]).unwrap_err();
     assert_eq!(e3["code"], ERR_METHOD_NOT_FOUND);
     assert_eq!(e3["message"], "Method not found");
@@ -908,7 +915,7 @@ fn unsupported_methods_error() {
         .as_str()
         .unwrap()
         .lines()
-        .any(|l| l == "syncwithvalidationinterfacequeue"));
+        .any(|l| { l == "syncwithvalidationinterfacequeue" || l == "gettxoutsetinfo" }));
     let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
     let listed: Vec<&str> = info["methods"]
         .as_array()
@@ -917,6 +924,7 @@ fn unsupported_methods_error() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(!listed.contains(&"syncwithvalidationinterfacequeue"));
+    assert!(!listed.contains(&"gettxoutsetinfo"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1076,7 +1084,6 @@ fn all_methods_callable_empty_or_error() {
         ("getblocktemplate", vec![]),
         ("combinerawtransaction", vec![]),
         ("generatetoaddress", vec![]),
-        ("gettxoutsetinfo", vec![]),
     ] {
         let _ = dispatch(&ctx, m, &params);
     }
@@ -1918,6 +1925,7 @@ fn miniwallet_raw_scan_and_gettxout() {
     );
     let empty = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([])]).unwrap();
     assert_eq!(empty["success"], true);
+    assert_eq!(empty["txouts"], json!(-1));
     assert_eq!(empty["unspents"].as_array().unwrap().len(), 0, "{empty}");
     let unknown = dispatch(&ctx, "scantxoutset", vec![json!("nope")]).unwrap_err();
     assert_eq!(unknown["code"], ERR_INVALID_PARAMETER);
@@ -2789,14 +2797,86 @@ fn submitpackage_oversized_spk_is_scriptpubkey() {
 }
 
 #[test]
-fn scantxoutset_txout_fallback_without_shindex() {
+fn scantxoutset_range_errors_match_core() {
+    let (ctx, dir) = ctx_empty();
+    let bad = |range: serde_json::Value| {
+        super::descriptor_scan::expand_scan_objects(
+            &ctx,
+            &[json!({"desc": "desc", "range": range})],
+        )
+        .unwrap_err()
+    };
+    let msg = |e: serde_json::Value| e["message"].as_str().unwrap().to_string();
+    assert_eq!(msg(bad(json!(-1))), "End of range is too high");
+    assert_eq!(
+        msg(bad(json!([-1, 10]))),
+        "Range should be greater or equal than 0"
+    );
+    assert_eq!(
+        msg(bad(json!([2, 1]))),
+        "Range specified as [begin,end] must not have begin after end"
+    );
+    assert_eq!(msg(bad(json!([0, 1000001]))), "Range is too large");
+    let huge = (2i64 << 32) - 1_000_000;
+    assert_eq!(
+        msg(bad(json!([huge, 2i64 << 32]))),
+        "End of range is too high"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scantxoutset_combo_desc_matches_core() {
+    let desc = "combo(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/1/1/0)";
+    let (ctx, dir) = ctx_empty();
+    let scripts = super::descriptor_scan::expand_scan_objects(&ctx, &[json!(desc)]).unwrap();
+    let pkh = scripts
+        .iter()
+        .find(|s| s.desc.starts_with("pkh("))
+        .expect("combo expands a pkh");
+    assert_eq!(
+        pkh.desc,
+        "pkh([0c5f9a1e/1/1/0]03e1c5b6e650966971d7e71ef2674f80222752740fc1dfd63bbbd220d2da9bd0fb)#cxmct4w8"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scantxoutset_hardened_wildcard_desc_matches_core() {
+    let desc = "combo(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0h/0h/*)";
+    let (ctx, dir) = ctx_empty();
+    let obj = json!({"desc": desc, "range": 1});
+    let scripts = super::descriptor_scan::expand_scan_objects(&ctx, &[obj]).unwrap();
+    let mut pkhs: Vec<&str> = scripts
+        .iter()
+        .filter(|s| s.desc.starts_with("pkh("))
+        .map(|s| s.desc.as_str())
+        .collect();
+    pkhs.sort();
+    assert_eq!(
+        pkhs,
+        vec![
+            "pkh([0c5f9a1e/0h/0h/0]026dbd8b2315f296d36e6b6920b1579ca75569464875c7ebe869b536a7d9503c8c)#rthll0rg",
+            "pkh([0c5f9a1e/0h/0h/1]033e6f25d76c00bedb3a8993c7d5739ee806397f0529b1b31dda31ef890f19a60c)#mcjajulr",
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scantxoutset_requires_shindex() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
     ctx.query.set_sh_index_enabled(false);
     let desc = "raw(51)";
     dispatch(&ctx, "generatetodescriptor", vec![json!(2), json!(desc)]).unwrap();
-    let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
-    assert_eq!(scan["success"], true);
-    assert_eq!(scan["unspents"].as_array().unwrap().len(), 2);
+    let err = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap_err();
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scripthash index disabled"),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5935,6 +6015,29 @@ fn testmempoolaccept_active_known_vs_mempool_vs_archive() {
         "{archived}"
     );
     dispatch(&ctx, "reconsiderblock", vec![tip]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rest_chaininfo_and_blockhash_match_rpc() {
+    let (ctx, dir) = ctx_empty();
+    let info = dispatch_rest(&ctx, "/rest/chaininfo.json", "", &[]);
+    assert_eq!(info.status, axum::http::StatusCode::OK);
+    let body = String::from_utf8(info.body).unwrap();
+    assert!(body.contains("\"chain\":\"regtest\""), "{body}");
+    let by_h = dispatch_rest(&ctx, "/rest/blockhashbyheight/0.json", "", &[]);
+    assert_eq!(by_h.status, axum::http::StatusCode::NOT_FOUND);
+    let off = dispatch_rest(
+        &ctx,
+        "/rest/blockfilter/basic/0000000000000000000000000000000000000000000000000000000000000000.json",
+        "",
+        &[],
+    );
+    assert_eq!(off.status, axum::http::StatusCode::BAD_REQUEST);
+    let msg = String::from_utf8(off.body).unwrap();
+    assert!(msg.contains("Index is not enabled"), "{msg}");
+    let empty = dispatch_rest(&ctx, "/rest/getutxos.json", "", &[]);
+    assert_eq!(empty.status, axum::http::StatusCode::BAD_REQUEST);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

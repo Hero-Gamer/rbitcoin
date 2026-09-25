@@ -115,14 +115,14 @@ Per-method notes, auth, and the shindex matrix live in
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (`getblockstats` from `txstat` when stamped; size and count fields match Core, including `utxo_increase_actual`; omit coins-DB `utxo_size_*`) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done (BIP324 v2-only; peer `timeoffset` / `synced_*` from session state; hostname `addnode` / `--connect` resolve at dial and retry until live) |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done (Libre; RPC `maxfeerate` / `maxburnamount` / `"version"` only) |
-| Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done (Class A unspent walk — not a coins-DB) |
+| Coin / MiniWallet (`gettxout`, `scantxoutset`) | done (`scantxoutset` is descriptor expansion on `--sh-index`, not a coins-DB; `txouts` is always `-1`) |
 | Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done (`txindex` = Class A reconstruct) |
 | Fee (`estimatesmartfee`) | done (**10-minute inclusion** — not Core historical) |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done (node subset; official Core dialect scripts stay `rpc-dialect`) |
 | Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness (regtest only except `submitblock`) |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | done |
 | Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster`) | done (no stratum / BIP9 testdummy / wallet keys) |
-| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; full `scantxoutset` / `gettxoutsetinfo` | **never** |
+| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; `gettxoutsetinfo` | **never** (no UTXO set). The functional harness shims `gettxoutsetinfo` for `rpc_scantxoutset.py` |
 
 ## Electrum surface
 
@@ -257,16 +257,18 @@ Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.
 | 5 | feefilter | tip policy |
 | 9–15 | getblocks…mempool | headers/blocks/inv |
 | 17–21 | notfound…tx | ping/pong/sendcmpct/tx |
+| 22–27 | getcfilters…cfcheckpt | BIP157 basic while `--block-filter-index` is on. A stop past the filter watermark is silence |
 | 28 | addrv2 | BIP155 |
 
 Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 `sendaddrv2`, and unknown/extension commands.
 
-**Not implemented as product features** (short slots 22–27 compact filters, 29–36
-placeholders, 37 `feature`): decode may reject unknown short IDs; peers that
-only need the live set above interoperate. Full Core filter/light-client APIs
-are deferred (**Q-65**). satd’s native BIP 157/158 index is noted in
-[`docs/peer-clients.md`](./docs/peer-clients.md).
+**Not implemented as product features** (short slots 29–36 placeholders, 37
+`feature`): decode may reject unknown short IDs. Slots 22–27 are live for
+BIP158 basic filters while `--block-filter-index` is on
+(`NODE_COMPACT_FILTERS` from startup, `getcfilters`, `getcfheaders`,
+`getcfcheckpt`, `getblockfilter`). A request whose stop height is past the
+filter watermark is silence, not an empty filter or a short batch.
 
 ## Deferred surfaces
 

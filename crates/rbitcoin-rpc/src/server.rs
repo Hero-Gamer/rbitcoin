@@ -7,7 +7,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 
 /// Axum's default request-body cap, named so auth and 413 share one limit.
@@ -243,9 +243,45 @@ pub async fn run_rpc(
 fn rpc_app(state: AppState) -> Router {
     Router::new()
         .route("/", post(rpc_post))
+        .route("/rest/{*path}", get(rest_entry).post(rest_entry))
         .layer(DefaultBodyLimit::max(RPC_MAX_HTTP_BODY))
         .layer(from_fn_with_state(state.clone(), reject_unauthorized))
         .with_state(state)
+}
+
+async fn rest_entry(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+    let _permit = match state.work_queue.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Work queue depth exceeded\n",
+            )
+                .into_response();
+        }
+    };
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let body = axum::body::to_bytes(req.into_body(), RPC_MAX_HTTP_BODY)
+        .await
+        .unwrap_or_default();
+    let ctx = Arc::clone(&state.ctx);
+    let reply = tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        crate::methods::dispatch_rest(&ctx, &path, &query, &body)
+    })
+    .await
+    .unwrap_or_else(|_| crate::methods::RestReply {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        content_type: "text/plain",
+        body: b"rest failed\n".to_vec(),
+    });
+    (
+        reply.status,
+        [(header::CONTENT_TYPE, reply.content_type)],
+        reply.body,
+    )
+        .into_response()
 }
 
 async fn reject_unauthorized(
@@ -253,6 +289,10 @@ async fn reject_unauthorized(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // Core REST is unauthenticated on TCP. POST / stays Bearer.
+    if req.uri().path().starts_with("/rest/") {
+        return next.run(req).await;
+    }
     if state.require_auth && !authorized(&state.auth, req.headers()) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -804,6 +844,19 @@ mod tests {
         assert!(
             text.contains("401") || text.contains("Unauthorized"),
             "{text}"
+        );
+
+        let mut rest = tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap();
+        let get = b"GET /rest/chaininfo.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        rest.write_all(get).await.unwrap();
+        let mut rest_buf = Vec::new();
+        rest.read_to_end(&mut rest_buf).await.unwrap();
+        let rest_text = String::from_utf8_lossy(&rest_buf);
+        assert!(
+            rest_text.contains("200") && rest_text.contains("regtest"),
+            "{rest_text}"
         );
 
         handle.shutdown().await;

@@ -13,9 +13,10 @@ subset** (table below). Official Core dialect scripts (`rpc_decodescript.py`,
 `rpc_validateaddress.py`, `rpc_invalid_address_message.py`) stay inventory
 `rpc-dialect`; the functional harness does not intercept those names.
 `getblocktemplate` / `getmininginfo` are a miner-backend (no stratum, no BIP9
-testdummy). `scantxoutset` supports `raw(script)` via the scripthash
-index (when `--sh-index`) or Class A txout + spent. Prefer **Electrum /
-Esplora** (with `--sh-index`) for address/script history.
+testdummy). `scantxoutset` expands descriptors and looks them up on the
+scripthash index. It requires `--sh-index` (`scripthash index disabled`
+otherwise). Prefer **Electrum / Esplora** (with `--sh-index`) for address
+history.
 
 ## Operator knobs
 
@@ -26,10 +27,21 @@ Esplora** (with `--sh-index`) for address/script history.
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
 | `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
+| `--block-filter-index` | **off** | BIP158 basic. `NODE_COMPACT_FILTERS` is advertised for the life of the process. `getblockfilter` and `/rest/blockfilter/` serve heights the watermark already covers. Independent of `--sh-index` |
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
-Bearer-authenticated (`{datadir}/rpc.token`). The Core-functional proxy still
+Bearer-authenticated (`{datadir}/rpc.token`). `GET /rest/…` is on the same
+binds. TCP `/rest/` skips Bearer, matching Core. Routes: `chaininfo.json`,
+`blockhashbyheight/<height>.<bin|hex|json>`, `headers/<count>/<hash>.*`,
+`block/<hash>.*`, `block/notxdetails/<hash>.*`, `tx/<txid>.*` (chain and
+mempool), `mempool/info.json`, `mempool/contents.json`, `getutxos.json`
+(confirmed spentness, plus the mempool overlay `gettxout` uses when the path
+includes `checkmempool`), `deploymentinfo.json`, and
+`blockfilter/basic/<hash>.*` when `--block-filter-index` is on and that height is sealed. A later height is “still in the process of being indexed”, not an empty filter.
+No wallet routes. Broadcast and fees stay `POST /`.
+
+The Core-functional proxy still
 speaks TestNode cookie + HTTP Basic on the public port and forwards Bearer
 to the node. Mixed AuthServiceProxy `{args: […], maxfeerate: …}` is expanded
 to a positional list in that proxy (`echo` mixed `{args, argN}` stays on the
@@ -114,7 +126,8 @@ still wait for durable SH when shindex is on.
 | `submitpackage` | All networks. Sequential `MempoolHub::submit_package_rpc` (`accept_tx` per tx; keep successes). Remainders that failed `min relay fee` or missing inputs are then `accept_package` (CPFP waiver is a child-with-parents ancestor tree). RPC `maxfeerate` / `maxburnamount` / `"version"` pre-checks. A 3-gen chain admits when fees/policy allow. A later member that failed missing-inputs stays `bad-txns-inputs-missingorspent`. `IsChildWithParents` `-25` and in-package maxfeerate overlay apply only when `RBITCOIN_RPC_PACKAGE_DIALECT` is on ([`env-knobs.md`](./env-knobs.md)). `package_msg` / `tx-results` / `replaced-transactions`. Esplora `POST /txs/package` and Electrum `broadcast_package` still use atomic `accept_package` (all-or-nothing; child-fail rollback). |
 | `gettxspendingprevout` | All networks. Live mempool spender of each `{txid,vout}`. |
 | `submitblock` | All networks. Same `ChainHub::accept_received_block` as a P2P `block` message: tip-extend, or hold by hash + most-work `accept_branch`. |
-| `scantxoutset` | All networks. `raw(HEX)` over Class A unspent outputs. MiniWallet on-ramp. Not Core coins-DB / HD-range scan. |
+| `scantxoutset` | All networks. Requires `--sh-index`. Expands output descriptors (`range` default 1000, Core's range errors) and looks each script up on the scripthash index. Refuses more than 10000 derived scripts. Does not store the descriptor. `txouts` is always `-1` (no coins DB; the count is not computed). |
+| `getblockfilter` | All networks. Requires `--block-filter-index`. `filtertype` `basic` only. Returns `filter` and `header` hex for a sealed height. Flag off is “Index is not enabled”. Flag on and this height not sealed yet is “still in the process of being indexed”. |
 | `gettxout` | All networks. Connected Class A + mempool. Default `include_mempool=true` returns `null` for a confirmed out spent by a live mempool tx. `include_mempool=false` still returns the confirmed coin. A leftover still live in the hub (IBD / `-blocksonly`) uses the connected path, not `confirmations: 0`. A disconnected archive row is `null` (not tip+1 confirmations). |
 | `getindexinfo` | All networks. Reports `txindex` synced at tip — we reconstruct by txid from Class A (no separate index flag). |
 | `getchaintips` | All networks. Active + archive `valid-fork` + held `valid-headers` + header-only (`submitheader` / P2P headers). Invalid body after a known header marks that branch `invalid`. |
@@ -134,7 +147,7 @@ still wait for durable SH when shindex is on.
 | Core `generate*` as a mining product | **Regtest harness only.** `submitblock` is the same receive path as P2P |
 | `combinerawtransaction` / `createrawtransaction` / `signrawtransactionwithkey` / `createmultisig` / `deriveaddresses` | Not implemented (harness proxy only) |
 | Decode Core dialect | Node `decodescript` omits wrap/`desc`; `validateaddress` omits `error_locations`; `decoderawtransaction` asm is rust-bitcoin. Official scripts stay `rpc-dialect`. |
-| Full `scantxoutset` / `gettxoutsetinfo` | No UTXO-set coins DB; denserels ≠ chainstate. `raw()` Class A walk is the MiniWallet subset only. |
+| `gettxoutsetinfo` | No UTXO set. Not implemented. |
 | Address history via Core method names | Use Electrum/Esplora with `--sh-index` |
 | Exact Core JSON field-for-field | Best-effort |
 | Multi-user `rpcauth` / method whitelist | Future |

@@ -22,6 +22,7 @@ from rpc_proxy import (
     peel_authproxy_args,
     rewrite_core_maxfeerate,
     rewrite_testmempoolaccept_abort,
+    shim_gettxoutsetinfo,
 )
 
 seq = {
@@ -41,6 +42,8 @@ seq = {
         },
     ]
 }
+info = shim_gettxoutsetinfo(3, "ab" * 32)
+assert info == {"height": 3, "bestblock": "ab" * 32, "txouts": -1}, info
 rewrite_testmempoolaccept_abort("testmempoolaccept", seq)
 assert seq["result"][0] == {"txid": "aa", "wtxid": "wa"}, seq
 assert seq["result"][1]["reject-reason"] == "missing-inputs", seq

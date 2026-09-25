@@ -2,6 +2,7 @@
 
 mod archive;
 mod batch_parents;
+mod block_filter;
 mod catchup;
 mod chain_view;
 mod combined_stage;
@@ -300,6 +301,7 @@ pub struct Query {
     /// Operator scripthash index intent (`--shindex`). When false, Class C skips
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
     sh_index_enabled: std::sync::atomic::AtomicBool,
+    block_filter_enabled: std::sync::atomic::AtomicBool,
     /// Optional BIP-352 thin tweak index (`--sptweaks`). Files may exist when off.
     sp_tweaks: Mutex<Option<SpTweaksTable>>,
     sptweaks_enabled: AtomicBool,
@@ -448,6 +450,7 @@ impl Query {
             // Library default: SH on (tests / enter_direct). Node sets false for
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
+            block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
             sp_tweaks: Mutex::new(sp_tweaks),
             sptweaks_enabled: AtomicBool::new(false),
             sptweaks_origin: AtomicU32::new(sptweaks_origin),

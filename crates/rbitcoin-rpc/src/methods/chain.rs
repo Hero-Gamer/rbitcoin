@@ -487,11 +487,18 @@ pub(crate) fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
     tip.saturating_sub(height.0).saturating_add(1)
 }
 
-/// Enough of Core `scantxoutset` for MiniWallet: `raw(script)` over Class A.
-/// Not a coins-DB product (no HD range / combo / addr expansion).
+/// Descriptor scan over the scripthash index. `txouts` is always `-1`.
 pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["action", "scanobjects"])?;
-    let action = params.req_str(0, "action")?;
+    let Some(action_v) = params.get(0, "action") else {
+        return Err(rpc_error(
+            ERR_MISC,
+            "scantxoutset \"action\" ( [scanobjects,...] )",
+        ));
+    };
+    let action = action_v
+        .as_str()
+        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "action must be a string"))?;
     match action {
         "status" => return Ok(Value::Null),
         "abort" => return Ok(json!(false)),
@@ -509,35 +516,13 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
             "scanobjects argument is required for the start action",
         )
     })?;
-    let mut scripts: Vec<Vec<u8>> = Vec::new();
-    for o in objs {
-        let desc = match o {
-            Value::String(s) => s.as_str(),
-            Value::Object(m) => m
-                .get("desc")
-                .and_then(Value::as_str)
-                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "scanobject desc required"))?,
-            _ => {
-                return Err(rpc_error(
-                    ERR_INVALID_PARAMS,
-                    "scanobjects entries must be descriptor strings",
-                ));
-            }
-        };
-        let script = if let Some(s) = parse_raw_descriptor(desc) {
-            s
-        } else if let Some(s) = parse_addr_descriptor(ctx, desc) {
-            s
-        } else if let Some(s) = parse_wrapped_multi(desc) {
-            s
-        } else {
-            return Err(rpc_error(
-                ERR_INVALID_PARAMS,
-                format!("unsupported descriptor (got {desc})"),
-            ));
-        };
-        scripts.push(script.to_bytes());
+    if !ctx.query.sh_index_enabled() {
+        return Err(rpc_error(ERR_MISC, "scripthash index disabled"));
     }
+    let expanded = super::descriptor_scan::expand_scan_objects(ctx, objs)?;
+    let scripts: Vec<Vec<u8>> = expanded.iter().map(|s| s.script.clone()).collect();
+    let desc_for_script: Vec<(Vec<u8>, String)> =
+        expanded.into_iter().map(|s| (s.script, s.desc)).collect();
 
     let tip = ctx.query.tip_height().unwrap_or(Height(0));
     let best = if let Some(h) = ctx.query.tip_height() {
@@ -559,24 +544,76 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
     let mut total_sat = 0u64;
     for u in found {
         total_sat = total_sat.saturating_add(u.value);
+        let blockhash = ctx
+            .query
+            .header_at_height(Height(u.height))
+            .ok()
+            .flatten()
+            .map(|(_, rec)| hash_hex_display(&rec.hash))
+            .unwrap_or_default();
         unspents.push(json!({
             "txid": hash_hex_display(&u.txid),
             "vout": u.vout,
             "scriptPubKey": hex_encode(&u.script),
-            "desc": format!("raw({})", hex_encode(&u.script)),
+            "desc": desc_for_script
+                .iter()
+                .find(|(spk, _)| spk == &u.script)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_else(|| format!("raw({})", hex_encode(&u.script))),
             "amount": sat_btc_json(u.value as i64),
             "coinbase": u.coinbase,
             "height": u.height,
+            "blockhash": blockhash,
+            "confirmations": confirmations(ctx, Height(u.height)),
         }));
     }
 
     Ok(json!({
         "success": true,
-        "txouts": unspents.len(),
+        "txouts": -1,
         "height": tip.0,
         "bestblock": best,
         "unspents": unspents,
         "total_amount": Amount::from_sat(total_sat).to_btc(),
+    }))
+}
+
+pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash", "filtertype"])?;
+    let hex = params.req_str(0, "blockhash")?;
+    let filtertype = params.opt_str(1, "filtertype")?.unwrap_or("basic");
+    if filtertype != "basic" {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Unknown filtertype {filtertype}"),
+        ));
+    }
+    if !ctx.query.block_filter_enabled() {
+        return Err(rpc_error(
+            ERR_MISC,
+            "Index is not enabled for filtertype basic",
+        ));
+    }
+    let hash = parse_hash32_display(hex)?;
+    let height = ctx
+        .query
+        .height_of_hash(&hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+    let (body, header) = ctx
+        .query
+        .basic_filter_at(height.0)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| {
+            rpc_error(
+                ERR_MISC,
+                "Filter not found. Block filters are still in the process of being indexed.",
+            )
+        })?;
+    use bitcoin::hashes::Hash;
+    Ok(json!({
+        "filter": hex_encode(&body),
+        "header": hex_encode(header.as_byte_array()),
     }))
 }
 

@@ -58,8 +58,11 @@ arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
 maxfeerate overlay. Production (unset) is sequential admit. The RPC proxy
 rewrites multi-tx `testmempoolaccept` abort-class rows (`missing-inputs` /
 `max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
-node keeps earlier `allowed: true`. `rpc_packages.py` `run` includes that
-named shim dialect (same honesty as `WAIT_TIP_IDLE`).
+node keeps earlier `allowed: true`. The proxy answers `gettxoutsetinfo`
+with `getblockcount`, `getbestblockhash`, and `txouts: -1` so
+`rpc_scantxoutset.py` can compare an empty scan. The node does not
+implement that method. `rpc_packages.py` `run` includes that named shim
+dialect (same honesty as `WAIT_TIP_IDLE`).
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
@@ -132,7 +135,7 @@ First production-green pair (historical): `feature_uacomment.py`
 | `no-wallet` | wallet RPC / `wallet/` URL |
 | `no-mining-product` | GBT / `prioritisetransaction` as Core mining |
 | `no-prune` | prune / blk xor / `-blocksdir` |
-| `no-utxo-set` | coins DB / assumeutxo / scantxoutset |
+| `no-utxo-set` | coins DB / assumeutxo |
 | `no-zmq` / `no-ipc` / `no-qt` | those interfaces |
 | `no-core-rest` | Core REST (`interface_rest.py`); we have Esplora instead |
 | `no-tool` | bitcoin-wallet / bitcoin-tx / bitcoin-util / bitcoin-chainstate |

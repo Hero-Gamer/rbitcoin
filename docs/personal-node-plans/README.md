@@ -67,7 +67,7 @@ A node on CGNAT / no forwarded TCP still:
 
 ## Out of this group
 
-- IBD bootstrap snapshots; BIP157/158 (**Q-65**).
+- IBD bootstrap snapshots. BIP157/158 basic filters ship as `--block-filter-index`.
 - In-binary Electrum TLS / rustls / fingerprint pairing; scripthash allowlist;
   `--personal` preset / `getwalletconnect`; **Q-63** as a TLS story.
 - UPnP / NAT-PMP; in-process Arti; Core wallet RPC; Dandelion++ stem/fluff

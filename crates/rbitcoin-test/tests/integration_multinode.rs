@@ -69,6 +69,10 @@ fn open_padded_query(dir: &TempDir) -> Query {
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
+    q.set_block_filter_index(true);
+    q.backfill_block_filters_through(1)
+        .expect("filters through height 1");
+    rbitcoin_net::set_compact_filters_service(true);
     P2PNode::start(
         "127.0.0.1:0".parse().unwrap(),
         q,
@@ -651,6 +655,113 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         .expect("p2p_timeout_getaddr_and_keepalive_ping wall timeout (20s)");
 }
 
+/// Heights 0 and 1 are sealed; the tip is not. The seeder still advertises
+/// `NODE_COMPACT_FILTERS`. A stop past the watermark is silence.
+async fn pin_compact_filters(peer: &P2PNode, seed: &P2PNode) {
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+
+    let hash_at = |h: u32| {
+        let (_, rec) = seed
+            .query
+            .header_at_height(Height(h))
+            .unwrap()
+            .unwrap_or_else(|| panic!("header {h}"));
+        BlockHash::from_byte_array(rec.hash)
+    };
+    let tip = seed.hub.tip_hash().expect("pad tip");
+    let sealed = hash_at(1);
+    const COMPACT: u64 = 1 << 6;
+    wait_ms_until(
+        3_000,
+        || {
+            peer.peers
+                .live_peers()
+                .into_iter()
+                .any(|p| !p.inbound && p.handshake_complete() && p.services & COMPACT != 0)
+        },
+        || {
+            format!(
+                "version must advertise COMPACT_FILTERS while the index lags (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+    wait_ms_until(
+        3_000,
+        || {
+            peer.peers.live_peers().into_iter().any(|p| {
+                !p.inbound
+                    && p.handshake_complete()
+                    && p.queue_msg(NetworkMessage::GetCFilters(GetCFilters {
+                        filter_type: 0,
+                        start_height: 0,
+                        stop_hash: tip,
+                    }))
+            })
+        },
+        || {
+            format!(
+                "outbound must take getcfilters for the tip (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let early = peer
+        .peers
+        .snapshot()
+        .into_iter()
+        .any(|p| !p.inbound && p.bytesrecv_per_msg.get("cfilter").copied().unwrap_or(0) > 0);
+    assert!(
+        !early,
+        "stop past the watermark is silence (peer={:?})",
+        peer.peers.snapshot()
+    );
+    let queued = peer.peers.live_peers().into_iter().any(|p| {
+        !p.inbound
+            && p.handshake_complete()
+            && p.queue_msg(NetworkMessage::GetCFilters(GetCFilters {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: sealed,
+            }))
+            && p.queue_msg(NetworkMessage::GetCFHeaders(GetCFHeaders {
+                filter_type: 0,
+                start_height: 1,
+                stop_hash: sealed,
+            }))
+            && p.queue_msg(NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                filter_type: 0,
+                stop_hash: sealed,
+            }))
+    });
+    assert!(
+        queued,
+        "outbound must take filter requests inside the watermark"
+    );
+    wait_ms_until(
+        5_000,
+        || {
+            peer.peers.snapshot().into_iter().any(|p| {
+                !p.inbound
+                    && p.bytesrecv_per_msg.get("cfilter").copied().unwrap_or(0) > 0
+                    && p.bytesrecv_per_msg.get("cfheaders").copied().unwrap_or(0) > 0
+                    && p.bytesrecv_per_msg.get("cfcheckpt").copied().unwrap_or(0) > 0
+            })
+        },
+        || {
+            format!(
+                "seed must answer sealed filters (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+}
+
 fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
     let tip = node.hub.tip_hash().expect("tip hash");
     let tip_time = node.hub.tip_header().expect("tip header").time;
@@ -690,6 +801,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             peer.follow_live_count() >= 1,
             "outbound follow must stay live"
         );
+        pin_compact_filters(&peer, &seed).await;
 
         let h_empty = mine_on(&seed, pad_h + 1);
         peer.wait_tip_hash(h_empty, Duration::from_secs(5))

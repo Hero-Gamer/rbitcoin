@@ -245,6 +245,7 @@ impl Query {
         );
 
         self.enqueue_sh_pending(items, create_pins)?;
+        self.seal_confirmed_block_filters(items)?;
 
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
@@ -252,6 +253,23 @@ impl Query {
         self.record_confirmed_seqsigwit_window(items)?;
 
         Ok(out)
+    }
+
+    /// Seal basic filters through the last height of this confirm batch.
+    fn seal_confirmed_block_filters(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
+        if !self.block_filter_enabled() {
+            return Ok(());
+        }
+        let Some(tip) = items.last().map(|i| i.height.0) else {
+            return Ok(());
+        };
+        let t0 = std::time::Instant::now();
+        self.backfill_block_filters_through(tip)?;
+        rbitcoin_log::debug!(
+            "ibd: perf blockfilter confirm through={tip} us={}",
+            t0.elapsed().as_micros()
+        );
+        Ok(())
     }
 
     fn record_confirmed_seqsigwit_window(
@@ -797,6 +815,7 @@ impl Query {
             self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
         }
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
+        self.truncate_basic_filters_to_tip()?;
         Ok(())
     }
 }

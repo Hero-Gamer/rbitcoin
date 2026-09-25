@@ -145,6 +145,11 @@ _TMA_ABORT = frozenset(
 )
 
 
+def shim_gettxoutsetinfo(height: Any, bestblock: Any) -> dict[str, Any]:
+    """Harness stand-in. No UTXO set, so `txouts` is -1."""
+    return {"height": height, "bestblock": bestblock, "txouts": -1}
+
+
 def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None:
     """Core PCKG abort: first abort-class row keeps reject-reason; others id-only."""
     if method != "testmempoolaccept":

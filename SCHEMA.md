@@ -276,6 +276,8 @@ itself changed.
     scripthash.unsorted/post/NN/  # pass 2 dir of SHPST01 spills (000000…); pack folds to one map then slot_for_key16 + 2+ body; DONE.post=SHPOST02 last_fk; unlinked after pack
     # previous DONE / 24 B NN (SHUNSRT3) with no SHKEYS02 is wiped and pass 1 restarts; no SCHEMA_VERSION bump
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
+    blockfilters/basic.headers        # optional BIP158 basic: 32 B header per height (`--block-filter-index`)
+    blockfilters/basic.bodies         # u32 LE length + filter bytes, same height order. Missing files: index off
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/

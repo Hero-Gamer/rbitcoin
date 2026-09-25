@@ -1352,6 +1352,9 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
+    query.set_block_filter_index(config.block_filter_index);
+    // Advertised for the process lifetime of the flag. The watermark may lag.
+    rbitcoin_net::set_compact_filters_service(config.block_filter_index);
     query.set_max_sh_creates(config.max_sh_creates);
     query.set_seqsigwit_ram_threshold_bytes(config.prune_seqsigwit_ram_threshold_bytes)?;
     if !config.prune_seqsigwit && query.prune_seqsigwit() {
@@ -1720,6 +1723,7 @@ pub(crate) fn enter_tip_mode(
             query.index_mode()
         );
         info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
+        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1741,13 +1745,14 @@ pub(crate) fn enter_tip_mode(
             query.scripthash_entry_count()
         );
         info!("node: tip-mode complete — safe to start Electrum");
+        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: true,
         };
     }
 
-    info!("node: scripthash bulk materialize from Class A (Direct collect, then Tip)…");
+    info!("node: index materialize from Class A (Direct collect, then Tip)…");
     if !query.index_mode().is_direct() {
         if let Err(e) = query.enter_direct_index_mode_sh(true) {
             warn!("node: enter Direct for SH collect: {e}");
@@ -1756,11 +1761,11 @@ pub(crate) fn enter_tip_mode(
     let cancel_ref = cancel.as_deref();
     let sh_ok = match query.finalize_sh_runs_cancellable(cancel_ref) {
         Ok(n) => {
-            info!("node: scripthash bulk materialize creates≈{n}");
+            info!("node: index materialize scripthash creates≈{n}");
             true
         }
         Err(StoreError::Cancelled(msg)) => {
-            warn!("node: scripthash bulk materialize cancelled ({msg})");
+            warn!("node: index materialize cancelled ({msg})");
             warn!(
                 "node: partial cold shards kept (scripthash.cold_progress) — \
                  restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
@@ -1768,7 +1773,7 @@ pub(crate) fn enter_tip_mode(
             false
         }
         Err(e) => {
-            warn!("node: scripthash bulk materialize failed: {e}");
+            warn!("node: index materialize failed: {e}");
             warn!(
                 "node: Electrum history incomplete until materialize succeeds — \
                  keep store/scripthash.runs (incl. *.run.mat / merge/) and restart; \
@@ -1778,6 +1783,7 @@ pub(crate) fn enter_tip_mode(
         }
     };
     if !sh_ok {
+        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1796,6 +1802,7 @@ pub(crate) fn enter_tip_mode(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
              Electrum deferred until drain succeeds (restart finalize); tip follow on"
         );
+        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1807,9 +1814,23 @@ pub(crate) fn enter_tip_mode(
         query.scripthash_entry_count()
     );
     info!("node: tip-mode complete — safe to start Electrum");
+    seal_block_filters(query);
     TipModeGates {
         tip_follow_ready: true,
         sh_tip_ready: true,
+    }
+}
+
+fn seal_block_filters(query: &Query) {
+    if !query.block_filter_enabled() {
+        return;
+    }
+    match query.backfill_block_filters() {
+        Ok(()) => info!(
+            "node: index materialize block filters hwm={:?}",
+            query.basic_filter_hwm().ok().flatten()
+        ),
+        Err(e) => warn!("node: block filter backfill failed: {e}"),
     }
 }
 
