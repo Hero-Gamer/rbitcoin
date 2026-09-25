@@ -781,12 +781,16 @@ async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Val
 async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
-    let rate = {
+    let (rate, prior_spend, independent_coinbase) = {
         let q = Query::open_or_create_tiny(td.store_path()).unwrap();
         let chain = build_mature_regtest_with_spend(&q, &params);
         q.flush().unwrap();
         let spend = &chain.blocks[chain.spend_height as usize].txdata[1];
-        rbitcoin_consensus::policy::fee_rate_sat_per_kvb(1_0000_0000, spend.weight().to_wu())
+        (
+            rbitcoin_consensus::policy::fee_rate_sat_per_kvb(1_0000_0000, spend.weight().to_wu()),
+            spend.compute_txid(),
+            chain.blocks[2].txdata[0].compute_txid(),
+        )
     };
 
     let rpc_addr = ephemeral_addr();
@@ -818,6 +822,55 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
         .as_f64()
         .unwrap_or_else(|| panic!("144-block estimate after relay start: {fee}"));
     assert_eq!((got * 100_000_000.0).round() as u64, rate, "{fee}");
+
+    // A later block not assembled from the mempool confirms a CPFP package.
+    // Its parent and child share the package rate; the unrelated spend keeps
+    // the block's p10 from being a single-transaction special case.
+    let parent = acs_spend(
+        prior_spend,
+        49_0000_0000,
+        25_000_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = acs_spend(
+        parent.compute_txid(),
+        48_7500_0000,
+        25_000_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let independent = acs_spend(
+        independent_coinbase,
+        50_0000_0000,
+        1_0000_0000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let package_rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(
+        50_000_000,
+        parent.weight().to_wu() + child.weight().to_wu(),
+    );
+    let mined = jsonrpc(
+        rpc_addr,
+        "generateblock",
+        json!([
+            "raw(51)",
+            [
+                encode_tx(&parent),
+                encode_tx(&child),
+                encode_tx(&independent)
+            ]
+        ]),
+    )
+    .await;
+    assert!(mined["result"]["hash"].is_string(), "{mined}");
+    let fee = jsonrpc(rpc_addr, "estimatesmartfee", json!([144])).await;
+    let got = fee["result"]["feerate"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("144-block estimate after package block: {fee}"));
+    assert_eq!(
+        (got * 100_000_000.0).round() as u64,
+        package_rate,
+        "in-block CPFP rows use the package rate: {fee}"
+    );
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
