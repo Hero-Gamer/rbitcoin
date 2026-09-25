@@ -558,3 +558,18 @@ store-less unit when the journey cannot see it. `MISSED` in the nightly
 artifact means no workspace test cared. Extend the journey. A same-crate
 twin that only existed to satisfy a package-local mutant is a deletion
 candidate once a workspace run shows the journey catching it.
+
+### Seed corpus mining (roadmap 1.4)
+
+Fuzz corpus lives in `fuzz/corpus/` — gitignored and cached for 7 days.
+Inputs that catch surviving mutants are promoted to permanent fixtures:
+- Location: `crates/<crate>/tests/fixtures/fuzz_mined/<target>/`
+- `_bin` = input data; `_out` = expected `Debug` output
+- Replayed via `fuzz_mined.rs` — runs in default `cargo test` suite
+- `cargo-mutants` exercises these inputs alongside unit tests
+
+Workflow:
+1. Fuzz populates `fuzz/corpus/`
+2. `./scripts/fuzz-mine.sh --promote fuzz/corpus/<target>` → staged artifact
+3. Review → manually commit to `crates/*/tests/fixtures/fuzz_mined/`
+4. `--sidecars` regenerate `.out` files if Debug output changes

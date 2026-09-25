@@ -234,3 +234,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PUBLISH_COVERAGE_BADGE: "1"
         run: ./scripts/publish-coverage-badge.sh
+
+  corpus-self-test:
+    name: Fixture Corpus Self-Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo test -p rbitcoin-consensus -- fuzz_mined

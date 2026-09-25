@@ -1,0 +1,3 @@
+# Regression fixture: malformed PUSHDATA with negative length
+# Expected: parser rejects this as invalid
+6a ff ff ff ff ff
