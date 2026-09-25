@@ -290,16 +290,16 @@ fn header_and_spending_boundaries() {
     assert_eq!(q.tip_height(), Some(Height(100)));
     time += 600;
 
+    // Zero txid with vout 0 is not a null outpoint or a coinbase input.
     let missing = spend_anyone_can_spend(
-        bitcoin::Txid::from_byte_array([0xab; 32]),
+        bitcoin::Txid::from_byte_array([0u8; 32]),
         0,
         Amount::from_sat(1),
     );
     let miss_block = mine_regtest_block(tip, time, 101, vec![missing]);
     let err = accept_and_connect_block(&q, &params, Height(101), &miss_block, Milestone::NONE);
     assert!(
-        matches!(err, Err(ConsensusError::MissingPrevout))
-            || matches!(err, Err(ConsensusError::BadTx(s)) if s.contains("missing")),
+        matches!(err, Err(ConsensusError::MissingPrevout)),
         "missing prevout: {err:?}"
     );
 
