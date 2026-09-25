@@ -299,6 +299,8 @@ pub enum TableKind {
     Input = 22,
     /// Per-create `n_in` (`input.loc`, 2 B/create).
     InputLoc = 23,
+    /// Optional BIP158 basic filter bytes (`blockfilter.body`).
+    BlockFilter = 24,
 }
 
 impl TableKind {
@@ -325,6 +327,7 @@ impl TableKind {
             21 => Some(TableKind::TxStatBlk),
             22 => Some(TableKind::Input),
             23 => Some(TableKind::InputLoc),
+            24 => Some(TableKind::BlockFilter),
             _ => None,
         }
     }
@@ -404,6 +407,7 @@ mod tests {
         assert_eq!(TableKind::TxStatBlk.as_u16(), 21);
         assert_eq!(TableKind::Input.as_u16(), 22);
         assert_eq!(TableKind::InputLoc.as_u16(), 23);
+        assert_eq!(TableKind::from_u16(24), Some(TableKind::BlockFilter));
     }
 
     #[test]

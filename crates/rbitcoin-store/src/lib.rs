@@ -7,6 +7,7 @@ mod address_head;
 mod array_table;
 mod bdz;
 mod binary_fuse8;
+mod block_filter;
 mod block_queue;
 mod block_wire;
 mod bulk_io;
@@ -63,6 +64,7 @@ mod var_table;
 
 pub use crate::compact::output_flags;
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
+pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable};
 pub use block_queue::{BlockQueue, QueuedBlockMeta, TakenRaw};
 pub use block_wire::block_wire_input_count;
 pub use create_loc::CreateLocPair;
