@@ -1498,10 +1498,6 @@ pub async fn fee_estimates(State(st): State<AppState>) -> Response {
     spawn_join(move || fee_estimates_sync(&st)).await
 }
 
-pub async fn fees_recommended(State(st): State<AppState>) -> Response {
-    spawn_join(move || fees_recommended_sync(&st)).await
-}
-
 /// Esplora sat/vB from the estimator's BTC/kvB, keeping its 1 sat/kvB (0.001
 /// sat/vB) resolution. No estimate (negative) answers 1 sat/vB.
 fn sat_vb(btc_kb: f64) -> f64 {
@@ -1512,7 +1508,7 @@ fn sat_vb(btc_kb: f64) -> f64 {
     }
 }
 
-/// mempool.space tiers from the 1/3/6/144-block estimates.
+/// Wallet WS `fees`: mempool.space tiers from the 1/3/6/144-block estimates.
 fn fees_recommended_from(pairs: &[(u32, f64)]) -> Value {
     let tier = |target: u32| {
         pairs
@@ -1531,10 +1527,6 @@ fn fees_recommended_from(pairs: &[(u32, f64)]) -> Value {
 
 pub(crate) fn fees_recommended_json(mp: Option<&MempoolHub>) -> Value {
     fees_recommended_from(&mp.map(|m| m.fee_estimates_btc_per_kb()).unwrap_or_default())
-}
-
-fn fees_recommended_sync(st: &AppState) -> Response {
-    Json(fees_recommended_json(st.mempool.as_deref())).into_response()
 }
 
 /// Esplora `/fee-estimates`: confirm target → sat/vB.

@@ -285,7 +285,7 @@ const client = axios.create({
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
-| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`, `/fees/recommended`; `POST /tx` and **`POST /txs/package`** when hub open |
+| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
 | Unknown / non-goal | **404** (address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](../../COMPAT.md) |
 
