@@ -1957,19 +1957,48 @@ impl TxTable {
         ranges: &[(u64, u64)],
     ) -> Result<Vec<(u32, bool, Fk)>, StoreError> {
         let slot = OutputRecord::SPENT_SLOT_LEN;
+        let slot_len = slot as u64;
         let mut out = Vec::new();
         let mut i = 0;
         while i < ranges.len() {
             let mut j = i + 1;
-            while j < ranges.len() && ranges[j].0 == ranges[j - 1].0 + ranges[j - 1].1 {
+            while j < ranges.len() {
+                let previous_end = ranges[j - 1]
+                    .0
+                    .checked_add(ranges[j - 1].1)
+                    .ok_or(StoreError::Corrupt("invariant: spent range end"))?;
+                if ranges[j].0 != previous_end {
+                    break;
+                }
                 j += 1;
             }
+            if ranges[i..j].iter().any(|(_, len)| len % slot_len != 0) {
+                return Err(StoreError::Corrupt("invariant: spent range slot alignment"));
+            }
             let start = ranges[i].0;
-            let end = ranges[j - 1].0 + ranges[j - 1].1;
-            self.spent.with_bytes_at(start, end - start, |raw| {
+            let end = ranges[j - 1]
+                .0
+                .checked_add(ranges[j - 1].1)
+                .ok_or(StoreError::Corrupt("invariant: spent range end"))?;
+            let span_len = end
+                .checked_sub(start)
+                .ok_or(StoreError::Corrupt("invariant: spent range bounds"))?;
+            self.spent.with_bytes_at(start, span_len, |raw| {
                 for (k, &(off, len)) in ranges[i..j].iter().enumerate() {
-                    let at = (off - start) as usize;
-                    for s in raw[at..at + len as usize].chunks_exact(slot) {
+                    let at = usize::try_from(
+                        off.checked_sub(start)
+                            .ok_or(StoreError::Corrupt("invariant: spent range bounds"))?,
+                    )
+                    .map_err(|_| StoreError::Corrupt("invariant: spent range bounds"))?;
+                    let len = usize::try_from(len)
+                        .map_err(|_| StoreError::Corrupt("invariant: spent range bounds"))?;
+                    let end = at
+                        .checked_add(len)
+                        .ok_or(StoreError::Corrupt("invariant: spent range bounds"))?;
+                    let slots = raw
+                        .get(at..end)
+                        .ok_or(StoreError::Corrupt("invariant: spent range bounds"))?;
+                    for s in slots.chunks_exact(slot) {
                         let (flags, field, _vin) = decode_spent_slot(s)?;
                         if !field.is_null() {
                             let multi = flags & output_flags::MULTI_SPENDER != 0;
