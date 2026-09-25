@@ -161,6 +161,28 @@ impl Query {
             .map(|(body, slot)| (body, FilterHeader::from_byte_array(slot.filter_header))))
     }
 
+    /// Filter hash and header for `start..=end` without filter bytes.
+    /// `None` when the index is off or `end` is past the watermark.
+    pub fn basic_filter_hashes_and_headers(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> Result<Option<Vec<(FilterHash, FilterHeader)>>, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(None);
+        };
+        Ok(table.slots(Height(start), Height(end))?.map(|v| {
+            v.into_iter()
+                .map(|s| {
+                    (
+                        FilterHash::from_byte_array(s.filter_hash),
+                        FilterHeader::from_byte_array(s.filter_header),
+                    )
+                })
+                .collect()
+        }))
+    }
+
     /// Heights the appender may seal now: released through tip, or `None`.
     fn block_filter_target(&self) -> Option<u32> {
         let tip = self.tip_height()?.0;

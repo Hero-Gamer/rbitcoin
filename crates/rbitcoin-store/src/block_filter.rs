@@ -266,6 +266,36 @@ impl BlockFilterTable {
         Ok(Some(Self::read_slot_at(&inner.segs[si], local)?.1))
     }
 
+    /// Idx facts for `start..=end`, one idx pread per segment touched.
+    /// `None` when `end` is past the watermark.
+    pub fn slots(
+        &self,
+        start: Height,
+        end: Height,
+    ) -> Result<Option<Vec<BlockFilterSlot>>, StoreError> {
+        let inner = self.lock();
+        if Self::locate(&inner, end).is_none() || start > end {
+            return Ok(None);
+        }
+        let Some((mut si, mut local)) = Self::locate(&inner, start) else {
+            return Ok(None);
+        };
+        let mut left = u64::from(end.0 - start.0) + 1;
+        let mut out = Vec::with_capacity(left as usize);
+        while left > 0 {
+            let seg = &inner.segs[si];
+            let run = left.min(seg.n_slots - local);
+            let mut b = vec![0u8; (run * SLOT) as usize];
+            seg.idx
+                .read_at(FILE_HEADER_LEN as u64 + local * SLOT, &mut b)?;
+            out.extend(b.chunks_exact(SLOT as usize).map(|c| decode_slot(c).1));
+            left -= run;
+            si += 1;
+            local = 0;
+        }
+        Ok(Some(out))
+    }
+
     /// Filter bytes and idx facts at `height`. `None` past the watermark.
     pub fn filter(&self, height: Height) -> Result<Option<(Vec<u8>, BlockFilterSlot)>, StoreError> {
         let inner = self.lock();
@@ -467,6 +497,11 @@ mod tests {
         assert_eq!(bytes, vec![7u8; 10]);
         assert_eq!(s, slot(7));
         assert_eq!(t.slot(Height(9)).unwrap(), Some(slot(9)));
+        assert_eq!(
+            t.slots(Height(3), Height(9)).unwrap().unwrap(),
+            (3..=9).map(slot).collect::<Vec<_>>()
+        );
+        assert!(t.slots(Height(3), Height(10)).unwrap().is_none());
         assert!(t.slot(Height(10)).unwrap().is_none());
     }
 
@@ -538,6 +573,11 @@ mod tests {
         assert!(BlockFilterTable::seg_body_path(&dir, 1).is_file());
         assert_eq!(t.filter(Height(1)).unwrap().unwrap().0, vec![1u8; 4]);
         assert_eq!(t.filter(Height(2)).unwrap().unwrap().0, vec![2u8; 5]);
+        assert_eq!(
+            t.slots(Height(0), Height(2)).unwrap().unwrap(),
+            (0..=2).map(slot).collect::<Vec<_>>(),
+            "range read crosses the segment roll"
+        );
         t.truncate_through(Some(Height(0))).unwrap();
         assert!(!BlockFilterTable::seg_body_path(&dir, 1).exists());
         assert_eq!(t.next_height(), Height(1));
