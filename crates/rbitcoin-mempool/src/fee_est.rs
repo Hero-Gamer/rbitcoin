@@ -266,6 +266,96 @@ pub fn percentile_sat(mut v: Vec<u64>, pct: u8) -> Option<u64> {
     Some(v[i])
 }
 
+/// In-block package larger than this shares one aggregate rate instead of
+/// ancestor-set chunking, which is quadratic in the package size.
+pub const BLOCK_PACKAGE_MAX_TXS: usize = 64;
+
+/// Package-aware rate (sat/kvB) of each block tx, from `(fee_sat, weight)`
+/// rows and in-block `(parent, child)` spend edges (indices into `txs`).
+///
+/// Each connected package is split greedily: the remaining tx whose
+/// in-package ancestor set has the best rate takes that set at that rate, as
+/// a miner selecting by ancestor feerate would. A CPFP parent gets its
+/// child's package rate; a cheap child does not drag down its parent.
+pub fn block_package_rates(txs: &[(u64, u64)], edges: &[(u32, u32)]) -> Vec<u64> {
+    use rbitcoin_consensus::policy::fee_rate_sat_per_kvb;
+    let n = txs.len();
+    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut root: Vec<usize> = (0..n).collect();
+    fn find(root: &mut [usize], mut i: usize) -> usize {
+        while root[i] != i {
+            root[i] = root[root[i]];
+            i = root[i];
+        }
+        i
+    }
+    for &(p, c) in edges {
+        let (p, c) = (p as usize, c as usize);
+        if p >= n || c >= n || p == c {
+            continue;
+        }
+        parents[c].push(p);
+        let (rp, rc) = (find(&mut root, p), find(&mut root, c));
+        root[rp] = rc;
+    }
+    let mut packages: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let r = find(&mut root, i);
+        packages.entry(r).or_default().push(i);
+    }
+    let mut rates = vec![0u64; n];
+    for members in packages.into_values() {
+        if members.len() > BLOCK_PACKAGE_MAX_TXS {
+            let fee = members.iter().map(|&i| txs[i].0).sum();
+            let weight = members.iter().map(|&i| txs[i].1).sum();
+            let rate = fee_rate_sat_per_kvb(fee, weight);
+            for i in members {
+                rates[i] = rate;
+            }
+            continue;
+        }
+        let mut left: std::collections::BTreeSet<usize> = members.into_iter().collect();
+        while !left.is_empty() {
+            let mut best: Option<(u64, Vec<usize>)> = None;
+            for &tip in &left {
+                let mut set = vec![tip];
+                let mut i = 0;
+                while i < set.len() {
+                    for &p in &parents[set[i]] {
+                        if left.contains(&p) && !set.contains(&p) {
+                            set.push(p);
+                        }
+                    }
+                    i += 1;
+                }
+                let fee = set.iter().map(|&j| txs[j].0).sum();
+                let weight = set.iter().map(|&j| txs[j].1).sum();
+                let rate = fee_rate_sat_per_kvb(fee, weight);
+                if best.as_ref().is_none_or(|(r, _)| rate > *r) {
+                    best = Some((rate, set));
+                }
+            }
+            let (rate, set) = best.expect("left is not empty");
+            for j in set {
+                rates[j] = rate;
+                left.remove(&j);
+            }
+        }
+    }
+    rates
+}
+
+/// A block's p10 package rate (sat/kvB) over txs at or above `min_relay`.
+/// Rates below it (out-of-band or zero-fee inclusions) are not market rates.
+pub fn block_p10_sat_kvb(txs: &[(u64, u64)], edges: &[(u32, u32)], min_relay: u64) -> Option<u64> {
+    let rates = block_package_rates(txs, edges)
+        .into_iter()
+        .filter(|&r| r >= min_relay)
+        .collect();
+    percentile_sat(rates, 10)
+}
+
 /// Per-block p10 ring → quantile `100·c(N)` (median if fewer than 12 samples).
 pub fn historical_far_sat_kvb(block_p10s: &[u64], n_blocks: u32) -> Option<u64> {
     if block_p10s.is_empty() {
@@ -518,5 +608,60 @@ mod tests {
             flow_for_depth(None, Some(3_000), true, 144, min_r),
             Some(3_000)
         );
+    }
+
+    // (fee_sat, weight_wu); 1000 WU = 250 vB, so fee 250 is 1000 sat/kvB.
+    #[test]
+    fn block_package_rates_for_independent_txs_are_their_own() {
+        let txs = [(250, 1_000), (2_500, 1_000)];
+        assert_eq!(block_package_rates(&txs, &[]), vec![1_000, 10_000]);
+    }
+
+    #[test]
+    fn block_package_rates_give_a_cpfp_parent_its_package_rate() {
+        // zero-fee parent, child pays for both: 5000 sat / 500 vB
+        let txs = [(0, 1_000), (5_000, 1_000)];
+        assert_eq!(block_package_rates(&txs, &[(0, 1)]), vec![10_000, 10_000]);
+    }
+
+    #[test]
+    fn block_package_rates_do_not_average_a_cheap_child_into_its_parent() {
+        // parent mines alone at 40000; the cheap child is its own chunk
+        let txs = [(10_000, 1_000), (250, 1_000)];
+        assert_eq!(block_package_rates(&txs, &[(0, 1)]), vec![40_000, 1_000]);
+    }
+
+    #[test]
+    fn block_package_rates_take_the_best_ancestor_set_first() {
+        // a -> b -> c: {a,b,c} = 12000/750 vB = 16000 beats {a} = 4000
+        // and {a,b} = 2000/500 vB = 4000
+        let txs = [(1_000, 1_000), (1_000, 1_000), (10_000, 1_000)];
+        let rates = block_package_rates(&txs, &[(0, 1), (1, 2)]);
+        assert_eq!(rates, vec![16_000, 16_000, 16_000]);
+    }
+
+    #[test]
+    fn block_package_rates_share_one_rate_past_the_component_cap() {
+        let n = BLOCK_PACKAGE_MAX_TXS as u32 + 1;
+        let txs: Vec<(u64, u64)> = (0..n).map(|i| (u64::from(i) * 100, 1_000)).collect();
+        let edges: Vec<(u32, u32)> = (1..n).map(|i| (i - 1, i)).collect();
+        let fee: u64 = txs.iter().map(|t| t.0).sum();
+        let whole = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, u64::from(n) * 1_000);
+        assert!(block_package_rates(&txs, &edges)
+            .iter()
+            .all(|&r| r == whole));
+    }
+
+    #[test]
+    fn block_p10_drops_rates_below_min_relay() {
+        // an out-of-band zero-fee tx is dropped; a CPFP'd zero-fee parent counts
+        let mut txs = vec![(0, 1_000), (0, 1_000), (5_000, 1_000)];
+        let edges = [(1, 2)];
+        for i in 1..=9u64 {
+            txs.push((i * 250, 1_000));
+        }
+        // rates: 10000, 10000 and 1000..=9000; p10 of 11 samples is index 1
+        assert_eq!(block_p10_sat_kvb(&txs, &edges, 100), Some(2_000));
+        assert_eq!(block_p10_sat_kvb(&[(0, 1_000)], &[], 100), None);
     }
 }
