@@ -2480,6 +2480,19 @@ fn filter_q<T>(r: Result<T, rbitcoin_store::StoreError>) -> Result<T, NetError> 
     r.map_err(|e| NetError::Consensus(e.to_string()))
 }
 
+fn on_compact_filters(
+    payload: &NetworkMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+) -> Result<(), NetError> {
+    match payload {
+        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, m),
+        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
+        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
+        _ => Ok(()),
+    }
+}
+
 fn on_getcfilters(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -2623,9 +2636,9 @@ fn handle_peer_inventory_msg(
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
-        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, m)?,
-        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m)?,
-        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m)?,
+        NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx)?,
         NetworkMessage::Unknown { .. }
         | NetworkMessage::GetData(_)
         | NetworkMessage::Block(_)

@@ -802,6 +802,12 @@ async fn pin_rest_block_and_tx(rpc_addr: SocketAddr, tip: &str, txid: &str) {
     let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/block/{tip}.bin")).await;
     assert_eq!(st, 200);
     assert!(raw.len() > 80, "block bin");
+    let (st, body) = http_get(
+        rpc_addr,
+        "/rest/block/0000000000000000000000000000000000000000000000000000000000000000.json",
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
 
     let (st, body) = http_get(rpc_addr, &format!("/rest/tx/{txid}.json")).await;
     assert_eq!(st, 200, "{body}");
@@ -899,6 +905,14 @@ async fn pin_scantxoutset_drops_spent_coinbase(rpc_addr: SocketAddr, spent_cb: &
         uns.iter().any(|u| u["coinbase"] == false),
         "scan must still see a non-coinbase unspent: {scan}"
     );
+    let xpub = "pkh(tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp/0/*)";
+    let ranged = jsonrpc(
+        rpc_addr,
+        "scantxoutset",
+        json!(["start", [{"desc": xpub, "range": 1}]]),
+    )
+    .await;
+    assert_eq!(ranged["result"]["success"], true, "{ranged}");
 }
 
 async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {

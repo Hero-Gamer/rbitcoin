@@ -69,6 +69,9 @@ fn open_padded_query(dir: &TempDir) -> Query {
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
+    q.set_block_filter_index(true);
+    q.backfill_block_filters()
+        .expect("basic filters through the pad");
     P2PNode::start(
         "127.0.0.1:0".parse().unwrap(),
         q,
@@ -651,6 +654,86 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         .expect("p2p_timeout_getaddr_and_keepalive_ping wall timeout (20s)");
 }
 
+/// Peer asks the seeder for basic filters, headers, and checkpoints at `stop`.
+async fn pin_compact_filters(peer: &P2PNode, stop: BlockHash) {
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
+
+    wait_ms_until(
+        3_000,
+        || {
+            peer.peers.live_peers().into_iter().any(|p| {
+                !p.inbound
+                    && p.handshake_complete()
+                    && p.queue_msg(NetworkMessage::GetCFilters(GetCFilters {
+                        filter_type: 0,
+                        start_height: 0,
+                        stop_hash: stop,
+                    }))
+            })
+        },
+        || {
+            format!(
+                "outbound must take getcfilters (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+    wait_ms_until(
+        5_000,
+        || {
+            peer.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| !p.inbound && p.bytesrecv_per_msg.get("cfilter").copied().unwrap_or(0) > 0)
+        },
+        || {
+            format!(
+                "seed must answer cfilter (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+    let queued = peer.peers.live_peers().into_iter().any(|p| {
+        !p.inbound
+            && p.handshake_complete()
+            && p.queue_msg(NetworkMessage::GetCFHeaders(GetCFHeaders {
+                filter_type: 0,
+                start_height: 0,
+                stop_hash: stop,
+            }))
+            && p.queue_msg(NetworkMessage::GetCFHeaders(GetCFHeaders {
+                filter_type: 0,
+                start_height: 1,
+                stop_hash: stop,
+            }))
+            && p.queue_msg(NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                filter_type: 0,
+                stop_hash: stop,
+            }))
+    });
+    assert!(queued, "outbound must take cfheaders and cfcheckpt");
+    wait_ms_until(
+        5_000,
+        || {
+            peer.peers.snapshot().into_iter().any(|p| {
+                !p.inbound
+                    && p.bytesrecv_per_msg.get("cfheaders").copied().unwrap_or(0) > 0
+                    && p.bytesrecv_per_msg.get("cfcheckpt").copied().unwrap_or(0) > 0
+            })
+        },
+        || {
+            format!(
+                "seed must answer cfheaders and cfcheckpt (peer={:?})",
+                peer.peers.snapshot()
+            )
+        },
+    )
+    .await;
+}
+
 fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
     let tip = node.hub.tip_hash().expect("tip hash");
     let tip_time = node.hub.tip_header().expect("tip header").time;
@@ -690,6 +773,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             peer.follow_live_count() >= 1,
             "outbound follow must stay live"
         );
+        pin_compact_filters(&peer, seed.hub.tip_hash().expect("pad tip")).await;
 
         let h_empty = mine_on(&seed, pad_h + 1);
         peer.wait_tip_hash(h_empty, Duration::from_secs(5))
