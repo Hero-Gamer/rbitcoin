@@ -210,8 +210,9 @@ Point Node `ESPLORA.UNIX_SOCKET_PATH` at `--esplora-listen
 `/internal/*` is available. Put the sock in `/run/rbitcoin` (**0750**,
 rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
 tree is `0700`. TCP `--esplora-listen host:port` is public REST+WS only (no
-`/internal`). Core RPC is `{datadir}/rpc.sock` plus the `bitcoin-client`
-`socketPath` patch below — **not** `COOKIE_PATH` / HTTP Basic. Requires
+`/internal`). Core RPC is `--rpc-socket /run/rbitcoin/rpc.sock` (mode
+**0660**) plus the `bitcoin-client` `socketPath` patch below — **not**
+`COOKIE_PATH` / HTTP Basic. Requires
 `--sh-index`. The default `--max-sh-creates` is 10000; set 0 for an unlimited unpaged join.
 
 ```bash
@@ -223,12 +224,13 @@ sudo chmod 0750 /run/rbitcoin
   --datadir ./datadir-mainnet \
   --network mainnet \
   --sh-index \
-  --rpc \
+  --rpc-socket /run/rbitcoin/rpc.sock \
   --esplora-listen /run/rbitcoin/esplora.sock \
   --log-level info
 ```
 
-Same UID as rbitcoin for mempool Node (`rpc.sock` is **0600**). First start
+Run mempool Node as a user in rbitcoin's group; both sockets are **0660**
+and `/run/rbitcoin` is **0750**. First start
 must import `pools-v2.json` or every block is **Unknown**: `npm run start
 --update-pools` (needs GitHub, or point `POOLS_JSON_URL` /
 `POOLS_JSON_TREE_URL` at a local mirror). `SELECT COUNT(*) FROM pools` is
@@ -239,6 +241,8 @@ sync + rust-gbt; they are empty until `/internal/mempool/txs` has filled.
 
 Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
 `{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
+`--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a
+client in rbitcoin's group can connect without traversing the `0700` datadir.
 `--rpc-listen` adds TCP on `127.0.0.1:<network port>` when ADDR is omitted
 (mainnet 8332, testnet 18332, signet 38332, regtest 18443). TCP auth is
 `Authorization: Bearer` from `{datadir}/rpc.token` (0600). See
@@ -248,9 +252,10 @@ Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
 Their unix config is Esplora, not bitcoind. Point their Node at this
 socket with a small patch to `backend/src/api/bitcoin/bitcoin-client.ts`
 (same `socketPath` + dummy `http://rpc/` pattern as
-`ESPLORA.UNIX_SOCKET_PATH`). Do **not** send `Authorization`. Run their
-Node as the **same UID** as rbitcoin (0600); or `chmod 0660` and a shared
-group. TCP `--rpc-listen` stays Bearer — that is not the mempool recipe.
+`ESPLORA.UNIX_SOCKET_PATH`). Do **not** send `Authorization`. Bind the
+socket with `--rpc-socket /run/rbitcoin/rpc.sock` (0660) and run their Node
+in rbitcoin's group, or run it as the **same UID** with the default 0600
+`{datadir}/rpc.sock`. TCP `--rpc-listen` stays Bearer — that is not the mempool recipe.
 
 ```bash
 ./target/release/rbitcoin-node \

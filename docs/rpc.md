@@ -22,6 +22,7 @@ Esplora** (with `--sh-index`) for address/script history.
 | Knob | Default | Meaning |
 |------|---------|---------|
 | `--rpc` / conf `rpc=` | **off** | Unix JSON-RPC `{datadir}/rpc.sock` (mode 0600; filesystem auth) |
+| `--rpc-socket PATH` / conf `rpc_socket=` | **off** | Bind the unix socket at PATH (mode **0660**, group may connect) instead of `{datadir}/rpc.sock`. Implies `--rpc`. For a client running as another user, such as mempool's Node. |
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
 | `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |

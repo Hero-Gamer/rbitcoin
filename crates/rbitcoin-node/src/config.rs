@@ -232,8 +232,10 @@ pub struct RpcOpts {
     pub listen: Option<SocketAddr>,
     /// `--rpc-listen` was set with no ADDR; resolve after `--network`.
     pub listen_default: bool,
-    /// Unix socket at `{datadir}/rpc.sock` (`--rpc` or `--rpc-listen`).
+    /// Unix JSON-RPC socket (`--rpc`, `--rpc-listen`, or `--rpc-socket`).
     pub socket: bool,
+    /// `--rpc-socket`: bind here, mode 0660, instead of `{datadir}/rpc.sock` (0600).
+    pub socket_path: Option<PathBuf>,
     /// Override `{datadir}/rpc.token`.
     pub token_file: Option<PathBuf>,
     pub work_queue: Option<usize>,
@@ -245,6 +247,7 @@ impl Default for RpcOpts {
             listen: None,
             listen_default: false,
             socket: false,
+            socket_path: None,
             token_file: None,
             work_queue: Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE),
         }
@@ -661,9 +664,12 @@ impl NodeConfig {
             .unwrap_or_else(|| rbitcoin_rpc::default_token_path(self.datadir.path()))
     }
 
-    /// `{datadir}/rpc.sock`.
+    /// `--rpc-socket`, else `{datadir}/rpc.sock`.
     pub fn rpc_socket_path(&self) -> PathBuf {
-        rbitcoin_rpc::default_socket_path(self.datadir.path())
+        self.rpc
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| rbitcoin_rpc::default_socket_path(self.datadir.path()))
     }
 
     /// Owner-only mode for a directory this process just created.
@@ -1005,6 +1011,13 @@ impl NodeConfig {
                     "rpcuser/rpcpassword removed; unix socket --rpc or Bearer {datadir}/rpc.token"
                         .into(),
                 ));
+            }
+            "rpc_socket" => {
+                if val.is_empty() {
+                    return Err(NodeError::Config("conf rpc_socket requires a path".into()));
+                }
+                self.rpc.socket = true;
+                self.rpc.socket_path = Some(PathBuf::from(val));
             }
             "rpc_token_file" => {
                 if val.is_empty() {
@@ -1439,6 +1452,23 @@ mod tests {
         rpc.resolve_listen_defaults();
         assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
         assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn rpc_socket_moves_the_socket_out_of_the_datadir() {
+        let mut c = NodeConfig::default().with_datadir(Path::new("/var/lib/rbitcoin"));
+        assert_eq!(c.rpc_socket_path(), Path::new("/var/lib/rbitcoin/rpc.sock"));
+        assert_eq!(
+            c.apply_kv("rpc_socket", "/run/rbitcoin/rpc.sock").unwrap(),
+            ConfApply::Applied
+        );
+        assert!(c.rpc.socket, "rpc_socket implies rpc");
+        assert_eq!(c.rpc_socket_path(), Path::new("/run/rbitcoin/rpc.sock"));
+        let err = NodeConfig::default()
+            .apply_kv("rpc_socket", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rpc_socket requires a path"), "{err}");
     }
 
     #[test]

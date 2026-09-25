@@ -847,7 +847,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
-    cfg.rpc.socket = true;
+    // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
+    let rpc_sock = td.path().join("run").join("rpc.sock");
+    cfg.apply_kv("rpc_socket", rpc_sock.to_str().unwrap())
+        .unwrap();
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     cfg.max_run_secs = Some(90);
 
@@ -856,12 +859,18 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     pin_address_prefix_404(esplora_addr).await;
     #[cfg(unix)]
     {
-        let rpc_sock = td.path().join("rpc.sock");
+        use std::os::unix::fs::PermissionsExt;
         wait_unix_socket(&rpc_sock).await;
+        let mode = std::fs::metadata(&rpc_sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o660,
+            "--rpc-socket is group-accessible, got {mode:o}"
+        );
+        assert!(!td.path().join("rpc.sock").exists(), "no datadir rpc.sock");
         let unix_count = jsonrpc_unix(&rpc_sock, "getblockcount", json!([])).await;
         assert_eq!(
             unix_count["result"], 106,
-            "unix rpc.sock getblockcount without Authorization: {unix_count}"
+            "unix --rpc-socket getblockcount without Authorization: {unix_count}"
         );
     }
 
