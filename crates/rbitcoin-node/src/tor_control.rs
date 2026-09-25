@@ -2,16 +2,13 @@
 
 use crate::error::NodeError;
 use bitcoin::hex::DisplayHex;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use bitcoin_hashes::{hmac, sha256, Hash, HashEngine};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SAFECOOKIE_SERVER_KEY: &[u8] = b"Tor safe cookie authentication server-to-controller hash";
 const SAFECOOKIE_CLIENT_KEY: &[u8] = b"Tor safe cookie authentication controller-to-server hash";
@@ -401,12 +398,9 @@ fn hex_nybble(b: u8) -> Option<u8> {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let out = mac.finalize().into_bytes();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&out);
-    arr
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(key);
+    engine.input(data);
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
 }
 
 fn write_key_file(path: &Path, key: &str) -> Result<(), NodeError> {
@@ -433,6 +427,34 @@ fn write_key_file(path: &Path, key: &str) -> Result<(), NodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 4231 HMAC-SHA-256. Case 1 is a short key; case 4 hashes the key
+    /// because it is longer than the SHA-256 block.
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        let short = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            short,
+            [
+                0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+                0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+                0x2e, 0x32, 0xcf, 0xf7,
+            ]
+        );
+        let long = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            long,
+            [
+                0x60, 0xe4, 0x31, 0x59, 0x1e, 0xe0, 0xb6, 0x7f, 0x0d, 0x8a, 0x26, 0xaa, 0xcb, 0xf5,
+                0xb7, 0x7f, 0x8e, 0x0b, 0xc6, 0x21, 0x37, 0x28, 0xc5, 0x14, 0x05, 0x46, 0x04, 0x0f,
+                0x0e, 0xe3, 0x7f, 0x54,
+            ]
+        );
+    }
+
     use bitcoin::hex::DisplayHex;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
