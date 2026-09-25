@@ -1949,6 +1949,41 @@ impl TxTable {
             })
     }
 
+    /// `(tx index, multi, field)` for every annotated output slot in `ranges`
+    /// (`spent.body` `(offset, len)` per tx). Ranges that sit back to back
+    /// on disk, as one block's txs do, are read as one span.
+    pub(crate) fn spent_fields(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<(u32, bool, Fk)>, StoreError> {
+        let slot = OutputRecord::SPENT_SLOT_LEN;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < ranges.len() {
+            let mut j = i + 1;
+            while j < ranges.len() && ranges[j].0 == ranges[j - 1].0 + ranges[j - 1].1 {
+                j += 1;
+            }
+            let start = ranges[i].0;
+            let end = ranges[j - 1].0 + ranges[j - 1].1;
+            self.spent.with_bytes_at(start, end - start, |raw| {
+                for (k, &(off, len)) in ranges[i..j].iter().enumerate() {
+                    let at = (off - start) as usize;
+                    for s in raw[at..at + len as usize].chunks_exact(slot) {
+                        let (flags, field, _vin) = decode_spent_slot(s)?;
+                        if !field.is_null() {
+                            let multi = flags & output_flags::MULTI_SPENDER != 0;
+                            out.push(((i + k) as u32, multi, field));
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            i = j;
+        }
+        Ok(out)
+    }
+
     /// One packed body walk: spender meta for many vouts (ascending).
     ///
     /// Returns `(vout, multi, field)` for each found vout. Missing vouts omitted.

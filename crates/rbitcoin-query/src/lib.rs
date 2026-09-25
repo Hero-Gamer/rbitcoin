@@ -27,7 +27,7 @@ mod write_create_loc;
 #[cfg(debug_assertions)]
 pub use combined_stage::{body_ok_reads, reset_body_ok_reads};
 pub use combined_stage::{load_creates_once, CombinedCreate};
-pub use reconstruct::StampedTxstatBlock;
+pub use reconstruct::{BlockFeeRows, StampedTxstatBlock};
 pub use resolved_wire::{BlockQueueWaveIntake, ResolvedWire};
 pub use soft_densify::{
     bq_assign_stop_bytes, soft_assign_restricted, soft_confirm_window_covered,
