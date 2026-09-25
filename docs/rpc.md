@@ -147,7 +147,7 @@ still wait for durable SH when shindex is on.
 | Core `generate*` as a mining product | **Regtest harness only.** `submitblock` is the same receive path as P2P |
 | `combinerawtransaction` / `createrawtransaction` / `signrawtransactionwithkey` / `createmultisig` / `deriveaddresses` | Not implemented (harness proxy only) |
 | Decode Core dialect | Node `decodescript` omits wrap/`desc`; `validateaddress` omits `error_locations`; `decoderawtransaction` asm is rust-bitcoin. Official scripts stay `rpc-dialect`. |
-| `gettxoutsetinfo` hash / `muhash` / assumeutxo | No coins DB. The method returns `height`, `bestblock`, and a confirmed unspent `txouts` count only. |
+| `gettxoutsetinfo` | No UTXO set. Not implemented. |
 | Address history via Core method names | Use Electrum/Esplora with `--sh-index` |
 | Exact Core JSON field-for-field | Best-effort |
 | Multi-user `rpcauth` / method whitelist | Future |

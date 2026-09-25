@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from rpc_proxy import RpcError
+from rpc_proxy import RpcError, shim_gettxoutsetinfo
 
 HERE = Path(__file__).resolve().parent
 CORE_FUNC = HERE.parents[1] / "third_party" / "bitcoin" / "test" / "functional"
@@ -163,6 +163,24 @@ def register_utility(proxy) -> None:
     proxy.register("deriveaddresses", deriveaddresses)
     # Core sync_mempools; the node has no wallet/index callback queue.
     proxy.register("syncwithvalidationinterfacequeue", lambda _: None)
+
+    def _node_result(method: str) -> Any:
+        r = proxy.forward({"jsonrpc": "1.0", "id": 0, "method": method, "params": []})
+        if not isinstance(r, dict):
+            raise RpcError(-1, "node returned non-object")
+        err = r.get("error")
+        if isinstance(err, dict):
+            raise RpcError(int(err.get("code", -1)), str(err.get("message", err)))
+        if err:
+            raise RpcError(-1, str(err))
+        return r.get("result")
+
+    def gettxoutsetinfo(_params: Any) -> dict[str, Any]:
+        return shim_gettxoutsetinfo(
+            _node_result("getblockcount"), _node_result("getbestblockhash")
+        )
+
+    proxy.register("gettxoutsetinfo", gettxoutsetinfo)
 
 
 def createrawtransaction(params: Any) -> str:

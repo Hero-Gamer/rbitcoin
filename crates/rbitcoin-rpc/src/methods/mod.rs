@@ -496,13 +496,13 @@ pub(crate) fn dispatch_inner(
         "getmempoolfeeratediagram" => getmempoolfeeratediagram(ctx, &params),
         "submitpackage" => submitpackage(ctx, &params),
         "gettxspendingprevout" => gettxspendingprevout(ctx, &params),
-        "gettxoutsetinfo" => gettxoutsetinfo(ctx, &params),
         "getblockfilter" => getblockfilter(ctx, &params),
         "createrawtransaction"
         | "signrawtransactionwithkey"
         | "createmultisig"
         | "combinerawtransaction"
-        | "deriveaddresses" => Err(rpc_error(
+        | "deriveaddresses"
+        | "gettxoutsetinfo" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
         )),
@@ -637,7 +637,6 @@ const METHOD_LIST: &[&str] = &[
     "generateblock",
     "generate",
     "scantxoutset",
-    "gettxoutsetinfo",
     "getblockfilter",
     "gettxout",
     "getindexinfo",

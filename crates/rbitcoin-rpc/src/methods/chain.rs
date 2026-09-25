@@ -578,31 +578,6 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
     }))
 }
 
-/// Height, tip, and confirmed unspent count. No coins-DB hash.
-pub(crate) fn gettxoutsetinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["hash_type", "hash_or_height", "use_index"])?;
-    let tip = ctx.query.tip_height().unwrap_or(Height(0));
-    let best = if let Some(h) = ctx.query.tip_height() {
-        ctx.query
-            .header_at_height(h)
-            .ok()
-            .flatten()
-            .map(|(_, rec)| hash_hex_display(&rec.hash))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let txouts = ctx
-        .query
-        .confirmed_unspent_txouts()
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    Ok(json!({
-        "height": tip.0,
-        "bestblock": best,
-        "txouts": txouts,
-    }))
-}
-
 pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash", "filtertype"])?;
     let hex = params.req_str(0, "blockhash")?;

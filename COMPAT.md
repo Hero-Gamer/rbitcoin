@@ -122,7 +122,7 @@ Per-method notes, auth, and the shindex matrix live in
 | Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness (regtest only except `submitblock`) |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | done |
 | Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster`) | done (no stratum / BIP9 testdummy / wallet keys) |
-| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; `gettxoutsetinfo` hash / assumeutxo | **never** (`gettxoutsetinfo` returns height, tip, and a confirmed unspent count; no coins-DB hash) |
+| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; `gettxoutsetinfo` | **never** (no UTXO set). The functional harness shims `gettxoutsetinfo` for `rpc_scantxoutset.py` |
 
 ## Electrum surface
 

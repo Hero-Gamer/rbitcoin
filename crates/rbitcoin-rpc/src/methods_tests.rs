@@ -898,6 +898,15 @@ fn unsupported_methods_error() {
     let (ctx, dir) = ctx_empty();
     let e2 = dispatch(&ctx, "combinerawtransaction", vec![]).unwrap_err();
     assert_eq!(e2["code"], ERR_METHOD_NOT_FOUND);
+    let utxo = dispatch(&ctx, "gettxoutsetinfo", vec![]).unwrap_err();
+    assert_eq!(utxo["code"], ERR_METHOD_NOT_FOUND);
+    assert!(
+        utxo["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not supported"),
+        "{utxo}"
+    );
     let e3 = dispatch(&ctx, "syncwithvalidationinterfacequeue", vec![]).unwrap_err();
     assert_eq!(e3["code"], ERR_METHOD_NOT_FOUND);
     assert_eq!(e3["message"], "Method not found");
@@ -906,7 +915,7 @@ fn unsupported_methods_error() {
         .as_str()
         .unwrap()
         .lines()
-        .any(|l| l == "syncwithvalidationinterfacequeue"));
+        .any(|l| { l == "syncwithvalidationinterfacequeue" || l == "gettxoutsetinfo" }));
     let info = dispatch(&ctx, "getrpcinfo", vec![]).unwrap();
     let listed: Vec<&str> = info["methods"]
         .as_array()
@@ -915,6 +924,7 @@ fn unsupported_methods_error() {
         .filter_map(|v| v.as_str())
         .collect();
     assert!(!listed.contains(&"syncwithvalidationinterfacequeue"));
+    assert!(!listed.contains(&"gettxoutsetinfo"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1074,7 +1084,6 @@ fn all_methods_callable_empty_or_error() {
         ("getblocktemplate", vec![]),
         ("combinerawtransaction", vec![]),
         ("generatetoaddress", vec![]),
-        ("gettxoutsetinfo", vec![]),
     ] {
         let _ = dispatch(&ctx, m, &params);
     }

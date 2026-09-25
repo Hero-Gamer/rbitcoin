@@ -145,25 +145,9 @@ _TMA_ABORT = frozenset(
 )
 
 
-def scantxoutset_objects_empty(item: dict[str, Any]) -> bool:
-    """True for `scantxoutset("start", [])` (positional or named)."""
-    params = item.get("params", [])
-    if isinstance(params, list):
-        return len(params) >= 2 and params[1] == []
-    if isinstance(params, dict):
-        return params.get("scanobjects") == []
-    return False
-
-
-def align_empty_scantxoutset_txouts(
-    item: dict[str, Any], parsed: dict[str, Any], txouts: Any
-) -> None:
-    """Copy a coins-DB count onto an empty scan. Other scans stay `-1`."""
-    if item.get("method") != "scantxoutset" or not scantxoutset_objects_empty(item):
-        return
-    result = parsed.get("result")
-    if isinstance(result, dict) and "txouts" in result:
-        result["txouts"] = txouts
+def shim_gettxoutsetinfo(height: Any, bestblock: Any) -> dict[str, Any]:
+    """Harness stand-in. No UTXO set, so `txouts` is -1."""
+    return {"height": height, "bestblock": bestblock, "txouts": -1}
 
 
 def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None:
@@ -370,23 +354,6 @@ class RpcProxy:
             return {"result": result, "error": None, "id": req_id}
         return self.forward(item)
 
-    def _align_empty_scantxoutset(self, item: dict[str, Any], parsed: dict[str, Any]) -> None:
-        if item.get("method") != "scantxoutset" or not scantxoutset_objects_empty(item):
-            return
-        info = self.forward(
-            {
-                "jsonrpc": "1.0",
-                "id": item.get("id"),
-                "method": "gettxoutsetinfo",
-                "params": [],
-            }
-        )
-        got = info.get("result") if isinstance(info, dict) else None
-        txouts = got.get("txouts") if isinstance(got, dict) else None
-        if txouts is None:
-            return
-        align_empty_scantxoutset_txouts(item, parsed, txouts)
-
     def forward(self, item: dict[str, Any]) -> dict[str, Any]:
         cookie = self.cookie_line() or ""
         body = json.dumps(item).encode()
@@ -434,7 +401,6 @@ class RpcProxy:
             }
         if isinstance(parsed, dict):
             rewrite_testmempoolaccept_abort(item.get("method"), parsed)
-            self._align_empty_scantxoutset(item, parsed)
             return parsed
         return {
             "result": None,

@@ -21,9 +21,8 @@ from rpc_proxy import (
     node_rpc_port,
     peel_authproxy_args,
     rewrite_core_maxfeerate,
-    align_empty_scantxoutset_txouts,
     rewrite_testmempoolaccept_abort,
-    scantxoutset_objects_empty,
+    shim_gettxoutsetinfo,
 )
 
 seq = {
@@ -43,18 +42,8 @@ seq = {
         },
     ]
 }
-empty_scan = {"method": "scantxoutset", "params": ["start", []]}
-assert scantxoutset_objects_empty(empty_scan)
-filled = {"method": "scantxoutset", "params": ["start", [{"desc": "raw(51)"}]]}
-assert not scantxoutset_objects_empty(filled)
-named_empty = {"method": "scantxoutset", "params": {"action": "start", "scanobjects": []}}
-assert scantxoutset_objects_empty(named_empty)
-scan_body = {"result": {"success": True, "txouts": -1, "unspents": []}}
-align_empty_scantxoutset_txouts(empty_scan, scan_body, 7)
-assert scan_body["result"]["txouts"] == 7
-filled_body = {"result": {"success": True, "txouts": -1}}
-align_empty_scantxoutset_txouts(filled, filled_body, 7)
-assert filled_body["result"]["txouts"] == -1
+info = shim_gettxoutsetinfo(3, "ab" * 32)
+assert info == {"height": 3, "bestblock": "ab" * 32, "txouts": -1}, info
 rewrite_testmempoolaccept_abort("testmempoolaccept", seq)
 assert seq["result"][0] == {"txid": "aa", "wtxid": "wa"}, seq
 assert seq["result"][1]["reject-reason"] == "missing-inputs", seq

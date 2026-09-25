@@ -58,10 +58,11 @@ arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
 maxfeerate overlay. Production (unset) is sequential admit. The RPC proxy
 rewrites multi-tx `testmempoolaccept` abort-class rows (`missing-inputs` /
 `max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
-node keeps earlier `allowed: true`. An empty `scantxoutset` `start` copies
-`txouts` from `gettxoutsetinfo` (production always returns `-1`; the count
-is not computed). `rpc_packages.py` `run` includes that named shim dialect
-(same honesty as `WAIT_TIP_IDLE`).
+node keeps earlier `allowed: true`. The proxy answers `gettxoutsetinfo`
+with `getblockcount`, `getbestblockhash`, and `txouts: -1` so
+`rpc_scantxoutset.py` can compare an empty scan. The node does not
+implement that method. `rpc_packages.py` `run` includes that named shim
+dialect (same honesty as `WAIT_TIP_IDLE`).
 
 ```bash
 ./scripts/core-functional/bitcoind.test.sh
