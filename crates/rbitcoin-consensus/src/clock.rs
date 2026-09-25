@@ -60,6 +60,16 @@ pub fn current_now() -> u64 {
     NOW_OVERRIDE.with(|c| c.get()).unwrap_or_else(wall_now)
 }
 
+impl NodeClock {
+    /// Freeze wall time to the current value while executing `f`.
+    /// Uses the existing thread-local `with_now` mechanism so tests
+    /// see a consistent timestamp throughout the operation.
+    pub fn with_frozen<R>(&self, f: impl FnOnce() -> R) -> R {
+        let frozen = self.now_secs();
+        with_now(frozen, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
