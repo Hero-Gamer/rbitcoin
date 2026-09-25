@@ -608,10 +608,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn internal_txs() {
-        let pad = pad_hub("internal-txs", 3);
-        let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-        pad.hub.accept_tx(&a).unwrap();
+    #[tokio::test]
+    async fn esplora_unix_internal() {
+        let pad = pad_hub("unix-internal", 3);
+        let mem_tx = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        pad.hub.accept_tx(&mem_tx).unwrap();
         let (handle, sock) = run_unix(
             pad.dir.as_ref(),
             Arc::clone(&pad.q),
@@ -619,7 +620,7 @@ mod tests {
         )
         .await;
         let conf = pad.cbs[1].to_string();
-        let mem = a.compute_txid().to_string();
+        let mem = mem_tx.compute_txid().to_string();
         let unknown = "00".repeat(32);
         let body = serde_json::to_vec(&json!([conf, mem, unknown])).unwrap();
         let (st, resp) = http_post_unix(&sock, "/internal/txs", &body).await;
@@ -631,32 +632,54 @@ mod tests {
         let (st, resp) = http_post_unix(&sock, "/internal/txs", b"[]").await;
         assert_eq!(st, 200, "{resp}");
         assert_eq!(resp, "[]");
-        handle.shutdown().await;
-        let _ = pad.dir;
-    }
 
-    #[cfg(unix)]
-    async fn internal_mempool_txs_post() {
-        let pad = pad_hub("internal-mp-post", 3);
-        let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-        pad.hub.accept_tx(&a).unwrap();
-        let (handle, sock) = run_unix(
-            pad.dir.as_ref(),
-            Arc::clone(&pad.q),
-            Some(Arc::clone(&pad.hub)),
-        )
-        .await;
-        let conf = pad.cbs[1].to_string();
-        let mem = a.compute_txid().to_string();
         let body = serde_json::to_vec(&json!([conf, mem])).unwrap();
         let (st, resp) = http_post_unix(&sock, "/internal/mempool/txs", &body).await;
         assert_eq!(st, 200, "{resp}");
         let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
         assert_eq!(arr.len(), 1, "confirmed omitted: {resp}");
+
+        let g = pad.genesis.to_string();
+        let (st, body) = http_get_unix(&sock, &format!("/internal/block/{g}/txs")).await;
+        assert_eq!(st, 200, "{body}");
+        let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(arr.len(), 1, "genesis coinbase");
+        assert_eq!(arr[0]["vin"][0]["is_coinbase"], true);
+        let (st, ids) = http_get_unix(&sock, &format!("/block/{g}/txids")).await;
+        assert_eq!(st, 200, "{ids}");
+        let txids: Vec<String> = serde_json::from_str(&ids).unwrap();
+        assert_eq!(arr.len(), txids.len());
+        assert_eq!(arr[0]["txid"].as_str(), Some(txids[0].as_str()));
+        let (st, pubp) = http_get_unix(&sock, &format!("/block/{g}/txs")).await;
+        assert_eq!(st, 200, "{pubp}");
+        let pub_arr: Vec<Value> = serde_json::from_str(&pubp).unwrap();
+        assert_eq!(pub_arr.len(), 1);
+        let (st, miss) =
+            http_get_unix(&sock, &format!("/internal/block/{}/txs", "11".repeat(32))).await;
+        assert_eq!(st, 404, "{miss}");
+
+        let spent = pad.cbs[0].to_string();
+        let unknown = "ff".repeat(32);
+        let body = serde_json::to_vec(&json!([spent, unknown])).unwrap();
+        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
+        assert_eq!(st, 200, "{resp}");
+        let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+        assert_eq!(arr.len(), 2, "same-length slots");
+        assert_eq!(arr[0][0]["spent"], true);
+        assert!(arr[0][0].get("vin").is_some(), "{resp}");
+        assert_eq!(arr[1], json!([]));
+        let op = format!("{spent}:0");
+        let body = serde_json::to_vec(&json!([op, "bad"])).unwrap();
+        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-outpoint", &body).await;
+        assert_eq!(st, 200, "{resp}");
+        let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["spent"], true);
+        assert_eq!(arr[1]["spent"], false);
+
         handle.shutdown().await;
         let _ = pad.dir;
     }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn internal_mempool_txs_page() {
@@ -761,64 +784,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn internal_block_txs() {
-        let pad = pad_hub("internal-block-txs", 1);
-        let (handle, sock) = run_unix(pad.dir.as_ref(), Arc::clone(&pad.q), None).await;
-        let g = pad.genesis.to_string();
-        let (st, body) = http_get_unix(&sock, &format!("/internal/block/{g}/txs")).await;
-        assert_eq!(st, 200, "{body}");
-        let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(arr.len(), 1, "genesis coinbase");
-        assert_eq!(arr[0]["vin"][0]["is_coinbase"], true);
-        let (st, ids) = http_get_unix(&sock, &format!("/block/{g}/txids")).await;
-        assert_eq!(st, 200, "{ids}");
-        let txids: Vec<String> = serde_json::from_str(&ids).unwrap();
-        assert_eq!(arr.len(), txids.len());
-        assert_eq!(arr[0]["txid"].as_str(), Some(txids[0].as_str()));
-        let (st, pubp) = http_get_unix(&sock, &format!("/block/{g}/txs")).await;
-        assert_eq!(st, 200, "{pubp}");
-        let pub_arr: Vec<Value> = serde_json::from_str(&pubp).unwrap();
-        assert_eq!(pub_arr.len(), 1);
-        let (st, miss) =
-            http_get_unix(&sock, &format!("/internal/block/{}/txs", "11".repeat(32))).await;
-        assert_eq!(st, 404, "{miss}");
-        handle.shutdown().await;
-        let _ = pad.dir;
-    }
-
-    #[cfg(unix)]
-    async fn internal_outspends() {
-        let pad = pad_hub("internal-outspends", 3);
-        let a = spend_true(pad.cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-        pad.hub.accept_tx(&a).unwrap();
-        let (handle, sock) = run_unix(
-            pad.dir.as_ref(),
-            Arc::clone(&pad.q),
-            Some(Arc::clone(&pad.hub)),
-        )
-        .await;
-        let spent = pad.cbs[0].to_string();
-        let unknown = "ff".repeat(32);
-        let body = serde_json::to_vec(&json!([spent, unknown])).unwrap();
-        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
-        assert_eq!(st, 200, "{resp}");
-        let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
-        assert_eq!(arr.len(), 2, "same-length slots");
-        assert_eq!(arr[0][0]["spent"], true);
-        assert!(arr[0][0].get("vin").is_some(), "{resp}");
-        assert_eq!(arr[1], json!([]));
-        let op = format!("{}:0", spent);
-        let body = serde_json::to_vec(&json!([op, "bad"])).unwrap();
-        let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-outpoint", &body).await;
-        assert_eq!(st, 200, "{resp}");
-        let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["spent"], true);
-        assert_eq!(arr[1]["spent"], false);
-        handle.shutdown().await;
-        let _ = pad.dir;
-    }
-
     #[tokio::test]
     async fn get_txs_outspends_query() {
         let pad = pad_hub("get-txs-outspends", 3);
@@ -893,14 +858,5 @@ mod tests {
 
         handle.shutdown().await;
         let _ = pad.dir;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn esplora_unix_internal() {
-        internal_txs().await;
-        internal_mempool_txs_post().await;
-        internal_block_txs().await;
-        internal_outspends().await;
     }
 }
