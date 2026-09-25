@@ -1,0 +1,3 @@
+# Optional host client. Not a mutants gate. Same stance as coverage.
+# cargo-mutants ignores this file when the command line passes --exclude.
+exclude_globs = ["crates/rbitcoin-bench/**/*.rs"]

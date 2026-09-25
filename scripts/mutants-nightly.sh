@@ -7,11 +7,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 90 minutes. One workspace suite is the unit of work, and two of them in
-# parallel do not fit a hosted runner, so this is -j 1. An hour finishes
-# only a couple of mutants after setup; 90 minutes can clear a normal day's
-# new mutants and still walk the backlog.
-BUDGET_SEC="${MUTANTS_BUDGET_SEC:-5400}"
+# 5 hours. One workspace suite is the unit of work, and two of them in
+# parallel do not fit a hosted runner, so this is -j 1. The job timeout
+# is 30 minutes longer so the script can stop itself and upload artifacts.
+# GitHub-hosted jobs cannot run longer than 6 hours.
+BUDGET_SEC="${MUTANTS_BUDGET_SEC:-18000}"
 BATCH="${MUTANTS_BATCH:-4}"
 # A mutant that has not finished in 20 minutes is a hang, not a miss.
 MUTANT_TIMEOUT="${MUTANTS_TIMEOUT:-1200}"
@@ -48,7 +48,9 @@ head_sha="$(git rev-parse HEAD)"
 git diff "$new_base"..HEAD --unified=0 -- crates >"$OUT/new.diff" || true
 
 echo "mutants-nightly: listing workspace mutants"
-cargo mutants --workspace --list >"$OUT/all.txt"
+# rbitcoin-bench is an optional host client, not a mutants gate.
+# CLI --exclude replaces exclude_globs in .cargo/mutants.toml (same glob).
+cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' --list >"$OUT/all.txt"
 
 python3 "$ROOT/scripts/mutants_queue.py" order \
   --list "$OUT/all.txt" --diff "$OUT/new.diff" \
@@ -100,7 +102,8 @@ while ((offset < queue_len && SECONDS < deadline)); do
   echo "mutants-nightly: batch at $offset (${#RE_ARGS[@]} regexes, ${remain}s left)"
   set +e
   timeout --signal=TERM --kill-after=60s "$remain" \
-    cargo mutants --workspace --test-workspace=true --baseline=skip \
+    cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' \
+      --test-workspace=true --baseline=skip \
       -j 1 --timeout "$MUTANT_TIMEOUT" \
       "${RE_ARGS[@]}" \
       >"$OUT/batch-$offset.log" 2>&1

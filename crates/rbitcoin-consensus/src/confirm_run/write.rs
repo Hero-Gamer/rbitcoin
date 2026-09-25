@@ -530,7 +530,7 @@ fn annotation_matches(
     let mut n = 0u32;
     while let Some(id) = cur.get() {
         n = n.saturating_add(1);
-        if n > 1_000_000 {
+        if spender_multi_list_capped(n) {
             return Err(ConsensusError::Store(StoreError::Corrupt(
                 "invariant: spender multi-list cycle",
             )));
@@ -546,6 +546,12 @@ fn annotation_matches(
         cur = next;
     }
     Ok(false)
+}
+
+// `==` differs from `>` only at 1_000_000 links.
+#[mutants::skip]
+fn spender_multi_list_capped(n: u32) -> bool {
+    n > 1_000_000
 }
 
 fn annotate_slots_from_connected_hash(

@@ -1,12 +1,16 @@
 # Nightly workspace mutants. Not a required check.
 # New lines since the cursor run first, then a rotating backlog.
-# 90 minute budget, one workspace suite at a time. MISSED is an artifact,
+# 5 hour budget, one workspace suite at a time. MISSED is an artifact,
 # not a failure. Owner: TESTING.md (Mutation testing).
+#
+# 07:47 UTC is 00:47 Pacific during PDT and 23:47 during PST. Minute 47
+# avoids the top-of-hour schedule queue (the 07:00 UTC cron on 2026-09-25
+# did not start until 12:25 UTC).
 
 name: mutants
 on:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "47 7 * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +20,7 @@ permissions:
 jobs:
   mutants-nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 330
     env:
       CARGO_INCREMENTAL: "1"
       CARGO_TERM_COLOR: never

@@ -1387,13 +1387,11 @@ async fn run_ibd_or_skip(
         return CatchUp::Incomplete;
     }
     let target_peers = max_out.clamp(8, 32);
+    // Window, per-peer cap, and stall come from `IbdConfig::default`.
+    // A 5s stall caused reassign storms (clearing 200+ inflight before peers
+    // could deliver mid-chain blocks). Default 30s is enough.
     let ibd_cfg = IbdConfig {
-        window: rbitcoin_net::DEFAULT_IBD_WINDOW,
-        per_peer: rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
         target_peers,
-        // 5s caused reassign storms (clearing 200+ inflight before peers
-        // could deliver mid-chain blocks). Default 30s is enough.
-        stall: std::time::Duration::from_secs(30),
         peers: Some(std::sync::Arc::clone(shared_peers)),
         dialer: node.dialer(),
         ..IbdConfig::default()
@@ -2765,6 +2763,68 @@ mod tests {
         assert!(result.is_ok(), "run_p2p timed out");
         // Incomplete IBD is ok (warn path); should not hang.
         let _ = result.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `IbdConfig` literal in `run_ibd_or_skip` is not built by the config
+    /// journey, so this drives `run_p2p`. A refused connect must flush a fail
+    /// mark into the saved book, and the SOCKS proxy must be the socket dialed.
+    #[tokio::test]
+    async fn run_p2p_refused_connect_flushes_book_and_dials_proxy() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-proxy-{nanos}"));
+        let proxy_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = proxy_l.local_addr().unwrap();
+        let target_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let connect = target_l.local_addr().unwrap();
+        let proxy_hit = Arc::new(AtomicBool::new(false));
+        let target_hit = Arc::new(AtomicBool::new(false));
+        let proxy_flag = Arc::clone(&proxy_hit);
+        let target_flag = Arc::clone(&target_hit);
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = proxy_l.accept() {
+                proxy_flag.store(true, Ordering::SeqCst);
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 16];
+                let _ = sock.read(&mut buf);
+                // No acceptable SOCKS method: the dial fails before CONNECT.
+                let _ = sock.write_all(&[0x05, 0xFF]);
+            }
+        });
+        std::thread::spawn(move || {
+            while target_l.accept().is_ok() {
+                target_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.listen.use_seeds = false;
+        cfg.listen.connect = vec![rbitcoin_net::NetAddr::from_socket(connect)];
+        cfg.listen.proxy = Some(proxy);
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(20), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        let _ = result.unwrap();
+
+        assert!(
+            proxy_hit.load(Ordering::SeqCst),
+            "IBD must dial the configured SOCKS proxy"
+        );
+        assert!(
+            !target_hit.load(Ordering::SeqCst),
+            "SOCKS dial must not open a direct TCP connection to the target"
+        );
+        let book = AddrMan::load(&dir.join("peers")).expect("peers saved");
+        assert!(
+            book.flags(&connect).failed_last_connect(),
+            "IBD must flush the dial failure into the saved peer book"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

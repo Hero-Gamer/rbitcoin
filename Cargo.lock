@@ -680,6 +680,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mutants"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc0287524726960e07b119cebd01678f852f147742ae0d925e6a520dca956126"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -822,6 +828,7 @@ dependencies = [
  "arc-swap",
  "bitcoin",
  "bitcoin_hashes 0.14.101",
+ "mutants",
  "rbitcoin-log",
  "rbitcoin-primitives",
  "rbitcoin-query",
@@ -937,6 +944,7 @@ version = "0.7.99"
 dependencies = [
  "arc-swap",
  "bitcoin",
+ "mutants",
  "rbitcoin-log",
  "rbitcoin-primitives",
  "rbitcoin-store",

@@ -281,11 +281,11 @@ impl Query {
         &self,
         height: Height,
     ) -> Result<Option<Vec<ThinTweakRow>>, QueryError> {
+        // One height: the eligible cap applies only when a later height is added.
         let mut batch = self.load_thin_tweaks_range(
             height,
             ThinTweakRangeLimits {
                 max_heights: 1,
-                max_eligible: usize::MAX,
                 ..ThinTweakRangeLimits::default()
             },
         )?;
