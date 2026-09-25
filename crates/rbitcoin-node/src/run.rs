@@ -145,6 +145,21 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     });
 }
 
+/// Backfill far-target fee history from the chain once relay is on, off the
+/// tip path (~1008 blocks of `txstat` + `spent` reads, no bodies).
+fn spawn_fee_history_backfill(mempool: &Arc<MempoolHub>) {
+    let mp = Arc::clone(mempool);
+    tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        let t = Instant::now();
+        let n = mp.backfill_block_fee_history();
+        info!(
+            "mempool: fee history from the chain: {n} block(s) in {:.1?}",
+            t.elapsed()
+        );
+    });
+}
+
 async fn mempool_blocking<T: Send + 'static>(
     mp: &Arc<MempoolHub>,
     f: impl FnOnce(&MempoolHub) -> T + Send + 'static,
@@ -601,6 +616,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 node.hub.in_ibd(),
             ) {
                 mempool_blocking(&mempool, |mp| mp.set_relay_enabled(true)).await?;
+                spawn_fee_history_backfill(&mempool);
             }
             let mp_live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
             info!(
@@ -935,6 +951,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 if want_relay != mempool.relay_enabled() {
                     mempool_blocking(&mempool, move |mp| mp.set_relay_enabled(want_relay)).await?;
                     if want_relay {
+                        spawn_fee_history_backfill(&mempool);
                         info!("ibd: leaving IBD — enabling tx relay");
                     } else {
                         info!("ibd: entering IBD — pausing tx relay");

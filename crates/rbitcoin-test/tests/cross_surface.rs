@@ -11,7 +11,7 @@ use rbitcoin_electrum::electrum_scripthash_hex;
 use rbitcoin_node::{run_p2p, NodeConfig};
 use rbitcoin_primitives::{Height, Network};
 use rbitcoin_query::Query;
-use rbitcoin_test::TestDatadir;
+use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -771,6 +771,60 @@ async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Val
         .unwrap_or_else(|_| panic!("electrum {method}: read_line timed out"))
         .unwrap_or_else(|e| panic!("electrum {method}: io {e}"));
     serde_json::from_str(&resp_line).unwrap()
+}
+
+/// A node with a fee-paying block already on disk answers far-target
+/// estimates as soon as it leaves IBD and relay turns on: fee history is
+/// backfilled from the chain, not rebuilt one new block at a time. Core
+/// keeps `fee_estimates.dat` for the same purpose.
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_history_backfills_from_the_chain_when_relay_starts() {
+    let td = TestDatadir::new().unwrap();
+    let params = ChainParams::regtest();
+    let rate = {
+        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+        let chain = build_mature_regtest_with_spend(&q, &params);
+        q.flush().unwrap();
+        let spend = &chain.blocks[chain.spend_height as usize].txdata[1];
+        rbitcoin_consensus::policy::fee_rate_sat_per_kvb(1_0000_0000, spend.weight().to_wu())
+    };
+
+    let rpc_addr = ephemeral_addr();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect.clear();
+    cfg.rpc.listen = Some(rpc_addr);
+    std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
+    cfg.max_run_secs = Some(60);
+    let node = tokio::spawn(run_p2p(cfg));
+    wait_listeners(&[rpc_addr]).await;
+
+    // A fresh tip leaves IBD; the only fee-paying block is below it.
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    assert!(mined["result"].is_array(), "{mined}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fee = loop {
+        let fee = jsonrpc(rpc_addr, "estimatesmartfee", json!([144])).await;
+        if fee["result"]["feerate"].is_number() || Instant::now() > deadline {
+            break fee;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let got = fee["result"]["feerate"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("144-block estimate after relay start: {fee}"));
+    assert_eq!((got * 100_000_000.0).round() as u64, rate, "{fee}");
+
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
+    assert!(
+        matches!(stopped, Ok(Ok(Ok(())))),
+        "run_p2p did not stop cleanly"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
