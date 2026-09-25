@@ -756,31 +756,6 @@ fn s8_rejects_wrong_witness_commitment() {
     );
 }
 
-/// Mainnet height 1: witness banned (segwit @ 481824).
-#[test]
-fn s8_mainnet_rejects_witness_before_segwit() {
-    let p = Box::leak(Box::new(ChainParams::mainnet()));
-    assert!(!p.segwit_active_at(1));
-    let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
-    validate_block_structure(&block_with(vec![coinbase(1)]), &ctx).unwrap();
-    let mut spend = non_coinbase_spend(10);
-    spend.input[0].witness = Witness::from_slice(&[vec![0x01]]);
-    let mut cb = coinbase(1);
-    // Valid-looking commitment magic so we hit the pre-segwit ban first.
-    let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
-    let b = block_with(vec![cb, spend]);
-    let err = validate_block_structure(&b, &ctx).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadBlock(s) if s.contains("before segwit")),
-        "got {err:?}"
-    );
-}
-
 /// Core `CheckWitnessMalleation` only when SegWit is active. Pre-segwit
 /// `aa21a9ed` OP_RETURN is data (mainnet 434499), not a BIP141 nonce demand.
 #[test]
@@ -947,13 +922,16 @@ fn script_sigop_count_and_last_push_helpers() {
     p2sh.push(0x87);
     assert!(is_p2sh_script(&p2sh));
     assert!(!is_p2sh_script(&[0x00]));
+    assert!(!is_p2sh_script(&[0xa9, 0x14]));
     let mut wpkh = vec![0x00, 0x14];
     wpkh.extend_from_slice(&[1u8; 20]);
     assert!(is_p2wpkh_program(&wpkh));
+    assert!(!is_p2wpkh_program(&[0x51, 0x14]));
     let mut wsh = vec![0x00, 0x20];
     wsh.extend_from_slice(&[2u8; 32]);
     assert!(is_p2wsh_program(&wsh));
     assert!(!is_p2wsh_program(&wpkh));
+    assert!(!is_p2wsh_program(&[0x51, 0x20]));
 }
 
 #[test]

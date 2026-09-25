@@ -221,9 +221,10 @@ fn h7_rejects_header_hash_above_target() {
 fn header_and_spending_boundaries() {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::Sequence;
+    use bitcoin::{Sequence, Witness};
 
-    let (_td, q, params) = regtest_q();
+    let (_td, q, mut params) = regtest_q();
+    params.apply_test_activation_height("segwit", 2).unwrap();
     let g = regtest_genesis();
     let mut bad_g = g.clone();
     bad_g.header.nonce = g.header.nonce.wrapping_add(1);
@@ -233,6 +234,27 @@ fn header_and_spending_boundaries() {
         "h1: {err:?}"
     );
     accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
+
+    let mut pre_segwit_spend = spend_anyone_can_spend(
+        bitcoin::Txid::from_byte_array([0xa1; 32]),
+        0,
+        Amount::from_sat(1),
+    );
+    pre_segwit_spend.input[0].witness = Witness::from_slice(&[&[0x01]]);
+    let pre_segwit = mine_regtest_block(
+        g.block_hash(),
+        g.header.time + 600,
+        1,
+        vec![pre_segwit_spend],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(1), &pre_segwit, Milestone::NONE);
+    assert!(
+        matches!(
+            err,
+            Err(ConsensusError::BadBlock("unexpected witness before segwit"))
+        ),
+        "pre-activation witness block must hit the SegWit gate: {err:?}"
+    );
 
     let mut bad_prev = mine_regtest_block(g.block_hash(), g.header.time + 1, 1, vec![]);
     bad_prev.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
