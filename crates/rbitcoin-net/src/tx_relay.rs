@@ -637,9 +637,24 @@ impl MempoolHub {
         max_weight_wu: u64,
         persist: bool,
     ) -> Result<Arc<Self>, String> {
+        Self::open_with_weight_persist_and_sigop_reserve(dir, query, max_weight_wu, persist, None)
+    }
+
+    /// Open with a configured reserve applied before migrated entries are
+    /// recomputed, so admission and template selection share the same budget.
+    pub fn open_with_weight_persist_and_sigop_reserve(
+        dir: impl AsRef<Path>,
+        query: Arc<Query>,
+        max_weight_wu: u64,
+        persist: bool,
+        reserved_sigops: Option<u64>,
+    ) -> Result<Arc<Self>, String> {
         let dir_buf = dir.as_ref().to_path_buf();
-        let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
+        let mut mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
+        if let Some(reserved) = reserved_sigops {
+            mp.set_block_reserved_sigops(reserved);
+        }
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
         let (isolated_kick, _) = broadcast::channel(32);
@@ -4665,6 +4680,76 @@ mod tests {
         hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
         assert_eq!(hub.get_live_sigop_cost(&tx.compute_txid()), Some(16_004));
         let _ = std::fs::remove_dir_all(&mp);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn startup_recomputes_unknown_sigops_with_configured_reserve() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0xae]),
+                };
+                999
+            ],
+        };
+        let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+        let mempool_dir = tmp();
+        {
+            let mut store = rbitcoin_mempool::Mempool::open_or_create(&mempool_dir).unwrap();
+            store
+                .append_live_tx(
+                    &tx,
+                    &txid,
+                    &wtxid,
+                    4_999_999_001,
+                    tx.weight().to_wu(),
+                    u64::MAX,
+                    &[],
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+        let hub = MempoolHub::open_with_weight_persist_and_sigop_reserve(
+            &mempool_dir,
+            Arc::new(q),
+            rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT,
+            true,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(hub.get_live_sigop_cost(&txid), Some(79_920));
+        assert!(hub.contains(&txid));
+        let _ = std::fs::remove_dir_all(&mempool_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 

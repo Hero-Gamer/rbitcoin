@@ -165,6 +165,8 @@ pub struct TxGraph {
     cluster_weight_limit: u64,
     /// Core `-bytespersigop` (default [`DEFAULT_BYTES_PER_SIGOP`]).
     bytes_per_sigop: u64,
+    /// Sigop allowance held back for the block's coinbase/template overhead.
+    block_reserved_sigops: u64,
 }
 
 impl Default for TxGraph {
@@ -184,6 +186,7 @@ impl Default for TxGraph {
             cluster_vsize_limit: MAX_CLUSTER_VSIZE,
             cluster_weight_limit: MAX_CLUSTER_WEIGHT,
             bytes_per_sigop: DEFAULT_BYTES_PER_SIGOP,
+            block_reserved_sigops: COINBASE_SIGOPS_RESERVE,
         }
     }
 }
@@ -219,6 +222,15 @@ impl TxGraph {
 
     pub fn bytes_per_sigop(&self) -> u64 {
         self.bytes_per_sigop
+    }
+
+    /// Set the shared admission and block-template sigop reserve.
+    pub(crate) fn set_block_reserved_sigops(&mut self, reserved: u64) {
+        self.block_reserved_sigops = reserved;
+    }
+
+    pub(crate) fn block_reserved_sigops(&self) -> u64 {
+        self.block_reserved_sigops
     }
 
     fn adjusted_weight_of(&self, txid: &Txid) -> u64 {
@@ -944,7 +956,7 @@ impl TxGraph {
     /// Empty pool or zero cap → `[]`. A high-feerate child chunk pulls in
     /// still-unselected in-mempool ancestors so the block is topological.
     /// A chunk (plus those ancestors) that would overflow the weight cap or the
-    /// block sigop budget (80_000 less the 400 coinbase reserve) is skipped;
+    /// block sigop budget (80_000 less `block_reserved_sigops`) is skipped;
     /// later chunks are still tried.
     pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
         self.select_block_txids_delta(max_weight_wu, 0, |_| 0)
@@ -982,7 +994,7 @@ impl TxGraph {
         let mut selected = HashSet::new();
         let mut out = Vec::new();
         let mut used = 0u64;
-        let mut sigops = COINBASE_SIGOPS_RESERVE;
+        let mut sigops = self.block_reserved_sigops;
         for (_, _, ch) in scored {
             let mut add = Vec::new();
             for t in &ch.txids {
@@ -1452,6 +1464,23 @@ mod tests {
         assert_eq!(pool(79_599), vec![hid], "79_999 fits; +1 reaches 80_000");
         assert_eq!(pool(79_598), vec![hid, lid], "80_000 - 1 total fits");
         assert_eq!(pool(u64::MAX), vec![lid], "unknown cost never selected");
+    }
+
+    #[test]
+    fn selection_uses_configured_sigop_reserve() {
+        let tx = spend_op([0x18u8; 32], 50_000, 49_000);
+        let mut g = TxGraph::new();
+        let mut e = entry_for(&tx, 10_000, 0);
+        e.sigop_cost = 79_999;
+        g.insert(e, &tx);
+        assert!(g
+            .select_block_txids(TxGraph::template_tx_weight())
+            .is_empty());
+        g.set_block_reserved_sigops(0);
+        assert_eq!(
+            g.select_block_txids(TxGraph::template_tx_weight()),
+            vec![tx.compute_txid()]
+        );
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {

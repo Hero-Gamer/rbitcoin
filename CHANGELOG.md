@@ -27,10 +27,11 @@ before 1.0).
   cheaper than it is.
 
 - **Mempool sigop cost:** admission rejects a tx whose BIP16+BIP141 sigop
-  cost exceeds 80,000 − 400 (no block can hold it), and every live entry
-  records its full cost. The sidecar is schema 3; schema 2 pools soft-migrate
-  on open and the hub recomputes the cost, dropping entries whose inputs no
-  longer resolve.
+  cost reaches the template budget (80,000 minus `--block-reserved-sigops`,
+  default 400), using the same strict limit as template selection. The reserve
+  is configurable from 0 to 80,000. Every live entry records its full cost.
+  The sidecar is schema 3; schema 2 pools soft-migrate on open and the hub
+  recomputes the cost, dropping entries whose inputs no longer resolve.
 - **An invalid script from a peer adds 10 to that peer's ban score.**
   Consensus block flags are unchanged. There is no 16_000 standard sigop
   cap (Libre policy); the only sigop reject is the whole-block limit above,

@@ -294,6 +294,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let cluster_count = config.mempool.limit_cluster_count;
     let cluster_kvb = config.mempool.limit_cluster_size_kvb;
     let bytes_per_sigop = config.mempool.bytes_per_sigop;
+    let block_reserved_sigops = config.mempool.block_reserved_sigops;
     let min_relay_sat = match config.mempool.min_relay_fee_btc.as_deref() {
         Some(s) => Some(
             parse_btc_to_sat(s)
@@ -307,7 +308,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let hub = Arc::clone(&node.hub);
     let (mempool, mp_gen, mp_live) = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
-        let mp = MempoolHub::open_with_weight_persist(mempool_path, query, max_weight, persist)?;
+        let mp = MempoolHub::open_with_weight_persist_and_sigop_reserve(
+            mempool_path,
+            query,
+            max_weight,
+            persist,
+            block_reserved_sigops,
+        )?;
         mp.set_cluster_limits(cluster_count, cluster_kvb);
         if let Some(b) = bytes_per_sigop {
             mp.set_bytes_per_sigop(b);

@@ -7,13 +7,14 @@
 Mempool admission counted no standard sigop cap before the script
 interpreter, and an invalid script was logged without a ban score.
 
-A transaction whose sigop cost cannot fit a block (above 80_000 minus the
-400 coinbase reserve) is rejected as `bad-txns-too-many-sigops` before
-`verify_tx_scripts_detached`. Core's 16_000 standard cap
-(`MAX_BLOCK_SIGOPS_COST / 5`) is not applied: Libre policy keeps only the
-consensus limit. The cost is up to ~5x more signature checks per rejected
-tx; the ban score below bounds repeat abuse, and `--bytes-per-sigop`
-charges heavy txs for the block sigop budget they take.
+A transaction whose sigop cost does not fit the configured template budget
+(80_000 minus `--block-reserved-sigops`, default 400) is rejected as
+`bad-txns-too-many-sigops` before `verify_tx_scripts_detached`. This is a
+local admission/template policy, not a consensus-invalidity test. Core's
+16_000 standard cap (`MAX_BLOCK_SIGOPS_COST / 5`) is not applied. The cost is
+up to ~5x more signature checks per rejected tx; the ban score below bounds
+repeat abuse, and `--bytes-per-sigop` charges heavy txs for the block sigop
+budget they take.
 An `AcceptError::Script` from a peer adds 10 to that peer's ban score.
 Policy rejects and the block sigop reject are not scored.
 

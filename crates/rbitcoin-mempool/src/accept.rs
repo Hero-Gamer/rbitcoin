@@ -1,9 +1,7 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{
-    sigops_adjusted_weight, TxEntry, TxGraph, COINBASE_SIGOPS_RESERVE, MAX_BLOCK_SIGOPS_COST,
-};
+use crate::graph::{sigops_adjusted_weight, TxEntry, TxGraph, MAX_BLOCK_SIGOPS_COST};
 use crate::orphanage::Orphanage;
 use crate::packed::VinAux;
 use crate::store::Mempool;
@@ -211,8 +209,8 @@ pub enum AcceptError {
     Durable(String),
     /// Consensus script verification failed for one or more inputs.
     Script(String),
-    /// Sigop cost alone exceeds what any block can hold beside the coinbase
-    /// reserve (consensus-impossible, not a Libre policy knob).
+    /// Sigop cost cannot fit the configured block-template budget, including
+    /// its reserved coinbase allowance.
     TooManySigops {
         cost: u64,
     },
@@ -334,15 +332,19 @@ fn tx_has_witness(tx: &Transaction) -> bool {
 }
 
 /// Full BIP16 + BIP141 sigop cost (Core ATMP `GetTransactionSigOpCost`; P2SH
-/// and witness flags match `STANDARD_SCRIPT_VERIFY_FLAGS`). Rejects a cost no
-/// block can hold beside the coinbase reserve (consensus-impossible, not policy).
-fn block_fit_sigop_cost(tx: &Transaction, prevouts: &[TxOut]) -> Result<u64, AcceptError> {
+/// and witness flags match `STANDARD_SCRIPT_VERIFY_FLAGS`). Rejects a cost
+/// that does not fit the configured template reserve.
+fn block_fit_sigop_cost(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    reserved_sigops: u64,
+) -> Result<u64, AcceptError> {
     let spks: Vec<&[u8]> = prevouts
         .iter()
         .map(|o| o.script_pubkey.as_bytes())
         .collect();
     let cost = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
-    if cost > MAX_BLOCK_SIGOPS_COST - COINBASE_SIGOPS_RESERVE {
+    if reserved_sigops.saturating_add(cost) >= MAX_BLOCK_SIGOPS_COST {
         return Err(AcceptError::TooManySigops { cost });
     }
     Ok(cost)
@@ -488,6 +490,11 @@ impl ActiveMempool {
         self.graph.set_bytes_per_sigop(bytes_per_sigop);
     }
 
+    /// Set the sigop reserve shared by admission and block-template selection.
+    pub fn set_block_reserved_sigops(&mut self, reserved_sigops: u64) {
+        self.graph.set_block_reserved_sigops(reserved_sigops);
+    }
+
     /// Overlay Core `-minrelaytxfee` (sat/kvB). `0` admits any non-negative fee.
     pub fn set_min_relay_sat_kvb(&mut self, sat_kvb: u64) {
         self.min_relay_sat_kvb = sat_kvb;
@@ -589,6 +596,9 @@ impl ActiveMempool {
         ingested
             .graph
             .set_bytes_per_sigop(self.graph.bytes_per_sigop());
+        ingested
+            .graph
+            .set_block_reserved_sigops(self.graph.block_reserved_sigops());
         self.graph = ingested.graph;
         self.bodies = ingested.bodies;
         self.vin_aux = ingested.vin_aux;
@@ -864,7 +874,7 @@ impl ActiveMempool {
 
         check_mempool_structural(tx, &chain_coins, tip)?;
 
-        let sigop_cost = block_fit_sigop_cost(tx, &prevouts)?;
+        let sigop_cost = block_fit_sigop_cost(tx, &prevouts, self.graph.block_reserved_sigops())?;
 
         let mut output_value = 0u64;
         for o in &tx.output {
@@ -1757,7 +1767,10 @@ impl ActiveMempool {
                 })
                 .collect();
             let slot = self.graph.get(&id).map(|e| e.slot);
-            match (prevouts.map(|p| block_fit_sigop_cost(&tx, &p)), slot) {
+            match (
+                prevouts.map(|p| block_fit_sigop_cost(&tx, &p, self.graph.block_reserved_sigops())),
+                slot,
+            ) {
                 (Some(Ok(cost)), Some(slot)) => {
                     self.graph.set_sigop_cost(&id, cost);
                     if let Err(e) = self.store.set_sigop_cost(slot, cost) {
@@ -2565,9 +2578,7 @@ mod tests {
         tx
     }
 
-    /// Probe regression: 1001 × `OP_CHECKMULTISIG` (cost 80,080) can never be
-    /// mined, so admission rejects it. 995 outputs (79,600 = 80k − coinbase
-    /// reserve) still fit a block and are admitted.
+    /// Admission and templates share a strict sigop budget and reserve.
     #[test]
     fn reject_tx_over_block_sigop_budget() {
         let dir = tmp_dir();
@@ -2582,9 +2593,28 @@ mod tests {
         );
         assert_eq!(err.to_string(), "bad-txns-too-many-sigops");
         assert_eq!(mp.live_count(), 0);
-        mp.accept_tx(&multisig_outputs_tx(op, 995), &utxos, TIP_OK)
-            .expect("79,600 fits beside the coinbase reserve");
-        assert_eq!(mp.live_count(), 1);
+        let fits_default = multisig_outputs_tx(op, 994);
+        let exact_default_budget = multisig_outputs_tx(op, 995);
+        mp.accept_tx(&fits_default, &utxos, TIP_OK)
+            .expect("79,520 fits beside the default reserve");
+        assert_eq!(mp.select_block_txs(TxGraph::template_tx_weight()).len(), 1);
+        mp.remove_for_block(&[fits_default.compute_txid()]).unwrap();
+        assert!(matches!(
+            mp.accept_tx(&exact_default_budget, &utxos, TIP_OK),
+            Err(AcceptError::TooManySigops { cost: 79_600 })
+        ));
+        mp.set_block_reserved_sigops(0);
+        let fits_without_reserve = multisig_outputs_tx(op, 999);
+        mp.accept_tx(&fits_without_reserve, &utxos, TIP_OK)
+            .expect("79,920 fits when the template reserve is zero");
+        assert_eq!(mp.select_block_txs(TxGraph::template_tx_weight()).len(), 1);
+        mp.remove_for_block(&[fits_without_reserve.compute_txid()])
+            .unwrap();
+        assert!(matches!(
+            mp.accept_tx(&multisig_outputs_tx(op, 1000), &utxos, TIP_OK),
+            Err(AcceptError::TooManySigops { cost: 80_000 })
+        ));
+        assert_eq!(mp.live_count(), 0);
     }
 
     /// Chain coins at P2SH and P2WSH of `0 <pk> <pk> 2 CHECKMULTISIG` (2 accurate
@@ -4582,15 +4612,17 @@ mod tests {
 
     /// `-bytespersigop` survives compact (graph rebuild).
     #[test]
-    fn compact_preserves_bytes_per_sigop_overlay() {
+    fn compact_preserves_mempool_policy_overlays() {
         let dir = tmp_dir();
         let (op, _, utxos) = chain_utxo(100_000);
         let tx = spend_tx(op, 90_000);
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.set_bytes_per_sigop(7);
+        mp.set_block_reserved_sigops(12);
         mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
         mp.remove_for_block(&[tx.compute_txid()]).unwrap();
         let _ = mp.maybe_compact().unwrap();
         assert_eq!(mp.graph.bytes_per_sigop(), 7);
+        assert_eq!(mp.graph.block_reserved_sigops(), 12);
     }
 }
