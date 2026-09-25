@@ -913,6 +913,14 @@ async fn pin_scantxoutset_drops_spent_coinbase(rpc_addr: SocketAddr, spent_cb: &
     )
     .await;
     assert_eq!(ranged["result"]["success"], true, "{ranged}");
+    let hardened = "pkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/*h)";
+    let hard = jsonrpc(
+        rpc_addr,
+        "scantxoutset",
+        json!(["start", [{"desc": hardened, "range": 0}]]),
+    )
+    .await;
+    assert_eq!(hard["result"]["success"], true, "{hard}");
 }
 
 async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Value) -> Value {

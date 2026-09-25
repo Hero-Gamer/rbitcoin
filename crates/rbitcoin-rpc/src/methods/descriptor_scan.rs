@@ -407,36 +407,13 @@ fn format_origin_key(
     pk_hex: &str,
     secp: &Secp256k1<bitcoin::secp256k1::All>,
 ) -> Option<String> {
-    let (fp, children) = if key.starts_with("xprv") || key.starts_with("tprv") {
-        let xpriv = Xpriv::from_str(key).ok()?;
-        let fp = xpriv.fingerprint(secp);
-        let mut children = parse_path_steps(path_src);
-        if let Some(i) = index {
-            let hardened = path_src.contains("*h") || path_src.contains("*'");
-            children.push(if hardened {
-                ChildNumber::from_hardened_idx(i).ok()?
-            } else {
-                ChildNumber::from_normal_idx(i).ok()?
-            });
-        }
-        let _ = xpriv;
-        (fp, children)
+    let fp = if key.starts_with("xprv") || key.starts_with("tprv") {
+        Xpriv::from_str(key).ok()?.fingerprint(secp)
     } else {
-        let xpub = Xpub::from_str(key).ok()?;
-        let fp = xpub.fingerprint();
-        let mut children = parse_path_steps(path_src);
-        if let Some(i) = index {
-            let hardened = path_src.contains("*h") || path_src.contains("*'");
-            children.push(if hardened {
-                ChildNumber::from_hardened_idx(i).ok()?
-            } else {
-                ChildNumber::from_normal_idx(i).ok()?
-            });
-        }
-        (fp, children)
+        Xpub::from_str(key).ok()?.fingerprint()
     };
     let mut path = String::new();
-    for c in children {
+    for c in derivation_children(path_src, index)? {
         path.push('/');
         match c {
             ChildNumber::Normal { index } => path.push_str(&index.to_string()),
@@ -447,6 +424,20 @@ fn format_origin_key(
         }
     }
     Some(format!("[{fp}{path}]{pk_hex}"))
+}
+
+fn derivation_children(path_src: &str, index: Option<u32>) -> Option<Vec<ChildNumber>> {
+    let mut children = parse_path_steps(path_src);
+    let Some(i) = index else {
+        return Some(children);
+    };
+    let hardened = path_src.contains("*h") || path_src.contains("*'");
+    children.push(if hardened {
+        ChildNumber::from_hardened_idx(i).ok()?
+    } else {
+        ChildNumber::from_normal_idx(i).ok()?
+    });
+    Some(children)
 }
 
 fn source_has_hardened_wildcard(source: &str) -> bool {
