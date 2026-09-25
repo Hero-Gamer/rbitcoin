@@ -289,6 +289,8 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Build Class B scripthash index (Electrum/Esplora history). Default **off**.
     pub shindex: bool,
+    /// Build BIP158 basic block filters. Default **off**. Independent of `shindex`.
+    pub block_filter_index: bool,
     /// Drop Class A seqsigwit below a 288-height watermark (`NETWORK_LIMITED`).
     pub prune_seqsigwit: bool,
     /// RAM cap for the prune witness window. `0` keeps nothing in RAM.
@@ -372,6 +374,7 @@ impl Default for NodeConfig {
             head_scale: HeadScale::Mainnet,
             max_run_secs: None,
             shindex: false,
+            block_filter_index: false,
             prune_seqsigwit: false,
             prune_seqsigwit_ram_threshold_bytes: 256 * 1024 * 1024,
             sptweaks: false,
@@ -974,6 +977,10 @@ impl NodeConfig {
             "sh_index" => {
                 self.shindex = parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf sh_index: {e}")))?;
+            }
+            "block_filter_index" => {
+                self.block_filter_index = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf block_filter_index: {e}")))?;
             }
             "prune_seqsigwit" => {
                 self.prune_seqsigwit = parse_conf_bool(val)

@@ -257,16 +257,18 @@ Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.
 | 5 | feefilter | tip policy |
 | 9–15 | getblocks…mempool | headers/blocks/inv |
 | 17–21 | notfound…tx | ping/pong/sendcmpct/tx |
+| 22–27 | getcfilters…cfcheckpt | BIP157 basic, only when `--block-filter-index` is tip-ready |
 | 28 | addrv2 | BIP155 |
 
 Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 `sendaddrv2`, and unknown/extension commands.
 
-**Not implemented as product features** (short slots 22–27 compact filters, 29–36
-placeholders, 37 `feature`): decode may reject unknown short IDs; peers that
-only need the live set above interoperate. Full Core filter/light-client APIs
-are deferred (**Q-65**). satd’s native BIP 157/158 index is noted in
-[`docs/peer-clients.md`](./docs/peer-clients.md).
+**Not implemented as product features** (short slots 29–36 placeholders, 37
+`feature`): decode may reject unknown short IDs. Slots 22–27 are live for
+BIP158 basic filters when `--block-filter-index` has reached the tip
+(`NODE_COMPACT_FILTERS`, `getcfilters`, `getcfheaders`, `getcfcheckpt`,
+`getblockfilter`). Serving before that watermark is silence, not an empty
+filter.
 
 ## Deferred surfaces
 

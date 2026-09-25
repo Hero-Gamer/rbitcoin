@@ -303,7 +303,7 @@ fn operator_usage() -> String {
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
-    [--sh-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -342,6 +342,7 @@ Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n
   --net-permission / --net-permission-bind are CIDR or bind grants (noban, relay, …; IPv4 and IPv6).\n\
   --net-permission-relay (default on) / --net-permission-force-relay (default off) are implicit bits on a bare CIDR grant.\n\
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
+Block filters: --block-filter-index (default off) builds BIP158 basic filters. Independent of --sh-index.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
   --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
     Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
@@ -388,6 +389,7 @@ fn is_bool_key(key: &str) -> bool {
     matches!(
         key,
         "sh_index"
+            | "block_filter_index"
             | "prune_seqsigwit"
             | "sp_tweaks"
             | "esplora_block_template"
@@ -592,6 +594,7 @@ mod tests {
             "--net-permission-force-relay",
             "--signet-block-time",
             "--sh-index",
+            "--block-filter-index",
             "--prune-seqsigwit",
             "--sp-tweaks",
             "--sp-tweaks-dust",

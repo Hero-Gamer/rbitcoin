@@ -495,6 +495,7 @@ pub(crate) fn dispatch_inner(
         "submitpackage" => submitpackage(ctx, &params),
         "gettxspendingprevout" => gettxspendingprevout(ctx, &params),
         "gettxoutsetinfo" => gettxoutsetinfo(ctx, &params),
+        "getblockfilter" => getblockfilter(ctx, &params),
         "createrawtransaction"
         | "signrawtransactionwithkey"
         | "createmultisig"
@@ -635,6 +636,7 @@ const METHOD_LIST: &[&str] = &[
     "generate",
     "scantxoutset",
     "gettxoutsetinfo",
+    "getblockfilter",
     "gettxout",
     "getindexinfo",
     "getchaintips",
@@ -718,6 +720,11 @@ const NAMED_HELP: &[(&str, &str)] = &[
         "scantxoutset",
         "scantxoutset \"action\" ( [scanobjects,...] )\n\
          Descriptor scan on --sh-index. action is start, abort, or status.",
+    ),
+    (
+        "getblockfilter",
+        "getblockfilter blockhash (filtertype)\n\
+         BIP158 basic filter when --block-filter-index has reached the tip.",
     ),
     (
         "decoderawtransaction",

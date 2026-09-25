@@ -607,6 +607,40 @@ pub(crate) fn gettxoutsetinfo(ctx: &RpcContext, params: &RpcParams) -> Result<Va
     }))
 }
 
+pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    params.reject_unknown(&["blockhash", "filtertype"])?;
+    let hex = params.req_str(0, "blockhash")?;
+    let filtertype = params.opt_str(1, "filtertype")?.unwrap_or("basic");
+    if filtertype != "basic" {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            format!("Unknown filtertype {filtertype}"),
+        ));
+    }
+    if !ctx.query.basic_filter_tip_ready() {
+        return Err(rpc_error(
+            ERR_MISC,
+            "Index is not enabled for filtertype basic",
+        ));
+    }
+    let hash = parse_hash32_display(hex)?;
+    let height = ctx
+        .query
+        .height_of_hash(&hash)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+    let (body, header) = ctx
+        .query
+        .basic_filter_at(height.0)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .ok_or_else(|| rpc_error(ERR_MISC, "Index is not enabled for filtertype basic"))?;
+    use bitcoin::hashes::Hash;
+    Ok(json!({
+        "filter": hex_encode(&body),
+        "header": hex_encode(header.as_byte_array()),
+    }))
+}
+
 pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "n", "include_mempool"])?;
     let hex = params.req_str(0, "txid")?;
