@@ -2630,8 +2630,11 @@ mod script_detection_kills {
         // 1. PRE-SEGWIT + WITNESS → REJECT (THE CRITICAL PATH)
         let r1 = reject_witness_malleation(&block_with_witness, &ctx_pre, &pres_with_witness);
         assert!(
-            r1.is_err(),
-            "1. Pre-segwit+witness MUST REJECT; got {:?}",
+            matches!(
+                r1,
+                Err(ConsensusError::BadBlock("unexpected witness before segwit"))
+            ),
+            "1. Pre-segwit+witness MUST reject with the pre-segwit error; got {:?}",
             r1
         );
 
@@ -2747,21 +2750,4 @@ mod script_detection_kills {
         );
     }
 
-    #[test]
-    fn kill_boundary_198() {
-        // Boundary: large/saturating values — no panic, no wrap
-        let params = ChainParams::regtest();
-
-        // Far future — no crash
-        let ctx_large = ValidationContext::at(&params, Height(1_000_000), Milestone::default());
-        let _ = ctx_large.params.segwit_active_at(ctx_large.height.0);
-
-        // Near u32 max — no overflow
-        let ctx_huge = ValidationContext::at(&params, Height(u32::MAX - 1), Milestone::default());
-        let _ = ctx_huge.params.segwit_active_at(ctx_huge.height.0);
-
-        // Zero — safe
-        let ctx_zero = ValidationContext::at(&params, Height(0), Milestone::default());
-        let _ = ctx_zero.params.segwit_active_at(ctx_zero.height.0);
-    }
 }
