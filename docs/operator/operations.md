@@ -179,7 +179,7 @@ socket. With `--electrum-listen`, the node `ADD_ONION`s that TCP port to
 `{datadir}/onion/electrum.priv` (0600). `server.features.hosts` is
 `{ "<id>.onion": { "tcp_port": N } }` with no `ssl_port`. With
 `--esplora-listen`, the same control port `ADD_ONION`s Esplora (`{datadir}/onion/esplora.priv`);
-REST and `/ws` share that TCP port (`http://….onion:<port>`). `--esplora-onion=0`
+REST is on that TCP port (`http://….onion:<port>`). `--esplora-onion=0`
 skips Esplora HS. `getnetworkinfo.localaddresses` lists those onion hostnames
 even with `--no-discover`. Sparrow: `tcp://<id>.onion:50001` (plain TCP; no
 in-binary TLS). JSON-RPC stays off the onion (`rpc.sock` / `--rpc-listen` only).

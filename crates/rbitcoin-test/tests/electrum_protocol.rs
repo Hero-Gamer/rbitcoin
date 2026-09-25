@@ -1504,7 +1504,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
         "127.0.0.1:0".parse().unwrap(),
         bitcoin::Network::Regtest,
     );
-    let esplora = rbitcoin_esplora::run_esplora(esplora_cfg, Arc::clone(&q), None, None)
+    let esplora = rbitcoin_esplora::run_esplora(esplora_cfg, Arc::clone(&q), None)
         .await
         .expect("esplora listen");
     let (tip_tx, _) = broadcast::channel(8);

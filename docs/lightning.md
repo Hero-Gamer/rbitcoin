@@ -31,7 +31,6 @@ wallets (BDK, Electrum address lists), not for Lightning channel monitors.
 | **RPC** | chain, `getblock` / `getrawtransaction`, `gettxout`, `sendrawtransaction`, fees, mempool | none for LN |
 | **Electrum** | `server.*`, headers / `blockchain.block.header`, `transaction.get` / `get_merkle` / `broadcast`, `estimatefee` / `relayfee` / `mempool.get_info`, `outpoint.*` | `blockchain.scripthash.*`, `blockchain.tweaks.subscribe`, `blockchain.silentpayments.*`, scripthash `asof:` |
 | **Esplora REST** | tip, `/block/*`, `/tx/*` (raw / status / outspend / merkle*), `/mempool`, `/fee-estimates`, `POST /tx` | `/address/*`, `/scripthash/*`, `POST /addresses/*`, `POST /scripthashes/*` |
-| **Esplora WS** | `want: blocks` / `stats`, `ping`, `init`, `track-tx` | `track-address` / `track-addresses` |
 
 Fail closed (never empty history/utxo that looks like a new wallet):
 

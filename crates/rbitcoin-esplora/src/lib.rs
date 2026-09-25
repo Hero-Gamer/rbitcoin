@@ -11,7 +11,6 @@ mod internal;
 mod script_fields;
 mod server;
 mod tx_json;
-mod ws;
 
 pub use server::{
     run_esplora, sample_reset_perf, BlockTemplateFn, EsploraConfig, EsploraHandle, EsploraListen,

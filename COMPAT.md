@@ -231,75 +231,17 @@ App `ServeLimits` always on (same model as Electrum).
 | `POST /txs/test` | done | JSON array of hex (max 25) → `MempoolHub::test_accept` (no admit). `?maxfeerate=` is BTC/kvB like electrs (`0` unlimited; omitted → 0.1 BTC/kvB). |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
 | electrs `/internal/*` | done | **Unix listen only.** TCP GET/POST `/internal/…` → **404** (same unknown-path fallback). `POST /internal/txs` (400 on unparseable id; missing omitted); `POST /internal/mempool/txs` (mempool only); `GET /internal/mempool/txs[/all or /:last]` (txid-sort pages, default `max_txs=10000`; `/all` registered first); `GET /internal/block/:hash/txs` (full list; public `/txs` stays 25/page); `POST /internal/txs/outspends/by-txid` (same-length slots, unknown → `[]`); `POST /internal/txs/outspends/by-outpoint` (`txid:vout`; malformed → `{"spent":false}`). Snapshot JSON is published on the hub (no admit-path build). `GET /mempool/txids/page` is public electrs (both listeners). |
-| Unix listen | done | `--esplora-listen` filesystem path (mode **0660**). Public REST+WS plus `/internal/*`. TCP `--esplora-listen host:port` never mounts `/internal`. |
+| Unix listen | done | `--esplora-listen` filesystem path (mode **0660**). Public REST plus `/internal/*`. TCP `--esplora-listen host:port` never mounts `/internal`. |
 | Unknown path | 404 | plain body (including `/address-prefix`) |
 | `GET /block-template` | opt-in | `--esplora-block-template` (default off → **404**). Same JSON as RPC `getblocktemplate` `{"rules":["segwit"]}` template mode. **503** without tip. `Cache-Control: no-store`. 15 s cache, invalidated on tip or mempool `template_updates`. No proposal/longpoll HTTP (parked **Q-64**). |
 | **Non-goal / never** | — | Address-prefix search, Liquid/assets. mempool.space `/api/v1/` catalogue stays their Node. |
 
-## Esplora WebSocket (wallet live subset)
+## No Esplora WebSocket
 
-Same listen as REST (`--esplora-listen`). Paths: **`/v1/ws`** (preferred) and
-**`/ws`** alias. Plain WS in-process; terminate **WSS** at the reverse proxy
-(often public URL `wss://host/api/ws` when nginx `/api/` → this listen).
-
-**Product boundary:** wallet live updates (tip, address watchlist, pending
-txids, wallet-scoped RBF, hub `want: stats`). mempool.space explorer live
-catalogue (`live-2h-chart`, compressed `mempool-blocks`, …) is **their**
-`/api/v1/ws`, not this listen. nginx `/api/` is our Esplora (`/api/ws`);
-`/api/v1/` stays their backend. Message *names* follow mempool.space where
-listed; **payloads use Esplora REST shapes**.
-
-### Client → server (supported)
-
-| Message | Behavior |
-|---------|----------|
-| `{ "action": "want", "data": ["blocks"] }` | Subscribe tip pushes |
-| `{ "action": "want", "data": ["stats"] }` | Immediate `{ "mempoolInfo", "fees" }` (`mempoolInfo` is the `GET /mempool` JSON; `fees` is mempool.space's recommended tiers in sat/vB at the estimator's resolution, a tier without an estimate `null`, `minimumFee` the mempool min fee; `fees` is `null` without a mempool); re-push on announce/tip when fee-snapshot `computed_at` changes or 1 s age elapses. Combine with `blocks` |
-| empty want / no `blocks` / no `stats` | Clear those subscriptions |
-| `{ "action": "ping" }` | `{ "pong": true }` |
-| `{ "action": "init" }` | `{ "block": { "height", "id", "timestamp" } }` from the current tip (not Node's 8-block blob) |
-| `{ "track-address": "<addr>" }` / `{ "track-addresses": [...] }` | Watchlist (network-checked); over-cap → `{ "error": "max_track_addresses exceeded" }`. Subscribe snapshots live mempool txs (`address-transactions` / keyed `multi-address-transactions`) |
-| `{ "track-address": "stop" }` / `{ "track-tx": "stop" }` / empty / `stop-track-*` | Unsubscribe |
-| `{ "track-tx": "<txid>" }` / `{ "track-txs": [...] }` | Pending set; over-cap → error |
-
-Unknown `want` tokens (`mempool-blocks`, `live-2h-chart`, …) **no-op** (no disconnect). No client API for global `track-mempool*` or `track-rbf` trees.
-
-### Server → client (supported)
-
-| Key | When |
-|-----|------|
-| `{ "pong": true }` | After `{ "action": "ping" }` |
-| `{ "block": { "height", "id", "timestamp" } }` | Tip advance after `want: blocks`; also `{ "action": "init" }` |
-| `{ "mempoolInfo", "fees" }` | After `want: stats` and coalesced announce/tip |
-| `{ "address-transactions": [ … ] }` | Subscribe snapshot and mempool accept touching a tracked script (Esplora tx JSON) |
-| `{ "multi-address-transactions": { "<addr>": [ … ] } }` | `track-addresses` snapshot, keyed by the display address the client sent |
-| `{ "address-removed-transactions": [ … ] }` | Full-RBF/drop of a tx that paid a tracked script |
-| `{ "block-transactions": [ … ] }` | Tip height: txs in that block that create or spend a tracked script (posting-list probe; no Class A expand on a miss) |
-| `{ "tx": { "txid", "status" } }` | Tracked txid status transition (mempool / confirmed) |
-| `{ "replaced-transactions": [ { "txid", "replaced-by" } ] }` | Full-RBF replace **only if** old or new intersects this connection’s tracks |
-
-Unknown client keys: ignored (or JSON error for bad JSON / oversize). Lagged
-broadcast receivers drop (best-effort, like Electrum).
-
-### Caps (`EsploraConfig`, defaults)
-
-| Knob | Default |
-|------|---------|
-| max_ws_connections | 64 (separate from REST concurrency) |
-| max_ws_message_bytes | 64 KiB |
-| max_track_addresses | 64 / connection |
-| max_track_txs | 64 / connection |
-
-### Gap list (explorer-only — not supported)
-
-| mempool.space-style feature | Status |
-|-----------------------------|--------|
-| `want`: `mempool-blocks`, `live-2h-chart` (Node `/api/v1/ws`) | **No** |
-| `track-mempool` / `track-mempool-txids` global firehose | **No** |
-| `track-mempool-block` projected templates | **No** |
-| Global `track-rbf` / `rbfLatest` trees | **No** (wallet-scoped replace only) |
-| CPFP / `txPosition` / explorer fee-ladder fields | **No** |
-| Durable resume / sequence cursors | **No** |
+Esplora and electrs have no WebSocket. mempool.space's `/api/v1/ws`
+(`want`, `track-address`, `track-tx`, …) is its backend's surface, so
+`/ws` and `/v1/ws` are **404** here. Wallets watching live use Electrum
+subscriptions, or mempool's backend in front of this Esplora.
 
 ## BIP324 v2 short-ID surface (live paths)
 

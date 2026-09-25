@@ -69,7 +69,7 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 | **getheaders continuation** | full 2000-header reply locates from last hash | Next batch after that hash, not a replay from our tip. |
 | **headers poll** | skip if `best_known` cannot beat our tip | 120s `getheaders` only for peers that can still add work. |
 | **Chainwork prefix** | `Vec<Work>` `prefix[h] = work through h` (~32 B × tip; ≈28–32 MiB at 900k) | Process cache. Extend/truncate to `query.tip_height()`. Not durable. Restart rebuilds on first `chain_work`. |
-| **Mempool fee snapshot** | Published Arc (chunks + live count/vsize/total_fee) | Dirty/singleflight ≤~1 s. Admit only marks dirty. `GET /mempool` and WS `want: stats` Arc-load; no graph walk, no body clones. |
+| **Mempool fee snapshot** | Published Arc (chunks + live count/vsize/total_fee) | Dirty/singleflight ≤~1 s. Admit only marks dirty. `GET /mempool` Arc-loads; no graph walk, no body clones. |
 | **Mempool tx-body snapshot** | Lazy; ≤ one extra live-pool of `Arc<Transaction>` + JSON `OnceLock` after first unix `/internal` mempool-tx page | Dirty/singleflight. Not FIFO/LRU. Operators who never hit unix `/internal` do not keep this. |
 
 ## Soft budgets: request-limited only (invariant)

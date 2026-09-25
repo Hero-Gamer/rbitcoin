@@ -639,42 +639,6 @@ async fn pin_esplora_after_txid_and_post_multi(
     assert!(!posted.is_empty(), "{body}");
 }
 
-/// B13: one live `want: blocks` + `track-tx` on this `run_p2p` process.
-async fn spawn_esplora_ws_want_blocks_and_track_tx(
-    esplora_addr: SocketAddr,
-    track_txid: String,
-) -> tokio::task::JoinHandle<(bool, bool)> {
-    tokio::spawn(async move {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message as WsMsg;
-        let url = format!("ws://{esplora_addr}/v1/ws");
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-            .await
-            .expect("esplora ws upgrade");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        ws.send(WsMsg::Text(r#"{"action":"want","data":["blocks"]}"#.into()))
-            .await
-            .unwrap();
-        ws.send(WsMsg::Text(
-            format!(r#"{{"track-tx":"{track_txid}"}}"#).into(),
-        ))
-        .await
-        .unwrap();
-        let mut saw = (false, false);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !(saw.0 && saw.1) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let Ok(Some(Ok(WsMsg::Text(t)))) = tokio::time::timeout(left, ws.next()).await else {
-                break;
-            };
-            let v: Value = serde_json::from_str(t.as_str()).unwrap_or(json!(null));
-            saw.0 |= v["block"]["height"] == 107;
-            saw.1 |= v["tx"]["txid"] == track_txid && v["tx"]["status"]["confirmed"] == true;
-        }
-        saw
-    })
-}
-
 fn encode_tx(tx: &Transaction) -> String {
     let mut raw = Vec::new();
     tx.consensus_encode(&mut raw).unwrap();
@@ -1454,8 +1418,6 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     pin_waitforblockheight_timeout_zero_behind(rpc_addr, 106, &tip_hash).await;
     pin_getblock_hash_oob_unknown_and_raw(rpc_addr, 106, &tip_hash).await;
     let waiters = spawn_wait_and_gbt_longpoll(rpc_addr, 107).await;
-    let ws = spawn_esplora_ws_want_blocks_and_track_tx(esplora_addr, pkg_parent_txid.clone()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert_eq!(
@@ -1470,15 +1432,14 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let tip = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let new_hash = tip["result"].as_str().expect("new tip");
     waiters.assert_woke_on_new_tip(new_hash, 107).await;
-    let (saw_block, saw_tx) = tokio::time::timeout(Duration::from_secs(10), ws)
-        .await
-        .expect("esplora ws timed out")
-        .expect("esplora ws join");
-    assert!(saw_block, "ws want:blocks must push the generate tip");
-    assert!(
-        saw_tx,
-        "ws track-tx must confirm {pkg_parent_txid} on generate"
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{pkg_parent_txid}/status")).await;
+    assert_eq!(st, 200, "tx status: {body}");
+    let status: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        status["confirmed"], true,
+        "{pkg_parent_txid} confirms on generate: {body}"
     );
+    assert_eq!(status["block_height"], 107, "{body}");
     let blk = jsonrpc(rpc_addr, "getblock", json!([tip["result"].clone(), 2])).await;
     let txs = blk["result"]["tx"].as_array().expect("mined tx array");
     assert!(

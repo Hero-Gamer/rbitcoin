@@ -15,7 +15,7 @@ shared libraries through storage and runtime crates to composition and tools;
 | `rbitcoin-net` | P2P, IBD, tip follow, and transaction relay |
 | `rbitcoin-rpc` | Core-class JSON-RPC subset |
 | `rbitcoin-electrum` | Electrum TCP server |
-| `rbitcoin-esplora` | Esplora REST and wallet-scoped WebSocket server |
+| `rbitcoin-esplora` | Esplora REST server |
 | `rbitcoin-node` | Product binary and process composition |
 | `rbitcoin-cli` | RPC client binary |
 | `rbitcoin-test` | High-level scenario and integration-test harness |
