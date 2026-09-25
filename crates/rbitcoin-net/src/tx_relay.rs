@@ -2144,12 +2144,6 @@ impl MempoolHub {
         (snap.count, snap.vsize, snap.total_fee)
     }
 
-    /// Fee-snapshot generation for WS `want: stats` coalesce (not the tx-body Arc).
-    pub fn fee_snapshot_computed_at(&self) -> Instant {
-        self.maybe_refresh_fee_snapshot();
-        self.fee_snapshot.load().computed_at
-    }
-
     fn finish_accept_err(&self, us: u64, e: AcceptError) -> Result<AcceptResult, AcceptError> {
         // Soft outcomes (already in pool / orphan / full) are not "rejects".
         let hard = !matches!(
