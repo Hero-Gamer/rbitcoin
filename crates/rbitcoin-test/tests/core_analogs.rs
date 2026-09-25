@@ -8,6 +8,9 @@
 //!    fails when scripts are skipped (`feature_assumevalid.py`,
 //!    `mempool_persist.py`)
 //! 2. Reconstruct height 1 after wiping `tx.head/` (`feature_reindex*.py`)
+//! 3. BIP158 basic filters built from Class A match the reference builder,
+//!    including below a seqsigwit prune (`rpc_getblockfilter.py`,
+//!    `feature_blockfilterindex_prune.py`)
 
 use bitcoin::hashes::Hash;
 use bitcoin::{
@@ -423,4 +426,106 @@ fn analog_reconstruct_after_lost_head() {
 
     std::fs::write(head.join("meta"), []).unwrap();
     assert_query_rebuilds_from_class_a(&store, &b1, &cb_txid);
+}
+
+/// Class A filter build matches rust-bitcoin's `new_script_filter` at every
+/// height: coinbase-only, a spend, and a block with a duplicate script, an
+/// OP_RETURN, and a segwit output. Below a seqsigwit prune the build still
+/// works (it needs no witness data), while reconstruct refuses.
+#[test]
+fn analog_block_filters_from_class_a() {
+    use bitcoin::bip158::BlockFilter;
+    use std::collections::HashMap;
+
+    let params = ChainParams::regtest();
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    let chain = build_mature_regtest_with_spend(&q, &params);
+    let mut blocks = chain.blocks.clone();
+
+    let spend = &blocks[chain.spend_height as usize].txdata[1];
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mixed = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: spend.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: op_true.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: op_true,
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 1, 2, 3, 4]),
+            },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes([&[0x00, 0x14][..], &[7u8; 20]].concat()),
+            },
+        ],
+    };
+    let tip = blocks.last().unwrap();
+    let h_mixed = blocks.len() as u32;
+    let b = mine_regtest_block(
+        tip.block_hash(),
+        tip.header.time + 600,
+        h_mixed,
+        vec![mixed],
+    );
+    accept_and_connect_block(&q, &params, Height(h_mixed), &b, Milestone::NONE).unwrap();
+    blocks.push(b);
+
+    let mut outs: HashMap<OutPoint, ScriptBuf> = HashMap::new();
+    for b in &blocks {
+        for tx in &b.txdata {
+            let txid = tx.compute_txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                outs.insert(OutPoint::new(txid, vout as u32), o.script_pubkey.clone());
+            }
+        }
+    }
+    let reference = |b: &bitcoin::Block| {
+        BlockFilter::new_script_filter(b, |op| {
+            outs.get(op)
+                .cloned()
+                .ok_or(bitcoin::bip158::Error::UtxoMissing(*op))
+        })
+        .unwrap()
+    };
+    for (h, b) in blocks.iter().enumerate() {
+        let (built, header_fk) = q.build_basic_filter(Height(h as u32)).unwrap();
+        assert_eq!(built, reference(b), "filter at height {h}");
+        assert_eq!(
+            q.header_at_height(Height(h as u32)).unwrap().unwrap().0,
+            header_fk
+        );
+    }
+
+    let tip = blocks.last().unwrap();
+    let last = h_mixed + Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    pad_empty_from(
+        &q,
+        &params,
+        tip.block_hash(),
+        tip.header.time,
+        h_mixed + 1,
+        last,
+    );
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert!(q.reconstruct_block_at_height(Height(h_mixed)).is_err());
+    let (built, _) = q.build_basic_filter(Height(h_mixed)).unwrap();
+    assert_eq!(built, reference(&blocks[h_mixed as usize]));
 }

@@ -4,10 +4,10 @@
 //! `blockfilters/basic.bodies` is `u32` length then filter bytes, same order.
 //! The watermark is the last sealed height. A missing directory is "not built".
 
-use bitcoin::bip158::{BlockFilter, Error as Bip158Error, FilterHeader};
+use bitcoin::bip158::{BlockFilter, Error as Bip158Error, FilterHeader, GcsFilterWriter};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint, ScriptBuf};
-use rbitcoin_primitives::Height;
+use rbitcoin_primitives::{Fk, Height};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use crate::{Query, QueryError};
 
 const HEADER_LEN: u64 = 32;
+/// BIP158 basic filter Golomb-Rice parameters (`M`, `P`).
+const BASIC_FILTER_M: u64 = 784_931;
+const BASIC_FILTER_P: u8 = 19;
 
 fn dir(store: &Path) -> PathBuf {
     store.join("blockfilters")
@@ -174,6 +177,33 @@ pub fn read_basic_filter(
 }
 
 impl Query {
+    /// Basic filter of best-chain `height`, built from Class A, and its `header_fk`.
+    pub fn build_basic_filter(&self, height: Height) -> Result<(BlockFilter, Fk), QueryError> {
+        let (header_fk, rec) =
+            self.header_at_height(height)?
+                .ok_or(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: blockfilter height not confirmed",
+                ))?;
+        let (first, n) = self.store.header_txs.get_range(header_fk)?.ok_or(
+            rbitcoin_store::StoreError::Corrupt("confirmed header missing body list"),
+        )?;
+        let elements = self
+            .store
+            .txs
+            .basic_filter_elements(first.0, first.0 + u64::from(n) - 1)?;
+        let k0 = u64::from_le_bytes(rec.hash[0..8].try_into().unwrap());
+        let k1 = u64::from_le_bytes(rec.hash[8..16].try_into().unwrap());
+        let mut content = Vec::new();
+        let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
+        for e in &elements {
+            writer.add_element(e);
+        }
+        writer
+            .finish()
+            .map_err(|_| rbitcoin_store::StoreError::Corrupt("invariant: blockfilter encode"))?;
+        Ok((BlockFilter::new(&content), header_fk))
+    }
+
     pub fn block_filter_enabled(&self) -> bool {
         self.block_filter_enabled
             .load(std::sync::atomic::Ordering::SeqCst)
