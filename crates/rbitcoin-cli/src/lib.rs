@@ -15,6 +15,7 @@ fn usage() -> String {
          \n\
          Options:\n\
            --datadir PATH         node datadir (default ./datadir); unix socket PATH/rpc.sock\n\
+           --rpc-socket PATH      unix socket the node binds with --rpc-socket\n\
            --network NET          mainnet|testnet|signet|regtest (default TCP port)\n\
            --rpc-url URL          HTTP JSON-RPC (default http://127.0.0.1:<network port>)\n\
            --rpc-token-file PATH  Bearer token (default PATH/rpc.token from --datadir)\n\
@@ -31,6 +32,7 @@ struct CliConfig {
     datadir: PathBuf,
     network: Network,
     rpc_url: Option<String>,
+    socket: Option<PathBuf>,
     token_file: Option<PathBuf>,
     command: Option<String>,
     params: Vec<String>,
@@ -42,6 +44,7 @@ impl Default for CliConfig {
             datadir: PathBuf::from(".").join("datadir"),
             network: Network::Mainnet,
             rpc_url: None,
+            socket: None,
             token_file: None,
             command: None,
             params: Vec::new(),
@@ -101,6 +104,7 @@ fn parse_args(args: &[OsString]) -> Result<Action, String> {
                         Network::parse(&val).map_err(|e| format!("invalid --network: {e}"))?;
                 }
                 "rpc-url" => cfg.rpc_url = Some(val),
+                "rpc-socket" => cfg.socket = Some(PathBuf::from(val)),
                 "rpc-token-file" => cfg.token_file = Some(PathBuf::from(val)),
                 other => return Err(format!("unknown argument `--{other}`")),
             }
@@ -118,7 +122,9 @@ fn parse_args(args: &[OsString]) -> Result<Action, String> {
 }
 
 fn socket_path(cfg: &CliConfig) -> PathBuf {
-    cfg.datadir.join("rpc.sock")
+    cfg.socket
+        .clone()
+        .unwrap_or_else(|| cfg.datadir.join("rpc.sock"))
 }
 
 fn token_path(cfg: &CliConfig) -> PathBuf {
@@ -251,7 +257,7 @@ fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     }
     let params: Vec<Value> = cfg.params.iter().map(|p| param_value(p)).collect();
     let sock = socket_path(cfg);
-    let result = if cfg.rpc_url.is_none() && sock.exists() {
+    let result = if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
         let stream = connect_unix(&sock)?;
         rpc_http(stream, "localhost", 0, None, cmd, &params)?
     } else {
@@ -466,14 +472,10 @@ mod tests {
         assert_eq!(Network::Regtest.default_rpc_port(), 18443);
     }
 
+    /// Answer one JSON-RPC request on `listener` with `"result": 7`.
     #[cfg(unix)]
-    #[test]
-    fn unix_socket_needs_no_token() {
-        use std::os::unix::net::UnixListener;
-        let dir = tmp_datadir();
-        let sock = dir.join("rpc.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let h = thread::spawn(move || {
+    fn serve_one_rpc(listener: std::os::unix::net::UnixListener) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut raw = Vec::new();
             let mut tmp = [0u8; 1024];
@@ -491,7 +493,16 @@ mod tests {
                 body.len()
             );
             s.write_all(resp.as_bytes()).unwrap();
-        });
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_needs_no_token() {
+        use std::os::unix::net::UnixListener;
+        let dir = tmp_datadir();
+        let sock = dir.join("rpc.sock");
+        let h = serve_one_rpc(UnixListener::bind(&sock).unwrap());
         let code = cli_main([
             "rbitcoin-cli",
             "--datadir",
@@ -502,6 +513,29 @@ mod tests {
         assert!(
             exit_ok(code),
             "unix getblockcount must succeed, got {code:?}"
+        );
+        let _ = h.join();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_socket_reaches_a_socket_outside_the_datadir() {
+        use std::os::unix::net::UnixListener;
+        let dir = tmp_datadir();
+        let sock = dir.join("rpc-elsewhere.sock");
+        let h = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+        let code = cli_main([
+            "rbitcoin-cli",
+            "--datadir",
+            dir.join("no-such-datadir").to_str().unwrap(),
+            "--rpc-socket",
+            sock.to_str().unwrap(),
+            "getblockcount",
+        ]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            exit_ok(code),
+            "--rpc-socket getblockcount must succeed, got {code:?}"
         );
         let _ = h.join();
     }

@@ -56,7 +56,8 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary \
 
 ### rbitcoin-cli
 
-`--datadir` (default `./datadir`) prefers `{datadir}/rpc.sock`. TCP uses
+`--datadir` (default `./datadir`) prefers `{datadir}/rpc.sock`.
+`--rpc-socket PATH` talks to a node started with `--rpc-socket PATH`. TCP uses
 `--rpc-url` (default `http://127.0.0.1:<network port>`) and Bearer from
 `{datadir}/rpc.token` or `--rpc-token-file`. Prints the JSON-RPC `result`
 (strings unquoted).
