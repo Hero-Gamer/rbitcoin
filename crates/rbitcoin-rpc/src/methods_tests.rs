@@ -489,13 +489,31 @@ fn cln_bcli_rpc_shapes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core's result: `feerate` and `blocks` with an estimate; `errors` and
+/// `blocks`, and no `feerate`, without one.
 #[test]
-fn estimatesmartfee_maps_to_product() {
+fn estimatesmartfee_core_result_shape() {
     let (ctx, dir) = ctx_empty();
     let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
-    assert_eq!(r["feerate"], json!(-1.0), "{r}");
-    assert_eq!(r["errors"][0], "Insufficient data or empty mempool", "{r}");
-    assert!(r.get("rbitcoin_model").is_none(), "{r}");
+    assert!(
+        r.get("feerate").is_none(),
+        "no estimate has no feerate: {r}"
+    );
+    assert_eq!(
+        r["errors"][0], "Insufficient data or no feerate found",
+        "{r}"
+    );
+    assert_eq!(r["blocks"], 2, "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (hex, _) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 10_000);
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
+    assert!(r["feerate"].as_f64().is_some_and(|f| f > 0.0), "{r}");
+    assert_eq!(r["blocks"], 2, "{r}");
+    let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 2, "only feerate and blocks: {r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
