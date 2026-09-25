@@ -21,12 +21,13 @@ tower-http = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.23"
 getrandom = "0.4"
 
 [dev-dependencies]
 rbitcoin-test = { workspace = true }
 rbitcoin-consensus = { workspace = true }
+# HTTP Basic in the TCP-auth rejection test. Not on the node graph.
+base64 = "0.23"
 
 [lints]
 workspace = true
