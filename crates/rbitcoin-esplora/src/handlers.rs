@@ -1504,31 +1504,6 @@ fn sat_vb(btc_kb: f64) -> Option<f64> {
     (btc_kb >= 0.0).then(|| (btc_kb * 100_000_000.0).round() / 1_000.0)
 }
 
-/// Wallet WS `fees`: mempool.space tiers from the 1/3/6/144-block estimates.
-/// A tier with no estimate is `null`; `minimumFee` is the mempool min fee.
-fn fees_recommended_from(pairs: &[(u32, f64)], min_fee_sat_kvb: u64) -> Value {
-    let tier = |target: u32| {
-        pairs
-            .iter()
-            .find(|(t, _)| *t == target)
-            .and_then(|(_, btc_kb)| sat_vb(*btc_kb))
-    };
-    json!({
-        "fastestFee": tier(1),
-        "halfHourFee": tier(3),
-        "hourFee": tier(6),
-        "economyFee": tier(144),
-        "minimumFee": min_fee_sat_kvb as f64 / 1_000.0,
-    })
-}
-
-/// `null` without a mempool.
-pub(crate) fn fees_recommended_json(mp: Option<&MempoolHub>) -> Value {
-    mp.map_or(Value::Null, |m| {
-        fees_recommended_from(&m.fee_estimates_btc_per_kb(), m.mempool_min_fee_sat_kvb())
-    })
-}
-
 /// Esplora `/fee-estimates`: confirm target → sat/vB. Targets without an
 /// estimate are left out (electrs); `None` when no target has one.
 fn fee_estimates_from(pairs: &[(u32, f64)]) -> Option<Value> {
@@ -1970,10 +1945,7 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
 
 #[cfg(test)]
 mod pure_helper_tests {
-    use super::{
-        block_summary_json, fee_estimates_from, fees_recommended_from, outspend_json,
-        resolve_address_sh,
-    };
+    use super::{block_summary_json, fee_estimates_from, outspend_json, resolve_address_sh};
     use bitcoin::Network;
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::testutil::FixtureChain;
@@ -2036,12 +2008,6 @@ mod pure_helper_tests {
         assert_eq!(est["1"], json!(1.234));
         assert_eq!(est["3"], json!(0.987));
         assert_eq!(est["144"], json!(0.101));
-        let rec = fees_recommended_from(&pairs, 100);
-        assert_eq!(rec["fastestFee"], json!(1.234));
-        assert_eq!(rec["halfHourFee"], json!(0.987));
-        assert_eq!(rec["hourFee"], json!(0.31));
-        assert_eq!(rec["economyFee"], json!(0.101));
-        assert_eq!(rec["minimumFee"], json!(0.1));
     }
 
     #[test]
@@ -2052,9 +2018,6 @@ mod pure_helper_tests {
         assert_eq!(est["6"], json!(0.2));
         assert!(fee_estimates_from(&[(1, -1.0)]).is_none());
         assert!(fee_estimates_from(&[]).is_none());
-        let rec = fees_recommended_from(&[(1, -1.0)], 2_500);
-        assert!(rec["fastestFee"].is_null(), "{rec}");
-        assert_eq!(rec["minimumFee"], json!(2.5));
     }
 
     #[test]

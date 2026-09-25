@@ -603,7 +603,7 @@ mod tests {
             EsploraListen::Unix(sock.clone()),
             bitcoin::Network::Regtest,
         );
-        let handle = run_esplora(cfg, q, mp, None).await.unwrap();
+        let handle = run_esplora(cfg, q, mp).await.unwrap();
         (handle, sock)
     }
 
@@ -734,7 +734,7 @@ mod tests {
         assert!(expect_vsize > 0);
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
+        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)))
             .await
             .unwrap();
         let addr = handle.local_addr;
@@ -767,7 +767,7 @@ mod tests {
             .unwrap();
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
+        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)))
             .await
             .unwrap();
         let addr = handle.local_addr;
@@ -791,7 +791,7 @@ mod tests {
         pad.hub.accept_tx(&a).unwrap();
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
+        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)))
             .await
             .unwrap();
         let addr = handle.local_addr;
@@ -823,7 +823,7 @@ mod tests {
         let hex = serialize_hex(&a);
         let cfg =
             EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)), None)
+        let handle = run_esplora(cfg, Arc::clone(&pad.q), Some(Arc::clone(&pad.hub)))
             .await
             .unwrap();
         let addr = handle.local_addr;

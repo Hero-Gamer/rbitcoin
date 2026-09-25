@@ -84,8 +84,6 @@ idle-longest). Not an 8-script LRU and not a >5s process whale cache. Extra
 operator RAM is the kernel page cache of Class A `txout` / SH heads. Public
 explorer second-hit of a whale GET is nginx/CDN (`/api/address/` is cacheable).
 `--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A paged history request is still served.
-Esplora WS `block-transactions` uses the same posting-list tip probe
-as Electrum subscribe (miss skips Class A).
 
 Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 --passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.
@@ -209,7 +207,7 @@ Point Node `ESPLORA.UNIX_SOCKET_PATH` at `--esplora-listen
 /run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api` is fine) so
 `/internal/*` is available. Put the sock in `/run/rbitcoin` (**0750**,
 rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
-tree is `0700`. TCP `--esplora-listen host:port` is public REST+WS only (no
+tree is `0700`. TCP `--esplora-listen host:port` is public REST only (no
 `/internal`). Core RPC is `--rpc-socket /run/rbitcoin/rpc.sock` (mode
 **0660**) plus the `bitcoin-client` `socketPath` patch below — **not**
 `COOKIE_PATH` / HTTP Basic. Requires
@@ -281,28 +279,24 @@ const client = axios.create({
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
-| WebSocket | `/v1/ws` (+ `/ws`); **separate** WS connection cap (default 64) so upgrades do not starve REST |
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
-| Without mempool | mempool routes empty/safe; POST broadcast → **503**; WS track still upgrades but mempool pushes need hub |
-| Unknown / non-goal | **404** (address-prefix; Liquid). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](../../COMPAT.md) |
+| Without mempool | mempool routes empty/safe; POST broadcast → **503** |
+| Unknown / non-goal | **404** (address-prefix; Liquid; mempool.space `/ws` / `/v1/ws`). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](../../COMPAT.md) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
-WebSocket extras (defaults): max 64 concurrent `/v1/ws` sockets, 64 KiB client frames,
-64 tracked addresses and 64 tracked txids per connection. See [`COMPAT.md`](../../COMPAT.md)
-“Esplora WebSocket”.
 
-### Reverse proxy (TLS + WebSocket upgrade)
+### Reverse proxy (TLS)
 
-Terminate TLS and forward REST **and** WebSocket to the same upstream.
-`/api/v1/` is mempool's Node (MariaDB catalogue), including **`/api/v1/ws`**.
-`/api/` is rbitcoin Esplora (electrs HTTP), including wallet **`/api/ws`**
-(`--esplora-listen` `/v1/ws` + `/ws`). Register `/api/v1/` **first**. Deny
+Terminate TLS at the proxy.
+`/api/v1/` is mempool's Node (MariaDB catalogue), including its WebSocket
+**`/api/v1/ws`**. `/api/` is rbitcoin Esplora (electrs HTTP, no WebSocket).
+Register `/api/v1/` **first**. Deny
 `/api/internal/` at nginx even when Esplora is a unix sock.
 
 **Slash rules (these 404/502 if wrong):**
@@ -346,8 +340,6 @@ services.nginx = {
       extraConfig = ''
         proxy_pass http://unix:/run/rbitcoin/esplora.sock:/;
         proxy_set_header Host api;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
         proxy_set_header X-Rbitcoin-Client $connection;
       '';
     };
@@ -381,8 +373,6 @@ location /api/ {
   proxy_pass http://unix:/run/rbitcoin/esplora.sock:/;
   # TCP Esplora: proxy_pass http://127.0.0.1:3000/;
   proxy_http_version 1.1;
-  proxy_set_header Upgrade $http_upgrade;
-  proxy_set_header Connection "upgrade";
   proxy_set_header Host api;
   proxy_set_header X-Rbitcoin-Client $connection;
   proxy_read_timeout 3600s;
@@ -395,10 +385,10 @@ Probe (200 + a height, `X-Powered-By: rbitcoin-esplora/…`):
 curl -sS -D- http://127.0.0.1:8080/api/blocks/tip/height | head
 ```
 
-Caddy: `reverse_proxy` with default HTTP/1.1 upgrade support to the same
+Caddy: `reverse_proxy` to the same
 listen. `X-Rbitcoin-Client $connection` is how last-1 GET and last-bulk POST
 joins stick to one nginx connection; omit it on a public TCP expose. HTTP/1.1
 browsers open several `$connection` ids (each GET can miss last-1); terminate
 **HTTP/2** on this location so one tab maps to one connection. Every Esplora
-REST response and the WS upgrade includes
+REST response includes
 `X-Powered-By: rbitcoin-esplora/<version>-<hex>` (mempool failover regex).

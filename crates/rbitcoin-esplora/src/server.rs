@@ -1,8 +1,7 @@
-//! Esplora HTTP listener (axum + tower limits) and wallet WebSocket live path.
+//! Esplora HTTP listener (axum + tower limits).
 
 use crate::handlers;
 use crate::tx_json::{build_tx_json, build_tx_json_from_tx, tx_status_json_in};
-use crate::ws;
 use axum::extract::{FromRequestParts, Path, Query as AxumQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -14,7 +13,7 @@ use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
-use rbitcoin_net::{MempoolHub, TipEvent};
+use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
@@ -27,7 +26,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -282,15 +280,6 @@ async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next: Nex
     }
 }
 
-/// Default concurrent upgraded WebSocket sockets (separate from REST concurrency).
-pub const DEFAULT_MAX_WS_CONNECTIONS: usize = 64;
-/// Default max inbound client WebSocket text frame size.
-pub const DEFAULT_MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
-/// Default max tracked addresses per WS connection (wallet watchlist).
-pub const DEFAULT_MAX_TRACK_ADDRESSES: usize = 64;
-/// Default max tracked txids per WS connection (pending set).
-pub const DEFAULT_MAX_TRACK_TXS: usize = 64;
-
 /// Opt-in `GET /block-template` builder (node injects GBT; tests inject a stub).
 #[derive(Clone)]
 pub struct BlockTemplateFn(pub Arc<dyn Fn() -> Result<Value, String> + Send + Sync>);
@@ -349,7 +338,7 @@ impl EsploraListen {
     }
 }
 
-/// Esplora HTTP server config (listen + shared DoS floor + WS caps).
+/// Esplora HTTP server config (listen + shared DoS floor).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
     pub listen: EsploraListen,
@@ -357,14 +346,6 @@ pub struct EsploraConfig {
     pub limits: ServeLimits,
     /// Address encoding network (mainnet/testnet/signet/regtest).
     pub network: Network,
-    /// Max concurrent upgraded WebSocket connections (not REST concurrency).
-    pub max_ws_connections: usize,
-    /// Max inbound WS text frame bytes.
-    pub max_ws_message_bytes: usize,
-    /// Max tracked addresses per WS connection.
-    pub max_track_addresses: usize,
-    /// Max tracked txids per WS connection.
-    pub max_track_txs: usize,
     /// `None` → `GET /block-template` is 404 (default).
     pub block_template: Option<BlockTemplateFn>,
 }
@@ -383,10 +364,6 @@ impl EsploraConfig {
             listen,
             limits: ServeLimits::for_public_proxy(),
             network,
-            max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
-            max_ws_message_bytes: DEFAULT_MAX_WS_MESSAGE_BYTES,
-            max_track_addresses: DEFAULT_MAX_TRACK_ADDRESSES,
-            max_track_txs: DEFAULT_MAX_TRACK_TXS,
             block_template: None,
         }
     }
@@ -414,12 +391,6 @@ pub(crate) struct AppState {
     pub(crate) network: Network,
     pub(crate) mempool: Option<Arc<MempoolHub>>,
     pub(crate) max_body: usize,
-    /// Tip fan-out for `want: blocks` (each WS connection subscribes).
-    pub(crate) tip_tx: Option<broadcast::Sender<TipEvent>>,
-    pub(crate) ws_sem: Option<Arc<Semaphore>>,
-    pub(crate) max_ws_message_bytes: usize,
-    pub(crate) max_track_addresses: usize,
-    pub(crate) max_track_txs: usize,
     /// Per-client last-1 GET + last-bulk POST joins (unix or `join_header_trusted`).
     pub(crate) sh_join: Arc<Mutex<JoinCache>>,
     /// Unix listen trusts `X-Rbitcoin-Client` without a TCP peer address.
@@ -753,20 +724,16 @@ fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::n
     Ok(listener)
 }
 
-/// Start Esplora **plain HTTP** (+ wallet WebSocket) on `config.listen`.
+/// Start Esplora **plain HTTP** on `config.listen`.
 ///
-/// TLS is external (reverse proxy). App [`ServeLimits`] always apply to REST
-/// (concurrency, body size, request timeout). WebSocket upgrades use a **separate**
-/// semaphore so long-lived sockets do not starve HTTP concurrency.
+/// TLS is external (reverse proxy). App [`ServeLimits`] always apply
+/// (concurrency, body size, request timeout).
 ///
-/// Optional `mempool` enables fee estimates, mempool summary, `POST /tx`, and
-/// live track pushes. Optional `tip_tx` enables `want: blocks` and confirm pushes
-/// (clone of a broadcast sender; node bridges `ChainHub` tips into it).
+/// Optional `mempool` enables fee estimates, mempool summary, and `POST /tx`.
 pub async fn run_esplora(
     config: EsploraConfig,
     query: Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
-    tip_tx: Option<broadcast::Sender<TipEvent>>,
 ) -> Result<EsploraHandle, std::io::Error> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_c = shutdown.clone();
@@ -777,18 +744,11 @@ pub async fn run_esplora(
     // Floor for request timeout: at least 1s so unit tests with short idle still work.
     let timeout = idle.max(Duration::from_secs(1));
 
-    let ws_sem = Arc::new(Semaphore::new(config.max_ws_connections.max(1)));
-
     let state = AppState {
         query,
         network: config.network,
         mempool,
         max_body,
-        tip_tx,
-        ws_sem: Some(ws_sem),
-        max_ws_message_bytes: config.max_ws_message_bytes.max(1024),
-        max_track_addresses: config.max_track_addresses.max(1),
-        max_track_txs: config.max_track_txs.max(1),
         sh_join: Arc::new(Mutex::new(JoinCache::default())),
         join_header_trusted: {
             #[cfg(unix)]
@@ -925,13 +885,7 @@ pub async fn run_esplora(
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(ConcurrencyLimitLayer::new(max_conn));
 
-    // WS routes: separate from REST concurrency so upgrades do not hold HTTP permits.
-    let ws_routes = Router::new()
-        .route("/v1/ws", get(ws::ws_upgrade))
-        .route("/ws", get(ws::ws_upgrade));
-
     let app = rest
-        .merge(ws_routes)
         .layer(middleware::from_fn(stamp_powered_by_mw))
         .with_state(state);
 
@@ -1392,11 +1346,6 @@ mod tests {
             network: Network::Regtest,
             mempool: None,
             max_body: 1 << 20,
-            tip_tx: None,
-            ws_sem: None,
-            max_ws_message_bytes: 1024,
-            max_track_addresses: 1,
-            max_track_txs: 1,
             sh_join: cache,
             join_header_trusted: true,
             block_template: None,
@@ -1613,7 +1562,7 @@ mod tests {
         let q = Arc::new(q);
         let sock = dir.join("esplora.sock");
         let cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock.clone()), Network::Regtest);
-        let handle = run_esplora(cfg, q, None, None).await.expect("unix listen");
+        let handle = run_esplora(cfg, q, None).await.expect("unix listen");
         assert!(sock.exists(), "socket file");
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1638,9 +1587,7 @@ mod tests {
         let (h0, t0) = coinbase(0, Fk::NULL, None);
         q.connect_block(Height(0), &h0, &[t0]).unwrap();
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::new(q), None, None)
-            .await
-            .expect("listen");
+        let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
         let (st, raw, body) = http_get_raw(handle.local_addr, "/blocks/tip/height").await;
         assert_eq!(st, 200, "{body}");
         let powered = header_value(&raw, "x-powered-by").expect("X-Powered-By");
@@ -1690,11 +1637,6 @@ mod tests {
             network: Network::Regtest,
             mempool: None,
             max_body: 1 << 20,
-            tip_tx: None,
-            ws_sem: None,
-            max_ws_message_bytes: 1024,
-            max_track_addresses: 1,
-            max_track_txs: 1,
             sh_join: cache,
             join_header_trusted: trusted,
             block_template: None,
@@ -1737,7 +1679,7 @@ mod tests {
         q.connect_block(Height(0), &h0, &[t0]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let addr = handle.local_addr;
 
         let (st, raw, body) = http_get_raw(addr, "/blocks/tip/hash").await;
@@ -1778,7 +1720,7 @@ mod tests {
         q.connect_block(Height(1), &h1, &[t1]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -1835,11 +1777,6 @@ mod tests {
             network: Network::Regtest,
             mempool: None,
             max_body: 1024,
-            tip_tx: None,
-            ws_sem: None,
-            max_ws_message_bytes: 1024,
-            max_track_addresses: 1,
-            max_track_txs: 1,
             sh_join: Arc::new(Mutex::new(JoinCache::default())),
             join_header_trusted: false,
             block_template: None,
@@ -1877,11 +1814,6 @@ mod tests {
             network: Network::Regtest,
             mempool: None,
             max_body: 1024,
-            tip_tx: None,
-            ws_sem: None,
-            max_ws_message_bytes: 1024,
-            max_track_addresses: 1,
-            max_track_txs: 1,
             sh_join: Arc::new(Mutex::new(JoinCache::default())),
             join_header_trusted: false,
             block_template: None,
@@ -1931,7 +1863,7 @@ mod tests {
         let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
         hub.set_relay_enabled(true);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), Some(hub), None)
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(hub))
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -1990,7 +1922,7 @@ mod tests {
         let (dir, q) = temp_query("empty");
         let q = Arc::new(q);
         let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let (st, raw, _) = http_get_raw(handle.local_addr, "/blocks/tip/height").await;
         assert_eq!(st, 503);
         assert!(
@@ -2007,10 +1939,6 @@ mod tests {
     fn config_defaults_use_public_proxy_limits() {
         let cfg = EsploraConfig::new("0.0.0.0:3000".parse().unwrap());
         assert_eq!(cfg.limits, ServeLimits::for_public_proxy());
-        assert_eq!(cfg.max_ws_connections, DEFAULT_MAX_WS_CONNECTIONS);
-        assert_eq!(cfg.max_ws_message_bytes, DEFAULT_MAX_WS_MESSAGE_BYTES);
-        assert_eq!(cfg.max_track_addresses, DEFAULT_MAX_TRACK_ADDRESSES);
-        assert_eq!(cfg.max_track_txs, DEFAULT_MAX_TRACK_TXS);
     }
 
     #[test]
@@ -2052,7 +1980,7 @@ mod tests {
         q.connect_block(Height(0), &header, &[ta]).unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -2069,6 +1997,12 @@ mod tests {
 
         // mempool.space's tiers are its backend's /api/v1 surface, not Esplora's.
         for path in ["/fees/recommended", "/v1/fees/recommended"] {
+            let (st, body) = http_get(addr, path).await;
+            assert_eq!(st, 404, "{path}: {body}");
+        }
+
+        // mempool.space's websocket is its backend's /api/v1/ws, not Esplora's.
+        for path in ["/ws", "/v1/ws"] {
             let (st, body) = http_get(addr, path).await;
             assert_eq!(st, 404, "{path}: {body}");
         }
@@ -2111,7 +2045,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -2233,7 +2167,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -2254,7 +2188,7 @@ mod tests {
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
-    /// Regtest P2WPKH address + scriptPubKey for wallet-style track-address tests.
+    /// Regtest P2WPKH address + scriptPubKey.
     fn regtest_p2wpkh() -> (String, bitcoin::ScriptBuf) {
         regtest_p2wpkh_sk(7)
     }
@@ -2277,108 +2211,6 @@ mod tests {
         rbitcoin_primitives::display_hash_hex(&txid.to_byte_array())
     }
 
-    async fn ws_recv_json(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        timeout_secs: u64,
-    ) -> serde_json::Value {
-        use futures_util::StreamExt;
-        use tokio_tungstenite::tungstenite::Message as WsMsg;
-        let frame = tokio::time::timeout(Duration::from_secs(timeout_secs), ws.next())
-            .await
-            .expect("timeout")
-            .expect("closed")
-            .expect("err");
-        match frame {
-            WsMsg::Text(t) => serde_json::from_str(t.as_str()).expect("json"),
-            other => panic!("expected text, got {other:?}"),
-        }
-    }
-    /// Caps: honest error frames for max_track_addresses and max_track_txs.
-    #[tokio::test]
-    async fn ws_track_caps_error_frames() {
-        use futures_util::SinkExt;
-        use tokio_tungstenite::tungstenite::Message as WsMsg;
-
-        let (dir, q) = temp_query("ws-caps");
-        let q = Arc::new(q);
-        let mut cfg =
-            EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), bitcoin::Network::Regtest);
-        cfg.max_track_addresses = 1;
-        cfg.max_track_txs = 1;
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
-            .await
-            .expect("listen");
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{}/v1/ws", handle.local_addr))
-                .await
-                .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let (a1, _) = regtest_p2wpkh();
-        // Second distinct address.
-        let a2 = {
-            use bitcoin::key::CompressedPublicKey;
-            use bitcoin::secp256k1::{Secp256k1, SecretKey};
-            use bitcoin::{Address, Network, PrivateKey};
-            let secp = Secp256k1::new();
-            let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
-            let pk = PrivateKey::new(sk, Network::Regtest);
-            let cpk = CompressedPublicKey::from_private_key(&secp, &pk).unwrap();
-            Address::p2wpkh(&cpk, Network::Regtest).to_string()
-        };
-
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{a1}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text(
-            (format!(r#"{{"track-address":"{a2}"}}"#)).into(),
-        ))
-        .await
-        .unwrap();
-        let mut saw_addr_cap = false;
-        for _ in 0..6 {
-            let v = ws_recv_json(&mut ws, 2).await;
-            if v.get("error")
-                .and_then(|e| e.as_str())
-                .is_some_and(|s| s.contains("max_track_addresses"))
-            {
-                saw_addr_cap = true;
-                break;
-            }
-        }
-        assert!(saw_addr_cap, "expected max_track_addresses error frame");
-
-        let t1 = "11".repeat(32);
-        let t2 = "22".repeat(32);
-        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t1}"}}"#)).into()))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        ws.send(WsMsg::Text((format!(r#"{{"track-tx":"{t2}"}}"#)).into()))
-            .await
-            .unwrap();
-        let mut saw_tx_cap = false;
-        for _ in 0..6 {
-            let v = ws_recv_json(&mut ws, 2).await;
-            if v.get("error")
-                .and_then(|e| e.as_str())
-                .is_some_and(|s| s.contains("max_track_txs"))
-            {
-                saw_tx_cap = true;
-                break;
-            }
-        }
-        assert!(saw_tx_cap, "expected max_track_txs error frame");
-
-        let _ = ws.close(None).await;
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     /// Mempool-only txs (not in Class A) must be full Esplora JSON, not a stub.
     #[tokio::test]
     async fn mempool_only_tx_json_has_vin_vout_size_weight() {
@@ -2426,7 +2258,7 @@ mod tests {
         let sh_hex = block_hash_hex(&script_hash(&[0x51]));
 
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)), None)
+        let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)))
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -2519,7 +2351,7 @@ mod tests {
         q.apply_prune_seqsigwit_tip().unwrap();
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+        let handle = run_esplora(cfg, Arc::clone(&q), None)
             .await
             .expect("listen");
         let addr = handle.local_addr;
@@ -2570,7 +2402,7 @@ mod tests {
         }
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let addr = handle.local_addr;
         let sh = block_hash_hex(&script_hash(&[0x51]));
         let newest = block_hash_hex(&txids[2]);
@@ -2676,7 +2508,7 @@ mod tests {
 
         let q = Arc::new(q);
         let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
-        let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+        let handle = run_esplora(cfg, q, None).await.expect("listen");
         let addr = handle.local_addr;
         let sh1 = block_hash_hex(&script_hash(spk1.as_bytes()));
         let sh2 = block_hash_hex(&script_hash(spk2.as_bytes()));
@@ -2735,8 +2567,6 @@ mod tests {
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    include!("esplora_ws_journey.rs");
 
     include!("esplora_sh_journey.rs");
 }

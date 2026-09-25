@@ -161,7 +161,7 @@ async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 3
         c.fetch_add(1, Ordering::Relaxed);
         Ok(json!({"height": 1, "rules": ["segwit"]}))
     })));
-    let handle = run_esplora(cfg, Arc::clone(&q), None, None)
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
     let (st, raw, body) = http_get_raw(handle.local_addr, "/block-template").await;
@@ -184,7 +184,7 @@ async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 3
 
     let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
     cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Err("no hub".into()))));
-    let handle = run_esplora(cfg, q, None, None).await.expect("listen");
+    let handle = run_esplora(cfg, q, None).await.expect("listen");
     let (st, body) = http_get(handle.local_addr, "/block-template").await;
     assert_eq!(st, 503, "{body}");
     assert!(body.contains("no hub"), "{body}");
@@ -195,7 +195,7 @@ async fn template_missing_tip_or_knob() {
     let (dir, empty) = temp_query("gbt-notip");
     let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
     cfg.block_template = Some(BlockTemplateFn(Arc::new(|| Ok(json!({"height": 1})))));
-    let handle = run_esplora(cfg, Arc::new(empty), None, None)
+    let handle = run_esplora(cfg, Arc::new(empty), None)
         .await
         .expect("listen");
     let (st, body) = http_get(handle.local_addr, "/block-template").await;
@@ -205,7 +205,7 @@ async fn template_missing_tip_or_knob() {
 
     let (dir, q) = temp_query("gbt-404");
     let cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
-    let handle = run_esplora(cfg, Arc::new(q), None, None)
+    let handle = run_esplora(cfg, Arc::new(q), None)
         .await
         .expect("listen");
     let (st, body) = http_get(handle.local_addr, "/block-template").await;

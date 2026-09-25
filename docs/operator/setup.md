@@ -114,7 +114,6 @@ and Electrum as TLS-wrapped TCP on port 50002, using one ACME certificate:
       forceSSL = true;
       locations."/" = {
         proxyPass = "http://127.0.0.1:3000";
-        proxyWebsockets = true;
       };
       locations."/rpc/".proxyPass = "http://127.0.0.1:8332/";
     };

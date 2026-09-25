@@ -735,7 +735,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers
             .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
     }
-    let (esplora_handles, esplora_tip_bridge) = start_esplora_if_ready(
+    let esplora_handles = start_esplora_if_ready(
         sh_tip_ready,
         config.listen.esplora.clone(),
         config.network,
@@ -1139,10 +1139,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     for e in esplora_handles {
         e.shutdown().await;
-    }
-    if let Some(h) = esplora_tip_bridge {
-        h.abort();
-        let _ = h.await;
     }
     if let Some(h) = rpc_handle {
         if h.stop.load(Ordering::SeqCst) {
@@ -1592,12 +1588,12 @@ async fn start_esplora_if_ready(
     shutdown: &Shutdown,
     hub: Arc<ChainHub>,
     mempool: &std::sync::Arc<MempoolHub>,
-) -> (Vec<EsploraHandle>, Option<tokio::task::JoinHandle<()>>) {
+) -> Vec<EsploraHandle> {
     let Some(listen) = listen else {
-        return (Vec::new(), None);
+        return Vec::new();
     };
     if !sh_tip_ready || shutdown.requested() {
-        return (Vec::new(), None);
+        return Vec::new();
     }
     let q = hub.query.clone();
     let btc_net = match network {
@@ -1606,14 +1602,6 @@ async fn start_esplora_if_ready(
         rbitcoin_primitives::Network::Signet => bitcoin::Network::Signet,
         rbitcoin_primitives::Network::Regtest => bitcoin::Network::Regtest,
     };
-    let (esplora_tip_tx, _) = broadcast::channel::<TipEvent>(64);
-    let hub_tips = hub.subscribe_tips();
-    let bridge = spawn_hub_tip_bridge(
-        hub_tips,
-        esplora_tip_tx.clone(),
-        Arc::clone(&shutdown.flag),
-        Some,
-    );
     let mut ecfg = EsploraConfig::with_listen(listen, btc_net);
     if enable_block_template {
         let q = Arc::clone(&hub.query);
@@ -1649,22 +1637,21 @@ async fn start_esplora_if_ready(
     let max_conn = ecfg.limits.max_connections;
     let max_body = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
-    let max_ws = ecfg.max_ws_connections;
-    match run_esplora(ecfg, q, Some(Arc::clone(mempool)), Some(esplora_tip_tx)).await {
+    match run_esplora(ecfg, q, Some(Arc::clone(mempool))).await {
         Ok(h) => {
             info!(
-                "esplora HTTP+WS on {} (REST + /v1/ws; max_conn={} max_body={} idle={}s max_ws={}; TLS via reverse proxy if public)",
+                "esplora HTTP on {} (max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
                 h.socket_path
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| h.local_addr.to_string()),
-                max_conn, max_body, idle_secs, max_ws
+                max_conn, max_body, idle_secs
             );
-            (vec![h], Some(bridge))
+            vec![h]
         }
         Err(e) => {
             warn!("esplora HTTP start warning: {e}");
-            (Vec::new(), Some(bridge))
+            Vec::new()
         }
     }
 }
