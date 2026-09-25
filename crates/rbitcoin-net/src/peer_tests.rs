@@ -8868,5 +8868,18 @@ fn addr_key_oracle(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
     h
 }
 
+#[test]
+fn invalid_script_is_scored_and_policy_is_not() {
+    use rbitcoin_mempool::AcceptError;
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Script("script false".into())),
+        10
+    );
+    assert_eq!(
+        super::tx_reject_ban_score(&AcceptError::Policy("min relay fee")),
+        0
+    );
+}
+
 include!("peer_catchup_journey.rs");
 include!("peer_hostile_journey.rs");

@@ -5,9 +5,9 @@
 //!
 //! | File | Role |
 //! |------|------|
-//! | `meta` | Magic, schema **2**, commit generation **G**, slot capacity, live count |
+//! | `meta` | Magic, schema **3**, commit generation **G**, slot capacity, live count |
 //! | `slots` | Fixed-size slot records (status + body range + txid) |
-//! | `tx.body` | Packed live records (fee, weight, txid, wtxid, packed tx, vin aux) |
+//! | `tx.body` | Packed live records (fee, weight, sigop cost, txid, wtxid, packed tx, vin aux) |
 //!
 //! **Commit model:** body tail complete → slot LIVE → RAM graph. No fsync per
 //! tx. Admits persist on a 5 s timer ([`ActiveMempool::persist_due`]); that path

@@ -1,4 +1,7 @@
-//! MEM_SCHEMA 2 packed live records (`fee‖weight‖txid‖wtxid‖tx‖vin aux`).
+//! MEM_SCHEMA 3 packed live records (`fee‖weight‖sigops‖txid‖wtxid‖tx‖vin aux`).
+//!
+//! Schema 2 had no `sigops`; [`decode_packed_live_v2`] reads it for the soft
+//! migrate, which writes [`SIGOP_COST_UNKNOWN`] until the hub recomputes.
 //!
 //! Vin codec mirrors Class A packed flags/witness but writes `prev_txid` when
 //! there is no Class A `create_fk`. Outputs reuse [`OutputRecord`] unspent
@@ -17,6 +20,11 @@ const VIN_EMPTY_WITNESS: u8 = 1 << 2;
 const VIN_HAS_CREATE_FK: u8 = 1 << 3;
 const VIN_HAS_SCRIPT_HASH: u8 = 1 << 4;
 
+/// `sigops` value for a record migrated from schema ≤ 2 (cost not yet known).
+const SIGOP_COST_UNKNOWN: u64 = u64::MAX;
+/// Byte offset of `sigops` in a schema-3 record.
+pub(crate) const SIGOP_COST_OFF: usize = 16;
+
 /// Per-vin aux persisted with the packed body (SH index / tip-entry purge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VinAux {
@@ -26,11 +34,13 @@ pub struct VinAux {
     pub create_fk: Option<Fk>,
 }
 
-/// One LIVE body payload (schema 2).
+/// One LIVE body payload (schema 3).
 #[derive(Debug, Clone)]
 pub struct PackedLive {
     pub fee_sat: u64,
     pub weight: u64,
+    /// Full sigop cost; `None` for a record migrated from schema ≤ 2.
+    pub sigop_cost: Option<u64>,
     pub txid: Txid,
     pub wtxid: Wtxid,
     pub tx: Transaction,
@@ -43,6 +53,7 @@ pub fn encode_packed_live(
     wtxid: &Wtxid,
     fee_sat: u64,
     weight: u64,
+    sigop_cost: Option<u64>,
     vins: &[VinAux],
 ) -> Result<Vec<u8>, MempoolError> {
     if vins.len() != tx.input.len() && !vins.is_empty() {
@@ -51,6 +62,8 @@ pub fn encode_packed_live(
     let mut out = Vec::with_capacity(80 + tx.input.len() * 80 + tx.output.len() * 40);
     out.extend_from_slice(&fee_sat.to_le_bytes());
     out.extend_from_slice(&weight.to_le_bytes());
+    let sigops = sigop_cost.unwrap_or(SIGOP_COST_UNKNOWN);
+    out.extend_from_slice(&sigops.to_le_bytes());
     out.extend_from_slice(txid.as_byte_array());
     out.extend_from_slice(wtxid.as_byte_array());
     out.extend_from_slice(&tx.version.0.to_le_bytes());
@@ -70,14 +83,33 @@ pub fn encode_packed_live(
 }
 
 pub fn decode_packed_live(buf: &[u8]) -> Result<PackedLive, MempoolError> {
-    if buf.len() < 16 + 32 + 32 + 8 {
+    decode_packed(buf, true)
+}
+
+/// Schema-2 record (no `sigops` field) for the 2 → 3 soft migrate.
+pub(crate) fn decode_packed_live_v2(buf: &[u8]) -> Result<PackedLive, MempoolError> {
+    decode_packed(buf, false)
+}
+
+fn decode_packed(buf: &[u8], has_sigops: bool) -> Result<PackedLive, MempoolError> {
+    let ids = if has_sigops { 24 } else { 16 };
+    if buf.len() < ids + 32 + 32 + 8 {
         return Err(MempoolError::Corrupt("packed live short"));
     }
     let fee_sat = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let weight = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let txid = Txid::from_byte_array(buf[16..48].try_into().unwrap());
-    let wtxid = Wtxid::from_byte_array(buf[48..80].try_into().unwrap());
-    let mut off = 80usize;
+    let sigop_cost = if has_sigops {
+        let v = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        // Above the block limit is unknown: covers SIGOP_COST_UNKNOWN and a
+        // torn in-place write-back (0xFF.. partly overwritten, see
+        // `Mempool::set_sigop_cost`), which always overestimates.
+        (v <= crate::graph::MAX_BLOCK_SIGOPS_COST).then_some(v)
+    } else {
+        None
+    };
+    let txid = Txid::from_byte_array(buf[ids..ids + 32].try_into().unwrap());
+    let wtxid = Wtxid::from_byte_array(buf[ids + 32..ids + 64].try_into().unwrap());
+    let mut off = ids + 64;
     let version = i32::from_le_bytes(take_arr(buf, &mut off)?);
     let lock_time = u32::from_le_bytes(take_arr(buf, &mut off)?);
     let (n_in, n) = read_compact_size(&buf[off..])?;
@@ -122,6 +154,7 @@ pub fn decode_packed_live(buf: &[u8]) -> Result<PackedLive, MempoolError> {
     Ok(PackedLive {
         fee_sat,
         weight,
+        sigop_cost,
         txid,
         wtxid,
         tx,
@@ -315,14 +348,50 @@ mod tests {
             script_hash: Some(sh),
             create_fk: Some(Fk(42)),
         }];
-        let packed = encode_packed_live(&tx, &txid, &wtxid, 123, 400, &aux).unwrap();
+        let packed = encode_packed_live(&tx, &txid, &wtxid, 123, 400, Some(80), &aux).unwrap();
         let got = decode_packed_live(&packed).unwrap();
         assert_eq!(got.fee_sat, 123);
         assert_eq!(got.weight, 400);
+        assert_eq!(got.sigop_cost, Some(80));
         assert_eq!(got.txid, txid);
         assert_eq!(got.wtxid, wtxid);
         assert_eq!(serialize(&got.tx), raw, "consensus serialize pin");
         assert_eq!(got.vins[0].script_hash, Some(sh));
         assert_eq!(got.vins[0].create_fk, Some(Fk(42)));
+    }
+
+    #[test]
+    fn unknown_sigops_and_schema2_record_decode_as_none() {
+        let tx = sample_tx(false);
+        let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+        let v3 = encode_packed_live(&tx, &txid, &wtxid, 7, 400, None, &[]).unwrap();
+        assert_eq!(decode_packed_live(&v3).unwrap().sigop_cost, None);
+        // A torn 8-byte write-back over 0xFF.. overestimates; any cost no block
+        // can hold reads as unknown so the open-time pass recomputes it.
+        for (stored, want) in [(80_000, Some(80_000)), (80_001, None)] {
+            let rec = encode_packed_live(&tx, &txid, &wtxid, 7, 400, Some(stored), &[]).unwrap();
+            assert_eq!(decode_packed_live(&rec).unwrap().sigop_cost, want);
+        }
+        let mut v2 = v3.clone();
+        v2.drain(SIGOP_COST_OFF..SIGOP_COST_OFF + 8);
+        let got = decode_packed_live_v2(&v2).unwrap();
+        assert_eq!((got.fee_sat, got.weight, got.sigop_cost), (7, 400, None));
+        assert_eq!(got.txid, txid);
+        assert_eq!(serialize(&got.tx), serialize(&tx));
+        // Fixed prefix is 96 B (schema 3) / 88 B (schema 2): one byte short
+        // fails the length guard; exactly the prefix reaches the input count.
+        for (buf, min, decode) in [
+            (&v3, 96, decode_packed_live as fn(&[u8]) -> _),
+            (&v2, 88, decode_packed_live_v2),
+        ] {
+            assert!(matches!(
+                decode(&buf[..min - 1]),
+                Err(MempoolError::Corrupt("packed live short"))
+            ));
+            assert!(matches!(
+                decode(&buf[..min]),
+                Err(MempoolError::Corrupt("compact size empty"))
+            ));
+        }
     }
 }

@@ -11,10 +11,31 @@ before 1.0).
 
 ### Fixed
 
-- **Standard sigop cost is enforced before script execution.** A transaction
-  whose sigop cost exceeds 16_000 is `bad-txns-too-many-sigops` and is not
-  handed to the interpreter. An invalid script from a peer adds 10 to that
-  peer's ban score. Consensus block flags are unchanged.
+- **`-blockmintxfee` floors whole chunks:** `getblocktemplate` / `generate`
+  apply the floor to each chunk's modified feerate (Core `BlockAssembler`)
+  instead of filtering txs one by one after selection, which could drop a
+  low-fee CPFP parent and keep its child (`bad-txns-inputs-missingorspent`).
+
+- **Sigop-adjusted policy size:** feerate, RBF, min relay, package min
+  relay, chunk ranking, eviction, fee estimation and `-blockmintxfee` use
+  Core's `max(weight, sigop_cost × bytes_per_sigop)` (default 20, new
+  `--bytes-per-sigop`, `0` disables). `getmempoolentry` /
+  `testmempoolaccept` `vsize` and `getmempoolcluster` weights report it;
+  `weight` and the block weight budget stay raw. Cluster and package limits
+  also stay raw, unlike Core, so a sigop-dense tx is priced higher but not
+  capped below the block sigop limit. A sigop-dense tx no longer looks
+  cheaper than it is.
+
+- **Mempool sigop cost:** admission rejects a tx whose BIP16+BIP141 sigop
+  cost reaches the template budget (80,000 minus `--block-reserved-sigops`,
+  default 400), using the same strict limit as template selection. The reserve
+  is configurable from 0 to 80,000. Every live entry records its full cost.
+  The sidecar is schema 3; schema 2 pools soft-migrate on open and the hub
+  recomputes the cost, dropping entries whose inputs no longer resolve.
+- **An invalid script from a peer adds 10 to that peer's ban score.**
+  Consensus block flags are unchanged. There is no 16_000 standard sigop
+  cap (Libre policy); the only sigop reject is the whole-block limit above,
+  checked before the interpreter.
 - **Full-mempool fee floor follows evicted feerate.** While the mempool is
   at the weight cap the static bump remains, and an evicted chunk raises
   the floor one sat/kvB above that chunk so the same-rate transaction cannot
@@ -162,6 +183,17 @@ before 1.0).
 - **Mempool script skip requires the wtxid:** a block transaction is not
   treated as already checked just because its txid is in the mempool.
   A script job whose prevout count does not match its inputs fails closed.
+
+- **Block template sigop budget:** `getblocktemplate` / `generate` selection
+  starts at the 400 coinbase sigop reserve and skips a chunk that would reach
+  80,000 (Core `TestChunkBlockLimits`). Weight overflow also skips and keeps
+  trying later chunks instead of stopping, so a sigop-heavy pool no longer
+  yields a `bad-blk-sigops` template.
+
+- **`getblocktemplate` `sigops`:** each row reports the entry's full
+  BIP16+BIP141 sigop cost recorded at admission (Core
+  `GetTransactionSigOpCost`), not legacy sigops × 4. P2SH and P2WSH spends
+  were under-reported.
 
 - **Weekday script-verify fuzz skip floor is 0.3%:** the 600s job lands
   near 0.43% real comparisons (2026-09-21..23). The 0.5% bar was the

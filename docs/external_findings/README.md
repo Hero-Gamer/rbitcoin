@@ -47,7 +47,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `mempool_under_pressure` |
-| [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed | `mempool_under_pressure` |
+| [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `reject_tx_over_block_sigop_budget`, `mempool_under_pressure` |
 | [049](./049-rolling-min-fee.md) | medium | Full-mempool fee floor is a static bump | fixed | `mempool_under_pressure` |
 | [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `mempool_under_pressure` |
 | [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` |

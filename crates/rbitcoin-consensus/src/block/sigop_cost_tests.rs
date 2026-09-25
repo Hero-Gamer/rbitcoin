@@ -2,7 +2,7 @@
 
 use super::{
     is_p2sh_script, last_script_push, p2sh_sigop_count, prevout_spk_sigops, script_sigop_count,
-    tx_gbt_sigops, tx_sigop_cost, witness_sigop_count,
+    tx_sigop_cost, witness_sigop_count,
 };
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
@@ -18,7 +18,7 @@ fn spks(prevouts: &[TxOut]) -> Vec<&[u8]> {
 }
 
 #[test]
-fn gbt_sigops_scales_legacy_checksig() {
+fn legacy_sigop_cost_scales_checksig() {
     let tx = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -28,7 +28,7 @@ fn gbt_sigops_scales_legacy_checksig() {
             script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
         }],
     };
-    assert_eq!(tx_gbt_sigops(&tx), 4);
+    assert_eq!(tx_sigop_cost(&tx, &[], false, false), 4);
     let empty = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -38,7 +38,7 @@ fn gbt_sigops_scales_legacy_checksig() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    assert_eq!(tx_gbt_sigops(&empty), 0);
+    assert_eq!(tx_sigop_cost(&empty, &[], false, false), 0);
 }
 
 #[test]

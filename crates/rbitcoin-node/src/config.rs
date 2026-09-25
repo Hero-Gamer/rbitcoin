@@ -190,6 +190,10 @@ pub struct MempoolOpts {
     pub expiry_hours: Option<u64>,
     pub limit_cluster_count: Option<u32>,
     pub limit_cluster_size_kvb: Option<u32>,
+    /// Core `-bytespersigop` (`None` = 20; `0` disables sigop-adjusted size).
+    pub bytes_per_sigop: Option<u64>,
+    /// Sigops reserved for coinbase/template overhead (`None` = 400).
+    pub block_reserved_sigops: Option<u64>,
     pub blocksonly: bool,
 }
 
@@ -202,6 +206,8 @@ impl Default for MempoolOpts {
             expiry_hours: None,
             limit_cluster_count: None,
             limit_cluster_size_kvb: None,
+            bytes_per_sigop: None,
+            block_reserved_sigops: None,
             blocksonly: false,
         }
     }
@@ -540,6 +546,15 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> Result<(), NodeError> {
+        if self
+            .mempool
+            .block_reserved_sigops
+            .is_some_and(|n| n > 80_000)
+        {
+            return Err(NodeError::Config(
+                "block-reserved-sigops must be <= 80000".into(),
+            ));
+        }
         if self.datadir.path().as_os_str().is_empty() {
             return Err(NodeError::Config("datadir must not be empty".into()));
         }
@@ -1110,6 +1125,18 @@ impl NodeConfig {
                 self.mempool.limit_cluster_count =
                     Some(val.parse().map_err(|e| {
                         NodeError::Config(format!("conf limit_cluster_count: {e}"))
+                    })?);
+            }
+            "bytes_per_sigop" => {
+                self.mempool.bytes_per_sigop = Some(
+                    val.parse()
+                        .map_err(|e| NodeError::Config(format!("conf bytes_per_sigop: {e}")))?,
+                );
+            }
+            "block_reserved_sigops" => {
+                self.mempool.block_reserved_sigops =
+                    Some(val.parse().map_err(|e| {
+                        NodeError::Config(format!("conf block_reserved_sigops: {e}"))
                     })?);
             }
             "limit_cluster_size" => {

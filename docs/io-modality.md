@@ -240,7 +240,7 @@ Sealed `.fuse8` sidecars and SH BDZ3 occupancy prefixes are the mmap
 exceptions (read-only, not `MmapMut`). Packed `g` stays FdOnly. Class C is
 L2 write-behind (`flush_class_c_tip`
 before BQ dequeue) — **not** mapped (`strong_tx` write-behind is tip-last).
-Mempool schema 2 is InRam Vecs + `pwrite`.
+Mempool schema 3 is InRam Vecs + `pwrite`.
 
 Live head insert is page-coalesced pread → mutate → pwrite (not per-slot uring).
 Head resolve batches one pread per distinct probe page, then one loc batch

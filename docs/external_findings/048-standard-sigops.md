@@ -7,15 +7,22 @@
 Mempool admission counted no standard sigop cap before the script
 interpreter, and an invalid script was logged without a ban score.
 
-A transaction whose sigop cost exceeds 16_000 (`MAX_BLOCK_SIGOPS_COST / 5`)
-is rejected as `bad-txns-too-many-sigops` before `verify_tx_scripts_detached`.
+A transaction whose sigop cost does not fit the configured template budget
+(80_000 minus `--block-reserved-sigops`, default 400) is rejected as
+`bad-txns-too-many-sigops` before `verify_tx_scripts_detached`. This is a
+local admission/template policy, not a consensus-invalidity test. Core's
+16_000 standard cap (`MAX_BLOCK_SIGOPS_COST / 5`) is not applied. The cost is
+up to ~5x more signature checks per rejected tx; the ban score below bounds
+repeat abuse, and `--bytes-per-sigop` charges heavy txs for the block sigop
+budget they take.
 An `AcceptError::Script` from a peer adds 10 to that peer's ban score.
-Policy rejects, including the sigop cap, are not scored.
+Policy rejects and the block sigop reject are not scored.
 
 NULLFAIL, LOW_S, and CLEANSTACK stay at the flags production script verify
 already uses: NULLFAIL and LOW_S are off, and witness programs already
 require a clean true stack. Block validation does not gain those flags.
 
 **Regression:** `rbitcoin-mempool`
+`accept::tests::reject_tx_over_block_sigop_budget`,
 `accept::tests::mempool_under_pressure`,
 `rbitcoin-net` `peer::tests::invalid_script_is_scored_and_policy_is_not`.

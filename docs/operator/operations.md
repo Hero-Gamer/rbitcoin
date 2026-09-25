@@ -124,6 +124,8 @@ Clean smoke:
 | `--max-tip-age SECS` | `max_tip_age=` | unset — hub relay-inhibited age (default 24h) |
 | `--block-version N` | `block_version=` | unset — generate/template version overlay |
 | `--block-min-tx-fee BTC` | `block_min_tx_fee=` | unset — template min tx fee; garbage/negatives fail start |
+| `--bytes-per-sigop N` | `bytes_per_sigop=` | 20 — policy size is `max(weight, sigops*N)/4` for feerate; `0` disables |
+| `--block-reserved-sigops N` | `block_reserved_sigops=` | 400 — sigop budget held for coinbase/template overhead; admission and template selection use the same strict limit; range 0–80000 |
 | `--alert-notify CMD` | `alert_notify=` | unset — `%s` = warning; fires once |
 | `--startup-notify CMD` | `startup_notify=` | unset |
 | `--test-activation-height name@HEIGHT` | `test_activation_height=` | empty — buried deployment overlay |

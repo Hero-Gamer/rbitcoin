@@ -61,6 +61,8 @@ struct FeeSnapshot {
     by_depth_btc_per_kb: HashMap<u32, f64>,
     /// Best-first mining chunks from the last refresh (histogram / frontier).
     chunks: Vec<Chunk>,
+    /// Per-chunk Σ raw member vsize, parallel to [`Self::chunks`] (histogram).
+    chunk_raw_vsize: Vec<u64>,
     /// Live tx count from the same graph read as [`Self::chunks`].
     count: usize,
     /// Σ `(weight + 3) / 4` over live entries (GET `/mempool` `vsize`).
@@ -75,6 +77,7 @@ impl FeeSnapshot {
         Self {
             by_depth_btc_per_kb: HashMap::new(),
             chunks: Vec::new(),
+            chunk_raw_vsize: Vec::new(),
             count: 0,
             vsize: 0,
             total_fee: 0,
@@ -91,9 +94,9 @@ impl FeeSnapshot {
 
     fn histogram(&self) -> Vec<(u64, u64)> {
         let mut by_rate: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        for ch in &self.chunks {
+        // Raw vsize (electrs `tx.vsize()`), so buckets sum to GET `/mempool` `vsize`.
+        for (ch, vsize) in self.chunks.iter().zip(&self.chunk_raw_vsize) {
             let rate = ch.fee_rate_sat_per_kvb();
-            let vsize = rbitcoin_consensus::policy::get_virtual_size(ch.weight);
             *by_rate.entry(rate).or_insert(0) += vsize;
         }
         by_rate.into_iter().rev().collect()
@@ -309,6 +312,7 @@ fn is_hard_recent_reject(e: &AcceptError) -> bool {
 pub struct RecentAccept {
     pub txid: Txid,
     pub fee_sat: u64,
+    /// Raw BIP141 weight (not sigop-adjusted).
     pub weight: u64,
     /// Sum of output values (sats).
     pub value_sat: u64,
@@ -633,9 +637,24 @@ impl MempoolHub {
         max_weight_wu: u64,
         persist: bool,
     ) -> Result<Arc<Self>, String> {
+        Self::open_with_weight_persist_and_sigop_reserve(dir, query, max_weight_wu, persist, None)
+    }
+
+    /// Open with a configured reserve applied before migrated entries are
+    /// recomputed, so admission and template selection share the same budget.
+    pub fn open_with_weight_persist_and_sigop_reserve(
+        dir: impl AsRef<Path>,
+        query: Arc<Query>,
+        max_weight_wu: u64,
+        persist: bool,
+        reserved_sigops: Option<u64>,
+    ) -> Result<Arc<Self>, String> {
         let dir_buf = dir.as_ref().to_path_buf();
-        let mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
+        let mut mp = ActiveMempool::open_with_limit_persist(dir.as_ref(), max_weight_wu, persist)
             .map_err(|e| format!("mempool open: {e}"))?;
+        if let Some(reserved) = reserved_sigops {
+            mp.set_block_reserved_sigops(reserved);
+        }
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
         let (isolated_kick, _) = broadcast::channel(32);
@@ -712,6 +731,9 @@ impl MempoolHub {
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(HashMap::new()),
         };
+        // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
+        hub.lock_write()
+            .recompute_missing_sigops(&QueryUtxoProvider::new(&hub.query));
         {
             let mut u = hub.unbroadcast.lock().unwrap();
             u.retain(|t| hub.contains(t));
@@ -1002,7 +1024,8 @@ impl MempoolHub {
         let entry = RecentAccept {
             txid: r.txid,
             fee_sat: r.fee_sat,
-            weight: r.weight,
+            // Raw: Esplora `/mempool/recent` vsize is electrs `tx.vsize()`.
+            weight: tx.weight().to_wu(),
             value_sat,
         };
         let mut q = self.recent.lock().unwrap();
@@ -1607,12 +1630,6 @@ impl MempoolHub {
             Err(e) => return Err(e),
         };
         let t_script = Instant::now();
-        if rbitcoin_consensus::policy::exceeds_standard_sigops(tx, &prep.prevouts) {
-            stages.script_us = stages
-                .script_us
-                .saturating_add(t_script.elapsed().as_micros() as u64);
-            return Err(AcceptError::Policy("bad-txns-too-many-sigops"));
-        }
         if let Err(e) =
             rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone())
         {
@@ -1996,9 +2013,19 @@ impl MempoolHub {
     /// One graph linearize under short read lock, then pure math off-lock → publish.
     fn refresh_fee_snapshot(&self) {
         let t0 = Instant::now();
-        let (chunks, count, vsize, total_fee) = {
+        let (chunks, chunk_raw_vsize, count, vsize, total_fee) = {
             let g = self.lock_read();
             let chunks = g.graph.mining_chunks_best_first();
+            let chunk_raw_vsize = chunks
+                .iter()
+                .map(|c| {
+                    c.txids
+                        .iter()
+                        .filter_map(|t| g.graph.get(t))
+                        .map(|e| e.weight.saturating_add(3) / 4)
+                        .sum()
+                })
+                .collect();
             let mut count = 0usize;
             let mut vsize = 0u64;
             let mut total_fee = 0u64;
@@ -2007,7 +2034,7 @@ impl MempoolHub {
                 total_fee = total_fee.saturating_add(e.fee_sat);
                 vsize = vsize.saturating_add(e.weight.saturating_add(3) / 4);
             }
-            (chunks, count, vsize, total_fee)
+            (chunks, chunk_raw_vsize, count, vsize, total_fee)
         };
 
         let now = Instant::now();
@@ -2057,6 +2084,7 @@ impl MempoolHub {
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
             by_depth_btc_per_kb: by_depth,
             chunks,
+            chunk_raw_vsize,
             count,
             vsize,
             total_fee,
@@ -2182,7 +2210,8 @@ impl MempoolHub {
         let t0 = Instant::now();
         let utxo = self.utxo_provider();
         let sat_kvb = self.min_relay_sat_kvb();
-        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb) {
+        let bps = self.lock_read().graph.bytes_per_sigop();
+        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb, bps) {
             Some(0)
         } else {
             None
@@ -2312,9 +2341,15 @@ impl MempoolHub {
         let n = {
             let mut g = self.lock_write();
             let mut block_rates = Vec::new();
+            let bps = g.graph.bytes_per_sigop();
             for tid in txids {
                 if let Some(e) = g.graph.get(tid) {
-                    let rate = e.fee_rate_sat_per_kvb();
+                    // Core `CBlockPolicyEstimator` records fee over the
+                    // sigop-adjusted size, like the chunk frontier.
+                    let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(
+                        e.fee_sat,
+                        e.adjusted_weight(bps),
+                    );
                     self.push_confirm_memory(rate);
                     block_rates.push(rate);
                 }
@@ -2743,13 +2778,16 @@ impl MempoolHub {
     }
 
     /// Block template / generate selection: mining-order live txs that fit
-    /// in a block (best chunks first). Same helper GBT will use.
-    pub fn select_block_txs(&self) -> Vec<Transaction> {
+    /// in a block (best chunks first), skipping chunks under `min_sat_kvb`
+    /// (`-blockmintxfee`) on modified fee.
+    pub fn select_block_txs(&self, min_sat_kvb: u64) -> Vec<Transaction> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let g = self.lock_read();
-        g.select_block_txs_delta(rbitcoin_mempool::TxGraph::template_tx_weight(), |id| {
-            deltas.get(&id).copied().unwrap_or(0)
-        })
+        g.select_block_txs_delta(
+            rbitcoin_mempool::TxGraph::template_tx_weight(),
+            min_sat_kvb,
+            |id| deltas.get(&id).copied().unwrap_or(0),
+        )
     }
 
     /// Additive `prioritisetransaction` delta (sat). Zero total drops the entry.
@@ -2820,6 +2858,19 @@ impl MempoolHub {
             .collect()
     }
 
+    /// Core `GetTotalTxSize` / `totalFee`: (count, sigop-adjusted vbytes, fee) for `getmempoolinfo`.
+    pub fn live_adjusted_totals(&self) -> (usize, u64, u64) {
+        let g = self.lock_read();
+        let bps = g.graph.bytes_per_sigop();
+        g.graph.iter().fold((0, 0, 0), |(n, vb, fee), (_, e)| {
+            (
+                n + 1,
+                vb + rbitcoin_consensus::policy::get_virtual_size(e.adjusted_weight(bps)),
+                fee + e.fee_sat,
+            )
+        })
+    }
+
     /// Fee/weight for one live mempool txid (no live-set scan).
     pub fn get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
         self.lock_read()
@@ -2828,13 +2879,26 @@ impl MempoolHub {
             .map(|e| (e.fee_sat, e.weight))
     }
 
+    /// Core `GetAdjustedWeight`: `max(weight, sigop_cost * bytes_per_sigop)`.
+    pub fn get_live_adjusted_weight(&self, txid: &Txid) -> Option<u64> {
+        let g = self.lock_read();
+        let bps = g.graph.bytes_per_sigop();
+        g.graph.get(txid).map(|e| e.adjusted_weight(bps))
+    }
+
+    /// Full BIP16 + BIP141 sigop cost recorded at admission (GBT `sigops`).
+    pub fn get_live_sigop_cost(&self, txid: &Txid) -> Option<u64> {
+        self.lock_read().graph.get(txid).map(|e| e.sigop_cost)
+    }
+
+    /// Fee + sigop-adjusted weight for the feefilter announce gate (Core
+    /// `txinfo.vsize` is `GetTxSize`). `None` if a writer holds `inner`.
     pub fn try_get_live_meta(&self, txid: &Txid) -> Option<(u64, u64)> {
-        self.inner
-            .try_read()
-            .ok()?
-            .graph
+        let g = self.inner.try_read().ok()?;
+        let bps = g.graph.bytes_per_sigop();
+        g.graph
             .get(txid)
-            .map(|e| (e.fee_sat, e.weight))
+            .map(|e| (e.fee_sat, e.adjusted_weight(bps)))
     }
 
     /// Compact fill: siphash live txid/wtxid, clone **matching** bodies only.
@@ -3005,6 +3069,11 @@ impl MempoolHub {
         self.lock_write().set_cluster_limits(count, size_kvb);
     }
 
+    /// Core `-bytespersigop` overlay: `0` disables sigop-adjusted sizing.
+    pub fn set_bytes_per_sigop(&self, bytes_per_sigop: u64) {
+        self.lock_write().set_bytes_per_sigop(bytes_per_sigop);
+    }
+
     /// Min-relay overlay (sat/kvB). `0` admits any non-negative fee.
     pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
         self.min_relay_sat_kvb.store(sat_kvb, Ordering::Release);
@@ -3130,7 +3199,7 @@ impl MempoolHub {
         Some(AcceptResult {
             txid: e.txid,
             fee_sat: e.fee_sat,
-            weight: e.weight,
+            weight: e.adjusted_weight(g.graph.bytes_per_sigop()),
             slot: e.slot,
             replaced: Vec::new(),
             replaced_scripthashes: Vec::new(),
@@ -3139,18 +3208,21 @@ impl MempoolHub {
     }
 
     #[allow(clippy::type_complexity)] // packed row / pin / script-hash tuple is the on-disk shape
-    /// `getmempoolcluster` payload from the live graph.
+    /// `getmempoolcluster` payload from the live graph (weights sigop-adjusted).
     pub fn cluster_rpc(&self, txid: &Txid) -> Option<(u64, usize, Vec<(i64, u64, Vec<Txid>)>)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let d = |id: Txid| deltas.get(&id).copied().unwrap_or(0);
         let g = self.lock_read();
         let c = g.graph.cluster_of_delta(txid, d)?;
-        let chunks = c
+        let chunks: Vec<_> = c
             .chunks
             .iter()
             .map(|ch| (ch.fee_sat as i64, ch.weight, ch.txids.clone()))
             .collect();
-        Some((c.total_weight, c.members.len(), chunks))
+        // Core `clusterweight` is sigop-adjusted; `total_weight` is the raw
+        // cluster-limit basis, chunk weights are adjusted.
+        let adjusted = chunks.iter().fold(0u64, |w, ch| w.saturating_add(ch.1));
+        Some((adjusted, c.members.len(), chunks))
     }
 
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
@@ -3441,11 +3513,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp() -> std::path::PathBuf {
+        // macOS clocks tick in µs: back-to-back calls can share `n`.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
     }
 
     #[test]
@@ -3479,6 +3554,7 @@ mod tests {
                 wtxid: good.compute_wtxid(),
                 fee_sat: 1,
                 weight: good.weight().to_wu(),
+                sigop_cost: 0,
                 slot: 0,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
@@ -3814,7 +3890,7 @@ mod tests {
             {
                 let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
                 store
-                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, &[])
+                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, 0, &[])
                     .unwrap();
                 store.flush().unwrap();
             }
@@ -3828,6 +3904,63 @@ mod tests {
                 !hub.scripthash_mempool(&sh).is_empty(),
                 "batch-fill the vin that lacked aux"
             );
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            // Unknown sigop cost (schema-2 migrate): open recomputes it from
+            // chain coins and drops the entry whose input is not a coin.
+            let mp = tmp();
+            // OP_CHECKSIG output: one legacy sigop, cost 4.
+            let ok = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0xac]));
+            let gone = spend_true(Txid::from_byte_array([0xee; 32]), 1_000, spk.clone());
+            {
+                let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
+                for tx in [&ok, &gone] {
+                    let (tid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+                    store
+                        .append_live_tx(tx, &tid, &wtxid, 1_000, 400, u64::MAX, &[])
+                        .unwrap();
+                }
+                store.flush().unwrap();
+            }
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            assert_eq!(hub.get_live_sigop_cost(&ok.compute_txid()), Some(4));
+            assert_eq!(
+                hub.get_live_sigop_cost(&gone.compute_txid()),
+                None,
+                "unresolvable input evicted"
+            );
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        {
+            // Sigop-adjusted weight: max(400, 100 * 20) until bps is 0.
+            let mp = tmp();
+            let tx = spend_true(cbs[0], 1_000, spk.clone());
+            let (tid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+            {
+                let mut store = rbitcoin_mempool::Mempool::open_or_create(&mp).unwrap();
+                store
+                    .append_live_tx(&tx, &tid, &wtxid, 1_000, 400, 100, &[])
+                    .unwrap();
+                store.flush().unwrap();
+            }
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            assert_eq!(hub.get_live_adjusted_weight(&tid), Some(2_000));
+            // Core `getmempoolcluster` `clusterweight` is sigop-adjusted.
+            assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 2_000);
+            // Feefilter announce gate: Core `txinfo.vsize` is sigop-adjusted.
+            assert_eq!(hub.try_get_live_meta(&tid), Some((1_000, 2_000)));
+            hub.set_bytes_per_sigop(0);
+            assert_eq!(hub.get_live_adjusted_weight(&tid), Some(400));
+            assert_eq!(hub.cluster_rpc(&tid).unwrap().0, 400);
+            assert_eq!(hub.get_live_adjusted_weight(&Txid::all_zeros()), None);
+            hub.set_bytes_per_sigop(20);
+            // Confirmed feerate memory: 1_000 sat on 500 adjusted vB (raw 100).
+            hub.set_relay_enabled(true);
+            assert_eq!(hub.remove_for_block(&[tid]), 1);
+            assert_eq!(hub.confirm_memory_floor_sat_per_kvb(), Some(2_000));
             let _ = std::fs::remove_dir_all(&mp);
         }
 
@@ -4500,6 +4633,123 @@ mod tests {
             "compact-seen extra must fill short-ids"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn hub_admits_sigops_over_core_standard_cap() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        // 4001 legacy CHECKSIG × 4 = 16004 sigop cost: over Core's standard
+        // cap, under the block limit, so Libre policy admits it.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
+            }],
+        };
+        hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
+        assert_eq!(hub.get_live_sigop_cost(&tx.compute_txid()), Some(16_004));
+        let _ = std::fs::remove_dir_all(&mp);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn startup_recomputes_unknown_sigops_with_configured_reserve() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            1,
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cbs[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0xae]),
+                };
+                999
+            ],
+        };
+        let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+        let mempool_dir = tmp();
+        {
+            let mut store = rbitcoin_mempool::Mempool::open_or_create(&mempool_dir).unwrap();
+            store
+                .append_live_tx(
+                    &tx,
+                    &txid,
+                    &wtxid,
+                    4_999_999_001,
+                    tx.weight().to_wu(),
+                    u64::MAX,
+                    &[],
+                )
+                .unwrap();
+            store.flush().unwrap();
+        }
+        let hub = MempoolHub::open_with_weight_persist_and_sigop_reserve(
+            &mempool_dir,
+            Arc::new(q),
+            rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT,
+            true,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(hub.get_live_sigop_cost(&txid), Some(79_920));
+        assert!(hub.contains(&txid));
+        let _ = std::fs::remove_dir_all(&mempool_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
@@ -5431,6 +5681,14 @@ mod tests {
         let _ = hub.take_chunks_rebuilds();
         let _ = hub.fee_histogram();
         assert_eq!(hub.take_chunks_rebuilds(), 0, "totals share fee refresh");
+        // Electrum histogram buckets are raw vsize, summing to GET /mempool vsize.
+        let hist_vsize: u64 = hub.fee_histogram().iter().map(|(_, v)| v).sum();
+        assert_eq!(hist_vsize, expect_vsize);
+        // getmempoolinfo totals: a plain spend's adjusted vsize is its raw vsize.
+        assert_eq!(
+            hub.live_adjusted_totals(),
+            (expect_count, expect_vsize, expect_fee)
+        );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

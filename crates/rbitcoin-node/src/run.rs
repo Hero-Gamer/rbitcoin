@@ -293,6 +293,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let persist = config.mempool.persist;
     let cluster_count = config.mempool.limit_cluster_count;
     let cluster_kvb = config.mempool.limit_cluster_size_kvb;
+    let bytes_per_sigop = config.mempool.bytes_per_sigop;
+    let block_reserved_sigops = config.mempool.block_reserved_sigops;
     let min_relay_sat = match config.mempool.min_relay_fee_btc.as_deref() {
         Some(s) => Some(
             parse_btc_to_sat(s)
@@ -306,8 +308,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let hub = Arc::clone(&node.hub);
     let (mempool, mp_gen, mp_live) = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
-        let mp = MempoolHub::open_with_weight_persist(mempool_path, query, max_weight, persist)?;
+        let mp = MempoolHub::open_with_weight_persist_and_sigop_reserve(
+            mempool_path,
+            query,
+            max_weight,
+            persist,
+            block_reserved_sigops,
+        )?;
         mp.set_cluster_limits(cluster_count, cluster_kvb);
+        if let Some(b) = bytes_per_sigop {
+            mp.set_bytes_per_sigop(b);
+        }
         if immediate_relay {
             mp.set_immediate_relay(true);
         }
@@ -2667,11 +2678,14 @@ mod tests {
         cfg.listen.connect.clear();
         cfg.max_run_secs = Some(0); // exit after catch-up / tip mode
         cfg.smoke = false;
+        cfg.mempool.bytes_per_sigop = Some(0);
+        let mempool_path = cfg.mempool_path();
         // Bound runtime so a hang fails the test suite instead of blocking.
         // max_run_secs=0 should exit immediately after catch-up; keep bound tight.
         let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p ok with no peers");
+        assert!(mempool_path.exists(), "run_p2p opens the mempool");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

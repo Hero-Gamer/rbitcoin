@@ -23,14 +23,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
             "orphanage": { "size": 0, "bytes": 0 },
         }));
     };
-    let live = mp.list_live_meta();
-    let size = live.len();
-    let mut bytes = 0u64;
-    let mut total_fee = 0u64;
-    for (_, fee, weight) in &live {
-        bytes += rbitcoin_consensus::policy::get_virtual_size(*weight);
-        total_fee += fee;
-    }
+    let (size, bytes, total_fee) = mp.live_adjusted_totals();
     let (orphan_size, orphan_wu) = mp.orphan_stats();
     Ok(json!({
         "loaded": true,
@@ -75,7 +68,9 @@ pub(crate) fn sat_btc_json(sat: i64) -> Value {
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
-    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
+    // Core `vsize` is sigop-adjusted; `weight` stays raw.
+    let adj = mp.get_live_adjusted_weight(txid).unwrap_or(weight);
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(adj);
     let delta = mp.fee_delta(txid);
     let modified = (fee as i64).saturating_add(delta);
     let (ac, asz, afee, dc, dsz, dfee, a_mod, d_mod, chunk_fee, chunk_w) =
@@ -93,7 +88,7 @@ pub(crate) fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight:
                 cw,
             ),
             None => (
-                1, vsize, fee, 1, vsize, fee, modified, modified, modified, weight,
+                1, vsize, fee, 1, vsize, fee, modified, modified, modified, adj,
             ),
         };
     let (depends, spentby) = match mp.depends_spentby(txid) {
@@ -1338,7 +1333,10 @@ fn submitpackage_admit(
             to_admit.push(tx.clone());
             continue;
         }
-        if let Some((fee, weight)) = mp.get_live_meta(&tx.compute_txid()) {
+        if let (Some((fee, _)), Some(weight)) = (
+            mp.get_live_meta(&tx.compute_txid()),
+            mp.get_live_adjusted_weight(&tx.compute_txid()),
+        ) {
             tx_results.insert(
                 wtxid,
                 json!({
