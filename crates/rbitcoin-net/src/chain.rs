@@ -1621,7 +1621,8 @@ impl ChainHub {
         if let Some(mp) = self.mempool() {
             mp.clear_recent_rejects();
             if mp.relay_enabled() {
-                for &(_height, hash) in need_meta {
+                for &(height, hash) in need_meta {
+                    mp.note_block_fee_history(Height(height));
                     if let Ok(Some(block)) =
                         self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                     {
@@ -2681,6 +2682,9 @@ impl ChainHub {
             if n > 0 {
                 rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
             }
+            if mp.relay_enabled() {
+                mp.note_block_fee_history(Height(height));
+            }
         }
         let mp_strip_ns = t_mp.elapsed().as_nanos() as u64;
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
@@ -3277,6 +3281,46 @@ mod tests {
         mp.set_relay_enabled(true);
         assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
         mp
+    }
+
+    /// Far-target fee history is read from the chain: a mined block counts at
+    /// its package rate even if this pool never saw its txs, and a restarted
+    /// hub backfills it at once instead of rebuilding one block at a time.
+    #[test]
+    fn fee_history_is_read_from_the_chain() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("pad");
+        let mp = attach_mp(dir.path(), &hub);
+        let paid = mature_spend_tx(&hub);
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(10_000, paid.weight().to_wu());
+        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![paid])
+            .expect("generate");
+        let sat_kvb = |btc_kb: f64| (btc_kb * 100_000_000.0).round() as u64;
+        assert_eq!(
+            sat_kvb(mp.estimate_fee_btc_per_kb(144)),
+            rate,
+            "tip block counts"
+        );
+
+        let fresh = crate::tx_relay::MempoolHub::open(
+            dir.path().join("mp-restart"),
+            Arc::clone(&hub.query),
+        )
+        .unwrap();
+        fresh.set_relay_enabled(true);
+        assert!(
+            fresh.estimate_fee_btc_per_kb(144) < 0.0,
+            "no history before backfill"
+        );
+        assert_eq!(
+            fresh.backfill_block_fee_history(),
+            1,
+            "one block has fee-paying txs"
+        );
+        assert_eq!(sat_kvb(fresh.estimate_fee_btc_per_kb(144)), rate);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
