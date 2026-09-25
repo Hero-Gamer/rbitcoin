@@ -254,6 +254,17 @@ impl Query {
     }
 }
 
+fn read_header_at(store: &Path, height: u32) -> Result<FilterHeader, QueryError> {
+    let path = headers_path(store);
+    let mut f = File::open(&path).map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
+    f.seek(SeekFrom::Start(u64::from(height) * HEADER_LEN))
+        .map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
+    let mut buf = [0u8; 32];
+    f.read_exact(&mut buf)
+        .map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
+    Ok(FilterHeader::from_byte_array(buf))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,15 +354,4 @@ mod tests {
             sealed.0
         );
     }
-}
-
-fn read_header_at(store: &Path, height: u32) -> Result<FilterHeader, QueryError> {
-    let path = headers_path(store);
-    let mut f = File::open(&path).map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
-    f.seek(SeekFrom::Start(u64::from(height) * HEADER_LEN))
-        .map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
-    let mut buf = [0u8; 32];
-    f.read_exact(&mut buf)
-        .map_err(|e| rbitcoin_store::StoreError::io(&path, e))?;
-    Ok(FilterHeader::from_byte_array(buf))
 }
