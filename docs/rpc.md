@@ -31,7 +31,17 @@ history.
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
-Bearer-authenticated (`{datadir}/rpc.token`). The Core-functional proxy still
+Bearer-authenticated (`{datadir}/rpc.token`). `GET /rest/…` is on the same
+binds. TCP `/rest/` skips Bearer, matching Core. Routes: `chaininfo.json`,
+`blockhashbyheight/<height>.<bin|hex|json>`, `headers/<count>/<hash>.*`,
+`block/<hash>.*`, `block/notxdetails/<hash>.*`, `tx/<txid>.*` (chain and
+mempool), `mempool/info.json`, `mempool/contents.json`, `getutxos.json`
+(confirmed spentness, plus the mempool overlay `gettxout` uses when the path
+includes `checkmempool`), `deploymentinfo.json`, and
+`blockfilter/basic/<hash>.*` when `--block-filter-index` is tip-ready.
+No wallet routes. Broadcast and fees stay `POST /`.
+
+The Core-functional proxy still
 speaks TestNode cookie + HTTP Basic on the public port and forwards Bearer
 to the node. Mixed AuthServiceProxy `{args: […], maxfeerate: …}` is expanded
 to a positional list in that proxy (`echo` mixed `{args, argN}` stays on the

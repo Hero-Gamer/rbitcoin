@@ -16,6 +16,7 @@ use std::time::Instant;
 pub(crate) use chain::{tip_hash_height, wait_timeout_ms};
 pub(crate) use mine::gbt_longpoll_id;
 pub use mine::{gbt_template, submit_received_block};
+pub(crate) use rest::{dispatch_rest, RestReply};
 thread_local! {
     static HTTP_WAIT_SATISFIED: Cell<bool> = const { Cell::new(false) };
 }
@@ -53,6 +54,7 @@ mod descriptor_scan;
 mod mempool;
 mod mine;
 mod net;
+mod rest;
 
 use chain::*;
 use decode::*;

@@ -243,7 +243,11 @@ Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
 client in rbitcoin's group can connect without traversing the `0700` datadir.
 `--rpc-listen` adds TCP on `127.0.0.1:<network port>` when ADDR is omitted
 (mainnet 8332, testnet 18332, signet 38332, regtest 18443). TCP auth is
-`Authorization: Bearer` from `{datadir}/rpc.token` (0600). See
+`Authorization: Bearer` from `{datadir}/rpc.token` (0600). The same
+listeners serve Core REST: `GET /rest/chaininfo.json`, block, headers, tx,
+mempool, `getutxos`, `deploymentinfo`, and `blockfilter/basic` when
+`--block-filter-index` is tip-ready. TCP `/rest/` is unauthenticated (Core).
+Unix socket stays mode 0600 with no HTTP header. See
 [`docs/rpc.md`](../../docs/rpc.md) and [`COMPAT.md`](../../COMPAT.md).
 
 **mempool.space `CORE_RPC`:** stock mempool is TCP + cookie or user/pass.

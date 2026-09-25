@@ -15,8 +15,8 @@ Fee math: [`mempool-fee-estimation.md`](./mempool-fee-estimation.md).
 | **CLN** stock `bcli` | `bitcoin-cli` → Core RPC | Methods exist on unix `{datadir}/rpc.sock`. Wrapper: [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) (`-datadir=` → `--datadir`). Cookie/TCP `rpcauth` is not the product listen. |
 | **ldk-node Esplora** | `--esplora-listen` REST | Tip, `/tx/*` (raw/status/outspend/merkleblock-proof), `/fee-estimates`, `POST /tx` work **without** `--sh-index`. Address/scripthash: 503 `scripthash index disabled`. |
 | **ldk-node Electrum** | `--electrum-listen` TCP | Headers, `transaction.get` / broadcast, `estimatefee` work **without** `--sh-index`. `blockchain.scripthash.*`: JSON-RPC `scripthash index disabled`. TLS is reverse-proxy only (**Q-63**). |
-| **ldk-node bitcoind REST** | Core `/rest/block/` | **Out of scope.** |
-| **LND** | bitcoind + ZMQ or BIP157 | **Out of scope.** |
+| **ldk-node bitcoind REST** | `--rpc-listen` `GET /rest/block/` | Block bytes, headers, and hash-by-height. TCP `/rest/` is unauthenticated. The BDK wallet still needs Esplora or Electrum with `--sh-index`. |
+| **LND** | bitcoind + ZMQ or BIP157 | ZMQ stays out. Optional `--block-filter-index` serves BIP158 basic on P2P once the filter watermark is the tip. |
 
 `--sh-index` is **not** required to start Electrum/Esplora or for channel
 watches (txid / outpoint). SH-only methods fail closed.
@@ -66,8 +66,10 @@ Wrapper [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) talk
 
 ## LDK / ldk-node
 
-ldk-node chain sources: Esplora, Electrum, bitcoind RPC/REST. We claim the
-first two.
+ldk-node chain sources: Esplora, Electrum, bitcoind RPC/REST. Esplora and
+Electrum are above. Bitcoind REST is `GET /rest/…` on `--rpc-listen` (same
+port as JSON-RPC). The BDK wallet on that REST source still needs an
+address index, so point BDK at Esplora or Electrum with `--sh-index`.
 
 ### Esplora (`EsploraSyncClient` + BDK)
 
@@ -103,5 +105,7 @@ BDK on-chain wallet still needs `/address/*` and `/scripthash/*` → **`--sh-ind
 
 ## Not this node
 
-Core wallet RPC, ZMQ, BIP157 compact filters, Core REST, LND, in-binary
-Electrum TLS, cookie/`rpcauth` as the LN listen.
+Core wallet RPC, ZMQ, LND’s ZMQ chain source, in-binary Electrum TLS,
+cookie/`rpcauth` as the LN listen. BIP158 basic filters are optional
+(`--block-filter-index`). Core REST block/header/tx routes are on the RPC
+listener.

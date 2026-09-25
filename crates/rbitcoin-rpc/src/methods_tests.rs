@@ -6009,6 +6009,29 @@ fn testmempoolaccept_active_known_vs_mempool_vs_archive() {
 }
 
 #[test]
+fn rest_chaininfo_and_blockhash_match_rpc() {
+    let (ctx, dir) = ctx_empty();
+    let info = dispatch_rest(&ctx, "/rest/chaininfo.json", "", &[]);
+    assert_eq!(info.status, axum::http::StatusCode::OK);
+    let body = String::from_utf8(info.body).unwrap();
+    assert!(body.contains("\"chain\":\"regtest\""), "{body}");
+    let by_h = dispatch_rest(&ctx, "/rest/blockhashbyheight/0.json", "", &[]);
+    assert_eq!(by_h.status, axum::http::StatusCode::NOT_FOUND);
+    let off = dispatch_rest(
+        &ctx,
+        "/rest/blockfilter/basic/0000000000000000000000000000000000000000000000000000000000000000.json",
+        "",
+        &[],
+    );
+    assert_eq!(off.status, axum::http::StatusCode::BAD_REQUEST);
+    let msg = String::from_utf8(off.body).unwrap();
+    assert!(msg.contains("Index is not enabled"), "{msg}");
+    let empty = dispatch_rest(&ctx, "/rest/getutxos.json", "", &[]);
+    assert_eq!(empty.status, axum::http::StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn http_wait_satisfied_tracks_the_setter() {
     set_http_wait_satisfied(false);
     assert!(
