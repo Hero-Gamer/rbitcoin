@@ -10,7 +10,8 @@ can spend an output the sealed tip already spent.
 
 Open replays `finish_post_commit_hashes` for heights above the
 `spend_durable` marker, then `sync_data`s the stems that replay reads and
-publishes the marker. The write thread does that sync every 8 confirm
+publishes the marker. A missing marker checks the last 6 blocks. Matching
+spends publish the marker at the tip. A mismatch replays from genesis. The write thread does that sync every 8 confirm
 batches or 30 seconds. The tip-window check stays at least 6 blocks wide
 and includes every height above durable-through. Disconnect below the
 marker lowers it. `tip_seal`, `tx.head` meta, and the marker `fsync` the

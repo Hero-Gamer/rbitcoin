@@ -157,3 +157,49 @@ fn zeroed_spend_slot_after_tip_seal_rejects_respend() {
     );
     let _ = dir;
 }
+
+#[test]
+fn missing_marker_with_matching_tip_spends_does_not_replay() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-window");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    for h in 2..=maturity + 2 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let tx = spend_one(c1, Amount::from_sat(49_0000_0000));
+    let block = mine(tip, tip_time + 600, maturity + 3, vec![tx]);
+    accept_and_connect_block(&q, &params, Height(maturity + 3), &block, ms).unwrap();
+    let store = q.store().path().to_path_buf();
+    let tip_h = q.tip_height().unwrap().0;
+    drop(q);
+    let _ = std::fs::remove_file(store.join(rbitcoin_store::SPEND_DURABLE_NAME));
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    q.set_spend_index(true);
+    let replayed = crate::replay_spend_annotations(&q).unwrap();
+    assert_eq!(
+        replayed, 0,
+        "a matching tip window must not rewrite the chain"
+    );
+    assert_eq!(q.store().spend_annotated_through().unwrap(), Some(tip_h));
+    let _ = dir;
+}
+
+#[test]
+fn replay_status_is_ten_seconds() {
+    assert!(!super::write::replay_status_due(9_999));
+    assert!(super::write::replay_status_due(10_000));
+}

@@ -352,12 +352,23 @@ pub fn finish_post_commit_hashes(
 }
 
 const REPLAY_BATCH: usize = 8;
+const REPLAY_STATUS_MS: u64 = 10_000;
+
+pub(super) fn replay_status_due(elapsed_ms: u64) -> bool {
+    elapsed_ms >= REPLAY_STATUS_MS
+}
+
+fn tip_window_start(tip: u32) -> u32 {
+    tip.saturating_sub(rbitcoin_store::VERIFY_TIP_BLOCKS - 1)
+}
 
 /// Rewrite spend annotations above the durable marker, then `sync_data` and advance it.
 ///
-/// Idempotent. A missing marker replays every height above genesis. Returns how
-/// many heights were rewritten. Call this on process open after tip-window
-/// revalidation.
+/// Idempotent. A missing marker checks the last 6 heights. When those spends
+/// already match, the marker is published at the tip and nothing is rewritten.
+/// A mismatch replays every height above genesis.
+/// Returns how many heights were rewritten. Call this on process open after
+/// tip-window revalidation.
 pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
     let Some(tip) = query.tip_height().map(|h| h.0) else {
         return Ok(0);
@@ -366,17 +377,40 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
         .store()
         .spend_annotated_through()
         .map_err(ConsensusError::from)?;
-    let a = annotated.unwrap_or(0).min(tip);
+    let a = match annotated {
+        Some(h) => h.min(tip),
+        None if tip_window_matches(query, tip)? => {
+            publish_spend_marker(query, tip)?;
+            return Ok(0);
+        }
+        None => {
+            rbitcoin_log::info!("store: tip spend window inconsistent; replaying (0, {tip}]");
+            0
+        }
+    };
     if a == tip {
         return Ok(0);
     }
-    let start = a + 1;
-    rbitcoin_log::info!("store: replay spend annotations ({a}, {tip}]");
-    let mut heights = Vec::new();
-    for h in start..=tip {
-        heights.push(h);
-    }
+    rewrite_spend_heights(query, a, tip)
+}
+
+fn publish_spend_marker(query: &Query, tip: u32) -> Result<(), ConsensusError> {
+    let sync_ns = query
+        .store()
+        .sync_spend_durable(tip)
+        .map_err(ConsensusError::from)?;
+    rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
+    Ok(())
+}
+
+fn rewrite_spend_heights(query: &Query, annotated: u32, tip: u32) -> Result<u32, ConsensusError> {
+    let start = annotated + 1;
+    rbitcoin_log::info!("store: replay spend annotations ({annotated}, {tip}]");
+    let heights: Vec<u32> = (start..=tip).collect();
     let replayed = heights.len() as u32;
+    let started = std::time::Instant::now();
+    let mut logged_at = started;
+    let mut done = 0u32;
     for chunk in heights.chunks(REPLAY_BATCH) {
         let mut items = Vec::with_capacity(chunk.len());
         for &h in chunk {
@@ -384,20 +418,134 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
                 .header_at_height(rbitcoin_primitives::Height(h))
                 .map_err(ConsensusError::from)?
             else {
-                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: spend replay missing header",
                 )));
             };
             items.push((h, rec.hash));
         }
         finish_post_commit_hashes(query, &items)?;
+        done = done.saturating_add(chunk.len() as u32);
+        let elapsed = logged_at.elapsed().as_millis() as u64;
+        if replay_status_due(elapsed) {
+            let h = *chunk.last().unwrap_or(&tip);
+            rbitcoin_log::info!("store: replay spend annotations {done}/{replayed} height={h}");
+            logged_at = std::time::Instant::now();
+        }
     }
-    let sync_ns = query
-        .store()
-        .sync_spend_durable(tip)
-        .map_err(ConsensusError::from)?;
-    rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
+    publish_spend_marker(query, tip)?;
     Ok(replayed)
+}
+
+fn tip_window_matches(query: &Query, tip: u32) -> Result<bool, ConsensusError> {
+    for h in tip_window_start(tip)..=tip {
+        if !height_spends_match(query, h)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn height_spends_match(query: &Query, height: u32) -> Result<bool, ConsensusError> {
+    let Some((_, rec)) = query
+        .header_at_height(rbitcoin_primitives::Height(height))
+        .map_err(ConsensusError::from)?
+    else {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: spend replay missing header",
+        )));
+    };
+    let Some((hfk, _)) = query
+        .get_header_by_hash(&rec.hash)
+        .map_err(ConsensusError::from)?
+    else {
+        return Ok(true);
+    };
+    let Some(tx_fks) = query
+        .store()
+        .header_txs
+        .get_list(hfk)
+        .map_err(ConsensusError::from)?
+    else {
+        return Ok(true);
+    };
+    for &spend_fk in &tx_fks {
+        if !tx_spends_match(query, spend_fk)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn tx_spends_match(
+    query: &Query,
+    spend_fk: rbitcoin_primitives::Fk,
+) -> Result<bool, ConsensusError> {
+    let (_meta, ins, _outs) = query
+        .store()
+        .get_tx_full(spend_fk)
+        .map_err(ConsensusError::from)?;
+    for (inp_i, inp) in ins.into_iter().enumerate() {
+        if inp.is_coinbase() {
+            continue;
+        }
+        let create_fk = if inp.create_fk.is_null() {
+            query
+                .store()
+                .get_fk_by_txid_tip(&inp.prev_txid)
+                .map_err(ConsensusError::from)?
+                .unwrap_or(rbitcoin_primitives::Fk::NULL)
+        } else {
+            inp.create_fk
+        };
+        if create_fk.is_null() {
+            continue;
+        }
+        let (multi, field, field_vin) = query
+            .store()
+            .txs
+            .get_output_spender_meta(create_fk, inp.prev_index)
+            .map_err(ConsensusError::from)?;
+        let vin = inp_i as u32;
+        if annotation_matches(query, multi, field, field_vin, spend_fk, vin)? {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn annotation_matches(
+    query: &Query,
+    multi: bool,
+    field: rbitcoin_primitives::Fk,
+    field_vin: u32,
+    spend_fk: rbitcoin_primitives::Fk,
+    spend_vin: u32,
+) -> Result<bool, ConsensusError> {
+    if !multi {
+        return Ok(field == spend_fk && field_vin == spend_vin);
+    }
+    let mut cur = field;
+    let mut n = 0u32;
+    while let Some(id) = cur.get() {
+        n = n.saturating_add(1);
+        if n > 1_000_000 {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: spender multi-list cycle",
+            )));
+        }
+        let (sfk, vin, next) = query
+            .store()
+            .spenders
+            .get(rbitcoin_primitives::Fk(id))
+            .map_err(ConsensusError::from)?;
+        if sfk == spend_fk && vin == spend_vin {
+            return Ok(true);
+        }
+        cur = next;
+    }
+    Ok(false)
 }
 
 fn annotate_slots_from_connected_hash(
