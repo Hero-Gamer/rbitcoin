@@ -259,6 +259,12 @@ impl I2pSam {
                     self._forward = Some(s);
                     return Ok(());
                 }
+                Err(e) if stream_socket_dead(&e) => {
+                    last = Some(e);
+                    let (sam, _) =
+                        Self::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+                    *self = sam;
+                }
                 Err(e) if stream_retry(&e) => {
                     last = Some(e);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -522,6 +528,7 @@ mod tests {
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(0)),
             false,
+            Arc::new(Mutex::new(0)),
         )
         .await
     }
@@ -532,6 +539,7 @@ mod tests {
         stream_drops: Arc<Mutex<usize>>,
         forward_drops: Arc<Mutex<usize>>,
         rst_unknown: bool,
+        forward_rst: Arc<Mutex<usize>>,
     ) -> (SocketAddr, Arc<Mutex<HashSet<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -548,6 +556,7 @@ mod tests {
                 let fwd_drops = Arc::clone(&forward_drops);
                 let ok = ok_hello;
                 let rst = rst_unknown;
+                let fwd_rst = Arc::clone(&forward_rst);
                 tokio::spawn(async move {
                     let mut created_id: Option<String> = None;
                     loop {
@@ -594,6 +603,19 @@ mod tests {
                             };
                             if drop_n {
                                 break;
+                            }
+                            let reset = {
+                                let mut n = fwd_rst.lock().unwrap();
+                                if *n > 0 {
+                                    *n -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if reset {
+                                rst_sam_socket(s);
+                                return;
                             }
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                         } else if up.starts_with("STREAM CONNECT") {
@@ -682,6 +704,7 @@ mod tests {
             drops,
             Arc::new(Mutex::new(0)),
             false,
+            Arc::new(Mutex::new(0)),
         )
         .await;
         let sam = I2pSam::connect(addr).await.unwrap();
@@ -701,12 +724,63 @@ mod tests {
             Arc::new(Mutex::new(0)),
             drops,
             false,
+            Arc::new(Mutex::new(0)),
         )
         .await;
         let mut sam = I2pSam::connect(addr).await.unwrap();
         sam.stream_forward(18444).await.unwrap();
         let got = stream_lines(&log, "STREAM FORWARD");
         assert_eq!(got.len(), 3, "{got:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn i2p_sam_forward_recreates_session_on_reset() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (addr, _live) = fake_sam_opts(
+            true,
+            Arc::clone(&log),
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(0)),
+            false,
+            Arc::new(Mutex::new(1)),
+        )
+        .await;
+        let mut sam = I2pSam::connect(addr).await.unwrap();
+        sam.stream_forward(18444).await.unwrap();
+        let creates = stream_lines(&log, "SESSION CREATE");
+        assert_eq!(creates.len(), 2, "{creates:?}");
+        assert!(
+            creates[1].contains(&format!("DESTINATION={FAKE_DEST}")),
+            "{creates:?}"
+        );
+    }
+
+    fn rst_sam_socket(s: TcpStream) {
+        #[cfg(unix)]
+        {
+            if let Ok(std) = s.into_std() {
+                use std::os::fd::AsRawFd;
+                let linger = libc::linger {
+                    l_onoff: 1,
+                    l_linger: 0,
+                };
+                // SAFETY: fd is the accepted SAM socket; SO_LINGER 0 resets it.
+                unsafe {
+                    libc::setsockopt(
+                        std.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_LINGER,
+                        &linger as *const libc::linger as *const libc::c_void,
+                        std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(s);
+        }
     }
 
     #[tokio::test]
@@ -871,6 +945,7 @@ mod tests {
             Arc::new(Mutex::new(0)),
             Arc::new(Mutex::new(0)),
             true,
+            Arc::new(Mutex::new(0)),
         )
         .await;
         let sam = I2pSam::connect(addr).await.unwrap();
