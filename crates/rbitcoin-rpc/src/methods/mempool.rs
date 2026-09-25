@@ -932,7 +932,26 @@ pub(crate) fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<V
             }
         }
     }
-    estimate_fee_result(ctx, conf_target)
+    smart_fee_result(ctx, conf_target)
+}
+
+/// Core's `estimatesmartfee` result: `feerate` (at least `mempoolminfee`) and
+/// `blocks` with an estimate; `errors` and `blocks`, and no `feerate`, without one.
+fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
+    let blocks = conf_target.max(1);
+    let Some(mp) = ctx.mempool.as_ref() else {
+        return Ok(json!({ "errors": ["mempool unavailable"], "blocks": blocks }));
+    };
+    let rate = mp.estimate_fee_btc_per_kb(conf_target);
+    if rate < 0.0 {
+        return Ok(json!({
+            "errors": ["Insufficient data or no feerate found"],
+            "blocks": blocks,
+        }));
+    }
+    // Core: an estimate is at least mempoolminfee (which includes minrelaytxfee).
+    let sat_kvb = ((rate * 100_000_000.0).round() as u64).max(mp.mempool_min_fee_sat_kvb());
+    Ok(json!({ "feerate": sat_btc_json(sat_kvb as i64), "blocks": blocks }))
 }
 
 /// Same 10-minute product as [`estimatesmartfee`] under the Core name.

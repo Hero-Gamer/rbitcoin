@@ -57,7 +57,7 @@ Wrapper [`scripts/lightning/bitcoin-cli`](../scripts/lightning/bitcoin-cli) talk
 | Plugin | Node RPC | Spike |
 |--------|----------|--------|
 | `getchaininfo` | `getblockchaininfo` | `chain` is bip70 (`regtest` / `signet` / `main` / `test`). `blocks`, `headers`, `initialblockdownload` present. |
-| `estimatefees` | `estimatesmartfee` 2 / 6 / 12 / 100 | Core JSON `{feerate: BTC/kvB, blocks}` or `{feerate: -1.0, errors: ["Insufficient data or empty mempool"]}`. Conf target 1–1008. Product is **10-minute inclusion**, not Core historical. `bcli` converts BTC/kvB → sat/kvB. |
+| `estimatefees` | `estimatesmartfee` 2 / 6 / 12 / 100 | Core JSON `{feerate: BTC/kvB, blocks}`, or `{errors: ["Insufficient data or no feerate found"], blocks}` with no `feerate`. Conf target 1–1008. Product is **10-minute inclusion**, not Core historical. `bcli` converts BTC/kvB → sat/kvB. |
 | `getrawblockbyheight` | `getblockhash` + `getblock` verbosity **0** | Hex string; `false` is verbosity 0. Witness included on reconstruct. |
 | `getutxout` | `gettxout` | Live coin: `value` BTC, `scriptPubKey.hex`. Spent / unknown / disconnected archive: JSON **`null`** (not RPC error). |
 | `sendrawtransaction` | `sendrawtransaction` | `maxfeerate` is **sat/vB** (default 10000). CLN `allowhighfees` must pass **`0`**. |
