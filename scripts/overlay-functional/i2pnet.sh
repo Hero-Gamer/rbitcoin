@@ -103,20 +103,45 @@ with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED) as z:
 print(zpath)
 PY
 
+wait_dead() {
+  local pid="$1" i
+  for i in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  sleep 0.2
+}
+
+port_open() {
+  python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.2); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); sys.exit(0 if r==0 else 1)' "$1"
+}
+
 for i in $(seq 0 $((N - 1))); do
   if [[ -f "$ROOT/n$i/i2pd.pid" ]]; then
-    kill "$(cat "$ROOT/n$i/i2pd.pid")" 2>/dev/null || true
+    pid="$(cat "$ROOT/n$i/i2pd.pid")"
+    kill "$pid" 2>/dev/null || true
+    wait_dead "$pid"
   fi
 done
-sleep 1
+for port in "${SAMS[@]}"; do
+  for _ in $(seq 1 50); do
+    if ! port_open "$port"; then
+      break
+    fi
+    sleep 0.2
+  done
+done
 for i in $(seq 0 $((N - 1))); do
   ipv4="127.0.0.$((i + 2))"
   i2pd --datadir "$ROOT/n$i" --conf "$ROOT/n$i/i2pd.conf" \
     --address4 "$ipv4" --reseed.zipfile "$ROOT/reseed.zip" --daemon
 done
-sleep 3
 
-sam_hello() {
+# HELLO can succeed on a router that still resets SESSION CREATE.
+sam_session() {
   local port="$1" wall="$2"
   python3 - "$port" "$wall" <<'PY'
 import socket, sys, time
@@ -128,22 +153,35 @@ while time.time() < end:
     try:
         s = socket.create_connection(("127.0.0.1", port), 2)
         s.sendall(b"HELLO VERSION MIN=3.1 MAX=3.1\n")
-        last = s.recv(1024).decode("utf-8", "replace")
+        hello = s.recv(1024).decode("utf-8", "replace")
+        if "RESULT=OK" not in hello.upper():
+            last = hello
+            s.close()
+            time.sleep(0.4)
+            continue
+        sid = f"rbtc{int(time.time() * 1000)}"
+        s.sendall(
+            f"SESSION CREATE STYLE=STREAM ID={sid} DESTINATION=TRANSIENT SIGNATURE_TYPE=7\n".encode()
+        )
+        last = s.recv(8192).decode("utf-8", "replace")
         s.close()
         if "RESULT=OK" in last.upper():
             sys.exit(0)
     except OSError as e:
         last = str(e)
     time.sleep(0.4)
-print(f"SAM {port} not ready: {last}", file=sys.stderr)
+print(f"SAM {port} session not ready: {last}", file=sys.stderr)
 sys.exit(1)
 PY
 }
 
-sam_hello "${SAMS[0]}" 180
-sam_hello "${SAMS[1]}" 180
-# HELLO can succeed before SESSION CREATE is stable on a tiny net.
-sleep 2
+if ! sam_session "${SAMS[0]}" 180 || ! sam_session "${SAMS[1]}" 180; then
+  for i in $(seq 0 $((N - 1))); do
+    echo "--- n$i i2pd.log ---" >&2
+    tail -n 40 "$ROOT/n$i/i2pd.log" >&2 || true
+  done
+  exit 1
+fi
 
 cat >"$ROOT/env" <<EOF
 OVERLAY_I2P_SAM=127.0.0.1:${SAMS[0]}
