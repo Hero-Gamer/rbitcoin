@@ -15,6 +15,40 @@ use crate::{Query, QueryError};
 /// BIP158 basic filter Golomb-Rice parameters (`M`, `P`).
 const BASIC_FILTER_M: u64 = 784_931;
 const BASIC_FILTER_P: u8 = 19;
+/// Heights built per commit. Bounds RAM held between build and commit and
+/// how long a disconnect waits on the appender lock.
+const SEAL_CHUNK: u32 = 64;
+
+/// Block filter write-behind state (one appender thread).
+pub(crate) struct BlockFilterWriteBehind {
+    /// Serializes commits against disconnect truncate.
+    appender: std::sync::Mutex<()>,
+    wake: std::sync::Mutex<()>,
+    wake_cv: std::sync::Condvar,
+}
+
+impl BlockFilterWriteBehind {
+    pub(crate) fn new() -> Self {
+        Self {
+            appender: std::sync::Mutex::new(()),
+            wake: std::sync::Mutex::new(()),
+            wake_cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn notify(&self) {
+        self.wake_cv.notify_one();
+    }
+
+    pub(crate) fn lock_appender(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.appender.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait(&self, d: std::time::Duration) {
+        let g = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.wake_cv.wait_timeout(g, d);
+    }
+}
 
 impl Query {
     /// Basic filter of best-chain `height`, built from Class A, and its `header_fk`.
@@ -113,23 +147,39 @@ impl Query {
             .map(|(body, slot)| (body, FilterHeader::from_byte_array(slot.filter_header))))
     }
 
-    /// Seal missing heights `(hwm, tip]`. No-op when the index flag is off.
-    pub fn backfill_block_filters(&self) -> Result<(), QueryError> {
-        let Some(tip) = self.tip_height() else {
-            return Ok(());
-        };
-        self.backfill_block_filters_through(tip.0)
+    /// Heights the appender may seal now: released through tip, or `None`.
+    fn block_filter_target(&self) -> Option<u32> {
+        let tip = self.tip_height()?.0;
+        Some(self.index_released_through_height()?.min(tip))
     }
 
-    pub fn backfill_block_filters_through(&self, through: u32) -> Result<(), QueryError> {
+    /// Seal the next chunk of `[next, through]`. Returns heights committed.
+    ///
+    /// Builds without the appender lock, then commits under it only if the
+    /// watermark is still `next` and every built height is still
+    /// `confirmed[h]` (a disconnect in between drops the chunk).
+    pub fn seal_block_filters_chunk(&self, through: u32) -> Result<u32, QueryError> {
         let Some(table) = self.block_filter_table() else {
-            return Ok(());
+            return Ok(0);
         };
         let start = table.next_height().0;
         if start > through {
-            return Ok(());
+            return Ok(0);
         }
-        let t0 = std::time::Instant::now();
+        let end = through.min(start.saturating_add(SEAL_CHUNK - 1));
+        let built = (start..=end)
+            .map(|h| self.build_basic_filter(Height(h)))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let _appender = self.bf_wb.lock_appender();
+        if table.next_height().0 != start {
+            return Ok(0);
+        }
+        for (h, (_, header_fk)) in (start..=end).zip(&built) {
+            if self.store.confirmed.get(Height(h))? != Some(*header_fk) {
+                return Ok(0);
+            }
+        }
         let mut prev = match start.checked_sub(1) {
             None => FilterHeader::from_byte_array([0u8; 32]),
             Some(h) => FilterHeader::from_byte_array(
@@ -141,24 +191,36 @@ impl Query {
                     .filter_header,
             ),
         };
-        for h in start..=through {
-            let (filter, header_fk) = self.build_basic_filter(Height(h))?;
+        let mut slots = Vec::with_capacity(built.len());
+        for (filter, header_fk) in &built {
             let header = filter.filter_header(&prev);
-            table.put(&[BlockFilterRecord {
-                height: Height(h),
-                slot: BlockFilterSlot {
-                    header_fk,
-                    filter_hash: FilterHash::hash(&filter.content).to_byte_array(),
-                    filter_header: header.to_byte_array(),
-                },
-                filter: &filter.content,
-            }])?;
+            slots.push(BlockFilterSlot {
+                header_fk: *header_fk,
+                filter_hash: FilterHash::hash(&filter.content).to_byte_array(),
+                filter_header: header.to_byte_array(),
+            });
             prev = header;
         }
-        rbitcoin_log::debug!(
-            "ibd: perf blockfilter backfill {start}..={through} us={}",
-            t0.elapsed().as_micros()
-        );
+        let recs: Vec<BlockFilterRecord<'_>> = (start..=end)
+            .zip(&built)
+            .zip(&slots)
+            .map(|((h, (filter, _)), slot)| BlockFilterRecord {
+                height: Height(h),
+                slot: *slot,
+                filter: &filter.content,
+            })
+            .collect();
+        table.put(&recs)?;
+        Ok(end - start + 1)
+    }
+
+    /// Seal every released height now (regtest `generate`, tests).
+    pub fn seal_block_filters_released(&self) -> Result<(), QueryError> {
+        while let Some(t) = self.block_filter_target() {
+            if self.seal_block_filters_chunk(t)? == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -168,4 +230,49 @@ impl Query {
             None => Ok(()),
         }
     }
+}
+
+/// The block filter appender: after catch-up, seals `(hwm, released tip]`
+/// off the confirm path. The first pass over a large gap is the materialize;
+/// after that each released tip is one chunk.
+///
+/// Apply errors request `stop` and `on_fatal`, like the scripthash appender.
+pub fn spawn_block_filter_writebehind(
+    query: std::sync::Arc<Query>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_fatal: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    std::thread::Builder::new()
+        .name("rbtc-bf-wb".into())
+        .spawn(move || {
+            // Spawned after catch-up: the current tip was already announced.
+            if let Some(tip) = query.tip_height() {
+                query.release_index_writebehind(tip);
+            }
+            while !stop.load(Ordering::Relaxed) {
+                let Some(target) = query.block_filter_target() else {
+                    query.bf_wb.wait(std::time::Duration::from_millis(200));
+                    continue;
+                };
+                let t0 = std::time::Instant::now();
+                match query.seal_block_filters_chunk(target) {
+                    Ok(0) => query.bf_wb.wait(std::time::Duration::from_millis(200)),
+                    Ok(_) => {
+                        let hwm = query.basic_filter_hwm().ok().flatten();
+                        rbitcoin_log::info!(
+                            "blockfilter: apply h={hwm:?} wall={}ms target={target}",
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        rbitcoin_log::error!("blockfilter write-behind: {e}");
+                        stop.store(true, Ordering::SeqCst);
+                        on_fatal();
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn block filter write-behind")
 }

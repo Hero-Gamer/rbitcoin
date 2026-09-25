@@ -1762,6 +1762,9 @@ impl ChainHub {
         if let Err(e) = self.query.apply_sh_pending() {
             rbitcoin_log::warn!("generate: SH write-behind drain: {e}");
         }
+        if let Err(e) = self.query.seal_block_filters_released() {
+            rbitcoin_log::warn!("generate: block filter write-behind drain: {e}");
+        }
         Ok(hashes)
     }
 

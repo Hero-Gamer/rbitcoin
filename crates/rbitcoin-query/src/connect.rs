@@ -245,7 +245,6 @@ impl Query {
         );
 
         self.enqueue_sh_pending(items, create_pins)?;
-        self.seal_confirmed_block_filters(items)?;
 
         if let Some(tip) = self.tip_height() {
             let _ = self.ensure_height_by_hash_index(tip);
@@ -253,23 +252,6 @@ impl Query {
         self.record_confirmed_seqsigwit_window(items)?;
 
         Ok(out)
-    }
-
-    /// Seal basic filters through the last height of this confirm batch.
-    fn seal_confirmed_block_filters(&self, items: &[ConfirmPrepared]) -> Result<(), QueryError> {
-        if !self.block_filter_enabled() {
-            return Ok(());
-        }
-        let Some(tip) = items.last().map(|i| i.height.0) else {
-            return Ok(());
-        };
-        let t0 = std::time::Instant::now();
-        self.backfill_block_filters_through(tip)?;
-        rbitcoin_log::debug!(
-            "ibd: perf blockfilter confirm through={tip} us={}",
-            t0.elapsed().as_micros()
-        );
-        Ok(())
     }
 
     fn record_confirmed_seqsigwit_window(
@@ -337,6 +319,7 @@ impl Query {
         let v = through.0.saturating_add(1);
         self.index_released_through.fetch_max(v, Ordering::Release);
         self.sh.pending_cv.notify_one();
+        self.bf_wb.notify();
     }
 
     /// Last height durable apply is allowed to run (`None` until first release).
@@ -753,6 +736,7 @@ impl Query {
         self.require_seqsigwit_at(height)?;
         self.drop_seqsigwit_ram_height(height.0);
         let _appender = self.sh.appender.lock().unwrap();
+        let _bf_appender = self.bf_wb.lock_appender();
         if drop_pending {
             self.drop_sh_pending_from(height);
         } else {

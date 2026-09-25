@@ -532,7 +532,8 @@ fn analog_block_filters_from_class_a() {
     // Reorg the tip while the index is off: reopening with it on must not
     // serve the stale-branch slot.
     q.set_block_filter_index(true).unwrap();
-    q.backfill_block_filters().unwrap();
+    q.release_index_writebehind(Height(last));
+    q.seal_block_filters_released().unwrap();
     assert_eq!(q.basic_filter_hwm().unwrap(), Some(last));
     drop(q);
     let q = Query::open_or_create_tiny(td.store_path()).unwrap();
@@ -556,7 +557,8 @@ fn analog_block_filters_from_class_a() {
         Some(last - 1),
         "open drops the slot whose block left the best chain"
     );
-    q.backfill_block_filters().unwrap();
+    q.release_index_writebehind(Height(last));
+    q.seal_block_filters_released().unwrap();
     let (bytes, _) = q.basic_filter_at(last).unwrap().unwrap();
     assert_eq!(bytes, reference(&alt).content);
 }

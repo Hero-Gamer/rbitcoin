@@ -168,6 +168,7 @@ pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
 };
+pub use block_filter::spawn_block_filter_writebehind;
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
@@ -304,6 +305,7 @@ pub struct Query {
     block_filter_enabled: std::sync::atomic::AtomicBool,
     /// BIP158 basic filter table, opened when the index is first turned on.
     block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
+    bf_wb: block_filter::BlockFilterWriteBehind,
     /// Optional BIP-352 thin tweak index (`--sptweaks`). Files may exist when off.
     sp_tweaks: Mutex<Option<SpTweaksTable>>,
     sptweaks_enabled: AtomicBool,
@@ -455,6 +457,7 @@ impl Query {
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
             block_filters: std::sync::OnceLock::new(),
+            bf_wb: block_filter::BlockFilterWriteBehind::new(),
             sp_tweaks: Mutex::new(sp_tweaks),
             sptweaks_enabled: AtomicBool::new(false),
             sptweaks_origin: AtomicU32::new(sptweaks_origin),
