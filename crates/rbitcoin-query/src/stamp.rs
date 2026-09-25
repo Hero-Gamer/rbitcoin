@@ -159,6 +159,16 @@ fn stamp_inflight_hits<'a>(
     }
 }
 
+// Capacity is not an observable result: empty maps insert the same keys.
+#[mutants::skip]
+fn external_parent_stamp(need_len: usize) -> ExternalParentStamp {
+    ExternalParentStamp {
+        resolved: TxidFkMap::with_capacity_and_hasher(need_len / 2, Default::default()),
+        idents: U64Map::with_capacity_and_hasher(need_len, Default::default()),
+        ..ExternalParentStamp::default()
+    }
+}
+
 /// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
 ///
 /// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
@@ -177,11 +187,7 @@ pub fn stamp_external_parents(
     skeleton: Option<&BatchParentIds>,
     stats: &crate::ConfirmStats,
 ) -> Result<ExternalParentStamp, QueryError> {
-    let mut stamp = ExternalParentStamp {
-        resolved: TxidFkMap::with_capacity_and_hasher(need.len() / 2, Default::default()),
-        idents: U64Map::with_capacity_and_hasher(need.len(), Default::default()),
-        ..ExternalParentStamp::default()
-    };
+    let mut stamp = external_parent_stamp(need.len());
 
     let t_inflight = Instant::now();
     let mut still_need: Vec<&[u8; 32]> = Vec::new();

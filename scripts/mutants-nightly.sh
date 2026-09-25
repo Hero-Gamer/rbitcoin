@@ -48,7 +48,9 @@ head_sha="$(git rev-parse HEAD)"
 git diff "$new_base"..HEAD --unified=0 -- crates >"$OUT/new.diff" || true
 
 echo "mutants-nightly: listing workspace mutants"
-cargo mutants --workspace --list >"$OUT/all.txt"
+# rbitcoin-bench is an optional host client, not a mutants gate.
+# CLI --exclude replaces exclude_globs in .cargo/mutants.toml (same glob).
+cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' --list >"$OUT/all.txt"
 
 python3 "$ROOT/scripts/mutants_queue.py" order \
   --list "$OUT/all.txt" --diff "$OUT/new.diff" \
@@ -100,7 +102,8 @@ while ((offset < queue_len && SECONDS < deadline)); do
   echo "mutants-nightly: batch at $offset (${#RE_ARGS[@]} regexes, ${remain}s left)"
   set +e
   timeout --signal=TERM --kill-after=60s "$remain" \
-    cargo mutants --workspace --test-workspace=true --baseline=skip \
+    cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' \
+      --test-workspace=true --baseline=skip \
       -j 1 --timeout "$MUTANT_TIMEOUT" \
       "${RE_ARGS[@]}" \
       >"$OUT/batch-$offset.log" 2>&1

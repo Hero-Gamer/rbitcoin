@@ -57,5 +57,14 @@ assert_ok "finished new clears skip" grep -q '"new_skip": 0' "$tmp/cursor.json"
 # old_index was 1; the extra completed mutant walks one old slot -> 0 (mod 2)
 assert_ok "old index wraps" grep -q '"old_index": 0' "$tmp/cursor.json"
 
+NIGHTLY="$ROOT/scripts/mutants-nightly.sh"
+TOML="$ROOT/.cargo/mutants.toml"
+assert_ok "nightly list excludes rbitcoin-bench" \
+  bash -c 'grep -q -- "--exclude '"'"'crates/rbitcoin-bench/\*\*/\*.rs'"'"' --list" "$1"' _ "$NIGHTLY"
+assert_ok "nightly run excludes rbitcoin-bench" \
+  bash -c 'grep -q -- "--exclude '"'"'crates/rbitcoin-bench/\*\*/\*.rs'"'"'" "$1"' _ "$NIGHTLY"
+assert_ok "mutants.toml excludes rbitcoin-bench" \
+  grep -q 'crates/rbitcoin-bench/\*\*/\*.rs' "$TOML"
+
 echo "$PASS passed, $FAIL failed"
 test "$FAIL" -eq 0
