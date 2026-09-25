@@ -86,7 +86,7 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 | S5 | Unique txids | `BadBlock("duplicate txid")` | `structure_rule_tests::s5_rejects_duplicate_txid` |
 | S6 | Merkle root matches txids | `BadBlock("merkle root mismatch")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch` (+ `merkle_root_bytes_single_and_odd`) |
 | S7 | BIP34 height in coinbase (h≥1) | `BadBlock("bip34…")` | `s7_rejects_bip34_missing_at_height_1`, `s7_bip34_not_required_at_height_0` |
-| S8 | Witness commitment when any witness | missing / mismatch | `s8_rejects_missing_witness_commitment`, `s8_rejects_wrong_witness_commitment` |
+| S8 | Witness commitment when any witness; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `s8_rejects_missing_witness_commitment`, `s8_rejects_wrong_witness_commitment`; `consensus_rules::header_and_spending_boundaries` (connect-path pre-activation reject) |
 | S9 | Coinbase scriptSig length 2..=100 | `bad-cb-length` | `s9_rejects_bad_cb_length_short`, `s9_rejects_bad_cb_length_long` |
 | S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `s10_rejects_vout_toolarge` |
 | S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `s11_rejects_excessive_legacy_sigops` (20_000 accept / 20_001 reject) |
