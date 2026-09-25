@@ -529,13 +529,41 @@ fn analog_block_filters_from_class_a() {
     let (built, _) = q.build_basic_filter(Height(h_mixed)).unwrap();
     assert_eq!(built, reference(&blocks[h_mixed as usize]));
 
+    // Materialize on the appender, stopped after its first commit and
+    // restarted: the table equals a serial per-height build with an
+    // unbroken header chain.
+    q.set_block_filter_index(true).unwrap();
+    let q = Arc::new(q);
+    let run_appender = |until: &dyn Fn(Option<u32>) -> bool| {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+            Arc::clone(&q),
+            Arc::clone(&stop),
+            || {},
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !until(q.basic_filter_hwm().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "appender stalled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        bf.join().unwrap();
+        q.basic_filter_hwm().unwrap()
+    };
+    assert!(run_appender(&|h| h.is_some()).is_some());
+    assert_eq!(run_appender(&|h| h == Some(last)), Some(last));
+    let mut prev = bitcoin::bip158::FilterHeader::from_byte_array([0u8; 32]);
+    for h in 0..=last {
+        let (bytes, header) = q.basic_filter_at(h).unwrap().unwrap();
+        let (built, _) = q.build_basic_filter(Height(h)).unwrap();
+        assert_eq!(bytes, built.content, "filter at {h}");
+        assert_eq!(header, built.filter_header(&prev), "header chain at {h}");
+        prev = header;
+    }
+    drop(q);
+
     // Reorg the tip while the index is off: reopening with it on must not
     // serve the stale-branch slot.
-    q.set_block_filter_index(true).unwrap();
-    q.release_index_writebehind(Height(last));
-    q.seal_block_filters_released().unwrap();
-    assert_eq!(q.basic_filter_hwm().unwrap(), Some(last));
-    drop(q);
     let q = Query::open_or_create_tiny(td.store_path()).unwrap();
     q.disconnect_tip().unwrap();
     let (_, parent) = q.header_at_height(Height(last - 1)).unwrap().unwrap();
