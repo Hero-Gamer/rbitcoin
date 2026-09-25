@@ -16,7 +16,7 @@ Fee math: [`mempool-fee-estimation.md`](./mempool-fee-estimation.md).
 | **ldk-node Esplora** | `--esplora-listen` REST | Tip, `/tx/*` (raw/status/outspend/merkleblock-proof), `/fee-estimates`, `POST /tx` work **without** `--sh-index`. Address/scripthash: 503 `scripthash index disabled`. |
 | **ldk-node Electrum** | `--electrum-listen` TCP | Headers, `transaction.get` / broadcast, `estimatefee` work **without** `--sh-index`. `blockchain.scripthash.*`: JSON-RPC `scripthash index disabled`. TLS is reverse-proxy only (**Q-63**). |
 | **ldk-node bitcoind REST** | `--rpc-listen` `GET /rest/block/` | Block bytes, headers, and hash-by-height. TCP `/rest/` is unauthenticated. The BDK wallet still needs Esplora or Electrum with `--sh-index`. |
-| **LND** | bitcoind + ZMQ or BIP157 | ZMQ stays out. Optional `--block-filter-index` serves BIP158 basic on P2P once the filter watermark is the tip. |
+| **LND** | bitcoind + ZMQ or BIP157 | ZMQ stays out. Optional `--block-filter-index` advertises `NODE_COMPACT_FILTERS` immediately and serves BIP158 basic for sealed heights. |
 
 `--sh-index` is **not** required to start Electrum/Esplora or for channel
 watches (txid / outpoint). SH-only methods fail closed.

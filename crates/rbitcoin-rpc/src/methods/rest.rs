@@ -369,7 +369,7 @@ fn blockfilter(ctx: &RpcContext, fmt: RestFmt, rest: &str) -> Result<RestReply, 
             &format!("Unknown filtertype {filtertype}"),
         ));
     }
-    if !ctx.query.basic_filter_tip_ready() {
+    if !ctx.query.block_filter_enabled() {
         return Err(err(
             axum::http::StatusCode::BAD_REQUEST,
             "Index is not enabled for filtertype basic",

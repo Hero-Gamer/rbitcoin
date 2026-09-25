@@ -250,8 +250,10 @@ pub fn local_service_flags() -> ServiceFlags {
 
 static COMPACT_FILTERS_ADVERTISED: AtomicBool = AtomicBool::new(false);
 
-/// Set when the basic-filter watermark is the tip. Version messages include
-/// `NODE_COMPACT_FILTERS` only after this is set.
+/// Version messages include `NODE_COMPACT_FILTERS` while this is set.
+///
+/// The bit follows `--block-filter-index`, not the watermark. A peer that
+/// handshakes during catch-up keeps the bit; a later flip never reaches it.
 pub fn set_compact_filters_service(on: bool) {
     COMPACT_FILTERS_ADVERTISED.store(on, Ordering::Release);
 }
@@ -2493,22 +2495,41 @@ fn on_compact_filters(
     }
 }
 
+/// `Some(stop height)` when this basic-filter request is inside the watermark.
+/// Silence (not a short batch, not an empty filter) when it is not.
+fn compact_filter_stop(
+    hub: &ChainHub,
+    filter_type: u8,
+    stop_hash: &[u8; 32],
+) -> Result<Option<u32>, NetError> {
+    if filter_type != 0 || !hub.query.block_filter_enabled() {
+        return Ok(None);
+    }
+    let Some(stop) = filter_q(hub.query.height_of_hash(stop_hash))? else {
+        return Ok(None);
+    };
+    let Some(hwm) = filter_q(hub.query.basic_filter_hwm())? else {
+        return Ok(None);
+    };
+    if stop.0 > hwm {
+        return Ok(None);
+    }
+    Ok(Some(stop.0))
+}
+
 fn on_getcfilters(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     m: &bitcoin::p2p::message_filter::GetCFilters,
 ) -> Result<(), NetError> {
     use bitcoin::hashes::Hash;
-    if m.filter_type != 0 || !hub.query.basic_filter_tip_ready() {
-        return Ok(());
-    }
-    let Some(stop) = filter_q(hub.query.height_of_hash(m.stop_hash.as_byte_array()))? else {
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
-    if m.start_height > stop.0 {
+    if m.start_height > stop {
         return Ok(());
     }
-    let end = stop.0.min(m.start_height.saturating_add(999));
+    let end = stop.min(m.start_height.saturating_add(999));
     for h in m.start_height..=end {
         let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
             return Ok(());
@@ -2536,16 +2557,13 @@ fn on_getcfheaders(
 ) -> Result<(), NetError> {
     use bitcoin::bip158::{FilterHash, FilterHeader};
     use bitcoin::hashes::Hash;
-    if m.filter_type != 0 || !hub.query.basic_filter_tip_ready() {
-        return Ok(());
-    }
-    let Some(stop) = filter_q(hub.query.height_of_hash(m.stop_hash.as_byte_array()))? else {
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
-    if m.start_height > stop.0 {
+    if m.start_height > stop {
         return Ok(());
     }
-    let end = stop.0.min(m.start_height.saturating_add(1999));
+    let end = stop.min(m.start_height.saturating_add(1999));
     let previous = if m.start_height == 0 {
         FilterHeader::from_byte_array([0u8; 32])
     } else {
@@ -2583,15 +2601,13 @@ fn on_getcfcheckpt(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     m: &bitcoin::p2p::message_filter::GetCFCheckpt,
 ) -> Result<(), NetError> {
-    if m.filter_type != 0 || !hub.query.basic_filter_tip_ready() {
-        return Ok(());
-    }
-    let Some(stop) = filter_q(hub.query.height_of_hash(m.stop_hash.as_byte_array()))? else {
+    use bitcoin::hashes::Hash;
+    let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
     let mut filter_headers = Vec::new();
     let mut h = 1000u32;
-    while h <= stop.0 {
+    while h <= stop {
         let Some((_, header)) = filter_q(hub.query.basic_filter_at(h))? else {
             return Ok(());
         };

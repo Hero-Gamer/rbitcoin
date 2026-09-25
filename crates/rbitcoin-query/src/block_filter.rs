@@ -195,14 +195,6 @@ impl Query {
         read_basic_filter(self.store.path(), height)
     }
 
-    /// True when the basic-filter watermark is the active tip.
-    pub fn basic_filter_tip_ready(&self) -> bool {
-        let Some(tip) = self.tip_height() else {
-            return false;
-        };
-        matches!(self.basic_filter_hwm(), Ok(Some(h)) if h == tip.0)
-    }
-
     /// Seal missing heights `(hwm, tip]`. No-op when the index flag is off.
     pub fn backfill_block_filters(&self) -> Result<(), QueryError> {
         let Some(tip) = self.tip_height() else {

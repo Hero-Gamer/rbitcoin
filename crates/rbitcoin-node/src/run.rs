@@ -595,9 +595,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let mut tip_follow_ready = false;
     let mut sh_tip_ready = false;
     if catch_up.is_complete() && !shutdown.requested() {
-        node.hub
-            .query
-            .set_block_filter_index(config.block_filter_index);
         let gates = enter_tip_mode(
             &node.hub.query,
             Some(Arc::clone(&shutdown.flag)),
@@ -1355,6 +1352,9 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
+    query.set_block_filter_index(config.block_filter_index);
+    // Advertised for the process lifetime of the flag. The watermark may lag.
+    rbitcoin_net::set_compact_filters_service(config.block_filter_index);
     query.set_max_sh_creates(config.max_sh_creates);
     query.set_seqsigwit_ram_threshold_bytes(config.prune_seqsigwit_ram_threshold_bytes)?;
     if !config.prune_seqsigwit && query.prune_seqsigwit() {
@@ -1832,7 +1832,6 @@ fn seal_block_filters(query: &Query) {
         ),
         Err(e) => warn!("node: block filter backfill failed: {e}"),
     }
-    rbitcoin_net::set_compact_filters_service(query.basic_filter_tip_ready());
 }
 
 /// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).

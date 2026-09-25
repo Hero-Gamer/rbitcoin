@@ -257,7 +257,7 @@ Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.
 | 5 | feefilter | tip policy |
 | 9–15 | getblocks…mempool | headers/blocks/inv |
 | 17–21 | notfound…tx | ping/pong/sendcmpct/tx |
-| 22–27 | getcfilters…cfcheckpt | BIP157 basic, only when `--block-filter-index` is tip-ready |
+| 22–27 | getcfilters…cfcheckpt | BIP157 basic while `--block-filter-index` is on. A stop past the filter watermark is silence |
 | 28 | addrv2 | BIP155 |
 
 Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
@@ -265,10 +265,10 @@ Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 
 **Not implemented as product features** (short slots 29–36 placeholders, 37
 `feature`): decode may reject unknown short IDs. Slots 22–27 are live for
-BIP158 basic filters when `--block-filter-index` has reached the tip
-(`NODE_COMPACT_FILTERS`, `getcfilters`, `getcfheaders`, `getcfcheckpt`,
-`getblockfilter`). Serving before that watermark is silence, not an empty
-filter.
+BIP158 basic filters while `--block-filter-index` is on
+(`NODE_COMPACT_FILTERS` from startup, `getcfilters`, `getcfheaders`,
+`getcfcheckpt`, `getblockfilter`). A request whose stop height is past the
+filter watermark is silence, not an empty filter or a short batch.
 
 ## Deferred surfaces
 

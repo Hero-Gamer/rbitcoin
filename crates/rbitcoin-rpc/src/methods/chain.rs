@@ -617,7 +617,7 @@ pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Val
             format!("Unknown filtertype {filtertype}"),
         ));
     }
-    if !ctx.query.basic_filter_tip_ready() {
+    if !ctx.query.block_filter_enabled() {
         return Err(rpc_error(
             ERR_MISC,
             "Index is not enabled for filtertype basic",
@@ -633,7 +633,12 @@ pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Val
         .query
         .basic_filter_at(height.0)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_MISC, "Index is not enabled for filtertype basic"))?;
+        .ok_or_else(|| {
+            rpc_error(
+                ERR_MISC,
+                "Filter not found. Block filters are still in the process of being indexed.",
+            )
+        })?;
     use bitcoin::hashes::Hash;
     Ok(json!({
         "filter": hex_encode(&body),
