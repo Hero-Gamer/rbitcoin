@@ -82,8 +82,21 @@ so far targets do not drop out while a nearer one has a rate.
 
 ### Confirm-memory / block history
 
-Package feerates on `remove_for_block` fill a 64-sample ring (**N=1 p90 clip**)
-and a per-block p10 ring (last 1008 blocks) for `R_hist`. Process-local.
+Confirmed mempool entries' feerates on `remove_for_block` fill a 64-sample
+ring (**N=1 p90 clip**). Process-local.
+
+`R_hist` reads the **chain**, not this pool. Each block's p10 comes from its
+stored `txstat` fee/weight rows and in-block spend edges (one `spent.body`
+span, rare `spent.ovf` walk), so it counts txs this node never saw.
+Every tx gets the rate of the ancestor set it was selected with: within
+each in-block package, the tx whose in-package ancestor set pays best takes
+that set, so a CPFP parent counts at its package rate and a cheap child does
+not pull its parent down. Packages over 64 txs share one aggregate rate.
+Rates below min relay (out-of-band or zero-fee inclusions) are dropped
+before the p10. History is keyed by height (a connect at `h` replaces any
+branch above it) and holds the newest 1008 blocks. It is backfilled from
+the chain when relay turns on, so far targets answer right after a restart.
+Core persists `fee_estimates.dat` for the same reason; this needs no file.
 
 ### Histogram / relayfee
 

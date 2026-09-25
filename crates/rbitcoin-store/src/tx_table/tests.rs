@@ -4569,6 +4569,19 @@ fn spent_range_uses_loc_not_txout_body() {
 }
 
 #[test]
+fn spent_fields_reject_partial_slots() {
+    let dir = tempfile_dir("spent-fields-partial-slot");
+    let t = create_tiny(&dir);
+    let fk = put_n_out(&t, 1, 1);
+    let (off, len) = t.spent_range(fk).unwrap();
+    assert!(matches!(
+        t.spent_fields(&[(off, len - 1)]),
+        Err(StoreError::Corrupt("invariant: spent range slot alignment"))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn backfill_head_from_empty_and_unindexed() {
     let dir = tempfile_dir("backfill-head");
     let t = create_tiny(&dir);

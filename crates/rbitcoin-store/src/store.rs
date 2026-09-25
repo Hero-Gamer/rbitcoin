@@ -1135,6 +1135,45 @@ impl Store {
             .collect())
     }
 
+    /// Spends inside one block whose txs are the consecutive fks from `first`
+    /// with `spent.body` ranges `spent_ranges`: `(parent, child)` tx indices.
+    /// A spender fk inside the block's range is a same-block child. Multi-
+    /// spender slots (a reorged-away double spend) walk `spent.ovf`.
+    pub fn in_block_spend_edges(
+        &self,
+        first: Fk,
+        spent_ranges: &[(u64, u64)],
+    ) -> Result<Vec<(u32, u32)>, StoreError> {
+        let n = spent_ranges.len() as u64;
+        let child = |fk: Fk| {
+            fk.0.checked_sub(first.0)
+                .filter(|&i| i < n)
+                .map(|i| i as u32)
+        };
+        let mut edges = Vec::new();
+        for (parent, multi, field) in self.txs.spent_fields(spent_ranges)? {
+            if !multi {
+                edges.extend(child(field).map(|c| (parent, c)));
+                continue;
+            }
+            let cap = self.spenders.count();
+            let mut cur = Some(field);
+            let mut steps = 0u64;
+            while let Some(fk) = cur {
+                steps += 1;
+                if steps > cap {
+                    return Err(StoreError::Corrupt("invariant: spender multi-list cycle"));
+                }
+                let (spend_tx, _vin, next) = self.spenders.get(fk)?;
+                edges.extend(child(spend_tx).map(|c| (parent, c)));
+                cur = if next.is_null() { None } else { Some(next) };
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        Ok(edges)
+    }
+
     /// Completion-driven loc→body io_uring pipeline (confirm load / prep).
     ///
     /// Jobs with pre-known `range` skip loc fill when `n_out` is already set.

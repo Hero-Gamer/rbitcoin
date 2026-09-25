@@ -1621,7 +1621,8 @@ impl ChainHub {
         if let Some(mp) = self.mempool() {
             mp.clear_recent_rejects();
             if mp.relay_enabled() {
-                for &(_height, hash) in need_meta {
+                for &(height, hash) in need_meta {
+                    mp.note_block_fee_history(Height(height));
                     if let Ok(Some(block)) =
                         self.query.reconstruct_block_by_hash(&hash.to_byte_array())
                     {
@@ -2680,6 +2681,9 @@ impl ChainHub {
             let n = mp.remove_for_block_spent(&ids, &spent);
             if n > 0 {
                 rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
+            }
+            if mp.relay_enabled() {
+                mp.note_block_fee_history(Height(height));
             }
         }
         let mp_strip_ns = t_mp.elapsed().as_nanos() as u64;
