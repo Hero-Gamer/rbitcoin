@@ -115,7 +115,7 @@ Per-method notes, auth, and the shindex matrix live in
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (`getblockstats` from `txstat` when stamped; size and count fields match Core, including `utxo_increase_actual`; omit coins-DB `utxo_size_*`) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done (BIP324 v2-only; peer `timeoffset` / `synced_*` from session state; hostname `addnode` / `--connect` resolve at dial and retry until live) |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done (Libre; RPC `maxfeerate` / `maxburnamount` / `"version"` only) |
-| Coin / MiniWallet (`gettxout`, `scantxoutset`) | done (`scantxoutset` is descriptor expansion on `--sh-index`, not a coins-DB) |
+| Coin / MiniWallet (`gettxout`, `scantxoutset`) | done (`scantxoutset` is descriptor expansion on `--sh-index`, not a coins-DB; `txouts` is always `-1`) |
 | Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done (`txindex` = Class A reconstruct) |
 | Fee (`estimatesmartfee`) | done (**10-minute inclusion** — not Core historical) |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done (node subset; official Core dialect scripts stay `rpc-dialect`) |

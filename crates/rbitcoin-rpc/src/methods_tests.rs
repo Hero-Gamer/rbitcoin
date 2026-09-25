@@ -1916,6 +1916,7 @@ fn miniwallet_raw_scan_and_gettxout() {
     );
     let empty = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([])]).unwrap();
     assert_eq!(empty["success"], true);
+    assert_eq!(empty["txouts"], json!(-1));
     assert_eq!(empty["unspents"].as_array().unwrap().len(), 0, "{empty}");
     let unknown = dispatch(&ctx, "scantxoutset", vec![json!("nope")]).unwrap_err();
     assert_eq!(unknown["code"], ERR_INVALID_PARAMETER);

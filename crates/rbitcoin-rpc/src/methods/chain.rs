@@ -487,7 +487,7 @@ pub(crate) fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
     tip.saturating_sub(height.0).saturating_add(1)
 }
 
-/// Descriptor scan over the scripthash index. `txouts` is the confirmed unspent count.
+/// Descriptor scan over the scripthash index. `txouts` is always `-1`.
 pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["action", "scanobjects"])?;
     let Some(action_v) = params.get(0, "action") else {
@@ -525,10 +525,6 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
         expanded.into_iter().map(|s| (s.script, s.desc)).collect();
 
     let tip = ctx.query.tip_height().unwrap_or(Height(0));
-    let txouts = ctx
-        .query
-        .confirmed_unspent_txouts()
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let best = if let Some(h) = ctx.query.tip_height() {
         ctx.query
             .header_at_height(h)
@@ -574,7 +570,7 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
 
     Ok(json!({
         "success": true,
-        "txouts": txouts,
+        "txouts": -1,
         "height": tip.0,
         "bestblock": best,
         "unspents": unspents,
