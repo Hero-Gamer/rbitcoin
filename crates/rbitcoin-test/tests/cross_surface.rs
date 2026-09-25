@@ -743,6 +743,140 @@ fn pin_mined_parent_before_child(txs: &[Value], parent: &str, child: &str) {
     );
 }
 
+/// Unauthenticated Core REST on the same RPC listener, plus `getblockfilter`
+/// once the basic index sealed through this tip.
+async fn pin_core_rest(rpc_addr: SocketAddr, tip: &str, height: u64, txid: &str) {
+    let (st, body) = http_get(rpc_addr, "/rest/chaininfo.json").await;
+    assert_eq!(st, 200, "{body}");
+    let info: Value = serde_json::from_str(&body).expect("chaininfo json");
+    assert_eq!(info["chain"], "regtest", "{info}");
+    assert_eq!(info["blocks"], height, "{info}");
+
+    let (st, body) = http_get(rpc_addr, &format!("/rest/blockhashbyheight/{height}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let by_h: Value = serde_json::from_str(&body).expect("blockhash json");
+    assert_eq!(by_h["blockhash"], tip, "{by_h}");
+    let (st, hex) = http_get(rpc_addr, &format!("/rest/blockhashbyheight/{height}.hex")).await;
+    assert_eq!(st, 200, "{hex}");
+    assert_eq!(hex, tip, "blockhash hex");
+    let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/blockhashbyheight/{height}.bin")).await;
+    assert_eq!(st, 200, "blockhash bin status");
+    assert_eq!(raw.len(), 32, "blockhash bin");
+    let (st, body) = http_get(rpc_addr, "/rest/blockhashbyheight/9999999.json").await;
+    assert_eq!(st, 404, "{body}");
+
+    let (st, body) = http_get(rpc_addr, "/rest/blockhashbyheight/0.json").await;
+    assert_eq!(st, 200, "{body}");
+    let genesis: Value = serde_json::from_str(&body).expect("genesis hash");
+    let genesis = genesis["blockhash"].as_str().expect("genesis blockhash");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/headers/3/{genesis}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let hdrs: Value = serde_json::from_str(&body).expect("headers json");
+    assert_eq!(hdrs.as_array().map(|a| a.len()), Some(3), "{hdrs}");
+    let (st, hex) = http_get(rpc_addr, &format!("/rest/headers/2/{genesis}.hex")).await;
+    assert_eq!(st, 200, "{hex}");
+    assert_eq!(hex.len(), 80 * 2 * 2, "two headers as hex");
+    let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/headers/2/{genesis}.bin")).await;
+    assert_eq!(st, 200);
+    assert_eq!(raw.len(), 160, "two headers as bin");
+
+    let (st, body) = http_get(rpc_addr, &format!("/rest/block/{tip}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let blk: Value = serde_json::from_str(&body).expect("block json");
+    assert_eq!(blk["hash"], tip, "{blk}");
+    assert!(blk["tx"].as_array().is_some_and(|a| a.len() > 1), "{blk}");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/block/notxdetails/{tip}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let brief: Value = serde_json::from_str(&body).expect("notxdetails");
+    assert!(brief["tx"][0].is_string(), "verbosity 1 txids: {brief}");
+    let (st, hex) = http_get(rpc_addr, &format!("/rest/block/{tip}.hex")).await;
+    assert_eq!(st, 200);
+    assert!(hex.len() > 160, "block hex");
+    let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/block/{tip}.bin")).await;
+    assert_eq!(st, 200);
+    assert!(raw.len() > 80, "block bin");
+
+    let (st, body) = http_get(rpc_addr, &format!("/rest/tx/{txid}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let tx: Value = serde_json::from_str(&body).expect("tx json");
+    assert_eq!(tx["txid"], txid, "{tx}");
+    let (st, hex) = http_get(rpc_addr, &format!("/rest/tx/{txid}.hex")).await;
+    assert_eq!(st, 200);
+    assert!(!hex.is_empty(), "tx hex");
+    let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/tx/{txid}.bin")).await;
+    assert_eq!(st, 200);
+    assert!(!raw.is_empty(), "tx bin");
+
+    let (st, body) = http_get(rpc_addr, "/rest/mempool/info.json").await;
+    assert_eq!(st, 200, "{body}");
+    let info: Value = serde_json::from_str(&body).expect("mempool info");
+    assert_eq!(info["size"], 0, "generate emptied the pool: {info}");
+    let (st, body) = http_get(rpc_addr, "/rest/mempool/contents.json").await;
+    assert_eq!(st, 200, "{body}");
+    let contents: Value = serde_json::from_str(&body).expect("contents");
+    assert!(
+        contents.as_object().is_some_and(|o| o.is_empty()),
+        "{contents}"
+    );
+    let (st, body) = http_get(rpc_addr, "/rest/mempool/contents.json?verbose=false").await;
+    assert_eq!(st, 200, "{body}");
+    let ids: Value = serde_json::from_str(&body).expect("txid list");
+    assert_eq!(ids, json!([]), "{ids}");
+    let (st, body) = http_get(
+        rpc_addr,
+        "/rest/mempool/contents.json?verbose=false&mempool_sequence=true",
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = http_get(
+        rpc_addr,
+        "/rest/mempool/contents.json?verbose=true&mempool_sequence=true",
+    )
+    .await;
+    assert_eq!(st, 400, "{body}");
+    let (st, body) = http_get(rpc_addr, "/rest/mempool/nope.json").await;
+    assert_eq!(st, 400, "{body}");
+
+    let (st, body) = http_get(rpc_addr, &format!("/rest/getutxos/{txid}-0.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let utxo: Value = serde_json::from_str(&body).expect("getutxos");
+    assert_eq!(utxo["chainHeight"], height, "{utxo}");
+    assert_eq!(utxo["bitmap"], "1", "coinbase output is unspent: {utxo}");
+    let (st, body) = http_get(
+        rpc_addr,
+        &format!("/rest/getutxos/checkmempool/{txid}-0.json"),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/getutxos/{txid}-0.hex")).await;
+    assert_eq!(st, 404, "{body}");
+
+    let (st, body) = http_get(rpc_addr, "/rest/deploymentinfo.json").await;
+    assert_eq!(st, 200, "{body}");
+    let dep: Value = serde_json::from_str(&body).expect("deploymentinfo");
+    assert!(dep["deployments"].is_object(), "{dep}");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/deploymentinfo/{tip}.json")).await;
+    assert_eq!(st, 200, "{body}");
+
+    let filt = jsonrpc(rpc_addr, "getblockfilter", json!([tip])).await;
+    let filter_hex = filt["result"]["filter"]
+        .as_str()
+        .unwrap_or_else(|| panic!("getblockfilter: {filt}"));
+    assert!(!filter_hex.is_empty(), "{filt}");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/blockfilter/basic/{tip}.json")).await;
+    assert_eq!(st, 200, "{body}");
+    let rest_f: Value = serde_json::from_str(&body).expect("blockfilter json");
+    assert_eq!(rest_f["filter"], filter_hex, "{rest_f}");
+    let (st, hex) = http_get(rpc_addr, &format!("/rest/blockfilter/basic/{tip}.hex")).await;
+    assert_eq!(st, 200);
+    assert!(hex.starts_with("00"), "type byte 0: {hex}");
+    let (st, raw) = http_get_raw(rpc_addr, &format!("/rest/blockfilter/basic/{tip}.bin")).await;
+    assert_eq!(st, 200);
+    assert_eq!(raw.first().copied(), Some(0), "filter bin type");
+    let (st, body) = http_get(rpc_addr, &format!("/rest/blockfilter/unknown/{tip}.json")).await;
+    assert_eq!(st, 400, "{body}");
+}
+
 async fn pin_scantxoutset_drops_spent_coinbase(rpc_addr: SocketAddr, spent_cb: &str) {
     let scan = jsonrpc(rpc_addr, "scantxoutset", json!(["start", ["raw(51)"]])).await;
     assert_eq!(scan["result"]["success"], true, "{scan}");
@@ -915,6 +1049,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.use_seeds = false;
     cfg.listen.connect.clear();
     cfg.shindex = true;
+    cfg.block_filter_index = true;
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
@@ -1588,6 +1723,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     pin_mined_parent_before_child(txs, &pkg_parent_txid, &pkg_child_txid);
     pin_scantxoutset_drops_spent_coinbase(rpc_addr, &cb_hex).await;
     let cb_txid = txs[0]["txid"].as_str().expect("coinbase txid").to_string();
+    pin_core_rest(rpc_addr, new_hash, 107, &cb_txid).await;
     pin_esplora_block_txids_merkle_and_outspend(esplora_addr, new_hash, &cb_txid, txs.len()).await;
     let parent_hash = blk["result"]["previousblockhash"]
         .as_str()
