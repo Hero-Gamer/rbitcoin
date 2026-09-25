@@ -22,6 +22,8 @@ lcov.info
 /result-*
 # Generated SBOM (scripts/sbom.sh)
 /rbitcoin.cdx.json
+# Lock file created by scripts/core-functional/init-submodule.sh
+/third_party/.init-bitcoin.lock
 .repro-out/
 # Operator IBD / soak logs (keep out of commits)
 *-ibd.log
