@@ -143,6 +143,8 @@ confirm_window! {
     structural_bip68_ns,
     class_c_ns,
     tweak_ns,
+    // `rbtc-bf-wb` build + commit (off the write thread)
+    blockfilter_ns,
     ensure_layout_ns,
     write_class_c_join_ns,
     write_drain_join_ns,

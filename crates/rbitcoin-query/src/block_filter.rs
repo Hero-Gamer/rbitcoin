@@ -127,6 +127,20 @@ impl Query {
         }
     }
 
+    /// Heights the tip leads the committed filter watermark (0 when off).
+    pub fn block_filter_lag_heights(&self) -> u32 {
+        let Some(table) = self.block_filter_table() else {
+            return 0;
+        };
+        match self.tip_height() {
+            None => 0,
+            Some(tip) => tip
+                .0
+                .saturating_add(1)
+                .saturating_sub(table.next_height().0),
+        }
+    }
+
     /// Last committed filter height.
     pub fn basic_filter_hwm(&self) -> Result<Option<u32>, QueryError> {
         Ok(self
@@ -220,9 +234,15 @@ impl Query {
         if start > through {
             return Ok(0);
         }
+        let t0 = std::time::Instant::now();
         let end = through.min(start.saturating_add(SEAL_CHUNK - 1));
         let built = self.build_basic_filters(start, end)?;
-        self.commit_basic_filters(table, start, &built)
+        let n = self.commit_basic_filters(table, start, &built)?;
+        crate::note_confirm(
+            &self.confirm_stats().blockfilter_ns,
+            t0.elapsed().as_nanos() as u64,
+        );
+        Ok(n)
     }
 
     /// Materialize step: build up to `workers` chunks of `[next, through]` in
@@ -244,6 +264,7 @@ impl Query {
         if start > through {
             return Ok(0);
         }
+        let t0 = std::time::Instant::now();
         let chunks: Vec<(u32, u32)> = (0..workers)
             .map(|i| start.saturating_add(i * SEAL_CHUNK))
             .take_while(|&s| s <= through)
@@ -270,6 +291,10 @@ impl Query {
                 break;
             }
         }
+        crate::note_confirm(
+            &self.confirm_stats().blockfilter_ns,
+            t0.elapsed().as_nanos() as u64,
+        );
         Ok(done)
     }
 
