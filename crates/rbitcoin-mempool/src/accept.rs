@@ -350,6 +350,18 @@ fn block_fit_sigop_cost(
     Ok(cost)
 }
 
+fn checked_fee_sat(tx: &Transaction, input_value: u64) -> Result<u64, AcceptError> {
+    let mut output_value = 0u64;
+    for output in &tx.output {
+        output_value = output_value
+            .checked_add(output.value.to_sat())
+            .ok_or(AcceptError::Policy("bad-txns-txouttotal-toolarge"))?;
+    }
+    input_value
+        .checked_sub(output_value)
+        .ok_or(AcceptError::Policy("negative fee"))
+}
+
 /// Fee and sigop-adjusted weight of `tx` over resolved `prevouts`; `None`
 /// if outputs exceed inputs.
 fn fee_and_adjusted_weight(
@@ -876,17 +888,7 @@ impl ActiveMempool {
 
         let sigop_cost = block_fit_sigop_cost(tx, &prevouts, self.graph.block_reserved_sigops())?;
 
-        let mut output_value = 0u64;
-        for o in &tx.output {
-            let v = o.value.to_sat();
-            output_value = output_value
-                .checked_add(v)
-                .ok_or(AcceptError::Policy("bad-txns-txouttotal-toolarge"))?;
-        }
-        if output_value > input_value {
-            return Err(AcceptError::Policy("negative fee"));
-        }
-        let fee_sat = input_value - output_value;
+        let fee_sat = checked_fee_sat(tx, input_value)?;
         let weight = tx.weight().to_wu();
         let admit_fee = (i128::from(fee_sat).saturating_add(i128::from(fee_delta))).max(0) as u64;
 
@@ -2445,6 +2447,19 @@ mod tests {
             matches!(err, AcceptError::Policy("bad-txns-txouttotal-toolarge")),
             "got {err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_admit_rejects_negative_fee() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 100_001);
+        let mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp
+            .prepare_admit(&tx, &utxos, TIP_OK, 0, false, None)
+            .expect_err("outputs exceed inputs");
+        assert!(matches!(err, AcceptError::Policy("negative fee")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
