@@ -132,7 +132,7 @@ First production-green pair (historical): `feature_uacomment.py`
 | `no-wallet` | wallet RPC / `wallet/` URL |
 | `no-mining-product` | GBT / `prioritisetransaction` as Core mining |
 | `no-prune` | prune / blk xor / `-blocksdir` |
-| `no-utxo-set` | coins DB / assumeutxo / scantxoutset |
+| `no-utxo-set` | coins DB / assumeutxo |
 | `no-zmq` / `no-ipc` / `no-qt` | those interfaces |
 | `no-core-rest` | Core REST (`interface_rest.py`); we have Esplora instead |
 | `no-tool` | bitcoin-wallet / bitcoin-tx / bitcoin-util / bitcoin-chainstate |

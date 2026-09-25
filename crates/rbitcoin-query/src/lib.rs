@@ -1241,6 +1241,25 @@ pub struct BlockQueueOffer {
 }
 
 impl Query {
+    /// Confirmed unspent outputs on the active chain. Not a coins DB.
+    pub fn confirmed_unspent_txouts(&self) -> Result<u64, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(0);
+        };
+        let mut n = 0u64;
+        for h in 0..=tip.0 {
+            for fk in self.block_tx_fks(Height(h))? {
+                let rec = self.get_tx(fk)?;
+                for v in 0..rec.output_count {
+                    if !self.is_outpoint_spent(&rec.txid, v)? {
+                        n = n.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// True if this outpoint is spent on the **best chain** (durable confirmed-strong).
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write

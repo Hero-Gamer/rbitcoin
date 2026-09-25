@@ -115,14 +115,14 @@ Per-method notes, auth, and the shindex matrix live in
 | Blockchain (`getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`/`header`, `getdifficulty`, `getblockstats`) | done (`getblockstats` from `txstat` when stamped; size and count fields match Core, including `utxo_increase_actual`; omit coins-DB `utxo_size_*`) |
 | Network (`getnetworkinfo`, `getconnectioncount`, `getpeerinfo`, `addnode`, `disconnectnode`, `addconnection`) | done (BIP324 v2-only; peer `timeoffset` / `synced_*` from session state; hostname `addnode` / `--connect` resolve at dial and retry until live) |
 | Mempool / rawtx (`getmempool*`, `getrawtransaction`, `sendrawtransaction`, `testmempoolaccept`) | done (Libre; RPC `maxfeerate` / `maxburnamount` / `"version"` only) |
-| Coin / MiniWallet (`gettxout`, `scantxoutset` `raw(HEX)`) | done (Class A unspent walk — not a coins-DB) |
+| Coin / MiniWallet (`gettxout`, `scantxoutset`) | done (`scantxoutset` is descriptor expansion on `--sh-index`, not a coins-DB) |
 | Index / tips (`getindexinfo`, `getchaintips`, `waitforblock*`) | done (`txindex` = Class A reconstruct) |
 | Fee (`estimatesmartfee`) | done (**10-minute inclusion** — not Core historical) |
 | Decode (`decoderawtransaction`, `decodescript`, `validateaddress`) | done (node subset; official Core dialect scripts stay `rpc-dialect`) |
 | Regtest `generatetoaddress` / `generatetodescriptor` / `generateblock` / `generate` / `submitblock` / `setmocktime` | harness (regtest only except `submitblock`) |
 | `invalidateblock` / `reconsiderblock` / `preciousblock` | done |
 | Mining template (`getblocktemplate`, `getmininginfo`, `prioritisetransaction`, `getmempoolcluster`) | done (no stratum / BIP9 testdummy / wallet keys) |
-| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; full `scantxoutset` / `gettxoutsetinfo` | **never** |
+| Wallet RPC; `createrawtransaction` / `combinerawtransaction`; `gettxoutsetinfo` hash / assumeutxo | **never** (`gettxoutsetinfo` returns height, tip, and a confirmed unspent count; no coins-DB hash) |
 
 ## Electrum surface
 

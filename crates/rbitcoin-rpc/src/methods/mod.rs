@@ -16,7 +16,6 @@ use std::time::Instant;
 pub(crate) use chain::{tip_hash_height, wait_timeout_ms};
 pub(crate) use mine::gbt_longpoll_id;
 pub use mine::{gbt_template, submit_received_block};
-
 thread_local! {
     static HTTP_WAIT_SATISFIED: Cell<bool> = const { Cell::new(false) };
 }
@@ -50,6 +49,7 @@ pub(crate) fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
 
 mod chain;
 mod decode;
+mod descriptor_scan;
 mod mempool;
 mod mine;
 mod net;
@@ -494,12 +494,12 @@ pub(crate) fn dispatch_inner(
         "getmempoolfeeratediagram" => getmempoolfeeratediagram(ctx, &params),
         "submitpackage" => submitpackage(ctx, &params),
         "gettxspendingprevout" => gettxspendingprevout(ctx, &params),
+        "gettxoutsetinfo" => gettxoutsetinfo(ctx, &params),
         "createrawtransaction"
         | "signrawtransactionwithkey"
         | "createmultisig"
         | "combinerawtransaction"
-        | "deriveaddresses"
-        | "gettxoutsetinfo" => Err(rpc_error(
+        | "deriveaddresses" => Err(rpc_error(
             ERR_METHOD_NOT_FOUND,
             format!("{method} is not supported (see docs/rpc.md)"),
         )),
@@ -634,6 +634,7 @@ const METHOD_LIST: &[&str] = &[
     "generateblock",
     "generate",
     "scantxoutset",
+    "gettxoutsetinfo",
     "gettxout",
     "getindexinfo",
     "getchaintips",
@@ -715,8 +716,8 @@ const NAMED_HELP: &[(&str, &str)] = &[
     ),
     (
         "scantxoutset",
-        "scantxoutset action (scanobjects)\n\
-         raw() scripts over Class A. MiniWallet support, not Core coins-DB.",
+        "scantxoutset \"action\" ( [scanobjects,...] )\n\
+         Descriptor scan on --sh-index. action is start, abort, or status.",
     ),
     (
         "decoderawtransaction",

@@ -948,9 +948,7 @@ analog = "none"
 
 [[test]]
 name = "rpc_scantxoutset.py"
-status = "skip"
-reason = "no-utxo-set"
-analog = "none"
+status = "run"
 
 [[test]]
 name = "rpc_setban.py"

@@ -1277,15 +1277,12 @@ impl Query {
 
     /// Confirmed unspents whose `scriptPubKey` is in `scripts`.
     ///
-    /// With `--shindex`, this is [`Self::scripthash_listunspent`]. Without, it
-    /// walks Class A `txout` + spentness per confirmed height — never
-    /// [`Self::reconstruct_block_at_height`].
+    /// Scripthash lookups only. Callers require `--sh-index`.
     pub fn scan_unspent_scripts(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
-        if self.sh_index_enabled() {
-            self.scan_unspent_via_shindex(scripts)
-        } else {
-            self.scan_unspent_via_txout(scripts)
+        if !self.sh_index_enabled() {
+            return Err(StoreError::Cancelled("scripthash index disabled"));
         }
+        self.scan_unspent_via_shindex(scripts)
     }
 
     fn scan_unspent_via_shindex(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
@@ -1311,41 +1308,6 @@ impl Query {
                     script: spk.clone(),
                     coinbase,
                 });
-            }
-        }
-        Ok(out)
-    }
-
-    fn scan_unspent_via_txout(&self, scripts: &[Vec<u8>]) -> Result<Vec<ScanUtxo>, QueryError> {
-        let Some(tip) = self.tip_height() else {
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for h in 0..=tip.0 {
-            let fks = self.block_tx_fks(Height(h))?;
-            for (ti, fk) in fks.into_iter().enumerate() {
-                let tx = self.get_tx(fk)?;
-                let (_meta, outs) = self.store.get_tx_meta_and_outputs(fk)?;
-                let coinbase = ti == 0;
-                for (vout, o) in outs.iter().enumerate() {
-                    if !scripts.iter().any(|s| s.as_slice() == o.script.as_slice()) {
-                        continue;
-                    }
-                    if self.is_outpoint_spent(&tx.txid, vout as u32)? {
-                        continue;
-                    }
-                    if o.value < 0 {
-                        continue;
-                    }
-                    out.push(ScanUtxo {
-                        txid: tx.txid,
-                        vout: vout as u32,
-                        height: h,
-                        value: o.value as u64,
-                        script: o.script.clone(),
-                        coinbase,
-                    });
-                }
             }
         }
         Ok(out)
