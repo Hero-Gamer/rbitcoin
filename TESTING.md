@@ -4,12 +4,25 @@
 
 | Prefer | Avoid |
 |--------|--------|
-| **Journey scenarios**: one `/tmp` store, one mature pad, then a **sequence** of asserts (spend, reject, reconstruct, scripthash, …) | Many skinny scenarios that each remine maturity and re-open the store |
-| **Pure units** on pure helpers (scriptnum, bits, fuse8, open-hash) with **no store** | Units that re-implement confirm and only paint lines a journey already hits |
-| **One entry** per production path (scenario **or** unit next to the shipped fn) | Twin unit + scenario for the same reject string |
+| **Journey scenarios**: one setup a peer, client, or operator could use, then a **sequence** of asserts on what they would observe | Many skinny scenarios that each remine maturity and re-open the store |
+| The socket, RPC, HTTP route, operator config, or scripted peer | An in-process helper the product never calls, or a thread-local the client does not share |
+| **Pure units** on pure helpers (scriptnum, bits, fuse8, open-hash) with **no store**, when a real session cannot reach them | Units that re-implement confirm and only paint lines a journey already hits |
+| **One entry** per production path (the journey owns the asserts) | A `#[test]` that only calls other tests, or those tests kept as private bodies |
 | Core JSON corpora for **script engine** breadth | A second parallel script suite |
 
-**Fewer scenario functions / store opens, not less coverage** — put more asserts on one carefully designed multi-stage journey.
+**Fewer scenario functions / store opens, not less coverage** — put more asserts on one story.
+
+### True journeys
+
+A journey is one setup and one story. A peer, a client, or an operator does a sequence of things to that same node. Each beat asserts what they would observe: a response, a push, a reject, bytes on disk, a tip after reopen. The story should read like this node meeting the real network or a real client, and it should run as much of that path as the arc needs. One chain, one server, one session, the beats in order.
+
+A `#[test]` whose body only calls other tests is not a journey. Each callee still opens its own store, hub, or socket. The suite gains one name and the same N boots. Delete the callees. The journey writes the asserts. Do not keep the old functions as private bodies the new test calls.
+
+Small tests are the exception. Use one when a real session cannot reach the behavior without a setup no peer, client, or operator has: pure arithmetic, a codec with no socket, two networks that cannot be the same chain. Say why next to the test. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
+
+Push the entry up. Prefer the surface a real session uses over an in-process dispatch the product never calls. In-process is for a fact that surface cannot show. Do not assert a thread-local, a counter on a worker the client does not share, or a helper's name. If the only proof lives there, it is not the contract yet.
+
+A small unit is faster to land. It also freezes behavior a real node never exhibits, and later work has to preserve that accident. Assert what changes the result for a real user, peer, or operator. That includes rare real cases: a lagged subscriber, a pruned witness, a cap that returns an RPC error while ping still works. It does not include an internal shape no session can hit.
 
 ### Default CI is the pin
 
@@ -29,7 +42,7 @@ When adding or folding a pin:
 |----|--------|
 | Extend an existing [catalog](#scenario-catalog) journey (same `/tmp` pad, more asserts) | A new skinny scenario that remine-pads the same chain |
 | Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
-| Keep guts the journey cannot hit | Delete handshake **format** needles, `decode_rpc_subset`, or BIP324 encode vectors waiting for Core |
+| Keep a unit only while no real session can reach that path, then move the assert onto the journey | A new small test for a path a peer, client, or operator can already hit. Handshake **format** needles, `decode_rpc_subset`, and BIP324 encode vectors stay until a journey hits them |
 | Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
 | New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` |
 
@@ -221,14 +234,17 @@ to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
 
 ### Philosophy
 
-1. Cover code with **high-level functional/integration scenarios** (this file).
-2. Prefer expanding the harness over adding private unit tests.
-3. If a branch is unreachable, **delete it** or hit it through a **shipped**
-   config / error / CLI path. Do not add a `pub` or `*_for_test` injector
-   so a unit can see it ([`CONTRIBUTING.md`](./CONTRIBUTING.md) principle 11).
-4. True unit tests only when a branch cannot be reached through any higher API
-   without absurd cost — document the reason in the test file. Drive the
-   shipped function, not a `#[cfg(test)]` wrapper around it.
+1. Cover code with a [true journey](#true-journeys): one setup, one story,
+   asserts on what a peer, client, or operator would observe.
+2. Prefer extending that journey over a new small test. A caller of other
+   tests is not a journey.
+3. If a branch is unreachable from any real session, **delete it** or hit it
+   through a **shipped** config / error / CLI path. Do not add a `pub` or
+   `*_for_test` injector so a unit can see it
+   ([`CONTRIBUTING.md`](./CONTRIBUTING.md) principle 11).
+4. A small unit only when a real session cannot reach the behavior without
+   absurd cost — say why in the test file. Drive the shipped function, not a
+   `#[cfg(test)]` wrapper around it.
 
 ### Closing a red region
 

@@ -30,6 +30,9 @@ Open [`CONTRIBUTING.md`](CONTRIBUTING.md) principles 7–11 and
   Crate and public rustdoc (`//!` / `///`) is not this rule (principle 7).
 - Tests assert shipped behavior, not repo text. No `*_for_test` backdoors.
   IO pins use session or table stats or on-disk state (principle 8).
+  A test that only calls other tests is not a journey. Small units are the
+  exception when a real session cannot reach the behavior.
+  [`TESTING.md`](TESTING.md) (True journeys).
 - A RAM or CPU trade is named (principle 9).
 - Control flow and composition: principle 10 and `docs/code-shape.md`.
 - Crate `pub` is the cross-crate graph only. No unused `pub`. No
