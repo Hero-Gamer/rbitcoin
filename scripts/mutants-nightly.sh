@@ -7,11 +7,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 90 minutes. One workspace suite is the unit of work, and two of them in
-# parallel do not fit a hosted runner, so this is -j 1. An hour finishes
-# only a couple of mutants after setup; 90 minutes can clear a normal day's
-# new mutants and still walk the backlog.
-BUDGET_SEC="${MUTANTS_BUDGET_SEC:-5400}"
+# 5 hours. One workspace suite is the unit of work, and two of them in
+# parallel do not fit a hosted runner, so this is -j 1. The job timeout
+# is 30 minutes longer so the script can stop itself and upload artifacts.
+# GitHub-hosted jobs cannot run longer than 6 hours.
+BUDGET_SEC="${MUTANTS_BUDGET_SEC:-18000}"
 BATCH="${MUTANTS_BATCH:-4}"
 # A mutant that has not finished in 20 minutes is a hang, not a miss.
 MUTANT_TIMEOUT="${MUTANTS_TIMEOUT:-1200}"

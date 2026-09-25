@@ -65,6 +65,13 @@ assert_ok "nightly run excludes rbitcoin-bench" \
   bash -c 'grep -q -- "--exclude '"'"'crates/rbitcoin-bench/\*\*/\*.rs'"'"'" "$1"' _ "$NIGHTLY"
 assert_ok "mutants.toml excludes rbitcoin-bench" \
   grep -q 'crates/rbitcoin-bench/\*\*/\*.rs' "$TOML"
+WF="$ROOT/.github/workflows/mutants.yml"
+assert_ok "nightly cron is 07:47 UTC" \
+  grep -q 'cron: "47 7 \* \* \*"' "$WF"
+assert_ok "job timeout is 330 minutes" \
+  grep -q 'timeout-minutes: 330' "$WF"
+assert_ok "script budget is 5 hours" \
+  grep -q 'MUTANTS_BUDGET_SEC:-18000' "$NIGHTLY"
 
 echo "$PASS passed, $FAIL failed"
 test "$FAIL" -eq 0
