@@ -189,9 +189,11 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
    (return, store after reopen, peer/RPC/log line). Do not `include_str!`
    production sources or markdown and `contains` identifiers, comments, or
    call graphs. Fixture JSON/hex and tests that read **datadir** bytes are
-   not this rule. Prefer **one** [catalog journey](./TESTING.md) over a twin
-   unit for the same reject. Core functional is nightly, not a substitute
-   for that journey.
+   not this rule. Prefer **one** [true journey](./TESTING.md#true-journeys)
+   over a twin unit for the same reject. A `#[test]` that only calls other
+   tests is not a journey. A small unit is the exception when a real peer,
+   client, or operator session cannot reach the behavior. Core functional
+   is nightly, not a substitute for that journey.
 9. **RAM and CPU are design inputs.** This node indexes chain-scale
    structures (tens of millions of keys, hundred-MiB arrays, GiB-class
    heads). Iterating those structures is expensive. Every algorithm should
@@ -293,9 +295,10 @@ IO; they do not package zips. GitHub Releases:
 
 ## Code review checklist
 
-- [ ] Behavior covered by a catalog journey (or a justified unit next to a
-      pure helper). No twin for the same reject. Core functional is not the
-      PR pin ([`TESTING.md`](./TESTING.md)).
+- [ ] Behavior covered by a true journey (or a justified unit next to a
+      pure helper a real session cannot reach). No caller-of-tests, no twin
+      for the same reject. Core functional is not the PR pin
+      ([`TESTING.md`](./TESTING.md#true-journeys)).
 - [ ] Core-facing RPC / P2P / Electrum / Esplora: [`COMPAT.md`](./COMPAT.md)
 - [ ] No new silent dead branches
 - [ ] No unused crate-root `pub` / `pub use` (principle 11). Tests drive
