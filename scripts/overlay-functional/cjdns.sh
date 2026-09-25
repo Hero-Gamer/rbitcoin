@@ -113,17 +113,17 @@ wait_tun() {
   return 1
 }
 
+start_cjdroute a
+wait_tun rbtc0
+start_cjdroute b
+wait_tun rbtc1
+
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
 
-cjdns_alive() {
-  [[ -f "$ROOT/$1.pid" ]] && kill -0 "$(cat "$ROOT/$1.pid")" 2>/dev/null
-}
-
 # Kernel TCP over the TUNs (the product path). ICMP through cjdns is not
 # reliable on GitHub-hosted runners even when the ifaces are up.
-cjdns_tcp() {
-  python3 - "$IPV6_A" "$IPV6_B" <<'PY'
+if ! python3 - "$IPV6_A" "$IPV6_B" <<'PY'
 import socket, sys, time
 a, b = sys.argv[1], sys.argv[2]
 end = time.time() + 60
@@ -156,64 +156,31 @@ while time.time() < end:
 print(f"cjdns TCP timeout ({a} -> {b}): {last}", file=sys.stderr)
 sys.exit(1)
 PY
-}
-
-restart_cjdns() {
-  local name
+then
+  echo "cjdns TCP timeout ($IPV6_A <-> $IPV6_B)" >&2
   for name in a b; do
-    if [[ -f "$ROOT/$name.pid" ]]; then
-      sudo kill "$(cat "$ROOT/$name.pid")" 2>/dev/null || true
+    echo "--- $name pid ---" >&2
+    if [[ -f "$ROOT/$name.pid" ]] && kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+      echo "alive $(cat "$ROOT/$name.pid")" >&2
+    else
+      echo "dead" >&2
     fi
+    echo "--- $name.log ---" >&2
+    tail -n 80 "$ROOT/$name.log" >&2 || true
   done
-  sudo ip link delete rbtc0 2>/dev/null || true
-  sudo ip link delete rbtc1 2>/dev/null || true
-  sleep 0.5
-  start_cjdroute a
-  wait_tun rbtc0
-  start_cjdroute b
-  wait_tun rbtc1
-}
-
-# cjdroute can segfault ~1s after the first TCP on GitHub runners.
-# Restart the pair instead of failing the mesh on that crash.
-mesh_ok=0
-for attempt in 1 2 3; do
-  if [[ "$attempt" -eq 1 ]]; then
-    start_cjdroute a
-    wait_tun rbtc0
-    start_cjdroute b
-    wait_tun rbtc1
-  else
-    echo "cjdns: restart attempt ${attempt}" >&2
-    restart_cjdns
-  fi
-  if ! cjdns_tcp; then
-    echo "cjdns TCP timeout ($IPV6_A <-> $IPV6_B)" >&2
-    if [[ "$attempt" -eq 3 ]]; then
-      for name in a b; do
-        echo "--- $name.log ---" >&2
-        tail -n 40 "$ROOT/$name.log" >&2 || true
-      done
-      exit 1
-    fi
-    continue
-  fi
-  dead=""
-  for name in a b; do
-    if ! cjdns_alive "$name"; then
-      echo "cjdns: $name not running after TCP wait" >&2
-      tail -n 40 "$ROOT/$name.log" >&2 || true
-      dead="$name"
-    fi
-  done
-  if [[ -z "$dead" ]]; then
-    mesh_ok=1
-    break
-  fi
-done
-if [[ "$mesh_ok" -ne 1 ]]; then
+  sudo ip -6 addr show rbtc0 >&2 || true
+  sudo ip -6 addr show rbtc1 >&2 || true
+  sudo ip -6 route get "$IPV6_B" >&2 || true
   exit 1
 fi
+
+for name in a b; do
+  if [[ ! -f "$ROOT/$name.pid" ]] || ! kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+    echo "cjdns: $name not running after TCP wait" >&2
+    tail -n 40 "$ROOT/$name.log" >&2 || true
+    exit 1
+  fi
+done
 # GHA: angel/core can crash ~1s after the first TCP; require the addrs
 # still bind after a settle so we do not hand a dead TUN to the journey.
 sleep 2
