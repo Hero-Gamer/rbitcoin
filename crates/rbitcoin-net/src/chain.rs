@@ -1657,7 +1657,7 @@ impl ChainHub {
         drop(confirmed);
         self.notify.notify_waiters();
         if let Some(&(height, _)) = need_meta.last() {
-            self.query.release_sh_writebehind(Height(height));
+            self.query.release_index_writebehind(Height(height));
         }
         Ok(())
     }
@@ -2704,7 +2704,7 @@ impl ChainHub {
         };
         let _ = self.tip_tx.send(event);
         self.notify.notify_waiters();
-        self.query.release_sh_writebehind(Height(height));
+        self.query.release_index_writebehind(Height(height));
         self.trim_held_bodies(height);
         Ok(())
     }
@@ -4674,7 +4674,7 @@ mod tests {
         }
         let ev = tip_rx.try_recv().expect("tip event after accept");
         assert_eq!(ev.height, 3);
-        assert_eq!(hub.query.sh_released_through_height(), Some(3));
+        assert_eq!(hub.query.index_released_through_height(), Some(3));
         assert_eq!(
             hub.query.sh_indexed_through_height(),
             Some(2),

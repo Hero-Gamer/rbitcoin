@@ -1022,7 +1022,7 @@ fn sh_writebehind_does_not_seed_until_release() {
         .sh_written_n
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    q.release_sh_writebehind(Height(0));
+    q.release_index_writebehind(Height(0));
     q.apply_sh_pending().unwrap();
     assert_eq!(q.sh_indexed_through_height(), Some(0));
     assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
@@ -1099,7 +1099,7 @@ fn apply_sh_pending_waits_for_in_flight_job() {
     q.commit_class_a_only(&h0, &[t0]).unwrap();
     q.confirm_block(Height(0), &h0.hash).unwrap();
     assert_eq!(q.sh_indexed_through_height(), None);
-    q.release_sh_writebehind(Height(0));
+    q.release_index_writebehind(Height(0));
 
     let stolen = q.take_sh_job_for_apply().expect("enqueued genesis");
     let height = Height(0);
@@ -1165,7 +1165,7 @@ fn apply_sh_job_skips_stale_job_after_same_height_replace() {
     t1a.outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0xaa])];
     q.commit_class_a_only(&h1a, &[t1a]).unwrap();
     q.confirm_block(Height(1), &h1a.hash).unwrap();
-    q.release_sh_writebehind(Height(1));
+    q.release_index_writebehind(Height(1));
     let stolen = q.take_sh_job_for_apply().expect("old branch job");
 
     q.disconnect_tip().unwrap();
@@ -1347,7 +1347,7 @@ fn recover_sh_writebehind_skips_bodyless_structural_tip() {
     let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
     q.commit_class_a_only(&h1, &[t1]).unwrap();
     let hfk1 = q.confirm_block(Height(1), &h1.hash).unwrap();
-    q.release_sh_writebehind(Height(1));
+    q.release_index_writebehind(Height(1));
     let _stolen = q.take_sh_job_for_apply().expect("height-1 job");
     q.finish_sh_job(Height(1));
     assert_eq!(q.tip_height(), Some(Height(1)));
@@ -1486,7 +1486,7 @@ fn sh_pending_join_holds_while_job_is_in_flight() {
     q.confirm_block(Height(1), &hash1).unwrap();
     assert_eq!(q.sh_indexed_through_height(), Some(0));
     assert!(q.scripthash_listunspent(&sh).unwrap().is_empty());
-    q.release_sh_writebehind(Height(1));
+    q.release_index_writebehind(Height(1));
 
     // Same transition as rbtc-sh-wb / apply_sh_pending: queue → applying,
     // durable watermark not advanced yet.

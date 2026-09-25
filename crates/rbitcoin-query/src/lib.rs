@@ -246,8 +246,6 @@ struct ShWriteBehind {
     pending_cv: Condvar,
     /// Job popped for apply but not yet watermarked.
     applying: Mutex<Option<connect::ShPendingJob>>,
-    /// `0` = none released; `h+1` = durable apply may run through height `h`.
-    released_through: AtomicU32,
     /// Pending + in-flight SH creates keyed by scripthash.
     ram_head: Mutex<HashMap<[u8; 32], Vec<Fk>>>,
     /// Serializes the one Class B appender (worker vs generate drain).
@@ -262,7 +260,6 @@ impl ShWriteBehind {
             pending: Mutex::new(VecDeque::new()),
             pending_cv: Condvar::new(),
             applying: Mutex::new(None),
-            released_through: AtomicU32::new(0),
             ram_head: Mutex::new(HashMap::new()),
             appender: Mutex::new(()),
         }
@@ -279,6 +276,9 @@ pub struct Query {
     /// Height-ordered SH write-behind (one Class B appender). Confirm enqueues;
     /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
     sh: ShWriteBehind,
+    /// Index write-behind release gate shared by every appender. `0` = none
+    /// released; `h+1` = appenders may apply through height `h`.
+    index_released_through: AtomicU32,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// In-RAM body queue + lookup-promoted decoded map. One mutex (no ArcSwap).
@@ -438,6 +438,7 @@ impl Query {
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh: ShWriteBehind::new(),
+            index_released_through: AtomicU32::new(0),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
                 q: rbitcoin_store::BlockQueue::open_or_create(&store_path)?,

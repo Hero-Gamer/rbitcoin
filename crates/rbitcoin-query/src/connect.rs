@@ -329,38 +329,37 @@ impl Query {
         Ok(())
     }
 
-    /// Allow the Class B appender to durable-apply jobs through `through`.
+    /// Allow index write-behind appenders to durable-apply through `through`.
     ///
     /// Enqueue publishes RAM records; seed waits for this so tip connect and
     /// block announce do not share disk with `locate_head`.
-    pub fn release_sh_writebehind(&self, through: Height) {
+    pub fn release_index_writebehind(&self, through: Height) {
         let v = through.0.saturating_add(1);
-        self.sh.released_through.fetch_max(v, Ordering::Release);
+        self.index_released_through.fetch_max(v, Ordering::Release);
         self.sh.pending_cv.notify_one();
     }
 
     /// Last height durable apply is allowed to run (`None` until first release).
-    pub fn sh_released_through_height(&self) -> Option<u32> {
-        let v = self.sh.released_through.load(Ordering::Acquire);
+    pub fn index_released_through_height(&self) -> Option<u32> {
+        let v = self.index_released_through.load(Ordering::Acquire);
         v.checked_sub(1)
     }
 
     fn release_queued_sh_writebehind(&self) {
         if let Some(h) = self.sh_pending_max_height() {
-            self.release_sh_writebehind(Height(h));
+            self.release_index_writebehind(Height(h));
         }
     }
 
-    fn clamp_sh_released_before(&self, height: Height) {
+    fn clamp_index_released_before(&self, height: Height) {
         let cap = height.0;
         loop {
-            let cur = self.sh.released_through.load(Ordering::Acquire);
+            let cur = self.index_released_through.load(Ordering::Acquire);
             if cur <= cap {
                 return;
             }
             if self
-                .sh
-                .released_through
+                .index_released_through
                 .compare_exchange(cur, cap, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
@@ -370,7 +369,7 @@ impl Query {
     }
 
     fn sh_job_released(&self, job: &ShPendingJob) -> bool {
-        let rel = self.sh.released_through.load(Ordering::Acquire);
+        let rel = self.index_released_through.load(Ordering::Acquire);
         rel > 0 && job.height.0.saturating_add(1) <= rel
     }
 
@@ -561,7 +560,7 @@ impl Query {
                 unindex_sh_ram_head(&mut head, job);
             }
         }
-        self.clamp_sh_released_before(height);
+        self.clamp_index_released_before(height);
     }
 
     /// Restore SH watermark from durable `include_hwm` and re-queue heights the
@@ -606,7 +605,7 @@ impl Query {
         if !items.is_empty() {
             self.enqueue_sh_pending(&items, None)?;
             if let Some(last) = items.last() {
-                self.release_sh_writebehind(last.height);
+                self.release_index_writebehind(last.height);
             }
         }
         Ok(())
@@ -757,7 +756,7 @@ impl Query {
         if drop_pending {
             self.drop_sh_pending_from(height);
         } else {
-            self.clamp_sh_released_before(height);
+            self.clamp_index_released_before(height);
         }
         let hash = self
             .header_at_height(height)?
