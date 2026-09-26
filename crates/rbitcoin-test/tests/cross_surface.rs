@@ -878,6 +878,26 @@ async fn pin_rest_deployment_and_filter(rpc_addr: SocketAddr, tip: &str) {
         .unwrap_or_else(|| panic!("getblockfilter: {filt}"))
         .to_string();
     assert!(!filter_hex.is_empty(), "{filt}");
+    // Filters reached the tip: new peers now hear NODE_COMPACT_FILTERS.
+    let mut names = json!(null);
+    for _ in 0..100 {
+        names = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await["result"]
+            ["localservicesnames"]
+            .clone();
+        if names
+            .as_array()
+            .is_some_and(|a| a.iter().any(|n| n == "COMPACT_FILTERS"))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        names
+            .as_array()
+            .is_some_and(|a| a.iter().any(|n| n == "COMPACT_FILTERS")),
+        "advertised once filters caught up: {names}"
+    );
     let (st, body) = http_get(rpc_addr, &format!("/rest/blockfilter/basic/{tip}.json")).await;
     assert_eq!(st, 200, "{body}");
     assert_eq!(rest_json(&body)["filter"], filter_hex, "{body}");

@@ -421,11 +421,13 @@ impl Query {
 ///
 /// Stop is checked between commits, so shutdown waits at most one chunk
 /// build. Apply errors request `stop` and `on_fatal`, like the scripthash
-/// appender.
+/// appender. `on_caught_up` runs once, the first time the committed filters
+/// reach the released tip (the node starts advertising `NODE_COMPACT_FILTERS`).
 pub fn spawn_block_filter_writebehind(
     query: std::sync::Arc<Query>,
     stop: std::sync::Arc<AtomicBool>,
     on_fatal: impl FnOnce() + Send + 'static,
+    on_caught_up: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     use std::time::{Duration, Instant};
     const PROGRESS_EVERY: Duration = Duration::from_secs(10);
@@ -440,9 +442,20 @@ pub fn spawn_block_filter_writebehind(
             if let Some(tip) = query.tip_height() {
                 query.release_index_writebehind(tip);
             }
+            let mut on_caught_up = Some(on_caught_up);
             while !stop.load(Ordering::Relaxed) {
                 let next = query.basic_filter_hwm().ok().flatten().map_or(0, |h| h + 1);
-                let Some(target) = query.block_filter_target().filter(|&t| t >= next) else {
+                let released = query.block_filter_target();
+                if released.is_some_and(|t| next > t) {
+                    if let Some(f) = on_caught_up.take() {
+                        rbitcoin_log::info!(
+                            "blockfilter: caught up through={}; advertising NODE_COMPACT_FILTERS",
+                            next - 1
+                        );
+                        f();
+                    }
+                }
+                let Some(target) = released.filter(|&t| t >= next) else {
                     query.bf_wb.wait(Duration::from_millis(200));
                     continue;
                 };

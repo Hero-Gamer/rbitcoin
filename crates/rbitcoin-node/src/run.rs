@@ -612,6 +612,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         let sd = Arc::clone(&shutdown);
                         move || sd.request()
                     },
+                    // Version carries the bit once per peer: advertise only
+                    // when served filters reach the tip, not during materialize.
+                    || rbitcoin_net::set_compact_filters_service(true),
                 ));
             }
             if config.sptweaks {
@@ -1367,8 +1370,6 @@ fn apply_startup_index_mode(
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
     query.set_block_filter_index(config.block_filter_index)?;
-    // Advertised for the process lifetime of the flag. The watermark may lag.
-    rbitcoin_net::set_compact_filters_service(config.block_filter_index);
     query.set_max_sh_creates(config.max_sh_creates);
     query.set_seqsigwit_ram_threshold_bytes(config.prune_seqsigwit_ram_threshold_bytes)?;
     if !config.prune_seqsigwit && query.prune_seqsigwit() {
