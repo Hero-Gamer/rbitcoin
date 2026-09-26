@@ -100,24 +100,25 @@ mod tests {
     fn unix_secs_panics_before_epoch() {
         unix_secs(UNIX_EPOCH - std::time::Duration::from_secs(1));
     }
-}
 
-#[test]
-fn with_frozen_exposes_value_restores_prev() {
-    let c = NodeClock::new();
-    c.set_mock(1_000_000_000);
+    #[test]
+    fn with_frozen_uses_current_now_restores_prior() {
+        let c = NodeClock::new();
+        c.set_mock(1_000_000_000);
 
-    c.with_frozen(|| {
+        c.set_mock(2_000_000_000);
+        c.with_frozen(|| {
+            assert_eq!(
+                current_now(),
+                2_000_000_000,
+                "frozen value visible via current_now() inside closure"
+            );
+        });
+
         assert_eq!(
             c.now_secs(),
-            1_000_000_000,
-            "frozen value visible inside closure"
+            2_000_000_000,
+            "outer mock value unchanged after scope"
         );
-    });
-
-    assert_eq!(
-        c.now_secs(),
-        1_000_000_000,
-        "outer mock unchanged after scope"
-    );
+    }
 }
