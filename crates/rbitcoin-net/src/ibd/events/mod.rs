@@ -252,12 +252,30 @@ fn ensure_accepted_prefix(
     headers[..lo].iter().copied().zip(lo_fks).collect()
 }
 
+/// Leading headers this IBD already stored keep their fk. They were accepted
+/// when first seen, and [`ChainHub::ensure_headers_batch`] walks a stored
+/// header's ancestors back to the connected tip. The rest go through
+/// [`ensure_accepted_prefix`].
+fn accepted_headers(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+) -> Vec<(bitcoin::block::Header, rbitcoin_primitives::Fk)> {
+    let mut accepted: Vec<_> = headers
+        .iter()
+        .map_while(|h| st.header_fks.get(&h.block_hash()).map(|fk| (*h, *fk)))
+        .collect();
+    let rest = &headers[accepted.len()..];
+    accepted.extend(ensure_accepted_prefix(hub, rest));
+    accepted
+}
+
 fn on_headers_batch(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     headers: Vec<bitcoin::block::Header>,
 ) -> usize {
-    let accepted = ensure_accepted_prefix(hub, &headers);
+    let accepted = accepted_headers(st, hub, &headers);
     let mut added = 0usize;
     let mut batch_prev: Option<(BlockHash, u32)> = None;
     for (hdr, fk) in accepted {

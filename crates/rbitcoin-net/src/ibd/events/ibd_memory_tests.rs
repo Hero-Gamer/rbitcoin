@@ -185,3 +185,47 @@ fn unsolicited_body_is_not_copied_into_the_queue() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A peer answering an overlapping `getheaders` re-sends headers this IBD
+/// already stored. Those were accepted when first seen, so they must not go
+/// back through `ensure_headers_batch`: each stored header there walks its
+/// ancestors back to the connected tip, and on mainnet that made every batch
+/// slower than the last until IBD stalled at 16 blocks.
+#[test]
+fn resent_stored_headers_do_not_walk_to_the_connected_tip() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let mut chain = Vec::new();
+    let mut prev = gen;
+    for height in 1..=240u32 {
+        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
+        prev = header.block_hash();
+        chain.push(header);
+    }
+    on_headers_batch(&mut st, &hub, chain[..200].to_vec());
+    let _ = hub.take_stored_height_walk_steps();
+
+    on_headers_batch(&mut st, &hub, chain[100..200].to_vec());
+    assert_eq!(
+        hub.take_stored_height_walk_steps(),
+        0,
+        "a re-sent run of stored headers walks no ancestors"
+    );
+
+    on_headers_batch(&mut st, &hub, chain.clone());
+    assert_eq!(
+        hub.take_stored_height_walk_steps(),
+        0,
+        "a stored prefix before new headers walks no ancestors"
+    );
+    for (height, header) in (1u32..).zip(&chain) {
+        assert_eq!(
+            st.hash_height.get(&header.block_hash()),
+            Some(&height),
+            "every header, stored or new, stays on the path at its height"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
