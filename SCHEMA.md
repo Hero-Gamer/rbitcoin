@@ -277,8 +277,8 @@ itself changed.
     # previous DONE / 24 B NN (SHUNSRT3) with no SHKEYS02 is wiped and pass 1 restarts; no SCHEMA_VERSION bump
     sp_tweaks.idx/  sp_tweaks.body/   # optional BIP-352 (schema 17 dirs; leftover files unlinked)
     blockfilter.idx/meta              # optional BIP158 basic (`--block-filter-index`): fmt:u32=1
-    blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ 0:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
-    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), no prefix; record ends at the next slot's off or the body end; new NNNNNN pair when the next start passes u32. Commit: body sync, then idx sync. Open drops torn tail slots and slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
+    blockfilter.idx/NNNNNN            # 80 B slot per height from 0: off:u32 ‖ len:u32 ‖ header_fk:u64 ‖ filter_hash[32] ‖ filter_header[32]
+    blockfilter.body/NNNNNN           # filter bytes (Core `BlockFilter` content), records back to back, no prefix; new NNNNNN pair when the next start passes u32. Commit: body sync, then idx sync, then publish. Open keeps the slot prefix whose records run back to back inside the body, cuts the body to its end, and drops slots whose header_fk is not confirmed[h]. Missing dirs: index off / not built
 
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
