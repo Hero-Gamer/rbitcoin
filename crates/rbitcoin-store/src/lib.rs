@@ -97,7 +97,7 @@ pub use sorted_run::{
     free_gib_label, list_materialize_claims, list_runs, next_run_path, write_sorted_run,
 };
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
-pub use sp_tweaks_uring::load_tweak_wave;
+pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx};
 pub use spend_annotate_uring::spend_ann_backend;
 pub use spend_durable::SPEND_DURABLE_NAME;
 pub use store::{keep_unspent_vout_subsequence, Store, StoreLayout};

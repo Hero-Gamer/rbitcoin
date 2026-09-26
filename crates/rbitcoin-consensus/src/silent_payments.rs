@@ -13,7 +13,7 @@ use bitcoin::secp256k1::{All, PublicKey, Scalar, Secp256k1, SecretKey};
 use bitcoin::{OutPoint, Transaction, TxOut, Witness};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
-use rbitcoin_store::{InputRecord, OutputRecord, StoreError};
+use rbitcoin_store::{IndexWindow, InputRecord, LoadedTweakTx, OutputRecord, StoreError};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
@@ -272,44 +272,64 @@ pub fn tweaks_for_height(
     }
 
     let wave = rbitcoin_store::load_tweak_wave(&query.store().txs, &fks)?;
-    let mut parent_outs: HashMap<Fk, Vec<OutputRecord>> = HashMap::new();
-    let mut parent_txid: HashMap<Fk, [u8; 32]> = HashMap::new();
+    let mut by_fk: HashMap<Fk, ([u8; 32], &[OutputRecord])> = HashMap::new();
     for t in &wave.txs {
-        parent_outs.insert(t.fk, t.outs.clone());
-        parent_txid.insert(t.fk, t.rec.txid);
+        by_fk.insert(t.fk, (t.rec.txid, &t.outs));
     }
     for (fk, (txid, outs)) in &wave.parents {
-        parent_outs.entry(Fk(*fk)).or_insert_with(|| outs.clone());
-        parent_txid.entry(Fk(*fk)).or_insert(*txid);
+        by_fk.entry(Fk(*fk)).or_insert((*txid, outs));
     }
+    let txs: Vec<&LoadedTweakTx> = wave.txs.iter().collect();
+    let tweaks = tweaks_for_txs(&txs, &|fk| by_fk.get(&fk).copied())?;
+    Ok(txs
+        .iter()
+        .zip(tweaks)
+        .filter_map(|(t, tw)| Some((t.rec.txid, tw?)))
+        .collect())
+}
 
-    let mut jobs: Vec<([u8; 32], bitcoin::Transaction, Vec<TxOut>)> = Vec::new();
-    for t in &wave.txs {
+/// Tweak records of `window.blocks[i]` in block order (`None` = ineligible).
+pub fn tweak_records_from_window(
+    window: &IndexWindow,
+    i: usize,
+) -> Result<Vec<Option<[u8; 33]>>, ConsensusError> {
+    let txs: Vec<&LoadedTweakTx> = window.blocks[i].txs.iter().collect();
+    let tweaks = tweaks_for_txs(&txs, &|fk| Some((window.txid(fk)?, window.outs(fk)?)))?;
+    Ok(tweaks.into_iter().map(|t| t.map(|t| t.tweak)).collect())
+}
+
+/// Txid and outputs of a spent create.
+type ParentLookup<'a> = dyn Fn(Fk) -> Option<([u8; 32], &'a [OutputRecord])> + 'a;
+
+/// Per-tx tweak (`None` = ineligible) for `txs` in order. Only P2TR-output
+/// txs with loaded inputs are candidates; EC math runs on idle script workers.
+fn tweaks_for_txs<'a>(
+    txs: &[&'a LoadedTweakTx],
+    parent: &ParentLookup<'a>,
+) -> Result<Vec<Option<TxTweak>>, ConsensusError> {
+    let mut jobs: Vec<(usize, Transaction, Vec<TxOut>)> = Vec::new();
+    for (i, t) in txs.iter().enumerate() {
         if !t.need_seqsigwit {
             continue;
         }
         let Some(inputs) = t.inputs.as_ref() else {
             continue;
         };
-        let Some(built) = build_tx_and_prevouts(inputs, &t.outs, &parent_outs, &parent_txid) else {
-            continue;
-        };
-        jobs.push((t.rec.txid, built.0, built.1));
+        let (tx, prevouts) = build_tx_and_prevouts(inputs, &t.outs, parent)?;
+        jobs.push((i, tx, prevouts));
     }
+    let mut out = vec![None; txs.len()];
     if jobs.is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(out);
     }
     let slots: Vec<OnceLock<Option<TxTweak>>> = (0..jobs.len()).map(|_| OnceLock::new()).collect();
     let idxs: Vec<usize> = (0..jobs.len()).collect();
-    crate::script_pool::try_for_each_parallel_idle(&idxs, |&i| {
-        let _ = slots[i].set(tweak_from_tx(&jobs[i].1, &jobs[i].2));
+    crate::script_pool::try_for_each_parallel_idle(&idxs, |&j| {
+        let _ = slots[j].set(tweak_from_tx(&jobs[j].1, &jobs[j].2));
         Ok(())
     })?;
-    let mut out = BTreeMap::new();
-    for (i, slot) in slots.iter().enumerate() {
-        if let Some(tweak) = slot.get().and_then(|o| o.clone()) {
-            out.insert(jobs[i].0, tweak);
-        }
+    for (j, slot) in slots.into_iter().enumerate() {
+        out[jobs[j].0] = slot.into_inner().flatten();
     }
     Ok(out)
 }
@@ -363,21 +383,24 @@ fn taproot_outs_from_records(outputs: &[OutputRecord]) -> Vec<TaprootOut> {
     out
 }
 
+/// A spent parent missing from the lookup is an invariant break, not an
+/// ineligible tx.
 fn build_tx_and_prevouts(
     inputs: &[InputRecord],
     outputs: &[OutputRecord],
-    parent_outs: &HashMap<Fk, Vec<OutputRecord>>,
-    parent_txid: &HashMap<Fk, [u8; 32]>,
-) -> Option<(Transaction, Vec<TxOut>)> {
+    parent: &ParentLookup<'_>,
+) -> Result<(Transaction, Vec<TxOut>), StoreError> {
     let mut prevouts = Vec::with_capacity(inputs.len());
     let mut txins = Vec::with_capacity(inputs.len());
     for inp in inputs {
         let (prev_txid, prev_script, prev_value) = if inp.is_coinbase() {
             ([0u8; 32], Vec::new(), 0i64)
         } else {
-            let tid = *parent_txid.get(&inp.create_fk)?;
-            let outs = parent_outs.get(&inp.create_fk)?;
-            let o = outs.get(inp.prev_index as usize)?;
+            const MISSING: &str = "invariant: sp_tweaks spent parent missing";
+            let (tid, outs) = parent(inp.create_fk).ok_or(StoreError::Corrupt(MISSING))?;
+            let o = outs
+                .get(inp.prev_index as usize)
+                .ok_or(StoreError::Corrupt(MISSING))?;
             (tid, o.script.clone(), o.value)
         };
         let wit_refs: Vec<&[u8]> = inp.witness.iter().map(|w| w.as_slice()).collect();
@@ -412,7 +435,7 @@ fn build_tx_and_prevouts(
             script_pubkey: bitcoin::ScriptBuf::from_bytes(o.script.clone()),
         });
     }
-    Some((
+    Ok((
         Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -1376,6 +1399,15 @@ mod tests {
 
         let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
         assert_eq!(naive.len(), 1);
+        // The window reader gives the same record whether the spent parent is
+        // inside the window (heights 0..=1) or read as an outside parent.
+        let want = vec![Some(naive.get(&spend_txid).unwrap().tweak)];
+        for start in [0, 1] {
+            let heights = q.index_heights(start, 1, Some(0)).unwrap();
+            let window = q.read_index_window(&heights).unwrap();
+            let i = window.blocks.len() - 1;
+            assert_eq!(tweak_records_from_window(&window, i).unwrap(), want);
+        }
         let n = backfill_sp_tweaks(&q, &params).unwrap();
         assert_eq!(n, 2);
         let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");

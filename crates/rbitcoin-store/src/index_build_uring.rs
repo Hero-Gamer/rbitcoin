@@ -64,13 +64,17 @@ pub struct IndexWindow {
 }
 
 impl IndexWindow {
+    /// Outputs of create `fk`, from this window's blocks or parents.
+    pub fn outs(&self, fk: Fk) -> Option<&[OutputRecord]> {
+        match self.in_window.get(&fk.0) {
+            Some(&(bi, ti)) => Some(&self.blocks[bi].txs[ti].outs),
+            None => Some(&self.parents.get(&fk.0)?.1),
+        }
+    }
+
     /// Output `vout` of create `fk`, from this window's blocks or parents.
     pub fn prevout(&self, fk: Fk, vout: u32) -> Option<&OutputRecord> {
-        let outs = match self.in_window.get(&fk.0) {
-            Some(&(bi, ti)) => &self.blocks[bi].txs[ti].outs,
-            None => &self.parents.get(&fk.0)?.1,
-        };
-        outs.get(vout as usize)
+        self.outs(fk)?.get(vout as usize)
     }
 
     /// Txid of create `fk` (zero when the window did not read txids).
