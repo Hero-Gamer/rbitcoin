@@ -17,8 +17,9 @@
 //! short read or errno on a live session completes with a libc pread; with no
 //! session the same stages run as serial preads.
 
+use crate::create_loc::CreateLocPair;
 use crate::error::StoreError;
-use crate::input::{decode_edges_span, InputEdge};
+use crate::input::{decode_edges_span, EdgesPlan, InputEdge};
 use crate::io_handle::IoHandle;
 use crate::sp_tweaks_uring::LoadedTweakTx;
 use crate::tx_table::{
@@ -58,9 +59,9 @@ pub struct IndexBlock {
 /// not itself in the window (`txid` is zero unless the window wants tweaks).
 pub struct IndexWindow {
     pub blocks: Vec<IndexBlock>,
-    pub parents: U64Map<([u8; 32], Vec<OutputRecord>)>,
+    pub parents: Parents,
     /// Create fk → `(block, tx)` for creates in `blocks`.
-    in_window: U64Map<(usize, usize)>,
+    in_window: InWindow,
 }
 
 impl IndexWindow {
@@ -235,33 +236,83 @@ fn missing(what: &'static str) -> StoreError {
     StoreError::Corrupt(what)
 }
 
+/// Parent fk → (txid, outputs).
+type Parents = U64Map<([u8; 32], Vec<OutputRecord>)>;
+/// Create fk → `(block, tx)` within a window.
+type InWindow = U64Map<(usize, usize)>;
+/// Stage 3 results: parent locators and parent txids.
+type ParentLocs = (Vec<Option<CreateLocPair>>, Vec<[u8; 32]>);
+
+/// Handles and paths every stage reads through.
+struct Files<'t> {
+    body: (IoHandle, &'t Path),
+    seqsigwit: (IoHandle, &'t Path),
+    txid: (IoHandle, &'t Path),
+    input_body: (IoHandle, &'t Path),
+}
+
+/// Stage 1 results.
+struct Locators {
+    locs: Vec<Option<CreateLocPair>>,
+    sws_ranges: Vec<Option<(u64, u64)>>,
+    edge_plans: Vec<EdgesPlan>,
+}
+
 fn read_window(
     table: &TxTable,
     heights: &[IndexHeight],
     reader: &mut Reader<'_>,
 ) -> Result<IndexWindow, StoreError> {
     let want_txids = heights.iter().any(|h| h.tweaks);
-    let secret = Some(&table.secret);
-    let body_file = (table.body.body_read_fd(), table.body.body_file_path());
-    let sws_file = (
-        table.seqsigwit.body_read_fd(),
-        table.seqsigwit.body_file_path(),
-    );
-    let txid_file = (table.txids.body_read_fd(), table.txids.file_path());
-    let (input_loc_file, input_body_file) = table.input.files();
+    let files = Files {
+        body: (table.body.body_read_fd(), table.body.body_file_path()),
+        seqsigwit: (
+            table.seqsigwit.body_read_fd(),
+            table.seqsigwit.body_file_path(),
+        ),
+        txid: (table.txids.body_read_fd(), table.txids.file_path()),
+        input_body: table.input.files().1,
+    };
+    let locators = read_locators(table, heights, reader)?;
+    let (mut blocks, in_window) =
+        read_blocks(table, &files, heights, &locators, want_txids, reader)?;
+    let parent_fks = outside_parents(&blocks, &in_window);
+    let (plocs, parent_txids) = read_witnesses_and_parent_locs(
+        table,
+        &files,
+        heights,
+        &locators.sws_ranges,
+        &mut blocks,
+        &parent_fks,
+        want_txids,
+        reader,
+    )?;
+    let parents = read_parents(table, &files, &parent_fks, &plocs, parent_txids, reader)?;
+    Ok(IndexWindow {
+        blocks,
+        parents,
+        in_window,
+    })
+}
 
-    // Stage 1: locators.
-    let fks: Vec<Fk> = heights
-        .iter()
+fn creates_of<'h>(heights: impl Iterator<Item = &'h IndexHeight>) -> Vec<Fk> {
+    heights
         .flat_map(|h| (0..u64::from(h.n)).map(move |i| Fk(h.first.0 + i)))
-        .collect();
-    let tw_fks: Vec<Fk> = heights
-        .iter()
-        .filter(|h| h.tweaks)
-        .flat_map(|h| (0..u64::from(h.n)).map(move |i| Fk(h.first.0 + i)))
-        .collect();
-    let mut loc_plan = table.create_loc.plan_range_batch(&fks)?;
-    let mut sws_plan = table.seqsigwit_loc.plan_range_batch(&tw_fks)?;
+        .collect()
+}
+
+/// Stage 1: `create.loc` and `seqsigwit.loc` windows and `input.loc` spans.
+fn read_locators(
+    table: &TxTable,
+    heights: &[IndexHeight],
+    reader: &mut Reader<'_>,
+) -> Result<Locators, StoreError> {
+    let mut loc_plan = table
+        .create_loc
+        .plan_range_batch(&creates_of(heights.iter()))?;
+    let mut sws_plan = table
+        .seqsigwit_loc
+        .plan_range_batch(&creates_of(heights.iter().filter(|h| h.tweaks)))?;
     let mut edge_plans = heights
         .iter()
         .map(|h| {
@@ -270,135 +321,186 @@ fn read_window(
                 .plan_edges_span(h.first.0, h.first.0 + u64::from(h.n) - 1)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    {
-        let mut jobs = Vec::new();
-        let loc_r = take_reads(&mut jobs, table.create_loc.loc_file(), loc_plan.reads());
-        let sws_r = take_reads(&mut jobs, table.seqsigwit_loc.loc_file(), sws_plan.reads());
-        let edge_r = take_reads(
-            &mut jobs,
-            input_loc_file,
-            edge_plans.iter_mut().map(|p| (p.loc_off, &mut p.loc)),
-        );
-        reader.run(&mut jobs)?;
-        give_back(&mut jobs, loc_r, loc_plan.reads());
-        give_back(&mut jobs, sws_r, sws_plan.reads());
-        give_back(
-            &mut jobs,
-            edge_r,
-            edge_plans.iter_mut().map(|p| (p.loc_off, &mut p.loc)),
-        );
-    }
-    let locs = table.create_loc.finish_range_batch(&loc_plan)?;
-    let sws_ranges = table.seqsigwit_loc.finish_range_batch(&sws_plan)?;
-
-    // Stage 2: block spans.
     let mut jobs = Vec::new();
-    let mut at = 0usize;
+    let loc_r = take_reads(&mut jobs, table.create_loc.loc_file(), loc_plan.reads());
+    let sws_r = take_reads(&mut jobs, table.seqsigwit_loc.loc_file(), sws_plan.reads());
+    let edge_r = take_reads(
+        &mut jobs,
+        table.input.files().0,
+        edge_plans.iter_mut().map(|p| (p.loc_off, &mut p.loc)),
+    );
+    reader.run(&mut jobs)?;
+    give_back(&mut jobs, loc_r, loc_plan.reads());
+    give_back(&mut jobs, sws_r, sws_plan.reads());
+    give_back(
+        &mut jobs,
+        edge_r,
+        edge_plans.iter_mut().map(|p| (p.loc_off, &mut p.loc)),
+    );
+    Ok(Locators {
+        locs: table.create_loc.finish_range_batch(&loc_plan)?,
+        sws_ranges: table.seqsigwit_loc.finish_range_batch(&sws_plan)?,
+        edge_plans,
+    })
+}
+
+/// Stage 2: each block's `txout`, `input.body`, and (tweaks) `txid.body` spans.
+fn read_blocks(
+    table: &TxTable,
+    files: &Files<'_>,
+    heights: &[IndexHeight],
+    locators: &Locators,
+    want_txids: bool,
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<IndexBlock>, InWindow), StoreError> {
+    let mut jobs = Vec::new();
     let mut spans = Vec::with_capacity(heights.len());
-    for (h, plan) in heights.iter().zip(&edge_plans) {
-        let pairs = &locs[at..at + h.n as usize];
-        at += h.n as usize;
-        let pairs = pairs
+    let mut at = 0usize;
+    for (h, plan) in heights.iter().zip(&locators.edge_plans) {
+        let pairs = locators.locs[at..at + h.n as usize]
             .iter()
             .map(|p| p.ok_or_else(|| missing("invariant: index build create loc missing")))
             .collect::<Result<Vec<_>, _>>()?;
+        at += h.n as usize;
         let lo = pairs.iter().map(|p| p.txout.0).min().unwrap_or(0);
         let hi = pairs
             .iter()
             .map(|p| p.txout.0 + p.txout.1)
             .max()
             .unwrap_or(0);
-        let txout_j = jobs.len();
-        jobs.push(ReadJob::new(body_file, lo, hi - lo));
+        spans.push((jobs.len(), lo, pairs));
+        jobs.push(ReadJob::new(files.body, lo, hi - lo));
         let (abs, len) = table.input.edges_body_read(plan)?;
-        jobs.push(ReadJob::new(input_body_file, abs, len));
+        jobs.push(ReadJob::new(files.input_body, abs, len));
         if want_txids {
             let off = TxidBody::entry_offset(h.first.0)?;
             jobs.push(ReadJob::new(
-                txid_file,
+                files.txid,
                 off,
                 u64::from(h.n) * TXID_ENTRY_LEN,
             ));
         }
-        spans.push((txout_j, lo, pairs));
     }
     reader.run(&mut jobs)?;
-
     let mut blocks = Vec::with_capacity(heights.len());
-    let mut in_window: U64Map<(usize, usize)> = U64Map::default();
-    for (bi, ((h, plan), (txout_j, lo, pairs))) in
-        heights.iter().zip(&edge_plans).zip(spans).enumerate()
+    let mut in_window = U64Map::default();
+    for (bi, ((h, plan), (j, lo, pairs))) in heights
+        .iter()
+        .zip(&locators.edge_plans)
+        .zip(spans)
+        .enumerate()
     {
-        let edges = decode_edges_span(plan, &jobs[txout_j + 1].buf)?
-            .into_iter()
-            .map(|e| e.ok_or_else(|| missing("invariant: index build input edges unstamped")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let txids = want_txids.then(|| &jobs[txout_j + 2].buf);
-        let mut txs = Vec::with_capacity(h.n as usize);
-        for (ti, pair) in pairs.iter().enumerate() {
-            let fk = Fk(h.first.0 + ti as u64);
-            let rel = (pair.txout.0 - lo) as usize;
-            let raw = &jobs[txout_j].buf[rel..rel + pair.txout.1 as usize];
-            let (mut rec, outs, _) =
-                decode_packed_tx_outs_with_spender_rels_secret(raw, pair.n_out, secret)?;
-            if let Some(ids) = txids {
-                rec.txid.copy_from_slice(&ids[ti * 32..ti * 32 + 32]);
-            }
-            rec.input_count = edges[ti].len() as u32;
-            let need_seqsigwit = h.tweaks && outs.iter().any(|o| is_p2tr(&o.script));
-            in_window.insert(fk.0, (bi, ti));
-            txs.push(LoadedTweakTx {
-                fk,
-                rec,
-                outs,
-                need_seqsigwit,
-                inputs: None,
-            });
+        let txids = want_txids.then(|| jobs[j + 2].buf.as_slice());
+        let block = decode_block(
+            table,
+            h,
+            plan,
+            &jobs[j].buf,
+            lo,
+            &pairs,
+            &jobs[j + 1].buf,
+            txids,
+        )?;
+        for (ti, tx) in block.txs.iter().enumerate() {
+            in_window.insert(tx.fk.0, (bi, ti));
         }
-        blocks.push(IndexBlock {
-            height: h.height,
-            header_fk: h.header_fk,
-            txs,
-            edges,
+        blocks.push(block);
+    }
+    Ok((blocks, in_window))
+}
+
+#[allow(clippy::too_many_arguments)] // one block's already-read spans
+fn decode_block(
+    table: &TxTable,
+    h: &IndexHeight,
+    plan: &EdgesPlan,
+    txout_span: &[u8],
+    lo: u64,
+    pairs: &[CreateLocPair],
+    edge_span: &[u8],
+    txids: Option<&[u8]>,
+) -> Result<IndexBlock, StoreError> {
+    let edges = decode_edges_span(plan, edge_span)?
+        .into_iter()
+        .map(|e| e.ok_or_else(|| missing("invariant: index build input edges unstamped")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut txs = Vec::with_capacity(pairs.len());
+    for (ti, pair) in pairs.iter().enumerate() {
+        let rel = (pair.txout.0 - lo) as usize;
+        let raw = &txout_span[rel..rel + pair.txout.1 as usize];
+        let (mut rec, outs, _) =
+            decode_packed_tx_outs_with_spender_rels_secret(raw, pair.n_out, Some(&table.secret))?;
+        if let Some(ids) = txids {
+            rec.txid.copy_from_slice(&ids[ti * 32..ti * 32 + 32]);
+        }
+        rec.input_count = edges[ti].len() as u32;
+        let need_seqsigwit = h.tweaks && outs.iter().any(|o| is_p2tr(&o.script));
+        txs.push(LoadedTweakTx {
+            fk: Fk(h.first.0 + ti as u64),
+            rec,
+            outs,
+            need_seqsigwit,
+            inputs: None,
         });
     }
-    drop(jobs);
+    Ok(IndexBlock {
+        height: h.height,
+        header_fk: h.header_fk,
+        txs,
+        edges,
+    })
+}
 
-    // Stage 3: parent locators, tweak witnesses, parent txids.
-    let mut parent_fks: Vec<u64> = blocks
+/// Parent fks the window's inputs spend that are not themselves in it.
+fn outside_parents(blocks: &[IndexBlock], in_window: &InWindow) -> Vec<u64> {
+    let mut fks: Vec<u64> = blocks
         .iter()
         .flat_map(|b| b.edges.iter().flatten())
         .map(|e| e.parent.0)
         .filter(|&fk| fk != 0 && !in_window.contains_key(&fk))
         .collect();
-    parent_fks.sort_unstable();
-    parent_fks.dedup();
-    let parent_fk_list: Vec<Fk> = parent_fks.iter().map(|&f| Fk(f)).collect();
-    let mut ploc_plan = table.create_loc.plan_range_batch(&parent_fk_list)?;
+    fks.sort_unstable();
+    fks.dedup();
+    fks
+}
+
+/// Stage 3: parent `create.loc`, P2TR-output txs' `seqsigwit.body`, and
+/// (tweaks) parent txids. Fills each such tx's `inputs`.
+#[allow(clippy::too_many_arguments)] // stage inputs; one call site
+fn read_witnesses_and_parent_locs(
+    table: &TxTable,
+    files: &Files<'_>,
+    heights: &[IndexHeight],
+    sws_ranges: &[Option<(u64, u64)>],
+    blocks: &mut [IndexBlock],
+    parent_fks: &[u64],
+    want_txids: bool,
+    reader: &mut Reader<'_>,
+) -> Result<ParentLocs, StoreError> {
+    let parent_list: Vec<Fk> = parent_fks.iter().map(|&f| Fk(f)).collect();
+    let mut ploc_plan = table.create_loc.plan_range_batch(&parent_list)?;
     let mut jobs = Vec::new();
     let ploc_r = take_reads(&mut jobs, table.create_loc.loc_file(), ploc_plan.reads());
+    let tweak_txs = blocks
+        .iter()
+        .zip(heights)
+        .enumerate()
+        .filter(|(_, (_, h))| h.tweaks)
+        .flat_map(|(bi, (b, _))| (0..b.txs.len()).map(move |ti| (bi, ti)));
     let mut sws_jobs = Vec::new();
-    let mut tw_i = 0usize;
-    for (bi, (b, h)) in blocks.iter().zip(heights).enumerate() {
-        if !h.tweaks {
-            continue;
-        }
-        for (ti, tx) in b.txs.iter().enumerate() {
-            let range = sws_ranges[tw_i];
-            tw_i += 1;
-            if tx.need_seqsigwit {
-                let (off, len) =
-                    range.ok_or_else(|| missing("invariant: index build seqsigwit loc missing"))?;
-                sws_jobs.push((bi, ti, jobs.len()));
-                jobs.push(ReadJob::new(sws_file, off, len));
-            }
+    for ((bi, ti), range) in tweak_txs.zip(sws_ranges) {
+        if blocks[bi].txs[ti].need_seqsigwit {
+            let (off, len) =
+                range.ok_or_else(|| missing("invariant: index build seqsigwit loc missing"))?;
+            sws_jobs.push((bi, ti, jobs.len()));
+            jobs.push(ReadJob::new(files.seqsigwit, off, len));
         }
     }
     let txid_j = jobs.len();
     if want_txids {
-        for &fk in &parent_fks {
+        for &fk in parent_fks {
             jobs.push(ReadJob::new(
-                txid_file,
+                files.txid,
                 TxidBody::entry_offset(fk)?,
                 TXID_ENTRY_LEN,
             ));
@@ -407,39 +509,43 @@ fn read_window(
     reader.run(&mut jobs)?;
     give_back(&mut jobs, ploc_r, ploc_plan.reads());
     for (bi, ti, j) in sws_jobs {
-        let tx = &mut blocks[bi].txs[ti];
-        let mut ins = decode_seqsigwit_secret(&jobs[j].buf, tx.rec.input_count, secret)?;
+        let n_in = blocks[bi].txs[ti].rec.input_count;
+        let mut ins = decode_seqsigwit_secret(&jobs[j].buf, n_in, Some(&table.secret))?;
         apply_input_edges(&mut ins, &blocks[bi].edges[ti])?;
         blocks[bi].txs[ti].inputs = Some(ins);
     }
-    let parent_txids: Vec<[u8; 32]> = (0..parent_fks.len())
-        .map(|k| {
-            let mut id = [0u8; 32];
-            if want_txids {
-                id.copy_from_slice(&jobs[txid_j + k].buf);
-            }
-            id
+    let txids = (0..parent_fks.len())
+        .map(|k| match jobs.get(txid_j + k) {
+            Some(job) if want_txids => job.buf.as_slice().try_into().unwrap_or([0u8; 32]),
+            _ => [0u8; 32],
         })
         .collect();
-    drop(jobs);
-    let plocs = table.create_loc.finish_range_batch(&ploc_plan)?;
+    Ok((table.create_loc.finish_range_batch(&ploc_plan)?, txids))
+}
 
-    // Stage 4: parent records.
-    let mut jobs = Vec::with_capacity(plocs.len());
-    for p in &plocs {
-        let p = p.ok_or_else(|| missing("invariant: index build parent loc missing"))?;
-        jobs.push(ReadJob::new(body_file, p.txout.0, p.txout.1));
-    }
+/// Stage 4: parent `txout` records.
+fn read_parents(
+    table: &TxTable,
+    files: &Files<'_>,
+    parent_fks: &[u64],
+    plocs: &[Option<CreateLocPair>],
+    txids: Vec<[u8; 32]>,
+    reader: &mut Reader<'_>,
+) -> Result<Parents, StoreError> {
+    let pairs = plocs
+        .iter()
+        .map(|p| p.ok_or_else(|| missing("invariant: index build parent loc missing")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut jobs: Vec<ReadJob<'_>> = pairs
+        .iter()
+        .map(|p| ReadJob::new(files.body, p.txout.0, p.txout.1))
+        .collect();
     reader.run(&mut jobs)?;
     let mut parents = U64Map::default();
-    for (k, (job, p)) in jobs.iter().zip(&plocs).enumerate() {
-        let n_out = p.map(|p| p.n_out).unwrap_or(0);
-        let (_, outs, _) = decode_packed_tx_outs_with_spender_rels_secret(&job.buf, n_out, secret)?;
-        parents.insert(parent_fks[k], (parent_txids[k], outs));
+    for (((fk, txid), job), p) in parent_fks.iter().zip(txids).zip(&jobs).zip(&pairs) {
+        let (_, outs, _) =
+            decode_packed_tx_outs_with_spender_rels_secret(&job.buf, p.n_out, Some(&table.secret))?;
+        parents.insert(*fk, (txid, outs));
     }
-    Ok(IndexWindow {
-        blocks,
-        parents,
-        in_window,
-    })
+    Ok(parents)
 }
