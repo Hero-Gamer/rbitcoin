@@ -257,7 +257,7 @@ Encode/decode uses Core’s `V2_MESSAGE_IDS` table (`crates/rbitcoin-net/src/v2.
 | 5 | feefilter | tip policy |
 | 9–15 | getblocks…mempool | headers/blocks/inv |
 | 17–21 | notfound…tx | ping/pong/sendcmpct/tx |
-| 22–27 | getcfilters…cfcheckpt | BIP157 basic while `--block-filter-index` is on. A stop past the filter watermark is silence |
+| 22–27 | getcfilters…cfcheckpt | BIP157 basic while `--block-filter-index` is on. A stop past the filter watermark is silence; an out-of-range request disconnects (Core) |
 | 28 | addrv2 | BIP155 |
 
 Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
@@ -268,7 +268,9 @@ Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 BIP158 basic filters while `--block-filter-index` is on
 (`NODE_COMPACT_FILTERS` from startup, `getcfilters`, `getcfheaders`,
 `getcfcheckpt`, `getblockfilter`). A request whose stop height is past the
-filter watermark is silence, not an empty filter or a short batch.
+filter watermark is silence, not an empty filter or a short batch. As in
+Core's `PrepareBlockFilterRequest`, start past stop, 1000+ `getcfilters`,
+or 2000+ `getcfheaders` heights disconnects the peer.
 
 ## Deferred surfaces
 

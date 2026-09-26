@@ -47,6 +47,7 @@ async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
     .expect("listen")
 }
 
+/// Mature regtest pad with basic filters sealed through height 1 only.
 fn open_padded_query(dir: &TempDir) -> Query {
     use rbitcoin_consensus::accept_and_connect_block;
     use rbitcoin_test::pad_empty_from;
@@ -55,23 +56,17 @@ fn open_padded_query(dir: &TempDir) -> Query {
     let params = ChainParams::regtest();
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let last = params.coinbase_maturity() + 1;
-    pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        last,
-    );
+    let (tip, time) = pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 1);
+    q.set_block_filter_index(true).unwrap();
+    q.release_index_writebehind(Height(1));
+    q.seal_block_filters_released()
+        .expect("filters through height 1");
+    pad_empty_from(&q, &params, tip, time, 2, params.coinbase_maturity() + 1);
     q
 }
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
-    q.set_block_filter_index(true);
-    q.backfill_block_filters_through(1)
-        .expect("filters through height 1");
     rbitcoin_net::set_compact_filters_service(true);
     P2PNode::start(
         "127.0.0.1:0".parse().unwrap(),
@@ -1754,8 +1749,11 @@ async fn ibd_skips_dead_peer() {
 }
 
 /// After IBD, seed announces a new tip; follower picks it up via inv/headers.
+/// With the filter index on, IBD confirm builds no basic filters; the
+/// write-behind appender materializes them, then follows the new tip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
+    use std::sync::Arc;
     let fut = async {
         let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
@@ -1765,10 +1763,29 @@ async fn tip_follow_after_ibd() {
         seed_chain(&seed, 5).await;
 
         let mut peer = start_node(&peer_dir).await;
+        peer.query.set_block_filter_index(true).unwrap();
         sync_ibd(&peer, seed.local_addr).await;
         peer.wait_height(5, Duration::from_secs(10))
             .await
             .expect("ibd");
+        assert_eq!(
+            peer.query.basic_filter_hwm().unwrap(),
+            None,
+            "IBD confirm leaves basic filters to the appender"
+        );
+        let bf_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+            Arc::clone(&peer.query),
+            Arc::clone(&bf_stop),
+            || {},
+        );
+        let hwm = |n: &P2PNode| n.query.basic_filter_hwm().unwrap();
+        wait_ms_until(
+            5_000,
+            || hwm(&peer) == Some(5),
+            || format!("materialize hwm={:?}", hwm(&peer)),
+        )
+        .await;
         peer.follow_from(seed.local_addr).await.expect("follow");
         assert!(
             peer.follow_live_count() >= 1,
@@ -1791,6 +1808,14 @@ async fn tip_follow_after_ibd() {
             .await
             .expect("tip follow");
         assert_eq!(peer.query.tip_height(), Some(Height(6)));
+        wait_ms_until(
+            5_000,
+            || hwm(&peer) == Some(6),
+            || format!("follow hwm={:?}", hwm(&peer)),
+        )
+        .await;
+        bf_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        bf.join().unwrap();
 
         seed.shutdown().await;
         peer.shutdown().await;
@@ -1854,15 +1879,26 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
     });
 }
 
-/// Most-work reorg — longer branch wins after disconnect/connect.
+/// Most-work reorg — longer branch wins after disconnect/connect. Basic
+/// filters are truncated with the disconnect and rebuilt for the branch.
 #[tokio::test]
 async fn reorg_to_longer_branch() {
+    use bitcoin::bip158::BlockFilter;
     use rbitcoin_consensus::{ChainParams, Milestone};
     use rbitcoin_net::{AcceptOutcome, ChainHub};
 
     let dir = TempDir::new().unwrap();
     let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    q.set_block_filter_index(true).unwrap();
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    // Coinbase-only blocks: the reference never looks up a prevout.
+    let reference = |b: &bitcoin::Block| {
+        BlockFilter::new_script_filter(b, |op| {
+            Err::<bitcoin::ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*op))
+        })
+        .unwrap()
+        .content
+    };
 
     let genesis = regtest_genesis();
     hub.accept_block(genesis.clone()).unwrap();
@@ -1875,6 +1911,9 @@ async fn reorg_to_longer_branch() {
         hub.accept_block(b).unwrap();
     }
     assert_eq!(hub.tip_height(), Some(4));
+    hub.query.seal_block_filters_released().unwrap();
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(4));
+    let old_3 = hub.query.basic_filter_at(3).unwrap().unwrap().0;
 
     // Fork from height 2: build longer branch 3',4',5',6'
     let fork_parent = hub
@@ -1905,6 +1944,16 @@ async fn reorg_to_longer_branch() {
     assert!(matches!(outcome, AcceptOutcome::Accepted { height: 6 }));
     assert_eq!(hub.tip_height(), Some(6));
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
+    hub.query.seal_block_filters_released().unwrap();
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(6));
+    for (h, b) in (3..).zip(&branch) {
+        assert_eq!(
+            hub.query.basic_filter_at(h).unwrap().unwrap().0,
+            reference(b),
+            "branch filter at {h}"
+        );
+    }
+    assert_ne!(hub.query.basic_filter_at(3).unwrap().unwrap().0, old_3);
 }
 
 /// Leftover/BadPrev: an orphan whose parent is not on the tip must be held, not

@@ -931,6 +931,18 @@ pub fn visit_packed_script_hashes(
     secret: Option<&crate::store_secret::StoreSecret>,
     mut f: impl FnMut([u8; 32]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    visit_packed_scripts(raw, n_out, secret, |script| {
+        f(crate::scripthash::script_hash(script))
+    })
+}
+
+/// Decode every output script of one packed create, in vout order.
+pub fn visit_packed_scripts(
+    raw: &[u8],
+    n_out: u32,
+    secret: Option<&crate::store_secret::StoreSecret>,
+    mut f: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
     let mut payload = Vec::new();
     for _ in 0..n_out {
@@ -949,7 +961,7 @@ pub fn visit_packed_script_hashes(
             xor_script_kind_v17_payload(kind, &mut payload, sec);
         }
         let script = crate::compact::decode_script_kind_v17(kind, &payload)?.0;
-        f(crate::scripthash::script_hash(&script))?;
+        f(&script)?;
         off = o + used;
     }
     check_trailing_zero_pad(raw, off)?;

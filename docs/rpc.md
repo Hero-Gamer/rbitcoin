@@ -27,7 +27,7 @@ history.
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
 | `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
-| `--block-filter-index` | **off** | BIP158 basic. `NODE_COMPACT_FILTERS` is advertised for the life of the process. `getblockfilter` and `/rest/blockfilter/` serve heights the watermark already covers. Independent of `--sh-index` |
+| `--block-filter-index` | **off** | BIP158 basic, built after catch-up by a write-behind appender (not during IBD). `NODE_COMPACT_FILTERS` is advertised for the life of the process. `getblockfilter` and `/rest/blockfilter/` serve heights the watermark already covers. Independent of `--sh-index` |
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is

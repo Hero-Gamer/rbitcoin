@@ -11,7 +11,7 @@ use rbitcoin_net::{
     Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
 };
 use rbitcoin_primitives::Network;
-use rbitcoin_query::{spawn_sh_writebehind, Query};
+use rbitcoin_query::{spawn_block_filter_writebehind, spawn_sh_writebehind, Query};
 use rbitcoin_rpc::{
     gbt_template, run_rpc, RpcActive, RpcConfig, RpcContext, RpcHandle, RpcRegtest,
 };
@@ -594,6 +594,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // tip_follow_ready ≠ sh_tip_ready: follow/relay do not wait on SH materialize.
     let mut tip_follow_ready = false;
     let mut sh_tip_ready = false;
+    let mut block_filter_writebehind = None;
     if catch_up.is_complete() && !shutdown.requested() {
         let gates = enter_tip_mode(
             &node.hub.query,
@@ -603,6 +604,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
+            if config.block_filter_index {
+                block_filter_writebehind = Some(spawn_block_filter_writebehind(
+                    Arc::clone(&node.hub.query),
+                    Arc::clone(&shutdown.flag),
+                    {
+                        let sd = Arc::clone(&shutdown);
+                        move || sd.request()
+                    },
+                ));
+            }
             if config.sptweaks {
                 spawn_sptweaks_backfill(
                     Arc::clone(&node.hub.query),
@@ -1178,6 +1189,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
+    if let Some(h) = block_filter_writebehind {
+        let _ = h.join();
+    }
     // In-flight tip accepts hold the hub. Drain them before the store flush.
     let hub = std::sync::Arc::clone(&node.hub);
     tokio::task::spawn_blocking(move || {
@@ -1352,7 +1366,7 @@ fn apply_startup_index_mode(
     taproot_height: u32,
 ) -> Result<(), NodeError> {
     query.set_sh_index_enabled(config.shindex);
-    query.set_block_filter_index(config.block_filter_index);
+    query.set_block_filter_index(config.block_filter_index)?;
     // Advertised for the process lifetime of the flag. The watermark may lag.
     rbitcoin_net::set_compact_filters_service(config.block_filter_index);
     query.set_max_sh_creates(config.max_sh_creates);
@@ -1723,7 +1737,6 @@ pub(crate) fn enter_tip_mode(
             query.index_mode()
         );
         info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
-        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1745,7 +1758,6 @@ pub(crate) fn enter_tip_mode(
             query.scripthash_entry_count()
         );
         info!("node: tip-mode complete — safe to start Electrum");
-        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: true,
@@ -1783,7 +1795,6 @@ pub(crate) fn enter_tip_mode(
         }
     };
     if !sh_ok {
-        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1802,7 +1813,6 @@ pub(crate) fn enter_tip_mode(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
              Electrum deferred until drain succeeds (restart finalize); tip follow on"
         );
-        seal_block_filters(query);
         return TipModeGates {
             tip_follow_ready: true,
             sh_tip_ready: false,
@@ -1814,23 +1824,9 @@ pub(crate) fn enter_tip_mode(
         query.scripthash_entry_count()
     );
     info!("node: tip-mode complete — safe to start Electrum");
-    seal_block_filters(query);
     TipModeGates {
         tip_follow_ready: true,
         sh_tip_ready: true,
-    }
-}
-
-fn seal_block_filters(query: &Query) {
-    if !query.block_filter_enabled() {
-        return;
-    }
-    match query.backfill_block_filters() {
-        Ok(()) => info!(
-            "node: index materialize block filters hwm={:?}",
-            query.basic_filter_hwm().ok().flatten()
-        ),
-        Err(e) => warn!("node: block filter backfill failed: {e}"),
     }
 }
 

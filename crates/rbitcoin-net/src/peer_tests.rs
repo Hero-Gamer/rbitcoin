@@ -7161,3 +7161,14 @@ fn invalid_script_is_scored_and_policy_is_not() {
 include!("peer_catchup_journey.rs");
 include!("peer_hostile_journey.rs");
 include!("peer_tip_announce_journey.rs");
+
+/// Core `PrepareBlockFilterRequest`: start past stop, or a range of 1000+
+/// cfilters / 2000+ cfheaders, disconnects instead of being clamped.
+#[test]
+fn compact_filter_ranges_past_core_limits_disconnect() {
+    assert!(compact_filter_range(5, 4, MAX_GETCFILTERS).is_err());
+    assert!(compact_filter_range(0, 999, MAX_GETCFILTERS).is_ok());
+    assert!(compact_filter_range(0, 1000, MAX_GETCFILTERS).is_err());
+    assert!(compact_filter_range(1, 2000, MAX_GETCFHEADERS).is_ok());
+    assert!(compact_filter_range(0, 2000, MAX_GETCFHEADERS).is_err());
+}

@@ -22,6 +22,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
 use rbitcoin_primitives::{Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -32,21 +33,13 @@ const SLOT: u64 = 4;
 /// Schema 17: segmented tip-only idx, original 0/33 body.
 const IDX_FMT_SEG_TIP: u32 = 3;
 
-struct Seg {
-    file_id: u32,
-    first_slot: u64,
-    n_slots: u64,
-    idx: TableFile,
-    body: TableFile,
-}
-
 struct Inner {
     segs: Vec<Seg>,
 }
 
 /// Height-dense thin tweak table (tip / strong heights only).
 pub struct SpTweaksTable {
-    dir: PathBuf,
+    dirs: SegDirs,
     origin: u32,
     inner: Mutex<Inner>,
 }
@@ -64,12 +57,8 @@ impl SpTweaksTable {
         Self::idx_dir(dir).join("meta")
     }
 
-    fn seg_idx_path(dir: &Path, file_id: u32) -> PathBuf {
-        Self::idx_dir(dir).join(format!("{file_id:06}"))
-    }
-
-    fn seg_body_path(dir: &Path, file_id: u32) -> PathBuf {
-        Self::body_dir(dir).join(format!("{file_id:06}"))
+    fn seg_dirs(dir: &Path) -> SegDirs {
+        SegDirs::new(Self::idx_dir(dir), Self::body_dir(dir), TableKind::SpTweaks)
     }
 
     pub fn files_present(dir: &Path) -> bool {
@@ -104,9 +93,10 @@ impl SpTweaksTable {
         std::fs::create_dir_all(Self::idx_dir(&dir)).map_err(|e| StoreError::io(&dir, e))?;
         std::fs::create_dir_all(Self::body_dir(&dir)).map_err(|e| StoreError::io(&dir, e))?;
         Self::write_meta(&dir, origin.0)?;
-        let seg = Self::create_seg(&dir, 0, 0)?;
+        let dirs = Self::seg_dirs(&dir);
+        let seg = dirs.create(0, 0)?;
         Ok(Self {
-            dir,
+            dirs,
             origin: origin.0,
             inner: Mutex::new(Inner { segs: vec![seg] }),
         })
@@ -118,19 +108,6 @@ impl SpTweaksTable {
         prefix[..4].copy_from_slice(&origin.to_le_bytes());
         prefix[4..8].copy_from_slice(&IDX_FMT_SEG_TIP.to_le_bytes());
         meta.write_at_pwrite(FILE_HEADER_LEN as u64, &prefix)
-    }
-
-    fn create_seg(dir: &Path, file_id: u32, first_slot: u64) -> Result<Seg, StoreError> {
-        let idx = TableFile::create(Self::seg_idx_path(dir, file_id), TableKind::ArrayLink)?;
-        idx.set_grow_tight(true);
-        let body = TableFile::create(Self::seg_body_path(dir, file_id), TableKind::SpTweaks)?;
-        Ok(Seg {
-            file_id,
-            first_slot,
-            n_slots: 0,
-            idx,
-            body,
-        })
     }
 
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -154,39 +131,15 @@ impl SpTweaksTable {
         if fmt != IDX_FMT_SEG_TIP {
             return Err(StoreError::Corrupt("sp_tweaks idx format"));
         }
-        let mut segs = Vec::new();
-        let mut first_slot = 0u64;
-        for file_id in 0u32.. {
-            let ip = Self::seg_idx_path(&dir, file_id);
-            let bp = Self::seg_body_path(&dir, file_id);
-            if !ip.exists() && !bp.exists() {
-                break;
-            }
-            if !ip.exists() || !bp.exists() {
-                return Err(StoreError::Corrupt("sp_tweaks incomplete segment"));
-            }
-            let idx = TableFile::open(&ip, TableKind::ArrayLink)?;
-            idx.set_grow_tight(true);
-            let body = TableFile::open(&bp, TableKind::SpTweaks)?;
-            let extra = idx.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
-            if !extra.is_multiple_of(SLOT) {
-                return Err(StoreError::Corrupt("sp_tweaks.idx size"));
-            }
-            let n_slots = extra / SLOT;
-            segs.push(Seg {
-                file_id,
-                first_slot,
-                n_slots,
-                idx,
-                body,
-            });
-            first_slot = first_slot.saturating_add(n_slots);
-        }
-        if segs.is_empty() {
-            return Err(StoreError::Corrupt("sp_tweaks no segments"));
+        let dirs = Self::seg_dirs(&dir);
+        let segs = dirs.open(SLOT)?;
+        if segs.iter().any(|s| {
+            !(s.idx.logical_len().saturating_sub(FILE_HEADER_LEN as u64)).is_multiple_of(SLOT)
+        }) {
+            return Err(StoreError::Corrupt("sp_tweaks.idx size"));
         }
         Ok(Self {
-            dir,
+            dirs,
             origin,
             inner: Mutex::new(Inner { segs }),
         })
@@ -295,24 +248,8 @@ impl SpTweaksTable {
     }
 
     fn locate(inner: &Inner, origin: u32, height: Height) -> Option<(usize, u64)> {
-        if height.0 < origin {
-            return None;
-        }
-        let g = u64::from(height.0 - origin);
-        for (si, s) in inner.segs.iter().enumerate() {
-            if g >= s.first_slot && g < s.first_slot.saturating_add(s.n_slots) {
-                return Some((si, g - s.first_slot));
-            }
-        }
-        None
-    }
-
-    fn roll(dir: &Path, inner: &mut Inner) -> Result<(), StoreError> {
-        let first_slot = inner.segs.iter().map(|s| s.n_slots).sum();
-        let file_id = u32::try_from(inner.segs.len())
-            .map_err(|_| StoreError::Corrupt("sp_tweaks too many segments"))?;
-        inner.segs.push(Self::create_seg(dir, file_id, first_slot)?);
-        Ok(())
+        let g = u64::from(height.0.checked_sub(origin)?);
+        locate(&inner.segs, g)
     }
 
     /// Encode one tx: `0` or `33 ‖ tweak`.
@@ -495,7 +432,7 @@ impl SpTweaksTable {
                 .map(|s| s.body.logical_len())
                 .unwrap_or(FILE_HEADER_LEN as u64);
             if start0 > u32::MAX as u64 {
-                Self::roll(&self.dir, &mut inner)?;
+                self.dirs.roll(&mut inner.segs)?;
             }
             let tail = inner
                 .segs
@@ -609,9 +546,7 @@ impl SpTweaksTable {
             first.body.set_logical_len(FILE_HEADER_LEN as u64)?;
             first.n_slots = 0;
             first.first_slot = 0;
-            let drop: Vec<u32> = inner.segs.iter().skip(1).map(|s| s.file_id).collect();
-            inner.segs.truncate(1);
-            drop_seg_files(&self.dir, &drop);
+            self.dirs.drop_after(&mut inner.segs, 1);
             return Ok(());
         }
         let last_keep = keep - 1;
@@ -631,17 +566,8 @@ impl SpTweaksTable {
                 .set_logical_len(new_body.max(FILE_HEADER_LEN as u64))?;
             inner.segs[si].n_slots = local_keep;
         }
-        let drop: Vec<u32> = inner.segs.iter().skip(si + 1).map(|s| s.file_id).collect();
-        inner.segs.truncate(si + 1);
-        drop_seg_files(&self.dir, &drop);
+        self.dirs.drop_after(&mut inner.segs, si + 1);
         Ok(())
-    }
-}
-
-fn drop_seg_files(dir: &Path, ids: &[u32]) {
-    for &id in ids {
-        let _ = std::fs::remove_file(SpTweaksTable::seg_idx_path(dir, id));
-        let _ = std::fs::remove_file(SpTweaksTable::seg_body_path(dir, id));
     }
 }
 
@@ -686,13 +612,13 @@ mod tests {
         assert_eq!(want.len(), 1 + 1 + 33 + 1);
         assert_eq!(want[0], 0);
         assert_eq!(want[1], 33);
-        let raw = fs::read(SpTweaksTable::seg_body_path(&dir, 0)).unwrap();
+        let raw = fs::read(SpTweaksTable::seg_dirs(&dir).body_path(0)).unwrap();
         let pub_len = t.body_logical_len() as usize;
         assert_eq!(pub_len, FILE_HEADER_LEN + want.len());
         assert_eq!(&raw[FILE_HEADER_LEN..pub_len], want.as_slice());
 
         // Idx slot is u32 off only (no header_fk).
-        let idx = fs::read(SpTweaksTable::seg_idx_path(&dir, 0)).unwrap();
+        let idx = fs::read(SpTweaksTable::seg_dirs(&dir).idx_path(0)).unwrap();
         let idx_hwm = u64::from_le_bytes(idx[8..16].try_into().unwrap()) as usize;
         assert_eq!(idx_hwm, FILE_HEADER_LEN + 4);
         assert_eq!(
@@ -742,12 +668,12 @@ mod tests {
         want.extend_from_slice(&blob0);
         want.extend_from_slice(&blob1);
         want.extend_from_slice(&blob2);
-        let raw = fs::read(SpTweaksTable::seg_body_path(&dir, 0)).unwrap();
+        let raw = fs::read(SpTweaksTable::seg_dirs(&dir).body_path(0)).unwrap();
         let pub_len = t.body_logical_len() as usize;
         assert_eq!(pub_len, FILE_HEADER_LEN + want.len());
         assert_eq!(&raw[FILE_HEADER_LEN..pub_len], want.as_slice());
 
-        let idx = fs::read(SpTweaksTable::seg_idx_path(&dir, 0)).unwrap();
+        let idx = fs::read(SpTweaksTable::seg_dirs(&dir).idx_path(0)).unwrap();
         let idx_hwm = u64::from_le_bytes(idx[8..16].try_into().unwrap()) as usize;
         assert_eq!(idx_hwm, FILE_HEADER_LEN + 12);
         let off0 = u32::from_le_bytes(
@@ -781,8 +707,8 @@ mod tests {
         drop(t);
 
         // Last (only) record lives at u32::MAX; HWM is one past so the next start rolls.
-        let body = SpTweaksTable::seg_body_path(&dir, 0);
-        let idx = SpTweaksTable::seg_idx_path(&dir, 0);
+        let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
+        let idx = SpTweaksTable::seg_dirs(&dir).idx_path(0);
         let start = u32::MAX;
         set_file_hwm(&body, u64::from(start) + 1);
         {
@@ -800,7 +726,7 @@ mod tests {
         assert_eq!(t.get_block(Height(0), 1).unwrap().unwrap(), vec![None]);
         t.put_block(Height(1), &[None, None])
             .expect("must roll instead of u32-off Corrupt");
-        assert!(SpTweaksTable::seg_body_path(&dir, 1).is_file());
+        assert!(SpTweaksTable::seg_dirs(&dir).body_path(1).is_file());
         assert_eq!(
             t.get_block(Height(1), 2).unwrap().unwrap(),
             vec![None, None]
@@ -817,7 +743,7 @@ mod tests {
         t.flush().unwrap();
         drop(t);
 
-        let body = SpTweaksTable::seg_body_path(&dir, 0);
+        let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
         let near = u32::MAX - 8;
         set_file_hwm(&body, u64::from(near));
         let t = SpTweaksTable::open(&dir).unwrap();
@@ -831,7 +757,7 @@ mod tests {
         assert_eq!(t.get_block(Height(1), 32).unwrap().unwrap(), fat);
         t.put_block(Height(2), &[None])
             .expect("next start > u32::MAX must roll, not Corrupt");
-        assert!(SpTweaksTable::seg_body_path(&dir, 1).is_file());
+        assert!(SpTweaksTable::seg_dirs(&dir).body_path(1).is_file());
         assert_eq!(t.get_block(Height(2), 1).unwrap().unwrap(), vec![None]);
         assert_eq!(t.get_block(Height(1), 32).unwrap().unwrap(), fat);
         let _ = fs::remove_dir_all(&dir);
@@ -845,7 +771,7 @@ mod tests {
         t.flush().unwrap();
         drop(t);
 
-        let body = SpTweaksTable::seg_body_path(&dir, 0);
+        let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
         let near = u32::MAX - 4;
         set_file_hwm(&body, u64::from(near));
         let t = SpTweaksTable::open(&dir).unwrap();
@@ -856,7 +782,7 @@ mod tests {
             (Height(3), &[None, None]),
         ])
         .expect("mid-batch start past u32 must roll, not Corrupt");
-        assert!(SpTweaksTable::seg_body_path(&dir, 1).is_file());
+        assert!(SpTweaksTable::seg_dirs(&dir).body_path(1).is_file());
         assert_eq!(t.get_block(Height(1), 20).unwrap().unwrap(), fat);
         assert_eq!(t.get_block(Height(2), 1).unwrap().unwrap(), vec![None]);
         assert_eq!(
@@ -993,9 +919,9 @@ mod tests {
         t.put_block(Height(0), &[None]).unwrap();
         t.flush().unwrap();
         drop(t);
-        let mut raw = fs::read(SpTweaksTable::seg_body_path(&dir, 0)).unwrap();
+        let mut raw = fs::read(SpTweaksTable::seg_dirs(&dir).body_path(0)).unwrap();
         raw[FILE_HEADER_LEN] = 32;
-        fs::write(SpTweaksTable::seg_body_path(&dir, 0), &raw).unwrap();
+        fs::write(SpTweaksTable::seg_dirs(&dir).body_path(0), &raw).unwrap();
         let t = SpTweaksTable::open(&dir).unwrap();
         let err = t.get_block(Height(0), 1).unwrap_err();
         assert!(
@@ -1058,7 +984,7 @@ mod tests {
         t.put_block(Height(0), &[Some(tw)]).unwrap();
         t.flush().unwrap();
         drop(t);
-        let p = SpTweaksTable::seg_body_path(&dir, 0);
+        let p = SpTweaksTable::seg_dirs(&dir).body_path(0);
         let mut raw = fs::read(&p).unwrap();
         raw.truncate(FILE_HEADER_LEN + 1 + 8);
         fs::write(&p, &raw).unwrap();

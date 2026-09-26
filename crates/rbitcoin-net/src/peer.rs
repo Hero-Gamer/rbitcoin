@@ -2495,8 +2495,25 @@ fn on_compact_filters(
     }
 }
 
-/// `Some(stop height)` when this basic-filter request is inside the watermark.
-/// Silence (not a short batch, not an empty filter) when it is not.
+/// Core `MAX_GETCFILTERS_SIZE` / `MAX_GETCFHEADERS_SIZE`.
+const MAX_GETCFILTERS: u32 = 1000;
+const MAX_GETCFHEADERS: u32 = 2000;
+
+/// Core `PrepareBlockFilterRequest` range rule: start past stop, or `max`
+/// or more heights, disconnects the peer.
+fn compact_filter_range(start: u32, stop: u32, max: u32) -> Result<(), NetError> {
+    if start > stop {
+        return Err(NetError::Protocol("compact filter request start past stop"));
+    }
+    if stop - start >= max {
+        return Err(NetError::Protocol("compact filter request range too large"));
+    }
+    Ok(())
+}
+
+/// Stop height of a basic-filter request. `None` (silence: not a short
+/// batch, not an empty filter) when the index is off, the stop hash is not
+/// on the best chain, or the stop is past the filter watermark.
 fn compact_filter_stop(
     hub: &ChainHub,
     filter_type: u8,
@@ -2505,16 +2522,11 @@ fn compact_filter_stop(
     if filter_type != 0 || !hub.query.block_filter_enabled() {
         return Ok(None);
     }
-    let Some(stop) = filter_q(hub.query.height_of_hash(stop_hash))? else {
-        return Ok(None);
-    };
-    let Some(hwm) = filter_q(hub.query.basic_filter_hwm())? else {
-        return Ok(None);
-    };
-    if stop.0 > hwm {
-        return Ok(None);
-    }
-    Ok(Some(stop.0))
+    Ok(filter_q(hub.query.height_of_hash(stop_hash))?.map(|h| h.0))
+}
+
+fn within_filter_watermark(hub: &ChainHub, stop: u32) -> Result<bool, NetError> {
+    Ok(filter_q(hub.query.basic_filter_hwm())?.is_some_and(|hwm| stop <= hwm))
 }
 
 fn on_getcfilters(
@@ -2526,14 +2538,14 @@ fn on_getcfilters(
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
-    if m.start_height > stop {
+    compact_filter_range(m.start_height, stop, MAX_GETCFILTERS)?;
+    if !within_filter_watermark(hub, stop)? {
         return Ok(());
     }
-    let end = stop.min(m.start_height.saturating_add(999));
-    for h in m.start_height..=end {
-        let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
-            return Ok(());
-        };
+    let Some(filters) = filter_q(hub.query.basic_filters(m.start_height, stop))? else {
+        return Ok(());
+    };
+    for (h, body) in (m.start_height..).zip(filters) {
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
             return Ok(());
@@ -2555,42 +2567,32 @@ fn on_getcfheaders(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     m: &bitcoin::p2p::message_filter::GetCFHeaders,
 ) -> Result<(), NetError> {
-    use bitcoin::bip158::{FilterHash, FilterHeader};
+    use bitcoin::bip158::FilterHeader;
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
-    if m.start_height > stop {
+    compact_filter_range(m.start_height, stop, MAX_GETCFHEADERS)?;
+    if !within_filter_watermark(hub, stop)? {
         return Ok(());
     }
-    let end = stop.min(m.start_height.saturating_add(1999));
-    let previous = if m.start_height == 0 {
-        FilterHeader::from_byte_array([0u8; 32])
-    } else {
-        match filter_q(hub.query.basic_filter_at(m.start_height - 1))? {
-            Some((_, h)) => h,
-            None => return Ok(()),
-        }
+    // One idx read covers the previous header and every hash in range.
+    let first = m.start_height.saturating_sub(1);
+    let Some(rows) = filter_q(hub.query.basic_filter_hashes_and_headers(first, stop))? else {
+        return Ok(());
     };
-    let mut filter_hashes = Vec::new();
-    for h in m.start_height..=end {
-        let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
-            return Ok(());
-        };
-        filter_hashes.push(FilterHash::hash(&body));
-    }
-    let Some((_, stop_rec)) =
-        filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(end)))?
-    else {
-        return Ok(());
+    let (previous, hashes) = if m.start_height == 0 {
+        (FilterHeader::from_byte_array([0u8; 32]), &rows[..])
+    } else {
+        (rows[0].1, &rows[1..])
     };
     queue_out(
         out_tx,
         NetworkMessage::CFHeaders(bitcoin::p2p::message_filter::CFHeaders {
             filter_type: 0,
-            stop_hash: bitcoin::BlockHash::from_byte_array(stop_rec.hash),
+            stop_hash: m.stop_hash,
             previous_filter_header: previous,
-            filter_hashes,
+            filter_hashes: hashes.iter().map(|(hash, _)| *hash).collect(),
         }),
     )?;
     Ok(())
@@ -2605,13 +2607,16 @@ fn on_getcfcheckpt(
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
         return Ok(());
     };
+    if !within_filter_watermark(hub, stop)? {
+        return Ok(());
+    }
     let mut filter_headers = Vec::new();
     let mut h = 1000u32;
     while h <= stop {
-        let Some((_, header)) = filter_q(hub.query.basic_filter_at(h))? else {
+        let Some(row) = filter_q(hub.query.basic_filter_hashes_and_headers(h, h))? else {
             return Ok(());
         };
-        filter_headers.push(header);
+        filter_headers.push(row[0].1);
         h = h.saturating_add(1000);
     }
     queue_out(

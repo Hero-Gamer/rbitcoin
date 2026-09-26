@@ -168,6 +168,7 @@ pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
 };
+pub use block_filter::spawn_block_filter_writebehind;
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
@@ -246,8 +247,6 @@ struct ShWriteBehind {
     pending_cv: Condvar,
     /// Job popped for apply but not yet watermarked.
     applying: Mutex<Option<connect::ShPendingJob>>,
-    /// `0` = none released; `h+1` = durable apply may run through height `h`.
-    released_through: AtomicU32,
     /// Pending + in-flight SH creates keyed by scripthash.
     ram_head: Mutex<HashMap<[u8; 32], Vec<Fk>>>,
     /// Serializes the one Class B appender (worker vs generate drain).
@@ -262,7 +261,6 @@ impl ShWriteBehind {
             pending: Mutex::new(VecDeque::new()),
             pending_cv: Condvar::new(),
             applying: Mutex::new(None),
-            released_through: AtomicU32::new(0),
             ram_head: Mutex::new(HashMap::new()),
             appender: Mutex::new(()),
         }
@@ -279,6 +277,9 @@ pub struct Query {
     /// Height-ordered SH write-behind (one Class B appender). Confirm enqueues;
     /// [`Self::apply_sh_pending`] / the tip-follow worker drain.
     sh: ShWriteBehind,
+    /// Index write-behind release gate shared by every appender. `0` = none
+    /// released; `h+1` = appenders may apply through height `h`.
+    index_released_through: AtomicU32,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// In-RAM body queue + lookup-promoted decoded map. One mutex (no ArcSwap).
@@ -302,6 +303,9 @@ pub struct Query {
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
     sh_index_enabled: std::sync::atomic::AtomicBool,
     block_filter_enabled: std::sync::atomic::AtomicBool,
+    /// BIP158 basic filter table, opened when the index is first turned on.
+    block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
+    bf_wb: block_filter::BlockFilterWriteBehind,
     /// Optional BIP-352 thin tweak index (`--sptweaks`). Files may exist when off.
     sp_tweaks: Mutex<Option<SpTweaksTable>>,
     sptweaks_enabled: AtomicBool,
@@ -436,6 +440,7 @@ impl Query {
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh: ShWriteBehind::new(),
+            index_released_through: AtomicU32::new(0),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             block_queue: Mutex::new(BodyQueueInner {
                 q: rbitcoin_store::BlockQueue::open_or_create(&store_path)?,
@@ -451,6 +456,8 @@ impl Query {
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
+            block_filters: std::sync::OnceLock::new(),
+            bf_wb: block_filter::BlockFilterWriteBehind::new(),
             sp_tweaks: Mutex::new(sp_tweaks),
             sptweaks_enabled: AtomicBool::new(false),
             sptweaks_origin: AtomicU32::new(sptweaks_origin),

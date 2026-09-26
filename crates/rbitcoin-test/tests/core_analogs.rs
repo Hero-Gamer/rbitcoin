@@ -8,6 +8,9 @@
 //!    fails when scripts are skipped (`feature_assumevalid.py`,
 //!    `mempool_persist.py`)
 //! 2. Reconstruct height 1 after wiping `tx.head/` (`feature_reindex*.py`)
+//! 3. BIP158 basic filters built from Class A match the reference builder,
+//!    including below a seqsigwit prune (`rpc_getblockfilter.py`,
+//!    `feature_blockfilterindex_prune.py`)
 
 use bitcoin::hashes::Hash;
 use bitcoin::{
@@ -423,4 +426,158 @@ fn analog_reconstruct_after_lost_head() {
 
     std::fs::write(head.join("meta"), []).unwrap();
     assert_query_rebuilds_from_class_a(&store, &b1, &cb_txid);
+}
+
+/// Filters the appender materializes from Class A match rust-bitcoin's
+/// `new_script_filter`: coinbase-only, a spend, and a block with a duplicate
+/// script, an OP_RETURN, and a segwit output. The build runs after a
+/// seqsigwit prune has passed those blocks (reconstruct refuses them).
+#[test]
+fn analog_block_filters_from_class_a() {
+    use bitcoin::bip158::BlockFilter;
+    use std::collections::HashMap;
+
+    let params = ChainParams::regtest();
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    let chain = build_mature_regtest_with_spend(&q, &params);
+    let mut blocks = chain.blocks.clone();
+
+    let spend = &blocks[chain.spend_height as usize].txdata[1];
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mixed = Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: spend.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: op_true.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: op_true,
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 1, 2, 3, 4]),
+            },
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes([&[0x00, 0x14][..], &[7u8; 20]].concat()),
+            },
+        ],
+    };
+    let tip = blocks.last().unwrap();
+    let h_mixed = blocks.len() as u32;
+    let b = mine_regtest_block(
+        tip.block_hash(),
+        tip.header.time + 600,
+        h_mixed,
+        vec![mixed],
+    );
+    accept_and_connect_block(&q, &params, Height(h_mixed), &b, Milestone::NONE).unwrap();
+    blocks.push(b);
+
+    let mut outs: HashMap<OutPoint, ScriptBuf> = HashMap::new();
+    for b in &blocks {
+        for tx in &b.txdata {
+            let txid = tx.compute_txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                outs.insert(OutPoint::new(txid, vout as u32), o.script_pubkey.clone());
+            }
+        }
+    }
+    let reference = |b: &bitcoin::Block| {
+        BlockFilter::new_script_filter(b, |op| {
+            outs.get(op)
+                .cloned()
+                .ok_or(bitcoin::bip158::Error::UtxoMissing(*op))
+        })
+        .unwrap()
+    };
+    let tip = blocks.last().unwrap();
+    let last = h_mixed + Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
+    pad_empty_from(
+        &q,
+        &params,
+        tip.block_hash(),
+        tip.header.time,
+        h_mixed + 1,
+        last,
+    );
+    q.set_prune_seqsigwit(true).unwrap();
+    q.apply_prune_seqsigwit_tip().unwrap();
+    assert!(q.reconstruct_block_at_height(Height(h_mixed)).is_err());
+
+    // Materialize after the prune on the appender, stopped after its first
+    // commit and restarted: every mined block matches the reference and the
+    // header chain is unbroken to the tip.
+    q.set_block_filter_index(true).unwrap();
+    let q = Arc::new(q);
+    let run_appender = |until: &dyn Fn(Option<u32>) -> bool| {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+            Arc::clone(&q),
+            Arc::clone(&stop),
+            || {},
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !until(q.basic_filter_hwm().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "appender stalled");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        bf.join().unwrap();
+        q.basic_filter_hwm().unwrap()
+    };
+    assert!(run_appender(&|h| h.is_some()).is_some());
+    assert_eq!(run_appender(&|h| h == Some(last)), Some(last));
+    let mut prev = bitcoin::bip158::FilterHeader::from_byte_array([0u8; 32]);
+    for h in 0..=last {
+        let (bytes, header) = q.basic_filter_at(h).unwrap().unwrap();
+        let filter = BlockFilter::new(&bytes);
+        if let Some(b) = blocks.get(h as usize) {
+            assert_eq!(filter, reference(b), "filter at {h}");
+        }
+        assert_eq!(header, filter.filter_header(&prev), "header chain at {h}");
+        prev = header;
+    }
+    drop(q);
+
+    // Reorg the tip while the index is off: reopening with it on must not
+    // serve the stale-branch slot.
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    q.disconnect_tip().unwrap();
+    let (_, parent) = q.header_at_height(Height(last - 1)).unwrap().unwrap();
+    let mut alt = mine_regtest_block(
+        BlockHash::from_byte_array(parent.hash),
+        parent.timestamp + 601,
+        last,
+        vec![],
+    );
+    alt.txdata[0].output[0].value = Amount::from_sat(1_0000_0000);
+    alt.header.merkle_root = alt.compute_merkle_root().unwrap();
+    grind_regtest_pow(&mut alt.header);
+    accept_and_connect_block(&q, &params, Height(last), &alt, Milestone::NONE).unwrap();
+    drop(q);
+    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+    q.set_block_filter_index(true).unwrap();
+    assert_eq!(
+        q.basic_filter_hwm().unwrap(),
+        Some(last - 1),
+        "open drops the slot whose block left the best chain"
+    );
+    q.release_index_writebehind(Height(last));
+    q.seal_block_filters_released().unwrap();
+    let (bytes, _) = q.basic_filter_at(last).unwrap().unwrap();
+    assert_eq!(bytes, reference(&alt).content);
 }

@@ -1657,7 +1657,7 @@ impl ChainHub {
         drop(confirmed);
         self.notify.notify_waiters();
         if let Some(&(height, _)) = need_meta.last() {
-            self.query.release_sh_writebehind(Height(height));
+            self.query.release_index_writebehind(Height(height));
         }
         Ok(())
     }
@@ -1761,6 +1761,9 @@ impl ChainHub {
         }
         if let Err(e) = self.query.apply_sh_pending() {
             rbitcoin_log::warn!("generate: SH write-behind drain: {e}");
+        }
+        if let Err(e) = self.query.seal_block_filters_released() {
+            rbitcoin_log::warn!("generate: block filter write-behind drain: {e}");
         }
         Ok(hashes)
     }
@@ -2704,7 +2707,7 @@ impl ChainHub {
         };
         let _ = self.tip_tx.send(event);
         self.notify.notify_waiters();
-        self.query.release_sh_writebehind(Height(height));
+        self.query.release_index_writebehind(Height(height));
         self.trim_held_bodies(height);
         Ok(())
     }
@@ -2947,6 +2950,11 @@ pub struct TipAcceptShInput {
     pub mp_strip_ns: u64,
     /// Tip `TxPrecompute` / mempool intersect before confirm.
     pub pres_ns: u64,
+    /// Block filter appender (`rbtc-bf-wb`) since the last take. Off the
+    /// accept wall, so not in `other`.
+    pub bf_ns: u64,
+    /// Heights between the tip and the committed filter watermark.
+    pub bf_lag: u32,
     pub sh_lag: u32,
     pub sh: rbitcoin_query::TipShSnap,
 }
@@ -2967,6 +2975,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     let drain_ms = i.drain_ns / 1_000_000;
     let mp_strip_ms = i.mp_strip_ns / 1_000_000;
     let pres_ms = i.pres_ns / 1_000_000;
+    let bf_ms = i.bf_ns / 1_000_000;
     let named = i
         .load_ns
         .saturating_add(i.script_ns)
@@ -3000,11 +3009,13 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
          sh={sh_ms}ms sh_lag={sh_lag} \
          (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
-         spend={spend_ms}ms tweaks={tweak_ms}ms lookup={lookup_ms}ms struct={structural_ms}ms \
+         spend={spend_ms}ms tweaks={tweak_ms}ms bf={bf_ms}ms bf_lag={bf_lag} \
+         lookup={lookup_ms}ms struct={structural_ms}ms \
          drain={drain_ms}ms mp_strip={mp_strip_ms}ms pres={pres_ms}ms other={other_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
         tx_count = i.tx_count,
         sh_lag = i.sh_lag,
+        bf_lag = i.bf_lag,
         pin = sh.pin,
         cold = sh.cold,
         creates = sh.creates,
@@ -3064,6 +3075,8 @@ fn log_tip_accept_sh(
         drain_ns,
         mp_strip_ns,
         pres_ns,
+        bf_ns: w.blockfilter_ns,
+        bf_lag: query.block_filter_lag_heights(),
         sh_lag: query.sh_lag_heights(),
         sh,
     });
@@ -4091,6 +4104,8 @@ mod tests {
             drain_ns: 10_000_000,
             mp_strip_ns: 20_000_000,
             pres_ns: 3_000_000,
+            bf_ns: 90_000_000,
+            bf_lag: 3,
             sh_lag: 2,
             sh: rbitcoin_query::TipShSnap {
                 collect_ns: 20_000_000,
@@ -4106,31 +4121,37 @@ mod tests {
             },
         });
         assert!(line.starts_with("tip: accept h=961445"), "{line}");
-        assert!(line.contains("tx=4959"), "{line}");
         assert!(!line.contains("nTx"), "{line}");
-        assert!(line.contains("wall=2500ms"), "{line}");
-        assert!(line.contains("class_c=7ms"), "{line}");
-        assert!(line.contains("(strong=5 tip_set=2)"), "{line}");
-        assert!(line.contains("sh=1725ms"), "{line}"); // 20+5+800+600+300
-        assert!(line.contains("sh_lag=2"), "{line}");
-        // Substep ms are unitless inside the paren (outer fields carry `ms`).
-        assert!(line.contains("seed=800"), "{line}");
-        assert!(line.contains("body=600"), "{line}");
-        assert!(line.contains("head=300"), "{line}");
-        assert!(line.contains("creates=12000"), "{line}");
-        assert!(line.contains("unique=9500"), "{line}");
-        assert!(line.contains("written=9400"), "{line}");
-        assert!(line.contains("pin=4000"), "{line}");
-        assert!(line.contains("cold=12"), "{line}");
-        assert!(line.contains("tweaks=400ms"), "{line}");
-        assert!(line.contains("lookup=300ms"), "{line}");
-        assert!(line.contains("struct=40ms"), "{line}");
-        assert!(line.contains("drain=10ms"), "{line}");
-        assert!(line.contains("mp_strip=20ms"), "{line}");
-        assert!(line.contains("pres=3ms"), "{line}");
-        // 2500 - (100+200+50+7+1725+80+400+300+40+10+20+3) = -435 → 0
-        assert!(line.contains("other=0ms"), "{line}");
-        assert!(line.contains("sh/wall=69%"), "{line}");
+        for tok in [
+            "tx=4959",
+            "wall=2500ms",
+            "class_c=7ms",
+            "(strong=5 tip_set=2)",
+            "sh=1725ms", // 20+5+800+600+300
+            "sh_lag=2",
+            // Substep ms are unitless inside the paren (outer fields carry `ms`).
+            "seed=800",
+            "body=600",
+            "head=300",
+            "creates=12000",
+            "unique=9500",
+            "written=9400",
+            "pin=4000",
+            "cold=12",
+            "tweaks=400ms",
+            // Filter appender time is off the accept wall: listed, not in `other`.
+            "bf=90ms bf_lag=3",
+            "lookup=300ms",
+            "struct=40ms",
+            "drain=10ms",
+            "mp_strip=20ms",
+            "pres=3ms",
+            // 2500 - (100+200+50+7+1725+80+400+300+40+10+20+3) = -435 → 0
+            "other=0ms",
+            "sh/wall=69%",
+        ] {
+            assert!(line.contains(tok), "{tok}: {line}");
+        }
     }
 
     #[test]
@@ -4674,7 +4695,7 @@ mod tests {
         }
         let ev = tip_rx.try_recv().expect("tip event after accept");
         assert_eq!(ev.height, 3);
-        assert_eq!(hub.query.sh_released_through_height(), Some(3));
+        assert_eq!(hub.query.index_released_through_height(), Some(3));
         assert_eq!(
             hub.query.sh_indexed_through_height(),
             Some(2),
