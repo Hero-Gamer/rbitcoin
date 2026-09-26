@@ -1,9 +1,10 @@
 //! Unknown-versionbits activation warnings (Core `WarningBitsConditionChecker`).
 //!
-//! Regtest/testnets: period = difficulty interval, threshold = 75% of period.
-//! When a completed period has ≥threshold blocks signalling an unassigned bit
-//! with BIP9 top bits, the next tip reports
-//! `Unknown new rules activated (versionbit N)`.
+//! Mainnet: period 2016, threshold 1815 (90%). Regtest/testnets: period =
+//! difficulty interval, threshold = 75% of period. Blocks below the network's
+//! `MinBIP9WarningHeight` are not counted. When a completed period has
+//! ≥threshold counted blocks signalling an unassigned bit with BIP9 top bits,
+//! the next tip reports `Unknown new rules activated (versionbit N)`.
 
 use rbitcoin_primitives::{Height, Network};
 use rbitcoin_query::Query;
@@ -13,15 +14,22 @@ const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
 const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
 const VERSIONBITS_NUM_BITS: i32 = 29;
 
-/// Period / threshold for unknown-bit warnings (Core test-chain rule).
+/// Period / threshold for unknown-bit warnings.
 pub fn warn_period_threshold(network: Network) -> (u32, u32) {
-    let period = match network {
-        Network::Regtest => 144,
-        Network::Testnet | Network::Signet => 2016,
-        Network::Mainnet => 2016,
-    };
-    let threshold = period * 3 / 4;
-    (period, threshold)
+    match network {
+        Network::Mainnet => (2016, 1815),
+        Network::Testnet | Network::Signet => (2016, 2016 * 3 / 4),
+        Network::Regtest => (144, 144 * 3 / 4),
+    }
+}
+
+/// Blocks below this height are not counted (Core `MinBIP9WarningHeight`).
+pub fn warn_min_height(network: Network) -> u32 {
+    match network {
+        Network::Mainnet => 711_648,
+        Network::Testnet => 2_013_984,
+        Network::Signet | Network::Regtest => 0,
+    }
 }
 
 /// Format Core's unknown-rules warning for `bit`.
@@ -65,10 +73,17 @@ impl UnknownBitsScan {
             return Vec::new();
         };
         let (period, threshold) = warn_period_threshold(network);
-        self.advance(query, tip.0, period, threshold)
+        self.advance(query, tip.0, period, threshold, warn_min_height(network))
     }
 
-    fn advance(&mut self, query: &Query, tip: u32, period: u32, threshold: u32) -> Vec<i32> {
+    fn advance(
+        &mut self,
+        query: &Query,
+        tip: u32,
+        period: u32,
+        threshold: u32,
+        min_height: u32,
+    ) -> Vec<i32> {
         // The most recent completed period is at most LOCKED_IN, not ACTIVE.
         let target = (tip / period).saturating_sub(1);
         if target < self.scanned_periods || !self.boundary_matches(query, period) {
@@ -78,7 +93,7 @@ impl UnknownBitsScan {
         }
         for p in self.scanned_periods..target {
             let mut counts = [0u32; VERSIONBITS_NUM_BITS as usize];
-            for h in (p * period).max(1)..(p + 1) * period {
+            for h in (p * period).max(min_height).max(1)..(p + 1) * period {
                 if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
                     for (bit, count) in counts.iter_mut().enumerate() {
                         if signals_unknown(&rec.version, bit as i32) {
@@ -135,11 +150,16 @@ pub fn warning_strings(query: &Query, network: Network) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Core `WarningBitsConditionChecker`: mainnet keeps 1815 of 2016 (BIP
+    /// 341's 90%), test chains take 75% of the difficulty interval, and each
+    /// chain counts from its `MinBIP9WarningHeight`.
     #[test]
-    fn regtest_period_matches_core_functional() {
-        let (p, t) = warn_period_threshold(Network::Regtest);
-        assert_eq!(p, 144);
-        assert_eq!(t, 108);
+    fn warn_rule_matches_core_chainparams() {
+        let rule = |n| (warn_period_threshold(n), warn_min_height(n));
+        assert_eq!(rule(Network::Mainnet), ((2016, 1815), 711_648));
+        assert_eq!(rule(Network::Testnet), ((2016, 1512), 2_013_984));
+        assert_eq!(rule(Network::Signet), ((2016, 1512), 0));
+        assert_eq!(rule(Network::Regtest), ((144, 108), 0));
     }
 
     #[test]
@@ -208,25 +228,36 @@ mod tests {
     #[test]
     fn unknown_bit_scan_activates_and_keeps_its_place() {
         let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-active");
-        assert!(UnknownBitsScan::new().advance(&q, 0, 4, 2).is_empty());
-        assert!(UnknownBitsScan::new().advance(&q, 4, 4, 2).is_empty());
+        assert!(UnknownBitsScan::new().advance(&q, 0, 4, 2, 0).is_empty());
+        assert!(UnknownBitsScan::new().advance(&q, 4, 4, 2, 0).is_empty());
 
         put_chain(&q, 9, |h| h < 4, 0);
         let mut scan = UnknownBitsScan::new();
-        assert_eq!(scan.advance(&q, 8, 4, 2), vec![27]);
+        assert_eq!(scan.advance(&q, 8, 4, 2, 0), vec![27]);
         assert_eq!(scan.scanned_periods, 1);
-        assert_eq!(scan.advance(&q, 8, 4, 2), vec![27]);
+        assert_eq!(scan.advance(&q, 8, 4, 2, 0), vec![27]);
         assert_eq!(scan.scanned_periods, 1, "same tip: nothing new to read");
-        assert!(UnknownBitsScan::new().advance(&q, 8, 4, 4).is_empty());
+        assert!(UnknownBitsScan::new().advance(&q, 8, 4, 4, 0).is_empty());
 
         let (dir2, other) = rbitcoin_query::testutil::tiny_query_labeled("vb-other");
         put_chain(&other, 9, |_| false, 1);
         assert!(
-            scan.advance(&other, 8, 4, 2).is_empty(),
+            scan.advance(&other, 8, 4, 2, 0).is_empty(),
             "a different header at the counted boundary starts over"
         );
         assert_eq!(scan.scanned_periods, 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// A block counts from the floor up, so mainnet's CSV, SegWit and Taproot
+    /// signalling periods raise no warning.
+    #[test]
+    fn unknown_bit_scan_counts_from_the_floor() {
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-floor");
+        put_chain(&q, 9, |h| h < 4, 0);
+        assert_eq!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 2), vec![27]);
+        assert!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 3).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
