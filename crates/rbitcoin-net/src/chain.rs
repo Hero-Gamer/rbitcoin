@@ -1244,7 +1244,11 @@ impl ChainHub {
                 .map_err(|e| NetError::Consensus(e.to_string()))?
             {
                 out[i] = fk;
-                if let Some(h) = self.stored_header_height(&header.block_hash()) {
+                let height = in_batch
+                    .get(&header.prev_blockhash.to_byte_array())
+                    .map(|p| p.height.saturating_add(1))
+                    .or_else(|| self.stored_header_height(&header.block_hash()));
+                if let Some(h) = height {
                     in_batch.insert(
                         hash,
                         HeaderSyncNode {

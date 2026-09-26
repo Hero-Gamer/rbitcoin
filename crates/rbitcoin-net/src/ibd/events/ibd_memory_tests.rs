@@ -229,3 +229,40 @@ fn resent_stored_headers_do_not_walk_to_the_connected_tip() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `header_fks` is bounded and `hygiene` can drop an entry for a stored
+/// header, so a re-sent run can still reach `ensure_headers_batch`. There a
+/// stored header takes its height from its parent earlier in the same batch
+/// instead of walking ancestors per header: one walk opens the run, not one
+/// per row.
+#[test]
+fn unmapped_stored_run_walks_once_not_per_header() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut chain = Vec::new();
+    let mut prev = gen;
+    for height in 1..=200u32 {
+        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
+        prev = header.block_hash();
+        chain.push(header);
+    }
+    hub.ensure_headers_batch(&chain).unwrap();
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let _ = hub.take_stored_height_walk_steps();
+
+    on_headers_batch(&mut st, &hub, chain.clone());
+    assert_eq!(
+        hub.take_stored_height_walk_steps(),
+        1,
+        "a stored run outside header_fks walks only its first header"
+    );
+    for (height, header) in (1u32..).zip(&chain) {
+        assert_eq!(
+            st.hash_height.get(&header.block_hash()),
+            Some(&height),
+            "every stored header is on the path at its height"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
