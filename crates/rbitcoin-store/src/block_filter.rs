@@ -234,19 +234,27 @@ impl BlockFilterTable {
         Ok(Self::with_segs(dir, segs))
     }
 
-    /// Keep the longest slot prefix whose records run back to back inside the
-    /// body, then cut the idx and body to it.
+    /// Drop trailing slots until the last one chains onto its predecessor and
+    /// ends inside the body, then cut the idx and body to it.
+    ///
+    /// Commits only append, so a crash can only tear the tail: this reads a
+    /// few slots at the end, not the whole idx.
     fn clamp_torn_tail(seg: &mut Seg) -> Result<(), StoreError> {
         let body_len = seg.body.logical_len();
-        let mut end = HDR;
-        let mut keep = 0u64;
-        for row in seg.read_rows(0, seg.n_slots)? {
-            if u64::from(row.off) != end || row.end() > body_len {
-                break;
+        let mut keep = seg.n_slots;
+        let end = loop {
+            let Some(last) = keep.checked_sub(1) else {
+                break HDR;
+            };
+            let first = last.saturating_sub(1);
+            let rows = seg.read_rows(first, last - first + 1)?;
+            let row = &rows[rows.len() - 1];
+            let start = if last == 0 { HDR } else { rows[0].end() };
+            if u64::from(row.off) == start && row.end() <= body_len {
+                break row.end();
             }
-            end = row.end();
-            keep += 1;
-        }
+            keep = last;
+        };
         let idx_len = HDR + keep * SLOT;
         if keep < seg.n_slots || seg.idx.logical_len() != idx_len || body_len != end {
             rbitcoin_log::warn!(
