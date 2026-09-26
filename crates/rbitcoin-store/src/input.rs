@@ -151,53 +151,56 @@ impl Input {
 
     /// Parent edges for contiguous creates `first..=last` (1-based ids).
     ///
-    /// One locator pread for the span and one body pread. `None` is unstamped.
+    /// One locator pread (from the window start, for the body offset) and one
+    /// body pread. `None` is unstamped.
     pub fn edges_span(
         &self,
         first: u64,
         last: u64,
     ) -> Result<Vec<Option<Vec<InputEdge>>>, StoreError> {
+        let mut plan = self.plan_edges_span(first, last)?;
+        self.loc.read_at(plan.loc_off, &mut plan.loc)?;
+        let (abs, len) = self.edges_body_read(&plan)?;
+        let mut body = vec![0u8; len as usize];
+        if len > 0 {
+            self.body.read_at(abs, &mut body)?;
+        }
+        decode_edges_span(&plan, &body)
+    }
+
+    /// Locator read for [`Self::edges_span`]: `n_in` from the window start of
+    /// `first` through `last` (no IO).
+    pub(crate) fn plan_edges_span(&self, first: u64, last: u64) -> Result<EdgesPlan, StoreError> {
         if first == 0 || last < first {
             return Err(StoreError::InvalidFk);
         }
         if last > self.count() {
             return Err(StoreError::NotFound);
         }
-        let n = (last - first + 1) as usize;
-        let mut loc = vec![0u8; n * LOC_SLOT as usize];
-        self.loc
-            .read_at(FILE_HEADER_LEN as u64 + (first - 1) * LOC_SLOT, &mut loc)?;
-        let mut n_ins = Vec::with_capacity(n);
-        let mut total = 0u64;
-        for chunk in loc.chunks_exact(LOC_SLOT as usize) {
-            let n_in = u16::from_le_bytes([chunk[0], chunk[1]]);
-            n_ins.push(n_in);
-            total = total.saturating_add(u64::from(n_in));
-        }
-        let abs = self.body_abs(first)?;
-        let mut body = vec![0u8; total as usize * REC_LEN as usize];
-        if total > 0 {
-            self.body.read_at(abs, &mut body)?;
-        }
-        let mut out = Vec::with_capacity(n);
-        let mut off = 0usize;
-        for n_in in n_ins {
-            if n_in == 0 {
-                out.push(None);
-                continue;
-            }
-            let len = n_in as usize * REC_LEN as usize;
-            let slice = &body[off..off + len];
-            let mut edges = Vec::with_capacity(n_in as usize);
-            for rec in slice.chunks_exact(REC_LEN as usize) {
-                let mut b = [0u8; REC_LEN as usize];
-                b.copy_from_slice(rec);
-                edges.push(InputEdge::unpack(b)?);
-            }
-            off += len;
-            out.push(Some(edges));
-        }
-        Ok(out)
+        let w = loc_window(first);
+        let win_first = w * LOC_WINDOW + 1;
+        let base = if w == 0 {
+            FILE_HEADER_LEN as u64
+        } else {
+            let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+            *cps.get((w - 1) as usize)
+                .ok_or(StoreError::Corrupt("invariant: input.off checkpoint"))?
+        };
+        Ok(EdgesPlan {
+            base,
+            skip: (first - win_first) as usize,
+            loc_off: FILE_HEADER_LEN as u64 + (win_first - 1) * LOC_SLOT,
+            loc: vec![0u8; (last - win_first + 1) as usize * LOC_SLOT as usize],
+        })
+    }
+
+    /// Body read `(abs, len)` for a plan whose locator bytes are filled.
+    pub(crate) fn edges_body_read(&self, plan: &EdgesPlan) -> Result<(u64, u64), StoreError> {
+        let n_in = |c: &[u8]| u64::from(u16::from_le_bytes([c[0], c[1]]));
+        let mut slots = plan.loc.chunks_exact(LOC_SLOT as usize);
+        let before: u64 = slots.by_ref().take(plan.skip).map(n_in).sum();
+        let span: u64 = slots.map(n_in).sum();
+        Ok((plan.base + before * REC_LEN, span * REC_LEN))
     }
 
     /// Parent edges in vin order. `None` when unstamped.
@@ -391,6 +394,43 @@ impl Input {
         }
         Ok(base + n * REC_LEN)
     }
+}
+
+/// Locator read of one [`Input::plan_edges_span`].
+pub(crate) struct EdgesPlan {
+    base: u64,
+    skip: usize,
+    pub(crate) loc_off: u64,
+    pub(crate) loc: Vec<u8>,
+}
+
+/// Edges per create of a filled plan and its body bytes.
+pub(crate) fn decode_edges_span(
+    plan: &EdgesPlan,
+    body: &[u8],
+) -> Result<Vec<Option<Vec<InputEdge>>>, StoreError> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for chunk in plan.loc.chunks_exact(LOC_SLOT as usize).skip(plan.skip) {
+        let n_in = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+        if n_in == 0 {
+            out.push(None);
+            continue;
+        }
+        let len = n_in * REC_LEN as usize;
+        let slice = body
+            .get(off..off + len)
+            .ok_or(StoreError::Corrupt("invariant: input.body span short"))?;
+        let mut edges = Vec::with_capacity(n_in);
+        for rec in slice.chunks_exact(REC_LEN as usize) {
+            let mut b = [0u8; REC_LEN as usize];
+            b.copy_from_slice(rec);
+            edges.push(InputEdge::unpack(b)?);
+        }
+        off += len;
+        out.push(Some(edges));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
