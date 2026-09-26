@@ -240,11 +240,17 @@ impl CreateLoc {
         fks: &[Fk],
         ctx: &mut IoCtx<'_>,
     ) -> Result<Vec<Option<CreateLocPair>>, StoreError> {
-        if fks.is_empty() {
-            return Ok(Vec::new());
-        }
+        let mut plan = self.plan_range_batch(fks)?;
+        self.pread_windows(ctx, &mut plan.windows)?;
+        self.finish_range_batch(&plan)
+    }
+
+    /// Window reads that resolve `fks` (offsets from RAM checkpoints; no IO).
+    ///
+    /// A completion machine pushes [`LocPlan::reads`] on its own session,
+    /// then calls [`Self::finish_range_batch`].
+    pub(crate) fn plan_range_batch(&self, fks: &[Fk]) -> Result<LocPlan, StoreError> {
         let count = self.count.load(Ordering::Acquire);
-        let mut out = vec![None; fks.len()];
         let mut jobs: Vec<(usize, u64)> = Vec::new();
         for (i, fk) in fks.iter().enumerate() {
             let Some(id) = fk.get() else { continue };
@@ -252,9 +258,6 @@ impl CreateLoc {
                 continue;
             }
             jobs.push((i, id));
-        }
-        if jobs.is_empty() {
-            return Ok(out);
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
         let mut windows: Vec<LocWinRead> = Vec::new();
@@ -293,11 +296,28 @@ impl CreateLoc {
             });
             w_i = w_j;
         }
-        self.pread_windows(ctx, &mut windows)?;
-        for win in &windows {
-            self.extract_win_pairs(win, &jobs, &mut out)?;
+        Ok(LocPlan {
+            out_len: fks.len(),
+            jobs,
+            windows,
+        })
+    }
+
+    /// Decode the window buffers of a filled [`LocPlan`].
+    pub(crate) fn finish_range_batch(
+        &self,
+        plan: &LocPlan,
+    ) -> Result<Vec<Option<CreateLocPair>>, StoreError> {
+        let mut out = vec![None; plan.out_len];
+        for win in &plan.windows {
+            self.extract_win_pairs(win, &plan.jobs, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// `create.loc` handle and path for a machine's reads.
+    pub(crate) fn loc_file(&self) -> (crate::io_handle::IoHandle, &Path) {
+        (self.loc.read_fd(), self.loc.path())
     }
 
     fn extract_win_pairs(
@@ -370,6 +390,22 @@ impl CreateLoc {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Window reads for one [`CreateLoc::plan_range_batch`].
+pub(crate) struct LocPlan {
+    out_len: usize,
+    jobs: Vec<(usize, u64)>,
+    windows: Vec<LocWinRead>,
+}
+
+impl LocPlan {
+    /// `(file offset, buffer)` for each window read, in plan order.
+    pub(crate) fn reads(&mut self) -> impl Iterator<Item = (u64, &mut Vec<u8>)> {
+        self.windows
+            .iter_mut()
+            .map(|w| (loc_file_off(w.win_first, SLOT), &mut w.buf))
     }
 }
 

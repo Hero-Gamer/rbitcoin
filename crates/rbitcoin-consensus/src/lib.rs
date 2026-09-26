@@ -6,6 +6,7 @@ mod confirm_run;
 mod convert;
 mod error;
 mod header;
+mod index_writebehind;
 mod milestone;
 mod params;
 pub mod policy;
@@ -70,6 +71,7 @@ pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, C
 pub use header::{
     expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
 };
+pub use index_writebehind::{build_indexes_released, spawn_index_writebehind};
 pub use milestone::{Milestone, MilestoneAnchor};
 pub use params::{
     default_milestone_height, genesis_block, mainnet_milestone_anchor, mainnet_min_chain_work_be,
@@ -82,8 +84,7 @@ pub use regtest_pad::{
 };
 pub use signet::signet_magic;
 pub use silent_payments::{
-    backfill_sp_tweaks_cancellable, taproot_matches_scan, tweak_from_tx, tweaks_for_height,
-    TaprootOut, TxTweak,
+    taproot_matches_scan, tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak,
 };
 
 use bitcoin::hashes::Hash;

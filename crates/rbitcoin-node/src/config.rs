@@ -591,6 +591,14 @@ impl NodeConfig {
                 "signet-block-time must be greater than zero".into(),
             ));
         }
+        if self.sptweaks && self.prune_seqsigwit {
+            // Tweaks read input keys from scriptSig and witness (seqsigwit).
+            return Err(NodeError::Config(
+                "--sp-tweaks cannot be combined with --prune-seqsigwit: tweaks need the \
+                 scriptSig and witness data pruning drops"
+                    .into(),
+            ));
+        }
         self.validate_only_net()?;
         self.validate_hidden_inbound()
     }

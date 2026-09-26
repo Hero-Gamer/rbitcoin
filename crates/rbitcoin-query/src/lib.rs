@@ -168,7 +168,6 @@ pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
 };
-pub use block_filter::spawn_block_filter_writebehind;
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
@@ -634,6 +633,11 @@ impl Query {
 
     pub fn set_prune_seqsigwit(&self, on: bool) -> Result<(), QueryError> {
         let was_on = self.prune_seqsigwit();
+        if on && self.sptweaks_enabled() {
+            return Err(StoreError::Layout(
+                "refusing --prune-seqsigwit while silent payment tweaks are enabled".into(),
+            ));
+        }
         if !on && self.prune_seqsigwit() {
             return Err(StoreError::Layout(
                 "refusing to disable prune-seqsigwit on a pruned datadir".into(),

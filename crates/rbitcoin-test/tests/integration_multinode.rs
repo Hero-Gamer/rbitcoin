@@ -59,8 +59,7 @@ fn open_padded_query(dir: &TempDir) -> Query {
     let (tip, time) = pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 1);
     q.set_block_filter_index(true).unwrap();
     q.release_index_writebehind(Height(1));
-    q.seal_block_filters_released()
-        .expect("filters through height 1");
+    rbitcoin_consensus::build_indexes_released(&q).expect("filters through height 1");
     pad_empty_from(&q, &params, tip, time, 2, params.coinbase_maturity() + 1);
     q
 }
@@ -1767,6 +1766,9 @@ async fn tip_follow_after_ibd() {
 
         let mut peer = start_node(&peer_dir).await;
         peer.query.set_block_filter_index(true).unwrap();
+        peer.query
+            .set_sptweaks_enabled(true, Height(ChainParams::regtest().taproot_height()))
+            .unwrap();
         sync_ibd(&peer, seed.local_addr).await;
         peer.wait_height(5, Duration::from_secs(10))
             .await
@@ -1776,68 +1778,90 @@ async fn tip_follow_after_ibd() {
             None,
             "IBD confirm leaves basic filters to the appender"
         );
-        let bf_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Records the watermark when the appender first reports caught up.
+        assert_eq!(
+            peer.query.sptweaks_next_height(),
+            Some(Height(0)),
+            "the confirm write thread writes no tweaks"
+        );
+        let pq = Arc::clone(&peer.query);
+        // Records the filter watermark when a builder first reports caught up.
         let caught_up_at = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
-        let bf = rbitcoin_query::spawn_block_filter_writebehind(
-            Arc::clone(&peer.query),
-            Arc::clone(&bf_stop),
-            || {},
-            {
-                let (q, at) = (Arc::clone(&peer.query), Arc::clone(&caught_up_at));
+        let spawn_builder = || {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (q, at) = (Arc::clone(&pq), Arc::clone(&caught_up_at));
+            let h = rbitcoin_consensus::spawn_index_writebehind(
+                Arc::clone(&pq),
+                Arc::clone(&stop),
+                || {},
                 move || {
                     let h = q.basic_filter_hwm().unwrap().unwrap_or(u32::MAX);
                     at.store(h, std::sync::atomic::Ordering::SeqCst);
-                }
-            },
-        );
-        let hwm = |n: &P2PNode| n.query.basic_filter_hwm().unwrap();
+                },
+            );
+            (stop, h)
+        };
+        let caught_up = || caught_up_at.load(std::sync::atomic::Ordering::SeqCst);
+        let indexed = || (pq.basic_filter_hwm().unwrap(), pq.sptweaks_next_height());
+        let (stop, builder) = spawn_builder();
         wait_ms_until(
             5_000,
-            || caught_up_at.load(std::sync::atomic::Ordering::SeqCst) != u32::MAX,
-            || format!("materialize hwm={:?}", hwm(&peer)),
+            || caught_up() != u32::MAX && indexed() == (Some(5), Some(Height(6))),
+            || format!("materialize {:?}", indexed()),
         )
         .await;
-        assert_eq!(
-            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "caught up fires once filters reach the tip"
-        );
+        assert_eq!(caught_up(), 5, "caught up fires once filters reach the tip");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        builder.join().unwrap();
+
         peer.follow_from(seed.local_addr).await.expect("follow");
         assert!(
             peer.follow_live_count() >= 1,
             "outbound follow session should be live"
         );
-
-        let tip = seed.cache.tip_hash().unwrap();
-        let tip_time = seed
-            .query
-            .header_at_height(Height(5))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
-        let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
-        let h6 = b6.block_hash();
-        seed.ingest_block(6, b6).unwrap();
-
+        let mine_next = |h: u32| {
+            let tip = seed.cache.tip_hash().unwrap();
+            let time = seed
+                .query
+                .header_at_height(Height(h - 1))
+                .unwrap()
+                .unwrap()
+                .1
+                .timestamp;
+            let b = mine_regtest_block(tip, time + 600, h, vec![]);
+            let hash = b.block_hash();
+            seed.ingest_block(h, b).unwrap();
+            hash
+        };
+        let h6 = mine_next(6);
         peer.wait_tip_hash(h6, Duration::from_secs(10))
             .await
             .expect("tip follow");
         assert_eq!(peer.query.tip_height(), Some(Height(6)));
+        assert_eq!(
+            indexed(),
+            (Some(5), Some(Height(6))),
+            "with no builder running, the confirm path writes no index data"
+        );
+
+        let (stop, builder) = spawn_builder();
         wait_ms_until(
             5_000,
-            || hwm(&peer) == Some(6),
-            || format!("follow hwm={:?}", hwm(&peer)),
+            || indexed() == (Some(6), Some(Height(7))),
+            || format!("catch up {:?}", indexed()),
         )
         .await;
-        assert_eq!(
-            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "caught up fires only once"
-        );
-        bf_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        bf.join().unwrap();
+        let h7 = mine_next(7);
+        peer.wait_tip_hash(h7, Duration::from_secs(10))
+            .await
+            .expect("tip follow");
+        wait_ms_until(
+            5_000,
+            || indexed() == (Some(7), Some(Height(8))),
+            || format!("follow {:?}", indexed()),
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        builder.join().unwrap();
 
         seed.shutdown().await;
         peer.shutdown().await;
@@ -1933,7 +1957,7 @@ async fn reorg_to_longer_branch() {
         hub.accept_block(b).unwrap();
     }
     assert_eq!(hub.tip_height(), Some(4));
-    hub.query.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&hub.query).unwrap();
     assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(4));
     let old_3 = hub.query.basic_filter_at(3).unwrap().unwrap().0;
 
@@ -1966,7 +1990,7 @@ async fn reorg_to_longer_branch() {
     assert!(matches!(outcome, AcceptOutcome::Accepted { height: 6 }));
     assert_eq!(hub.tip_height(), Some(6));
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
-    hub.query.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&hub.query).unwrap();
     assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(6));
     for (h, b) in (3..).zip(&branch) {
         assert_eq!(

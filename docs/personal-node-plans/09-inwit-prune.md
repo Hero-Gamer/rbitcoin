@@ -308,7 +308,8 @@ every OS.
 
 ## Risks / follow-ups
 
-- Tweaks naive path parent seqsigwit: must not Corrupt on pruned parents.
+- Silent payment tweaks need scriptSig and witness, so `--sp-tweaks` and
+  `--prune-seqsigwit` are refused together and a pruned node serves no tweaks.
 - mempool.space **frontend** may assume `vin` always present on `GET /tx`;
   personal-node wallets (Electrum history/utxo) do not. Partial JSON is for
   honest objects, not a claim that we are a full electrs archive.

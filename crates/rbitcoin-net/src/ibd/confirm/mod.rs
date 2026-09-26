@@ -1513,7 +1513,7 @@ pub(crate) fn spawn_confirm_engine(
                             info!(
                                 "ibd: confirm write slow batch={n} parts={parts} first={first_h} wall={:?} \
                                  class_a={}ms ensure={}ms struct={}ms spent={}ms create_h={}ms \
-                                 bip68={}ms class_c={}ms spend_ann={}ms tweaks={}ms",
+                                 bip68={}ms class_c={}ms spend_ann={}ms",
                                 elapsed,
                                 ms(p.class_a_ns),
                                 ms(p.ensure_ns),
@@ -1523,7 +1523,6 @@ pub(crate) fn spawn_confirm_engine(
                                 ms(p.bip68_ns),
                                 ms(p.class_c_ns),
                                 ms(p.spend_ann_ns),
-                                ms(p.tweak_ns),
                             );
                         }
                     }

@@ -25,6 +25,7 @@ pub mod head_resolve_stats;
 mod header_table;
 mod height_fence;
 mod idx_body_pipeline;
+mod index_build_uring;
 mod input;
 mod int_map;
 mod integrity;
@@ -77,6 +78,7 @@ pub use header_table::{block_header_hash, HeaderRecord};
 pub use height_fence::HeightFence;
 pub(crate) use idx_body_pipeline::run_idx_body_pipeline;
 pub use idx_body_pipeline::{BodyMode as IdxBodyMode, IdxBodyJob};
+pub use index_build_uring::{read_index_window, IndexBlock, IndexHeight, IndexWindow};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{merkle_root_from_txids, VERIFY_TIP_BLOCKS};
 pub use io_backend::{ReadIoBackend, WriteIoBackend};
@@ -95,7 +97,7 @@ pub use sorted_run::{
     free_gib_label, list_materialize_claims, list_runs, next_run_path, write_sorted_run,
 };
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
-pub use sp_tweaks_uring::load_tweak_wave;
+pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx};
 pub use spend_annotate_uring::spend_ann_backend;
 pub use spend_durable::SPEND_DURABLE_NAME;
 pub use store::{keep_unspent_vout_subsequence, Store, StoreLayout};

@@ -525,7 +525,7 @@ fn analog_block_filters_from_class_a() {
     let q = Arc::new(q);
     let run_appender = |until: &dyn Fn(Option<u32>) -> bool| {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+        let bf = rbitcoin_consensus::spawn_index_writebehind(
             Arc::clone(&q),
             Arc::clone(&stop),
             || {},
@@ -551,6 +551,24 @@ fn analog_block_filters_from_class_a() {
         }
         assert_eq!(header, filter.filter_header(&prev), "header chain at {h}");
         prev = header;
+    }
+    // The completion-driven window reader builds the same filters, reading
+    // windows that straddle the prune line and share parents across heights.
+    for start in (0..=last).step_by(37) {
+        let end = (start + 36).min(last);
+        let window = q
+            .read_index_window(&q.index_heights(start, end, None).unwrap())
+            .unwrap();
+        for (i, block) in window.blocks.iter().enumerate() {
+            let h = start + i as u32;
+            assert_eq!(block.height, Height(h));
+            let built = q.basic_filter_from_window(&window, i).unwrap();
+            assert_eq!(
+                built.content,
+                q.basic_filter_at(h).unwrap().unwrap().0,
+                "window filter at {h}"
+            );
+        }
     }
     drop(q);
 
@@ -578,7 +596,7 @@ fn analog_block_filters_from_class_a() {
         "open drops the slot whose block left the best chain"
     );
     q.release_index_writebehind(Height(last));
-    q.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&q).unwrap();
     let (bytes, _) = q.basic_filter_at(last).unwrap().unwrap();
     assert_eq!(bytes, reference(&alt).content);
 }
