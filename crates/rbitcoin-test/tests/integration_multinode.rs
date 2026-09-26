@@ -1778,74 +1778,90 @@ async fn tip_follow_after_ibd() {
             None,
             "IBD confirm leaves basic filters to the appender"
         );
-        let bf_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Records the watermark when the appender first reports caught up.
+        assert_eq!(
+            peer.query.sptweaks_next_height(),
+            Some(Height(0)),
+            "the confirm write thread writes no tweaks"
+        );
+        let pq = Arc::clone(&peer.query);
+        // Records the filter watermark when a builder first reports caught up.
         let caught_up_at = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
-        let bf = rbitcoin_consensus::spawn_index_writebehind(
-            Arc::clone(&peer.query),
-            Arc::clone(&bf_stop),
-            || {},
-            {
-                let (q, at) = (Arc::clone(&peer.query), Arc::clone(&caught_up_at));
+        let spawn_builder = || {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (q, at) = (Arc::clone(&pq), Arc::clone(&caught_up_at));
+            let h = rbitcoin_consensus::spawn_index_writebehind(
+                Arc::clone(&pq),
+                Arc::clone(&stop),
+                || {},
                 move || {
                     let h = q.basic_filter_hwm().unwrap().unwrap_or(u32::MAX);
                     at.store(h, std::sync::atomic::Ordering::SeqCst);
-                }
-            },
-        );
-        let hwm = |n: &P2PNode| n.query.basic_filter_hwm().unwrap();
+                },
+            );
+            (stop, h)
+        };
+        let caught_up = || caught_up_at.load(std::sync::atomic::Ordering::SeqCst);
+        let indexed = || (pq.basic_filter_hwm().unwrap(), pq.sptweaks_next_height());
+        let (stop, builder) = spawn_builder();
         wait_ms_until(
             5_000,
-            || caught_up_at.load(std::sync::atomic::Ordering::SeqCst) != u32::MAX,
-            || format!("materialize hwm={:?}", hwm(&peer)),
+            || caught_up() != u32::MAX && indexed() == (Some(5), Some(Height(6))),
+            || format!("materialize {:?}", indexed()),
         )
         .await;
-        assert_eq!(
-            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "caught up fires once filters reach the tip"
-        );
+        assert_eq!(caught_up(), 5, "caught up fires once filters reach the tip");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        builder.join().unwrap();
+
         peer.follow_from(seed.local_addr).await.expect("follow");
         assert!(
             peer.follow_live_count() >= 1,
             "outbound follow session should be live"
         );
-
-        let tip = seed.cache.tip_hash().unwrap();
-        let tip_time = seed
-            .query
-            .header_at_height(Height(5))
-            .unwrap()
-            .unwrap()
-            .1
-            .timestamp;
-        let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
-        let h6 = b6.block_hash();
-        seed.ingest_block(6, b6).unwrap();
-
+        let mine_next = |h: u32| {
+            let tip = seed.cache.tip_hash().unwrap();
+            let time = seed
+                .query
+                .header_at_height(Height(h - 1))
+                .unwrap()
+                .unwrap()
+                .1
+                .timestamp;
+            let b = mine_regtest_block(tip, time + 600, h, vec![]);
+            let hash = b.block_hash();
+            seed.ingest_block(h, b).unwrap();
+            hash
+        };
+        let h6 = mine_next(6);
         peer.wait_tip_hash(h6, Duration::from_secs(10))
             .await
             .expect("tip follow");
         assert_eq!(peer.query.tip_height(), Some(Height(6)));
-        wait_ms_until(
-            5_000,
-            || hwm(&peer) == Some(6),
-            || format!("follow hwm={:?}", hwm(&peer)),
-        )
-        .await;
         assert_eq!(
-            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "caught up fires only once"
+            indexed(),
+            (Some(5), Some(Height(6))),
+            "with no builder running, the confirm path writes no index data"
         );
+
+        let (stop, builder) = spawn_builder();
         wait_ms_until(
             5_000,
-            || peer.query.sptweaks_next_height() == Some(Height(7)),
-            || format!("tweaks next={:?}", peer.query.sptweaks_next_height()),
+            || indexed() == (Some(6), Some(Height(7))),
+            || format!("catch up {:?}", indexed()),
         )
         .await;
-        bf_stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        bf.join().unwrap();
+        let h7 = mine_next(7);
+        peer.wait_tip_hash(h7, Duration::from_secs(10))
+            .await
+            .expect("tip follow");
+        wait_ms_until(
+            5_000,
+            || indexed() == (Some(7), Some(Height(8))),
+            || format!("follow {:?}", indexed()),
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        builder.join().unwrap();
 
         seed.shutdown().await;
         peer.shutdown().await;

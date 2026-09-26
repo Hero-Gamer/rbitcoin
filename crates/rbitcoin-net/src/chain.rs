@@ -2972,8 +2972,6 @@ pub struct TipAcceptShInput {
     pub spend_ns: u64,
     pub strong_ns: u64,
     pub tip_ns: u64,
-    /// BIP-352 tip write-through (`index_sp_tweaks_batch`). Zero when `--sptweaks` is off.
-    pub tweak_ns: u64,
     /// Lookup stamp (`ConfirmWindow::lookup_total_ns`).
     pub lookup_ns: u64,
     /// Write structural (spentness / maturity / BIP68).
@@ -3003,7 +3001,6 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     let spend_ms = i.spend_ns / 1_000_000;
     let strong_ms = i.strong_ns / 1_000_000;
     let tip_ms = i.tip_ns / 1_000_000;
-    let tweak_ms = i.tweak_ns / 1_000_000;
     let lookup_ms = i.lookup_ns / 1_000_000;
     let structural_ms = i.structural_ns / 1_000_000;
     let drain_ms = i.drain_ns / 1_000_000;
@@ -3017,7 +3014,6 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
         .saturating_add(i.class_c_ns)
         .saturating_add(i.sh.total_sh_ns())
         .saturating_add(i.spend_ns)
-        .saturating_add(i.tweak_ns)
         .saturating_add(i.lookup_ns)
         .saturating_add(i.structural_ns)
         .saturating_add(i.drain_ns)
@@ -3044,7 +3040,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
          sh={sh_ms}ms sh_lag={sh_lag} \
          (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} sync={sync_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
-         spend={spend_ms}ms tweaks={tweak_ms}ms bf={bf_ms}ms bf_lag={bf_lag} \
+         spend={spend_ms}ms bf={bf_ms}ms bf_lag={bf_lag} \
          lookup={lookup_ms}ms struct={structural_ms}ms \
          drain={drain_ms}ms mp_strip={mp_strip_ms}ms pres={pres_ms}ms other={other_ms}ms sh/wall={sh_ratio}%",
         h = i.height,
@@ -3078,7 +3074,6 @@ fn log_tip_accept_sh(
     let structural_ns = w.structural_ns;
     let lookup_ns = w.lookup_total_ns;
     let drain_ns = w.write_drain_join_ns;
-    let tweak_ns = w.tweak_ns;
     let sh = rbitcoin_query::TipShSnap {
         collect_ns: w.sh_collect_ns,
         sort_ns: w.sh_sort_ns,
@@ -3105,7 +3100,6 @@ fn log_tip_accept_sh(
         spend_ns,
         strong_ns,
         tip_ns,
-        tweak_ns,
         lookup_ns,
         structural_ns,
         drain_ns,
@@ -4134,7 +4128,6 @@ mod tests {
             spend_ns: 80_000_000,
             strong_ns: 5_000_000,
             tip_ns: 2_000_000,
-            tweak_ns: 400_000_000,
             lookup_ns: 300_000_000,
             structural_ns: 40_000_000,
             drain_ns: 10_000_000,
@@ -4175,7 +4168,6 @@ mod tests {
             "written=9400",
             "pin=4000",
             "cold=12",
-            "tweaks=400ms",
             // Filter appender time is off the accept wall: listed, not in `other`.
             "bf=90ms bf_lag=3",
             "lookup=300ms",
@@ -4183,7 +4175,7 @@ mod tests {
             "drain=10ms",
             "mp_strip=20ms",
             "pres=3ms",
-            // 2500 - (100+200+50+7+1725+80+400+300+40+10+20+3) = -435 → 0
+            // 2500 - (100+200+50+7+1775+80+300+40+10+20+3) = -85 → 0
             "other=0ms",
             "sh/wall=71%",
         ] {

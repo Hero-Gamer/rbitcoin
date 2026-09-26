@@ -33,7 +33,7 @@
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff). `thr script work`
 //!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`
 //!   on steal workers.
-//! - **write** = Class A + ensure + structural + class_c + spend + tweaks
+//! - **write** = Class A + ensure + structural + class_c + spend
 //!   + `pins=` / `head_sub=` / `drain_join=` / `dequeue=`.
 //!     `other=` is write-thread work minus that inventory.
 //!
@@ -81,9 +81,6 @@ pub(crate) struct WriteStageSample {
     /// spend annotate (`spend=`)
     pub utxo_ms: u64,
     pub utxo_apply_ns: u64,
-    /// Tip write-through `index_sp_tweaks_batch` (`tweaks=`)
-    pub tweak_ms: u64,
-    pub tweak_ns: u64,
     /// Write-thread pin Arc copies: plan take + create-pin FkMap (`pins=`)
     pub pins_ms: u64,
     pub pins_ns: u64,
@@ -125,7 +122,6 @@ impl WriteStageSample {
         ("class_c", |s| s.class_c_ms, |s| s.class_c_ns),
         ("sh", |s| s.sh_ms, |s| s.sh_ns),
         ("spend", |s| s.utxo_ms, |s| s.utxo_apply_ns),
-        ("tweaks", |s| s.tweak_ms, |s| s.tweak_ns),
         ("pins", |s| s.pins_ms, |s| s.pins_ns),
         ("head_sub", |s| s.head_sub_ms, |s| s.head_sub_ns),
         ("class_c_join", |s| s.class_c_join_ms, |s| s.class_c_join_ns),
@@ -886,7 +882,6 @@ pub(crate) fn sample(
     let head_sub_ns = w.write_head_sub_ns;
     let pins_ns = pins_take_ns.saturating_add(pins_map_ns);
     let class_c_join_ns = w.write_class_c_join_ns;
-    let tweak_ns = w.tweak_ns;
     let spent_abs_ns = w.structural_spent_abs_ns;
     let spent_strong_ns = w.structural_spent_strong_ns;
     let spent_cold_ns = w.structural_spent_cold_ns;
@@ -967,8 +962,6 @@ pub(crate) fn sample(
             sh_ns,
             utxo_ms: ns_ms(utxo_apply_ns),
             utxo_apply_ns,
-            tweak_ms: ns_ms(tweak_ns),
-            tweak_ns,
             pins_ms: ns_ms(pins_ns),
             pins_ns,
             head_sub_ms: ns_ms(head_sub_ns),
@@ -1220,7 +1213,7 @@ fn plan_batch_ms(s: &IbdPerfSample) -> u64 {
 ///
 /// Class A + denserels ensure + structural + **Class C tables** (strong+tip) +
 /// **SH** (parallel with strong on tip; was previously folded into a join-wall
-/// `class_c`) + spend annotate + SP tweaks.
+/// `class_c`) + spend annotate.
 fn write_stage_ms(s: &IbdPerfSample) -> u64 {
     s.write.stage_ms()
 }
@@ -1913,8 +1906,6 @@ mod tests {
         write.sh_ns = 5_000_000;
         write.utxo_ms = 6;
         write.utxo_apply_ns = 6_000_000;
-        write.tweak_ms = 7;
-        write.tweak_ns = 7_000_000;
         write.pins_ms = 8;
         write.pins_ns = 8_000_000;
         write.head_sub_ms = 9;
@@ -1930,10 +1921,10 @@ mod tests {
         s.write = write;
         assert_eq!(
             s.write.stage_ms(),
-            78,
-            "inventory: class_a+ensure+struct+class_c+sh+spend+tweaks+pins+head_sub+class_c_join+drain_join+dequeue"
+            71,
+            "inventory: class_a+ensure+struct+class_c+sh+spend+pins+head_sub+class_c_join+drain_join+dequeue"
         );
-        assert_eq!(write_stage_ms(&s), 78);
+        assert_eq!(write_stage_ms(&s), 71);
         s.load_ms = 30;
         s.connect_ms = 8;
         assert_eq!(load_stage_wall_ms(&s), 38);
@@ -2023,7 +2014,6 @@ mod tests {
         s.write.ensure_ms = 3;
         s.write.class_c_ms = 40;
         s.write.utxo_ms = 25;
-        s.write.tweak_ms = 7;
         s.dominant = "confirm";
         s.live = Some((100, 32, 8000, 1500));
         s.confirm_reject_stops = 2;
@@ -2090,13 +2080,13 @@ mod tests {
             !line.contains("connect="),
             "assemble is inside load, not a peer stage: {line}"
         );
-        // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25)+tweaks(7) = 87
-        assert!(line.contains("write=87ms"), "{line}");
+        // write = class_a(12)+ensure(3)+class_c(40)+sh(0)+spend(25) = 80
+        assert!(line.contains("write=80ms"), "{line}");
         assert!(line.contains("class_a=12ms"), "{line}");
         assert!(line.contains("ensure=3ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
         assert!(line.contains("spend=25ms"), "{line}");
-        assert!(line.contains("tweaks=7ms"), "{line}");
+        assert!(!line.contains("tweaks="), "{line}");
         assert!(line.contains("struct=0ms"), "{line}");
         assert!(!line.contains("recon_ms="), "{line}");
         assert!(!line.contains("prefetch"), "{line}");
@@ -2146,8 +2136,8 @@ mod tests {
             line.contains("spent_sub(abs=20 strong=5 cold=3 pending=2)"),
             "{line}"
         );
-        // write = 12+3+50+40+25+7 = 137
-        assert!(line.contains("write=137ms"), "{line}");
+        // write = 12+3+50+40+25 = 130
+        assert!(line.contains("write=130ms"), "{line}");
         assert!(line.contains("class_a_sub(body=7 head=2"), "{line}");
         assert!(line.contains("pre_asm=30ms"), "{line}");
         assert!(line.contains("assemble=8ms"), "{line}");
@@ -2437,7 +2427,6 @@ mod tests {
         let mut s = IbdPerfSample::default();
         s.phase_blks = 10;
         s.write.utxo_apply_ns = 5_000_000; // 500 us/blk
-        s.write.tweak_ns = 3_000_000; // 300 us/blk
         s.spend_ranged = 10;
         s.wf_body_store = 3;
         s.wf_store_body_ms = 50;
@@ -2470,7 +2459,6 @@ mod tests {
         assert!(line.contains("ensure="), "{line}");
         assert!(line.contains("write="), "{line}");
         assert!(line.contains("spend=500(r=10)"), "{line}");
-        assert!(line.contains("tweaks=300"), "{line}");
         assert!(!line.contains("prefetch="), "{line}");
         assert!(!line.contains("wave body="), "{line}");
         assert!(!line.contains("sh seed="), "{line}");

@@ -514,13 +514,6 @@ fn outpoint_bytes(op: &OutPoint) -> [u8; 36] {
     b
 }
 
-/// True when `tx` has at least one P2TR output (BIP-352 eligible to consider).
-pub(crate) fn tx_has_p2tr_output(tx: &Transaction) -> bool {
-    tx.output
-        .iter()
-        .any(|o| is_p2tr(o.script_pubkey.as_bytes()))
-}
-
 fn taproot_outs(tx: &Transaction) -> Vec<TaprootOut> {
     let mut out = Vec::new();
     for (i, o) in tx.output.iter().enumerate() {
@@ -1202,14 +1195,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Tweaks come only from the index builder: each connect is sealed once
+    /// released, a disconnect truncates, and the replacement block is indexed.
     #[test]
-    fn confirm_hook_writes_thin_and_reorg_truncates() {
+    fn builder_writes_tweaks_and_reorg_truncates() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let seal = |h: u32| {
+            q.release_index_writebehind(Height(h));
+            crate::build_indexes_released(&q).unwrap();
+        };
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
             .unwrap();
+        assert_eq!(
+            q.sptweaks_next_height(),
+            Some(Height(0)),
+            "connect writes none"
+        );
+        seal(0);
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         let thin0 = q.load_thin_tweaks(Height(0)).unwrap().expect("indexed");
         assert!(
@@ -1219,6 +1224,7 @@ mod tests {
 
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+        seal(1);
         assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
 
         q.disconnect_tip().unwrap();
@@ -1227,42 +1233,16 @@ mod tests {
 
         let b1b = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 601, 2);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1b, Milestone::NONE).unwrap();
+        seal(1);
         assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
         assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Neither Direct nor Tip confirms write tweaks; one builder pass fills
+    /// origin..=tip.
     #[test]
-    fn direct_confirm_does_not_index_tweaks() {
-        use rbitcoin_query::IndexMode;
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        q.enter_direct_index_mode().unwrap();
-        q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        assert_eq!(q.index_mode(), IndexMode::Direct);
-        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
-
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
-            .unwrap();
-        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-
-        assert_eq!(
-            q.sptweaks_next_height(),
-            Some(Height(0)),
-            "Direct IBD must not write-through tweaks"
-        );
-        assert!(
-            q.load_thin_tweaks(Height(0)).unwrap().is_none(),
-            "no thin row until post-IBD backfill"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn backfill_after_direct_indexes_through_tip_then_tip_write_through() {
-        use rbitcoin_query::IndexMode;
+    fn builder_fills_the_gap_then_follows_the_tip() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
         q.enter_direct_index_mode().unwrap();
@@ -1272,57 +1252,20 @@ mod tests {
             .unwrap();
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
-
-        let n = backfill_sp_tweaks(&q, &params).unwrap();
-        assert_eq!(
-            n, 2,
-            "resume/restart backfill fills Direct gap origin..=tip"
-        );
-        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
-        assert!(q.load_thin_tweaks(Height(0)).unwrap().is_some());
-        assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
-
-        q.enter_tip_index_mode();
-        assert_eq!(q.index_mode(), IndexMode::Tip);
-        let b2 = crate::mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
-        crate::accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
-        assert_eq!(
-            q.sptweaks_next_height(),
-            Some(Height(3)),
-            "Tip write-through after backfill caught up"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tip_write_skips_when_next_lags_backfill_owns_the_hole() {
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        q.enter_direct_index_mode().unwrap();
-        q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
-            .unwrap();
-        let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-
         q.enter_tip_index_mode();
         let b2 = crate::mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
         crate::accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
-        assert_eq!(
-            q.sptweaks_next_height(),
-            Some(Height(0)),
-            "Tip write must not put height 2 while next is 0"
-        );
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
 
-        let n = backfill_sp_tweaks(&q, &params).unwrap();
-        assert_eq!(
-            n, 3,
-            "backfill fills origin..=live tip including skipped write"
-        );
+        q.release_index_writebehind(Height(2));
+        crate::build_indexes_released(&q).unwrap();
         assert_eq!(q.sptweaks_next_height(), Some(Height(3)));
-        assert!(q.load_thin_tweaks(Height(2)).unwrap().is_some());
+        for h in 0..=2 {
+            assert!(
+                q.load_thin_tweaks(Height(h)).unwrap().is_some(),
+                "height {h}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

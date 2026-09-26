@@ -33,7 +33,6 @@ macro_rules! confirm_window {
             last_write_bip68_ns: AtomicU64,
             last_write_class_c_ns: AtomicU64,
             last_write_spend_ann_ns: AtomicU64,
-            last_write_tweak_ns: AtomicU64,
             last_pin_plan_ns: AtomicU64,
             last_pin_cold_ns: AtomicU64,
             last_pin_contract_ns: AtomicU64,
@@ -65,7 +64,6 @@ macro_rules! confirm_window {
                     last_write_bip68_ns: AtomicU64::new(0),
                     last_write_class_c_ns: AtomicU64::new(0),
                     last_write_spend_ann_ns: AtomicU64::new(0),
-                    last_write_tweak_ns: AtomicU64::new(0),
                     last_pin_plan_ns: AtomicU64::new(0),
                     last_pin_cold_ns: AtomicU64::new(0),
                     last_pin_contract_ns: AtomicU64::new(0),
@@ -142,7 +140,6 @@ confirm_window! {
     structural_create_h_ns,
     structural_bip68_ns,
     class_c_ns,
-    tweak_ns,
     // `rbtc-bf-wb` build + commit (off the write thread)
     blockfilter_ns,
     ensure_layout_ns,
@@ -378,8 +375,6 @@ impl ConfirmStats {
             .store(p.class_c_ns, Ordering::Relaxed);
         self.last_write_spend_ann_ns
             .store(p.spend_ann_ns, Ordering::Relaxed);
-        self.last_write_tweak_ns
-            .store(p.tweak_ns, Ordering::Relaxed);
     }
 
     pub fn last_write_phases(&self) -> LastWritePhases {
@@ -394,7 +389,6 @@ impl ConfirmStats {
             bip68_ns: self.last_write_bip68_ns.load(Ordering::Relaxed),
             class_c_ns: self.last_write_class_c_ns.load(Ordering::Relaxed),
             spend_ann_ns: self.last_write_spend_ann_ns.load(Ordering::Relaxed),
-            tweak_ns: self.last_write_tweak_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -680,7 +674,6 @@ pub struct LastWritePhases {
     pub bip68_ns: u64,
     pub class_c_ns: u64,
     pub spend_ann_ns: u64,
-    pub tweak_ns: u64,
 }
 
 impl LastWritePhases {

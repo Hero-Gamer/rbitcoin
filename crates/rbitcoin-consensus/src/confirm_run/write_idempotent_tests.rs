@@ -52,7 +52,6 @@ fn script_ok_append_contiguous_and_gap() {
             time: 0,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             hash: [hash_byte; 32],
-            txids: vec![],
             prev_mtp: 0,
         }
     }
@@ -311,7 +310,6 @@ fn prepared_at(
         time: 1,
         bits: CompactTarget::from_consensus(0x207f_ffff),
         hash,
-        txids: vec![],
         prev_mtp: 0,
     }
 }
@@ -808,7 +806,6 @@ fn script_wave_skips_preverified_txids() {
         time: 1,
         bits: CompactTarget::from_consensus(0x207f_ffff),
         hash: [1u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     };
     let batch = LoadedBatch {
@@ -925,7 +922,6 @@ fn pin_and_ensure_journey() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [3u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     let bp = BatchParents::new();
@@ -1034,7 +1030,6 @@ fn pin_and_ensure_journey() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [4u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     q.store().reset_spent_range_batch();
@@ -1077,7 +1072,6 @@ fn pin_and_ensure_journey() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [5u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     let bp_cold = BatchParents::new();
@@ -1197,7 +1191,6 @@ fn pin_and_ensure_journey() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [6u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     q.store().reset_spent_range_batch();
@@ -1284,7 +1277,6 @@ fn fill_same_batch_abs_from_append_loc_ram() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [7u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     let mut bp = BatchParents::new();
@@ -1332,7 +1324,6 @@ fn fill_same_batch_abs_from_append_loc_ram() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [8u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     q.store().reset_spent_range_batch();
@@ -1762,7 +1753,6 @@ fn fill_just_written_survives_until_last_started_write() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [9u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     q.store().reset_spent_range_batch();
@@ -1851,7 +1841,6 @@ fn fill_stamp_spent_hole_from_write_tls() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [9u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     q.store().reset_spent_range_batch();
@@ -1946,7 +1935,6 @@ fn pin_and_ensure_from_pin_loc_without_tls() {
         time: 1,
         bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
         hash: [8u8; 32],
-        txids: vec![],
         prev_mtp: 0,
     }];
     ensure_spend_abs_layouts(&parents, &child).expect("abs from pin loc");
