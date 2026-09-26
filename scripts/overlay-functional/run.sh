@@ -55,6 +55,15 @@ WORKDIR="$(mktemp -d /tmp/rbitcoin-overlay.XXXXXX)"
 cleanup() {
   local st=$?
   set +e
+  if [[ "$st" -ne 0 && -d "$WORKDIR/i2p" ]]; then
+    echo "overlay-functional: i2pd logs" >&2
+    local log
+    for log in "$WORKDIR"/i2p/n*/i2pd.log; do
+      [[ -f "$log" ]] || continue
+      echo "----- $log -----" >&2
+      tail -n 40 "$log" >&2
+    done
+  fi
   if [[ -d "$WORKDIR/tor" ]]; then
     find "$WORKDIR/tor" -name tor.pid -print0 2>/dev/null \
       | xargs -0 -r -I{} sh -c 'kill "$(cat "$1")" 2>/dev/null' _ {}
@@ -65,7 +74,7 @@ cleanup() {
     done
     if [[ -f "$WORKDIR/i2p/loopbacks" ]]; then
       while read -r ip; do
-        sudo ip addr del "$ip/8" dev lo 2>/dev/null || true
+        sudo ip addr del "$ip/32" dev lo 2>/dev/null || sudo ip addr del "$ip/8" dev lo 2>/dev/null || true
       done <"$WORKDIR/i2p/loopbacks"
     fi
   fi

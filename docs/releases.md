@@ -139,7 +139,7 @@ show as `core-functional / core-functional` and so on.
 | Check | Who |
 |-------|-----|
 | `qc` `test` `windows` `macos` `coverage` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, deny, script self-tests, clippy, then nixos-module-eval. |
-| `mutants` | Nightly `47 7 * * *` (00:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests, new code first, then a backlog cursor. 5 hour budget. Not required. `MISSED` is an artifact. |
+| `mutants` | Nightly `47 3 * * *` (20:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests, new code first, then a backlog cursor. 5 hour budget. Not required. `MISSED` is an artifact. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `warnet-example` | Label **`warnet`**, `workflow_dispatch`; via `release-gate.yml` on label **`release`** **or** ship version. Two-tank Docker lab. |

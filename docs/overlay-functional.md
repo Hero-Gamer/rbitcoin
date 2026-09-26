@@ -21,7 +21,7 @@ GitHub Actions starts:
 | Mesh | How | Must not |
 |------|-----|----------|
 | Tor | TestingTorNetwork (chutney `basic-min` equivalent: dirauths + client). `AssumeReachable`, short voting. Client SOCKS + control cookie. | Bootstrap public Tor / public HSDir wait |
-| i2pd | Six floodfills, **`netid` 16** (not mainnet 2), empty `reseed.urls`, zip-seeded RouterInfos, NTCP2 on `127.0.0.1`, SAM on n0/n1 | Public I2P reseed / netid 2 |
+| i2pd | Six floodfills, **`netid` 16** (not mainnet 2), empty `reseed.urls`, zip-seeded RouterInfos, NTCP2 on `127.0.0.0/8` (`/32` aliases), exploratory tunnels length 1, SAM on n0/n1 | Public I2P reseed / netid 2 |
 | cjdns | Two `cjdroute` processes, UDP peer on `127.0.0.1`, real TUN (`rbtc0` / `rbtc1`) | Silent bind to `127.0.0.1` if TUN fails |
 
 Tor SOCKS CONNECT to `127.0.0.1` is unsafe/rejected. Tor journeys are

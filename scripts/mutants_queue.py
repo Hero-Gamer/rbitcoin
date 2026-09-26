@@ -14,6 +14,11 @@ import sys
 from pathlib import Path
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Rust regex meta. `<` and `>` are not in this set: `\<` and `\>` are
+# word-boundary assertions in the regex crate, not literals.
+RUST_META = set(r"\.+*?()|[]{}^$#&-~")
+FINISHED = re.compile(r"(?m)^(\d+) mutants tested\b")
+OUTCOME = re.compile(r"^(caught|MISSED|TIMEOUT|unviable)\b")
 
 
 def parse_mutant(line: str) -> tuple[str, int, str] | None:
@@ -81,6 +86,30 @@ def order(mutants: list[str], changed: set[tuple[str, int]], old_index: int) -> 
     return new, old
 
 
+def rust_re_exact(line: str) -> str:
+    """One cargo-mutants ``--list`` line, anchored for ``--re``.
+
+    ``re.escape`` is the wrong escaper: it emits ``\\<`` and ``\\>``, and the
+    Rust regex crate treats those as word boundaries.
+    """
+    body = "".join("\\" + c if c in RUST_META else c for c in line)
+    return f"^{body}$"
+
+
+def finished_mutants(log: str) -> int:
+    """How many mutants a cargo-mutants batch actually finished.
+
+    Caught and unviable mutants are not printed as their own lines unless
+    ``--caught`` / ``--unviable`` are on. The summary line counts them.
+    A batch killed before that line falls back to the outcome lines that
+    were printed.
+    """
+    found = FINISHED.findall(log)
+    if found:
+        return int(found[-1])
+    return sum(1 for line in log.splitlines() if OUTCOME.match(line))
+
+
 def advance(new_skip: int, old_index: int, n_new: int, n_old: int, completed: int) -> tuple[int, int, bool]:
     """Return (new_skip, old_index, new_done).
 
@@ -116,7 +145,20 @@ def main(argv: list[str]) -> int:
     adv.add_argument("--completed", type=int, required=True)
     adv.add_argument("--head", required=True)
 
+    re_p = sub.add_parser("re")
+    re_p.add_argument("line")
+
+    fin = sub.add_parser("finished")
+    fin.add_argument("--log", type=Path, required=True)
+
     args = parser.parse_args(argv)
+    if args.cmd == "re":
+        print(rust_re_exact(args.line))
+        return 0
+    if args.cmd == "finished":
+        print(finished_mutants(args.log.read_text()))
+        return 0
+
     if args.cmd == "order":
         mutants = load_mutants(args.list.read_text())
         changed = changed_lines(args.diff.read_text()) if args.diff.stat().st_size else set()

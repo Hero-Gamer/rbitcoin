@@ -476,10 +476,13 @@ async fn hello(s: &mut TcpStream) -> Result<(), NetError> {
 }
 
 async fn write_line(s: &mut TcpStream, line: &str) -> Result<(), NetError> {
-    s.write_all(line.as_bytes())
-        .await
-        .map_err(|e| NetError::Encode(format!("i2p sam write: {e}")))?;
-    s.write_all(b"\n")
+    // i2pd's handshake read accepts a HELLO segment that has no newline, then
+    // treats the following byte as the next command. A lone `\n` is a malformed
+    // message and it closes the socket, so the command and its newline are one write.
+    let mut framed = Vec::with_capacity(line.len() + 1);
+    framed.extend_from_slice(line.as_bytes());
+    framed.push(b'\n');
+    s.write_all(&framed)
         .await
         .map_err(|e| NetError::Encode(format!("i2p sam write: {e}")))?;
     s.flush()
@@ -517,6 +520,28 @@ mod tests {
 
     const FAKE_DEST: &str = "fakeprivdest";
     static INSTALL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn i2p_sam_hello_carries_its_newline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 128];
+            let n = std::io::Read::read(&mut sock, &mut buf).unwrap();
+            let got = &buf[..n];
+            assert!(
+                got.starts_with(b"HELLO VERSION") && got.contains(&b'\n'),
+                "first SAM segment {got:?}"
+            );
+            std::io::Write::write_all(&mut sock, b"HELLO REPLY RESULT=OK VERSION=3.1\n").unwrap();
+        });
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        hello(&mut s).await.unwrap();
+        server.await.unwrap();
+    }
 
     async fn fake_sam(
         ok_hello: bool,
