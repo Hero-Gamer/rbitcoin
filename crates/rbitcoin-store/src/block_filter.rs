@@ -563,81 +563,44 @@ mod tests {
             "range read matches single"
         );
         assert!(t.slot(Height(10)).unwrap().is_none());
+        let gap = t.put(&[BlockFilterRecord {
+            height: Height(11),
+            slot: slot(11),
+            filter: &[1],
+        }]);
+        assert!(matches!(gap, Err(StoreError::Corrupt(m)) if m.contains("next height")));
     }
 
+    /// Crash states a live session cannot produce on demand: a commit that
+    /// synced body bytes but not its slots, then an idx HWM covering a slot
+    /// whose record is cut short. Open keeps the committed prefix each time.
     #[test]
-    fn open_drops_slots_whose_record_runs_past_the_body_end() {
+    fn open_keeps_the_committed_prefix_after_torn_commits() {
         let dir = tmp_dir();
+        let body = BlockFilterTable::seg_body_path(&dir, 0);
+        let end_of = |h: u64| FILE_HEADER_LEN as u64 + (0..=h).map(|i| 3 + i).sum::<u64>();
         let t = BlockFilterTable::open_or_create(&dir).unwrap();
         put_range(&t, 0, 4);
         drop(t);
-        // Idx HWM covers slot 4 but the body stops one byte into record 3.
-        let body = BlockFilterTable::seg_body_path(&dir, 0);
-        let end2 = FILE_HEADER_LEN as u64 + (0..3).map(|h| 3 + h).sum::<u64>();
-        set_file_hwm(&body, end2 + 1);
 
-        let t = BlockFilterTable::open_or_create(&dir).unwrap();
-        assert_eq!(t.next_height(), Height(3), "record 3 is torn");
-        assert_eq!(t.filter(Height(2)).unwrap().unwrap().0, vec![2u8; 5]);
-        put_range(&t, 3, 4);
-        assert_eq!(t.filter(Height(3)).unwrap().unwrap().0, vec![3u8; 6]);
-        assert_eq!(t.filter(Height(4)).unwrap().unwrap().0, vec![4u8; 7]);
-    }
-
-    #[test]
-    fn open_ignores_body_bytes_a_crashed_commit_left_past_the_last_slot() {
-        let dir = tmp_dir();
-        let t = BlockFilterTable::open_or_create(&dir).unwrap();
-        put_range(&t, 0, 4);
-        drop(t);
-        // A commit synced its body bytes, then died before its idx slots.
-        let body = BlockFilterTable::seg_body_path(&dir, 0);
-        let end = FILE_HEADER_LEN as u64 + (0..=4).map(|h| 3 + h).sum::<u64>();
-        set_file_hwm(&body, end + 50);
+        set_file_hwm(&body, end_of(4) + 50);
         {
             let mut f = fs::OpenOptions::new().write(true).open(&body).unwrap();
-            f.seek(SeekFrom::Start(end)).unwrap();
+            f.seek(SeekFrom::Start(end_of(4))).unwrap();
             f.write_all(&[0xab; 50]).unwrap();
         }
-
         let t = BlockFilterTable::open_or_create(&dir).unwrap();
         assert_eq!(t.next_height(), Height(5));
         assert_eq!(t.filter(Height(4)).unwrap().unwrap().0, vec![4u8; 7]);
         put_range(&t, 5, 5);
         assert_eq!(t.filter(Height(5)).unwrap().unwrap().0, vec![5u8; 8]);
-        assert_eq!(t.filter(Height(4)).unwrap().unwrap().0, vec![4u8; 7]);
-    }
-
-    #[test]
-    fn put_must_be_next_height() {
-        let dir = tmp_dir();
-        let t = BlockFilterTable::open_or_create(&dir).unwrap();
-        let err = t
-            .put(&[BlockFilterRecord {
-                height: Height(1),
-                slot: slot(1),
-                filter: &[1],
-            }])
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Corrupt(m) if m.contains("next height")));
-    }
-
-    #[test]
-    fn truncate_then_rewrite_and_reopen() {
-        let dir = tmp_dir();
-        let t = BlockFilterTable::open_or_create(&dir).unwrap();
-        put_range(&t, 0, 5);
-        t.truncate_through(Some(Height(2))).unwrap();
-        assert_eq!(t.next_height(), Height(3));
-        assert!(t.filter(Height(3)).unwrap().is_none());
-        put_range(&t, 3, 3);
         drop(t);
+
+        set_file_hwm(&body, end_of(2) + 1);
         let t = BlockFilterTable::open_or_create(&dir).unwrap();
-        assert_eq!(t.next_height(), Height(4));
-        assert_eq!(t.filter(Height(3)).unwrap().unwrap().0, vec![3u8; 6]);
-        assert_eq!(t.filter(Height(2)).unwrap().unwrap().0, vec![2u8; 5]);
-        t.truncate_through(None).unwrap();
-        assert_eq!(t.next_height(), Height(0));
+        assert_eq!(t.next_height(), Height(3), "record 3 is torn");
+        put_range(&t, 3, 4);
+        assert_eq!(t.filter(Height(4)).unwrap().unwrap().0, vec![4u8; 7]);
     }
 
     #[test]

@@ -336,7 +336,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` | P2P/chain (default) | Orphan whose prev is not on the tip is held (not `BLOCK_FAILED`); winner branch reconstructs |
 | `serve_after_restart_via_reconstruct` | P2P (**default**) | Cold serve via reconstruct. Restart RAM body queue is empty. Same-process `rehydrate_block_queue_residue` drops at/below tip, skips empty payloads, keeps above-tip wire, unknown height stays queued. `has_block` / known-archived keep and tip+1 gap `missing` stay `bq_rehydrate_residue_keep_drop_gap_and_unknown` |
 | `ibd_skips_dead_peer` | P2P (**default**) | Live seeder + `127.0.0.1:1` |
-| `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
+| `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk). With the filter index on, the disconnect truncates basic filters and the branch's filters replace them |
 | `reorg_same_height_then_multi_block_branch` | P2P/chain (default) | Mature pad + competing-spend reorg (third spend is prevout-spent, not `multi-spender`); same-height rival then multi-block reorg near tip; `getchaintips` `active` vs `valid-fork`; 16 vs 17 equal-work siblings park as `valid-headers` (product held cap 320 does not FIFO at 17); `precious_block` the loser; less work ignored; unknown hash `Block not found`. Held cap FIFO stays `hold_body_caps_fifo` |
 | `three_node_relay_path` | P2P (**default**) | Leaf IBD-syncs from a mid node that already synced (hop serve) |
 | `ibd_two_peers` | P2P (**default**) | Dual live seeders, 8-block IBD |

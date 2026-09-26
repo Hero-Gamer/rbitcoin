@@ -1879,15 +1879,26 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
     });
 }
 
-/// Most-work reorg — longer branch wins after disconnect/connect.
+/// Most-work reorg — longer branch wins after disconnect/connect. Basic
+/// filters are truncated with the disconnect and rebuilt for the branch.
 #[tokio::test]
 async fn reorg_to_longer_branch() {
+    use bitcoin::bip158::BlockFilter;
     use rbitcoin_consensus::{ChainParams, Milestone};
     use rbitcoin_net::{AcceptOutcome, ChainHub};
 
     let dir = TempDir::new().unwrap();
     let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    q.set_block_filter_index(true).unwrap();
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    // Coinbase-only blocks: the reference never looks up a prevout.
+    let reference = |b: &bitcoin::Block| {
+        BlockFilter::new_script_filter(b, |op| {
+            Err::<bitcoin::ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*op))
+        })
+        .unwrap()
+        .content
+    };
 
     let genesis = regtest_genesis();
     hub.accept_block(genesis.clone()).unwrap();
@@ -1900,6 +1911,9 @@ async fn reorg_to_longer_branch() {
         hub.accept_block(b).unwrap();
     }
     assert_eq!(hub.tip_height(), Some(4));
+    hub.query.seal_block_filters_released().unwrap();
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(4));
+    let old_3 = hub.query.basic_filter_at(3).unwrap().unwrap().0;
 
     // Fork from height 2: build longer branch 3',4',5',6'
     let fork_parent = hub
@@ -1930,6 +1944,16 @@ async fn reorg_to_longer_branch() {
     assert!(matches!(outcome, AcceptOutcome::Accepted { height: 6 }));
     assert_eq!(hub.tip_height(), Some(6));
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
+    hub.query.seal_block_filters_released().unwrap();
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(6));
+    for (h, b) in (3..).zip(&branch) {
+        assert_eq!(
+            hub.query.basic_filter_at(h).unwrap().unwrap().0,
+            reference(b),
+            "branch filter at {h}"
+        );
+    }
+    assert_ne!(hub.query.basic_filter_at(3).unwrap().unwrap().0, old_3);
 }
 
 /// Leftover/BadPrev: an orphan whose parent is not on the tip must be held, not
