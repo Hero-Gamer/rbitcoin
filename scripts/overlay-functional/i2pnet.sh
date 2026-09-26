@@ -60,6 +60,12 @@ enabled = false
 urls =
 yggurls =
 threshold = 1
+
+[exploratory]
+inbound.length = 1
+inbound.quantity = 1
+outbound.length = 1
+outbound.quantity = 1
 EOF
 }
 
@@ -74,7 +80,11 @@ for i in $(seq 0 $((N - 1))); do
   NTCPS+=("$ntcp")
   SAMS+=("$sam")
   echo "$ipv4" >>"$ROOT/loopbacks"
-  sudo ip addr add "$ipv4/8" dev lo 2>/dev/null || true
+  # /32, not /8. A second 127.0.0.0/8 overlaps the primary loopback and
+  # local delivery of SAM on 127.0.0.1 becomes unstable.
+  if ! ip -4 addr show dev lo | grep -q "inet ${ipv4}/"; then
+    sudo ip addr add "$ipv4/32" dev lo
+  fi
   write_conf "$dir" "$ntcp" "$sam" "$ipv4"
   i2pd --datadir "$dir" --conf "$dir/i2pd.conf" --address4 "$ipv4" --daemon
 done
