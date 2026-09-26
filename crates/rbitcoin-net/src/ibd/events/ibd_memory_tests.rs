@@ -266,3 +266,43 @@ fn unmapped_stored_run_walks_once_not_per_header() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `stored_header_height` stops after a cap (10,000 in production). A stored
+/// run that opens above that cap must walk once; later headers stay
+/// unresolved instead of each walking to the cap. The hub cap is lowered so
+/// this does not mine thousands of headers — the branch is the same.
+#[test]
+fn unmapped_run_past_the_walk_cap_walks_once() {
+    const CAP: u32 = 4;
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut chain = Vec::new();
+    let mut prev = gen;
+    // Two headers past the cap, plus a further tip so neither re-sent hash
+    // is the header tip (`header_height` would resolve that one without a walk).
+    for height in 1..=CAP + 3 {
+        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
+        prev = header.block_hash();
+        chain.push(header);
+    }
+    hub.ensure_headers_batch(&chain).unwrap();
+    hub.set_stored_height_walk_cap(CAP);
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let _ = hub.take_stored_height_walk_steps();
+
+    let above = (CAP as usize)..(CAP as usize + 2);
+    on_headers_batch(&mut st, &hub, chain[above.clone()].to_vec());
+    assert_eq!(
+        hub.take_stored_height_walk_steps(),
+        u64::from(CAP),
+        "a stored run past the walk cap walks once, not once per header"
+    );
+    for header in &chain[above] {
+        assert!(
+            st.header_fks.contains_key(&header.block_hash()),
+            "a header past the cap is still accepted"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
