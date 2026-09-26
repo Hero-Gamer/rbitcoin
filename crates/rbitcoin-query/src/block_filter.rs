@@ -8,7 +8,10 @@
 use bitcoin::bip158::{BlockFilter, FilterHash, FilterHeader, GcsFilterWriter};
 use bitcoin::hashes::Hash;
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_store::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoreError};
+use rbitcoin_store::{
+    read_index_window, BlockFilterRecord, BlockFilterSlot, BlockFilterTable, IndexHeight,
+    IndexWindow, StoreError,
+};
 
 use crate::{Query, QueryError};
 use std::collections::BTreeMap;
@@ -55,6 +58,24 @@ impl BlockFilterWriteBehind {
     }
 }
 
+/// GCS-encode a basic filter keyed by `block_hash` (internal byte order).
+fn encode_basic_filter<'a>(
+    block_hash: &[u8; 32],
+    elements: impl Iterator<Item = &'a [u8]>,
+) -> Result<BlockFilter, QueryError> {
+    let k0 = u64::from_le_bytes(block_hash[0..8].try_into().unwrap());
+    let k1 = u64::from_le_bytes(block_hash[8..16].try_into().unwrap());
+    let mut content = Vec::new();
+    let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
+    for e in elements {
+        writer.add_element(e);
+    }
+    writer
+        .finish()
+        .map_err(|_| StoreError::Corrupt("invariant: blockfilter encode"))?;
+    Ok(BlockFilter::new(&content))
+}
+
 impl Query {
     /// Basic filter of best-chain `height`, built from Class A, and its `header_fk`.
     fn build_basic_filter(&self, height: Height) -> Result<(BlockFilter, Fk), QueryError> {
@@ -70,17 +91,70 @@ impl Query {
             .store
             .txs
             .basic_filter_elements(first.0, first.0 + u64::from(n) - 1)?;
-        let k0 = u64::from_le_bytes(rec.hash[0..8].try_into().unwrap());
-        let k1 = u64::from_le_bytes(rec.hash[8..16].try_into().unwrap());
-        let mut content = Vec::new();
-        let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
-        for e in &elements {
-            writer.add_element(e);
+        let filter = encode_basic_filter(&rec.hash, elements.iter().map(Vec::as_slice))?;
+        Ok((filter, header_fk))
+    }
+
+    /// Confirmed heights `start..=end` as reads for [`Self::read_index_window`];
+    /// heights at or above `tweaks_from` also read what tweaks need.
+    pub fn index_heights(
+        &self,
+        start: u32,
+        end: u32,
+        tweaks_from: Option<u32>,
+    ) -> Result<Vec<IndexHeight>, QueryError> {
+        (start..=end)
+            .map(|h| {
+                let header_fk = self
+                    .store
+                    .confirmed
+                    .get(Height(h))?
+                    .ok_or(StoreError::Corrupt("invariant: index height not confirmed"))?;
+                let (first, n) = self
+                    .store
+                    .header_txs
+                    .get_range(header_fk)?
+                    .ok_or(StoreError::Corrupt("confirmed header missing body list"))?;
+                Ok(IndexHeight {
+                    height: Height(h),
+                    header_fk,
+                    first,
+                    n,
+                    tweaks: tweaks_from.is_some_and(|t| h >= t),
+                })
+            })
+            .collect()
+    }
+
+    /// Read a window of blocks and the parents they spend (completion session).
+    pub fn read_index_window(&self, heights: &[IndexHeight]) -> Result<IndexWindow, QueryError> {
+        read_index_window(&self.store.txs, heights)
+    }
+
+    /// Basic filter of `window.blocks[i]`.
+    pub fn basic_filter_from_window(
+        &self,
+        window: &IndexWindow,
+        i: usize,
+    ) -> Result<BlockFilter, QueryError> {
+        const OP_RETURN: u8 = 0x6a;
+        let block = &window.blocks[i];
+        let hash = self.store.get_header(block.header_fk)?.hash;
+        let mut elements: Vec<&[u8]> = Vec::new();
+        for tx in &block.txs {
+            for o in &tx.outs {
+                if o.script.first() != Some(&OP_RETURN) {
+                    elements.push(&o.script);
+                }
+            }
         }
-        writer
-            .finish()
-            .map_err(|_| StoreError::Corrupt("invariant: blockfilter encode"))?;
-        Ok((BlockFilter::new(&content), header_fk))
+        for e in block.edges.iter().flatten().filter(|e| !e.parent.is_null()) {
+            let out = window.prevout(e.parent, e.vout).ok_or(StoreError::Corrupt(
+                "invariant: blockfilter prevout missing",
+            ))?;
+            elements.push(&out.script);
+        }
+        encode_basic_filter(&hash, elements.into_iter())
     }
 
     pub fn block_filter_enabled(&self) -> bool {

@@ -552,6 +552,24 @@ fn analog_block_filters_from_class_a() {
         assert_eq!(header, filter.filter_header(&prev), "header chain at {h}");
         prev = header;
     }
+    // The completion-driven window reader builds the same filters, reading
+    // windows that straddle the prune line and share parents across heights.
+    for start in (0..=last).step_by(37) {
+        let end = (start + 36).min(last);
+        let window = q
+            .read_index_window(&q.index_heights(start, end, None).unwrap())
+            .unwrap();
+        for (i, block) in window.blocks.iter().enumerate() {
+            let h = start + i as u32;
+            assert_eq!(block.height, Height(h));
+            let built = q.basic_filter_from_window(&window, i).unwrap();
+            assert_eq!(
+                built.content,
+                q.basic_filter_at(h).unwrap().unwrap().0,
+                "window filter at {h}"
+            );
+        }
+    }
     drop(q);
 
     // Reorg the tip while the index is off: reopening with it on must not

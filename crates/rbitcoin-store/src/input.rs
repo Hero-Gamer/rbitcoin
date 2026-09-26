@@ -203,6 +203,19 @@ impl Input {
         Ok((plan.base + before * REC_LEN, span * REC_LEN))
     }
 
+    /// `input.loc` / `input.body` handles and paths for a machine's reads.
+    pub(crate) fn files(
+        &self,
+    ) -> (
+        (crate::io_handle::IoHandle, &Path),
+        (crate::io_handle::IoHandle, &Path),
+    ) {
+        (
+            (self.loc.read_fd(), self.loc.path()),
+            (self.body.read_fd(), self.body.path()),
+        )
+    }
+
     /// Parent edges in vin order. `None` when unstamped.
     pub fn edges(&self, fk: Fk) -> Result<Option<Vec<InputEdge>>, StoreError> {
         let Some(n) = self.n_in(fk)? else {

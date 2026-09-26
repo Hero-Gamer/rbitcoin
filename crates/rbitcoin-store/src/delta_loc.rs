@@ -358,6 +358,11 @@ impl DeltaLoc {
         }
         Ok(out)
     }
+
+    /// Locator handle and path for a machine's reads.
+    pub(crate) fn loc_file(&self) -> (crate::io_handle::IoHandle, &Path) {
+        (self.loc.read_fd(), self.loc.path())
+    }
 }
 
 /// Window reads for one [`DeltaLoc::plan_range_batch`].

@@ -315,6 +315,11 @@ impl CreateLoc {
         Ok(out)
     }
 
+    /// `create.loc` handle and path for a machine's reads.
+    pub(crate) fn loc_file(&self) -> (crate::io_handle::IoHandle, &Path) {
+        (self.loc.read_fd(), self.loc.path())
+    }
+
     fn extract_win_pairs(
         &self,
         win: &LocWinRead,
@@ -393,6 +398,15 @@ pub(crate) struct LocPlan {
     out_len: usize,
     jobs: Vec<(usize, u64)>,
     windows: Vec<LocWinRead>,
+}
+
+impl LocPlan {
+    /// `(file offset, buffer)` for each window read, in plan order.
+    pub(crate) fn reads(&mut self) -> impl Iterator<Item = (u64, &mut Vec<u8>)> {
+        self.windows
+            .iter_mut()
+            .map(|w| (loc_file_off(w.win_first, SLOT), &mut w.buf))
+    }
 }
 
 struct LocWinRead {

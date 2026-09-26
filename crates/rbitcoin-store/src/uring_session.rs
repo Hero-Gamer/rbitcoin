@@ -1214,6 +1214,8 @@ pub const KIND_SP_SEQSIGWIT: u8 = 13;
 /// SP-tweak machine: parent `txout.body` pread.
 pub const KIND_SP_PARENT: u8 = 14;
 pub const KIND_MPHF_G: u8 = 15;
+/// Block index build machine (filters + tweaks): every stage's reads.
+pub const KIND_INDEX_BUILD: u8 = 16;
 
 /// Pack `(kind, epoch, slot)` into `user_data`.
 ///
@@ -1422,6 +1424,7 @@ mod tests {
             KIND_SP_SEQSIGWIT,
             KIND_SP_PARENT,
             KIND_MPHF_G,
+            KIND_INDEX_BUILD,
         ];
         let mut seen = std::collections::HashSet::new();
         for k in kinds {
