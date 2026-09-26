@@ -3031,6 +3031,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
     let seed_ms = sh.seed_ns / 1_000_000;
     let body_ms = sh.body_ns / 1_000_000;
     let head_ms = sh.head_ns / 1_000_000;
+    let sync_ms = sh.sync_ns / 1_000_000;
     let sh_ratio = if i.wall_ns == 0 {
         0u64
     } else {
@@ -3041,7 +3042,7 @@ pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
         "tip: accept h={h} tx={tx_count} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
          class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
          sh={sh_ms}ms sh_lag={sh_lag} \
-         (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} \
+         (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} sync={sync_ms} \
          pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
          spend={spend_ms}ms tweaks={tweak_ms}ms bf={bf_ms}ms bf_lag={bf_lag} \
          lookup={lookup_ms}ms struct={structural_ms}ms \
@@ -3084,6 +3085,7 @@ fn log_tip_accept_sh(
         seed_ns: w.sh_seed_ns,
         body_ns: w.sh_body_ns,
         head_ns: w.sh_head_ns,
+        sync_ns: w.sh_sync_ns,
         pin: w.sh_collect_pin,
         cold: w.sh_collect_cold,
         creates: w.sh_create_n,
@@ -4147,6 +4149,7 @@ mod tests {
                 seed_ns: 800_000_000,
                 body_ns: 600_000_000,
                 head_ns: 300_000_000,
+                sync_ns: 50_000_000,
                 pin: 4_000,
                 cold: 12,
                 creates: 12_000,
@@ -4161,12 +4164,12 @@ mod tests {
             "wall=2500ms",
             "class_c=7ms",
             "(strong=5 tip_set=2)",
-            "sh=1725ms", // 20+5+800+600+300
+            "sh=1775ms", // 20+5+800+600+300+50
             "sh_lag=2",
             // Substep ms are unitless inside the paren (outer fields carry `ms`).
             "seed=800",
             "body=600",
-            "head=300",
+            "head=300 sync=50",
             "creates=12000",
             "unique=9500",
             "written=9400",
@@ -4182,7 +4185,7 @@ mod tests {
             "pres=3ms",
             // 2500 - (100+200+50+7+1725+80+400+300+40+10+20+3) = -435 → 0
             "other=0ms",
-            "sh/wall=69%",
+            "sh/wall=71%",
         ] {
             assert!(line.contains(tok), "{tok}: {line}");
         }

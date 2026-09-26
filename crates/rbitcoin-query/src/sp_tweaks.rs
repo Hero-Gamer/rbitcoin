@@ -1,7 +1,7 @@
 //! Thin BIP-352 tweak index: Query join of `sp_tweaks.*` + Class A.
 
 use super::*;
-use rbitcoin_store::SpTweaksTable;
+use rbitcoin_store::{SpTweaksTable, TrimLast};
 
 /// Eligible tx after thin-index join (P2TR outs only).
 #[derive(Clone, Debug)]
@@ -181,9 +181,57 @@ impl Query {
     fn ensure_sp_tweaks(&self, origin: Height) -> Result<(), QueryError> {
         let mut g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            *g = Some(SpTweaksTable::open_or_create(self.store.path(), origin)?);
+            let t = SpTweaksTable::open_or_create(self.store.path(), origin)?;
+            self.repair_sp_tweaks(&t)?;
+            *g = Some(t);
             self.sptweaks_origin
                 .store(origin.0, AtomicOrdering::Release);
+        }
+        Ok(())
+    }
+
+    /// Trim the tweak table to what the chain backs after a crash: drop
+    /// heights above the tip (a disconnect whose truncate never ran), then
+    /// fit the last record to its block's tx count.
+    pub(crate) fn repair_sp_tweaks(&self, t: &SpTweaksTable) -> Result<(), QueryError> {
+        let before = t.next_height();
+        t.truncate_through_tip(self.tip_height())?;
+        while let Some(h) = t
+            .next_height()
+            .0
+            .checked_sub(1)
+            .filter(|&h| h >= t.origin_height().0)
+        {
+            let header_fk = self
+                .store
+                .confirmed
+                .get(Height(h))?
+                .ok_or(StoreError::Corrupt(
+                    "invariant: sp_tweaks height below tip not confirmed",
+                ))?;
+            let (_, n_tx) = self
+                .store
+                .header_txs
+                .get_range(header_fk)?
+                .ok_or(StoreError::Corrupt("confirmed header missing body list"))?;
+            match t.trim_last_record(n_tx)? {
+                TrimLast::Clean => break,
+                TrimLast::Cut => {
+                    rbitcoin_log::warn!("sp_tweaks: cut uncommitted body bytes after height {h}");
+                    break;
+                }
+                TrimLast::Dropped => {
+                    rbitcoin_log::warn!("sp_tweaks: dropped torn record at height {h}");
+                }
+            }
+        }
+        let after = t.next_height();
+        if after != before {
+            rbitcoin_log::warn!(
+                "sp_tweaks: repaired to the chain: next {} → {}",
+                before.0,
+                after.0
+            );
         }
         Ok(())
     }

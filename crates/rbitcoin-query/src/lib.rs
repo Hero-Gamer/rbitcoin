@@ -251,6 +251,10 @@ struct ShWriteBehind {
     ram_head: Mutex<HashMap<[u8; 32], Vec<Fk>>>,
     /// Serializes the one Class B appender (worker vs generate drain).
     appender: Mutex<()>,
+    /// Max create fk applied to the SH tables (may lead `include_hwm`).
+    applied_max_fk: AtomicU64,
+    /// Last durable `include_hwm` advance (throttles table syncs in a burst).
+    last_durable: Mutex<std::time::Instant>,
 }
 
 impl ShWriteBehind {
@@ -263,6 +267,8 @@ impl ShWriteBehind {
             applying: Mutex::new(None),
             ram_head: Mutex::new(HashMap::new()),
             appender: Mutex::new(()),
+            applied_max_fk: AtomicU64::new(0),
+            last_durable: Mutex::new(std::time::Instant::now()),
         }
     }
 }
@@ -487,6 +493,14 @@ impl Query {
             let _ = q.ensure_height_by_hash_index(tip);
         }
         q.recover_sh_writebehind()?;
+        if let Some(t) = q
+            .sp_tweaks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            q.repair_sp_tweaks(t)?;
+        }
         q.sweep_spill_at_or_below_pruneheight()?;
         Ok(q)
     }

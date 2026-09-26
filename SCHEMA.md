@@ -626,6 +626,12 @@ single-file, `header_fk` + absolute off) are unlinked on store open.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
+Durability: each put writes and syncs the body, then writes and syncs the
+idx, so an idx slot on disk never points at body bytes a power cut can lose.
+Open (and first enable) repairs a crash tail: slots above the tip (a
+disconnect whose truncate never ran) are dropped, then the last record is fit
+to its `n_tx` — body bytes past it are cut, and a short record drops its slot.
+
 ---
 
 ## Tx address head (segmented `tx.head/`)
