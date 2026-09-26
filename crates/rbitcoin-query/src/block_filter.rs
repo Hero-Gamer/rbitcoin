@@ -11,28 +11,33 @@ use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoreError};
 
 use crate::{Query, QueryError};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// BIP158 basic filter Golomb-Rice parameters (`M`, `P`).
 const BASIC_FILTER_M: u64 = 784_931;
 const BASIC_FILTER_P: u8 = 19;
-/// Heights built per commit. Bounds RAM held between build and commit and
-/// how long a disconnect waits on the appender lock.
+/// Heights per build unit. Bounds RAM per in-flight chunk and how long a
+/// disconnect waits on the appender lock.
 const SEAL_CHUNK: u32 = 64;
+/// Finished chunks committed per durable put (one fsync pair) while a gap closes.
+const GROUP_CHUNKS: u32 = 8;
 
 /// Block filter write-behind state (one appender thread).
 pub(crate) struct BlockFilterWriteBehind {
     /// Serializes commits against disconnect truncate.
-    appender: std::sync::Mutex<()>,
-    wake: std::sync::Mutex<()>,
-    wake_cv: std::sync::Condvar,
+    appender: Mutex<()>,
+    wake: Mutex<()>,
+    wake_cv: Condvar,
 }
 
 impl BlockFilterWriteBehind {
     pub(crate) fn new() -> Self {
         Self {
-            appender: std::sync::Mutex::new(()),
-            wake: std::sync::Mutex::new(()),
-            wake_cv: std::sync::Condvar::new(),
+            appender: Mutex::new(()),
+            wake: Mutex::new(()),
+            wake_cv: Condvar::new(),
         }
     }
 
@@ -79,8 +84,7 @@ impl Query {
     }
 
     pub fn block_filter_enabled(&self) -> bool {
-        self.block_filter_enabled
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.block_filter_enabled.load(Ordering::SeqCst)
     }
 
     /// Turn the index on (opening or creating the table) or off.
@@ -94,8 +98,7 @@ impl Query {
             self.trim_block_filters_to_best_chain(&table)?;
             let _ = self.block_filters.set(table);
         }
-        self.block_filter_enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        self.block_filter_enabled.store(enabled, Ordering::SeqCst);
         Ok(())
     }
 
@@ -246,38 +249,25 @@ impl Query {
         Ok(built.len() as u32)
     }
 
-    /// Seal the next chunk of `[next, through]` on this thread. Returns
-    /// heights committed.
-    pub fn seal_block_filters_chunk(&self, through: u32) -> Result<u32, QueryError> {
-        let Some(table) = self.block_filter_table() else {
-            return Ok(0);
-        };
-        let start = table.next_height().0;
-        if start > through {
-            return Ok(0);
-        }
-        let t0 = std::time::Instant::now();
-        let end = through.min(start.saturating_add(SEAL_CHUNK - 1));
-        let built = self.build_basic_filters(start, end)?;
-        let n = self.commit_basic_filters(table, start, &built)?;
-        crate::note_confirm(
-            &self.confirm_stats().blockfilter_ns,
-            t0.elapsed().as_nanos() as u64,
-        );
-        Ok(n)
-    }
-
-    /// Materialize step: build up to `workers` chunks of `[next, through]` in
-    /// parallel, then commit them in height order, stopping between commits.
+    /// Seal `[next, through]`; returns heights committed.
     ///
-    /// Trade: RAM holds `workers × SEAL_CHUNK` built filters (tens of MB at
-    /// mainnet sizes) and `workers` threads read Class A at once, only while
-    /// a gap is being closed.
-    fn seal_block_filters_parallel(
+    /// A one-chunk gap (the tip) builds on this thread. A wider gap (the
+    /// materialize, or a later catch-up) runs up to `workers` threads for the
+    /// whole pass: they take 64-height chunks in order from a shared cursor
+    /// and this thread commits them in order, up to `GROUP_CHUNKS` finished
+    /// chunks per durable put. `stop` is checked between commits. A commit
+    /// that finds the watermark or `confirmed[h]` moved (a reorg) ends the
+    /// pass early. `on_commit` gets the new watermark after each commit.
+    ///
+    /// Trade: at most `2 × workers` built chunks wait in RAM (tens of MB at
+    /// mainnet sizes), and `workers` threads read Class A at once, only
+    /// while a gap wider than one chunk is closing.
+    fn seal_block_filters(
         &self,
         through: u32,
         workers: u32,
-        stop: &std::sync::atomic::AtomicBool,
+        stop: &AtomicBool,
+        on_commit: &mut dyn FnMut(u32),
     ) -> Result<u32, QueryError> {
         let Some(table) = self.block_filter_table() else {
             return Ok(0);
@@ -287,32 +277,29 @@ impl Query {
             return Ok(0);
         }
         let t0 = std::time::Instant::now();
-        let chunks: Vec<(u32, u32)> = (0..workers)
-            .map(|i| start.saturating_add(i * SEAL_CHUNK))
-            .take_while(|&s| s <= through)
-            .map(|s| (s, through.min(s.saturating_add(SEAL_CHUNK - 1))))
-            .collect();
-        let built = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunks
-                .iter()
-                .map(|&(s, e)| scope.spawn(move || self.build_basic_filters(s, e)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("block filter build worker"))
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        let mut done = 0;
-        for (&(s, _), chunk) in chunks.iter().zip(&built) {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+        let n_chunks = (through - start) / SEAL_CHUNK + 1;
+        let chunk = |k: u32| {
+            let s = start + k * SEAL_CHUNK;
+            (s, through.min(s + SEAL_CHUNK - 1))
+        };
+        let done = if n_chunks == 1 || workers <= 1 {
+            let mut done = 0;
+            for k in 0..n_chunks {
+                if k > 0 && stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (s, e) = chunk(k);
+                let n = self.commit_basic_filters(table, s, &self.build_basic_filters(s, e)?)?;
+                done += n;
+                if n == 0 {
+                    break;
+                }
+                on_commit(s + n - 1);
             }
-            let n = self.commit_basic_filters(table, s, chunk)?;
-            done += n;
-            if n == 0 {
-                break;
-            }
-        }
+            done
+        } else {
+            self.seal_block_filters_pipelined(table, n_chunks, workers, &chunk, stop, on_commit)?
+        };
         crate::note_confirm(
             &self.confirm_stats().blockfilter_ns,
             t0.elapsed().as_nanos() as u64,
@@ -320,10 +307,89 @@ impl Query {
         Ok(done)
     }
 
+    fn seal_block_filters_pipelined(
+        &self,
+        table: &BlockFilterTable,
+        n_chunks: u32,
+        workers: u32,
+        chunk: &(dyn Fn(u32) -> (u32, u32) + Sync),
+        stop: &AtomicBool,
+        on_commit: &mut dyn FnMut(u32),
+    ) -> Result<u32, QueryError> {
+        type Built = Result<Vec<(BlockFilter, Fk)>, QueryError>;
+        let window = 2 * workers;
+        let cursor = AtomicU32::new(0);
+        let committed = Mutex::new(0u32);
+        let advanced = Condvar::new();
+        let abort = AtomicBool::new(false);
+        let (tx, rx) = std::sync::mpsc::channel::<(u32, Built)>();
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(n_chunks) {
+                let tx = tx.clone();
+                let (cursor, committed, advanced, abort) = (&cursor, &committed, &advanced, &abort);
+                scope.spawn(move || loop {
+                    let k = cursor.fetch_add(1, Ordering::Relaxed);
+                    if k >= n_chunks {
+                        return;
+                    }
+                    let mut c = committed.lock().unwrap_or_else(|e| e.into_inner());
+                    while k >= *c + window && !abort.load(Ordering::Relaxed) {
+                        c = advanced.wait(c).unwrap_or_else(|e| e.into_inner());
+                    }
+                    drop(c);
+                    if abort.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let (s, e) = chunk(k);
+                    if tx.send((k, self.build_basic_filters(s, e))).is_err() {
+                        return;
+                    }
+                });
+            }
+            drop(tx);
+            let res = (|| {
+                let mut ready: BTreeMap<u32, Built> = BTreeMap::new();
+                let (mut next_k, mut done) = (0u32, 0u32);
+                while next_k < n_chunks && !stop.load(Ordering::Relaxed) {
+                    let Ok((k, built)) = rx.recv() else { break };
+                    ready.insert(k, built);
+                    let mut group = Vec::new();
+                    let mut end_k = next_k;
+                    while end_k - next_k < GROUP_CHUNKS {
+                        let Some(built) = ready.remove(&end_k) else {
+                            break;
+                        };
+                        group.extend(built?);
+                        end_k += 1;
+                    }
+                    if group.is_empty() {
+                        continue;
+                    }
+                    let s = chunk(next_k).0;
+                    let n = self.commit_basic_filters(table, s, &group)?;
+                    done += n;
+                    if n == 0 {
+                        break;
+                    }
+                    next_k = end_k;
+                    *committed.lock().unwrap_or_else(|e| e.into_inner()) = next_k;
+                    advanced.notify_all();
+                    on_commit(s + n - 1);
+                }
+                Ok(done)
+            })();
+            abort.store(true, Ordering::Relaxed);
+            advanced.notify_all();
+            drop(rx);
+            res
+        })
+    }
+
     /// Seal every released height now (regtest `generate`, tests).
     pub fn seal_block_filters_released(&self) -> Result<(), QueryError> {
+        let never = AtomicBool::new(false);
         while let Some(t) = self.block_filter_target() {
-            if self.seal_block_filters_chunk(t)? == 0 {
+            if self.seal_block_filters(t, 1, &never, &mut |_| {})? == 0 {
                 break;
             }
         }
@@ -338,26 +404,18 @@ impl Query {
     }
 }
 
-/// Progress of one materialize pass (a gap wider than one chunk).
-struct Materialize {
-    from: u32,
-    started: std::time::Instant,
-    last_log: std::time::Instant,
-}
-
 /// The block filter appender: after catch-up, seals `(hwm, released tip]`
-/// off the confirm path. A gap wider than one chunk is the materialize
-/// (parallel build, progress logs); at the tip each release is one chunk.
+/// off the confirm path. A gap wider than one chunk is a materialize
+/// (worker pool, progress logs); at the tip each release is one chunk.
 ///
 /// Stop is checked between commits, so shutdown waits at most one chunk
 /// build. Apply errors request `stop` and `on_fatal`, like the scripthash
 /// appender.
 pub fn spawn_block_filter_writebehind(
     query: std::sync::Arc<Query>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<AtomicBool>,
     on_fatal: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     const PROGRESS_EVERY: Duration = Duration::from_secs(10);
     let workers = std::thread::available_parallelism()
@@ -371,65 +429,52 @@ pub fn spawn_block_filter_writebehind(
             if let Some(tip) = query.tip_height() {
                 query.release_index_writebehind(tip);
             }
-            let mut pass: Option<Materialize> = None;
             while !stop.load(Ordering::Relaxed) {
-                let Some(target) = query.block_filter_target() else {
+                let next = query.basic_filter_hwm().ok().flatten().map_or(0, |h| h + 1);
+                let Some(target) = query.block_filter_target().filter(|&t| t >= next) else {
                     query.bf_wb.wait(Duration::from_millis(200));
                     continue;
                 };
-                let next = query.basic_filter_hwm().ok().flatten().map_or(0, |h| h + 1);
-                if next > target {
-                    if let Some(p) = pass.take() {
-                        rbitcoin_log::info!(
-                            "blockfilter: materialize done through={target} heights={} elapsed={:.1}s",
-                            target + 1 - p.from,
-                            p.started.elapsed().as_secs_f64()
-                        );
-                    }
-                    query.bf_wb.wait(Duration::from_millis(200));
-                    continue;
-                }
                 let t0 = Instant::now();
-                let res = if target - next >= SEAL_CHUNK {
-                    let p = pass.get_or_insert_with(|| {
-                        rbitcoin_log::info!(
-                            "blockfilter: materialize from={next} to={target} workers={workers}"
-                        );
-                        Materialize {
-                            from: next,
-                            started: t0,
-                            last_log: t0,
+                let wide = target - next >= SEAL_CHUNK;
+                let res = if wide {
+                    rbitcoin_log::info!(
+                        "blockfilter: materialize from={next} to={target} workers={workers}"
+                    );
+                    let mut last_log = t0;
+                    query.seal_block_filters(target, workers, &stop, &mut |hwm| {
+                        if last_log.elapsed() >= PROGRESS_EVERY {
+                            let secs = t0.elapsed().as_secs_f64();
+                            rbitcoin_log::info!(
+                                "blockfilter: materialize next={} tip={target} rate={:.0}/s remain={} elapsed={secs:.0}s",
+                                hwm + 1,
+                                f64::from(hwm + 1 - next) / secs.max(0.001),
+                                target - hwm
+                            );
+                            last_log = Instant::now();
                         }
-                    });
-                    if p.last_log.elapsed() >= PROGRESS_EVERY {
-                        let done = next - p.from;
-                        let secs = p.started.elapsed().as_secs_f64();
-                        let rate = f64::from(done) / secs.max(0.001);
-                        rbitcoin_log::info!(
-                            "blockfilter: materialize next={next} tip={target} rate={rate:.0}/s remain={} elapsed={secs:.0}s",
-                            target + 1 - next
-                        );
-                        p.last_log = Instant::now();
-                    }
-                    query.seal_block_filters_parallel(target, workers, &stop)
+                    })
                 } else {
-                    query.seal_block_filters_chunk(target)
+                    query.seal_block_filters(target, 1, &stop, &mut |_| {})
                 };
                 match res {
-                    Ok(0) => query.bf_wb.wait(Duration::from_millis(200)),
-                    Ok(_) if pass.is_none() => {
-                        rbitcoin_log::info!(
-                            "blockfilter: apply h={target} wall={}ms",
-                            t0.elapsed().as_millis()
-                        );
-                    }
-                    Ok(_) => {}
                     Err(e) => {
                         rbitcoin_log::error!("blockfilter write-behind: {e}");
                         stop.store(true, Ordering::SeqCst);
                         on_fatal();
                         return;
                     }
+                    Ok(0) => query.bf_wb.wait(Duration::from_millis(200)),
+                    Ok(n) if wide => rbitcoin_log::info!(
+                        "blockfilter: materialize {} through={} heights={n} elapsed={:.1}s",
+                        if next + n > target { "done" } else { "stopped" },
+                        next + n - 1,
+                        t0.elapsed().as_secs_f64()
+                    ),
+                    Ok(_) => rbitcoin_log::info!(
+                        "blockfilter: apply h={target} wall={}ms",
+                        t0.elapsed().as_millis()
+                    ),
                 }
             }
         })

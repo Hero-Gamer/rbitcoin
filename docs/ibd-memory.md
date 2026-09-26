@@ -69,7 +69,7 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 | **getheaders continuation** | full 2000-header reply locates from last hash | Next batch after that hash, not a replay from our tip. |
 | **headers poll** | skip if `best_known` cannot beat our tip | 120s `getheaders` only for peers that can still add work. |
 | **Chainwork prefix** | `Vec<Work>` `prefix[h] = work through h` (~32 B × tip; ≈28–32 MiB at 900k) | Process cache. Extend/truncate to `query.tip_height()`. Not durable. Restart rebuilds on first `chain_work`. |
-| **Block filter materialize** | ≤ workers (≤8) × 64 built filters in flight (tens of MiB at mainnet sizes) | Only while `rbtc-bf-wb` closes a gap wider than one chunk. Committed in height order and dropped; nothing is kept between chunks. |
+| **Block filter materialize** | ≤ 2 × workers (≤8) chunks of 64 built filters waiting to commit (tens of MiB at mainnet sizes) | Only while `rbtc-bf-wb` closes a gap wider than one chunk. Workers stop at the window; committed chunks are dropped. |
 | **Fee history** | ≤1008 `(height, p10)` entries (~16 KiB) | Read from the chain per connected block; backfilled over the newest 1008 blocks when relay turns on (`txstat` + `spent` span reads, no bodies). Not a cache: every entry is a chain fact. |
 | **Mempool fee snapshot** | Published Arc (chunks + live count/vsize/total_fee) | Dirty/singleflight ≤~1 s. Admit only marks dirty. `GET /mempool` Arc-loads; no graph walk, no body clones. |
 | **Mempool tx-body snapshot** | Lazy; ≤ one extra live-pool of `Arc<Transaction>` + JSON `OnceLock` after first unix `/internal` mempool-tx page | Dirty/singleflight. Not FIFO/LRU. Operators who never hit unix `/internal` do not keep this. |
