@@ -96,7 +96,7 @@ The write thread `sync_data`s spend annotations and the Class A bodies replay ne
 | Class C barrier (`strong`, `header_txs`, `confirmed`, `tip_seal`) | No. This is the commit point. | Every barrier |
 | Spend annotations (`spent.body`, `spenders`) | Yes, from the block body and parent outputs, when those bytes are durable | Periodic, then advance `A` |
 | Class A bodies replay and the tip window read (`txid.body`, `txout`, `seqsigwit`, `input`, `txstat`) | No. A torn page cannot be rebuilt | Same periodic `sync_data`, which advances durable-through `D`. Open revalidates `(D, tip]` and at least the last 6 |
-| Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync` |
+| Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync`. SH write-behind syncs the SH tables before it advances `scripthash.include_hwm` (a tip block, the end of a catch-up burst, or ≥1 s since the last advance); recovery replays the idempotent appends above that HWM. `sync=` on `tip: accept` |
 | BIP-352 tweaks (`sp_tweaks.*`) | Yes, backfill from Class A | Each put syncs body, then idx. Open drops heights above the tip and fits the last record to its `n_tx` |
 | Mempool sidecar | No. RAM is source of truth | Leave the 5 s path |
 
