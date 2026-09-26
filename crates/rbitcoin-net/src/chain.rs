@@ -37,7 +37,9 @@ pub struct TipEvent {
 struct HeaderSyncNode {
     fk: Fk,
     header: Header,
-    height: u32,
+    /// Resolved height. `None` means the ancestor walk hit the cap; children
+    /// of that node must not walk again.
+    height: Option<u32>,
 }
 
 /// Never-confirmed side-branch bodies plus first-seen seq (equal-work FIFO).
@@ -323,6 +325,9 @@ pub struct ChainHub {
     header_contextual_checks: AtomicU64,
     #[cfg(test)]
     stored_height_walk_steps: AtomicU64,
+    /// Test stand-in for the 10_000-step ancestor cap. Production uses 10_000.
+    #[cfg(test)]
+    stored_height_walk_cap: AtomicU32,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -376,6 +381,8 @@ impl ChainHub {
             header_contextual_checks: AtomicU64::new(0),
             #[cfg(test)]
             stored_height_walk_steps: AtomicU64::new(0),
+            #[cfg(test)]
+            stored_height_walk_cap: AtomicU32::new(10_000),
         }
     }
 
@@ -1244,20 +1251,22 @@ impl ChainHub {
                 .map_err(|e| NetError::Consensus(e.to_string()))?
             {
                 out[i] = fk;
-                let height = in_batch
-                    .get(&header.prev_blockhash.to_byte_array())
-                    .map(|p| p.height.saturating_add(1))
-                    .or_else(|| self.stored_header_height(&header.block_hash()));
-                if let Some(h) = height {
-                    in_batch.insert(
-                        hash,
-                        HeaderSyncNode {
-                            fk,
-                            header: *header,
-                            height: h,
-                        },
-                    );
-                }
+                let prev = header.prev_blockhash.to_byte_array();
+                // A walk that returns `None` is still recorded. Omitting it
+                // made every later header in the run walk to the cap again.
+                let height = if let Some(parent) = in_batch.get(&prev) {
+                    parent.height.map(|h| h.saturating_add(1))
+                } else {
+                    self.stored_header_height(&header.block_hash())
+                };
+                in_batch.insert(
+                    hash,
+                    HeaderSyncNode {
+                        fk,
+                        header: *header,
+                        height,
+                    },
+                );
                 continue;
             }
             let prev_fk = self.header_sync_prev_fk(header, &in_batch)?;
@@ -1272,7 +1281,7 @@ impl ChainHub {
                 HeaderSyncNode {
                     fk,
                     header: *header,
-                    height,
+                    height: Some(height),
                 },
             );
             recs.push((i, header_to_record(prev_fk, header, hash)));
@@ -1380,7 +1389,7 @@ impl ChainHub {
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Option<u32> {
         if let Some(n) = in_batch.get(&hash.to_byte_array()) {
-            return Some(n.height);
+            return n.height;
         }
         self.stored_header_height(hash)
     }
@@ -1391,7 +1400,11 @@ impl ChainHub {
         }
         let mut cur = *hash;
         let mut delta = 0u32;
-        for _ in 0..10_000 {
+        #[cfg(test)]
+        let cap = self.stored_height_walk_cap.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let cap = 10_000u32;
+        for _ in 0..cap {
             #[cfg(test)]
             self.stored_height_walk_steps
                 .fetch_add(1, Ordering::Relaxed);
@@ -2791,6 +2804,11 @@ impl ChainHub {
     #[cfg(test)]
     pub(crate) fn take_stored_height_walk_steps(&self) -> u64 {
         self.stored_height_walk_steps.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stored_height_walk_cap(&self, cap: u32) {
+        self.stored_height_walk_cap.store(cap, Ordering::Relaxed);
     }
 
     #[cfg(test)]
