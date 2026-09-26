@@ -511,11 +511,45 @@ impl Query {
         }
 
         self.set_sh_indexed_through_height(Some(job.height.0));
-        if tip_sh_max_fk > 0 {
-            let _ = self.store.scripthash.note_include_hwm(tip_sh_max_fk);
-            let _ = self.sh_run.publish_seal_watermark(tip_sh_max_fk);
-        }
+        self.sh
+            .applied_max_fk
+            .fetch_max(tip_sh_max_fk, Ordering::AcqRel);
+        self.advance_sh_include_hwm()?;
         Ok(true)
+    }
+
+    /// Sync the SH tables, then advance `include_hwm` (and SEAL) to the
+    /// applied max create fk.
+    ///
+    /// `include_hwm` tells recovery which creates are already durable, so it
+    /// must never lead the body/head bytes: a power cut after an unsynced
+    /// append would otherwise lose those creates for good. Runs when no job
+    /// waits behind this one (a tip block, or the end of a catch-up burst) or
+    /// a second after the last advance; recovery replays the idempotent
+    /// appends above a lagging HWM.
+    fn advance_sh_include_hwm(&self) -> Result<(), QueryError> {
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+        let want = self.sh.applied_max_fk.load(Ordering::Acquire);
+        if want == 0 {
+            return Ok(());
+        }
+        let queued = !self.sh.pending.lock().unwrap().is_empty();
+        let mut last = self.sh.last_durable.lock().unwrap();
+        if queued && last.elapsed() < EVERY {
+            return Ok(());
+        }
+        if want <= self.store.scripthash.include_hwm() {
+            return Ok(());
+        }
+        let t0 = std::time::Instant::now();
+        self.store.scripthash.flush()?;
+        let st = self.confirm_stats();
+        crate::note_confirm(&st.sh_sync_ns, t0.elapsed().as_nanos() as u64);
+        crate::note_confirm(&st.sh_sync_n, 1);
+        self.store.scripthash.note_include_hwm(want)?;
+        self.sh_run.publish_seal_watermark(want)?;
+        *last = std::time::Instant::now();
+        Ok(())
     }
 
     pub fn drop_sh_pending_from(&self, height: Height) {

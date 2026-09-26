@@ -220,6 +220,9 @@ confirm_window! {
     sh_create_n,
     sh_unique_n,
     sh_written_n,
+    // SH table sync before a durable include_hwm advance (write-behind)
+    sh_sync_n,
+    sh_sync_ns,
     // archive prep/write
     arch_blocks,
     ext_need,
@@ -654,6 +657,7 @@ impl ConfirmStats {
             seed_ns: self.sh_seed_ns.swap(0, Ordering::Relaxed),
             body_ns: self.sh_body_ns.swap(0, Ordering::Relaxed),
             head_ns: self.sh_head_ns.swap(0, Ordering::Relaxed),
+            sync_ns: self.sh_sync_ns.swap(0, Ordering::Relaxed),
             pin: self.sh_collect_pin.swap(0, Ordering::Relaxed),
             cold: self.sh_collect_cold.swap(0, Ordering::Relaxed),
             creates: self.sh_create_n.swap(0, Ordering::Relaxed),
@@ -735,6 +739,8 @@ pub struct TipShSnap {
     pub seed_ns: u64,
     pub body_ns: u64,
     pub head_ns: u64,
+    /// Table sync before a durable `include_hwm` advance.
+    pub sync_ns: u64,
     pub pin: u64,
     pub cold: u64,
     pub creates: u64,
@@ -748,6 +754,7 @@ impl TipShSnap {
             .saturating_add(self.seed_ns)
             .saturating_add(self.body_ns)
             .saturating_add(self.head_ns)
+            .saturating_add(self.sync_ns)
     }
 
     pub fn total_sh_ns(&self) -> u64 {

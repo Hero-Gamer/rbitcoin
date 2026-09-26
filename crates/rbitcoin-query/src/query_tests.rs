@@ -1038,6 +1038,41 @@ fn sh_writebehind_does_not_seed_until_release() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Write-behind syncs the scripthash tables before `include_hwm` claims their
+/// creates (a power cut must not leave the HWM ahead of body/head bytes):
+/// once for a burst of queued catch-up jobs, once for a released tip job.
+#[test]
+fn sh_writebehind_syncs_tables_before_include_hwm() {
+    let (dir, q) = temp_query("sh-sync-before-hwm");
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    let mut connect = |h: u32| {
+        let (header, ta) = coinbase_block(h, prev, parent);
+        q.commit_class_a_only(&header, &[ta]).unwrap();
+        prev = q.confirm_block(Height(h), &header.hash).unwrap();
+        parent = Some(header.hash);
+    };
+    for h in 0..=2 {
+        connect(h);
+    }
+    let _ = q.confirm_stats().take_window();
+    q.apply_sh_pending().unwrap();
+    let burst = q.confirm_stats().take_window();
+    assert_eq!(q.sh_indexed_through_height(), Some(2));
+    let hwm_burst = q.store().scripthash.include_hwm();
+    assert!(hwm_burst > 0, "burst advanced the durable HWM");
+    assert_eq!(burst.sh_sync_n, 1, "a queued burst syncs once");
+
+    connect(3);
+    q.release_index_writebehind(Height(3));
+    q.apply_sh_pending().unwrap();
+    let tip = q.confirm_stats().take_window();
+    assert!(q.store().scripthash.include_hwm() > hwm_burst);
+    assert_eq!(tip.sh_sync_n, 1, "a released tip job syncs before its HWM");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ram_sh_head_lookup_is_per_scripthash() {
     let (dir, q) = temp_query("ram-sh-head");
