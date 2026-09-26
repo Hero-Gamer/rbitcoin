@@ -29,9 +29,8 @@ fn hex_bytes(s: &str) -> Vec<u8> {
 
 /// Fixture exists with correct hex pattern
 #[test]
-fn fixture_invalid_pushdata_present_and_correct() {
-    let fixture =
-        repo_root().join("fuzz/promoted/regression/script-parsing/invalid_op_push_negative");
+fn fixture_op_return_divergence_present_and_correct() {
+    let fixture = repo_root().join("fuzz/promoted/regression/script-parsing/op_return_divergence");
 
     assert!(
         fixture.exists(),
