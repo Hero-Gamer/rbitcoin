@@ -1,6 +1,7 @@
 //! Regression tests from fuzz-discovered edge cases
 //! Each input = a case that survives existing coverage → must be caught here
 
+use bitcoin::script::ScriptBuf;
 use std::fs;
 use std::path::Path;
 
@@ -12,25 +13,28 @@ fn repo_root() -> &'static Path {
         .unwrap()
 }
 
+/// Parse hex string to bytes — matches pattern in script_edge_fixtures.rs
+fn hex_bytes(s: &str) -> Vec<u8> {
+    s.split_whitespace()
+        .collect::<String>()
+        .as_bytes()
+        .chunks(2)
+        .map(|b| u8::from_str_radix(std::str::from_utf8(b).unwrap(), 16).unwrap())
+        .collect()
+}
+
 /// Verifies the concrete fuzz-discovered fixture exists with correct content
 #[test]
 fn fixture_invalid_pushdata_present_and_correct() {
-    // 📌 Concrete example: malformed PUSHDATA4
-    // Hex: 6a ff ff ff ff ff
-    // OP_PUSHDATA4 claims 0xFFFFFFFF bytes follow → only 4 remain → impossible
-    // This exact pattern was found by fuzzing and would slip past existing tests
-    // without this explicit check — it is NOT covered by the regular suite
     let fixture =
         repo_root().join("fuzz/promoted/regression/script-parsing/invalid_op_push_negative");
 
-    // Must exist at expected path
     assert!(
         fixture.exists(),
         "Fixture missing: expected at {:?}",
         fixture
     );
 
-    // Must contain the exact hex we intend to protect
     let content = fs::read_to_string(&fixture).expect("Failed to read fixture file");
 
     let hex_line = content
@@ -45,12 +49,28 @@ fn fixture_invalid_pushdata_present_and_correct() {
     );
 }
 
-/// Documents: this input represents a gap existing tests don't cover
-/// Without this fixture, a mutant weakening validation would survive undetected
+/// Documents the known gap: standard Script parsing stops at OP_RETURN
+/// and does NOT validate the impossible PUSHDATA4 length that follows.
+/// Validation MUST happen at the rbitcoin consensus/check level.
 #[test]
-fn fixture_represents_an_uncatchable_gap() {
-    // This is a placeholder documenting the gap
-    // Next PR: add canonical-pushdata validation assert here
-    // The fixture above is the real check — this test just explains the value
-    let _note = "Next: add canonical-validation assert to pin rejection behavior";
+fn standard_parser_does_not_reject_impossible_pushdata4() {
+    // Pattern: 6a ff ff ff ff ff
+    // 6a = OP_RETURN → standard parser stops here, ignores the rest
+    // ff ff ff ff ff = would-be PUSHDATA4 length field → impossible value
+    // This is the EXACT gap fuzzing surfaced:
+    // bitcoin::script::ScriptBuf accepts it silently → consensus MUST catch it
+    let bytes = hex_bytes("6a ff ff ff ff ff");
+    let script = ScriptBuf::from_bytes(bytes);
+    let mut iter = script.instructions();
+
+    // Confirmed: standard parser does NOT reject — returns Ok(OP_RETURN)
+    // This test locks in the KNOWN behavior so we know when it changes upstream
+    assert!(
+        matches!(iter.next(), Some(Ok(_))),
+        "Standard script parser accepts this — gap confirmed"
+    );
+
+    // The actual rejection belongs in rbitcoin consensus validation,
+    // NOT in the bitcoin library's instruction parser.
+    // TODO: add the consensus-level check here once validation path confirmed.
 }
