@@ -264,18 +264,16 @@ with `value <= SATS` and drops txs that then have none. Default **1000**.
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
 figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
-Tip follow writes 65 B-class records from already-pinned parents when the
-cursor is caught up. Reorg truncates with tip. Post-IBD backfill is a
-**one-core** completion machine: `txout` wave, then `seqsigwit`/parent `txout`
-only for P2TR creates, secp on **idle** `rbtc-scripts-*` workers (block
-scripts and mempool accept still win), then **batched** height-blob
-+ idx writes (one body pwrite + one idx pwrite per consecutive group — not
-per tx). On local SSD, mainnet `origin` (Taproot, 709632) → tip is typically
-**about 1–2 hours** (~200–250 h/s through 2022, then tens of h/s once
-P2TR/ordinals density rises). The old serial `get_tx_full` path was
-~15–25 h/s (**several hours**). 9p / spinning rust longer. Kill-safe:
-`next_height` is the last complete put. INFO every 10 s:
-`sptweaks: backfill next=… tip=… rate=…/s remain=…`.
+The index is built after catch-up by the block index builder (`rbtc-idx-wb`,
+shared with `--block-filter-index`) from the taproot origin (709632 on
+mainnet), then sealed per released tip block; the confirm write thread writes
+no tweaks. One IO thread reads windows of heights on one completion session
+(`seqsigwit` and parent txids only for P2TR-output txs); one CPU thread
+(`rbtc-idx-cpu`) computes the tweaks, secp included, and commits one batched
+height-blob + idx write per window. It does not borrow `rbtc-scripts-*`, so
+block scripts and mempool accept never share workers with it. Reorg
+truncates with tip. Kill-safe: `next_height` is the last complete put. INFO
+every 10 s: `index: build next=… tip=… rate=…/s remain=…`.
 
 Cake Wallet’s scan isolate may still hardcode `electrs.cakewallet.com` even
 after a successful probe — see `COMPAT.md`.

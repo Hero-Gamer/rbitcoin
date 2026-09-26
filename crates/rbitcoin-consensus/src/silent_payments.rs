@@ -179,12 +179,12 @@ pub fn tweak_records_from_window(
 type ParentLookup<'a> = dyn Fn(Fk) -> Option<([u8; 32], &'a [OutputRecord])> + 'a;
 
 /// Per-tx tweak (`None` = ineligible) for `txs` in order. Only P2TR-output
-/// txs with loaded inputs are candidates; EC math runs on idle script workers.
+/// txs with loaded inputs are candidates; EC math runs on the caller.
 fn tweaks_for_txs<'a>(
     txs: &[&'a LoadedTweakTx],
     parent: &ParentLookup<'a>,
 ) -> Result<Vec<Option<TxTweak>>, ConsensusError> {
-    let mut jobs: Vec<(usize, Transaction, Vec<TxOut>)> = Vec::new();
+    let mut out = vec![None; txs.len()];
     for (i, t) in txs.iter().enumerate() {
         if !t.need_seqsigwit {
             continue;
@@ -193,20 +193,7 @@ fn tweaks_for_txs<'a>(
             continue;
         };
         let (tx, prevouts) = build_tx_and_prevouts(inputs, &t.outs, parent)?;
-        jobs.push((i, tx, prevouts));
-    }
-    let mut out = vec![None; txs.len()];
-    if jobs.is_empty() {
-        return Ok(out);
-    }
-    let slots: Vec<OnceLock<Option<TxTweak>>> = (0..jobs.len()).map(|_| OnceLock::new()).collect();
-    let idxs: Vec<usize> = (0..jobs.len()).collect();
-    crate::script_pool::try_for_each_parallel_idle(&idxs, |&j| {
-        let _ = slots[j].set(tweak_from_tx(&jobs[j].1, &jobs[j].2));
-        Ok(())
-    })?;
-    for (j, slot) in slots.into_iter().enumerate() {
-        out[jobs[j].0] = slot.into_inner().flatten();
+        out[i] = tweak_from_tx(&tx, &prevouts);
     }
     Ok(out)
 }

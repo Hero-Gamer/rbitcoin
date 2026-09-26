@@ -5,7 +5,7 @@
 //! watermark up to the released tip and reads each through
 //! [`rbitcoin_store::read_index_window`] (one completion session). One CPU
 //! worker builds each index for the heights that index still needs (tweak
-//! EC math on idle script workers) and commits each index once per window
+//! EC math included) and commits each index once per window
 //! under the index write-behind lock. A commit that finds its watermark or a
 //! `confirmed[h]` moved (a reorg) returns 0, and the IO thread re-plans from
 //! the watermarks. A wide gap is the materialize; at the tip each release is
