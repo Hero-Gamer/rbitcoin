@@ -128,7 +128,6 @@ fn stream_retry(err: &NetError) -> bool {
                 || l.contains("connection closed")
                 || l.contains("cant_reach")
                 || l.contains("timeout")
-                || l.contains("connection refused")
         }
         _ => false,
     }
@@ -253,10 +252,6 @@ impl I2pSam {
 
     pub async fn stream_forward(&mut self, port: u16) -> Result<(), NetError> {
         let mut last = None;
-        // A reset on the FORWARD socket is often that socket, not the session.
-        // Replacing the session drops the control connection; i2pd on a tiny
-        // net exits when that happens, and the next connect is refused.
-        let mut dead_strikes = 0u32;
         for _ in 0..24 {
             match self.stream_forward_once(port).await {
                 Ok(s) => {
@@ -266,16 +261,9 @@ impl I2pSam {
                 }
                 Err(e) if stream_socket_dead(&e) => {
                     last = Some(e);
-                    dead_strikes += 1;
-                    if dead_strikes >= 3 {
-                        let (sam, _) =
-                            Self::connect_session_dest(self.sam_addr, Some(&self.destination))
-                                .await?;
-                        *self = sam;
-                        dead_strikes = 0;
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
+                    let (sam, _) =
+                        Self::connect_session_dest(self.sam_addr, Some(&self.destination)).await?;
+                    *self = sam;
                 }
                 Err(e) if stream_retry(&e) => {
                     last = Some(e);
@@ -772,7 +760,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn i2p_sam_forward_retries_one_reset_on_the_same_session() {
+    async fn i2p_sam_forward_recreates_session_on_reset() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let (addr, _live) = fake_sam_opts(
             true,
@@ -785,32 +773,12 @@ mod tests {
         .await;
         let mut sam = I2pSam::connect(addr).await.unwrap();
         sam.stream_forward(18444).await.unwrap();
-        assert_eq!(stream_lines(&log, "SESSION CREATE").len(), 1);
-        assert_eq!(stream_lines(&log, "STREAM FORWARD").len(), 2);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn i2p_sam_forward_recreates_session_after_repeated_resets() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let (addr, _live) = fake_sam_opts(
-            true,
-            Arc::clone(&log),
-            Arc::new(Mutex::new(0)),
-            Arc::new(Mutex::new(0)),
-            false,
-            Arc::new(Mutex::new(3)),
-        )
-        .await;
-        let mut sam = I2pSam::connect(addr).await.unwrap();
-        sam.stream_forward(18444).await.unwrap();
         let creates = stream_lines(&log, "SESSION CREATE");
         assert_eq!(creates.len(), 2, "{creates:?}");
         assert!(
             creates[1].contains(&format!("DESTINATION={FAKE_DEST}")),
             "{creates:?}"
         );
-        assert_eq!(stream_lines(&log, "STREAM FORWARD").len(), 4);
     }
 
     fn rst_sam_socket(s: TcpStream) {
