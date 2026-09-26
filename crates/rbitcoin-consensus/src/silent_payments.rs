@@ -126,129 +126,6 @@ pub fn tweaks_at_height(
     tweaks_for_height(query, params, height)
 }
 
-/// Sequential hole fill from the table’s next height through **live** tip.
-///
-/// Re-reads tip after each snapshot so tip-follow during backfill does not
-/// leave a tail. Stop when `next_height > tip`. Safe to resume after kill
-/// (`next_height` is the last complete `put`).
-pub fn backfill_sp_tweaks(query: &Query, params: &ChainParams) -> Result<u32, ConsensusError> {
-    backfill_sp_tweaks_cancellable(query, params, None)
-}
-
-#[allow(clippy::type_complexity)] // packed row / pin / script-hash tuple is the on-disk shape
-/// Like [`backfill_sp_tweaks`], stopping when `cancel` is set (process exit).
-pub fn backfill_sp_tweaks_cancellable(
-    query: &Query,
-    params: &ChainParams,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<u32, ConsensusError> {
-    if !query.sptweaks_enabled() {
-        return Ok(0);
-    }
-    let origin = query.sptweaks_origin();
-    let mut wrote = 0u32;
-    const WRITE_BATCH: usize = 16;
-    let t0 = std::time::Instant::now();
-    let mut last_log = t0;
-    let mut pending: Vec<(Height, Fk, Vec<Option<[u8; 33]>>)> = Vec::new();
-    let flush = |pending: &mut Vec<(Height, Fk, Vec<Option<[u8; 33]>>)>,
-                 wrote: &mut u32|
-     -> Result<(), ConsensusError> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let n = pending.len() as u32;
-        query.put_sp_tweaks_blocks(pending)?;
-        *wrote = wrote.saturating_add(n);
-        pending.clear();
-        Ok(())
-    };
-    loop {
-        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-            flush(&mut pending, &mut wrote)?;
-            return Ok(wrote);
-        }
-        let Some(tip) = query.tip_height() else {
-            flush(&mut pending, &mut wrote)?;
-            return Ok(wrote);
-        };
-        let mut h = query
-            .sptweaks_next_height()
-            .unwrap_or(origin)
-            .0
-            .max(origin.0);
-        if h > tip.0 {
-            flush(&mut pending, &mut wrote)?;
-            return Ok(wrote);
-        }
-        let snapshot = tip.0;
-        while h <= snapshot {
-            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-                flush(&mut pending, &mut wrote)?;
-                return Ok(wrote);
-            }
-            let height = Height(h);
-            let Some(header_fk) = query.store().confirmed.get(height)? else {
-                flush(&mut pending, &mut wrote)?;
-                return Ok(wrote);
-            };
-            let fks = match query.block_tx_fks(height) {
-                Ok(f) => f,
-                Err(StoreError::NotFound) => {
-                    flush(&mut pending, &mut wrote)?;
-                    return Ok(wrote);
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let map = tweaks_for_height(query, params, height)?;
-            let mut recs = Vec::with_capacity(fks.len());
-            for fk in fks {
-                let txid = query.store().txs.body_txid(fk)?;
-                recs.push(map.get(&txid).map(|t| t.tweak));
-            }
-            pending.push((height, header_fk, recs));
-            if pending.len() >= WRITE_BATCH {
-                flush(&mut pending, &mut wrote)?;
-            }
-            h = h.saturating_add(1);
-            maybe_log_sptweaks_backfill(&mut last_log, t0, h, snapshot, wrote);
-        }
-        flush(&mut pending, &mut wrote)?;
-    }
-}
-
-fn maybe_log_sptweaks_backfill(
-    last_log: &mut std::time::Instant,
-    t0: std::time::Instant,
-    h: u32,
-    snapshot: u32,
-    wrote: u32,
-) {
-    if last_log.elapsed() < std::time::Duration::from_secs(10) {
-        return;
-    }
-    *last_log = std::time::Instant::now();
-    let remain = snapshot.saturating_sub(h.saturating_sub(1));
-    let secs = t0.elapsed().as_secs_f64().max(1e-3);
-    let rate = wrote as f64 / secs;
-    rbitcoin_log::info!(
-        "{}",
-        format_sptweaks_progress(h, snapshot, rate, remain, t0.elapsed())
-    );
-}
-
-pub(crate) fn format_sptweaks_progress(
-    next: u32,
-    tip: u32,
-    rate: f64,
-    remain: u32,
-    elapsed: std::time::Duration,
-) -> String {
-    format!(
-        "sptweaks: backfill next={next} tip={tip} rate={rate:.1}/s remain={remain} elapsed={elapsed:?}"
-    )
-}
-
 /// Confirmed height → eligible txid (internal order) → tweak.
 ///
 /// Pre-Taproot and missing heights return an empty map (no error). Does not
@@ -788,21 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn format_sptweaks_progress_has_operator_tokens() {
-        let line = super::format_sptweaks_progress(
-            800_000,
-            963_000,
-            25.0,
-            163_000,
-            std::time::Duration::from_secs(90),
-        );
-        assert!(line.contains("next=800000"), "{line}");
-        assert!(line.contains("tip=963000"), "{line}");
-        assert!(line.contains("rate=25.0/s"), "{line}");
-        assert!(line.contains("remain=163000"), "{line}");
-    }
-
-    #[test]
     fn official_vectors_receiving_tweaks() {
         let raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1118,70 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn backfill_cancellable_stops_before_walk() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        q.enter_direct_index_mode().unwrap();
-        q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
-            .unwrap();
-        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
-        let cancel = AtomicBool::new(true);
-        assert_eq!(
-            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
-            0
-        );
-        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
-        cancel.store(false, Ordering::Relaxed);
-        assert_eq!(
-            backfill_sp_tweaks_cancellable(&q, &params, Some(&cancel)).unwrap(),
-            1
-        );
-        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn maybe_log_sptweaks_backfill_emits_after_ten_secs() {
-        let t0 = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(11))
-            .expect("clock");
-        let mut last = t0;
-        maybe_log_sptweaks_backfill(&mut last, t0, 3, 10, 2);
-        assert!(last > t0);
-        let before = last;
-        maybe_log_sptweaks_backfill(&mut last, t0, 4, 10, 2);
-        assert_eq!(last, before);
-    }
-
-    #[test]
-    fn backfill_no_tip_and_already_caught_up() {
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
-
-        q.enter_direct_index_mode().unwrap();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
-            .unwrap();
-        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 1);
-        assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
-        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn backfill_noop_when_flag_off() {
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        assert_eq!(backfill_sp_tweaks(&q, &params).unwrap(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn tweaks_for_height_unknown_is_empty() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
@@ -1351,8 +1149,9 @@ mod tests {
             let i = window.blocks.len() - 1;
             assert_eq!(tweak_records_from_window(&window, i).unwrap(), want);
         }
-        let n = backfill_sp_tweaks(&q, &params).unwrap();
-        assert_eq!(n, 2);
+        q.release_index_writebehind(Height(1));
+        crate::build_indexes_released(&q).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
         let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
         assert_eq!(
             rows.len(),
