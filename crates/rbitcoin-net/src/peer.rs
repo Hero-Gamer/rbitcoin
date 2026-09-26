@@ -2542,10 +2542,10 @@ fn on_getcfilters(
     if !within_filter_watermark(hub, stop)? {
         return Ok(());
     }
-    for h in m.start_height..=stop {
-        let Some((body, _)) = filter_q(hub.query.basic_filter_at(h))? else {
-            return Ok(());
-        };
+    let Some(filters) = filter_q(hub.query.basic_filters(m.start_height, stop))? else {
+        return Ok(());
+    };
+    for (h, body) in (m.start_height..).zip(filters) {
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
             return Ok(());

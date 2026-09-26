@@ -164,6 +164,17 @@ impl Query {
             .map(|(body, slot)| (body, FilterHeader::from_byte_array(slot.filter_header))))
     }
 
+    /// Filter bytes for `start..=end` in one idx and one body read per
+    /// segment. `None` when the index is off or `end` is past the watermark.
+    pub fn basic_filters(&self, start: u32, end: u32) -> Result<Option<Vec<Vec<u8>>>, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(None);
+        };
+        Ok(table
+            .filters(Height(start), Height(end))?
+            .map(|v| v.into_iter().map(|(body, _)| body).collect()))
+    }
+
     /// Filter hash and header for `start..=end` without filter bytes.
     /// `None` when the index is off or `end` is past the watermark.
     pub fn basic_filter_hashes_and_headers(
