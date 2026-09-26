@@ -564,7 +564,7 @@ candidate once a workspace run shows the journey catching it.
 Fuzz corpus lives in `fuzz/corpus/` — gitignored and cached for 7 days.
 Inputs that catch surviving mutants are promoted to permanent fixtures:
 - Location: `fuzz/promoted/regression/<category>/`
-- `_bin` = input data; `_out` = expected `Debug` output
+- Plain hex line = input pattern; comments explain divergence behavior
 - Replayed via `fuzz_mined.rs` — runs in default `cargo test` suite
 - `cargo-mutants` exercises these inputs alongside unit tests
 

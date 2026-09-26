@@ -1,3 +1,4 @@
-# Regression fixture: malformed PUSHDATA with negative length
-# Expected: parser rejects this as invalid
+# Regression fixture: OP_RETURN divergence
+# bitcoin::ScriptBuf accepts as valid OP_RETURN
+# rbitcoin consensus REJECTS immediately
 6a ff ff ff ff ff
