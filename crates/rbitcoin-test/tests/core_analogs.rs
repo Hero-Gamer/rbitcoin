@@ -428,10 +428,10 @@ fn analog_reconstruct_after_lost_head() {
     assert_query_rebuilds_from_class_a(&store, &b1, &cb_txid);
 }
 
-/// Class A filter build matches rust-bitcoin's `new_script_filter` at every
-/// height: coinbase-only, a spend, and a block with a duplicate script, an
-/// OP_RETURN, and a segwit output. Below a seqsigwit prune the build still
-/// works (it needs no witness data), while reconstruct refuses.
+/// Filters the appender materializes from Class A match rust-bitcoin's
+/// `new_script_filter`: coinbase-only, a spend, and a block with a duplicate
+/// script, an OP_RETURN, and a segwit output. The build runs after a
+/// seqsigwit prune has passed those blocks (reconstruct refuses them).
 #[test]
 fn analog_block_filters_from_class_a() {
     use bitcoin::bip158::BlockFilter;
@@ -504,15 +504,6 @@ fn analog_block_filters_from_class_a() {
         })
         .unwrap()
     };
-    for (h, b) in blocks.iter().enumerate() {
-        let (built, header_fk) = q.build_basic_filter(Height(h as u32)).unwrap();
-        assert_eq!(built, reference(b), "filter at height {h}");
-        assert_eq!(
-            q.header_at_height(Height(h as u32)).unwrap().unwrap().0,
-            header_fk
-        );
-    }
-
     let tip = blocks.last().unwrap();
     let last = h_mixed + Query::SEQSIGWIT_KEEP_HEIGHTS + 1;
     pad_empty_from(
@@ -526,12 +517,10 @@ fn analog_block_filters_from_class_a() {
     q.set_prune_seqsigwit(true).unwrap();
     q.apply_prune_seqsigwit_tip().unwrap();
     assert!(q.reconstruct_block_at_height(Height(h_mixed)).is_err());
-    let (built, _) = q.build_basic_filter(Height(h_mixed)).unwrap();
-    assert_eq!(built, reference(&blocks[h_mixed as usize]));
 
-    // Materialize on the appender, stopped after its first commit and
-    // restarted: the table equals a serial per-height build with an
-    // unbroken header chain.
+    // Materialize after the prune on the appender, stopped after its first
+    // commit and restarted: every mined block matches the reference and the
+    // header chain is unbroken to the tip.
     q.set_block_filter_index(true).unwrap();
     let q = Arc::new(q);
     let run_appender = |until: &dyn Fn(Option<u32>) -> bool| {
@@ -555,9 +544,11 @@ fn analog_block_filters_from_class_a() {
     let mut prev = bitcoin::bip158::FilterHeader::from_byte_array([0u8; 32]);
     for h in 0..=last {
         let (bytes, header) = q.basic_filter_at(h).unwrap().unwrap();
-        let (built, _) = q.build_basic_filter(Height(h)).unwrap();
-        assert_eq!(bytes, built.content, "filter at {h}");
-        assert_eq!(header, built.filter_header(&prev), "header chain at {h}");
+        let filter = BlockFilter::new(&bytes);
+        if let Some(b) = blocks.get(h as usize) {
+            assert_eq!(filter, reference(b), "filter at {h}");
+        }
+        assert_eq!(header, filter.filter_header(&prev), "header chain at {h}");
         prev = header;
     }
     drop(q);

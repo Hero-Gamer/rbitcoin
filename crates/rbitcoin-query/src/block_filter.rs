@@ -57,7 +57,7 @@ impl BlockFilterWriteBehind {
 
 impl Query {
     /// Basic filter of best-chain `height`, built from Class A, and its `header_fk`.
-    pub fn build_basic_filter(&self, height: Height) -> Result<(BlockFilter, Fk), QueryError> {
+    fn build_basic_filter(&self, height: Height) -> Result<(BlockFilter, Fk), QueryError> {
         let (header_fk, rec) = self.header_at_height(height)?.ok_or(StoreError::Corrupt(
             "invariant: blockfilter height not confirmed",
         ))?;
