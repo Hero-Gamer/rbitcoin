@@ -596,6 +596,80 @@ fn pin_disconnect_to_genesis_reconnect_and_tip_shrink(
     );
 }
 
+fn copy_flat_dir(from: &std::path::Path, to: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+}
+
+/// Tweak-index crash states, each followed by a reopen: a disconnect whose
+/// `confirmed[]` shrink reached disk before its tweak truncate did (restored
+/// snapshot), then a put whose body bytes reached disk without their idx slot.
+/// Reopen trims tweaks to the tip and the last record to its `n_tx`.
+fn pin_sp_tweaks_survive_crashes(
+    q: Query,
+    td: &TestDatadir,
+    n: u32,
+    saved: &[(HeaderRecord, rbitcoin_query::TxApply)],
+) -> Query {
+    let store = td.store_path();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let items: Vec<_> = (0..n)
+        .map(|h| {
+            let fk = q.header_at_height(Height(h)).unwrap().unwrap().0;
+            (Height(h), fk, vec![None])
+        })
+        .collect();
+    q.put_sp_tweaks_blocks(&items).unwrap();
+    assert_eq!(q.sptweaks_next_height(), Some(Height(n)));
+    let snap = td.path().join("sptweaks-snap");
+    for d in ["sp_tweaks.idx", "sp_tweaks.body"] {
+        copy_flat_dir(&store.join(d), &snap.join(d));
+    }
+    q.disconnect_tip().unwrap();
+    q.flush().unwrap();
+    drop(q);
+    for d in ["sp_tweaks.idx", "sp_tweaks.body"] {
+        copy_flat_dir(&snap.join(d), &store.join(d));
+    }
+
+    let q = Query::open_or_create_tiny(&store).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(n - 2)));
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    assert_eq!(
+        q.sptweaks_next_height(),
+        Some(Height(n - 1)),
+        "open drops tweaks above the tip"
+    );
+    let (header, ta) = &saved[(n - 1) as usize];
+    let fk = q
+        .connect_block(Height(n - 1), header, std::slice::from_ref(ta))
+        .unwrap();
+    q.put_sp_tweaks_blocks(&[(Height(n - 1), fk, vec![None])])
+        .unwrap();
+    q.flush().unwrap();
+    drop(q);
+
+    let body = store.join("sp_tweaks.body").join("000000");
+    let mut raw = std::fs::read(&body).unwrap();
+    let hwm = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    raw.truncate(hwm as usize);
+    raw.push(0);
+    raw[8..16].copy_from_slice(&(hwm + 1).to_le_bytes());
+    std::fs::write(&body, &raw).unwrap();
+
+    let q = Query::open_or_create_tiny(&store).unwrap();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    assert!(
+        q.load_thin_tweaks(Height(n - 1)).unwrap().is_some(),
+        "last record reads without the orphan byte"
+    );
+    q
+}
+
 #[test]
 fn chain_connect_reorg_and_growth() {
     use rbitcoin_query::TxApply;
@@ -666,6 +740,7 @@ fn chain_connect_reorg_and_growth() {
 
     let q = Query::open_or_create_tiny(td.store_path()).unwrap();
     assert_eq!(q.tip_height(), Some(Height(N - 1)));
+    let q = pin_sp_tweaks_survive_crashes(q, &td, N, &saved);
     pin_disconnect_to_genesis_reconnect_and_tip_shrink(q, &td, N, &saved);
 }
 

@@ -97,6 +97,7 @@ The write thread `sync_data`s spend annotations and the Class A bodies replay ne
 | Spend annotations (`spent.body`, `spenders`) | Yes, from the block body and parent outputs, when those bytes are durable | Periodic, then advance `A` |
 | Class A bodies replay and the tip window read (`txid.body`, `txout`, `seqsigwit`, `input`, `txstat`) | No. A torn page cannot be rebuilt | Same periodic `sync_data`, which advances durable-through `D`. Open revalidates `(D, tip]` and at least the last 6 |
 | Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync` |
+| BIP-352 tweaks (`sp_tweaks.*`) | Yes, backfill from Class A | Each put syncs body, then idx. Open drops heights above the tip and fits the last record to its `n_tx` |
 | Mempool sidecar | No. RAM is source of truth | Leave the 5 s path |
 
 `tx.head` meta and the spend marker use the same parent-directory `fsync` as `tip_seal` after tmp+rename. Windows denies that directory handle; the file was already synced. A missing `spend_durable` keeps the checkblocks window (default 6). `checkblocks=0` still walks from genesis.

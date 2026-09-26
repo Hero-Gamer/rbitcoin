@@ -27,6 +27,16 @@ use rbitcoin_primitives::{Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// What [`SpTweaksTable::trim_last_record`] did to the last record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimLast {
+    Clean,
+    /// Cut body bytes past the record.
+    Cut,
+    /// Dropped the record's slot (short or bad length).
+    Dropped,
+}
+
 /// Compressed BIP-352 server tweak (Electrum tweaks wire).
 pub const TWEAK_LEN: u8 = 33;
 const SLOT: u64 = 4;
@@ -456,8 +466,11 @@ impl SpTweaksTable {
             if offs.is_empty() {
                 return Err(StoreError::Corrupt("sp_tweaks body exceeds u32 off"));
             }
+            // Body before idx, each synced: an idx slot on disk never points
+            // at body bytes a power cut can lose.
             if !body.is_empty() {
                 tail.body.write_at_pwrite(start, &body)?;
+                tail.body.flush()?;
             }
             let mut idx_blob = Vec::with_capacity(offs.len() * SLOT as usize);
             for o in &offs {
@@ -466,6 +479,7 @@ impl SpTweaksTable {
             let idx_at = FILE_HEADER_LEN as u64 + tail.n_slots * SLOT;
             if !idx_blob.is_empty() {
                 tail.idx.write_at_pwrite(idx_at, &idx_blob)?;
+                tail.idx.flush()?;
             }
             tail.n_slots = tail.n_slots.saturating_add(offs.len() as u64);
         }
@@ -524,6 +538,50 @@ impl SpTweaksTable {
             u64::from(new_tip.0 - self.origin + 1)
         };
         self.truncate_keep_slots(keep)
+    }
+
+    /// Fit the last record to its block's `n_tx` after a crash.
+    ///
+    /// The last record ends at the body's logical end, so body bytes of a put
+    /// whose idx slot never landed would be read as part of it: those are
+    /// cut. A record shorter than `n_tx` entries or with a bad length byte (an
+    /// idx that reached disk ahead of its body) drops its slot; the caller
+    /// then checks the new last record.
+    pub fn trim_last_record(&self, n_tx: u32) -> Result<TrimLast, StoreError> {
+        let mut inner = self.lock();
+        let Some(seg) = inner.segs.iter_mut().rev().find(|s| s.n_slots > 0) else {
+            return Ok(TrimLast::Clean);
+        };
+        let last = seg.n_slots - 1;
+        let off = u64::from(Self::read_off(seg, last)?);
+        let body_len = seg.body.logical_len();
+        let mut bytes = vec![0u8; body_len.saturating_sub(off) as usize];
+        seg.body.read_at(off, &mut bytes)?;
+        let mut used = Some(0usize);
+        for _ in 0..n_tx {
+            used = used.and_then(|at| match bytes.get(at) {
+                Some(0) => Some(at + 1),
+                Some(&TWEAK_LEN) if at + 1 + 33 <= bytes.len() => Some(at + 34),
+                _ => None,
+            });
+        }
+        match used {
+            Some(n) if n == bytes.len() => Ok(TrimLast::Clean),
+            Some(n) => {
+                seg.body.set_logical_len(off + n as u64)?;
+                seg.body.flush()?;
+                Ok(TrimLast::Cut)
+            }
+            None => {
+                seg.idx
+                    .set_logical_len(FILE_HEADER_LEN as u64 + last * SLOT)?;
+                seg.idx.flush()?;
+                seg.body.set_logical_len(off.max(FILE_HEADER_LEN as u64))?;
+                seg.body.flush()?;
+                seg.n_slots = last;
+                Ok(TrimLast::Dropped)
+            }
+        }
     }
 
     /// `tip == None` drops every slot (empty chain).
@@ -630,6 +688,45 @@ mod tests {
             FILE_HEADER_LEN as u32
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_syncs_body_then_idx() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        t.put_blocks(&[
+            (Height(0), &[None] as &[Option<[u8; 33]>]),
+            (Height(1), &[None, None]),
+        ])
+        .unwrap();
+        let g = t.lock();
+        let seg = &g.segs[0];
+        assert!(!seg.body.pending_sync(), "body synced before its idx slots");
+        assert!(!seg.idx.pending_sync(), "idx synced before put returns");
+        drop(g);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An idx slot that reached disk ahead of its body (pre-sync builds):
+    /// the short record's slot drops and the one before it is clean.
+    #[test]
+    fn trim_last_record_drops_a_short_record() {
+        let dir = tmp_dir();
+        let t = SpTweaksTable::create(&dir, Height(0)).unwrap();
+        let mut tw = [0u8; 33];
+        tw[0] = 0x02;
+        t.put_block(Height(0), &[None]).unwrap();
+        t.put_block(Height(1), &[Some(tw), None]).unwrap();
+        drop(t);
+        let body = SpTweaksTable::seg_dirs(&dir).body_path(0);
+        set_file_hwm(&body, FILE_HEADER_LEN as u64 + 1 + 10);
+
+        let t = SpTweaksTable::open(&dir).unwrap();
+        assert_eq!(t.trim_last_record(2).unwrap(), TrimLast::Dropped);
+        assert_eq!(t.next_height(), Height(1));
+        assert_eq!(t.trim_last_record(1).unwrap(), TrimLast::Clean);
+        assert_eq!(t.get_block(Height(0), 1).unwrap().unwrap(), vec![None]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -493,6 +493,14 @@ impl Query {
             let _ = q.ensure_height_by_hash_index(tip);
         }
         q.recover_sh_writebehind()?;
+        if let Some(t) = q
+            .sp_tweaks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            q.repair_sp_tweaks(t)?;
+        }
         q.sweep_spill_at_or_below_pruneheight()?;
         Ok(q)
     }
