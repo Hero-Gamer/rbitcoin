@@ -222,9 +222,11 @@ mod tests {
         q.store().rebuild_height_fence().unwrap();
     }
 
-    /// Activation needs a signalling period plus one more; the scan keeps its
-    /// place across calls (`getnetworkinfo` used to re-read every header per
-    /// bit, ≈4.7 s on mainnet) and starts over when the boundary changes.
+    /// Activation needs a signalling period plus one more; only blocks at or
+    /// above the floor count (so mainnet's CSV, SegWit and Taproot periods
+    /// raise no warning); the scan keeps its place across calls
+    /// (`getnetworkinfo` used to re-read every header per bit, ≈4.7 s on
+    /// mainnet) and starts over when the boundary changes.
     #[test]
     fn unknown_bit_scan_activates_and_keeps_its_place() {
         let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-active");
@@ -238,6 +240,8 @@ mod tests {
         assert_eq!(scan.advance(&q, 8, 4, 2, 0), vec![27]);
         assert_eq!(scan.scanned_periods, 1, "same tip: nothing new to read");
         assert!(UnknownBitsScan::new().advance(&q, 8, 4, 4, 0).is_empty());
+        assert_eq!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 2), vec![27]);
+        assert!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 3).is_empty());
 
         let (dir2, other) = rbitcoin_query::testutil::tiny_query_labeled("vb-other");
         put_chain(&other, 9, |_| false, 1);
@@ -248,16 +252,5 @@ mod tests {
         assert_eq!(scan.scanned_periods, 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    /// A block counts from the floor up, so mainnet's CSV, SegWit and Taproot
-    /// signalling periods raise no warning.
-    #[test]
-    fn unknown_bit_scan_counts_from_the_floor() {
-        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("vb-floor");
-        put_chain(&q, 9, |h| h < 4, 0);
-        assert_eq!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 2), vec![27]);
-        assert!(UnknownBitsScan::new().advance(&q, 8, 4, 2, 3).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
