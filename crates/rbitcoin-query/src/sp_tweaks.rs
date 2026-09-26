@@ -169,6 +169,9 @@ impl Query {
     ///
     /// Does **not** gate Electrum: naive walk remains when off / hole.
     pub fn set_sptweaks_enabled(&self, on: bool, origin: Height) -> Result<(), QueryError> {
+        if on {
+            self.require_sp_tweaks_unpruned()?;
+        }
         self.sptweaks_origin
             .store(origin.0, AtomicOrdering::Release);
         if on {
@@ -232,6 +235,17 @@ impl Query {
                 before.0,
                 after.0
             );
+        }
+        Ok(())
+    }
+
+    /// Tweaks read input keys from scriptSig and witness, which
+    /// `--prune-seqsigwit` drops: a pruned node neither builds nor serves them.
+    pub fn require_sp_tweaks_unpruned(&self) -> Result<(), QueryError> {
+        if self.prune_seqsigwit() {
+            return Err(StoreError::Layout(
+                "silent payment tweaks are unavailable with --prune-seqsigwit".into(),
+            ));
         }
         Ok(())
     }
@@ -356,6 +370,7 @@ impl Query {
         start: Height,
         limits: ThinTweakRangeLimits,
     ) -> Result<Vec<(Height, Vec<ThinTweakRow>)>, QueryError> {
+        self.require_sp_tweaks_unpruned()?;
         if limits.max_heights == 0 {
             return Ok(Vec::new());
         }
@@ -573,6 +588,24 @@ mod tests {
         assert!(m.contains("body missing"), "{m}");
         assert!(e.contains("body empty"), "{e}");
         assert_ne!(m, e);
+    }
+
+    /// If you prune seqsigwit you cannot serve tweaks: enabling the index,
+    /// pruning under it, and reading tweaks are all refused.
+    #[test]
+    fn prune_seqsigwit_and_sp_tweaks_exclude_each_other() {
+        let (dir, q) = tmp_q();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        assert!(q.set_prune_seqsigwit(true).is_err(), "prune under tweaks");
+        q.set_sptweaks_enabled(false, Height(0)).unwrap();
+        q.set_prune_seqsigwit(true).unwrap();
+        let err = q.set_sptweaks_enabled(true, Height(0)).unwrap_err();
+        assert!(err.to_string().contains("prune-seqsigwit"), "{err}");
+        assert!(
+            q.load_thin_tweaks(Height(0)).is_err(),
+            "no serving when pruned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

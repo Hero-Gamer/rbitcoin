@@ -258,6 +258,7 @@ pub fn tweaks_for_height(
     params: &ChainParams,
     height: Height,
 ) -> Result<BTreeMap<[u8; 32], TxTweak>, ConsensusError> {
+    query.require_sp_tweaks_unpruned()?;
     if !params.taproot_active_at(height.0) {
         return Ok(BTreeMap::new());
     }

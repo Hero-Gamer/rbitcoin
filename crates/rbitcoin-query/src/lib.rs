@@ -634,6 +634,11 @@ impl Query {
 
     pub fn set_prune_seqsigwit(&self, on: bool) -> Result<(), QueryError> {
         let was_on = self.prune_seqsigwit();
+        if on && self.sptweaks_enabled() {
+            return Err(StoreError::Layout(
+                "refusing --prune-seqsigwit while silent payment tweaks are enabled".into(),
+            ));
+        }
         if !on && self.prune_seqsigwit() {
             return Err(StoreError::Layout(
                 "refusing to disable prune-seqsigwit on a pruned datadir".into(),

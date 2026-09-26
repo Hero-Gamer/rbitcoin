@@ -351,6 +351,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
+  Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
 Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
@@ -707,6 +708,22 @@ mod tests {
             cli_main(["rbitcoin-node", "--sptweaks-dust=1"]),
             ExitCode::from(2),
         );
+    }
+
+    /// Tweaks need the scriptSig and witness data seqsigwit pruning drops,
+    /// so the pair is refused from the CLI and from the conf file alike.
+    #[test]
+    fn sp_tweaks_refuses_prune_seqsigwit() {
+        let cli = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
+        let err = cli.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
+            "{err}"
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("prune_seqsigwit", "1").unwrap();
+        conf.apply_kv("sp_tweaks", "1").unwrap();
+        assert!(conf.validate().is_err());
     }
 
     #[test]
