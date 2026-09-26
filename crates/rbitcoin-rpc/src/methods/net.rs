@@ -157,6 +157,9 @@ pub(crate) fn services_names(bits: u64) -> Vec<&'static str> {
     if bits & 8 != 0 {
         n.push("WITNESS");
     }
+    if bits & 64 != 0 {
+        n.push("COMPACT_FILTERS");
+    }
     if bits & 0x400 != 0 {
         n.push("NETWORK_LIMITED");
     }

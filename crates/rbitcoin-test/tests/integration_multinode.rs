@@ -67,7 +67,6 @@ fn open_padded_query(dir: &TempDir) -> Query {
 
 async fn start_padded(dir: &TempDir) -> P2PNode {
     let q = open_padded_query(dir);
-    rbitcoin_net::set_compact_filters_service(true);
     P2PNode::start(
         "127.0.0.1:0".parse().unwrap(),
         q,
@@ -650,8 +649,9 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
         .expect("p2p_timeout_getaddr_and_keepalive_ping wall timeout (20s)");
 }
 
-/// Heights 0 and 1 are sealed; the tip is not. The seeder still advertises
-/// `NODE_COMPACT_FILTERS`. A stop past the watermark is silence.
+/// Heights 0 and 1 are sealed; the tip is not. A seeder whose filters have
+/// not caught up does not advertise `NODE_COMPACT_FILTERS`, but serves heights
+/// inside its watermark. A stop past the watermark is silence.
 async fn pin_compact_filters(peer: &P2PNode, seed: &P2PNode) {
     use bitcoin::p2p::message::NetworkMessage;
     use bitcoin::p2p::message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters};
@@ -673,16 +673,19 @@ async fn pin_compact_filters(peer: &P2PNode, seed: &P2PNode) {
             peer.peers
                 .live_peers()
                 .into_iter()
-                .any(|p| !p.inbound && p.handshake_complete() && p.services & COMPACT != 0)
+                .any(|p| !p.inbound && p.handshake_complete())
         },
-        || {
-            format!(
-                "version must advertise COMPACT_FILTERS while the index lags (peer={:?})",
-                peer.peers.snapshot()
-            )
-        },
+        || format!("outbound handshake (peer={:?})", peer.peers.snapshot()),
     )
     .await;
+    assert!(
+        peer.peers
+            .live_peers()
+            .into_iter()
+            .all(|p| p.inbound || p.services & COMPACT == 0),
+        "no NODE_COMPACT_FILTERS before filters catch up (peer={:?})",
+        peer.peers.snapshot()
+    );
     wait_ms_until(
         3_000,
         || {
@@ -1774,18 +1777,32 @@ async fn tip_follow_after_ibd() {
             "IBD confirm leaves basic filters to the appender"
         );
         let bf_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Records the watermark when the appender first reports caught up.
+        let caught_up_at = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
         let bf = rbitcoin_query::spawn_block_filter_writebehind(
             Arc::clone(&peer.query),
             Arc::clone(&bf_stop),
             || {},
+            {
+                let (q, at) = (Arc::clone(&peer.query), Arc::clone(&caught_up_at));
+                move || {
+                    let h = q.basic_filter_hwm().unwrap().unwrap_or(u32::MAX);
+                    at.store(h, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
         );
         let hwm = |n: &P2PNode| n.query.basic_filter_hwm().unwrap();
         wait_ms_until(
             5_000,
-            || hwm(&peer) == Some(5),
+            || caught_up_at.load(std::sync::atomic::Ordering::SeqCst) != u32::MAX,
             || format!("materialize hwm={:?}", hwm(&peer)),
         )
         .await;
+        assert_eq!(
+            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "caught up fires once filters reach the tip"
+        );
         peer.follow_from(seed.local_addr).await.expect("follow");
         assert!(
             peer.follow_live_count() >= 1,
@@ -1814,6 +1831,11 @@ async fn tip_follow_after_ibd() {
             || format!("follow hwm={:?}", hwm(&peer)),
         )
         .await;
+        assert_eq!(
+            caught_up_at.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "caught up fires only once"
+        );
         bf_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         bf.join().unwrap();
 

@@ -252,8 +252,9 @@ static COMPACT_FILTERS_ADVERTISED: AtomicBool = AtomicBool::new(false);
 
 /// Version messages include `NODE_COMPACT_FILTERS` while this is set.
 ///
-/// The bit follows `--block-filter-index`, not the watermark. A peer that
-/// handshakes during catch-up keeps the bit; a later flip never reaches it.
+/// The node sets it once basic filters first reach the tip, so a peer never
+/// hears the bit from a node that would answer its requests with silence.
+/// A peer that handshook earlier does not learn of a later flip.
 pub fn set_compact_filters_service(on: bool) {
     COMPACT_FILTERS_ADVERTISED.store(on, Ordering::Release);
 }

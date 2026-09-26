@@ -529,6 +529,7 @@ fn analog_block_filters_from_class_a() {
             Arc::clone(&q),
             Arc::clone(&stop),
             || {},
+            || {},
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !until(q.basic_filter_hwm().unwrap()) {

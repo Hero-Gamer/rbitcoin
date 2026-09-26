@@ -266,7 +266,7 @@ Long-form (no short ID): `version`, `verack`, `wtxidrelay`, `sendheaders`,
 **Not implemented as product features** (short slots 29–36 placeholders, 37
 `feature`): decode may reject unknown short IDs. Slots 22–27 are live for
 BIP158 basic filters while `--block-filter-index` is on
-(`NODE_COMPACT_FILTERS` from startup, `getcfilters`, `getcfheaders`,
+(`NODE_COMPACT_FILTERS` once filters first reach the tip, `getcfilters`, `getcfheaders`,
 `getcfcheckpt`, `getblockfilter`). A request whose stop height is past the
 filter watermark is silence, not an empty filter or a short batch. As in
 Core's `PrepareBlockFilterRequest`, start past stop, 1000+ `getcfilters`,

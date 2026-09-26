@@ -85,7 +85,7 @@ just not the current product. COMPAT/OPERATOR stay the shipped contract.
 |----|------|------------|-------------|
 | **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
 | **Q-64** | GBT longpoll / `waitNext` (then Sv2 template provider) | Opt-in `getblocktemplate` + Esplora `/block-template` with 15 s cache is the mining extra. No stratum/pool. | DATUM / Bitaxe / mkpool users need push templates; IPC mining interface is the Core shape. |
-| **Q-65** | BIP157/158 compact block filters | Shipped as optional `--block-filter-index` (basic / type 0). `NODE_COMPACT_FILTERS` follows the flag. Serving follows the filter watermark, not the scripthash watermark. | — |
+| **Q-65** | BIP157/158 compact block filters | Shipped as optional `--block-filter-index` (basic / type 0). `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip. Serving follows the filter watermark, not the scripthash watermark. | — |
 
 ---
 
