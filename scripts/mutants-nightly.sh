@@ -81,7 +81,7 @@ re_args_for_batch() {
   while IFS= read -r line; do
     if ((i >= start && i < start + count)); then
       local escaped
-      escaped="$(python3 -c 'import re,sys; print(re.escape(sys.argv[1]))' "$line")"
+      escaped="$(python3 "$ROOT/scripts/mutants_queue.py" re "$line")"
       RE_ARGS+=(--re "$escaped")
     fi
     i=$((i + 1))
@@ -99,35 +99,52 @@ while ((offset < queue_len && SECONDS < deadline)); do
   if ((${#RE_ARGS[@]} == 0)); then
     break
   fi
-  echo "mutants-nightly: batch at $offset (${#RE_ARGS[@]} regexes, ${remain}s left)"
+  requested=$((${#RE_ARGS[@]} / 2))
+  echo "mutants-nightly: batch at $offset ($requested mutants, ${remain}s left)"
   set +e
   timeout --signal=TERM --kill-after=60s "$remain" \
     cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' \
-      --test-workspace=true --baseline=skip \
+      --test-workspace=true --baseline=skip --caught --unviable \
       -j 1 --timeout "$MUTANT_TIMEOUT" \
       "${RE_ARGS[@]}" \
       >"$OUT/batch-$offset.log" 2>&1
   ec=$?
   set -e
-  # Count finished scenarios. A killed batch still advances through those.
-  done_n="$(grep -cE '^(caught|MISSED|TIMEOUT|unviable)' "$OUT/batch-$offset.log" || true)"
+  # The summary counts caught and unviable. A killed batch has no summary;
+  # outcome lines still advance the cursor through what finished.
+  done_n="$(python3 "$ROOT/scripts/mutants_queue.py" finished --log "$OUT/batch-$offset.log")"
   grep -E '^MISSED' "$OUT/batch-$offset.log" >>"$OUT/missed.txt" || true
   if ((done_n == 0)); then
     echo "mutants-nightly: batch made no progress (exit $ec); same queue next night"
     break
   fi
+  # A finished batch consumed the queue slice it was given. A killed batch
+  # only consumed the mutants that printed an outcome. cargo-mutants can
+  # test more names than the slice when a regex is broad; do not skip the
+  # queue past the names this batch asked for.
+  if ((ec == 0)); then
+    step=$requested
+  else
+    step=$done_n
+    if ((step > requested)); then
+      step=$requested
+    fi
+  fi
   python3 "$ROOT/scripts/mutants_queue.py" advance \
     --cursor "$CURSOR" --n-new "$n_new" --n-old "$n_old" \
-    --completed "$done_n" --head "$head_sha"
-  completed_total=$((completed_total + done_n))
-  offset=$((offset + done_n))
+    --completed "$step" --head "$head_sha"
+  completed_total=$((completed_total + step))
+  offset=$((offset + step))
   if ((ec == 124)); then
     echo "mutants-nightly: budget exhausted after $completed_total mutants"
     break
   fi
 done
 
-cp "$CURSOR" "$OUT/cursor.json"
+# The default cursor path already lives in the artifact directory.
+if [[ ! "$CURSOR" -ef "$OUT/cursor.json" ]]; then
+  cp "$CURSOR" "$OUT/cursor.json"
+fi
 echo "mutants-nightly: completed=$completed_total missed=$(grep -c . "$OUT/missed.txt" || true)"
 if [[ -s "$OUT/missed.txt" ]]; then
   echo "mutants-nightly: MISSED (not a failure; extend a journey or keep a guts unit)"

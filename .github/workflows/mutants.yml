@@ -3,14 +3,14 @@
 # 5 hour budget, one workspace suite at a time. MISSED is an artifact,
 # not a failure. Owner: TESTING.md (Mutation testing).
 #
-# 07:47 UTC is 00:47 Pacific during PDT and 23:47 during PST. Minute 47
-# avoids the top-of-hour schedule queue (the 07:00 UTC cron on 2026-09-25
-# did not start until 12:25 UTC).
+# 03:47 UTC is 20:47 Pacific during PDT and 19:47 during PST. Minute 47
+# avoids the top-of-hour schedule queue. The 07:47 UTC cron on 2026-09-26
+# did not start until 12:29 UTC, so this is four hours earlier.
 
 name: mutants
 on:
   schedule:
-    - cron: "47 7 * * *"
+    - cron: "47 3 * * *"
   workflow_dispatch:
 
 permissions:
