@@ -563,7 +563,7 @@ candidate once a workspace run shows the journey catching it.
 
 Fuzz corpus lives in `fuzz/corpus/` — gitignored and cached for 7 days.
 Inputs that catch surviving mutants are promoted to permanent fixtures:
-- Location: `crates/<crate>/tests/fixtures/fuzz_mined/<target>/`
+- Location: `fuzz/promoted/regression/<category>/`
 - `_bin` = input data; `_out` = expected `Debug` output
 - Replayed via `fuzz_mined.rs` — runs in default `cargo test` suite
 - `cargo-mutants` exercises these inputs alongside unit tests
@@ -571,5 +571,5 @@ Inputs that catch surviving mutants are promoted to permanent fixtures:
 Workflow:
 1. Fuzz populates `fuzz/corpus/`
 2. `./scripts/fuzz-mine.sh --promote fuzz/corpus/<target>` → staged artifact
-3. Review → manually commit to `crates/*/tests/fixtures/fuzz_mined/`
+3. Review → manually commit to `fuzz/promoted/regression/`
 4. `--sidecars` regenerate `.out` files if Debug output changes
