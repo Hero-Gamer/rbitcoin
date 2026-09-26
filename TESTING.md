@@ -570,6 +570,6 @@ Inputs that catch surviving mutants are promoted to permanent fixtures:
 
 Workflow:
 1. Fuzz populates `fuzz/corpus/`
-2. `./scripts/fuzz-mine.sh --promote fuzz/corpus/<target>` → staged artifact
+2. Manual review → stage to fuzz/promoted/regression/<category>/
 3. Review → manually commit to `fuzz/promoted/regression/`
-4. `--sidecars` regenerate `.out` files if Debug output changes
+4. No sidecars — divergence described in fixture header only
