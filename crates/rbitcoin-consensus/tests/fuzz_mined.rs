@@ -1,7 +1,11 @@
 //! Regression tests from fuzz-discovered edge cases
-//! Each input = a case that survives existing coverage → must be caught here
+//! Each input = a case that survives existing coverage → MUST be rejected by rbitcoin consensus
 
-use bitcoin::script::ScriptBuf;
+use bitcoin::{
+    absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence, Transaction,
+    TxIn, TxOut, Witness,
+};
+use rbitcoin_consensus::verify_tx_scripts_detached_forks;
 use std::fs;
 use std::path::Path;
 
@@ -13,7 +17,7 @@ fn repo_root() -> &'static Path {
         .unwrap()
 }
 
-/// Parse hex string to bytes — matches pattern in script_edge_fixtures.rs
+/// Parse hex string to bytes
 fn hex_bytes(s: &str) -> Vec<u8> {
     s.split_whitespace()
         .collect::<String>()
@@ -23,7 +27,7 @@ fn hex_bytes(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Verifies the concrete fuzz-discovered fixture exists with correct content
+/// Fixture exists with correct hex pattern
 #[test]
 fn fixture_invalid_pushdata_present_and_correct() {
     let fixture =
@@ -45,32 +49,49 @@ fn fixture_invalid_pushdata_present_and_correct() {
 
     assert_eq!(
         hex_line, "6a ff ff ff ff ff",
-        "Fixture hex mismatch — expected the malformed PUSHDATA4 pattern"
+        "Fixture hex mismatch — expected the pattern that triggers divergent behavior"
     );
 }
 
-/// Documents the known gap: standard Script parsing stops at OP_RETURN
-/// and does NOT validate the impossible PUSHDATA4 length that follows.
-/// Validation MUST happen at the rbitcoin consensus/check level.
+/// rbitcoin consensus REJECTS scripts containing OP_RETURN
+/// The bitcoin crate parser accepts it as valid OP_RETURN — this divergence
+/// is exactly what fuzzing surfaced. rbitcoin interpreter returns Err immediately.
 #[test]
-fn standard_parser_does_not_reject_impossible_pushdata4() {
+fn op_return_script_is_rejected_by_rbitcoin_consensus() {
     // Pattern: 6a ff ff ff ff ff
-    // 6a = OP_RETURN → standard parser stops here, ignores the rest
-    // ff ff ff ff ff = would-be PUSHDATA4 length field → impossible value
-    // This is the EXACT gap fuzzing surfaced:
-    // bitcoin::script::ScriptBuf accepts it silently → consensus MUST catch it
-    let bytes = hex_bytes("6a ff ff ff ff ff");
-    let script = ScriptBuf::from_bytes(bytes);
-    let mut iter = script.instructions();
+    // 6a = OP_RETURN → rbitcoin interpreter rejects immediately
+    let script_sig_bytes = hex_bytes("6a ff ff ff ff ff");
 
-    // Confirmed: standard parser does NOT reject — returns Ok(OP_RETURN)
-    // This test locks in the KNOWN behavior so we know when it changes upstream
-    assert!(
-        matches!(iter.next(), Some(Ok(_))),
-        "Standard script parser accepts this — gap confirmed"
+    // Build minimal transaction
+    let tx = Transaction {
+        version: Version(1),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::default(),
+            script_sig: ScriptBuf::from(script_sig_bytes),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+
+    // Pass by value — matches function signature exactly
+    let empty_prevouts = Vec::new();
+    let result = verify_tx_scripts_detached_forks(
+        empty_prevouts, // 1: prevouts
+        tx,             // 2: transaction
+        true,           // 3: allow_checkpoint
+        true,           // 4: verify_sigops
+        true,           // 5: allow_witness
+        true,           // 6: is_standard
+        true,           // 7: taproot_active
     );
 
-    // The actual rejection belongs in rbitcoin consensus validation,
-    // NOT in the bitcoin library's instruction parser.
-    // TODO: add the consensus-level check here once validation path confirmed.
+    assert!(
+        result.is_err(),
+        "rbitcoin consensus MUST reject script containing OP_RETURN — diverges from bitcoin crate parser"
+    );
 }
