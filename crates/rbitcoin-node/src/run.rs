@@ -11,7 +11,7 @@ use rbitcoin_net::{
     Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
 };
 use rbitcoin_primitives::Network;
-use rbitcoin_query::{spawn_block_filter_writebehind, spawn_sh_writebehind, Query};
+use rbitcoin_query::{spawn_sh_writebehind, Query};
 use rbitcoin_rpc::{
     gbt_template, run_rpc, RpcActive, RpcConfig, RpcContext, RpcHandle, RpcRegtest,
 };
@@ -480,14 +480,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else {
         None
     };
-    if config.sptweaks && node.hub.query.index_mode().is_tip() {
-        spawn_sptweaks_backfill(
-            Arc::clone(&node.hub.query),
-            params.clone(),
-            Arc::clone(&shutdown.flag),
-        );
-    }
-
     let peers_path = config.datadir.path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -594,7 +586,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // tip_follow_ready ≠ sh_tip_ready: follow/relay do not wait on SH materialize.
     let mut tip_follow_ready = false;
     let mut sh_tip_ready = false;
-    let mut block_filter_writebehind = None;
+    let mut index_writebehind = None;
     if catch_up.is_complete() && !shutdown.requested() {
         let gates = enter_tip_mode(
             &node.hub.query,
@@ -604,8 +596,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
-            if config.block_filter_index {
-                block_filter_writebehind = Some(spawn_block_filter_writebehind(
+            if config.block_filter_index || config.sptweaks {
+                index_writebehind = Some(rbitcoin_consensus::spawn_index_writebehind(
                     Arc::clone(&node.hub.query),
                     Arc::clone(&shutdown.flag),
                     {
@@ -616,13 +608,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     // when served filters reach the tip, not during materialize.
                     || rbitcoin_net::set_compact_filters_service(true),
                 ));
-            }
-            if config.sptweaks {
-                spawn_sptweaks_backfill(
-                    Arc::clone(&node.hub.query),
-                    params.clone(),
-                    Arc::clone(&shutdown.flag),
-                );
             }
             if relay_while_following(
                 tip_meets_min_work(&config, &node.hub),
@@ -1192,7 +1177,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
-    if let Some(h) = block_filter_writebehind {
+    if let Some(h) = index_writebehind {
         let _ = h.join();
     }
     // In-flight tip accepts hold the hub. Drain them before the store flush.
@@ -1287,30 +1272,6 @@ fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: Netwo
         }
     }
     n
-}
-
-/// One walker per process: SH-warm start and post-IBD `enter_tip_mode` both call this.
-fn spawn_sptweaks_backfill(
-    query: Arc<Query>,
-    params: rbitcoin_consensus::ChainParams,
-    cancel: Arc<AtomicBool>,
-) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(move || {
-        std::thread::Builder::new()
-            .name("sptweaks-backfill".into())
-            .spawn(move || {
-                match rbitcoin_consensus::backfill_sp_tweaks_cancellable(
-                    &query,
-                    &params,
-                    Some(cancel.as_ref()),
-                ) {
-                    Ok(n) => info!("sp_tweaks: backfill wrote {n} heights"),
-                    Err(e) => warn!("sp_tweaks: backfill: {e}"),
-                }
-            })
-            .ok();
-    });
 }
 
 /// IBD horizon after `sync_cancellable` (or no peers to dial).

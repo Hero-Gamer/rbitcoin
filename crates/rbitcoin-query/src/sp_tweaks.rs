@@ -250,6 +250,42 @@ impl Query {
         Ok(())
     }
 
+    /// Next tweak height to seal (`None` when the tweak index is off).
+    pub fn tweak_index_next(&self) -> Option<u32> {
+        if !self.sptweaks_enabled() {
+            return None;
+        }
+        let origin = self.sptweaks_origin().0;
+        Some(self.sptweaks_next_height()?.0.max(origin))
+    }
+
+    #[allow(clippy::type_complexity)] // packed (fk, range) / span row is the on-disk shape
+    /// Commit tweak records for consecutive heights (a window) under the
+    /// index write-behind lock. Returns heights committed; 0 when the table's
+    /// next height or a `confirmed[h]` moved (a reorg).
+    pub fn commit_window_tweaks(
+        &self,
+        items: &[(Height, Fk, Vec<Option<[u8; 33]>>)],
+    ) -> Result<u32, QueryError> {
+        let _appender = self.bf_wb.lock_appender();
+        let g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = g.as_ref() else {
+            return Ok(0);
+        };
+        if items.first().is_none_or(|i| i.0 != t.next_height()) {
+            return Ok(0);
+        }
+        for (h, header_fk, _) in items {
+            if self.store.confirmed.get(*h)? != Some(*header_fk) {
+                return Ok(0);
+            }
+        }
+        let refs: Vec<(Height, &[Option<[u8; 33]>])> =
+            items.iter().map(|(h, _, r)| (*h, r.as_slice())).collect();
+        t.put_blocks(&refs)?;
+        Ok(items.len() as u32)
+    }
+
     pub fn sptweaks_origin(&self) -> Height {
         Height(self.sptweaks_origin.load(AtomicOrdering::Acquire))
     }

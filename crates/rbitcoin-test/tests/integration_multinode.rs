@@ -59,8 +59,7 @@ fn open_padded_query(dir: &TempDir) -> Query {
     let (tip, time) = pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 1);
     q.set_block_filter_index(true).unwrap();
     q.release_index_writebehind(Height(1));
-    q.seal_block_filters_released()
-        .expect("filters through height 1");
+    rbitcoin_consensus::build_indexes_released(&q).expect("filters through height 1");
     pad_empty_from(&q, &params, tip, time, 2, params.coinbase_maturity() + 1);
     q
 }
@@ -1767,6 +1766,9 @@ async fn tip_follow_after_ibd() {
 
         let mut peer = start_node(&peer_dir).await;
         peer.query.set_block_filter_index(true).unwrap();
+        peer.query
+            .set_sptweaks_enabled(true, Height(ChainParams::regtest().taproot_height()))
+            .unwrap();
         sync_ibd(&peer, seed.local_addr).await;
         peer.wait_height(5, Duration::from_secs(10))
             .await
@@ -1779,7 +1781,7 @@ async fn tip_follow_after_ibd() {
         let bf_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Records the watermark when the appender first reports caught up.
         let caught_up_at = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
-        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+        let bf = rbitcoin_consensus::spawn_index_writebehind(
             Arc::clone(&peer.query),
             Arc::clone(&bf_stop),
             || {},
@@ -1836,6 +1838,12 @@ async fn tip_follow_after_ibd() {
             5,
             "caught up fires only once"
         );
+        wait_ms_until(
+            5_000,
+            || peer.query.sptweaks_next_height() == Some(Height(7)),
+            || format!("tweaks next={:?}", peer.query.sptweaks_next_height()),
+        )
+        .await;
         bf_stop.store(true, std::sync::atomic::Ordering::SeqCst);
         bf.join().unwrap();
 
@@ -1933,7 +1941,7 @@ async fn reorg_to_longer_branch() {
         hub.accept_block(b).unwrap();
     }
     assert_eq!(hub.tip_height(), Some(4));
-    hub.query.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&hub.query).unwrap();
     assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(4));
     let old_3 = hub.query.basic_filter_at(3).unwrap().unwrap().0;
 
@@ -1966,7 +1974,7 @@ async fn reorg_to_longer_branch() {
     assert!(matches!(outcome, AcceptOutcome::Accepted { height: 6 }));
     assert_eq!(hub.tip_height(), Some(6));
     assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
-    hub.query.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&hub.query).unwrap();
     assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(6));
     for (h, b) in (3..).zip(&branch) {
         assert_eq!(

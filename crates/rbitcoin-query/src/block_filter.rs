@@ -271,8 +271,8 @@ impl Query {
         }))
     }
 
-    /// Heights the appender may seal now: released through tip, or `None`.
-    fn block_filter_target(&self) -> Option<u32> {
+    /// Heights index write-behind may seal now: released through tip.
+    pub fn index_target(&self) -> Option<u32> {
         let tip = self.tip_height()?.0;
         Some(self.index_released_through_height()?.min(tip))
     }
@@ -473,12 +473,35 @@ impl Query {
     /// Seal every released height now (regtest `generate`, tests).
     pub fn seal_block_filters_released(&self) -> Result<(), QueryError> {
         let never = AtomicBool::new(false);
-        while let Some(t) = self.block_filter_target() {
+        while let Some(t) = self.index_target() {
             if self.seal_block_filters(t, 1, &never, &mut |_| {})? == 0 {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// Next filter height to seal (`None` when the filter index is off).
+    pub fn filter_index_next(&self) -> Option<u32> {
+        self.block_filter_table().map(|t| t.next_height().0)
+    }
+
+    /// Commit filters built for `start..` (a window). Returns heights
+    /// committed; 0 when the watermark or a `confirmed[h]` moved (a reorg).
+    pub fn commit_window_filters(
+        &self,
+        start: u32,
+        built: &[(BlockFilter, Fk)],
+    ) -> Result<u32, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(0);
+        };
+        self.commit_basic_filters(table, start, built)
+    }
+
+    /// Wait for an index release (or `d`).
+    pub fn wait_index_release(&self, d: std::time::Duration) {
+        self.bf_wb.wait(d);
     }
 
     pub fn truncate_basic_filters_to_tip(&self) -> Result<(), QueryError> {
@@ -519,7 +542,7 @@ pub fn spawn_block_filter_writebehind(
             let mut on_caught_up = Some(on_caught_up);
             while !stop.load(Ordering::Relaxed) {
                 let next = query.basic_filter_hwm().ok().flatten().map_or(0, |h| h + 1);
-                let released = query.block_filter_target();
+                let released = query.index_target();
                 if released.is_some_and(|t| next > t) {
                     if let Some(f) = on_caught_up.take() {
                         rbitcoin_log::info!(

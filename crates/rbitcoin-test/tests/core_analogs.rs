@@ -525,7 +525,7 @@ fn analog_block_filters_from_class_a() {
     let q = Arc::new(q);
     let run_appender = |until: &dyn Fn(Option<u32>) -> bool| {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bf = rbitcoin_query::spawn_block_filter_writebehind(
+        let bf = rbitcoin_consensus::spawn_index_writebehind(
             Arc::clone(&q),
             Arc::clone(&stop),
             || {},
@@ -596,7 +596,7 @@ fn analog_block_filters_from_class_a() {
         "open drops the slot whose block left the best chain"
     );
     q.release_index_writebehind(Height(last));
-    q.seal_block_filters_released().unwrap();
+    rbitcoin_consensus::build_indexes_released(&q).unwrap();
     let (bytes, _) = q.basic_filter_at(last).unwrap().unwrap();
     assert_eq!(bytes, reference(&alt).content);
 }
