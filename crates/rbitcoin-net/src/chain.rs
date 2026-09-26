@@ -321,6 +321,8 @@ pub struct ChainHub {
     block_at_height_calls: AtomicU64,
     #[cfg(test)]
     header_contextual_checks: AtomicU64,
+    #[cfg(test)]
+    stored_height_walk_steps: AtomicU64,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -372,6 +374,8 @@ impl ChainHub {
             block_at_height_calls: AtomicU64::new(0),
             #[cfg(test)]
             header_contextual_checks: AtomicU64::new(0),
+            #[cfg(test)]
+            stored_height_walk_steps: AtomicU64::new(0),
         }
     }
 
@@ -1240,7 +1244,11 @@ impl ChainHub {
                 .map_err(|e| NetError::Consensus(e.to_string()))?
             {
                 out[i] = fk;
-                if let Some(h) = self.stored_header_height(&header.block_hash()) {
+                let height = in_batch
+                    .get(&header.prev_blockhash.to_byte_array())
+                    .map(|p| p.height.saturating_add(1))
+                    .or_else(|| self.stored_header_height(&header.block_hash()));
+                if let Some(h) = height {
                     in_batch.insert(
                         hash,
                         HeaderSyncNode {
@@ -1384,6 +1392,9 @@ impl ChainHub {
         let mut cur = *hash;
         let mut delta = 0u32;
         for _ in 0..10_000 {
+            #[cfg(test)]
+            self.stored_height_walk_steps
+                .fetch_add(1, Ordering::Relaxed);
             let hdr = self.header_of(&cur)?;
             let prev = hdr.prev_blockhash;
             if prev.to_byte_array() == [0u8; 32] {
@@ -2775,6 +2786,11 @@ impl ChainHub {
     #[cfg(test)]
     pub(crate) fn take_header_contextual_checks(&self) -> u64 {
         self.header_contextual_checks.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_stored_height_walk_steps(&self) -> u64 {
+        self.stored_height_walk_steps.swap(0, Ordering::Relaxed)
     }
 
     #[cfg(test)]
