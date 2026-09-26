@@ -29,6 +29,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::seg_pair::{locate, SegDirs, SegPair};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -52,18 +53,10 @@ pub struct BlockFilterRecord<'a> {
     pub filter: &'a [u8],
 }
 
-struct Seg {
-    file_id: u32,
-    first_slot: u64,
-    n_slots: u64,
-    /// End of the last committed record (`HDR` when empty).
-    body_end: u64,
-    idx: TableFile,
-    body: TableFile,
-}
-
 struct Inner {
-    segs: Vec<Seg>,
+    segs: Vec<SegPair>,
+    /// End of the last committed record in the last pair (`HDR` when empty).
+    tail_end: u64,
 }
 
 impl Inner {
@@ -72,18 +65,13 @@ impl Inner {
     }
 
     fn locate(&self, height: Height) -> Option<(usize, u64)> {
-        let g = u64::from(height.0);
-        self.segs
-            .iter()
-            .enumerate()
-            .find(|(_, s)| g >= s.first_slot && g < s.first_slot + s.n_slots)
-            .map(|(si, s)| (si, g - s.first_slot))
+        locate(&self.segs, u64::from(height.0))
     }
 }
 
 /// Height-dense basic filter table.
 pub struct BlockFilterTable {
-    dir: PathBuf,
+    dirs: SegDirs,
     inner: RwLock<Inner>,
     /// Serializes `put` and `truncate_through` (one writer at a time).
     writer: Mutex<()>,
@@ -132,11 +120,17 @@ impl SlotRow {
     }
 }
 
-impl Seg {
-    fn read_rows(&self, local: u64, n: u64) -> Result<Vec<SlotRow>, StoreError> {
-        let mut b = vec![0u8; (n * SLOT) as usize];
-        self.idx.read_at(HDR + local * SLOT, &mut b)?;
-        Ok(b.chunks_exact(SLOT as usize).map(decode_slot).collect())
+fn read_rows(seg: &SegPair, local: u64, n: u64) -> Result<Vec<SlotRow>, StoreError> {
+    let mut b = vec![0u8; (n * SLOT) as usize];
+    seg.idx.read_at(HDR + local * SLOT, &mut b)?;
+    Ok(b.chunks_exact(SLOT as usize).map(decode_slot).collect())
+}
+
+/// End of the last record in `seg` (`HDR` when empty).
+fn seg_end(seg: &SegPair) -> Result<u64, StoreError> {
+    match seg.n_slots.checked_sub(1) {
+        None => Ok(HDR),
+        Some(last) => Ok(read_rows(seg, last, 1)?[0].end()),
     }
 }
 
@@ -153,32 +147,18 @@ impl BlockFilterTable {
         Self::idx_dir(dir).join("meta")
     }
 
-    fn seg_idx_path(dir: &Path, file_id: u32) -> PathBuf {
-        Self::idx_dir(dir).join(format!("{file_id:06}"))
+    fn seg_dirs(dir: &Path) -> SegDirs {
+        SegDirs::new(
+            Self::idx_dir(dir),
+            Self::body_dir(dir),
+            TableKind::BlockFilter,
+        )
     }
 
-    fn seg_body_path(dir: &Path, file_id: u32) -> PathBuf {
-        Self::body_dir(dir).join(format!("{file_id:06}"))
-    }
-
-    fn create_seg(dir: &Path, file_id: u32, first_slot: u64) -> Result<Seg, StoreError> {
-        let idx = TableFile::create(Self::seg_idx_path(dir, file_id), TableKind::ArrayLink)?;
-        idx.set_grow_tight(true);
-        let body = TableFile::create(Self::seg_body_path(dir, file_id), TableKind::BlockFilter)?;
-        Ok(Seg {
-            file_id,
-            first_slot,
-            n_slots: 0,
-            body_end: HDR,
-            idx,
-            body,
-        })
-    }
-
-    fn with_segs(dir: &Path, segs: Vec<Seg>) -> Self {
+    fn with_segs(dir: &Path, segs: Vec<SegPair>, tail_end: u64) -> Self {
         Self {
-            dir: dir.to_path_buf(),
-            inner: RwLock::new(Inner { segs }),
+            dirs: Self::seg_dirs(dir),
+            inner: RwLock::new(Inner { segs, tail_end }),
             writer: Mutex::new(()),
         }
     }
@@ -189,7 +169,11 @@ impl BlockFilterTable {
         let meta = TableFile::create(Self::meta_path(dir), TableKind::ArrayLink)?;
         meta.write_at_pwrite(HDR, &IDX_FMT.to_le_bytes())?;
         meta.flush()?;
-        Ok(Self::with_segs(dir, vec![Self::create_seg(dir, 0, 0)?]))
+        Ok(Self::with_segs(
+            dir,
+            vec![Self::seg_dirs(dir).create(0, 0)?],
+            HDR,
+        ))
     }
 
     fn open(dir: &Path) -> Result<Self, StoreError> {
@@ -202,36 +186,13 @@ impl BlockFilterTable {
         if u32::from_le_bytes(fmt) != IDX_FMT {
             return Err(StoreError::Corrupt("blockfilter idx format"));
         }
-        let mut segs = Vec::new();
-        let mut first_slot = 0u64;
-        for file_id in 0u32.. {
-            let ip = Self::seg_idx_path(dir, file_id);
-            let bp = Self::seg_body_path(dir, file_id);
-            if !ip.exists() && !bp.exists() {
-                break;
-            }
-            if !ip.exists() || !bp.exists() {
-                return Err(StoreError::Corrupt("blockfilter incomplete segment"));
-            }
-            let idx = TableFile::open(&ip, TableKind::ArrayLink)?;
-            idx.set_grow_tight(true);
-            let body = TableFile::open(&bp, TableKind::BlockFilter)?;
-            let mut seg = Seg {
-                file_id,
-                first_slot,
-                n_slots: idx.logical_len().saturating_sub(HDR) / SLOT,
-                body_end: HDR,
-                idx,
-                body,
-            };
-            Self::clamp_torn_tail(&mut seg)?;
-            first_slot += seg.n_slots;
-            segs.push(seg);
-        }
-        if segs.is_empty() {
-            return Err(StoreError::Corrupt("blockfilter no segments"));
-        }
-        Ok(Self::with_segs(dir, segs))
+        let mut segs = Self::seg_dirs(dir).open(SLOT)?;
+        // Commits only append to the last pair, so only it can be torn.
+        let tail = segs
+            .last_mut()
+            .ok_or(StoreError::Corrupt("segment pairs missing"))?;
+        let tail_end = Self::clamp_torn_tail(tail)?;
+        Ok(Self::with_segs(dir, segs, tail_end))
     }
 
     /// Drop trailing slots until the last one chains onto its predecessor and
@@ -239,7 +200,7 @@ impl BlockFilterTable {
     ///
     /// Commits only append, so a crash can only tear the tail: this reads a
     /// few slots at the end, not the whole idx.
-    fn clamp_torn_tail(seg: &mut Seg) -> Result<(), StoreError> {
+    fn clamp_torn_tail(seg: &mut SegPair) -> Result<u64, StoreError> {
         let body_len = seg.body.logical_len();
         let mut keep = seg.n_slots;
         let end = loop {
@@ -247,7 +208,7 @@ impl BlockFilterTable {
                 break HDR;
             };
             let first = last.saturating_sub(1);
-            let rows = seg.read_rows(first, last - first + 1)?;
+            let rows = read_rows(seg, first, last - first + 1)?;
             let row = &rows[rows.len() - 1];
             let start = if last == 0 { HDR } else { rows[0].end() };
             if u64::from(row.off) == start && row.end() <= body_len {
@@ -271,8 +232,7 @@ impl BlockFilterTable {
             seg.body.flush()?;
         }
         seg.n_slots = keep;
-        seg.body_end = end;
-        Ok(())
+        Ok(end)
     }
 
     /// Open the table under `dir`, or create an empty one.
@@ -317,7 +277,7 @@ impl BlockFilterTable {
         while left > 0 {
             let seg = &inner.segs[si];
             let run = left.min(seg.n_slots - local);
-            out.push((si, seg.read_rows(local, run)?));
+            out.push((si, read_rows(seg, local, run)?));
             left -= run;
             si += 1;
             local = 0;
@@ -391,12 +351,10 @@ impl BlockFilterTable {
         }
         let mut i = 0usize;
         while i < items.len() {
-            if self.read().segs.last().map_or(0, |s| s.body_end) > u64::from(u32::MAX) {
+            if self.read().tail_end > u64::from(u32::MAX) {
                 let mut inner = self.write();
-                let file_id = u32::try_from(inner.segs.len())
-                    .map_err(|_| StoreError::Corrupt("blockfilter too many segments"))?;
-                let seg = Self::create_seg(&self.dir, file_id, inner.next())?;
-                inner.segs.push(seg);
+                self.dirs.roll(&mut inner.segs)?;
+                inner.tail_end = HDR;
             }
             let (n, end) = {
                 let inner = self.read();
@@ -406,7 +364,7 @@ impl BlockFilterTable {
                     .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
                 let mut body = Vec::new();
                 let mut idx_blob = Vec::new();
-                let mut at = tail.body_end;
+                let mut at = inner.tail_end;
                 while i < items.len() {
                     let (Ok(off), Ok(len)) =
                         (u32::try_from(at), u32::try_from(items[i].filter.len()))
@@ -421,7 +379,7 @@ impl BlockFilterTable {
                 if idx_blob.is_empty() {
                     return Err(StoreError::Corrupt("blockfilter body exceeds u32 off"));
                 }
-                tail.body.write_at_pwrite(tail.body_end, &body)?;
+                tail.body.write_at_pwrite(inner.tail_end, &body)?;
                 tail.body.flush()?;
                 tail.idx
                     .write_at_pwrite(HDR + tail.n_slots * SLOT, &idx_blob)?;
@@ -434,7 +392,7 @@ impl BlockFilterTable {
                 .last_mut()
                 .ok_or(StoreError::Corrupt("blockfilter no segments"))?;
             tail.n_slots += n;
-            tail.body_end = end;
+            inner.tail_end = end;
         }
         Ok(())
     }
@@ -458,20 +416,15 @@ impl BlockFilterTable {
         let seg = &mut inner.segs[si];
         let local_keep = keep - seg.first_slot;
         if local_keep < seg.n_slots {
-            let body_end = u64::from(seg.read_rows(local_keep, 1)?[0].off);
+            let body_end = u64::from(read_rows(seg, local_keep, 1)?[0].off);
             seg.idx.set_logical_len(HDR + local_keep * SLOT)?;
             seg.idx.flush()?;
             seg.body.set_logical_len(body_end)?;
             seg.body.flush()?;
             seg.n_slots = local_keep;
-            seg.body_end = body_end;
         }
-        let drop: Vec<u32> = inner.segs.iter().skip(si + 1).map(|s| s.file_id).collect();
-        inner.segs.truncate(si + 1);
-        for id in drop {
-            let _ = std::fs::remove_file(Self::seg_idx_path(&self.dir, id));
-            let _ = std::fs::remove_file(Self::seg_body_path(&self.dir, id));
-        }
+        inner.tail_end = seg_end(&inner.segs[si])?;
+        self.dirs.drop_after(&mut inner.segs, si + 1);
         Ok(())
     }
 }
@@ -534,7 +487,7 @@ mod tests {
 
         // Scribble over every other record's body bytes: a lookup must not
         // walk earlier records to find its own.
-        let body = BlockFilterTable::seg_body_path(&dir, 0);
+        let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
         let mut raw = fs::read(&body).unwrap();
         let start7 = FILE_HEADER_LEN + (0..7).map(|h| 3 + h).sum::<usize>();
         let len7 = 3 + 7;
@@ -577,7 +530,7 @@ mod tests {
     #[test]
     fn open_keeps_the_committed_prefix_after_torn_commits() {
         let dir = tmp_dir();
-        let body = BlockFilterTable::seg_body_path(&dir, 0);
+        let body = BlockFilterTable::seg_dirs(&dir).body_path(0);
         let end_of = |h: u64| FILE_HEADER_LEN as u64 + (0..=h).map(|i| 3 + i).sum::<u64>();
         let t = BlockFilterTable::open_or_create(&dir).unwrap();
         put_range(&t, 0, 4);
@@ -611,19 +564,19 @@ mod tests {
         drop(t);
         // Record 0 now ends one past u32::MAX (sparse body, slot len widened).
         let big = u32::MAX - FILE_HEADER_LEN as u32 + 1;
-        let idx = BlockFilterTable::seg_idx_path(&dir, 0);
+        let idx = BlockFilterTable::seg_dirs(&dir).idx_path(0);
         let mut raw = fs::read(&idx).unwrap();
         raw[FILE_HEADER_LEN + 4..FILE_HEADER_LEN + 8].copy_from_slice(&big.to_le_bytes());
         fs::write(&idx, &raw).unwrap();
         set_file_hwm(
-            &BlockFilterTable::seg_body_path(&dir, 0),
+            &BlockFilterTable::seg_dirs(&dir).body_path(0),
             u64::from(u32::MAX) + 1,
         );
 
         let t = BlockFilterTable::open_or_create(&dir).unwrap();
         assert_eq!(t.next_height(), Height(1));
         put_range(&t, 1, 2);
-        assert!(BlockFilterTable::seg_body_path(&dir, 1).is_file());
+        assert!(BlockFilterTable::seg_dirs(&dir).body_path(1).is_file());
         assert_eq!(
             t.filters(Height(1), Height(2)).unwrap().unwrap(),
             vec![(vec![1u8; 4], slot(1)), (vec![2u8; 5], slot(2))]
@@ -634,7 +587,7 @@ mod tests {
             "range read crosses the segment roll"
         );
         t.truncate_through(Some(Height(0))).unwrap();
-        assert!(!BlockFilterTable::seg_body_path(&dir, 1).exists());
+        assert!(!BlockFilterTable::seg_dirs(&dir).body_path(1).exists());
         assert_eq!(t.next_height(), Height(1));
     }
 }

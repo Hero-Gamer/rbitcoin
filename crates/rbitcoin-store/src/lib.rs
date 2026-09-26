@@ -45,6 +45,7 @@ mod scripthash_overflow;
 mod scripthash_pages;
 mod scripthash_slabs;
 mod scripthash_sorted_head;
+mod seg_pair;
 mod segmented_head;
 mod sorted_run;
 mod sp_tweaks;
