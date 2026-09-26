@@ -61,9 +61,9 @@ pub fn current_now() -> u64 {
 }
 
 impl NodeClock {
-    /// Freeze wall time to the current value while executing `f`.
-    /// Uses the existing thread-local `with_now` mechanism so tests
-    /// see a consistent timestamp throughout the operation.
+    /// Freeze wall time to a consistent value for the duration of `f`.
+    /// All `now_secs()` calls inside `f` return the same instant.
+    /// Restored when `f` exits — synchronous only, does not persist across .await.
     pub fn with_frozen<R>(&self, f: impl FnOnce() -> R) -> R {
         let frozen = self.now_secs();
         with_now(frozen, f)
@@ -100,4 +100,24 @@ mod tests {
     fn unix_secs_panics_before_epoch() {
         unix_secs(UNIX_EPOCH - std::time::Duration::from_secs(1));
     }
+}
+
+#[test]
+fn with_frozen_exposes_value_restores_prev() {
+    let c = NodeClock::new();
+    c.set_mock(1_000_000_000);
+
+    c.with_frozen(|| {
+        assert_eq!(
+            c.now_secs(),
+            1_000_000_000,
+            "frozen value visible inside closure"
+        );
+    });
+
+    assert_eq!(
+        c.now_secs(),
+        1_000_000_000,
+        "outer mock unchanged after scope"
+    );
 }
