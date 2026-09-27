@@ -49,8 +49,9 @@ fn analog_milestone_and_mempool_persist() {
 
     let mp_dir = td.path().join("mempool");
     let q_arc = Arc::new(q);
-    {
+    let (empty_body, fee_sat) = {
         let hub = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
+        let empty_body = std::fs::read(mp_dir.join("tx.body")).unwrap();
         hub.set_relay_enabled(true);
         let r = hub
             .accept_tx(&unconf)
@@ -58,17 +59,19 @@ fn analog_milestone_and_mempool_persist() {
         assert_eq!(r.txid, want);
         hub.flush().expect("SIGTERM-equivalent flush");
         assert!(hub.contains(&want));
-    }
+        (empty_body, r.fee_sat)
+    };
     let hub2 = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
     assert!(
         hub2.contains(&want),
         "flushed mempool must still hold the tx after reopen"
     );
     assert_eq!(hub2.live_count(), 1);
+    assert_eq!(hub2.get_live_meta(&want).map(|m| m.0), Some(fee_sat));
     drop(hub2);
     let (tip, tip_time, h) =
         pin_restart_catchup_then_tip_purge(&mp_dir, &q_arc, &params, &chain, &want);
-    pin_leftover_slots_tmp_and_truncated_body(&mp_dir, &q_arc, &want);
+    pin_leftover_slots_tmp_and_truncated_body(&mp_dir, &q_arc, &want, &empty_body);
 
     let q = q_arc.as_ref();
     let mut bad = spend_anyone_can_spend(spend_txid, 0, Amount::from_sat(47_0000_0000));
@@ -270,7 +273,12 @@ fn pin_restart_catchup_then_tip_purge(
     (blk.block_hash(), blk.header.time, h + 1)
 }
 
-fn pin_leftover_slots_tmp_and_truncated_body(mp_dir: &Path, q: &Arc<Query>, want: &bitcoin::Txid) {
+fn pin_leftover_slots_tmp_and_truncated_body(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    want: &bitcoin::Txid,
+    empty_body: &[u8],
+) {
     std::fs::copy(mp_dir.join("slots"), mp_dir.join("slots.tmp")).unwrap();
     assert!(mp_dir.join("slots.tmp").exists());
     let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
@@ -298,6 +306,13 @@ fn pin_leftover_slots_tmp_and_truncated_body(mp_dir: &Path, q: &Arc<Query>, want
             || err.to_lowercase().contains("range"),
         "expected disagree refuse, got {err}"
     );
+
+    std::fs::write(&body, empty_body).unwrap();
+    let err = match MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000) {
+        Ok(_) => panic!("an older body behind live slots must refuse"),
+        Err(e) => e,
+    };
+    assert!(err.contains("live slot body range"), "{err}");
 }
 
 fn first_head_sidecar(head: &Path, ext: &str) -> PathBuf {

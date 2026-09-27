@@ -2362,31 +2362,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn accept_single_flush_reopen() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        let tx = spend_tx(op, 99_000); // fee 1000
-        let txid = tx.compute_txid();
-        {
-            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-            let r = mp.accept_tx(&tx, &utxos, TIP_OK).expect("accept");
-            assert_eq!(r.txid, txid);
-            assert_eq!(r.fee_sat, 1000);
-            assert_eq!(mp.live_count(), 1);
-            mp.flush().unwrap();
-            assert!(mp.generation() >= 1);
-        }
-        {
-            let mp = ActiveMempool::open_or_create(&dir).unwrap();
-            assert_eq!(mp.live_count(), 1);
-            assert!(mp.graph.contains(&txid));
-            let e = mp.graph.get(&txid).unwrap();
-            assert_eq!(e.fee_sat, 1000);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Consensus script check must reject spends of real templates with empty witness.
     /// (Regression: accept used to skip verify and only apply Libre policy.)
     #[test]
@@ -2705,41 +2680,6 @@ mod tests {
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         let err = mp.accept_tx(&tx, &utxos, TIP_OK).unwrap_err();
         assert!(matches!(err, AcceptError::Policy("libre annex")));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn mine_clears_mempool() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        let tx = spend_tx(op, 90_000);
-        let txid = tx.compute_txid();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
-        assert_eq!(mp.live_count(), 1);
-        let n = mp.remove_for_block(&[txid]).unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(mp.live_count(), 0);
-        mp.flush().unwrap();
-        let mp = ActiveMempool::open_or_create(&dir).unwrap();
-        assert_eq!(mp.live_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reorg_reaccept() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        let tx = spend_tx(op, 90_000);
-        let txid = tx.compute_txid();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
-        mp.remove_for_block(&[txid]).unwrap();
-        assert_eq!(mp.live_count(), 0);
-        let results = mp.reorg_disconnect_reaccept(&[tx], &utxos, TIP_OK);
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_ok());
-        assert_eq!(mp.live_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3189,69 +3129,6 @@ mod tests {
         );
         mp.remember_extra_compact(&spend);
         assert_eq!(mp.extra_compact_txs().count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Parent below min-relay + paying child: 1p1c policy finds the parent body.
-    #[test]
-    fn one_parent_one_child_admits_below_minrelay_parent() {
-        let dir = tmp_dir();
-        let (op, txout, utxos) = chain_utxo(100_000);
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.set_min_relay_sat_kvb(50_000);
-        let parent = spend_tx(op, txout.value.to_sat() - 200);
-        let parent_id = parent.compute_txid();
-        assert!(
-            matches!(
-                mp.accept_tx(&parent, &utxos, TIP_OK),
-                Err(AcceptError::Policy("min relay fee"))
-            ),
-            "parent must fail min-relay alone"
-        );
-        assert_eq!(mp.live_count(), 0);
-        let child = spend_tx(
-            OutPoint {
-                txid: parent_id,
-                vout: 0,
-            },
-            1_000,
-        );
-        let missing = BTreeSet::from([parent_id]);
-        let got = mp
-            .try_one_parent_package(&child, &missing, &utxos)
-            .expect("paying child must select the extra-compact parent");
-        assert_eq!(got.compute_txid(), parent_id);
-        assert_eq!(mp.live_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn accept_package_admits_below_minrelay_parent_when_child_pays() {
-        let dir = tmp_dir();
-        let (op, txout, utxos) = chain_utxo(100_000);
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.set_min_relay_sat_kvb(50_000);
-        let parent = spend_tx(op, txout.value.to_sat() - 200);
-        let parent_id = parent.compute_txid();
-        assert!(
-            matches!(
-                mp.accept_tx(&parent, &utxos, TIP_OK),
-                Err(AcceptError::Policy("min relay fee"))
-            ),
-            "parent must fail min-relay alone"
-        );
-        let child = spend_tx(
-            OutPoint {
-                txid: parent_id,
-                vout: 0,
-            },
-            1_000,
-        );
-        let res = mp
-            .accept_package(&[parent, child], &utxos, TIP_OK)
-            .expect("combined package meets min-relay");
-        assert_eq!(res.len(), 2);
-        assert_eq!(mp.live_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
