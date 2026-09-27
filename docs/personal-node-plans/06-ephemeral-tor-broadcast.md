@@ -53,14 +53,14 @@ Dandelion++. Changing libre admission. Broadcasting other peers’ txs.
   `--onion` is set, or an explicit `--broadcast-isolated` default-on with
   proxy), tip-follow does not INV/announce local-origin txs to the standing
   set. Other mempool txs still relay as today (unless `--blocks-only`).
-- **Red:** `cargo test -p rbitcoin-net local_origin_not_inv_on_standing_peer`
-  — two live sessions: submit locally; standing peer records **no** INV/tx
+- **Red:** `cargo test -p rbitcoin-net peer_blocksonly_and_orphan_tx`
+  (isolated local-origin beat) — submit locally; standing peer records **no** INV/tx
   for that txid; a P2P-originated tx still INVs (unless `--blocks-only`).
 - **Green:** announce filter in tx relay
   ([`tx_relay.rs`](../../crates/rbitcoin-net/src/tx_relay.rs) / peer out
   queue).
 - **Refactor:** do not special-case Electrum vs RPC.
-- **Verify:** `cargo test -p rbitcoin-net local_origin_not_inv`
+- **Verify:** `cargo test -p rbitcoin-net peer_blocksonly_and_orphan_tx`
 - **Done when:** the [cycle](../how-we-plan.md#the-cycle-red--green--refactor) closed and the slice is committed
 
 ### Step 3 — One-shot isolated dial sends `tx`
