@@ -1,0 +1,494 @@
+/// Confirmed UTXO view that the journey's blocks move. A coin a block spent
+/// is `KnownUnavailable`. An outpoint the chain never saw is `Unknown`.
+#[derive(Default)]
+struct LifeChain {
+    unspent: HashMap<OutPoint, Coin>,
+    spent: HashMap<OutPoint, Coin>,
+    funded: u32,
+}
+
+impl LifeChain {
+    fn fund(&mut self, value: u64) -> OutPoint {
+        self.fund_at(value, 1, false)
+    }
+
+    fn fund_at(&mut self, value: u64, height: u32, is_coinbase: bool) -> OutPoint {
+        self.funded += 1;
+        let mut id = [0xc0; 32];
+        id[..4].copy_from_slice(&self.funded.to_le_bytes());
+        let op = out(Txid::from_byte_array(id), 0);
+        let txout = TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        self.unspent.insert(
+            op,
+            Coin {
+                create_height: height,
+                is_coinbase,
+                ..coin(txout)
+            },
+        );
+        op
+    }
+
+    fn spend(&mut self, op: OutPoint) {
+        if let Some(c) = self.unspent.remove(&op) {
+            self.spent.insert(op, c);
+        }
+    }
+
+    fn confirm(&mut self, tx: &Transaction, height: u32) {
+        for inp in &tx.input {
+            self.spend(inp.previous_output);
+        }
+        let txid = tx.compute_txid();
+        for (vout, txout) in tx.output.iter().enumerate() {
+            self.unspent.insert(
+                out(txid, vout as u32),
+                Coin {
+                    create_height: height,
+                    ..coin(txout.clone())
+                },
+            );
+        }
+    }
+
+    fn disconnect(&mut self, tx: &Transaction) {
+        let txid = tx.compute_txid();
+        for vout in 0..tx.output.len() {
+            self.unspent.remove(&out(txid, vout as u32));
+        }
+        for inp in &tx.input {
+            if let Some(c) = self.spent.remove(&inp.previous_output) {
+                self.unspent.insert(inp.previous_output, c);
+            }
+        }
+    }
+}
+
+impl UtxoProvider for LifeChain {
+    fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
+        self.unspent.get(op).cloned()
+    }
+
+    fn chain_prevout(&self, op: &OutPoint) -> ChainPrevout {
+        match self.unspent.get(op) {
+            Some(c) => ChainPrevout::Unspent(c.clone()),
+            None if self.spent.contains_key(op) => ChainPrevout::KnownUnavailable,
+            None => ChainPrevout::Unknown,
+        }
+    }
+}
+
+/// One mempool, the chain it accepts against, and that chain's tip.
+struct Life {
+    mp: ActiveMempool,
+    chain: LifeChain,
+    tip: ChainTipCtx,
+}
+
+impl Life {
+    fn accept(&mut self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
+        self.mp.accept_tx(tx, &self.chain, self.tip)
+    }
+
+    fn package(&mut self, txs: &[Transaction]) -> Result<Vec<AcceptResult>, AcceptError> {
+        self.mp.accept_package(txs, &self.chain, self.tip)
+    }
+
+    fn live(&self, tx: &Transaction) -> bool {
+        self.mp.graph.contains(&tx.compute_txid())
+    }
+
+    fn live_set(&self) -> BTreeSet<Txid> {
+        self.mp.graph.iter().map(|(t, _)| *t).collect()
+    }
+
+    fn cluster_len(&self, tx: &Transaction) -> usize {
+        self.mp
+            .graph
+            .cluster_of(&tx.compute_txid())
+            .map_or(0, |c| c.members.len())
+    }
+}
+
+fn out(txid: Txid, vout: u32) -> OutPoint {
+    OutPoint { txid, vout }
+}
+
+/// One OP_TRUE output of `out_value`, spending every `ops`.
+fn spend_all(ops: &[OutPoint], out_value: u64) -> Transaction {
+    let mut tx = spend_tx(ops[0], out_value);
+    tx.input = ops
+        .iter()
+        .map(|op| TxIn {
+            previous_output: *op,
+            ..tx.input[0].clone()
+        })
+        .collect();
+    tx
+}
+
+/// One OP_TRUE output per value in `values`.
+fn fan_out(op: OutPoint, values: &[u64]) -> Transaction {
+    let mut tx = spend_tx(op, 0);
+    tx.output = values
+        .iter()
+        .map(|v| TxOut {
+            value: Amount::from_sat(*v),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        })
+        .collect();
+    tx
+}
+
+/// Zero-value `OP_RETURN` followed by `nops` OP_NOPs.
+fn op_return_pad(nops: usize) -> TxOut {
+    let mut script = vec![0x6a];
+    script.resize(1 + nops, 0x61);
+    TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    }
+}
+
+fn with_annex(mut tx: Transaction) -> Transaction {
+    tx.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+    tx
+}
+
+/// The child arrives first and parks in RAM. The re-announce is not fresh.
+/// A dry-run sibling does not park. The parent promotes the parked child
+/// into one cluster, and a spend of the parent's missing vout is a reject.
+fn orphan_parks_then_promotes(life: &mut Life) {
+    let parent = spend_tx(life.chain.fund(100_000), 99_000);
+    let pid = parent.compute_txid();
+    let child = spend_tx(out(pid, 0), 98_000);
+    assert!(matches!(
+        life.accept(&child),
+        Err(AcceptError::Orphaned { fresh: true, .. })
+    ));
+    assert!(matches!(
+        life.accept(&child),
+        Err(AcceptError::Orphaned { fresh: false, .. })
+    ));
+    assert_eq!((life.mp.orphan_count(), life.mp.live_count()), (1, 0));
+    let dry = spend_tx(out(pid, 0), 97_000);
+    let err = life
+        .mp
+        .prepare_admit(&dry, &life.chain, life.tip, 0, false, None)
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::MissingPrevout(_)), "{err}");
+    assert_eq!(life.mp.orphan_count(), 1);
+
+    life.accept(&parent).expect("parent");
+    assert_eq!(life.mp.orphan_count(), 0);
+    assert!(life.live(&child));
+    assert!(!life.live(&dry));
+    assert_eq!(life.cluster_len(&parent), 2);
+    let err = life.accept(&spend_tx(out(pid, 9), 1_000)).unwrap_err();
+    assert!(matches!(err, AcceptError::MissingPrevout(_)), "{err}");
+    assert_eq!(life.mp.orphan_count(), 0);
+}
+
+/// A child of an invalid parent, and a spend of a coin a block already
+/// spent, are hard rejects, not orphans.
+fn invalid_or_spent_parent_does_not_park(life: &mut Life) {
+    let mut dup = spend_tx(life.chain.fund(100_000), 99_000);
+    dup.input.push(dup.input[0].clone());
+    assert!(matches!(
+        life.accept(&dup),
+        Err(AcceptError::InputsDuplicate)
+    ));
+    let err = life
+        .accept(&spend_tx(out(dup.compute_txid(), 0), 1_000))
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::MissingPrevout(_)), "{err}");
+
+    let spent = life.chain.fund(100_000);
+    life.chain.spend(spent);
+    let err = life.accept(&spend_tx(spent, 1)).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::MissingPrevout(op) if op == spent),
+        "{err}"
+    );
+    assert_eq!(life.mp.orphan_count(), 0);
+}
+
+/// Full RBF replaces a conflict, and the replaced tx cannot come back. The
+/// hub prepares under the read lock and commits under the write lock, so a
+/// conflict that lands in between fails the commit closed. Returns the
+/// replaced coin and the live replacement.
+fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
+    let d = life.chain.fund(100_000);
+    let low = spend_tx(d, 99_000);
+    let high = spend_tx(d, 50_000);
+    life.accept(&low).unwrap();
+    let r = life.accept(&high).expect("full RBF");
+    assert_eq!(r.replaced, vec![low.compute_txid()]);
+    assert!(!r.replaced_scripthashes.is_empty());
+    assert!(!life.live(&low));
+    let err = life.accept(&low).unwrap_err();
+    assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+
+    let e = life.chain.fund(100_000);
+    let first = spend_tx(e, 50_000);
+    let second = spend_tx(e, 99_000);
+    let prep = life
+        .mp
+        .prepare_admit(&second, &life.chain, life.tip, 0, false, None)
+        .expect("prevout free at prepare");
+    life.accept(&first).unwrap();
+    let err = life.mp.commit_after_script(&second, prep).unwrap_err();
+    assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+    assert!(life.live(&first));
+    assert!(!life.live(&second));
+    (d, high.compute_txid())
+}
+
+/// Pure RBFR: fee 1,500 loses BIP125's absolute fee to the 2,000 parent and
+/// child, but pays 1.25x the direct conflict and unpins both. Then a merger
+/// of 32 parents replaces their 32 children: 33 members fit the 64 cap only
+/// because replaced txs leave the count.
+fn replacements_unpin_and_leave_the_cluster_count(life: &mut Life) {
+    let f = life.chain.fund(1_000_000);
+    let pinned = spend_tx(f, 999_000);
+    let pin_child = spend_tx(out(pinned.compute_txid(), 0), 998_000);
+    life.accept(&pinned).unwrap();
+    life.accept(&pin_child).unwrap();
+    let r = life.accept(&spend_tx(f, 998_500)).expect("pure RBFR");
+    assert_eq!(r.replaced.len(), 2);
+    assert!(!life.live(&pin_child));
+
+    let mut parent_outs = Vec::new();
+    let mut kids = Vec::new();
+    for _ in 0..MAX_CLUSTER_COUNT / 2 {
+        let p = spend_tx(life.chain.fund(100_000), 90_000);
+        let k = spend_tx(out(p.compute_txid(), 0), 80_000);
+        life.accept(&p).unwrap();
+        life.accept(&k).unwrap();
+        parent_outs.push(out(p.compute_txid(), 0));
+        kids.push(k);
+    }
+    let merger = spend_all(&parent_outs, 10_000);
+    life.accept(&merger)
+        .expect("replaced children must not count toward the cluster cap");
+    assert_eq!(life.cluster_len(&merger), MAX_CLUSTER_COUNT / 2 + 1);
+    assert!(kids.iter().all(|k| !life.live(k)));
+}
+
+/// 3,000 outputs is ~30 kvB: over the old 101 kWU bug, under the 101 kvB
+/// cap. Then `mempool_cluster.py` `test_cluster_merging_size`: ten
+/// singletons and a merger padded to four vB over what is left of the cap.
+fn cluster_vsize_cap(life: &mut Life) {
+    let wide = fan_out(life.chain.fund(350_000), &[100; 3_000]);
+    let w = wide.weight().to_wu();
+    assert!(w > 101_000 && w <= MAX_CLUSTER_WEIGHT, "weight {w}");
+    life.accept(&wide).expect("large single tx");
+
+    let mut ten = Vec::new();
+    let mut ten_vsize = 0u64;
+    for _ in 0..10 {
+        let mut s = spend_tx(life.chain.fund(1_000_000), 900_000);
+        s.output.push(op_return_pad(9_880));
+        ten_vsize += s.vsize() as u64;
+        life.accept(&s).unwrap();
+        ten.push(out(s.compute_txid(), 0));
+    }
+    let remaining = MAX_CLUSTER_VSIZE - ten_vsize;
+    let mut merger = spend_all(&ten, 100_000);
+    merger.output.push(op_return_pad(0));
+    while (merger.vsize() as u64) < remaining + 4 {
+        merger.output[1] = op_return_pad(merger.output[1].script_pubkey.len());
+    }
+    let err = life.accept(&merger).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::ClusterTooLarge { count: 11, weight }
+            if weight.div_ceil(4) > MAX_CLUSTER_VSIZE),
+        "{err}"
+    );
+}
+
+/// Packages go parent first, and a CPFP pair shares one cluster. A failed
+/// child rolls back its RBF parent and restores the victim. Returns the
+/// CPFP coin and the live pair.
+fn packages_accept_and_roll_back(life: &mut Life) -> (OutPoint, [Txid; 2]) {
+    let h = life.chain.fund(100_000);
+    let cp = spend_tx(h, 99_000);
+    let cc = spend_tx(out(cp.compute_txid(), 0), 90_000);
+    let err = life.package(&[cc.clone(), cp.clone()]).unwrap_err();
+    assert!(matches!(err, AcceptError::PackageNotTopo), "{err}");
+    assert_eq!(
+        life.package(&[cp.clone(), cc.clone()]).expect("CPFP").len(),
+        2
+    );
+    assert_eq!(life.cluster_len(&cp), 2);
+
+    let i = life.chain.fund(100_000);
+    let victim = spend_tx(i, 99_000);
+    life.accept(&victim).unwrap();
+    let repl = spend_tx(i, 50_000);
+    let bad = with_annex(spend_tx(out(repl.compute_txid(), 0), 1_000));
+    let err = life.package(&[repl.clone(), bad]).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("libre annex")), "{err}");
+    assert!(!life.live(&repl));
+    assert!(life.live(&victim));
+    (h, [cp.compute_txid(), cc.compute_txid()])
+}
+
+/// A block double-spends two live coins and confirms the rest of the pool.
+/// The conflicts leave with their descendants.
+fn block_evicts_conflicts_and_confirms_the_rest(
+    life: &mut Life,
+    conflicted: [OutPoint; 2],
+    spenders: BTreeSet<Txid>,
+) {
+    let gone: BTreeSet<Txid> = life
+        .mp
+        .evict_conflicts_with(&conflicted)
+        .into_iter()
+        .collect();
+    assert_eq!(gone, spenders);
+    for op in conflicted {
+        life.chain.spend(op);
+    }
+    let rest: Vec<Txid> = life.live_set().into_iter().collect();
+    assert_eq!(life.mp.remove_live_txids(&rest).unwrap(), rest.len());
+    assert_eq!(life.mp.live_count(), 0);
+}
+
+/// Block 200 confirmed `zp`. A seq=1 spend of its output and a coinbase
+/// spend that matures at 201 enter. Disconnecting 200 puts `zp` back in the
+/// pool: the seq=1 child is BIP68 non-final behind an unconfirmed parent,
+/// and the coinbase spend is immature again. The next block 200 confirms
+/// `zp` once more.
+fn reorg_readmits_and_evicts_nonfinal(life: &mut Life) {
+    let zp = spend_tx(life.chain.fund_at(100_000, 150, false), 99_000);
+    life.chain.confirm(&zp, 200);
+    let mut seq1 = spend_tx(out(zp.compute_txid(), 0), 98_000);
+    seq1.input[0].sequence = Sequence::from_consensus(1);
+    let cb_spend = spend_tx(life.chain.fund_at(50_0000_0000, 101, true), 49_0000_0000);
+    life.accept(&seq1).expect("parent one block deep");
+    life.accept(&cb_spend).expect("mature at 201");
+
+    life.chain.disconnect(&zp);
+    life.tip.height = 199;
+    let back = life
+        .mp
+        .reorg_disconnect_reaccept(std::slice::from_ref(&zp), &life.chain, life.tip);
+    assert!(back[0].is_ok(), "{:?}", back[0].as_ref().err());
+    assert!(!life.live(&seq1));
+    assert!(!life.live(&cb_spend));
+    assert_eq!(life.live_set(), BTreeSet::from([zp.compute_txid()]));
+
+    life.chain.confirm(&zp, 200);
+    life.tip.height = 200;
+    assert_eq!(life.mp.remove_live_txids(&[zp.compute_txid()]).unwrap(), 1);
+}
+
+/// With -minrelaytxfee at 50 sat/vB a parent below it goes to the extra
+/// pool. A one-sat child does not carry it; a paying child with a confirmed
+/// second input does. An unrelated low-fee tx does not ride a package's
+/// waiver. A child that fails after its waived parent promoted a parked
+/// spender takes the spender down with the parent.
+fn raised_min_relay_one_parent_one_child(life: &mut Life) {
+    life.mp.set_min_relay_sat_kvb(50_000);
+    let lp = fan_out(life.chain.fund(100_000), &[49_900, 49_900]);
+    let lpid = lp.compute_txid();
+    assert!(matches!(
+        life.accept(&lp),
+        Err(AcceptError::Policy("min relay fee"))
+    ));
+    let missing = BTreeSet::from([lpid]);
+    let sib = spend_tx(out(lpid, 0), 49_899);
+    assert!(life
+        .mp
+        .try_one_parent_package(&sib, &missing, &life.chain)
+        .is_none());
+    let payer = spend_all(&[out(lpid, 1), life.chain.fund(100_000)], 1_000);
+    assert_eq!(
+        life.mp
+            .try_one_parent_package(&payer, &missing, &life.chain)
+            .map(|p| p.compute_txid()),
+        Some(lpid)
+    );
+
+    let extra = spend_tx(life.chain.fund(100_000), 99_800);
+    let wp = spend_tx(life.chain.fund(100_000), 99_800);
+    let wc = spend_tx(out(wp.compute_txid(), 0), 1_000);
+    let err = life.package(&[extra, wp, wc]).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("min relay fee")), "{err}");
+    assert_eq!(life.mp.live_count(), 0);
+
+    let two = fan_out(life.chain.fund(100_000), &[50_000, 49_800]);
+    let spender = spend_tx(out(two.compute_txid(), 0), 1_000);
+    assert!(matches!(
+        life.accept(&spender),
+        Err(AcceptError::Orphaned { .. })
+    ));
+    let bad = with_annex(spend_tx(out(two.compute_txid(), 1), 1_000));
+    let err = life.package(&[two, bad]).unwrap_err();
+    assert!(matches!(err, AcceptError::Policy("libre annex")), "{err}");
+    assert_eq!((life.mp.live_count(), life.mp.orphan_count()), (0, 0));
+}
+
+/// Room for three 61 vB txs. Over budget with the new tx as the worst
+/// chunk, the pass removes nothing and stops. The next arrival evicts the
+/// worst chunks, and the CPFP pair leaves together.
+fn full_pool_evicts_worst_chunks(life: &mut Life) {
+    life.mp.max_weight = 3 * spend_tx(OutPoint::null(), 0).weight().to_wu();
+    let p = spend_tx(life.chain.fund(100_000), 100_000 - 3_700);
+    let c = spend_tx(out(p.compute_txid(), 0), 100_000 - 3_700 - 12_200);
+    let s1 = spend_tx(life.chain.fund(100_000), 100_000 - 18_300);
+    let l = spend_tx(life.chain.fund(100_000), 100_000 - 3_400);
+    for tx in [&p, &c, &s1, &l] {
+        life.accept(tx).unwrap();
+    }
+    assert_eq!(life.mp.live_count(), 4);
+    assert!(life.mp.graph.total_weight() > life.mp.max_weight);
+    assert_eq!(
+        life.mp.mempool_min_fee_sat_kvb(),
+        50_000 + INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB,
+        "a pass that evicts nothing does not raise the floor"
+    );
+
+    let s2 = spend_tx(life.chain.fund(100_000), 100_000 - 19_500);
+    life.accept(&s2).unwrap();
+    assert_eq!(
+        life.live_set(),
+        BTreeSet::from([s1.compute_txid(), s2.compute_txid()])
+    );
+    assert!(life.mp.graph.total_weight() <= life.mp.max_weight);
+}
+
+/// One mempool from the first orphan to a full pool: relay order, RBF,
+/// cluster caps, packages, a block, a reorg, a raised `-minrelaytxfee`, and
+/// eviction, against one chain view.
+#[test]
+fn mempool_accept_life() {
+    let dir = tmp_dir();
+    let mut life = Life {
+        mp: ActiveMempool::open_or_create(&dir).unwrap(),
+        chain: LifeChain::default(),
+        tip: ChainTipCtx {
+            height: 200,
+            mtp: u32::MAX,
+        },
+    };
+    orphan_parks_then_promotes(&mut life);
+    invalid_or_spent_parent_does_not_park(&mut life);
+    let (rbf_coin, rbf_winner) = full_rbf_and_staged_commit(&mut life);
+    replacements_unpin_and_leave_the_cluster_count(&mut life);
+    cluster_vsize_cap(&mut life);
+    let (cpfp_coin, [cp, cc]) = packages_accept_and_roll_back(&mut life);
+    block_evicts_conflicts_and_confirms_the_rest(
+        &mut life,
+        [rbf_coin, cpfp_coin],
+        BTreeSet::from([rbf_winner, cp, cc]),
+    );
+    reorg_readmits_and_evicts_nonfinal(&mut life);
+    raised_min_relay_one_parent_one_child(&mut life);
+    full_pool_evicts_worst_chunks(&mut life);
+    let _ = std::fs::remove_dir_all(&dir);
+}
