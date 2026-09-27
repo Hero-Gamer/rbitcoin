@@ -141,6 +141,17 @@ ignore that file.
 |------|---------|----------|
 | **Default** (CI / local full suite) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + live P2P (8-block `two_node`, restart reconstruct, dead-peer, hop serve, dual live seeders, post-IBD tip follow, getheaders gap fill, product `run_p2p --connect`) + hub reorgs. When agents run this suite: [`docs/how-we-plan.md`](docs/how-we-plan.md). Coverage stays a PR job. |
 
+**tmpfs:** Linux CI (`test`, `coverage`, `mutants`) sets
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER` to
+[`scripts/tmpfs-test-runner.sh`](scripts/tmpfs-test-runner.sh). Each test
+binary gets a private `TMPDIR` under `/dev/shm`, removed when it exits.
+Store fsyncs dominate suite wall on disk; tmpfs runs the same syscalls for
+free (local workspace suite 141–299 s on disk, 79 s on tmpfs). With less than
+`RBTC_TEST_TMPFS_MIN_MB` (2048) free, it keeps the caller's `TMPDIR`.
+`windows` and `macos` stay on real disk. Local opt-in: export the same
+variable with an absolute path. Keep default-tier fixtures small: on tmpfs,
+test bytes are RAM.
+
 ### Suite speed budgets (default tier)
 
 **Target:** warm default suite wall **≤3 min** (stretch **&lt;2 min**) on a Linux host comparable to CI / agent VM with a warm `target/`.
@@ -270,7 +281,7 @@ matches scalar in default tests). Owner: [`docs/quality.md`](./docs/quality.md).
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). `--fail-above --threshold 30`; `.cargo-crap.toml` allowlists today's production CRAP>30 functions (remove a name when it scores ≤30). Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`. No `--fail-regression` (llvm-cov coverage % jitters per function) |
 | **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 92% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
-| **cargo-mutants** | Nightly, not a PR check. `./scripts/mutants-nightly.sh` lists `--workspace` mutants, runs new diff lines first, then walks a cursor through the rest. `rbitcoin-bench` is excluded (`.cargo/mutants.toml` and `--exclude` on both invocations; CLI replaces the config glob). `#[mutants::skip]` on an expression is the won't-test list; those mutants are omitted, not `MISSED`. Each mutant uses `--test-workspace=true` so a higher journey counts, `--baseline=skip`, `-j 1`, 20 minute mutant timeout, 5 hour budget. Cursor artifact `mutants-cursor`. `MISSED` is uploaded and does not fail the run. Snapshot lists in [`docs/mutants/`](docs/mutants/) are host history, not the gate. | `mutants.yml` daily `47 3 * * *` (20:47 Pacific during PDT) and `workflow_dispatch`. Job timeout 330 minutes. |
+| **cargo-mutants** | Nightly, not a PR check. `./scripts/mutants-nightly.sh` lists `--workspace` mutants, runs new diff lines first, then walks a cursor through the rest. `rbitcoin-bench` is excluded (`.cargo/mutants.toml` and `--exclude` on both invocations; CLI replaces the config glob). `#[mutants::skip]` on an expression is the won't-test list; those mutants are omitted, not `MISSED`. Each mutant uses `--test-workspace=true` so a higher journey counts, `--baseline=skip`, `-j 1`, test binaries on tmpfs (runner above; the mutants copy stays on disk), 20 minute mutant timeout, 5 hour budget. Cursor artifact `mutants-cursor`. `MISSED` is uploaded and does not fail the run. Snapshot lists in [`docs/mutants/`](docs/mutants/) are host history, not the gate. | `mutants.yml` daily `47 3 * * *` (20:47 Pacific during PDT) and `workflow_dispatch`. Job timeout 330 minutes. |
 
 Artifact silos above are unchanged: ast-grep / Miri dry-run / crap dry-run do
 not write `target/`. `mutants.out/` is gitignored.

@@ -92,6 +92,8 @@ jobs:
         run: ./scripts/pr-checks-watch.test.sh
       - name: mutants queue self-test
         run: ./scripts/mutants-queue.test.sh
+      - name: tmpfs test runner self-test
+        run: ./scripts/tmpfs-test-runner.test.sh
       - name: overlay-functional runner self-test
         run: ./scripts/overlay-functional/run.sh.test.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -118,6 +120,8 @@ jobs:
     env:
       # Keep uninstrumented artifacts out of the coverage tree (and vice versa).
       CARGO_TARGET_DIR: target/dev
+      # Test binaries get a private TMPDIR on /dev/shm (TESTING.md).
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/tmpfs-test-runner.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
@@ -125,6 +129,8 @@ jobs:
         with:
           shared-key: ci-test
           workspaces: ". -> target/dev"
+      - name: tmpfs headroom
+        run: df -h /dev/shm && free -m
       - name: cargo test
         run: cargo test --workspace
 
@@ -181,6 +187,7 @@ jobs:
     env:
       # coverage.sh also forces target/cov; set here so rust-cache keys match.
       CARGO_TARGET_DIR: target/cov
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/tmpfs-test-runner.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

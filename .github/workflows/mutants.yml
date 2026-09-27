@@ -25,6 +25,8 @@ jobs:
       CARGO_INCREMENTAL: "1"
       CARGO_TERM_COLOR: never
       RUSTFLAGS: ""
+      # Only test binaries go to /dev/shm; the mutants copy and target/ stay on disk.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/tmpfs-test-runner.sh
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
