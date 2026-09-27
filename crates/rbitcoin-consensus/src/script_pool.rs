@@ -49,6 +49,9 @@ unsafe impl Sync for Apply {}
 
 struct Wave {
     n: usize,
+    /// Jobs taken per successful steal. Script verify uses [`STEAL_CHUNK`].
+    /// An index window claims one height.
+    chunk: usize,
     next: AtomicUsize,
     in_wave: AtomicUsize,
     failed: AtomicBool,
@@ -81,7 +84,8 @@ impl Wave {
             self.notify_if_complete();
             return None;
         }
-        let i = self.next.fetch_add(STEAL_CHUNK, Ordering::Relaxed);
+        let chunk = self.chunk.max(1);
+        let i = self.next.fetch_add(chunk, Ordering::Relaxed);
         if i >= self.n {
             self.in_wave.fetch_sub(1, Ordering::AcqRel);
             self.notify_if_complete();
@@ -91,7 +95,7 @@ impl Wave {
         if STEAL_CLAIMS_ON.load(Ordering::Relaxed) {
             STEAL_CLAIMS.fetch_add(1, Ordering::Relaxed);
         }
-        Some(i..self.n.min(i.saturating_add(STEAL_CHUNK)))
+        Some(i..self.n.min(i.saturating_add(chunk)))
     }
 
     fn is_complete(&self) -> bool {
@@ -263,10 +267,20 @@ fn unpublish_fg(wave: &Arc<Wave>) {
 }
 
 /// Publish `items` for steal workers without waiting. `None` = already done
-/// (empty or single-item ran inline).
+/// (empty or single-item ran inline). Claims [`STEAL_CHUNK`] jobs at a time.
 pub(crate) fn start_for_each_owned<T: Sync>(
     items: Vec<T>,
     f: fn(&T) -> Result<(), ConsensusError>,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_for_each_owned_chunk(items, f, STEAL_CHUNK)
+}
+
+/// Same as [`start_for_each_owned`] with an explicit claim size. `chunk` of 0
+/// is treated as 1. Empty and single-item lists still run inline.
+pub(crate) fn start_for_each_owned_chunk<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
         return Err(ConsensusError::BadBlock(
@@ -291,6 +305,7 @@ pub(crate) fn start_for_each_owned<T: Sync>(
     }
     let wave = Arc::new(Wave {
         n: items.len(),
+        chunk,
         next: AtomicUsize::new(0),
         in_wave: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
@@ -812,6 +827,35 @@ mod tests {
         assert!(
             (8..32).contains(&claims),
             "expected ~8 chunks of 32 for 256 jobs, got {claims}"
+        );
+    }
+
+    fn run_owned_chunk(items: Vec<u32>, chunk: usize) -> Result<(), ConsensusError> {
+        match start_for_each_owned_chunk(items, ok_u32, chunk)? {
+            Some(w) => w.finish(),
+            None => Ok(()),
+        }
+    }
+
+    /// Index windows are at most 64 heights and often under 32, so a claim of
+    /// 32 assigns the whole window to one worker. Eight jobs at size 1 are
+    /// eight claims; the script-verify default still covers those eight in one.
+    #[test]
+    fn index_wave_claims_one_job() {
+        let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+        workers();
+        STEAL_CLAIMS.store(0, Ordering::Relaxed);
+        STEAL_CLAIMS_ON.store(true, Ordering::Relaxed);
+        run_owned_chunk((0..8).collect(), 1).unwrap();
+        let one = STEAL_CLAIMS.load(Ordering::Relaxed);
+        STEAL_CLAIMS.store(0, Ordering::Relaxed);
+        run_owned((0..8).collect(), ok_u32).unwrap();
+        let wide = STEAL_CLAIMS.load(Ordering::Relaxed);
+        STEAL_CLAIMS_ON.store(false, Ordering::Relaxed);
+        assert_eq!(one, 8, "claim size 1 is one claim per height");
+        assert_eq!(
+            wide, 1,
+            "script-verify chunk of 32 covers 8 jobs in one claim"
         );
     }
 

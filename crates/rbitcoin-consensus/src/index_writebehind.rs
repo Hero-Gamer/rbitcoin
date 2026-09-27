@@ -11,7 +11,7 @@
 //! the watermarks. A wide gap is the materialize; at the tip each release is
 //! a one-height window.
 
-use crate::script_pool::start_for_each_owned;
+use crate::script_pool::start_for_each_owned_chunk;
 use crate::silent_payments::tweak_records_from_window;
 use crate::ConsensusError;
 use rbitcoin_primitives::{Fk, Height};
@@ -138,7 +138,7 @@ fn assemble_window(query: &Query, window: &Arc<IndexWindow>) -> Result<Assembled
         }
         slots.push(out);
     }
-    if let Some(wave) = start_for_each_owned(jobs, assemble_index_height)? {
+    if let Some(wave) = start_for_each_owned_chunk(jobs, assemble_index_height, 1)? {
         wave.finish()?;
     }
     let mut filters = Vec::new();
