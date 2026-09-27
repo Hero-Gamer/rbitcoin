@@ -168,6 +168,7 @@ pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
 };
+pub use block_filter::basic_filter_of;
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;

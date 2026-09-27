@@ -4,13 +4,14 @@
 //! The IO thread plans windows of consecutive heights from the lower index
 //! watermark up to the released tip and reads each through
 //! [`rbitcoin_store::read_index_window`] (one completion session). One CPU
-//! worker builds each index for the heights that index still needs (tweak
-//! EC math included) and commits each index once per window
+//! worker publishes one job per height to `rbtc-scripts-*` (filter GCS and
+//! tweak EC) and commits each index once per window
 //! under the index write-behind lock. A commit that finds its watermark or a
 //! `confirmed[h]` moved (a reorg) returns 0, and the IO thread re-plans from
 //! the watermarks. A wide gap is the materialize; at the tip each release is
 //! a one-height window.
 
+use crate::script_pool::start_for_each_owned;
 use crate::silent_payments::tweak_records_from_window;
 use crate::ConsensusError;
 use rbitcoin_primitives::{Fk, Height};
@@ -18,7 +19,7 @@ use rbitcoin_query::Query;
 use rbitcoin_store::IndexWindow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Heights per window. Bounds how long a disconnect waits and how far the
@@ -63,7 +64,97 @@ fn plan_window(query: &Query, start: u32, target: u32) -> Result<u32, ConsensusE
 fn read_window(query: &Query, start: u32, end: u32) -> Result<IndexWindow, ConsensusError> {
     let tweaks_from = query.tweak_index_next();
     let heights = query.index_heights(start, end, tweaks_from)?;
-    Ok(query.read_index_window(&heights)?)
+    let mut window = query.read_index_window(&heights)?;
+    for block in &mut window.blocks {
+        block.hash = query.store().get_header(block.header_fk)?.hash;
+    }
+    Ok(window)
+}
+
+/// One tx: `None` when it has no tweak (coinbase, no P2TR output, ineligible).
+type HeightTweaks = Vec<Option<[u8; 33]>>;
+
+struct IndexHeightOut {
+    filter: Option<(bitcoin::bip158::BlockFilter, Fk)>,
+    tweaks: Option<(Height, Fk, HeightTweaks)>,
+}
+
+struct IndexHeightJob {
+    window: Arc<IndexWindow>,
+    index: usize,
+    want_filter: bool,
+    want_tweaks: bool,
+    out: Arc<Mutex<Option<IndexHeightOut>>>,
+}
+
+fn assemble_index_height(job: &IndexHeightJob) -> Result<(), ConsensusError> {
+    let block = &job.window.blocks[job.index];
+    let filter = if job.want_filter {
+        Some((
+            rbitcoin_query::basic_filter_of(&block.hash, &job.window, job.index)?,
+            block.header_fk,
+        ))
+    } else {
+        None
+    };
+    let tweaks = if job.want_tweaks {
+        Some((
+            block.height,
+            block.header_fk,
+            tweak_records_from_window(&job.window, job.index)?,
+        ))
+    } else {
+        None
+    };
+    *job.out.lock().unwrap_or_else(|e| e.into_inner()) = Some(IndexHeightOut { filter, tweaks });
+    Ok(())
+}
+
+struct Assembled {
+    filters: Vec<(bitcoin::bip158::BlockFilter, Fk)>,
+    tweaks: Vec<(Height, Fk, HeightTweaks)>,
+}
+
+/// One job per height that still needs a filter or tweaks. The wave joins
+/// before return, so the `Arc` is only shared for that call.
+fn assemble_window(query: &Query, window: &Arc<IndexWindow>) -> Result<Assembled, ConsensusError> {
+    let filter_from = query.filter_index_next();
+    let tweak_from = query.tweak_index_next();
+    let mut slots = Vec::with_capacity(window.blocks.len());
+    let mut jobs = Vec::new();
+    for (index, block) in window.blocks.iter().enumerate() {
+        let h = block.height.0;
+        let want_filter = filter_from.is_some_and(|n| h >= n);
+        let want_tweaks = tweak_from.is_some_and(|n| h >= n);
+        let out = Arc::new(Mutex::new(None));
+        if want_filter || want_tweaks {
+            jobs.push(IndexHeightJob {
+                window: Arc::clone(window),
+                index,
+                want_filter,
+                want_tweaks,
+                out: Arc::clone(&out),
+            });
+        }
+        slots.push(out);
+    }
+    if let Some(wave) = start_for_each_owned(jobs, assemble_index_height)? {
+        wave.finish()?;
+    }
+    let mut filters = Vec::new();
+    let mut tweaks = Vec::new();
+    for slot in &slots {
+        let Some(done) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            continue;
+        };
+        if let Some(filter) = done.filter {
+            filters.push(filter);
+        }
+        if let Some(tweak) = done.tweaks {
+            tweaks.push(tweak);
+        }
+    }
+    Ok(Assembled { filters, tweaks })
 }
 
 /// Milliseconds of one interval, or of one tip window.
@@ -152,7 +243,7 @@ struct CommitTimes {
 /// when a commit found the watermark or a `confirmed[h]` moved.
 fn commit_window(
     query: &Query,
-    window: &IndexWindow,
+    window: &Arc<IndexWindow>,
     stages: &IndexStageMs,
 ) -> Result<CommitTimes, ConsensusError> {
     let Some(first) = window.blocks.first().map(|b| b.height.0) else {
@@ -163,45 +254,17 @@ fn commit_window(
         });
     };
     let t_build = Instant::now();
-    let filters = if let Some(next) = query.filter_index_next() {
-        let skip = next.saturating_sub(first) as usize;
-        let built = window
-            .blocks
-            .iter()
-            .enumerate()
-            .skip(skip)
-            .map(|(i, b)| Ok((query.basic_filter_from_window(window, i)?, b.header_fk)))
-            .collect::<Result<Vec<_>, ConsensusError>>()?;
-        Some((first + skip as u32, built))
-    } else {
-        None
-    };
-    let tweaks = if let Some(next) = query.tweak_index_next() {
-        let skip = next.saturating_sub(first) as usize;
-        let items = window
-            .blocks
-            .iter()
-            .enumerate()
-            .skip(skip)
-            .map(|(i, b)| Ok((b.height, b.header_fk, tweak_records_from_window(window, i)?)))
-            .collect::<Result<Vec<(Height, Fk, _)>, ConsensusError>>()?;
-        Some(items)
-    } else {
-        None
-    };
+    let assembled = assemble_window(query, window)?;
     let build_ns = t_build.elapsed().as_nanos() as u64;
     let t_commit = Instant::now();
     let committed = (|| {
         let mut ok = true;
-        if let Some((start, built)) = &filters {
-            if !built.is_empty() {
-                ok &= query.commit_window_filters(*start, built)? > 0;
-            }
+        if !assembled.filters.is_empty() {
+            let start = query.filter_index_next().unwrap_or(first).max(first);
+            ok &= query.commit_window_filters(start, &assembled.filters)? > 0;
         }
-        if let Some(items) = &tweaks {
-            if !items.is_empty() {
-                ok &= query.commit_window_tweaks(items)? > 0;
-            }
+        if !assembled.tweaks.is_empty() {
+            ok &= query.commit_window_tweaks(&assembled.tweaks)? > 0;
         }
         Ok(ok)
     })();
@@ -227,7 +290,8 @@ pub fn build_indexes_released(query: &Query) -> Result<(), ConsensusError> {
         }
         let end = plan_window(query, start, target)?;
         let stages = IndexStageMs::default();
-        if !commit_window(query, &read_window(query, start, end)?, &stages)?.ok {
+        let window = Arc::new(read_window(query, start, end)?);
+        if !commit_window(query, &window, &stages)?.ok {
             break;
         }
     }
@@ -253,7 +317,8 @@ fn cpu_worker(
         if resync.load(Ordering::Acquire) {
             continue;
         }
-        let times = commit_window(query, &ready.window, stages)?;
+        let window = Arc::new(ready.window);
+        let times = commit_window(query, &window, stages)?;
         if ready.log_apply {
             rbitcoin_log::info!(
                 "{}",
@@ -473,5 +538,153 @@ mod tests {
         assert_eq!((a.read_ms, a.build_ms, a.commit_ms), (2, 1, 0));
         let b = s.take_ms();
         assert_eq!((b.read_ms, b.build_ms, b.commit_ms), (0, 0, 0));
+    }
+
+    /// Three heights: coinbase (ineligible), a same-window spend into P2TR,
+    /// and a later coinbase that is also ineligible. Pooled assemble matches
+    /// the serial window walk.
+    #[test]
+    fn per_height_jobs_match_serial_window() {
+        use bitcoin::hashes::{hash160, Hash};
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_store::{InputRecord, OutputRecord};
+
+        let _gate = crate::script_pool::steal_test_gate();
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-jobs");
+        q.set_block_filter_index(true).unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let ser = pk.serialize();
+        let h160 = hash160::Hash::hash(&ser);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(h160.as_ref());
+        let (xonly, _) = pk.x_only_public_key();
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&xonly.serialize());
+
+        let mut genesis_txid = [0u8; 32];
+        genesis_txid[31] = 0xcb;
+        let h0 = header_rec(0, Fk::NULL, None);
+        let fk0 = q
+            .connect_block(
+                Height(0),
+                &h0,
+                &[tx_apply(
+                    genesis_txid,
+                    vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
+                )],
+            )
+            .unwrap();
+        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
+
+        let mut spend_txid = [0u8; 32];
+        spend_txid[0] = 0x11;
+        spend_txid[31] = 0xcd;
+        let h1 = header_rec(1, fk0, Some(h0.hash));
+        let fk1 = q
+            .connect_block(
+                Height(1),
+                &h1,
+                &[tx_apply(
+                    spend_txid,
+                    vec![InputRecord {
+                        prev_txid: genesis_txid,
+                        create_fk,
+                        prev_index: 0,
+                        sequence: u32::MAX,
+                        script_sig: vec![],
+                        witness: vec![vec![0u8; 64], ser.to_vec()],
+                    }],
+                    vec![OutputRecord::unspent(49_0000_0000, p2tr)],
+                )],
+            )
+            .unwrap();
+
+        let mut later_txid = [0u8; 32];
+        later_txid[31] = 0xee;
+        let h2 = header_rec(2, fk1, Some(h1.hash));
+        q.connect_block(
+            Height(2),
+            &h2,
+            &[tx_apply(
+                later_txid,
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+            )],
+        )
+        .unwrap();
+
+        let window = Arc::new(read_window(&q, 0, 2).unwrap());
+        assert_eq!(window.blocks.len(), 3);
+        let got = assemble_window(&q, &window).unwrap();
+        assert_eq!(got.filters.len(), 3);
+        assert_eq!(got.tweaks.len(), 3);
+        for (i, block) in window.blocks.iter().enumerate() {
+            let serial_f = q.basic_filter_from_window(&window, i).unwrap();
+            assert_eq!(got.filters[i].0.content, serial_f.content, "filter {i}");
+            assert_eq!(got.filters[i].1, block.header_fk);
+            let serial_t = crate::silent_payments::tweak_records_from_window(&window, i).unwrap();
+            assert_eq!(got.tweaks[i].2, serial_t, "tweaks {i}");
+        }
+        assert!(got.tweaks[0].2.iter().all(|t| t.is_none()), "coinbase");
+        assert!(
+            got.tweaks[1].2.iter().any(|t| t.is_some()),
+            "same-window P2TR spend"
+        );
+        assert!(
+            got.tweaks[2].2.iter().all(|t| t.is_none()),
+            "no P2TR output"
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    fn header_rec(
+        h: u32,
+        prev_fk: Fk,
+        prev_hash: Option<[u8; 32]>,
+    ) -> rbitcoin_store::HeaderRecord {
+        let mut merkle = [0u8; 32];
+        merkle[0..4].copy_from_slice(&h.to_le_bytes());
+        merkle[5] = 0xec;
+        let hash = match prev_hash {
+            None => merkle,
+            Some(ph) => rbitcoin_store::block_header_hash(1, &ph, &merkle, h + 1, 0x207f_ffff, h),
+        };
+        rbitcoin_store::HeaderRecord {
+            prev_fk,
+            version: 1,
+            timestamp: h + 1,
+            bits: 0x207f_ffff,
+            nonce: h,
+            merkle_root: merkle,
+            hash,
+            size: 0,
+            weight: 0,
+        }
+    }
+
+    fn tx_apply(
+        txid: [u8; 32],
+        inputs: Vec<rbitcoin_store::InputRecord>,
+        outputs: Vec<rbitcoin_store::OutputRecord>,
+    ) -> rbitcoin_query::TxApply {
+        rbitcoin_query::TxApply {
+            tx: rbitcoin_store::TxRecord {
+                txid,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: inputs.len() as u32,
+                output_start_fk: Fk::NULL,
+                output_count: outputs.len() as u32,
+            },
+            inputs,
+            outputs,
+        }
     }
 }

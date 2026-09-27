@@ -50,6 +50,34 @@ impl BlockFilterWriteBehind {
     }
 }
 
+/// Basic filter of `window.blocks[i]` using a hash the caller already loaded.
+///
+/// No store IO. Output scripts other than `OP_RETURN`, then each spent prevout
+/// script. A missing prevout is corrupt.
+pub fn basic_filter_of(
+    block_hash: &[u8; 32],
+    window: &IndexWindow,
+    i: usize,
+) -> Result<BlockFilter, QueryError> {
+    const OP_RETURN: u8 = 0x6a;
+    let block = &window.blocks[i];
+    let mut elements: Vec<&[u8]> = Vec::new();
+    for tx in &block.txs {
+        for o in &tx.outs {
+            if o.script.first() != Some(&OP_RETURN) {
+                elements.push(&o.script);
+            }
+        }
+    }
+    for e in block.edges.iter().flatten().filter(|e| !e.parent.is_null()) {
+        let out = window.prevout(e.parent, e.vout).ok_or(StoreError::Corrupt(
+            "invariant: blockfilter prevout missing",
+        ))?;
+        elements.push(&out.script);
+    }
+    encode_basic_filter(block_hash, elements.into_iter())
+}
+
 /// GCS-encode a basic filter keyed by `block_hash` (internal byte order).
 fn encode_basic_filter<'a>(
     block_hash: &[u8; 32],
@@ -105,30 +133,14 @@ impl Query {
         read_index_window(&self.store.txs, heights)
     }
 
-    /// Basic filter of `window.blocks[i]`.
+    /// Basic filter of `window.blocks[i]`. Reads the block hash from the header.
     pub fn basic_filter_from_window(
         &self,
         window: &IndexWindow,
         i: usize,
     ) -> Result<BlockFilter, QueryError> {
-        const OP_RETURN: u8 = 0x6a;
-        let block = &window.blocks[i];
-        let hash = self.store.get_header(block.header_fk)?.hash;
-        let mut elements: Vec<&[u8]> = Vec::new();
-        for tx in &block.txs {
-            for o in &tx.outs {
-                if o.script.first() != Some(&OP_RETURN) {
-                    elements.push(&o.script);
-                }
-            }
-        }
-        for e in block.edges.iter().flatten().filter(|e| !e.parent.is_null()) {
-            let out = window.prevout(e.parent, e.vout).ok_or(StoreError::Corrupt(
-                "invariant: blockfilter prevout missing",
-            ))?;
-            elements.push(&out.script);
-        }
-        encode_basic_filter(&hash, elements.into_iter())
+        let hash = self.store.get_header(window.blocks[i].header_fk)?.hash;
+        basic_filter_of(&hash, window, i)
     }
 
     pub fn block_filter_enabled(&self) -> bool {
