@@ -162,6 +162,13 @@ static STEAL_CLAIMS_ON: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static STEAL_TEST: Mutex<()> = Mutex::new(());
 
+/// Hold across a test that publishes a steal wave, so pool tests do not
+/// interleave waves.
+#[cfg(test)]
+pub(crate) fn steal_test_gate() -> std::sync::MutexGuard<'static, ()> {
+    STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn waves_snap() -> &'static ArcSwap<Vec<Arc<Wave>>> {
     WAVES_SNAP.get_or_init(|| ArcSwap::from_pointee(Vec::new()))
 }

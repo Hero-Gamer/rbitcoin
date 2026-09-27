@@ -269,11 +269,12 @@ shared with `--block-filter-index`) from the taproot origin (709632 on
 mainnet), then sealed per released tip block; the confirm write thread writes
 no tweaks. One IO thread reads windows of heights on one completion session
 (`seqsigwit` and parent txids only for P2TR-output txs); one CPU thread
-(`rbtc-idx-cpu`) computes the tweaks, secp included, and commits one batched
-height-blob + idx write per window. It does not borrow `rbtc-scripts-*`, so
-block scripts and mempool accept never share workers with it. Reorg
-truncates with tip. Kill-safe: `next_height` is the last complete put. INFO
-every 10 s: `index: build next=… tip=… rate=…/s remain=…`.
+(`rbtc-idx-cpu`) publishes one job per height to `rbtc-scripts-*` (tweak EC,
+and filter GCS when that index is on) and commits one batched height-blob +
+idx write per window. A catch-up wave shares that pool with block scripts for
+at most one window. Reorg truncates with tip. Kill-safe: `next_height` is the
+last complete put. INFO every 10 s: `index: build next=… tip=… rate=…/s
+remain=… read=…ms build=…ms commit=…ms`.
 
 Cake Wallet’s scan isolate may still hardcode `electrs.cakewallet.com` even
 after a successful probe — see `COMPAT.md`.

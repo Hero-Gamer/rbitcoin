@@ -50,6 +50,9 @@ pub struct IndexHeight {
 pub struct IndexBlock {
     pub height: Height,
     pub header_fk: Fk,
+    /// Block hash, internal byte order. Zero until the index IO thread fills
+    /// it from the header; assemble reads this and does not touch the store.
+    pub hash: [u8; 32],
     /// `inputs` is `Some` only for tweak-height txs with a P2TR output.
     pub txs: Vec<LoadedTweakTx>,
     pub edges: Vec<Vec<InputEdge>>,
@@ -446,6 +449,7 @@ fn decode_block(
     Ok(IndexBlock {
         height: h.height,
         header_fk: h.header_fk,
+        hash: [0u8; 32],
         txs,
         edges,
     })
