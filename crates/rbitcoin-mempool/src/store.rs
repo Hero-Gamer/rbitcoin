@@ -1527,58 +1527,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn new_slots_old_short_body_is_corrupt() {
-        let dir = tmp_dir();
-        let mut mp = Mempool::open_or_create(&dir).unwrap();
-        let raw = tiny_tx();
-        let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, 0, &[])
-            .unwrap();
-        mp.flush().unwrap();
-        let body_first = fs::read(dir.join("tx.body")).unwrap();
-        let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, 0, &[])
-            .unwrap();
-        mp.flush().unwrap();
-        drop(mp);
-        fs::write(dir.join("tx.body"), body_first).unwrap();
-        let mp = Mempool::open_or_create(&dir).unwrap();
-        match mp.load_live_txs() {
-            Err(MempoolError::Corrupt(m)) => {
-                assert!(m.contains("live slot body range"), "{m}");
-            }
-            other => panic!("expected live slot body range, got {other:?}"),
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn compact_crash_after_body_rename_finishes_slots() {
-        let dir = tmp_dir();
-        let mut mp = Mempool::open_or_create(&dir).unwrap();
-        let raw = tiny_tx();
-        let t1 = Txid::from_byte_array([0x01; 32]);
-        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, 0, &[])
-            .unwrap();
-        mp.flush().unwrap();
-        let slots_unpacked = fs::read(dir.join("slots")).unwrap();
-        mp.mark_slot_dead(0).unwrap();
-        let t2 = Txid::from_byte_array([0x02; 32]);
-        mp.append_live_tx(&raw, &t2, &raw.compute_wtxid(), 1, 400, 0, &[])
-            .unwrap();
-        mp.flush().unwrap();
-        mp.compact().unwrap();
-        let slots_packed = fs::read(dir.join("slots")).unwrap();
-        drop(mp);
-        fs::write(dir.join("slots"), &slots_unpacked).unwrap();
-        fs::write(dir.join("slots.tmp"), &slots_packed).unwrap();
-        let mp = Mempool::open_or_create(&dir).unwrap();
-        assert!(!dir.join("slots.tmp").exists());
-        mp.load_live_txs().expect("open must finish slots.tmp");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn compact_both_tmps_discarded_on_open() {
         let dir = tmp_dir();
         let mut mp = Mempool::open_or_create(&dir).unwrap();

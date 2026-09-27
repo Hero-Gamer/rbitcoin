@@ -50,7 +50,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `reject_tx_over_block_sigop_budget`, `mempool_under_pressure` |
 | [049](./049-rolling-min-fee.md) | medium | Full-mempool fee floor is a static bump | fixed | `mempool_under_pressure` |
 | [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `mempool_under_pressure` |
-| [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `pure_rbfr_unpins_descendant_package` |
+| [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `mempool_accept_life` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
 | [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `hostile_peer_session` |
 | [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` |

@@ -12,5 +12,5 @@ the full conflict set. A high-feerate replacement with a lower absolute
 fee than a fat descendant package is admitted by the direct-set rule.
 
 **Regression:** `rbitcoin-mempool`
-`accept::tests::pure_rbfr_unpins_descendant_package`,
+`accept::tests::mempool_accept_life`,
 `accept::tests::pure_rbfr_1_25x_ratio`.
