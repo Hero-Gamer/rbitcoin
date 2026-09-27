@@ -92,6 +92,8 @@ jobs:
         run: ./scripts/pr-checks-watch.test.sh
       - name: mutants queue self-test
         run: ./scripts/mutants-queue.test.sh
+      - name: tmpfs test runner self-test
+        run: ./scripts/tmpfs-test-runner.test.sh
       - name: overlay-functional runner self-test
         run: ./scripts/overlay-functional/run.sh.test.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
