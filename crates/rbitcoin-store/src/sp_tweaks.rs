@@ -645,7 +645,11 @@ mod tests {
             .write(true)
             .open(path)
             .unwrap();
-        f.set_len(hwm.max(FILE_HEADER_LEN as u64)).unwrap();
+        let hwm_len = hwm.max(FILE_HEADER_LEN as u64);
+        f.set_len(hwm_len).unwrap();
+        // Grow fallocates from offset 0, so leave sparse capacity past the HWM
+        // or a write near u32::MAX allocates the whole 4 GiB hole.
+        f.set_len(hwm_len + (1 << 20)).unwrap();
         let mut hdr = [0u8; FILE_HEADER_LEN];
         f.seek(SeekFrom::Start(0)).unwrap();
         f.read_exact(&mut hdr).unwrap();
