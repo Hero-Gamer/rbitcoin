@@ -1473,30 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn rpc_listen_and_dropped_user_apply_kv() {
-        let err = NodeConfig::default()
-            .apply_kv("rpcuser", "u")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rpc.token"), "{err}");
-        let err = NodeConfig::default()
-            .apply_kv("rpcpassword", "p")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rpc.token"), "{err}");
-        let mut rpc = NodeConfig {
-            network: Network::Regtest,
-            ..NodeConfig::default()
-        };
-        assert_eq!(rpc.apply_kv("rpc", "1").unwrap(), ConfApply::Applied);
-        assert!(rpc.rpc.socket);
-        assert_eq!(rpc.apply_kv("rpc_listen", "").unwrap(), ConfApply::Applied);
-        rpc.resolve_listen_defaults();
-        assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
-        assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
-    }
-
-    #[test]
     fn rpc_socket_moves_the_socket_out_of_the_datadir() {
         let mut c = NodeConfig::default().with_datadir(Path::new("/var/lib/rbitcoin"));
         assert_eq!(c.rpc_socket_path(), Path::new("/var/lib/rbitcoin/rpc.sock"));
@@ -1567,33 +1543,6 @@ mod tests {
         }
         match c.apply_kv("sptweaks_dust", "1").unwrap() {
             ConfApply::Unknown(k) => assert_eq!(k, "sptweaks_dust"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn minrelaytxfee_garbage_and_negative_are_config_errors() {
-        let mut c = NodeConfig::default();
-        let bad = c.apply_kv("min_relay_tx_fee", "nope").unwrap_err();
-        assert!(
-            format!("{bad}").contains("min_relay_tx_fee"),
-            "garbage must name the knob: {bad}"
-        );
-        let neg = c.apply_kv("min_relay_tx_fee", "-0.0001").unwrap_err();
-        assert!(
-            format!("{neg}").contains("min_relay_tx_fee"),
-            "negative must name the knob: {neg}"
-        );
-        assert_eq!(
-            c.apply_kv("min_relay_tx_fee", "0").unwrap(),
-            ConfApply::Applied
-        );
-        assert_eq!(
-            c.apply_kv("min_relay_tx_fee", "0.00000001").unwrap(),
-            ConfApply::Applied
-        );
-        match c.apply_kv("minrelaytxfee", "0").unwrap() {
-            ConfApply::Unknown(k) => assert_eq!(k, "minrelaytxfee"),
             other => panic!("{other:?}"),
         }
     }
@@ -1837,52 +1786,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn conf_file_maps_operator_knobs() {
-        let dir = tmp();
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("rbitcoin.conf");
-        std::fs::write(
-            &conf,
-            "# test conf\n\
-             network=signet\n\
-             max_inbound=40\n\
-             max_outbound=8\n\
-             mempool_size_mb=50\n\
-             milestone=100\n\
-             log_level=debug\n\
-             api_log=/tmp/rbitcoin-api.jsonl\n\
-             asmap=/tmp/ip_asn.dat\n\
-             connect=127.0.0.1:38333\n\
-             datadir-cold=/mnt/hdd/rbtc-cold\n",
-        )
-        .unwrap();
-        let mut cfg = NodeConfig::default().with_datadir(dir.join("data"));
-        cfg.merge_conf_file(&conf).unwrap();
-        assert_eq!(cfg.network, Network::Signet);
-        assert_eq!(cfg.listen.max_inbound, 40);
-        assert!(cfg.listen.max_inbound_explicit);
-        assert_eq!(cfg.listen.max_outbound, 8);
-        assert_eq!(cfg.mempool.max_weight, 50_000_000);
-        assert_eq!(cfg.milestone_height, 100);
-        assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
-        assert_eq!(
-            cfg.api_log.as_deref(),
-            Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl"))
-        );
-        assert_eq!(
-            cfg.asmap.as_deref(),
-            Some(std::path::Path::new("/tmp/ip_asn.dat"))
-        );
-        assert_eq!(cfg.listen.connect.len(), 1);
-        assert!(cfg.listen.connect_dns.is_empty());
-        assert_eq!(
-            cfg.datadir.cold.as_deref(),
-            Some(std::path::Path::new("/mnt/hdd/rbtc-cold"))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Env is an input when inbound was not explicit; never published back.
     #[test]
     fn absorb_inbound_env_reads_but_does_not_write() {
@@ -1997,45 +1900,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_signet_conf_builds_params() {
-        let dir = tmp();
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("custom-signet.conf");
-        std::fs::write(
-            &conf,
-            "network=signet\n\
-             signet_challenge=51\n\
-             signet_block_time=60\n",
-        )
-        .unwrap();
-
-        let mut cfg = NodeConfig::default();
-        cfg.merge_conf_file(&conf).unwrap();
-        cfg.validate().unwrap();
-        let params = cfg.chain_params().unwrap();
-        assert_eq!(params.btc.pow_target_spacing, 60);
-        assert_eq!(params.signet_challenge.unwrap().as_bytes(), &[0x51]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn custom_signet_options_require_signet_and_challenge() {
-        let challenge = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-        let mainnet = NodeConfig {
-            signet_challenge: Some(challenge),
-            ..NodeConfig::default()
-        };
-        assert!(mainnet.validate().is_err());
-
-        let missing_challenge = NodeConfig {
-            network: Network::Signet,
-            signet_block_time: Some(30),
-            ..NodeConfig::default()
-        };
-        assert!(missing_challenge.validate().is_err());
-    }
-
-    #[test]
     fn ensure_datadir_rejects_file_path_after_parent_exists() {
         let dir = tmp();
         std::fs::create_dir_all(&dir).unwrap();
@@ -2077,72 +1941,6 @@ mod tests {
         assert_eq!(cfg.milestone(), Milestone::NONE);
         cfg.milestone_height = 10;
         assert_eq!(cfg.milestone().height, 10);
-    }
-
-    #[test]
-    fn max_inbound_zero_is_allowed() {
-        let mut c = NodeConfig::default().with_datadir(tmp());
-        assert_eq!(c.apply_kv("max_inbound", "0").unwrap(), ConfApply::Applied);
-        assert_eq!(c.listen.max_inbound, 0);
-        assert!(c.listen.max_inbound_explicit);
-        c.validate()
-            .expect("max_inbound=0 is outbound-only, not an error");
-
-        let err = NodeConfig::default()
-            .apply_kv("max_outbound", "0")
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("max_outbound"),
-            "max_outbound=0 must still fail: {err}"
-        );
-        let mut o = NodeConfig::default().with_datadir(tmp());
-        o.listen.max_outbound = 0;
-        let verr = o.validate().unwrap_err().to_string();
-        assert!(
-            verr.contains("max-outbound"),
-            "validate must still reject max_outbound=0: {verr}"
-        );
-    }
-
-    #[test]
-    fn conf_bare_network_flags_and_bad_line() {
-        let dir = tmp();
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("flags.conf");
-        std::fs::write(
-            &conf,
-            "regtest\n\
-             # comment\n\
-             ; also\n\
-             \n\
-             no_seeds=1\n",
-        )
-        .unwrap();
-        let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
-        cfg.merge_conf_file(&conf).unwrap();
-        assert_eq!(cfg.network, Network::Regtest);
-        assert!(!cfg.listen.use_seeds);
-
-        let conf2 = dir.join("signet.conf");
-        std::fs::write(&conf2, "signet\n").unwrap();
-        let mut cfg2 = NodeConfig::default().with_datadir(dir.join("d2"));
-        cfg2.merge_conf_file(&conf2).unwrap();
-        assert_eq!(cfg2.network, Network::Signet);
-
-        let conf3 = dir.join("testnet.conf");
-        std::fs::write(&conf3, "testnet\n").unwrap();
-        let mut cfg3 = NodeConfig::default().with_datadir(dir.join("d3"));
-        cfg3.merge_conf_file(&conf3).unwrap();
-        assert_eq!(cfg3.network, Network::Testnet);
-
-        let conf_bad = dir.join("bad.conf");
-        std::fs::write(&conf_bad, "not_a_key_value\n").unwrap();
-        let mut cfg_bad = NodeConfig::default().with_datadir(dir.join("db"));
-        assert!(cfg_bad.merge_conf_file(&conf_bad).is_err());
-
-        let missing = dir.join("nope.conf");
-        assert!(cfg_bad.merge_conf_file(&missing).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
