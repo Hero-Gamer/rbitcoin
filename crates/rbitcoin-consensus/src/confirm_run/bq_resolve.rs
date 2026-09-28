@@ -1175,35 +1175,6 @@ mod tests {
     }
 
     #[test]
-    fn bq_wave_then_stamp_confirms_empty_block() {
-        let (path, q) = tmp_query();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        q.block_queue_enqueue(1, b1.block_hash().to_byte_array(), 1, &serialize(&b1))
-            .unwrap();
-        resolve_and_take(&q, &params, &[1]);
-        assert!(!q.block_queue_has_height(1));
-        let items = [(Height(1), std::sync::Arc::new(b1), None)];
-        let stamped = crate::confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
-            .expect("coinbase-only block needs no external head");
-        let mat = crate::confirm_wire_load_from_plan(
-            &q,
-            &params,
-            Milestone::NONE,
-            stamped,
-            None,
-            &ScriptPreverified::new(),
-        )
-        .expect("load");
-        let ok = crate::confirm_scripts_phase(mat.batch).expect("scripts");
-        crate::confirm_write_phase(&q, &params, Milestone::NONE, ok.batch).expect("write");
-        assert_eq!(q.tip_height().map(|h| h.0), Some(1));
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[test]
     fn taken_hi_tracks_sent_load_batches_not_unsent_wave() {
         let (path, q) = tmp_query();
         let params = ChainParams::regtest();

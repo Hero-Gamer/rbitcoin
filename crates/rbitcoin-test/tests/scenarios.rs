@@ -2749,7 +2749,19 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     assert!(q
         .is_block_archived(&b1.block_hash().to_byte_array())
         .unwrap());
+    assert_eq!(
+        q.tip_height(),
+        Some(Height::GENESIS),
+        "Class A alone does not move the tip"
+    );
     let n_before = q.tx_body_count();
+    commit_class_a_block(&q, &params, Height(1), &b1, ms).unwrap();
+    assert_eq!(
+        q.tx_body_count(),
+        n_before,
+        "a second archive does not re-append"
+    );
+    pin_block_size_weight_from_txstat(&q, &b1);
     confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
     assert_eq!(q.tip_height(), Some(Height(1)));
     assert_eq!(
@@ -2767,6 +2779,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     assert_eq!(q.tip_height(), Some(Height(1)));
     tip = b1.block_hash();
     tip_time = b1.header.time;
+    pin_confirm_refuses_without_advancing_tip(&q, &params, ms, &b1);
 
     let mut batch: Vec<(Height, bitcoin::Block)> = Vec::new();
     for h in 2u32..=4 {
@@ -2810,6 +2823,130 @@ fn unified_wire_pipeline_multi_block_to_tip() {
             h.0
         );
     }
+    pin_bq_wave_then_stamp_confirms_empty_block(&q, &params, ms, tip, tip_time);
+}
+
+/// Block size and weight come from the txstat rows Class A wrote. A zero
+/// row falls back to rebuilding the block instead of shortening the sum.
+fn pin_block_size_weight_from_txstat(q: &Query, b1: &Block) {
+    use rbitcoin_store::TxStatRow;
+
+    let hash = b1.block_hash().to_byte_array();
+    let (hfk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
+    let want = (b1.total_size() as u32, b1.weight().to_wu() as u32);
+    let _ = q.sample_reset_reconstruct_archived();
+    assert_eq!(q.block_size_weight(hfk).unwrap(), Some(want));
+    assert_eq!(
+        q.sample_reset_reconstruct_archived(),
+        0,
+        "the txstat sum does not reconstruct"
+    );
+    let cb_fk = q.header_tx_fks(hfk, Some(&hash)).unwrap().unwrap()[0];
+    let row = q.get_txstat(cb_fk).unwrap().unwrap();
+    let zero = TxStatRow {
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    };
+    q.store().write_txstat_row(cb_fk, &zero).unwrap();
+    assert_eq!(q.block_size_weight(hfk).unwrap(), Some(want));
+    assert_eq!(q.sample_reset_reconstruct_archived(), 1);
+    q.store().write_txstat_row(cb_fk, &row).unwrap();
+    assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
+}
+
+fn pin_confirm_refuses_without_advancing_tip(
+    q: &Query,
+    params: &ChainParams,
+    ms: Milestone,
+    b1: &Block,
+) {
+    use rbitcoin_consensus::{confirm_wire_load_phase, header_to_record, ScriptPreverified};
+    use rbitcoin_query::ConfirmPrepared;
+
+    let none = ScriptPreverified::new();
+    let g = regtest_genesis();
+    let non_contiguous = [(Height(1), g.clone()), (Height(3), g)];
+    for batch in [&[][..], &non_contiguous[..]] {
+        match confirm_wire_load_phase(q, params, ms, batch, &none) {
+            Err(rbitcoin_consensus::ConsensusError::BadBlock(_)) => {}
+            Err(e) => panic!("expected BadBlock, got {e}"),
+            Ok(_) => panic!("load of {} blocks must refuse", batch.len()),
+        }
+    }
+
+    let header_only = mine_regtest_block(b1.block_hash(), b1.header.time + 600, 2, vec![]);
+    let (tip_fk, _) = q
+        .get_header_by_hash(&b1.block_hash().to_byte_array())
+        .unwrap()
+        .unwrap();
+    let rec = header_to_record(
+        tip_fk,
+        &header_only.header,
+        header_only.block_hash().to_byte_array(),
+    );
+    let hfk = q.ensure_header(&rec).unwrap();
+    let err = q
+        .confirm_blocks_run(&[ConfirmPrepared {
+            height: Height(2),
+            header_fk: hfk,
+            tx_fks: vec![],
+        }])
+        .expect_err("a header without a body cannot confirm");
+    assert!(err.to_string().contains("header_txs"), "{err}");
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    let genesis_cb = q.block_tx_fks(Height::GENESIS).unwrap()[0];
+    assert_eq!(
+        q.store().tx_height_get(genesis_cb).unwrap(),
+        Some(0),
+        "the height fence keeps its runs"
+    );
+}
+
+/// A coinbase-only block taken off the block queue confirms through the
+/// split lookup → load → scripts → write stages with no external head.
+fn pin_bq_wave_then_stamp_confirms_empty_block(
+    q: &Query,
+    params: &ChainParams,
+    ms: Milestone,
+    tip: BlockHash,
+    tip_time: u32,
+) {
+    use bitcoin::consensus::encode::serialize;
+    use rbitcoin_consensus::{
+        confirm_bq_resolve_wave_capped, confirm_scripts_phase, confirm_wire_load_from_plan,
+        confirm_wire_lookup_stamp, confirm_write_phase, take_wave_items_for_load,
+        ScriptPreverified, BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
+    };
+
+    let h = q.tip_height().unwrap().0 + 1;
+    let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+    q.block_queue_enqueue(
+        h,
+        b.block_hash().to_byte_array(),
+        u64::from(h),
+        &serialize(&b),
+    )
+    .unwrap();
+    let wave = confirm_bq_resolve_wave_capped(
+        q,
+        params,
+        ms,
+        &[h],
+        BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        BQ_RESOLVE_WAVE_MAX_INPUTS,
+    )
+    .unwrap();
+    take_wave_items_for_load(q, &wave.items).unwrap();
+    assert!(!q.block_queue_has_height(h));
+    let items = [(Height(h), std::sync::Arc::new(b), None)];
+    let stamped = confirm_wire_lookup_stamp(q, params, ms, &items, None)
+        .expect("a coinbase-only block needs no external head");
+    let mat = confirm_wire_load_from_plan(q, params, ms, stamped, None, &ScriptPreverified::new())
+        .expect("load");
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+    confirm_write_phase(q, params, ms, ok.batch).expect("write");
+    assert_eq!(q.tip_height(), Some(Height(h)));
 }
 
 fn pin_wire_prep_ahead_cross_batch(

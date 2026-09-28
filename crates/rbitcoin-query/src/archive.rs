@@ -1437,63 +1437,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_class_a_only_does_not_advance_tip() {
-        use rbitcoin_store::HeaderRecord;
-
-        let (dir, q) = temp_query("class-a-only-no-tip");
-        assert!(q.tip_height().is_none());
-        let header = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash: [2u8; 32],
-            size: 0,
-            weight: 0,
-        };
-        let txs = [coinbase_apply(1)];
-        let (block, _) = crate::testutil::block_from_applies(&txs);
-        let hfk = q.commit_class_a_only(&header, &txs).unwrap();
-        assert!(q.tip_height().is_none(), "Class A helper must not set tip");
-        assert!(q.store().header_txs.has_body(hfk).unwrap());
-        let rec = q.store().headers.get(hfk).unwrap();
-        assert_eq!((rec.size, rec.weight), (0, 0));
-        let _ = q.sample_reset_reconstruct_archived();
-        let hit = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(
-            hit,
-            (
-                u32::try_from(block.total_size()).unwrap(),
-                u32::try_from(block.weight().to_wu()).unwrap(),
-            )
-        );
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "txstat sum must not reconstruct"
-        );
-        let (first, _) = q.store().header_txs.get_range(hfk).unwrap().unwrap();
-        q.store()
-            .write_txstat_row(
-                first,
-                &rbitcoin_store::TxStatRow {
-                    fee_sat: 0,
-                    base: 0,
-                    wit_extra: 0,
-                },
-            )
-            .unwrap();
-        let _ = q.sample_reset_reconstruct_archived();
-        let rebuilt = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(rebuilt, hit, "a zero txstat cell must not shorten the sum");
-        assert_eq!(q.sample_reset_reconstruct_archived(), 1);
-        assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn commit_class_a_only_writes_packed_ins_from_wire() {
         use rbitcoin_store::HeaderRecord;
 
@@ -2827,70 +2770,6 @@ mod tests {
         // Contiguous Class A commit of the merged frozen plan.
         assert!(q.archive_commit_plan(plan_a).unwrap());
         assert_eq!(q.tx_body_count(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Second commit after header_txs is linked must not re-append body (partial
-    /// confirm retry / crash recovery).
-    #[test]
-    fn archive_commit_plan_idempotent_when_header_already_has_body() {
-        use rbitcoin_store::HeaderRecord;
-
-        let (dir, q) = temp_query("arch-idempotent");
-        let header = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash: [2u8; 32],
-            size: 0,
-            weight: 0,
-        };
-        let hfk = q.ensure_header(&header).unwrap();
-        let need = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan = plan_applies(
-            &q,
-            &need,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
-        assert!(!plan.is_empty());
-        assert!(q.archive_commit_plan(plan).unwrap(), "first commit appends");
-        let n = q.tx_body_count();
-        assert!(n >= 1);
-        assert!(q.store().header_txs.has_body(hfk).unwrap());
-
-        // Rebuild a plan as if lookup incorrectly re-planned the same header.
-        let need2 = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan2 = plan_applies(
-            &q,
-            &need2,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
-        // filter_need empties txs when has_body — plan may be empty. Force a
-        // non-empty plan by planning against a fresh need then swapping ranges.
-        if plan2.is_empty() {
-            // Production path: archive_filter_need_header_fks / has_body clears need → empty plan.
-            // Commit empty is no-op.
-            assert!(!q.archive_commit_plan(plan2).unwrap());
-        } else {
-            assert!(
-                !q.archive_commit_plan(plan2).unwrap(),
-                "second commit must skip re-append"
-            );
-        }
-        assert_eq!(
-            q.tx_body_count(),
-            n,
-            "tx body count must not grow on idempotent re-commit"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

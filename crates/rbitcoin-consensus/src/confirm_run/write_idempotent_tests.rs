@@ -503,39 +503,6 @@ fn check_bip34_helper_and_expected_bits_no_retarget() {
     let _ = Height;
 }
 
-#[test]
-fn empty_confirm_batch_rejected() {
-    // confirm_wire_load_phase empty → BadBlock without store open
-    // We only have Query API; use a throwaway path under /tmp when available.
-    use super::confirm_wire_load_phase;
-    use super::ScriptPreverified;
-    use crate::milestone::Milestone;
-    use crate::params::ChainParams;
-    use rbitcoin_primitives::Height;
-    let (path, q) = tmp_query();
-    let params = ChainParams::regtest();
-    let none = ScriptPreverified::new();
-    let err = match confirm_wire_load_phase(&q, &params, Milestone::NONE, &[], &none) {
-        Ok(_) => panic!("expected empty batch error"),
-        Err(e) => e,
-    };
-    assert!(matches!(err, crate::error::ConsensusError::BadBlock(_)));
-    // Non-contiguous
-    let g = crate::params::genesis_block(&params);
-    let err2 = match confirm_wire_load_phase(
-        &q,
-        &params,
-        Milestone::NONE,
-        &[(Height(1), g.clone()), (Height(3), g)],
-        &none,
-    ) {
-        Ok(_) => panic!("expected non-contiguous error"),
-        Err(e) => e,
-    };
-    assert!(matches!(err2, crate::error::ConsensusError::BadBlock(_)));
-    let _ = std::fs::remove_dir_all(&path);
-}
-
 /// Trailing null `confirmed[]` + reopen must still connect real tip+1
 /// (`NotFound` was the inflated-HWM miss on a valid body).
 #[test]
