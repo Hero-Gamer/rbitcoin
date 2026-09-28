@@ -1974,10 +1974,33 @@ async fn start_and_exit(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError>
         .expect("run_p2p did not exit")
 }
 
+/// `run_p2p` off the runtime workers, as `cli_main` blocks on it: an empty
+/// datadir connects genesis through tip-accept, which refuses a worker.
+fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>> {
+    tokio::task::spawn_blocking(move || {
+        let _block = rbitcoin_net::BlockingRegion::enter();
+        tokio::runtime::Handle::current().block_on(run_p2p(cfg))
+    })
+}
+
+async fn stop_run_p2p(
+    rpc_addr: SocketAddr,
+    node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
+) {
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    match tokio::time::timeout(Duration::from_secs(15), node).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
+        Ok(Err(e)) => panic!("run_p2p join: {e}"),
+        Err(_) => panic!("run_p2p did not exit after stop"),
+    }
+}
+
 /// One operator datadir restarted through the startup arms `run_p2p` owns
 /// while its one `--connect` peer is down: a junk peer book, a missing then a
 /// valid asmap, the wallet servers up until `stop`, an Electrum port someone
-/// else holds, and a pruned datadir that refuses an unpruned start.
+/// else holds, seeds with no `--connect`, and a pruned datadir that refuses
+/// an unpruned start.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_listen_and_exit() {
     let td = TestDatadir::new().unwrap();
@@ -2015,7 +2038,7 @@ async fn node_listen_and_exit() {
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
     cfg.max_run_secs = Some(60);
-    let node = tokio::spawn(run_p2p(cfg));
+    let node = spawn_run_p2p(cfg);
     wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
     let (st, height) = http_get(esplora_addr, "/blocks/tip/height").await;
     assert_eq!((st, height.as_str()), (200, "0"), "esplora on genesis");
@@ -2024,12 +2047,7 @@ async fn node_listen_and_exit() {
     assert_eq!(tip["result"]["height"], 0, "{tip}");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
     assert_eq!(count["result"], 0, "{count}");
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
-    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
-    assert!(
-        matches!(stopped, Ok(Ok(Ok(())))),
-        "run_p2p did not stop cleanly"
-    );
+    stop_run_p2p(rpc_addr, node).await;
 
     // Another process holds the Electrum port. The bind fails with a warning
     // and the node still starts and exits.
@@ -2344,7 +2362,7 @@ async fn tor_control_onion_lifecycle() {
     cfg.tor.password = Some(TOR_PASSWORD.into());
     cfg.rpc.listen = Some(rpc);
     cfg.max_run_secs = Some(60);
-    let node = tokio::spawn(run_p2p(cfg));
+    let node = spawn_run_p2p(cfg);
     wait_listeners(&[electrum, esplora, rpc]).await;
     let info = jsonrpc(rpc, "getnetworkinfo", json!([])).await;
     let local: Vec<(String, u64)> = info["result"]["localaddresses"]
@@ -2369,12 +2387,7 @@ async fn tor_control_onion_lifecycle() {
     }
     .host_str();
     assert!(local.iter().any(|(a, _)| *a == i2p_p2p), "{local:?}");
-    let _ = jsonrpc(rpc, "stop", json!([])).await;
-    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
-    assert!(
-        matches!(stopped, Ok(Ok(Ok(())))),
-        "run_p2p did not stop cleanly"
-    );
+    stop_run_p2p(rpc, node).await;
 
     let first = tor.take_log();
     assert!(first.contains(&format!("AUTHENTICATE \"{TOR_PASSWORD}\"")));
@@ -2439,28 +2452,6 @@ async fn tor_control_onion_lifecycle() {
     for n in 0..3 {
         let dest = format!("DESTINATION={} ", fake_i2p_destination(n));
         assert!(creates.iter().any(|c| c.contains(&dest)), "{creates:?}");
-    }
-}
-
-/// `run_p2p` off the runtime workers, as `cli_main` blocks on it: an empty
-/// datadir connects genesis through tip-accept, which refuses a worker.
-fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>> {
-    tokio::task::spawn_blocking(move || {
-        let _block = rbitcoin_net::BlockingRegion::enter();
-        tokio::runtime::Handle::current().block_on(run_p2p(cfg))
-    })
-}
-
-async fn stop_run_p2p(
-    rpc_addr: SocketAddr,
-    node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
-) {
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
-    match tokio::time::timeout(Duration::from_secs(15), node).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
-        Ok(Err(e)) => panic!("run_p2p join: {e}"),
-        Err(_) => panic!("run_p2p did not exit after stop"),
     }
 }
 
