@@ -45,6 +45,7 @@ use std::time::Instant;
 
 mod bq_resolve;
 mod head_drain;
+mod index;
 mod lookup;
 mod phases;
 mod pin;
@@ -170,6 +171,8 @@ pub struct LoadedBatch {
     script_preverified: ScriptPreverified,
     /// Planned Class A write from wire lookup/load (committed in write stage).
     pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
+    /// Indexes to assemble. Copied from `index_live` at load.
+    index_want: index::IndexWant,
     stats: Arc<rbitcoin_query::ConfirmStats>,
 }
 
@@ -181,6 +184,8 @@ pub struct ScriptOkBatch {
     wire_blocks: Vec<Arc<Block>>,
     batch_parents: rbitcoin_query::BatchParents,
     pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
+    /// Filter bytes and tweak vecs for this batch. Empty when the indexes are off.
+    index_seal: index::IndexSeal,
 }
 
 /// Outcome of load: batch ready for scripts + pure work wall.
@@ -195,6 +200,8 @@ pub struct ConfirmScriptOutcome {
     pub batch: ScriptOkBatch,
     /// Script verify only (when produced by [`confirm_scripts_phase`]).
     pub work_ns: u64,
+    /// Filter and tweak assemble on this stage. Not part of `work_ns`.
+    pub idx_asm_ns: u64,
 }
 
 /// LOAD STAGE from **raw wire blocks** (unified height-ordered pipeline).
@@ -381,9 +388,18 @@ impl ScriptOkBatch {
         if self.archive_plan.is_some() != other.archive_plan.is_some() {
             return Err(other);
         }
+        let self_f = !self.index_seal.filters.is_empty();
+        let other_f = !other.index_seal.filters.is_empty();
+        if self_f != other_f {
+            return Err(other);
+        }
         self.prepared.append(&mut other.prepared);
         self.wire_blocks.append(&mut other.wire_blocks);
         self.batch_parents.extend_from(other.batch_parents);
+        self.index_seal
+            .filters
+            .append(&mut other.index_seal.filters);
+        self.index_seal.tweaks.append(&mut other.index_seal.tweaks);
         if let (Some(dst), Some(src)) = (self.archive_plan.as_mut(), other.archive_plan.take()) {
             dst.append(src);
         }

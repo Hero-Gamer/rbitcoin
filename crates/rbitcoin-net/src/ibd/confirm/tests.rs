@@ -2,8 +2,17 @@
 
 use super::{
     format_conf_q, format_queue_depth, format_stamp_reject_missing_prevout,
-    stamp_reject_operator_msg, ConfirmFeed, ConfirmQueueDepths,
+    stamp_reject_operator_msg, write_drain_max_parts, write_queue_cap, ConfirmFeed,
+    ConfirmQueueDepths, CONFIRM_RUN_MAX_BLOCKS,
 };
+
+#[test]
+fn index_startup_gap_matches_one_write_drain() {
+    assert_eq!(
+        rbitcoin_consensus::INDEX_STARTUP_GAP_HEIGHTS as usize,
+        write_drain_max_parts(write_queue_cap()) * CONFIRM_RUN_MAX_BLOCKS
+    );
+}
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;

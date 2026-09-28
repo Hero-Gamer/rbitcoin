@@ -1676,12 +1676,15 @@ pub(crate) fn spawn_confirm_engine(
                     );
                 },
                 |outcome, meta| {
-                    loop_stats_sc
-                        .confirm_ns
-                        .fetch_add(outcome.work_ns, Ordering::Relaxed);
+                    loop_stats_sc.confirm_ns.fetch_add(
+                        outcome.work_ns.saturating_add(outcome.idx_asm_ns),
+                        Ordering::Relaxed,
+                    );
                     confirm_thr_stats::add_script_work(
                         &stats,
-                        confirm_thr_stats::script_work_from_verify_ns(outcome.work_ns),
+                        confirm_thr_stats::script_work_from_verify_ns(
+                            outcome.work_ns.saturating_add(outcome.idx_asm_ns),
+                        ),
                     );
                     let script_ms = outcome.work_ns / 1_000_000;
                     let mat_ms = meta.mat_ns / 1_000_000;

@@ -980,26 +980,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Tweaks come only from the index builder: each connect is sealed once
-    /// released, a disconnect truncates, and the replacement block is indexed.
+    /// A connect with tweaks on seals that height. Disconnect truncates, and
+    /// the replacement block is sealed on the next connect.
     #[test]
-    fn builder_writes_tweaks_and_reorg_truncates() {
+    fn live_connect_seals_tweaks_and_reorg_truncates() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        let seal = |h: u32| {
-            q.release_index_writebehind(Height(h));
-            crate::build_indexes_released(&q).unwrap();
-        };
+        crate::prepare_live_indexes(&q).unwrap();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
             .unwrap();
-        assert_eq!(
-            q.sptweaks_next_height(),
-            Some(Height(0)),
-            "connect writes none"
-        );
-        seal(0);
         assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
         let thin0 = q.load_thin_tweaks(Height(0)).unwrap().expect("indexed");
         assert!(
@@ -1009,7 +1000,6 @@ mod tests {
 
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        seal(1);
         assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
 
         q.disconnect_tip().unwrap();
@@ -1018,29 +1008,26 @@ mod tests {
 
         let b1b = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 601, 2);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1b, Milestone::NONE).unwrap();
-        seal(1);
         assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
         assert!(q.load_thin_tweaks(Height(1)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Neither Direct nor Tip confirms write tweaks; one builder pass fills
-    /// origin..=tip.
+    /// Contiguous connects seal tweaks. The materialize does not rewrite them.
     #[test]
-    fn builder_fills_the_gap_then_follows_the_tip() {
+    fn live_connect_seals_tweaks_builder_leaves_them() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
-        q.enter_direct_index_mode().unwrap();
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        crate::prepare_live_indexes(&q).unwrap();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         crate::accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
             .unwrap();
         let b1 = crate::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
         crate::accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        q.enter_tip_index_mode();
         let b2 = crate::mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
         crate::accept_and_connect_block(&q, &params, Height(2), &b2, Milestone::NONE).unwrap();
-        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        assert_eq!(q.sptweaks_next_height(), Some(Height(3)));
 
         q.release_index_writebehind(Height(2));
         crate::build_indexes_released(&q).unwrap();

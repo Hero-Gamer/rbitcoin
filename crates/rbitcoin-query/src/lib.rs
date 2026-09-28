@@ -168,7 +168,7 @@ pub(crate) use batch_parents::FkSet;
 pub use batch_parents::{
     layout_covers_need, sparse_spender_rels, BatchParents, FkMap, U32Map, U64Map, U64Set,
 };
-pub use block_filter::basic_filter_of;
+pub use block_filter::{basic_filter_from_scripts, basic_filter_of};
 pub use catchup::IndexMode;
 pub use chain_view::{ChainView, ChainViewKind};
 pub use confirm_load::SpendEdges;
@@ -309,6 +309,10 @@ pub struct Query {
     /// SH collect/enqueue/durable write-through entirely (tip follow independent).
     sh_index_enabled: std::sync::atomic::AtomicBool,
     block_filter_enabled: std::sync::atomic::AtomicBool,
+    /// Confirm appends filter and tweak rows. Set by `prepare_live_indexes`
+    /// when every enabled index is contiguous with the tip. Load reads it;
+    /// the write thread is the only writer.
+    index_live: std::sync::atomic::AtomicBool,
     /// BIP158 basic filter table, opened when the index is first turned on.
     block_filters: std::sync::OnceLock<rbitcoin_store::BlockFilterTable>,
     bf_wb: block_filter::BlockFilterWriteBehind,
@@ -462,6 +466,7 @@ impl Query {
             // `--shindex` off before entering Direct.
             sh_index_enabled: std::sync::atomic::AtomicBool::new(true),
             block_filter_enabled: std::sync::atomic::AtomicBool::new(false),
+            index_live: std::sync::atomic::AtomicBool::new(false),
             block_filters: std::sync::OnceLock::new(),
             bf_wb: block_filter::BlockFilterWriteBehind::new(),
             sp_tweaks: Mutex::new(sp_tweaks),

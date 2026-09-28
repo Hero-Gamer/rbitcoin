@@ -6,6 +6,7 @@ mod confirm_run;
 mod convert;
 mod error;
 mod header;
+mod index_rows;
 mod index_writebehind;
 mod milestone;
 mod params;
@@ -71,7 +72,10 @@ pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, C
 pub use header::{
     expected_next_bits, median_time_past, validate_header, validate_header_on_parent,
 };
-pub use index_writebehind::{build_indexes_released, spawn_index_writebehind};
+pub use index_writebehind::{
+    build_indexes_released, index_tip_entry, prepare_live_indexes, spawn_index_writebehind,
+    IndexTipEntry, INDEX_STARTUP_GAP_HEIGHTS,
+};
 pub use milestone::{Milestone, MilestoneAnchor};
 pub use params::{
     default_milestone_height, genesis_block, mainnet_milestone_anchor, mainnet_min_chain_work_be,

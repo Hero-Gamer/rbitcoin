@@ -44,16 +44,27 @@ fn take_script_jobs(
     jobs
 }
 
-fn outcome_from(batch: LoadedBatch, work_ns: u64) -> ConfirmScriptOutcome {
+fn outcome_from(
+    batch: LoadedBatch,
+    work_ns: u64,
+    seal: super::index::IndexSeal,
+    idx_asm_ns: u64,
+) -> ConfirmScriptOutcome {
     rbitcoin_query::note_confirm(&batch.stats.script_ns, work_ns);
+    if idx_asm_ns > 0 {
+        rbitcoin_query::note_confirm(&batch.stats.idx_asm_ns, idx_asm_ns);
+        rbitcoin_query::note_confirm(&batch.stats.blockfilter_ns, idx_asm_ns);
+    }
     ConfirmScriptOutcome {
         batch: ScriptOkBatch {
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
             batch_parents: batch.batch_parents,
             archive_plan: batch.archive_plan,
+            index_seal: seal,
         },
         work_ns,
+        idx_asm_ns,
     }
 }
 
@@ -104,7 +115,11 @@ impl Inflight {
         if let Some(w) = self.wave {
             w.finish()?;
         }
-        Ok((outcome_from(self.batch, work_ns), self.meta))
+        let (seal, idx_asm_ns) = super::index::live_index_seal(&self.batch)?;
+        Ok((
+            outcome_from(self.batch, work_ns, seal, idx_asm_ns),
+            self.meta,
+        ))
     }
 }
 
