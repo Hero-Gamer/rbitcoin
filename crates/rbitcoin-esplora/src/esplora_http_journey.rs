@@ -1,0 +1,452 @@
+struct HttpPad {
+    q: Arc<Query>,
+    hub: Arc<rbitcoin_net::MempoolHub>,
+    addr: SocketAddr,
+    /// Coinbase txids by height.
+    cbs: Vec<[u8; 32]>,
+    hashes: Vec<[u8; 32]>,
+    tip_fk: Fk,
+}
+
+impl HttpPad {
+    fn tip(&self) -> u32 {
+        u32::try_from(self.hashes.len() - 1).unwrap()
+    }
+
+    fn connect(&mut self, extra: Vec<TxApply>) {
+        let h = u32::try_from(self.hashes.len()).unwrap();
+        let (header, cb) = coinbase(h, self.tip_fk, self.hashes.last().copied());
+        let mut txs = vec![cb];
+        txs.extend(extra);
+        self.cbs.push(txs[0].tx.txid);
+        self.hashes.push(header.hash);
+        self.tip_fk = self.q.connect_block(Height(h), &header, &txs).unwrap();
+    }
+}
+
+fn pay_txid(tag: u8) -> [u8; 32] {
+    two_script_pay(tag, bitcoin::ScriptBuf::new()).tx.txid
+}
+
+async fn empty_chain_has_no_tip(addr: SocketAddr) {
+    let (st, raw, _) = http_get_raw(addr, "/blocks/tip/height").await;
+    assert_eq!(st, 503);
+    assert!(
+        header_value(&raw, HDR_CHAIN_TIP).is_none(),
+        "empty chain must omit the tip header"
+    );
+    let (st, _) = http_get(addr, "/blocks/tip/hash").await;
+    assert_eq!(st, 503);
+}
+
+async fn tip_headers_and_powered_by(pad: &HttpPad) {
+    let (st, raw, body) = http_get_raw(pad.addr, "/blocks/tip/hash").await;
+    assert_eq!(st, 200, "hash body={body}");
+    let tip = header_value(&raw, HDR_CHAIN_TIP).expect("X-Bitcoin-Chain-Tip");
+    let height = header_value(&raw, HDR_CHAIN_TIP_HEIGHT).expect("height");
+    assert_eq!(tip, body);
+    assert_eq!(tip, block_hash_hex(pad.hashes.last().unwrap()));
+    assert_eq!(height, pad.tip().to_string());
+    let expose = header_value(&raw, "access-control-expose-headers").unwrap_or_default();
+    assert!(
+        expose.to_ascii_lowercase().contains("x-bitcoin-chain-tip"),
+        "CORS must expose the tip header: {expose}"
+    );
+
+    let (st, raw, body) = http_get_raw(pad.addr, "/blocks/tip/height").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body, pad.tip().to_string());
+    assert_eq!(
+        header_value(&raw, HDR_CHAIN_TIP).as_deref(),
+        Some(tip.as_str())
+    );
+    let powered = header_value(&raw, "x-powered-by").expect("X-Powered-By");
+    assert!(
+        powered.starts_with("rbitcoin-esplora/"),
+        "prefix: {powered}"
+    );
+    let hex_run = powered
+        .bytes()
+        .collect::<Vec<_>>()
+        .windows(5)
+        .any(|w| w.iter().all(|b| b.is_ascii_hexdigit()));
+    assert!(hex_run, "need ≥5 hex for mempool failover: {powered}");
+
+    let (st, body) = http_get(pad.addr, "/no/such/path").await;
+    assert_eq!(st, 404, "404 body={body}");
+    assert!(body.to_ascii_lowercase().contains("not found") || body.contains("Not Found"));
+}
+
+/// `sh1` got t1 then t3; `sh2` got t2 in between.
+async fn wallet_pages_after_txid(addr: SocketAddr, sh1: &str) {
+    let [t1, t3] = [0x11, 0x33].map(|tag| block_hash_hex(&pay_txid(tag)));
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh1}/txs")).await;
+    assert_eq!(st, 200, "{body}");
+    let all: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let ids: Vec<&str> = all.iter().filter_map(|v| v["txid"].as_str()).collect();
+    assert_eq!(ids, vec![t3.as_str(), t1.as_str()]);
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh1}/txs?after_txid={t3}")).await;
+    assert_eq!(st, 200, "{body}");
+    let page: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let ids: Vec<&str> = page.iter().filter_map(|v| v["txid"].as_str()).collect();
+    assert_eq!(ids, vec![t1.as_str()]);
+    let (st, body) = http_get(
+        addr,
+        &format!("/scripthash/{sh1}/txs/summary?after_txid={t3}"),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let sum: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(sum[0]["txid"], t1);
+    assert!(!sum.iter().any(|v| v["txid"] == t3));
+
+    let unknown = "ff".repeat(32);
+    for path in [
+        format!("/scripthash/{sh1}/txs?after_txid={unknown}"),
+        format!("/scripthash/{sh1}/txs/summary?after_txid={unknown}"),
+    ] {
+        let (st, body) = http_get(addr, &path).await;
+        assert_eq!(st, 422, "{path}: {body}");
+        assert!(body.contains("after_txid not found"), "{body}");
+    }
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh1}/txs?after_txid=zz")).await;
+    assert_eq!(st, 422, "{body}");
+}
+
+async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]) {
+    let [t1, t2, t3] = [0x11, 0x22, 0x33].map(|tag| block_hash_hex(&pay_txid(tag)));
+    let unknown = "ff".repeat(32);
+    let body = serde_json::to_vec(&json!(sh)).unwrap();
+    let (st, resp) = http_post(addr, "/scripthashes/txs", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let rows: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    let ids: Vec<&str> = rows.iter().filter_map(|v| v["txid"].as_str()).collect();
+    assert_eq!(ids, vec![t3.as_str(), t2.as_str(), t1.as_str()], "{resp}");
+    let (st, resp) = http_post(
+        addr,
+        "/addresses/txs",
+        &serde_json::to_vec(&json!(a)).unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200, "{resp}");
+    let rows: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(rows[0]["txid"], t3);
+    let (st, resp) = http_post(addr, "/scripthashes/txs/summary", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let rows: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(rows[0]["txid"], t3);
+    assert_eq!(rows[1]["txid"], t2);
+    let (st, resp) = http_post(addr, &format!("/scripthashes/txs?after_txid={t3}"), &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let rows: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(rows[0]["txid"], t2);
+    assert!(!rows.iter().any(|v| v["txid"] == t3));
+    let (st, resp) = http_post(
+        addr,
+        &format!("/scripthashes/txs?after_txid={unknown}"),
+        &body,
+    )
+    .await;
+    assert_eq!(st, 422, "{resp}");
+    assert!(resp.contains("after_txid not found"), "{resp}");
+    let too: Vec<String> = (0..301).map(|_| "aa".repeat(32)).collect();
+    let (st, resp) = http_post(
+        addr,
+        "/scripthashes/txs",
+        &serde_json::to_vec(&too).unwrap(),
+    )
+    .await;
+    assert_eq!(st, 422, "{resp}");
+    assert!(resp.contains("body too long"), "{resp}");
+}
+
+/// Packed SH `/txs` runs on `spawn_blocking`, so tip height still answers on
+/// the test's single worker.
+async fn tip_height_overlaps_scripthash_txs(pad: &HttpPad) {
+    let addr = pad.addr;
+    let t0 = Instant::now();
+    let txs_path = format!("/scripthash/{}/txs", block_hash_hex(&script_hash(&[0x51])));
+    let h_txs = tokio::spawn(async move { http_get(addr, &txs_path).await });
+    let h_tip = tokio::spawn(async move { http_get(addr, "/blocks/tip/height").await });
+    let (txs, tip) = tokio::join!(h_txs, h_tip);
+    let (st_txs, _) = txs.unwrap();
+    let (st_tip, body_tip) = tip.unwrap();
+    assert_eq!(st_txs, 200);
+    assert_eq!(st_tip, 200, "{body_tip}");
+    assert_eq!(body_tip, pad.tip().to_string());
+    assert!(t0.elapsed().as_secs() < 2);
+}
+
+/// A mempool-only spend is full Esplora JSON (not a stub) on every route.
+async fn mempool_spend_is_full_json(pad: &HttpPad) -> bitcoin::Transaction {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let addr = pad.addr;
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(pad.cbs[0]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let (st, body) = http_post(addr, "/tx", serialize_hex(&spend).as_bytes()).await;
+    assert_eq!(st, 200, "POST /tx: {body}");
+    let txid_hex = display_txid(spend.compute_txid());
+    assert_eq!(body, txid_hex);
+    assert!(pad.hub.contains(&spend.compute_txid()));
+    let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs/mempool")).await;
+    assert_eq!(st, 200, "{body}");
+    let arr: Value = serde_json::from_str(&body).unwrap();
+    let row = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["txid"] == txid_hex)
+        .expect("mempool list contains spend");
+    for key in ["vin", "vout", "size", "weight"] {
+        assert!(row.get(key).is_some(), "stub omitted {key}: {row}");
+    }
+    assert_eq!(row["status"]["confirmed"], false);
+    assert_eq!(row["fee"], 1_000);
+
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh_hex}/txs")).await;
+    assert_eq!(st, 200, "{body}");
+    let arr: Value = serde_json::from_str(&body).unwrap();
+    let row = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["txid"] == txid_hex)
+        .expect("combined /txs contains spend");
+    assert!(row.get("vin").is_some(), "combined stub omitted vin: {row}");
+
+    let (st, body) = http_get(addr, &format!("/tx/{txid_hex}")).await;
+    assert_eq!(st, 200, "GET /tx mempool-only: {body}");
+    let full: Value = serde_json::from_str(&body).unwrap();
+    for key in ["vin", "vout", "size", "weight"] {
+        assert!(full.get(key).is_some(), "GET /tx omitted {key}: {full}");
+    }
+    assert_eq!(full["status"]["confirmed"], false);
+    let (st, body) = http_get(addr, &format!("/tx/{txid_hex}/status")).await;
+    assert_eq!(st, 200, "GET /tx status mempool-only: {body}");
+    let status: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status["confirmed"], false);
+
+    spend
+}
+
+/// The spent coinbase shows the mempool spend; `?asof=` hides it.
+async fn mempool_spend_outspends_and_hex(pad: &HttpPad, spend: &bitcoin::Transaction) {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let addr = pad.addr;
+    let txid_hex = display_txid(spend.compute_txid());
+    let cb0 = block_hash_hex(&pad.cbs[0]);
+    let (st, body) = http_get(addr, &format!("/tx/{cb0}/outspend/0")).await;
+    assert_eq!(st, 200, "mempool-spent confirmed coin: {body}");
+    let os: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(os["spent"], true, "{os}");
+    assert_eq!(os["txid"], txid_hex);
+    assert_eq!(os["status"]["confirmed"], false);
+    let (st, body) = http_get(addr, &format!("/tx/{txid_hex}/outspend/0")).await;
+    assert_eq!(st, 200, "mempool-only create outspend: {body}");
+    let os: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(os["spent"], false, "{os}");
+    let asof0 = block_hash_hex(&pad.hashes[0]);
+    let (st, body) = http_get(addr, &format!("/tx/{cb0}/outspend/0?asof={asof0}")).await;
+    assert_eq!(st, 200, "asof outspend: {body}");
+    let os: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(os["spent"], false, "asof omits mempool spend: {os}");
+
+    let (st, hex_body) = http_get(addr, &format!("/tx/{txid_hex}/hex")).await;
+    assert_eq!(st, 200, "{hex_body}");
+    assert_eq!(hex_body, serialize_hex(spend));
+    let (st, _) = http_get(addr, &format!("/tx/{txid_hex}/raw")).await;
+    assert_eq!(st, 200);
+}
+
+async fn junk_paths_asof_and_post(addr: SocketAddr, genesis: &[u8; 32]) {
+    let h0hex = block_hash_hex(genesis);
+    for (path, want) in [
+        ("/block/zz".to_string(), 404),
+        ("/tx/aa".into(), 404),
+        ("/scripthash/aa".into(), 404),
+        ("/block-height/nope".into(), 400),
+        ("/address/not-an-address".into(), 404),
+        (format!("/tx/{h0hex}/outspend/nope"), 400),
+        ("/blocks/nope".into(), 400),
+        (format!("/tx/{h0hex}?asof={h0hex}"), 404),
+        (format!("/mempool?asof={h0hex}"), 404),
+        (format!("/tx/{h0hex}/status?asof=zz"), 404),
+        (format!("/tx/{h0hex}/status?asof="), 404),
+        ("/tx/aa/status?asof=nothex".into(), 404),
+        ("/tx".into(), 405),
+    ] {
+        let (st, body) = http_get(addr, &path).await;
+        assert_eq!(st, want, "{path}: {body}");
+    }
+
+    for (path, body, want) in [
+        ("/tx", &b"zz"[..], Some("invalid hex")),
+        ("/tx", b"", None),
+        ("/txs/package", b"{}", Some("JSON array")),
+        ("/txs/package", b"not-json", Some("invalid json")),
+        ("/txs/package", b"[1]", Some("hex string")),
+    ] {
+        let (st, resp) = http_post(addr, path, body).await;
+        assert_eq!(st, 400, "{path}: {resp}");
+        if let Some(needle) = want {
+            assert!(resp.contains(needle), "{path}: {resp}");
+        }
+    }
+}
+
+/// A same-height replace restamps a scripthash read. `/mempool` never pins a view.
+async fn same_height_replace_restamps(pad: &mut HttpPad) {
+    let sh_hex = block_hash_hex(&script_hash(&[0x51]));
+    let path = format!("/scripthash/{sh_hex}/utxo");
+    let (st, raw_a, _) = http_get_raw(pad.addr, &path).await;
+    assert_eq!(st, 200, "utxo A");
+    let tip_a = header_value(&raw_a, HDR_CHAIN_TIP).expect("tip A");
+    assert_eq!(tip_a, block_hash_hex(pad.hashes.last().unwrap()));
+
+    pad.q.disconnect_tip().unwrap();
+    let h = pad.tip();
+    pad.hashes.pop();
+    pad.cbs.pop();
+    let parent = *pad.hashes.last().unwrap();
+    let prev_fk = pad.q.tip_header_fk().unwrap().unwrap();
+    let (mut hb, tb) = coinbase(h, prev_fk, Some(parent));
+    hb.nonce = hb.nonce.wrapping_add(1);
+    hb.hash = rbitcoin_store::block_header_hash(
+        hb.version,
+        &parent,
+        &hb.merkle_root,
+        hb.timestamp,
+        hb.bits,
+        hb.nonce,
+    );
+    pad.cbs.push(tb.tx.txid);
+    pad.hashes.push(hb.hash);
+    pad.tip_fk = pad.q.connect_block(Height(h), &hb, &[tb]).unwrap();
+
+    let (st, raw_b, _) = http_get_raw(pad.addr, &path).await;
+    assert_eq!(st, 200, "utxo B");
+    let tip_b = header_value(&raw_b, HDR_CHAIN_TIP).expect("tip B");
+    assert_eq!(tip_b, block_hash_hex(&hb.hash));
+    assert_ne!(tip_a, tip_b);
+
+    let (st, raw, body) = http_get_raw(pad.addr, "/mempool").await;
+    assert_eq!(
+        st, 200,
+        "mempool must not 503 on same-height replace: {body}"
+    );
+    assert!(
+        header_value(&raw, HDR_CHAIN_TIP).is_none(),
+        "mempool must not pin/stamp a chain view"
+    );
+}
+
+/// Once the tip is past the prune window, old tx JSON is partial and raw is 404.
+async fn pruned_tail_is_partial_json(pad: &mut HttpPad) {
+    while pad.hashes.len() < 300 {
+        pad.connect(vec![]);
+    }
+    pad.q.set_prune_seqsigwit(true).unwrap();
+    pad.q.apply_prune_seqsigwit_tip().unwrap();
+
+    let tx0 = block_hash_hex(&pad.cbs[0]);
+    let (st, body) = http_get(pad.addr, &format!("/tx/{tx0}")).await;
+    assert_eq!(st, 200, "{body}");
+    let row: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(row["txid"], tx0);
+    assert_eq!(row["pruned"], true);
+    assert_eq!(row["vin"][0]["is_coinbase"], true, "{row}");
+    assert!(row["vin"][0].get("witness").is_none(), "{row}");
+    assert!(row.get("vout").is_some());
+
+    let (st, body) = http_get(pad.addr, &format!("/tx/{tx0}/raw")).await;
+    assert_eq!(st, 404, "{body}");
+    assert!(body.contains("pruned"), "{body}");
+
+    let h0 = block_hash_hex(&pad.hashes[0]);
+    let (st, body) = http_get(pad.addr, &format!("/block/{h0}/txs")).await;
+    assert_eq!(st, 200, "{body}");
+    let arr: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        arr.as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["txid"] == tx0 && t["pruned"] == true),
+        "{body}"
+    );
+}
+
+/// One TCP Esplora on one hub: an empty chain, then a mature pad a wallet
+/// pages, a mempool spend, junk requests, a same-height tip replace, and a
+/// pruned tail once the chain grows past the prune window.
+#[tokio::test(flavor = "current_thread")]
+async fn esplora_tcp_wallet_mempool_and_replace() {
+    let (a1, spk1) = regtest_p2wpkh();
+    let (a2, spk2) = regtest_p2wpkh_sk(9);
+    let sh1 = block_hash_hex(&script_hash(spk1.as_bytes()));
+    let sh2 = block_hash_hex(&script_hash(spk2.as_bytes()));
+
+    let (dir, q) = temp_query("esplora-tcp");
+    let q = Arc::new(q);
+    let mp_dir = dir.join("mp");
+    std::fs::create_dir_all(&mp_dir).unwrap();
+    let hub = rbitcoin_net::MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&hub)))
+        .await
+        .expect("listen");
+    empty_chain_has_no_tip(handle.local_addr).await;
+
+    let mut pad = HttpPad {
+        q,
+        hub,
+        addr: handle.local_addr,
+        cbs: Vec::new(),
+        hashes: Vec::new(),
+        tip_fk: Fk::NULL,
+    };
+    for h in 0..101u32 {
+        let pay = match h {
+            1 => vec![two_script_pay(0x11, spk1.clone())],
+            2 => vec![two_script_pay(0x22, spk2.clone())],
+            3 => vec![two_script_pay(0x33, spk1.clone())],
+            _ => vec![],
+        };
+        pad.connect(pay);
+    }
+    tip_headers_and_powered_by(&pad).await;
+    wallet_pages_after_txid(pad.addr, &sh1).await;
+    wallet_posts_scripthashes(pad.addr, [&a1, &a2], [&sh1, &sh2]).await;
+    tip_height_overlaps_scripthash_txs(&pad).await;
+    let spend = mempool_spend_is_full_json(&pad).await;
+    mempool_spend_outspends_and_hex(&pad, &spend).await;
+    junk_paths_asof_and_post(pad.addr, &pad.hashes[0]).await;
+    same_height_replace_restamps(&mut pad).await;
+    pruned_tail_is_partial_json(&mut pad).await;
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
