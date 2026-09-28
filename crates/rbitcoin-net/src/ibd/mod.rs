@@ -661,6 +661,7 @@ pub async fn ibd_cancellable(
             disconnect_stalled_block_peers(
                 &mut st.slots,
                 &mut st.inflight,
+                &mut st.body,
                 &mut st.addr_cooldown,
                 &mut st.addr_strikes,
                 now,
@@ -669,6 +670,7 @@ pub async fn ibd_cancellable(
             disconnect_relative_slow_block_peers(
                 &mut st.slots,
                 &mut st.inflight,
+                &mut st.body,
                 &mut st.addr_cooldown,
                 &mut st.addr_strikes,
                 now,

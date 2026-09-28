@@ -470,6 +470,7 @@ pub(crate) fn ibd_header_locator(
 pub(crate) fn release_peer_block_work(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    body: &mut super::body::BodyPresence,
     peer: usize,
 ) {
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
@@ -481,6 +482,9 @@ pub(crate) fn release_peer_block_work(
                 .unwrap_or(false);
             if empty {
                 inflight.remove(&h);
+                if body.is_pending(&h) {
+                    body.mark_missing(h);
+                }
             }
         }
     }
@@ -609,6 +613,7 @@ pub(crate) fn note_dead_without_block_bytes(
 pub(crate) fn disconnect_stalled_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
@@ -617,6 +622,7 @@ pub(crate) fn disconnect_stalled_block_peers(
     disconnect_stalled_block_peers_at(
         slots,
         inflight,
+        body,
         addr_cooldown,
         addr_strikes,
         now,
@@ -625,9 +631,11 @@ pub(crate) fn disconnect_stalled_block_peers(
     );
 }
 
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(crate) fn disconnect_stalled_block_peers_at(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
@@ -651,7 +659,7 @@ pub(crate) fn disconnect_stalled_block_peers_at(
             let _ = s.cmd_tx.send(PeerCmd::Shutdown);
             s.task.abort();
         }
-        release_peer_block_work(slots, inflight, id);
+        release_peer_block_work(slots, inflight, body, id);
     }
 }
 
@@ -665,6 +673,7 @@ pub(crate) fn disconnect_stalled_block_peers_at(
 pub(crate) fn disconnect_relative_slow_block_peers(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
@@ -675,6 +684,7 @@ pub(crate) fn disconnect_relative_slow_block_peers(
     disconnect_relative_slow_block_peers_at(
         slots,
         inflight,
+        body,
         addr_cooldown,
         addr_strikes,
         now,
@@ -689,6 +699,7 @@ pub(crate) fn disconnect_relative_slow_block_peers(
 pub(crate) fn disconnect_relative_slow_block_peers_at(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
     addr_strikes: &mut HashMap<SocketAddr, u8>,
     now: Instant,
@@ -746,7 +757,7 @@ pub(crate) fn disconnect_relative_slow_block_peers_at(
         let _ = s.cmd_tx.send(PeerCmd::Shutdown);
         s.task.abort();
     }
-    release_peer_block_work(slots, inflight, id);
+    release_peer_block_work(slots, inflight, body, id);
     *suspect = None;
     *last_kick_ms = now_ms;
 }
@@ -1181,8 +1192,32 @@ mod tests {
         slot.in_flight.insert(h);
         let mut inflight = HashMap::new();
         inflight.insert(h, super::super::state::InflightReq::new(3));
-        release_peer_block_work(&mut [slot], &mut inflight, 3);
+        let mut body = super::super::body::BodyPresence::new();
+        body.mark_pending(h);
+        release_peer_block_work(&mut [slot], &mut inflight, &mut body, 3);
         assert!(inflight.is_empty());
+        assert!(!body.is_pending(&h));
+        assert!(body.is_missing(&h));
+    }
+
+    #[test]
+    fn release_peer_block_work_keeps_pending_for_another_owner() {
+        let a = addr(9);
+        let mut slot = dummy_slot(3, a, true);
+        let h = BlockHash::from_byte_array([8u8; 32]);
+        slot.in_flight.insert(h);
+        let mut inflight = HashMap::new();
+        let mut request = super::super::state::InflightReq::new(3);
+        request.add_peer(4);
+        inflight.insert(h, request);
+        let mut body = super::super::body::BodyPresence::new();
+        body.mark_pending(h);
+
+        release_peer_block_work(&mut [slot], &mut inflight, &mut body, 3);
+
+        assert!(inflight.contains_key(&h));
+        assert!(body.is_pending(&h));
+        assert!(!body.is_missing(&h));
     }
 
     #[test]
@@ -1253,6 +1288,7 @@ mod tests {
         disconnect_stalled_block_peers_at(
             std::slice::from_mut(&mut slot),
             &mut inflight,
+            &mut super::super::body::BodyPresence::new(),
             &mut cooldown,
             &mut strikes,
             Instant::now(),
@@ -1278,6 +1314,7 @@ mod tests {
         disconnect_stalled_block_peers_at(
             std::slice::from_mut(&mut slot),
             &mut inflight,
+            &mut super::super::body::BodyPresence::new(),
             &mut cooldown,
             &mut strikes,
             Instant::now(),
@@ -1296,6 +1333,7 @@ mod tests {
         disconnect_stalled_block_peers(
             &mut [dummy_slot(7, addr(13), true)],
             &mut HashMap::new(),
+            &mut super::super::body::BodyPresence::new(),
             &mut cooldown,
             &mut strikes,
             now,
@@ -1434,6 +1472,7 @@ mod tests {
         disconnect_relative_slow_block_peers(
             &mut slots,
             &mut inflight,
+            &mut super::super::body::BodyPresence::new(),
             &mut cooldown,
             &mut strikes,
             now,
@@ -1492,9 +1531,11 @@ mod tests {
         let mut strikes = HashMap::new();
         let mut suspect = None;
         let mut last_kick_ms = 0u64;
+        let mut body = super::super::body::BodyPresence::new();
         disconnect_relative_slow_block_peers_at(
             &mut pack,
             &mut inflight,
+            &mut body,
             &mut cooldown,
             &mut strikes,
             now,
@@ -1506,6 +1547,7 @@ mod tests {
         disconnect_relative_slow_block_peers_at(
             &mut pack,
             &mut inflight,
+            &mut body,
             &mut cooldown,
             &mut strikes,
             now,
@@ -1524,6 +1566,7 @@ mod tests {
         disconnect_relative_slow_block_peers_at(
             &mut pack,
             &mut inflight,
+            &mut body,
             &mut cooldown,
             &mut strikes,
             now,
@@ -1536,6 +1579,7 @@ mod tests {
         disconnect_relative_slow_block_peers_at(
             &mut pack,
             &mut inflight,
+            &mut body,
             &mut cooldown,
             &mut strikes,
             now,

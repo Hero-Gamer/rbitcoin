@@ -552,6 +552,9 @@ fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
                 .unwrap_or(false);
             if empty {
                 st.inflight.remove(h);
+                if st.body.is_pending(h) {
+                    st.body.mark_missing(*h);
+                }
             }
         }
     }
@@ -575,7 +578,7 @@ fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, 
             st.addr_cooldown.contains_key(&s.addr),
         );
     }
-    release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
+    release_peer_block_work(&mut st.slots, &mut st.inflight, &mut st.body, peer);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).
