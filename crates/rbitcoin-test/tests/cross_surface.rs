@@ -15,6 +15,8 @@ use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -1947,4 +1949,618 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         Ok(Err(e)) => panic!("run_p2p join: {e}"),
         Err(_) => panic!("run_p2p did not exit after stop"),
     }
+}
+
+/// Nothing listens here. A pinned `--connect` at genesis still enters tip mode.
+const DEAD_CONNECT: &str = "127.0.0.1:1";
+
+/// `run_p2p` on regtest with an ephemeral P2P bind, no seeds, the one
+/// `--connect` down, and `--max-run-secs 0`: exit once tip entry ends.
+fn listen_and_exit_cfg(datadir: &std::path::Path) -> NodeConfig {
+    let mut cfg = NodeConfig::default()
+        .with_datadir(datadir)
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect = vec![DEAD_CONNECT.parse().unwrap()];
+    cfg.max_run_secs = Some(0);
+    cfg
+}
+
+async fn start_and_exit(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError> {
+    tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg))
+        .await
+        .expect("run_p2p did not exit")
+}
+
+/// `run_p2p` off the runtime workers, as `cli_main` blocks on it: an empty
+/// datadir connects genesis through tip-accept, which refuses a worker.
+fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>> {
+    tokio::task::spawn_blocking(move || {
+        let _block = rbitcoin_net::BlockingRegion::enter();
+        tokio::runtime::Handle::current().block_on(run_p2p(cfg))
+    })
+}
+
+async fn stop_run_p2p(
+    rpc_addr: SocketAddr,
+    node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
+) {
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    match tokio::time::timeout(Duration::from_secs(15), node).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
+        Ok(Err(e)) => panic!("run_p2p join: {e}"),
+        Err(_) => panic!("run_p2p did not exit after stop"),
+    }
+}
+
+/// One operator datadir restarted through the startup arms `run_p2p` owns
+/// while its one `--connect` peer is down: a junk peer book, a missing then a
+/// valid asmap, the wallet servers up until `stop`, an Electrum port someone
+/// else holds, seeds with no `--connect`, and a pruned datadir that refuses
+/// an unpruned start.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_listen_and_exit() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let peers = dir.join("peers");
+
+    // A copied-in datadir: the peer book is junk and the configured asmap is
+    // not there. Catch-up gives up on the refused peer instead of hanging,
+    // and the book on disk is a real book again.
+    std::fs::write(&peers, b"not-a-valid-peers-blob\xff\x00").unwrap();
+    let dead: SocketAddr = DEAD_CONNECT.parse().unwrap();
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.asmap = Some(dir.join("no-such-asmap"));
+    let mempool = cfg.mempool_path();
+    start_and_exit(cfg)
+        .await
+        .expect("a refused peer is not fatal");
+    assert!(mempool.exists(), "run_p2p opens the mempool");
+    let book = rbitcoin_net::AddrMan::load(&peers).expect("junk book replaced");
+    assert!(
+        book.flags(&dead).failed_last_connect(),
+        "the refused --connect is in the saved book"
+    );
+
+    // The asmap is in place now, the saved book loads, and the wallet servers
+    // answer until the operator stops the node.
+    std::fs::write(dir.join("ip_asn.dat"), rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (electrum_addr, esplora_addr, rpc_addr) =
+        (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.milestone_height = 100;
+    cfg.shindex = true;
+    cfg.listen.electrum = Some(electrum_addr);
+    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
+    cfg.rpc.listen = Some(rpc_addr);
+    cfg.max_run_secs = Some(60);
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
+    let (st, height) = http_get(esplora_addr, "/blocks/tip/height").await;
+    assert_eq!((st, height.as_str()), (200, "0"), "esplora on genesis");
+    let mut el = TcpStream::connect(electrum_addr).await.unwrap();
+    let tip = electrum_rpc(&mut el, 1, "blockchain.headers.subscribe", json!([])).await;
+    assert_eq!(tip["result"]["height"], 0, "{tip}");
+    let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+    assert_eq!(count["result"], 0, "{count}");
+    stop_run_p2p(rpc_addr, node).await;
+
+    // Another process holds the Electrum port. The bind fails with a warning
+    // and the node still starts and exits.
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.shindex = true;
+    cfg.listen.electrum = Some(held.local_addr().unwrap());
+    start_and_exit(cfg)
+        .await
+        .expect("an Electrum bind failure is not fatal");
+    drop(held);
+
+    // Without `--connect` and with seeds on: regtest resolves none, the one
+    // saved peer still refuses, and the node exits short of tip mode.
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.listen.connect.clear();
+    cfg.listen.use_seeds = true;
+    start_and_exit(cfg)
+        .await
+        .expect("no reachable peer is not fatal");
+
+    // Once pruned, the datadir refuses a start without --prune-seqsigwit.
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.prune_seqsigwit = true;
+    start_and_exit(cfg).await.expect("pruned start");
+    let err = start_and_exit(listen_and_exit_cfg(&dir))
+        .await
+        .expect_err("unpruned start on a pruned datadir")
+        .to_string();
+    assert!(err.contains("--prune-seqsigwit"), "{err}");
+}
+
+/// Tor control port stand-in: PROTOCOLINFO advertises `methods`, SAFECOOKIE
+/// answers from `cookie`, and ADD_ONION NEW mints `key{n}` for service `n`.
+/// Every command line lands in `log`. Live Tor is overlay-functional.
+struct FakeTor {
+    addr: SocketAddr,
+    methods: Arc<Mutex<&'static str>>,
+    log: Arc<Mutex<Vec<String>>>,
+    minted: Arc<Mutex<Vec<String>>>,
+}
+
+const TOR_COOKIE: [u8; 32] = [0x2a; 32];
+const TOR_PASSWORD: &str = "s3cret";
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use bitcoin::hashes::{hmac, sha256, HashEngine};
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(key);
+    engine.input(data);
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+}
+
+fn fake_onion_service_id(n: usize) -> String {
+    let pk = [u8::try_from(n + 1).unwrap(); 32];
+    let name = rbitcoin_net::NetAddr::Onion { pk, port: 0 }.to_string();
+    name.trim_end_matches(".onion:0").to_string()
+}
+
+impl FakeTor {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tor = Self {
+            addr: listener.local_addr().unwrap(),
+            methods: Arc::new(Mutex::new("SAFECOOKIE")),
+            log: Arc::default(),
+            minted: Arc::default(),
+        };
+        let (methods, log, minted) = (
+            Arc::clone(&tor.methods),
+            Arc::clone(&tor.log),
+            Arc::clone(&tor.minted),
+        );
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                tokio::spawn(fake_tor_session(
+                    s,
+                    Arc::clone(&methods),
+                    Arc::clone(&log),
+                    Arc::clone(&minted),
+                ));
+            }
+        });
+        tor
+    }
+
+    fn take_log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().unwrap())
+    }
+}
+
+async fn fake_tor_session(
+    s: TcpStream,
+    methods: Arc<Mutex<&'static str>>,
+    log: Arc<Mutex<Vec<String>>>,
+    minted: Arc<Mutex<Vec<String>>>,
+) {
+    use bitcoin::hex::{DisplayHex, FromHex};
+    let (r, mut w) = s.into_split();
+    let mut lines = BufReader::new(r).lines();
+    let mut client_hash: Option<[u8; 32]> = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        log.lock().unwrap().push(line.clone());
+        let reply = if line == "PROTOCOLINFO 1" {
+            let methods = *methods.lock().unwrap();
+            format!("250-PROTOCOLINFO 1\r\n250-AUTH METHODS={methods}\r\n250 OK\r\n")
+        } else if let Some(nonce) = line.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+            let server_nonce = [0x5a; 32];
+            let mut mat = TOR_COOKIE.to_vec();
+            mat.extend(Vec::<u8>::from_hex(nonce).unwrap());
+            mat.extend(server_nonce);
+            client_hash = Some(hmac_sha256(
+                b"Tor safe cookie authentication controller-to-server hash",
+                &mat,
+            ));
+            let server_hash = hmac_sha256(
+                b"Tor safe cookie authentication server-to-controller hash",
+                &mat,
+            );
+            format!(
+                "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                server_hash.to_lower_hex_string(),
+                server_nonce.to_lower_hex_string()
+            )
+        } else if let Some(auth) = line.strip_prefix("AUTHENTICATE ") {
+            let ok = auth == format!("\"{TOR_PASSWORD}\"")
+                || client_hash.is_some_and(|h| auth == h.to_lower_hex_string());
+            if ok {
+                "250 OK\r\n"
+            } else {
+                "515 Authentication failed\r\n"
+            }
+            .to_string()
+        } else if line == "GETINFO version" {
+            "250-version=0.4.8.10\r\n250 OK\r\n".to_string()
+        } else if let Some(rest) = line.strip_prefix("ADD_ONION ") {
+            let spec = rest.split_once(" Port=").map_or(rest, |(s, _)| s);
+            let mut minted = minted.lock().unwrap();
+            if spec == "NEW:ED25519-V3" {
+                let n = minted.len();
+                minted.push(format!("ED25519-V3:key{n}"));
+                format!(
+                    "250-ServiceID={}\r\n250-PrivateKey={}\r\n250 OK\r\n",
+                    fake_onion_service_id(n),
+                    minted[n]
+                )
+            } else if let Some(n) = minted.iter().position(|k| k == spec) {
+                format!("250-ServiceID={}\r\n250 OK\r\n", fake_onion_service_id(n))
+            } else {
+                "512 Invalid onion key\r\n".to_string()
+            }
+        } else {
+            "510 Unrecognized command\r\n".to_string()
+        };
+        if w.write_all(reply.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// I2P SAM stand-in: SESSION CREATE TRANSIENT hands out destination `n`, a
+/// stored destination comes back as itself, and STREAM FORWARD is accepted.
+struct FakeSam {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+/// A 387-byte public destination with no certificate, distinct per `n`:
+/// I2P base64 of `fake_i2p_public(n)`.
+fn fake_i2p_destination(n: usize) -> String {
+    let first = char::from(b'B' + u8::try_from(n).unwrap());
+    format!("{first}{}", "A".repeat(515))
+}
+
+fn fake_i2p_public(n: usize) -> Vec<u8> {
+    let mut raw = vec![0u8; 387];
+    raw[0] = (u8::try_from(n).unwrap() + 1) << 2;
+    raw
+}
+
+impl FakeSam {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sam = Self {
+            addr: listener.local_addr().unwrap(),
+            log: Arc::default(),
+        };
+        let log = Arc::clone(&sam.log);
+        let transient = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let (log, transient) = (Arc::clone(&log), Arc::clone(&transient));
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        log.lock().unwrap().push(line.clone());
+                        let reply = if line.starts_with("HELLO VERSION") {
+                            "HELLO REPLY RESULT=OK VERSION=3.1".to_string()
+                        } else if line.starts_with("SESSION CREATE") {
+                            let asked = line
+                                .split_whitespace()
+                                .find_map(|t| t.strip_prefix("DESTINATION="))
+                                .unwrap_or("TRANSIENT");
+                            let dest = if asked == "TRANSIENT" {
+                                let n = transient.fetch_add(1, Ordering::SeqCst);
+                                fake_i2p_destination(n)
+                            } else {
+                                asked.to_string()
+                            };
+                            format!("SESSION STATUS RESULT=OK DESTINATION={dest}")
+                        } else if line.starts_with("STREAM FORWARD") {
+                            "STREAM STATUS RESULT=OK".to_string()
+                        } else {
+                            "SESSION STATUS RESULT=I2P_ERROR".to_string()
+                        };
+                        if w.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        sam
+    }
+
+    fn take_log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().unwrap())
+    }
+}
+
+fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+/// An operator publishes P2P, Electrum, and Esplora as onion and I2P
+/// services through a local Tor control port and SAM bridge. A bad or short
+/// cookie, or a Tor that does not offer SAFECOOKIE, stops the start before
+/// any AUTHENTICATE; password auth mints and saves a key per service; a
+/// SAFECOOKIE restart reuses every saved key and destination.
+#[tokio::test(flavor = "multi_thread")]
+async fn tor_control_onion_lifecycle() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let tor = FakeTor::start().await;
+    let sam = FakeSam::start().await;
+    let cookie = dir.join("control.authcookie");
+    let cookie_cfg = |cookie: &std::path::Path| {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(tor.addr);
+        cfg.tor.cookie = Some(cookie.to_path_buf());
+        cfg
+    };
+
+    // A cookie from another Tor, a truncated cookie, and a Tor that only
+    // offers plain COOKIE all refuse the start, and none sends AUTHENTICATE:
+    // the node never hands the raw cookie to whatever owns the port.
+    std::fs::write(&cookie, [0u8; 32]).unwrap();
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("wrong cookie")
+        .to_string();
+    assert!(err.contains("server hash mismatch"), "{err}");
+    std::fs::write(&cookie, [0x2a; 2]).unwrap();
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("short cookie")
+        .to_string();
+    assert!(err.contains("32 bytes"), "{err}");
+    std::fs::write(&cookie, TOR_COOKIE).unwrap();
+    *tor.methods.lock().unwrap() = "COOKIE";
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("plain COOKIE only")
+        .to_string();
+    assert!(err.contains("SAFECOOKIE"), "{err}");
+    let refused = tor.take_log();
+    assert!(
+        starts_with_any(&refused, "AUTHENTICATE ").is_empty(),
+        "{refused:?}"
+    );
+    assert!(
+        starts_with_any(&refused, "ADD_ONION ").is_empty(),
+        "{refused:?}"
+    );
+
+    // Password auth. Each service gets a fresh onion key, saved 0600 under
+    // the datadir, and an I2P destination; getnetworkinfo lists them all.
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (p2p, electrum, esplora, rpc) = (
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+    );
+    let services_cfg = || {
+        let mut cfg = listen_and_exit_cfg(&dir).with_p2p_listen(p2p);
+        cfg.tor.control = Some(tor.addr);
+        cfg.listen.listen_onion = true;
+        cfg.listen.i2p_sam = Some(sam.addr);
+        cfg.listen.i2p_accept_incoming = true;
+        cfg.shindex = true;
+        cfg.listen.electrum = Some(electrum);
+        cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora));
+        cfg
+    };
+    let mut cfg = services_cfg();
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[electrum, esplora, rpc]).await;
+    let info = jsonrpc(rpc, "getnetworkinfo", json!([])).await;
+    let local: Vec<(String, u64)> = info["result"]["localaddresses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{info}"))
+        .iter()
+        .map(|r| {
+            (
+                r["address"].as_str().unwrap().to_string(),
+                r["port"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let regtest_port = Network::Regtest.default_p2p_port();
+    for (n, port) in [(0, regtest_port), (1, electrum.port()), (2, esplora.port())] {
+        let host = format!("{}.onion", fake_onion_service_id(n));
+        assert!(local.contains(&(host, u64::from(port))), "{local:?}");
+    }
+    let i2p_p2p = rbitcoin_net::NetAddr::I2p {
+        dest: bitcoin::hashes::sha256::Hash::hash(&fake_i2p_public(0)).to_byte_array(),
+        port: 0,
+    }
+    .host_str();
+    assert!(local.iter().any(|(a, _)| *a == i2p_p2p), "{local:?}");
+    stop_run_p2p(rpc, node).await;
+
+    let first = tor.take_log();
+    assert!(first.contains(&format!("AUTHENTICATE \"{TOR_PASSWORD}\"")));
+    let onions = starts_with_any(&first, "ADD_ONION ");
+    let targets = [
+        format!("Port={regtest_port},127.0.0.1:{}", p2p.port()),
+        format!("Port={0},127.0.0.1:{0}", electrum.port()),
+        format!("Port={0},127.0.0.1:{0}", esplora.port()),
+    ];
+    assert_eq!(onions.len(), 3, "{onions:?}");
+    for (line, target) in onions.iter().zip(&targets) {
+        assert_eq!(*line, format!("ADD_ONION NEW:ED25519-V3 {target}"));
+    }
+    for (n, name) in ["p2p", "electrum", "esplora"].into_iter().enumerate() {
+        let key = dir.join("onion").join(format!("{name}.priv"));
+        assert_eq!(
+            std::fs::read_to_string(&key).unwrap().trim(),
+            format!("ED25519-V3:key{n}")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} onion key mode");
+        }
+        let dest = dir.join("i2p").join(format!("{name}.priv"));
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap().trim(),
+            fake_i2p_destination(n)
+        );
+    }
+    let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+    for port in [p2p.port(), electrum.port(), esplora.port()] {
+        assert!(
+            forwards
+                .iter()
+                .any(|f| f.contains(&format!("PORT={port} "))),
+            "{forwards:?}"
+        );
+    }
+
+    // SAFECOOKIE restart: the same three services under the saved keys, and
+    // each SAM session under its saved destination.
+    *tor.methods.lock().unwrap() = "SAFECOOKIE";
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    start_and_exit(cfg).await.expect("SAFECOOKIE restart");
+    let second = tor.take_log();
+    assert_eq!(
+        starts_with_any(&second, "AUTHCHALLENGE SAFECOOKIE ").len(),
+        1,
+        "{second:?}"
+    );
+    let onions = starts_with_any(&second, "ADD_ONION ");
+    assert_eq!(onions.len(), 3, "{onions:?}");
+    for (n, (line, target)) in onions.iter().zip(&targets).enumerate() {
+        assert_eq!(*line, format!("ADD_ONION ED25519-V3:key{n} {target}"));
+    }
+    assert_eq!(tor.minted.lock().unwrap().len(), 3, "no key minted twice");
+    let creates = starts_with_any(&sam.take_log(), "SESSION CREATE");
+    assert_eq!(creates.len(), 3, "{creates:?}");
+    for n in 0..3 {
+        let dest = format!("DESTINATION={} ", fake_i2p_destination(n));
+        assert!(creates.iter().any(|c| c.contains(&dest)), "{creates:?}");
+    }
+}
+
+async fn history_len(electrum_addr: SocketAddr, scripthash: &str) -> usize {
+    let mut el = TcpStream::connect(electrum_addr).await.unwrap();
+    let hist = electrum_rpc(
+        &mut el,
+        1,
+        "blockchain.scripthash.get_history",
+        json!([scripthash]),
+    )
+    .await;
+    hist["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{hist}"))
+        .len()
+}
+
+/// One datadir whose operator turns `--sh-index` on and off across
+/// restarts. Blocks mined while it is off are collected from the archive
+/// on the first start with it on; turning it off closes Electrum and keeps
+/// the index; turning it back on after a crash that left a collect run and
+/// a lagging high-water mark resumes the write-behind, discards the run,
+/// and follows the next block.
+#[tokio::test(flavor = "multi_thread")]
+async fn enter_tip_mode_indexes() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let store = td.store_path();
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (electrum_addr, rpc_addr) = (ephemeral_addr(), ephemeral_addr());
+    let start = |shindex: bool| {
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(Network::Regtest)
+            .with_tiny_heads()
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.listen.use_seeds = false;
+        cfg.listen.connect.clear();
+        cfg.shindex = shindex;
+        cfg.listen.electrum = Some(electrum_addr);
+        cfg.rpc.listen = Some(rpc_addr);
+        cfg.max_run_secs = Some(60);
+        spawn_run_p2p(cfg)
+    };
+    let op_true = electrum_scripthash_hex(&[0x51]);
+
+    // No scripthash index: tip follow and RPC run, Electrum does not.
+    let node = start(false);
+    wait_listeners(&[rpc_addr]).await;
+    for _ in 0..3 {
+        let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+        assert!(mined["result"]["hash"].is_string(), "{mined}");
+    }
+    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    stop_run_p2p(rpc_addr, node).await;
+
+    // First start with the index: the three coinbases are collected from the
+    // archive before Electrum opens.
+    let node = start(true);
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    assert_eq!(history_len(electrum_addr, &op_true).await, 3);
+    stop_run_p2p(rpc_addr, node).await;
+
+    // Index off again: Electrum stays closed.
+    let node = start(false);
+    wait_listeners(&[rpc_addr]).await;
+    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    stop_run_p2p(rpc_addr, node).await;
+
+    // A crash left a collect run behind and the write-behind mark short of
+    // the tip. Turning the index off kept it, so it resumes under
+    // write-behind: a recollect would merge the stale run, and instead the
+    // run is discarded, Electrum opens, and the next block lands in history.
+    let runs = store.join("scripthash.runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let stale_sh = [0xee; 32];
+    let mut rec = [0u8; 40];
+    rec[..32].copy_from_slice(&stale_sh);
+    rec[32..].copy_from_slice(&99u64.to_le_bytes());
+    rbitcoin_store::write_sorted_run(&rbitcoin_store::next_run_path(&runs, 50), 40, 40, &rec)
+        .unwrap();
+    let hwm_path = store.join(rbitcoin_store::INCLUDE_HWM_NAME);
+    let hwm = u64::from_le_bytes(std::fs::read(&hwm_path).unwrap().try_into().unwrap());
+    std::fs::write(&hwm_path, (hwm - 2).to_le_bytes()).unwrap();
+    let node = start(true);
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    assert_eq!(
+        rbitcoin_store::list_runs(&runs).unwrap().len(),
+        0,
+        "leftover run discarded"
+    );
+    assert_eq!(
+        history_len(
+            electrum_addr,
+            &bitcoin::hex::DisplayHex::to_lower_hex_string(&stale_sh[..])
+        )
+        .await,
+        0
+    );
+    let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+    assert!(mined["result"]["hash"].is_string(), "{mined}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while history_len(electrum_addr, &op_true).await < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "write-behind did not reach the tip"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop_run_p2p(rpc_addr, node).await;
 }

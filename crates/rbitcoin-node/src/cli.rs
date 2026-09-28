@@ -564,7 +564,62 @@ mod tests {
     }
 
     #[test]
-    fn help_advertises_kebab_not_concatenated_core_names() {
+    fn bytes_per_sigop_flag_sets_mempool_overlay() {
+        assert_eq!(
+            ready_config(["rbitcoin-node"]).mempool.bytes_per_sigop,
+            None
+        );
+        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop", "0"]);
+        assert_eq!(cfg.mempool.bytes_per_sigop, Some(0));
+        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop=40"]);
+        assert_eq!(cfg.mempool.bytes_per_sigop, Some(40));
+        assert_exit(
+            cli_main(["rbitcoin-node", "--bytes-per-sigop=x"]),
+            ExitCode::from(2),
+        );
+    }
+
+    #[test]
+    fn block_reserved_sigops_flag_configures_shared_budget() {
+        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "0"]);
+        assert_eq!(cfg.mempool.block_reserved_sigops, Some(0));
+        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops=400"]);
+        assert_eq!(cfg.mempool.block_reserved_sigops, Some(400));
+        let mut cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "80001"]);
+        assert!(cfg.validate().is_err());
+        cfg.mempool.block_reserved_sigops = Some(80_000);
+        cfg.validate().expect("consensus maximum is accepted");
+    }
+
+    /// Tweaks need the scriptSig and witness data seqsigwit pruning drops,
+    /// so the pair is refused from the CLI and from the conf file alike.
+    #[test]
+    fn sp_tweaks_refuses_prune_seqsigwit() {
+        let cli = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
+        let err = cli.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
+            "{err}"
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("prune_seqsigwit", "1").unwrap();
+        conf.apply_kv("sp_tweaks", "1").unwrap();
+        assert!(conf.validate().is_err());
+    }
+
+    /// What argv and the conf file assemble before `run_node`. The smoke
+    /// journey (`node_cli_and_surface_smoke`) sees only the exit code and
+    /// the datadir; these values and the help text are not reported by any
+    /// running surface, so this is the one place they are read.
+    #[allow(clippy::cognitive_complexity)] // one operator's conf and argv
+    #[test]
+    fn operator_conf_and_argv() {
+        use crate::config::P2pListen;
+        use rbitcoin_consensus::Milestone;
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let h = operator_usage();
         for flag in [
             "--prefill-compact",
@@ -597,6 +652,7 @@ mod tests {
             "--sh-index",
             "--block-filter-index",
             "--prune-seqsigwit",
+            "--prune-seqsigwit-ram-threshold-bytes",
             "--sp-tweaks",
             "--sp-tweaks-dust",
             "--esplora-block-template",
@@ -620,13 +676,12 @@ mod tests {
         ] {
             assert!(h.contains(flag), "help must list {flag}");
         }
-        for concat in ["--shindex", "--sptweaks", "-shindex", "-sptweaks"] {
-            assert!(
-                !h.contains(concat),
-                "help must not advertise concatenated or one-dash long {concat}"
-            );
-        }
         for concat in [
+            "--shindex",
+            "--sptweaks",
+            "-shindex",
+            "-sptweaks",
+            "--pruneseqsigwit",
             "--prefillcompact",
             "--limitclustercount",
             "--limitclustersize",
@@ -655,317 +710,215 @@ mod tests {
         ] {
             assert!(!h.contains(concat), "help must not advertise {concat}");
         }
-        assert!(
-            h.contains("Networks: mainnet|testnet|signet|regtest."),
-            "network list must end with a period"
-        );
-        assert!(
-            h.contains("[--signet-block-time SECS]"),
-            "duration placeholder must be SECS"
-        );
-    }
+        assert!(h.contains("Networks: mainnet|testnet|signet|regtest."));
+        assert!(h.contains("[--signet-block-time SECS]"));
+        assert!(matches!(
+            operator_config_from_args(["rbitcoin-node", "-V"]),
+            Ok(OperatorArgs::Version)
+        ));
+        assert!(matches!(
+            operator_config_from_args(["rbitcoin-node", "--log-level=off"]),
+            Ok(OperatorArgs::Ready {
+                log_level_cli: Some(None),
+                ..
+            })
+        ));
 
-    #[test]
-    fn bytes_per_sigop_flag_sets_mempool_overlay() {
-        assert_eq!(
-            ready_config(["rbitcoin-node"]).mempool.bytes_per_sigop,
-            None
-        );
-        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop", "0"]);
-        assert_eq!(cfg.mempool.bytes_per_sigop, Some(0));
-        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop=40"]);
-        assert_eq!(cfg.mempool.bytes_per_sigop, Some(40));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--bytes-per-sigop=x"]),
-            ExitCode::from(2),
-        );
-    }
-
-    #[test]
-    fn block_reserved_sigops_flag_configures_shared_budget() {
-        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "0"]);
-        assert_eq!(cfg.mempool.block_reserved_sigops, Some(0));
-        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops=400"]);
-        assert_eq!(cfg.mempool.block_reserved_sigops, Some(400));
-        let mut cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "80001"]);
-        assert!(cfg.validate().is_err());
-        cfg.mempool.block_reserved_sigops = Some(80_000);
-        cfg.validate().expect("consensus maximum is accepted");
-    }
-
-    #[test]
-    fn sh_index_and_sp_tweaks_are_kebab_not_concat() {
-        let on = ready_config(["rbitcoin-node", "--sh-index", "--sp-tweaks"]);
-        assert!(on.shindex);
-        assert!(on.sptweaks);
-        let eq = ready_config(["rbitcoin-node", "--sh-index=1", "--sp-tweaks-dust=546"]);
-        assert!(eq.shindex);
-        assert_eq!(eq.sptweaks_dust, 546);
-        assert_exit(cli_main(["rbitcoin-node", "--shindex"]), ExitCode::from(2));
-        assert_exit(cli_main(["rbitcoin-node", "-shindex"]), ExitCode::from(2));
-        assert_exit(cli_main(["rbitcoin-node", "--sptweaks"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sptweaks-dust=1"]),
-            ExitCode::from(2),
-        );
-    }
-
-    /// Tweaks need the scriptSig and witness data seqsigwit pruning drops,
-    /// so the pair is refused from the CLI and from the conf file alike.
-    #[test]
-    fn sp_tweaks_refuses_prune_seqsigwit() {
-        let cli = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
-        let err = cli.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
-            "{err}"
-        );
-        let mut conf = NodeConfig::default();
-        conf.apply_kv("prune_seqsigwit", "1").unwrap();
-        conf.apply_kv("sp_tweaks", "1").unwrap();
-        assert!(conf.validate().is_err());
-    }
-
-    #[test]
-    fn max_inbound_zero_is_allowed() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
-        let cfg = ready_config(["rbitcoin-node", "--max-inbound", "0"]);
-        assert_eq!(cfg.listen.max_inbound, 0);
-        assert!(cfg.listen.max_inbound_explicit);
-        cfg.validate()
-            .expect("CLI --max-inbound 0 must assemble and validate");
-        let out = NodeConfig::default()
-            .apply_kv("max_outbound", "0")
-            .unwrap_err();
-        assert!(format!("{out}").contains("max_outbound"));
-    }
-
-    #[test]
-    fn listen_zero_does_not_default_loopback() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
-        let mut c = NodeConfig::default();
-        assert_eq!(c.apply_kv("listen", "0").unwrap(), ConfApply::Applied);
-        assert_eq!(c.listen.p2p, crate::config::P2pListen::Off);
-        assert!(c.listen.p2p_bind_addr(Network::Regtest).is_none());
-
-        let n = ready_config(["rbitcoin-node", "--no-listen"]);
-        assert_eq!(n.listen.p2p, crate::config::P2pListen::Off);
-        assert!(n.listen.p2p_bind_addr(Network::Regtest).is_none());
-
-        let eq = ready_config(["rbitcoin-node", "--listen=0"]);
-        assert_eq!(eq.listen.p2p, crate::config::P2pListen::Off);
-
-        let bound = ready_config(["rbitcoin-node", "--listen", "127.0.0.1:18444"]);
-        assert_eq!(
-            bound.listen.p2p,
-            crate::config::P2pListen::Socket("127.0.0.1:18444".parse().unwrap())
-        );
-        assert_eq!(
-            bound.listen.p2p_bind_addr(Network::Regtest),
-            Some("127.0.0.1:18444".parse().unwrap())
-        );
-
-        let auto = NodeConfig::default();
-        assert_eq!(auto.listen.p2p, crate::config::P2pListen::Auto);
-        assert_eq!(
-            auto.listen.p2p_bind_addr(Network::Regtest),
-            Some("127.0.0.1:18444".parse().unwrap())
-        );
-
-        let h = operator_usage();
-        assert!(
-            h.contains("--no-listen"),
-            "help must list kebab --no-listen"
-        );
-        assert!(
-            !h.contains("--nolisten"),
-            "help must not advertise concatenated --nolisten"
-        );
-    }
-
-    #[test]
-    fn prune_seqsigwit_is_kebab() {
-        let on = ready_config([
-            "rbitcoin-node",
-            "--prune-seqsigwit",
-            "--prune-seqsigwit-ram-threshold-bytes=4096",
-        ]);
-        assert!(on.prune_seqsigwit);
-        assert_eq!(on.prune_seqsigwit_ram_threshold_bytes, 4096);
-        let mut conf = NodeConfig::default();
-        conf.apply_kv("prune_seqsigwit", "1").unwrap();
-        conf.apply_kv("prune_seqsigwit_ram_threshold_bytes", "8192")
-            .unwrap();
-        assert!(conf.prune_seqsigwit);
-        assert_eq!(conf.prune_seqsigwit_ram_threshold_bytes, 8192);
-        conf.apply_kv("prune_seqsigwit_ram_threshold_bytes", "0")
-            .unwrap();
-        assert_eq!(conf.prune_seqsigwit_ram_threshold_bytes, 0);
-        let h = operator_usage();
-        assert!(h.contains("--prune-seqsigwit"));
-        assert!(h.contains("--prune-seqsigwit-ram-threshold-bytes"));
-        assert!(!h.contains("--pruneseqsigwit"));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--pruneseqsigwit"]),
-            ExitCode::from(2),
-        );
-    }
-
-    #[tokio::test]
-    async fn i2p_accept_incoming_forwards_to_loopback() {
-        use std::sync::{Arc, Mutex};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::{TcpListener, TcpStream};
-
-        async fn write_line(s: &mut TcpStream, line: &str) {
-            s.write_all(line.as_bytes()).await.unwrap();
-            s.write_all(b"\n").await.unwrap();
-            s.flush().await.unwrap();
-        }
-        async fn read_line(s: &mut TcpStream) -> Option<String> {
-            let mut reader = BufReader::new(s);
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await.ok()?;
-            if n == 0 {
-                return None;
-            }
-            Some(line.trim_end_matches(['\r', '\n']).to_string())
-        }
-
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let log_acc = Arc::clone(&log);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut s, _)) = listener.accept().await else {
-                    break;
-                };
-                let log = Arc::clone(&log_acc);
-                tokio::spawn(async move {
-                    loop {
-                        let Some(line) = read_line(&mut s).await else {
-                            break;
-                        };
-                        let up = line.to_ascii_uppercase();
-                        if up.starts_with("HELLO VERSION") {
-                            write_line(&mut s, "HELLO REPLY RESULT=OK VERSION=3.1").await;
-                        } else if up.starts_with("SESSION CREATE") {
-                            write_line(&mut s, "SESSION STATUS RESULT=OK DESTINATION=fakeprivdest")
-                                .await;
-                        } else if up.starts_with("STREAM FORWARD") {
-                            log.lock().unwrap().push(line);
-                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
-                        } else if up.starts_with("STREAM CONNECT") {
-                            write_line(&mut s, "STREAM STATUS RESULT=OK").await;
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-
-        let dir = tmp_datadir();
-        let dest_path = dir.join("i2p").join("p2p.priv");
-        let mut sam = rbitcoin_net::I2pSam::connect_persistent(addr, &dest_path)
-            .await
-            .unwrap();
-        sam.stream_forward(18444).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&dest_path).unwrap().trim(),
-            "fakeprivdest"
-        );
-        let fw = log.lock().unwrap().clone();
-        assert_eq!(fw.len(), 1, "{fw:?}");
-        assert!(fw[0].contains("PORT=18444"), "{}", fw[0]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    include!("overlay_config_journey.rs");
-
-    #[test]
-    fn no_discover_conf() {
-        let _g = OPERATOR_ENV_TEST_LOCK.lock().unwrap();
-        assert!(NodeConfig::default().listen.discover);
-        let off = ready_config(["rbitcoin-node", "--no-discover"]);
-        assert!(!off.listen.discover);
-        let mut c = NodeConfig::default();
-        assert_eq!(c.apply_kv("no_discover", "1").unwrap(), ConfApply::Applied);
-        assert!(!c.listen.discover);
-        c.apply_kv("no_discover", "0").unwrap();
-        assert!(c.listen.discover);
-    }
-
-    #[test]
-    fn kebab_seed_node_and_min_relay_tx_fee_parse() {
-        let seeds = ready_config(["rbitcoin-node", "--seed-node", "127.0.0.1:8333"]);
-        assert_eq!(seeds.listen.seednodes, vec!["127.0.0.1:8333".to_string()]);
-        let fee = ready_config(["rbitcoin-node", "--min-relay-tx-fee", "0.00001000"]);
-        assert_eq!(fee.mempool.min_relay_fee_btc.as_deref(), Some("0.00001000"));
-        let compact = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
-        assert!(!compact.prefill_compact);
-        let rpc = ready_config(["rbitcoin-node", "--network", "regtest", "--rpc-listen"]);
-        assert!(rpc.rpc.socket);
-        assert_eq!(rpc.rpc.listen.unwrap().port(), 18443);
-        assert_eq!(rpc.rpc.listen.unwrap().ip().to_string(), "127.0.0.1");
-        let sock = ready_config(["rbitcoin-node", "--rpc"]);
-        assert!(sock.rpc.socket);
-        assert!(sock.rpc.listen.is_none());
-        let el = ready_config(["rbitcoin-node", "--sh-index", "--electrum-listen"]);
-        assert_eq!(el.listen.electrum.unwrap().port(), 50001);
-        let es = ready_config(["rbitcoin-node", "--sh-index", "--esplora-listen"]);
-        match es.listen.esplora.unwrap() {
-            rbitcoin_esplora::EsploraListen::Tcp(a) => assert_eq!(a.port(), 3000),
-            #[cfg(unix)]
-            rbitcoin_esplora::EsploraListen::Unix(_) => panic!("default esplora-listen is TCP"),
-        }
-        #[cfg(unix)]
-        {
-            let es_unix = ready_config([
-                "rbitcoin-node",
-                "--sh-index",
-                "--esplora-listen",
-                "/tmp/esplora.sock",
-            ]);
-            match es_unix.listen.esplora.unwrap() {
-                rbitcoin_esplora::EsploraListen::Unix(p) => {
-                    assert_eq!(p, std::path::PathBuf::from("/tmp/esplora.sock"))
-                }
-                rbitcoin_esplora::EsploraListen::Tcp(_) => panic!("path must be unix"),
-            }
-        }
-    }
-
-    #[test]
-    fn check_blocks_cli_parses_zero_and_negative() {
+        // No argv: mainnet with the anchored milestone and the chainwork floor.
         let omitted = ready_config(["rbitcoin-node"]);
+        assert_eq!(omitted.network, Network::Mainnet);
+        assert_eq!(
+            omitted.milestone_height,
+            default_milestone_height(Network::Mainnet)
+        );
+        assert!(omitted.milestone().anchor.is_some());
+        assert!(!omitted.milestone().skips_scripts_at(1));
+        assert!(!omitted.meets_minimum_chain_work([0; 32]));
+        assert!(omitted.prefill_compact);
         assert_eq!(omitted.check_blocks, None);
         assert_eq!(
             omitted.check_blocks_window(),
             rbitcoin_store::VERIFY_TIP_BLOCKS
         );
-        let six = ready_config(["rbitcoin-node", "--check-blocks=6"]);
-        assert_eq!(six.check_blocks, Some(6));
-        assert_eq!(six.check_blocks_window(), 6);
-        let all = ready_config(["rbitcoin-node", "--check-blocks", "0"]);
-        assert_eq!(all.check_blocks, Some(0));
-        assert_eq!(all.check_blocks_window(), 0);
-        let neg = ready_config(["rbitcoin-node", "--check-blocks=-1"]);
-        assert_eq!(neg.check_blocks, Some(-1));
-        assert_eq!(neg.check_blocks_window(), 0);
+        assert!(omitted.listen.discover);
+        assert_eq!(omitted.listen.p2p, P2pListen::Auto);
+        assert_eq!(
+            omitted.listen.p2p_bind_addr(Network::Regtest),
+            Some("127.0.0.1:18444".parse().unwrap())
+        );
+
+        // A custom signet operator's conf file.
+        let dir = tmp_datadir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let knobs = dir.join("rbitcoin.conf");
+        std::fs::write(
+            &knobs,
+            "# custom signet\n\
+             network=signet\n\
+             signet_challenge=51\n\
+             signet_block_time=60\n\
+             max_inbound=40\n\
+             max_outbound=8\n\
+             mempool_size_mb=50\n\
+             milestone=100\n\
+             log_level=debug\n\
+             api_log=/tmp/rbitcoin-api.jsonl\n\
+             asmap=/tmp/ip_asn.dat\n\
+             connect=127.0.0.1:38333\n\
+             datadir-cold=/mnt/hdd/rbtc-cold\n",
+        )
+        .unwrap();
+        let cfg = ready_config(["rbitcoin-node", "--conf", knobs.to_str().unwrap()]);
+        assert_eq!(cfg.network, Network::Signet);
+        let params = cfg.chain_params().unwrap();
+        assert_eq!(params.btc.pow_target_spacing, 60);
+        assert_eq!(params.signet_challenge.unwrap().as_bytes(), &[0x51]);
+        assert_eq!(cfg.listen.max_inbound, 40);
+        assert!(cfg.listen.max_inbound_explicit);
+        assert_eq!(cfg.listen.max_outbound, 8);
+        assert_eq!(cfg.mempool.max_weight, 50_000_000);
+        assert_eq!(cfg.milestone_height, 100);
+        assert_eq!(cfg.conf_log_level.as_deref(), Some("debug"));
+        assert_eq!(
+            cfg.api_log.as_deref(),
+            Some(std::path::Path::new("/tmp/rbitcoin-api.jsonl"))
+        );
+        assert_eq!(
+            cfg.asmap.as_deref(),
+            Some(std::path::Path::new("/tmp/ip_asn.dat"))
+        );
+        assert_eq!(cfg.listen.connect.len(), 1);
+        assert!(cfg.listen.connect_dns.is_empty());
+        assert_eq!(
+            cfg.datadir.cold.as_deref(),
+            Some(std::path::Path::new("/mnt/hdd/rbtc-cold"))
+        );
+
+        // Bare network lines, and an explicit milestone 0 that the network
+        // default does not replace, from the conf and from argv alike.
+        for (bare, net) in [
+            ("regtest", Network::Regtest),
+            ("signet", Network::Signet),
+            ("testnet", Network::Testnet),
+        ] {
+            let conf = dir.join(format!("{bare}.conf"));
+            std::fs::write(&conf, format!("{bare}\n; also a comment\n\nno_seeds=1\n")).unwrap();
+            let eq = format!("--conf={}", conf.to_str().unwrap());
+            let cfg = ready_config(["rbitcoin-node", eq.as_str()]);
+            assert_eq!(cfg.network, net);
+            assert!(!cfg.listen.use_seeds);
+        }
+        let zero = dir.join("milestone.conf");
+        std::fs::write(&zero, "milestone=0\n").unwrap();
+        for cfg in [
+            ready_config(["rbitcoin-node", "--conf", zero.to_str().unwrap()]),
+            ready_config(["rbitcoin-node", "--milestone", "0"]),
+        ] {
+            assert_eq!(cfg.network, Network::Mainnet);
+            assert_eq!(cfg.milestone(), Milestone::NONE);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let explicit = ready_config(["rbitcoin-node", "--milestone", "840000"]);
+        assert!(explicit.milestone().anchor.is_none());
+        assert!(explicit.milestone().skips_scripts_at(1));
+        let signet = ready_config(["rbitcoin-node", "--network=signet"]);
+        assert_eq!(signet.milestone_height, 0);
+        assert!(!signet.milestone().skips_scripts_at(1));
+        let signet_skip = ready_config([
+            "rbitcoin-node",
+            "--network=signet",
+            "--milestone",
+            "2000000",
+        ]);
+        assert!(signet_skip.milestone().skips_scripts_at(1));
+        let work = ready_config(["rbitcoin-node", "--min-chain-work=0x65"]);
+        assert_eq!(work.minimum_chain_work.unwrap()[31], 0x65);
+
+        // Kebab flags set the knob the conf key of the same name sets.
+        let cfg = ready_config([
+            "rbitcoin-node",
+            "--network",
+            "regtest",
+            "--sh-index",
+            "--sp-tweaks",
+            "--sp-tweaks-dust=546",
+            "--max-inbound",
+            "0",
+            "--no-discover",
+            "--seed-node",
+            "127.0.0.1:8333",
+            "--min-relay-tx-fee",
+            "0.00001000",
+            "--rpc-listen",
+            "--electrum-listen",
+            "--esplora-listen",
+        ]);
+        assert!(cfg.shindex && cfg.sptweaks);
+        assert_eq!(cfg.sptweaks_dust, 546);
+        assert_eq!(cfg.listen.max_inbound, 0);
+        assert!(cfg.listen.max_inbound_explicit);
+        assert!(!cfg.listen.discover);
+        assert_eq!(cfg.listen.seednodes, vec!["127.0.0.1:8333".to_string()]);
+        assert_eq!(cfg.mempool.min_relay_fee_btc.as_deref(), Some("0.00001000"));
+        assert!(cfg.rpc.socket);
+        assert_eq!(cfg.rpc.listen, Some("127.0.0.1:18443".parse().unwrap()));
+        assert_eq!(cfg.listen.electrum.unwrap().port(), 50001);
+        match cfg.listen.esplora.unwrap() {
+            rbitcoin_esplora::EsploraListen::Tcp(a) => assert_eq!(a.port(), 3000),
+            #[cfg(unix)]
+            rbitcoin_esplora::EsploraListen::Unix(_) => panic!("default esplora-listen is TCP"),
+        }
+        #[cfg(unix)]
+        match ready_config(["rbitcoin-node", "--esplora-listen", "/tmp/esplora.sock"])
+            .listen
+            .esplora
+            .unwrap()
+        {
+            rbitcoin_esplora::EsploraListen::Unix(p) => {
+                assert_eq!(p, PathBuf::from("/tmp/esplora.sock"))
+            }
+            rbitcoin_esplora::EsploraListen::Tcp(_) => panic!("path must be unix"),
+        }
+        let sock = ready_config(["rbitcoin-node", "--rpc"]);
+        assert!(sock.rpc.socket && sock.rpc.listen.is_none());
+        let pruned = ready_config([
+            "rbitcoin-node",
+            "--prune-seqsigwit",
+            "--prune-seqsigwit-ram-threshold-bytes=4096",
+        ]);
+        assert!(pruned.prune_seqsigwit);
+        assert_eq!(pruned.prune_seqsigwit_ram_threshold_bytes, 4096);
+        for (argv, want) in [
+            (&["--prefill-compact=0"][..], false),
+            (&["--prefill-compact"], true),
+            (&["--prefill-compact=1"], true),
+        ] {
+            let mut args = vec!["rbitcoin-node"];
+            args.extend_from_slice(argv);
+            assert_eq!(ready_config(args).prefill_compact, want, "{argv:?}");
+        }
+        for (arg, stored, window) in [
+            ("--check-blocks=6", 6, 6),
+            ("--check-blocks=0", 0, 0),
+            ("--check-blocks=-1", -1, 0),
+        ] {
+            let cfg = ready_config(["rbitcoin-node", arg]);
+            assert_eq!(cfg.check_blocks, Some(stored));
+            assert_eq!(cfg.check_blocks_window(), window, "{arg}");
+        }
+        for off in ["--no-listen", "--listen=0"] {
+            let cfg = ready_config(["rbitcoin-node", off]);
+            assert_eq!(cfg.listen.p2p, P2pListen::Off, "{off}");
+            assert!(cfg.listen.p2p_bind_addr(Network::Regtest).is_none());
+        }
+        let bound = ready_config(["rbitcoin-node", "--listen", "127.0.0.1:18445"]);
+        assert_eq!(
+            bound.listen.p2p_bind_addr(Network::Regtest),
+            Some("127.0.0.1:18445".parse().unwrap())
+        );
     }
 
-    #[test]
-    fn prefillcompact_omitted_is_on_zero_disables() {
-        let omitted = ready_config(["rbitcoin-node"]);
-        assert!(omitted.prefill_compact);
-        let off = ready_config(["rbitcoin-node", "--prefill-compact=0"]);
-        assert!(!off.prefill_compact);
-        let on = ready_config(["rbitcoin-node", "--prefill-compact"]);
-        assert!(on.prefill_compact);
-        let on_eq = ready_config(["rbitcoin-node", "--prefill-compact=1"]);
-        assert!(on_eq.prefill_compact);
-    }
+    include!("overlay_config_journey.rs");
 
     #[test]
     fn max_sh_creates_and_esplora_block_template_cli_hyphens() {
@@ -988,444 +941,6 @@ mod tests {
         assert!(NodeConfig::default().esplora_onion);
         let onion_off = ready_config(["rbitcoin-node", "--esplora-onion=0"]);
         assert!(!onion_off.esplora_onion);
-    }
-
-    #[test]
-    fn explicit_milestone_zero_sticks_on_mainnet() {
-        use rbitcoin_consensus::{default_milestone_height, Milestone};
-
-        let omitted = ready_config(["rbitcoin-node"]);
-        assert_eq!(omitted.network, Network::Mainnet);
-        assert_eq!(
-            omitted.milestone_height,
-            default_milestone_height(Network::Mainnet)
-        );
-        assert!(omitted.milestone().anchor.is_some());
-        assert!(!omitted.milestone().skips_scripts_at(1));
-
-        let cli0 = ready_config(["rbitcoin-node", "--milestone", "0"]);
-        assert_eq!(cli0.network, Network::Mainnet);
-        assert_eq!(cli0.milestone_height, 0);
-        assert_eq!(cli0.milestone(), Milestone::NONE);
-        assert!(!cli0.milestone().skips_scripts_at(1));
-
-        assert!(operator_config_from_args(["rbitcoin-node", "--assumevalid-height=0"]).is_err());
-
-        assert!(
-            matches!(
-                operator_config_from_args(["rbitcoin-node", "-V"]),
-                Ok(OperatorArgs::Version)
-            ),
-            "-V must assemble Version before run"
-        );
-        assert!(
-            operator_config_from_args(["rbitcoin-node", "--conf="]).is_err(),
-            "empty --conf= must fail"
-        );
-        match operator_config_from_args(["rbitcoin-node", "--log-level=off"]) {
-            Ok(OperatorArgs::Ready {
-                log_level_cli: Some(None),
-                ..
-            }) => {}
-            other => panic!("--log-level=off must be Ready with log off, got {other:?}"),
-        }
-        assert!(operator_config_from_args(["rbitcoin-node", "--log-level"]).is_err());
-
-        let dir = tmp_datadir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("m.conf");
-        std::fs::write(&conf, "milestone=0\n").unwrap();
-        let from_conf = ready_config(["rbitcoin-node", "--conf", conf.to_str().unwrap()]);
-        assert_eq!(from_conf.network, Network::Mainnet);
-        assert_eq!(from_conf.milestone_height, 0);
-        assert_eq!(from_conf.milestone(), Milestone::NONE);
-        let eq = format!("--conf={}", conf.to_str().unwrap());
-        let from_eq = ready_config(["rbitcoin-node", eq.as_str()]);
-        assert_eq!(from_eq.milestone_height, 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn default_milestone_is_anchored_and_signet_is_full_scripts() {
-        let omitted = ready_config(["rbitcoin-node"]);
-        assert!(omitted.milestone().anchor.is_some());
-        assert!(!omitted.milestone().skips_scripts_at(1));
-        assert!(omitted.minimum_chain_work.is_some());
-        assert!(!omitted.meets_minimum_chain_work([0; 32]));
-        let explicit = ready_config(["rbitcoin-node", "--milestone", "840000"]);
-        assert!(explicit.milestone().anchor.is_none());
-        assert!(explicit.milestone().skips_scripts_at(1));
-        let signet = ready_config(["rbitcoin-node", "--network=signet"]);
-        assert_eq!(signet.milestone_height, 0);
-        assert!(!signet.milestone().skips_scripts_at(1));
-        let signet_skip = ready_config([
-            "rbitcoin-node",
-            "--network=signet",
-            "--milestone",
-            "2000000",
-        ]);
-        assert!(signet_skip.milestone().skips_scripts_at(1));
-        let custom_work = ready_config(["rbitcoin-node", "--min-chain-work=0x65"]);
-        assert_eq!(custom_work.minimum_chain_work.unwrap()[31], 0x65);
-    }
-
-    #[test]
-    fn flag_matrix_cli_equals_conf_apply_kv() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut cfg = crate::config::NodeConfig::default();
-        assert_eq!(
-            cfg.apply_kv("network", "regtest").unwrap(),
-            crate::config::ConfApply::Applied
-        );
-        assert_eq!(cfg.network, Network::Regtest);
-        assert_eq!(
-            cfg.apply_kv("chain", "signet").unwrap(),
-            crate::config::ConfApply::Unknown("chain".into())
-        );
-        assert_eq!(cfg.network, Network::Regtest);
-
-        let dir = tmp_datadir();
-        assert_exit(
-            cli_main([
-                "rbitcoin-node",
-                "--smoke",
-                "--network=regtest",
-                "--datadir",
-                dir.to_str().unwrap(),
-                "--no-seeds=1",
-                "--log-level",
-                "error",
-                "--milestone",
-                "0",
-            ]),
-            ExitCode::SUCCESS,
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert_exit(
-            cli_main(["rbitcoin-node", "--chain=regtest"]),
-            ExitCode::from(2),
-        );
-
-        let dir = tmp_datadir();
-        let conf = dir.join("node.conf");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&conf, "network=testnet\n").unwrap();
-        let smoke = dir.join("smoke");
-        assert_exit(
-            cli_main([
-                "rbitcoin-node",
-                "--smoke",
-                "--conf",
-                conf.to_str().unwrap(),
-                "--network=regtest",
-                "--datadir",
-                smoke.to_str().unwrap(),
-                "--no-seeds",
-                "--log-level",
-                "error",
-                "--milestone",
-                "0",
-            ]),
-            ExitCode::SUCCESS,
-        );
-        assert!(
-            smoke.join("store").exists(),
-            "CLI datadir must win over conf"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn testactivationheight_cli_smoke_regtest() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmp_datadir();
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--network",
-            "regtest",
-            "--datadir",
-            dir.to_str().unwrap(),
-            "--test-activation-height=csv@102",
-            "--test-activation-height=dersig@50",
-            "--trusted",
-            "--limit-cluster-count=10",
-            "--min-chain-work=0x65",
-            "--no-seeds",
-            "--log-level",
-            "error",
-            "--milestone",
-            "0",
-        ]);
-        assert_exit(code, ExitCode::SUCCESS);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn minimumchainwork_rejects_non_hex() {
-        let dir = tmp_datadir();
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--network",
-            "regtest",
-            "--datadir",
-            dir.to_str().unwrap(),
-            "--min-chain-work=test",
-            "--log-level",
-            "error",
-        ]);
-        assert_exit(code, ExitCode::from(1));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unknown_and_missing_value_errors() {
-        assert_exit(cli_main(["rbitcoin-node", "--nope"]), ExitCode::from(2));
-        assert_exit(cli_main(["rbitcoin-node", "--network"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--network", "bogus"]),
-            ExitCode::from(2),
-        );
-        assert_exit(cli_main(["rbitcoin-node", "--datadir"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--datadir-cold"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--log-level", "wat"]),
-            ExitCode::from(2),
-        );
-        assert_exit(cli_main(["rbitcoin-node", "--api-log"]), ExitCode::from(2));
-        assert_exit(cli_main(["rbitcoin-node", "--asmap"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-outbound", "0"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
-            ExitCode::from(2),
-        );
-        // Missing values / parse rejects for advanced knobs.
-        assert_exit(cli_main(["rbitcoin-node", "--conf"]), ExitCode::from(2));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--max-inbound", "nope"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sp-tweaks-dust"]),
-            ExitCode::from(2),
-        );
-        assert_exit(
-            cli_main(["rbitcoin-node", "--sp-tweaks-dust", "nope"]),
-            ExitCode::from(2),
-        );
-        // Bad conf path / invalid conf log_level.
-        let dir = tmp_datadir();
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_exit(
-            cli_main([
-                "rbitcoin-node",
-                "--conf",
-                dir.join("missing.conf").to_str().unwrap(),
-                "--datadir",
-                dir.join("d").to_str().unwrap(),
-            ]),
-            ExitCode::from(2),
-        );
-        let conf = dir.join("badlog.conf");
-        std::fs::write(&conf, "log_level=notalevel\nnetwork=regtest\n").unwrap();
-        assert_exit(
-            cli_main([
-                "rbitcoin-node",
-                "--smoke",
-                "--conf",
-                conf.to_str().unwrap(),
-                "--datadir",
-                dir.join("d2").to_str().unwrap(),
-                "--no-seeds",
-            ]),
-            ExitCode::from(2),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn smoke_datadir_cold_puts_seqsigwit_on_cold_store() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmp_datadir();
-        let hot = dir.join("hot");
-        let cold = dir.join("cold");
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--network",
-            "regtest",
-            "--datadir",
-            hot.to_str().unwrap(),
-            "--datadir-cold",
-            cold.to_str().unwrap(),
-            "--no-seeds",
-            "--log-level",
-            "error",
-            "--milestone",
-            "0",
-        ]);
-        assert_exit(code, ExitCode::SUCCESS);
-        assert!(hot.join("store").is_dir());
-        assert!(hot.join("store/txout.body").is_file());
-        assert!(!hot.join("store/seqsigwit.body").exists());
-        assert!(cold.join("store/seqsigwit.body").is_file());
-        assert!(cold.join("store/seqsigwit.loc").is_file());
-        assert!(hot.join("store").join("seqsigwit.reloc").is_file());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn custom_signet_cli_smoke() {
-        let dir = tmp_datadir();
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--network",
-            "signet",
-            "--datadir",
-            dir.to_str().unwrap(),
-            "--signet-challenge",
-            "51",
-            "--signet-block-time",
-            "60",
-            "--no-seeds",
-            "--log-level",
-            "error",
-            "--milestone",
-            "0",
-        ]);
-        assert_exit(code, ExitCode::SUCCESS);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn native_cli_flags_reject_core_aliases() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmp_datadir();
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--network",
-            "regtest",
-            "--datadir",
-            dir.to_str().unwrap(),
-            "--milestone",
-            "0",
-            "--max-inbound",
-            "5",
-            "--mempool-size-mb",
-            "8",
-            "--log-level",
-            "error",
-            "--no-seeds",
-        ]);
-        assert_exit(code, ExitCode::SUCCESS);
-        for flag in [
-            "--chain=regtest",
-            "--assumevalid-height=0",
-            "--maxconnections=5",
-            "--maxmempool=8",
-            "--whitelist=noban@127.0.0.1",
-            "--blocksonly",
-            "--minimumchainwork=0x65",
-            "--maxtipage=3600",
-            "--uacomment=x",
-            "--peertimeout=1",
-            "--prefillcompact=0",
-            "--limitclustercount=10",
-            "--limitclustersize=10",
-            "--minrelaytxfee=0.0001",
-            "--mempoolexpiry=1",
-            "--externalip=1.2.3.4",
-            "--seednode=127.0.0.1:1",
-            "--mocktime=1",
-            "--blockversion=1",
-            "--blockmintxfee=0.00000001",
-            "--bytespersigop=20",
-            "--blockreservedsigops=400",
-            "--alertnotify=echo",
-            "--startupnotify=echo",
-            "--testactivationheight=csv@102",
-            "--rpcworkqueue=1",
-            "--datadircold=/tmp/x",
-            "--electrumlisten=127.0.0.1:1",
-            "--esploralisten=127.0.0.1:1",
-            "--maxshcreates=1",
-            "--esplorablocktemplate=1",
-            "--apilog=/tmp/x",
-            "--maxrunsecs=1",
-            "--inhibitsuspend=1",
-            "--rpclisten=127.0.0.1:1",
-            "--rpc-user=u",
-            "--rpcuser=u",
-            "--rpcpassword=p",
-            "--checkblocks=6",
-            "--blocksdir=/tmp/x",
-            "--blocks-dir=/tmp/x",
-            "--whitelist-relay=0",
-            "--whitelist-forcerelay=1",
-            "--shindex",
-            "--sptweaks",
-            "-shindex",
-            "-sptweaks",
-            "-datadir=/tmp/x",
-        ] {
-            assert_exit(cli_main(["rbitcoin-node", flag]), ExitCode::from(2));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn conf_file_then_cli_override() {
-        let _g = OPERATOR_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tmp_datadir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let conf = dir.join("node.conf");
-        std::fs::write(&conf, "network=signet\nmax_inbound=33\n").unwrap();
-        let data = dir.join("data");
-        let code = cli_main([
-            "rbitcoin-node",
-            "--smoke",
-            "--conf",
-            conf.to_str().unwrap(),
-            "--datadir",
-            data.to_str().unwrap(),
-            "--network",
-            "regtest", // CLI overrides conf network
-            "--log-level",
-            "error",
-            "--no-seeds",
-            "--milestone",
-            "0",
-        ]);
-        assert_exit(code, ExitCode::SUCCESS);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CLI omit of inbound must not clobber pre-set advanced envs.

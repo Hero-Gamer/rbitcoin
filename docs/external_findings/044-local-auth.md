@@ -21,9 +21,9 @@ address is onion or I2P. Inbound Tor and I2P still arrive as the loopback
 TCP peer on the shared P2P socket, so that socket address is what the
 grant sees.
 
-**Regression:** `rbitcoin-node` `tor_control::tests::tor_plain_cookie_is_not_sent_when_safecookie_is_absent`,
-`tor_short_cookie_does_not_fall_back_to_raw_hex`,
-`config::tests::builders_paths_milestone_and_ensure`,
+**Regression:** `rbitcoin-test` `tor_control_onion_lifecycle` (plain COOKIE
+and a short cookie refuse the start before any `AUTHENTICATE`),
+`rbitcoin-node` `config::tests::builders_paths_milestone_and_ensure`,
 `rbitcoin-rpc` `server::tests::unix_socket_needs_no_http_auth`,
 `rbitcoin-esplora` `internal::tests::esplora_unix_internal`,
 `rbitcoin-net` `net_permissions::tests::loopback_grant_does_not_cover_onion_or_i2p`.

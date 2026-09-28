@@ -383,13 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn help_and_version_do_not_dial() {
-        assert!(exit_ok(cli_main(["rbitcoin-cli", "--help"])));
-        assert!(exit_ok(cli_main(["rbitcoin-cli", "-V"])));
-        assert!(exit_ok(cli_main(["rbitcoin-cli", "help"])));
-    }
-
-    #[test]
     fn equals_form_datadir_is_accepted() {
         let dir = tmp_datadir();
         std::fs::write(dir.join("rpc.token"), "s3cret").unwrap();

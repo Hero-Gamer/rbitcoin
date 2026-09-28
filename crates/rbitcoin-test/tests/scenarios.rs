@@ -78,6 +78,271 @@ fn pin_conf_unknown_key_and_peertimeout(td: &TestDatadir) {
     );
 }
 
+fn node(args: &[&str]) -> ExitCode {
+    node_cli_main(std::iter::once("rbitcoin-node").chain(args.iter().copied()))
+}
+
+fn exit_is(c: ExitCode, want: u8) -> bool {
+    format!("{c:?}") == format!("{:?}", ExitCode::from(want))
+}
+
+/// `--smoke` a regtest node under `td/name` with extra argv.
+fn smoke(td: &TestDatadir, name: &str, extra: &[&str]) -> ExitCode {
+    let d = td.path().join(name);
+    let mut args = vec!["--datadir", d.to_str().unwrap(), "--network", "regtest"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--no-seeds", "--log-level", "error", "--smoke"]);
+    node(&args)
+}
+
+/// Usage errors exit 2 before a datadir is touched: unknown flags, missing or
+/// unparsable values, and every concatenated, one-dash, or Core spelling of a
+/// native kebab flag.
+fn pin_argv_usage_errors() {
+    let refused: &[&[&str]] = &[
+        &["--not-a-real-option"],
+        &["--datadir"],
+        &["--datadir-cold"],
+        &["--network"],
+        &["--network", "nope"],
+        &["--listen"],
+        &["--listen", "not-an-addr"],
+        &["--connect"],
+        &["--connect", "bad host"],
+        &["--milestone"],
+        &["--milestone", "x"],
+        &["--max-outbound"],
+        &["--max-outbound", "0"],
+        &["--max-outbound", "nope"],
+        &["--max-inbound"],
+        &["--max-inbound", "nope"],
+        &["--mempool-size-mb"],
+        &["--mempool-size-mb", "0"],
+        &["--mempool-size-mb", "x"],
+        &["--max-run-secs"],
+        &["--max-run-secs", "x"],
+        &["--log-level"],
+        &["--log-level", "loud"],
+        &["--electrum-listen", "bad"],
+        &["--api-log"],
+        &["--asmap"],
+        &["--conf"],
+        &["--conf="],
+        &["--sp-tweaks-dust"],
+        &["--sp-tweaks-dust", "nope"],
+        &["--min-relay-tx-fee", "nope"],
+        &["--min-relay-tx-fee", "-0.0001"],
+    ];
+    for args in refused {
+        assert!(exit_is(node(args), 2), "{args:?} must be a usage error");
+    }
+    for alias in [
+        "--chain=regtest",
+        "--assumevalid-height=0",
+        "--maxconnections=5",
+        "--maxmempool=8",
+        "--whitelist=noban@127.0.0.1",
+        "--blocksonly",
+        "--minimumchainwork=0x65",
+        "--maxtipage=3600",
+        "--uacomment=x",
+        "--peertimeout=1",
+        "--prefillcompact=0",
+        "--limitclustercount=10",
+        "--limitclustersize=10",
+        "--minrelaytxfee=0.0001",
+        "--mempoolexpiry=1",
+        "--externalip=1.2.3.4",
+        "--seednode=127.0.0.1:1",
+        "--mocktime=1",
+        "--blockversion=1",
+        "--blockmintxfee=0.00000001",
+        "--bytespersigop=20",
+        "--blockreservedsigops=400",
+        "--alertnotify=echo",
+        "--startupnotify=echo",
+        "--testactivationheight=csv@102",
+        "--rpcworkqueue=1",
+        "--datadircold=/tmp/x",
+        "--electrumlisten=127.0.0.1:1",
+        "--esploralisten=127.0.0.1:1",
+        "--maxshcreates=1",
+        "--esplorablocktemplate=1",
+        "--apilog=/tmp/x",
+        "--maxrunsecs=1",
+        "--inhibitsuspend=1",
+        "--rpclisten=127.0.0.1:1",
+        "--rpc-user=u",
+        "--rpcuser=u",
+        "--rpcpassword=p",
+        "--checkblocks=6",
+        "--blocksdir=/tmp/x",
+        "--blocks-dir=/tmp/x",
+        "--whitelist-relay=0",
+        "--whitelist-forcerelay=1",
+        "--shindex",
+        "--sptweaks",
+        "--sptweaks-dust=1",
+        "--pruneseqsigwit",
+        "-shindex",
+        "-sptweaks",
+        "-datadir=/tmp/x",
+    ] {
+        assert!(exit_is(node(&[alias]), 2), "{alias} must be unknown");
+    }
+}
+
+/// A conf file that cannot be read or holds a line the node refuses exits 2.
+/// Core's `rpcuser` / `rpcpassword` are refused, not ignored: the node
+/// authenticates with `rpc.token`.
+fn pin_conf_file_refusals(td: &TestDatadir) {
+    let missing = td.path().join("missing.conf");
+    let d = td.path().join("conf-refused");
+    assert!(exit_is(
+        node(&["--conf", missing.to_str().unwrap(), "--smoke"]),
+        2
+    ));
+    for (name, body) in [
+        ("badlog", "network=regtest\nlog_level=notalevel\n"),
+        ("badline", "network=regtest\nnot_a_key_value\n"),
+        ("rpcuser", "network=regtest\nrpcuser=u\n"),
+        ("rpcpassword", "network=regtest\nrpcpassword=p\n"),
+        ("max-outbound-zero", "network=regtest\nmax_outbound=0\n"),
+    ] {
+        let conf = td.path().join(format!("{name}.conf"));
+        std::fs::write(&conf, body).unwrap();
+        assert!(
+            exit_is(
+                node(&[
+                    "--conf",
+                    conf.to_str().unwrap(),
+                    "--datadir",
+                    d.to_str().unwrap(),
+                    "--smoke",
+                ]),
+                2
+            ),
+            "{name} conf must refuse"
+        );
+    }
+    assert!(!d.join("store").exists(), "a refused conf opens no store");
+}
+
+/// Flags that parse but describe a node that cannot run exit 1 at validate.
+fn pin_validate_refusals(td: &TestDatadir) {
+    for (name, args) in [
+        ("chainwork-not-hex", &["--min-chain-work=test"][..]),
+        ("challenge-off-signet", &["--signet-challenge", "51"]),
+        ("tweaks-and-pruning", &["--sp-tweaks", "--prune-seqsigwit"]),
+    ] {
+        assert!(exit_is(smoke(td, name, args), 1), "{name} must refuse");
+    }
+    let d = td.path().join("signet-time-no-challenge");
+    assert!(exit_is(
+        node(&[
+            "--datadir",
+            d.to_str().unwrap(),
+            "--network",
+            "signet",
+            "--signet-block-time",
+            "30",
+            "--smoke",
+        ]),
+        1
+    ));
+}
+
+/// Operator starts that open a store: native flags, a conf file under CLI
+/// overrides, a pruned `--datadir-cold` split, and a custom signet.
+fn pin_operator_smokes(td: &TestDatadir) {
+    assert!(exit_success(smoke(
+        td,
+        "native-flags",
+        &[
+            "--milestone",
+            "0",
+            "--max-inbound",
+            "0",
+            "--mempool-size-mb",
+            "8",
+            "--no-seeds=1",
+            "--no-discover",
+            "--seed-node",
+            "127.0.0.1:8333",
+            "--min-relay-tx-fee",
+            "0.00000001",
+            "--prefill-compact=0",
+            "--check-blocks=-1",
+            "--sh-index=1",
+            "--sp-tweaks",
+            "--sp-tweaks-dust=546",
+            "--test-activation-height=csv@102",
+            "--test-activation-height=dersig@50",
+            "--trusted",
+            "--limit-cluster-count=10",
+            "--min-chain-work=0x65",
+        ],
+    )));
+
+    // Bare network lines and comments parse. CLI --network and --datadir win
+    // over the conf: the store lands under the CLI datadir.
+    let conf = td.path().join("bare.conf");
+    let conf_data = td.path().join("conf-datadir");
+    std::fs::write(
+        &conf,
+        format!(
+            "signet\n# comment\n; also\n\nmax_inbound=0\nmin_relay_tx_fee=0\ndatadir={}\n",
+            conf_data.display()
+        ),
+    )
+    .unwrap();
+    assert!(exit_success(smoke(
+        td,
+        "cli-datadir",
+        &["--conf", conf.to_str().unwrap()]
+    )));
+    assert!(td.path().join("cli-datadir").join("store").is_dir());
+    assert!(!conf_data.exists(), "CLI --datadir wins over the conf");
+
+    let hot = td.path().join("hot");
+    let cold = td.path().join("cold");
+    assert!(exit_success(node(&[
+        "--datadir",
+        hot.to_str().unwrap(),
+        "--datadir-cold",
+        cold.to_str().unwrap(),
+        "--prune-seqsigwit",
+        "--prune-seqsigwit-ram-threshold-bytes=4096",
+        "--network",
+        "regtest",
+        "--no-seeds",
+        "--log-level",
+        "error",
+        "--smoke",
+    ])));
+    assert!(hot.join("store/txout.body").is_file());
+    assert!(hot.join("store/seqsigwit.reloc").is_file());
+    assert!(!hot.join("store/seqsigwit.body").exists());
+    assert!(cold.join("store/seqsigwit.body").is_file());
+    assert!(cold.join("store/seqsigwit.loc").is_file());
+
+    let signet = td.path().join("custom-signet");
+    assert!(exit_success(node(&[
+        "--datadir",
+        signet.to_str().unwrap(),
+        "--network",
+        "signet",
+        "--signet-challenge",
+        "51",
+        "--signet-block-time",
+        "60",
+        "--no-seeds",
+        "--log-level",
+        "error",
+        "--smoke",
+    ])));
+}
+
 // ─── Lifecycle / CLI / surface smoke (collapsed) ────────────────────────────
 
 #[allow(clippy::cognitive_complexity)] // one fixture, many CLI/surface arms
@@ -162,96 +427,19 @@ fn node_cli_and_surface_smoke() {
     assert!(exit_success(node_cli_main(["rbitcoin-node", "--help"])));
     assert!(exit_success(node_cli_main(["rbitcoin-node", "--version"])));
     assert!(exit_success(node_cli_main(["rbitcoin-node", "-V"])));
-    let _ = cli_cli_main(["rbitcoin-cli", "--help"]);
-    let _ = cli_cli_main(["rbitcoin-cli", "--version"]);
-    assert!(exit_success(cli_cli_main(["rbitcoin-cli", "help"])));
+    // No node is listening: help and version answer without dialing RPC.
+    for arg in ["--help", "-h", "--version", "-V", "help"] {
+        assert!(
+            exit_success(cli_cli_main(["rbitcoin-cli", arg])),
+            "rbitcoin-cli {arg} must not dial"
+        );
+    }
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli"])));
     assert!(!exit_success(cli_cli_main([
         "rbitcoin-cli",
         "getblockchaininfo"
     ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--not-a-real-option"
-    ])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--datadir"])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--network",
-        "nope"
-    ])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--listen"])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--listen",
-        "not-an-addr"
-    ])));
-    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--connect"])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--connect",
-        "bad host"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--milestone",
-        "x"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--max-outbound",
-        "0"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--max-outbound"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--max-outbound",
-        "nope"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--mempool-size-mb"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--mempool-size-mb",
-        "0"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--mempool-size-mb",
-        "x"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--max-run-secs"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--max-run-secs",
-        "x"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--log-level"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--log-level",
-        "loud"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--electrum-listen",
-        "bad"
-    ])));
-    assert!(!exit_success(node_cli_main([
-        "rbitcoin-node",
-        "--milestone"
-    ])));
+    pin_argv_usage_errors();
     // Electrum without --sh-index still smokes (channel-watch APIs; SH methods fail closed).
     let no_sh = td.path().join("electrum-no-shindex");
     assert!(exit_success(node_cli_main([
@@ -340,6 +528,9 @@ fn node_cli_and_surface_smoke() {
         "--smoke",
     ])));
     pin_conf_unknown_key_and_peertimeout(&td);
+    pin_conf_file_refusals(&td);
+    pin_validate_refusals(&td);
+    pin_operator_smokes(&td);
     assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "a", "b"])));
     for flag in [
         "--rpcuser=u",
