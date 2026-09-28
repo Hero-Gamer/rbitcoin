@@ -2916,8 +2916,18 @@ async fn node_run_p2p_short() {
                 "empty disconnectnode: {miss_empty}"
             );
 
+            let id = rows[0]["id"].as_u64().expect("id");
             let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
             assert!(disc["error"].is_null(), "{disc}");
+            let after = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+            assert!(
+                after["result"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(|p| p["id"].as_u64() != Some(id))),
+                "disconnectnode must clear the row before the session task exits: {after}"
+            );
+            let again = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
+            assert_eq!(again["error"]["code"], -29, "node not connected: {again}");
             let gone_deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
@@ -2929,6 +2939,22 @@ async fn node_run_p2p_short() {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            wait_ms_until(
+                3_000,
+                || {
+                    !seed_peers
+                        .snapshot()
+                        .into_iter()
+                        .any(|p| p.inbound && p.handshake_complete)
+                },
+                || {
+                    format!(
+                        "the seeder must see the disconnect: {:?}",
+                        seed_peers.snapshot()
+                    )
+                },
+            )
+            .await;
 
             let added = jsonrpc(
                 rpc_addr,
@@ -2952,6 +2978,22 @@ async fn node_run_p2p_short() {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            wait_ms_until(
+                3_000,
+                || {
+                    seed_peers
+                        .snapshot()
+                        .into_iter()
+                        .any(|p| p.inbound && p.handshake_complete)
+                },
+                || {
+                    format!(
+                        "the seeder must see the addnode peer inbound: {:?}",
+                        seed_peers.snapshot()
+                    )
+                },
+            )
+            .await;
 
             pin_blocksonly_seeder_tx_disconnects(rpc_addr, &seed_peers).await;
             let _ = jsonrpc(rpc_addr, "stop", json!([])).await;

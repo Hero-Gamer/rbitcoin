@@ -2968,35 +2968,6 @@ mod tests {
     }
 
     #[test]
-    fn peerhub_register_snapshot_disconnect() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-        let p = hub.register(
-            a,
-            b,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
-        p.note_recv("pong", 8);
-        let snap = hub.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].id, 0);
-        assert_eq!(snap[0].subver, "/rbitcoin:0.1.0(testnode0)/");
-        assert!(!snap[0].inbound);
-        assert!(snap[0].bytesrecv_per_msg.get("pong").copied().unwrap() >= 29);
-        assert!(hub.disconnect_id(0));
-        assert!(p.stop.load(Ordering::SeqCst));
-        // disconnectnode must clear getpeerinfo immediately (mempool_reorg
-        // disconnect_nodes waits ≤5s on the far side seeing us gone).
-        assert!(
-            hub.snapshot().is_empty(),
-            "disconnect_id must unregister before the session task exits"
-        );
-    }
-
-    #[test]
     fn snapshot_hides_fin_completed_keeps_connecting() {
         use std::net::TcpListener;
 
