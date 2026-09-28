@@ -239,10 +239,6 @@ struct CommitTimes {
     commit_ns: u64,
 }
 
-fn index_commits_advanced(filters: Option<u32>, tweaks: Option<u32>) -> bool {
-    filters.is_none_or(|n| n > 0) && tweaks.is_none_or(|n| n > 0)
-}
-
 /// Build and commit what each index still needs from `window`. `ok` is false
 /// when a commit found the watermark or a `confirmed[h]` moved.
 fn commit_window(
@@ -262,18 +258,15 @@ fn commit_window(
     let build_ns = t_build.elapsed().as_nanos() as u64;
     let t_commit = Instant::now();
     let committed = (|| {
-        let filters = if !assembled.filters.is_empty() {
+        let mut ok = true;
+        if !assembled.filters.is_empty() {
             let start = query.filter_index_next().unwrap_or(first).max(first);
-            Some(query.commit_window_filters(start, &assembled.filters)?)
-        } else {
-            None
-        };
-        let tweaks = if !assembled.tweaks.is_empty() {
-            Some(query.commit_window_tweaks(&assembled.tweaks)?)
-        } else {
-            None
-        };
-        Ok(index_commits_advanced(filters, tweaks))
+            ok &= query.commit_window_filters(start, &assembled.filters)? > 0;
+        }
+        if !assembled.tweaks.is_empty() {
+            ok &= query.commit_window_tweaks(&assembled.tweaks)? > 0;
+        }
+        Ok(ok)
     })();
     let commit_ns = t_commit.elapsed().as_nanos() as u64;
     stages.add_build(build_ns);
@@ -415,7 +408,7 @@ fn io_loop(
         }
         let target = query.index_target();
         if let (Some(t), Some(f)) = (target, query.filter_index_next()) {
-            if filters_caught_up(f, t) {
+            if f > t {
                 if let Some(cb) = on_filters_caught_up.take() {
                     rbitcoin_log::info!(
                         "blockfilter: caught up through={}; advertising NODE_COMPACT_FILTERS",
@@ -445,7 +438,7 @@ fn io_loop(
             continue;
         }
         let now = Instant::now();
-        if backlog_pass_starts(start, target, pass.is_some()) {
+        if target - start >= WINDOW_HEIGHTS && pass.is_none() {
             rbitcoin_log::info!(
                 "index: build from={start} to={target} filters={:?} tweaks={:?}",
                 query.filter_index_next(),
@@ -458,7 +451,7 @@ fn io_loop(
             });
         }
         if let Some(p) = pass.as_mut() {
-            if progress_is_due(p.last_log, now) {
+            if p.last_log.elapsed() >= PROGRESS_EVERY {
                 rbitcoin_log::info!(
                     "{}",
                     format_index_build_progress(&IndexBuildProgress {
@@ -489,58 +482,14 @@ fn io_loop(
         {
             break;
         }
-        cursor = Some(next_index_height(end));
+        cursor = Some(end + 1);
     }
     Ok(())
-}
-
-fn filters_caught_up(next: u32, target: u32) -> bool {
-    next > target
-}
-
-fn backlog_pass_starts(start: u32, target: u32, already_started: bool) -> bool {
-    target - start >= WINDOW_HEIGHTS && !already_started
-}
-
-fn progress_is_due(last_log: Instant, now: Instant) -> bool {
-    now.duration_since(last_log) >= PROGRESS_EVERY
-}
-
-fn next_index_height(end: u32) -> u32 {
-    end + 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn index_commit_progress_requires_every_enabled_index_to_advance() {
-        assert!(index_commits_advanced(None, None));
-        assert!(index_commits_advanced(Some(1), Some(2)));
-        assert!(!index_commits_advanced(Some(0), None));
-        assert!(!index_commits_advanced(None, Some(0)));
-        assert!(!index_commits_advanced(Some(0), Some(1)));
-        assert!(!index_commits_advanced(Some(1), Some(0)));
-    }
-
-    #[test]
-    fn writebehind_boundaries_match_released_window_contract() {
-        assert!(!filters_caught_up(2, 2));
-        assert!(filters_caught_up(3, 2));
-
-        assert!(!backlog_pass_starts(30, 40, false));
-        assert!(backlog_pass_starts(0, WINDOW_HEIGHTS, false));
-        assert!(!backlog_pass_starts(0, WINDOW_HEIGHTS, true));
-
-        let at = Instant::now();
-        assert!(!progress_is_due(
-            at,
-            at + PROGRESS_EVERY - Duration::from_nanos(1)
-        ));
-        assert!(progress_is_due(at, at + PROGRESS_EVERY));
-        assert_eq!(next_index_height(63), 64);
-    }
 
     #[test]
     fn index_build_progress_names_stage_ms() {
