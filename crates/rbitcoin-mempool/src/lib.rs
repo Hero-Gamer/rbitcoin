@@ -55,7 +55,7 @@ pub use fee_est::{
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,
-    TxEntry, TxGraph,
+    SelectBudget, Selected, TxEntry, TxGraph,
 };
 pub use orphanage::{OrphanSnapshot, Orphanage};
 pub use packed::VinAux;

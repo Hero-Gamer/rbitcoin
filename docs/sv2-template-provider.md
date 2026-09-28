@@ -145,14 +145,21 @@ No new flag; GBT output for an unchanged mempool is unchanged.
   larger `reserved_sigops` skips a chunk that fit before and still takes a
   later one; a smaller `max_weight_wu` likewise. `fee_sat` is the base fee
   (not the delta-modified fee).
-- **Red:** `cargo test -p rbitcoin-mempool select_budget_` — reuse the
-  `CreateBigSigOpsCluster` / skip-and-continue fixtures from the sigop
-  budget work; reserved-sigops edge and weight edge.
+- **Red:** `cargo test -p rbitcoin-mempool select_` — the graph selector
+  is a pure unit (no session passes a non-default budget before Plan B).
+  Extend the existing `select_budgets_sigops_skip_and_continue` (per-tx
+  base fee and sigop cost; reserve 401 drops the light tail, 402 skips
+  the heavy chunk and still takes the light one) and pin base fee
+  under a delta in the existing delta unit; fold
+  `selection_uses_configured_sigop_reserve` into it. The weight edge is
+  the existing `select_skips_overweight_chunk_and_continues` on the
+  budget. No new `select_budget_` twin.
 - **Green:** thread the budget through the existing selection loop;
-  `select_block_txids_delta` becomes a thin wrapper (or goes away if its
-  callers move).
-- **Refactor:** one selection loop; drop the graph-global reserve's
-  template use if every template caller now passes it.
+  `select_block_txids` / `select_block_txids_delta` go away.
+  `ActiveMempool::select_block_txs_delta` passes the admission reserve
+  until A2 moves its caller.
+- **Refactor:** one selection loop; the graph-global reserve is admission
+  only, templates take the caller's.
 - **Verify:** `cargo test -p rbitcoin-mempool select_`
 
 ### A2 — Hub and GBT on the budgeted call

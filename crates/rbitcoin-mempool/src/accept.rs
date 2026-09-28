@@ -1,7 +1,7 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{sigops_adjusted_weight, TxEntry, TxGraph, MAX_BLOCK_SIGOPS_COST};
+use crate::graph::{sigops_adjusted_weight, SelectBudget, TxEntry, TxGraph, MAX_BLOCK_SIGOPS_COST};
 use crate::orphanage::Orphanage;
 use crate::packed::VinAux;
 use crate::store::Mempool;
@@ -1837,10 +1837,15 @@ impl ActiveMempool {
         min_sat_kvb: u64,
         delta: impl Fn(Txid) -> i64,
     ) -> Vec<Transaction> {
+        let budget = SelectBudget {
+            max_weight_wu,
+            reserved_sigops: self.graph.block_reserved_sigops(),
+            min_sat_kvb,
+        };
         self.graph
-            .select_block_txids_delta(max_weight_wu, min_sat_kvb, delta)
+            .select_block_template(budget, delta)
             .into_iter()
-            .filter_map(|id| self.get_tx(&id).cloned())
+            .filter_map(|s| self.get_tx(&s.txid).cloned())
             .collect()
     }
 }
