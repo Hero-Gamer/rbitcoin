@@ -6,6 +6,8 @@ Fixed
   so on signet with 30 peers they spent 77–85% of upload re-sending blocks
   already stored, and tip+1 waited behind those copies for up to 55s. A
   dropped owner now keeps the request and is not asked for that hash again.
+  Peers who still owe the block count toward its race cap, so dropping one
+  does not free a slot for a peer that was never asked.
 - **A tip-hole owner with other getdata queued is dropped only when it
   is actually slow.** Every peer has several blocks in flight during IBD,
   so the owner was dropped and replaced on every 50ms assign pass. It is

@@ -1216,7 +1216,8 @@ fn cover_tip_batch_holes(
 /// among owners, the owner's FIFO is still on densify, or a solo owner has held
 /// it too long and another peer exists. The whole race set is never cleared on
 /// request age. A dropped owner is retired: it keeps the request it was sent,
-/// still counts toward its queue, and is not asked for this hash again.
+/// still counts toward its queue and toward the ask cap, and is not asked
+/// for this hash again.
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1248,7 +1249,7 @@ pub(crate) fn cover_tip_holes(
                 avoid.insert(pid);
             }
         }
-        let already = st.inflight.get(&h).map(|e| e.len()).unwrap_or(0);
+        let already = st.inflight.get(&h).map(|e| e.holders()).unwrap_or(0);
         let want = max_peers;
         if already >= want {
             continue;
@@ -2200,6 +2201,76 @@ pub(in crate::ibd) mod tests {
         );
         assert!(st.inflight[&hole].holds(0));
         assert!(!st.inflight[&hole].peers.contains(&0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Peers who still owe a hash count toward its race cap. Dropping one
+    /// must not free a slot for a peer that has never been asked.
+    #[test]
+    fn cover_tip_holes_ask_cap_includes_peers_who_still_owe_the_block() {
+        use super::super::peer_io::ibd_mono_ms;
+        use super::super::state::InflightReq;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let mut wire = Vec::new();
+        for s in st.slots.iter_mut() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            s.cmd_tx = tx;
+            wire.push(rx);
+        }
+        let hole = h(0x5c);
+        let ht = hub.tip_height().unwrap_or(0).saturating_add(1);
+        st.record_height(hole, ht);
+        st.height_to_hash.insert(ht, hole);
+        st.body.mark_missing(hole);
+        let mut req = InflightReq::new(0);
+        req.add_peer(1);
+        req.asked_at
+            .insert(0, Instant::now() - Duration::from_secs(6));
+        st.inflight.insert(hole, req);
+        st.slots[0].in_flight.insert(hole);
+        st.slots[0].in_flight.insert(h(0x99));
+        st.slots[1].in_flight.insert(hole);
+        let now = ibd_mono_ms().max(1);
+        for s in st.slots.iter_mut() {
+            s.rate.note_rx(now);
+            seed_ewma(s, 1_000_000);
+        }
+        let cfg = IbdConfig::for_test();
+        let alive = vec![0, 1, 2, 3];
+        for _ in 0..5 {
+            let _ = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[hole], 2);
+        }
+        let asks: Vec<usize> = wire
+            .iter_mut()
+            .map(|rx| {
+                let mut n = 0;
+                while let Ok(cmd) = rx.try_recv() {
+                    if let PeerCmd::GetData { hashes } = cmd {
+                        n += hashes.iter().filter(|&&x| x == hole).count();
+                    }
+                }
+                n
+            })
+            .collect();
+        assert_eq!(
+            asks,
+            vec![0, 0, 0, 0],
+            "two peers already owe the block; cap is 2"
+        );
+        let r = &st.inflight[&hole];
+        assert!(r.holds(0) && r.holds(1));
+        assert!(!r.holds(2) && !r.holds(3));
         let _ = std::fs::remove_dir_all(dir);
     }
 

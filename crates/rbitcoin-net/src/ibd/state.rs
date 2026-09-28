@@ -43,6 +43,7 @@ pub(crate) struct WorkStructureSizes {
 /// Getdata cannot be cancelled. A peer dropped from the race moves to
 /// `retired`: it no longer counts as a racer, but it still holds the request,
 /// so the hash stays requested and that peer is not asked for it again.
+/// Retired peers still count toward the ask cap.
 #[derive(Debug, Clone)]
 pub(crate) struct InflightReq {
     /// Racing owners.
@@ -81,6 +82,11 @@ impl InflightReq {
     /// Racing owners only.
     pub(crate) fn len(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Racing and retired: every peer already sent this getdata.
+    pub(crate) fn holders(&self) -> usize {
+        self.peers.len() + self.retired.len()
     }
 
     /// Returns true if `peer` was newly added.

@@ -307,8 +307,10 @@ the hole can race, once it has held the hash ≥5s and a free peer's expected
 drain time is at most half the owner's; a hole owner with no qualifying rx is dropped when a sibling
 is pulling; a solo owner that has held the hash ≥30s is dropped when another
 peer exists. Getdata cannot be cancelled, so a dropped owner keeps the request,
-still counts toward its in-flight queue, and is never asked for that hash
-again. When
+still counts toward its in-flight queue and toward that hash's race cap,
+and is never asked for that hash again. A hash is sent to at most its cap
+of peers (4 on tip+1, 1 on a later hole in the gap), including peers dropped
+from the race who still owe it. When
 `hole=` is 0, at most one extra racer is added on the first later gap in the
 32-window, and only if that owner is missing, aged ≥30s, or ≤ pack-median/4.
 Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
