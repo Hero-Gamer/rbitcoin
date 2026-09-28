@@ -1181,6 +1181,13 @@ fn acct_bytes(cmd: &str, payload: u64) -> u64 {
     }
 }
 
+/// `(inbound, outbound)` among `peers`: `getnetworkinfo.connections_in` /
+/// `connections_out` over a [`PeerHub::snapshot`].
+pub fn connection_counts(peers: &[PeerInfo]) -> (u64, u64) {
+    let inbound = peers.iter().filter(|p| p.inbound).count();
+    (inbound as u64, (peers.len() - inbound) as u64)
+}
+
 /// RPC-facing snapshot.
 #[derive(Clone, Debug)]
 pub struct PeerInfo {

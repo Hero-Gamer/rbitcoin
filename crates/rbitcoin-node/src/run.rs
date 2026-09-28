@@ -218,10 +218,10 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// hold the process).
 #[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
-    let status = NodeStatus::new(config.shindex);
+    let status = NodeStatus::new(config.network, config.shindex);
     let _health = match config.listen.health {
         Some(addr) => Some(
-            run_health(addr, Arc::clone(&status))
+            run_health(addr, Arc::clone(&status), config.metrics)
                 .await
                 .map_err(|e| NodeError::Config(format!("health listen {addr}: {e}")))?,
         ),
@@ -293,7 +293,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
-    status.attach_chain(&node.hub);
+    status.attach_p2p(&node.hub, &node.peers);
     for extra in &config.listen.p2p_extra {
         let bound = node
             .add_listen(*extra)
@@ -386,6 +386,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .map_err(|e| NodeError::Config(format!("mempool open join: {e}")))?
     .map_err(NodeError::Config)?;
     node.peers.attach_mempool(&mempool);
+    status.attach_mempool(&mempool);
     if config.listen.proxy.is_some() || config.listen.onion.is_some() {
         mempool.set_isolated_broadcast(true);
     }

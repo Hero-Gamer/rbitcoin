@@ -59,8 +59,9 @@ pub use peer::{
 };
 pub use peer_dos::DEFAULT_MAX_INBOUND;
 pub use peers::{
-    parse_peer_addr, parse_peer_addr_with_port, parse_peer_net, pick_stale_follow_evict,
-    DialRequest, DialTarget, LivePeer, PeerConnType, PeerHub, PeerInfo, PeerOut, PingAction,
+    connection_counts, parse_peer_addr, parse_peer_addr_with_port, parse_peer_net,
+    pick_stale_follow_evict, DialRequest, DialTarget, LivePeer, PeerConnType, PeerHub, PeerInfo,
+    PeerOut, PingAction,
 };
 pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use rbitcoin_mempool::{AcceptError, Selected};

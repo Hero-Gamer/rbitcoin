@@ -13,6 +13,7 @@ use rbitcoin_primitives::{Height, Network};
 use rbitcoin_query::Query;
 use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -180,6 +181,87 @@ async fn readyz_after_startup(health_addr: SocketAddr) -> (u16, String) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// `GET /metrics` in the Prometheus text format: one value per series.
+async fn scrape_metrics(health_addr: SocketAddr) -> HashMap<String, f64> {
+    let mut stream = TcpStream::connect(health_addr)
+        .await
+        .expect("metrics connect");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut text = String::new();
+    stream.read_to_string(&mut text).await.unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("http headers");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+        "{head}"
+    );
+    body.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (series, v) = l.rsplit_once(' ').unwrap_or_else(|| panic!("sample: {l}"));
+            let v = v.parse().unwrap_or_else(|_| panic!("sample value: {l}"));
+            (series.to_string(), v)
+        })
+        .collect()
+}
+
+/// Every `/metrics` gauge that names an RPC field equals that field.
+async fn pin_metrics_equal_rpc(
+    health_addr: SocketAddr,
+    rpc_addr: SocketAddr,
+    ready: bool,
+) -> HashMap<String, f64> {
+    let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await["result"].clone();
+    let net = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await["result"].clone();
+    let mempool = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await["result"].clone();
+    let m = scrape_metrics(health_addr).await;
+    let num = |v: &Value| v.as_f64().unwrap_or_else(|| panic!("number: {v}"));
+    let flag = |b: bool| if b { 1.0 } else { 0.0 };
+    let build = format!(
+        "rbitcoin_build_info{{version=\"{}\",network=\"regtest\"}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (series, want) in [
+        (build.as_str(), 1.0),
+        ("rbitcoin_phase{phase=\"following\"}", 1.0),
+        ("rbitcoin_phase{phase=\"opening\"}", 0.0),
+        ("rbitcoin_ready", flag(ready)),
+        ("rbitcoin_blocks", num(&chain["blocks"])),
+        ("rbitcoin_headers", num(&chain["headers"])),
+        ("rbitcoin_tip_time_seconds", num(&chain["time"])),
+        (
+            "rbitcoin_initial_block_download",
+            flag(chain["initialblockdownload"] == true),
+        ),
+        (
+            "rbitcoin_connections{direction=\"in\"}",
+            num(&net["connections_in"]),
+        ),
+        (
+            "rbitcoin_connections{direction=\"out\"}",
+            num(&net["connections_out"]),
+        ),
+        ("rbitcoin_mempool_transactions", num(&mempool["size"])),
+        ("rbitcoin_mempool_bytes", num(&mempool["bytes"])),
+    ] {
+        assert_eq!(m.get(series), Some(&want), "{series}: {m:?}");
+    }
+    assert!(m["rbitcoin_scripthash_lag_blocks"] <= 6.0, "{m:?}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let started = m["process_start_time_seconds"];
+    assert!(started <= now && started > now - 600.0, "{m:?}");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(m["process_resident_memory_bytes"] > 0.0, "{m:?}");
+    m
 }
 
 async fn pin_address_prefix_404(esplora_addr: SocketAddr) {
@@ -1093,6 +1175,8 @@ async fn readyz_names_a_listener_that_did_not_bind() {
         readyz_after_startup(health_addr).await,
         (503, "not ready: rpc not listening".into())
     );
+    let (st, body) = http_get(health_addr, "/metrics").await;
+    assert_eq!(st, 404, "/metrics without --metrics: {body}");
     let stopped = tokio::time::timeout(Duration::from_secs(20), node).await;
     assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
 }
@@ -1157,6 +1241,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
     cfg.listen.health = Some(health_addr);
+    cfg.metrics = true;
     // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
     let rpc_sock = td.path().join("run").join("rpc.sock");
     cfg.apply_kv("rpc_socket", rpc_sock.to_str().unwrap())
@@ -1759,6 +1844,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_get(esplora_addr, "/fee-estimates").await;
     assert_eq!(st, 503, "GET /fee-estimates: {body}");
 
+    let metrics_in_ibd = pin_metrics_equal_rpc(health_addr, rpc_addr, false).await;
+    assert!(
+        metrics_in_ibd["rbitcoin_mempool_transactions"] > 0.0,
+        "{metrics_in_ibd:?}"
+    );
     let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();
     pin_waitforblockheight_timeout_zero_behind(rpc_addr, 106, &tip_hash).await;
@@ -1895,6 +1985,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{chain}"
     );
     assert_eq!(http_get(health_addr, "/readyz").await, (200, "ok".into()));
+    pin_metrics_equal_rpc(health_addr, rpc_addr, true).await;
 
     let relay_parent = acs_spend(
         relay_cb,

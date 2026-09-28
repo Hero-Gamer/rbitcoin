@@ -312,6 +312,8 @@ pub struct NodeConfig {
     pub max_sh_creates: u32,
     /// Opt-in Esplora `GET /block-template` (GBT template JSON). Default off.
     pub esplora_block_template: bool,
+    /// Prometheus `GET /metrics` on the health listener. Default off.
+    pub metrics: bool,
     /// ADD_ONION for `--esplora-listen` when `--tor-control` is set. Default on.
     pub esplora_onion: bool,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
@@ -389,6 +391,7 @@ impl Default for NodeConfig {
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
             esplora_block_template: false,
+            metrics: false,
             esplora_onion: true,
             milestone_height: 0,
             milestone_explicit: false,
@@ -606,6 +609,9 @@ impl NodeConfig {
                  scriptSig and witness data pruning drops"
                     .into(),
             ));
+        }
+        if self.metrics && self.listen.health.is_none() {
+            return Err(NodeError::Config("--metrics needs --health-listen".into()));
         }
         self.validate_only_net()?;
         self.validate_hidden_inbound()?;
@@ -1299,6 +1305,10 @@ impl NodeConfig {
                     val.parse()
                         .map_err(|e| NodeError::Config(format!("conf max_run_secs: {e}")))?,
                 );
+            }
+            "metrics" => {
+                self.metrics = parse_conf_bool(val)
+                    .map_err(|e| NodeError::Config(format!("conf metrics: {e}")))?;
             }
             "inhibit_suspend" => {
                 self.inhibit_suspend = parse_conf_bool(val)

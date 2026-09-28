@@ -302,7 +302,7 @@ fn operator_usage() -> String {
     [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
-    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] \\\n\
+    [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
@@ -354,7 +354,8 @@ Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak 
   Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz from the first second of startup\n\
-  (default 127.0.0.1:9332). Unauthenticated; keep it on loopback or a probe-only network.\n\
+  and GET /readyz (default 127.0.0.1:9332). Unauthenticated; keep it on loopback or a\n\
+  probe-only network. --metrics adds Prometheus GET /metrics there (needs --health-listen).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser.\n\
 Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
@@ -410,6 +411,7 @@ fn is_bool_key(key: &str) -> bool {
             | "proxy_randomize"
             | "i2p_accept_incoming"
             | "inhibit_suspend"
+            | "metrics"
             | "trusted"
             | "always_relay"
             | "relay"
@@ -817,6 +819,7 @@ mod tests {
             "--electrum-listen",
             "--esplora-listen",
             "--health-listen",
+            "--metrics",
         ]);
         assert!(cfg.shindex && cfg.sptweaks);
         assert_eq!(cfg.sptweaks_dust, 546);
@@ -829,6 +832,7 @@ mod tests {
         assert_eq!(cfg.rpc.listen, Some("127.0.0.1:18443".parse().unwrap()));
         assert_eq!(cfg.listen.electrum.unwrap().port(), 50001);
         assert_eq!(cfg.listen.health, Some("127.0.0.1:9332".parse().unwrap()));
+        assert!(cfg.metrics);
         match cfg.listen.esplora.unwrap() {
             rbitcoin_esplora::EsploraListen::Tcp(a) => assert_eq!(a.port(), 3000),
             #[cfg(unix)]

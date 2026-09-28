@@ -1,20 +1,24 @@
 //! Health listener (`--health-listen`): unauthenticated `GET /healthz` and
-//! `GET /readyz` for process probes.
+//! `GET /readyz` for process probes, and `GET /metrics` with `--metrics`.
 //!
 //! It binds at the top of [`crate::run_p2p`], before the store opens, so it
 //! answers through a schema migration, catch-up, and index materialize. The
 //! RPC, Electrum, and Esplora listeners bind only after those.
 
+mod metrics;
+
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use rbitcoin_log::{info, warn};
-use rbitcoin_net::{BlockingRegion, ChainHub};
+use rbitcoin_net::{BlockingRegion, ChainHub, MempoolHub, PeerHub};
+use rbitcoin_primitives::Network;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
@@ -46,7 +50,6 @@ pub(crate) enum Phase {
 }
 
 impl Phase {
-    #[cfg(test)]
     const ALL: [Self; 6] = [
         Self::Opening,
         Self::Starting,
@@ -83,18 +86,26 @@ impl Phase {
 /// transition; every read is an atomic load or a `OnceLock` get.
 pub(crate) struct NodeStatus {
     phase: AtomicU8,
+    network: Network,
     sh_index: bool,
+    started: SystemTime,
     chain: OnceLock<Arc<ChainHub>>,
+    peers: OnceLock<Arc<PeerHub>>,
+    mempool: OnceLock<Arc<MempoolHub>>,
     /// Configured listeners that failed to bind (RPC, Electrum, Esplora only warn).
     unbound: OnceLock<Vec<&'static str>>,
 }
 
 impl NodeStatus {
-    pub(crate) fn new(sh_index: bool) -> Arc<Self> {
+    pub(crate) fn new(network: Network, sh_index: bool) -> Arc<Self> {
         Arc::new(Self {
             phase: AtomicU8::new(Phase::Opening as u8),
+            network,
             sh_index,
+            started: SystemTime::now(),
             chain: OnceLock::new(),
+            peers: OnceLock::new(),
+            mempool: OnceLock::new(),
             unbound: OnceLock::new(),
         })
     }
@@ -103,8 +114,13 @@ impl NodeStatus {
         self.phase.store(phase as u8, Ordering::Release);
     }
 
-    pub(crate) fn attach_chain(&self, chain: &Arc<ChainHub>) {
+    pub(crate) fn attach_p2p(&self, chain: &Arc<ChainHub>, peers: &Arc<PeerHub>) {
         let _ = self.chain.set(Arc::clone(chain));
+        let _ = self.peers.set(Arc::clone(peers));
+    }
+
+    pub(crate) fn attach_mempool(&self, mempool: &Arc<MempoolHub>) {
+        let _ = self.mempool.set(Arc::clone(mempool));
     }
 
     /// Enter [`Phase::Following`] with the configured listeners that did not bind.
@@ -188,17 +204,19 @@ impl Drop for HealthHandle {
     }
 }
 
-/// Bind `addr` and serve the health routes until the handle drops.
+/// Bind `addr` and serve the health routes (and `/metrics` when `metrics`)
+/// until the handle drops.
 pub(crate) async fn run_health(
     addr: SocketAddr,
     status: Arc<NodeStatus>,
+    metrics: bool,
 ) -> std::io::Result<HealthHandle> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     if !local_addr.ip().is_loopback() {
         warn!("health: {local_addr} is not loopback; /healthz and /readyz are unauthenticated");
     }
-    let app = router(status);
+    let app = router(status, metrics);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             warn!("health: serve ended: {e}");
@@ -208,10 +226,16 @@ pub(crate) async fn run_health(
     Ok(HealthHandle { task })
 }
 
-fn router(status: Arc<NodeStatus>) -> Router {
-    Router::new()
+fn router(status: Arc<NodeStatus>, metrics: bool) -> Router {
+    let routes = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+        .route("/readyz", get(readyz));
+    let routes = if metrics {
+        routes.route("/metrics", get(scrape))
+    } else {
+        routes
+    };
+    routes
         // Outer → inner: concurrency → body (GET only, so none) → timeout.
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -224,6 +248,18 @@ fn router(status: Arc<NodeStatus>) -> Router {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+async fn scrape(State(status): State<Arc<NodeStatus>>) -> Response {
+    let body = tokio::task::spawn_blocking(move || {
+        let _g = BlockingRegion::enter();
+        metrics::render(&status)
+    })
+    .await;
+    match body {
+        Ok(body) => ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("metrics: {e}\n")).into_response(),
+    }
 }
 
 async fn readyz(State(status): State<Arc<NodeStatus>>) -> (StatusCode, String) {
@@ -331,7 +367,9 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap()
         };
-        let _h = run_health(addr, NodeStatus::new(false)).await.unwrap();
+        let _h = run_health(addr, NodeStatus::new(Network::Regtest, false), false)
+            .await
+            .unwrap();
         assert_eq!(get(addr, "/healthz").await, "HTTP/1.1 200 OK|ok\n");
         assert_eq!(
             get(addr, "/readyz").await,
