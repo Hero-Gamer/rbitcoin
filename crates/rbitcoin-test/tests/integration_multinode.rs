@@ -2360,6 +2360,11 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         "precious of an invalidated hash is a no-op"
     );
     hub.reconsider_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "no-op precious must not leave a preference reconsider would honor"
+    );
     hub.precious_block(ext.block_hash()).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
 
@@ -2379,10 +2384,55 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         sibling.block_hash(),
         "precious of less work must not activate"
     );
-    let err = hub
-        .precious_block(BlockHash::from_byte_array([0xab; 32]))
-        .unwrap_err();
+    let miss = BlockHash::from_byte_array([0xab; 32]);
+    let err = hub.precious_block(miss).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
+    let err = hub.reconsider_block(miss).unwrap_err();
+    assert!(err.to_string().contains("Block not found"), "{err}");
+}
+
+/// A lone side block is not a tip extend, a weaker branch is ignored, and an
+/// unknown parent errors on submit but is held when a peer sends it.
+fn pin_side_weaker_and_unknown_parent(hub: &rbitcoin_net::ChainHub) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let tip_h = hub.tip_height().unwrap();
+    let base = hub
+        .query
+        .header_at_height(Height(tip_h - 3))
+        .unwrap()
+        .unwrap()
+        .1;
+    let side = mine_regtest_block(
+        BlockHash::from_byte_array(base.hash),
+        base.timestamp + 950,
+        tip_h - 2,
+        vec![],
+    );
+    let err = hub.accept_block(side.clone()).unwrap_err();
+    assert!(matches!(err, NetError::SideBlock), "{err}");
+    assert!(matches!(
+        hub.accept_branch(&[side]).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+
+    let orphan = mine_regtest_block(
+        BlockHash::from_byte_array([0xab; 32]),
+        base.timestamp + 960,
+        tip_h + 5,
+        vec![],
+    );
+    assert!(matches!(
+        hub.accept_block(orphan.clone()).unwrap_err(),
+        NetError::UnknownParent
+    ));
+    assert!(matches!(
+        hub.accept_received_block(orphan.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    assert!(hub.held_body(&orphan.block_hash()).is_some());
+    assert!(!hub.has_block(&BlockHash::from_byte_array([0xde; 32])));
+    assert_eq!(hub.tip_height(), Some(tip_h));
 }
 
 /// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
@@ -2516,6 +2566,7 @@ fn reorg_same_height_then_multi_block_branch() {
         other => panic!("expected Accepted {ext_h}, got {other:?}"),
     }
     pin_precious_held_chaintips(&hub, ext, ext_h);
+    pin_side_weaker_and_unknown_parent(&hub);
 }
 
 /// After catch-up (`initialblockdownload` false; `-maxtipage` so the 2011
