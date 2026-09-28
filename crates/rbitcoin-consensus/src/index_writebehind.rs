@@ -640,6 +640,150 @@ mod tests {
             got.tweaks[2].2.iter().all(|t| t.is_none()),
             "no P2TR output"
         );
+
+        let resync = AtomicBool::new(true);
+        let stages = IndexStageMs::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ReadyWindow {
+            window: read_window(&q, 0, 2).unwrap(),
+            start: 0,
+            end: 2,
+            read_ns: 0,
+            log_apply: false,
+        })
+        .unwrap();
+        drop(tx);
+        cpu_worker(&q, rx, &resync, &stages).unwrap();
+        assert_eq!(
+            q.filter_index_next(),
+            Some(0),
+            "resync drops queued filters"
+        );
+        assert_eq!(q.tweak_index_next(), Some(0), "resync drops queued tweaks");
+
+        let stale = Arc::new(read_window(&q, 0, 2).unwrap());
+        q.disconnect_tip().unwrap();
+        assert!(
+            !commit_window(&q, &stale, &stages).unwrap().ok,
+            "a window whose confirmed tip moved must request resync"
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn released_builder_crosses_a_full_window_and_success_does_not_resync() {
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_store::{InputRecord, OutputRecord};
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-full-window");
+        q.set_block_filter_index(true).unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+
+        let mut prev_fk = Fk::NULL;
+        let mut prev_hash = None;
+        for height in 0..=WINDOW_HEIGHTS {
+            let header = header_rec(height, prev_fk, prev_hash);
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&height.to_le_bytes());
+            txid[31] = 0xcb;
+            prev_fk = q
+                .connect_block(
+                    Height(height),
+                    &header,
+                    &[tx_apply(
+                        txid,
+                        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                        vec![OutputRecord::unspent(1, vec![0x51])],
+                    )],
+                )
+                .unwrap();
+            prev_hash = Some(header.hash);
+        }
+        q.release_index_writebehind(Height(WINDOW_HEIGHTS));
+
+        build_indexes_released(&q).unwrap();
+        assert_eq!(q.filter_index_next(), Some(WINDOW_HEIGHTS + 1));
+        assert_eq!(q.tweak_index_next(), Some(WINDOW_HEIGHTS + 1));
+
+        let resync = AtomicBool::new(false);
+        let stages = IndexStageMs::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ReadyWindow {
+            window: read_window(&q, WINDOW_HEIGHTS, WINDOW_HEIGHTS).unwrap(),
+            start: WINDOW_HEIGHTS,
+            end: WINDOW_HEIGHTS,
+            read_ns: 0,
+            log_apply: false,
+        })
+        .unwrap();
+        drop(tx);
+        cpu_worker(&q, rx, &resync, &stages).unwrap();
+        assert!(
+            !resync.load(Ordering::Acquire),
+            "a successful commit stays synced"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn filter_catchup_callback_fires_only_after_the_released_tip() {
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_store::{InputRecord, OutputRecord};
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-filter-catchup");
+        q.set_block_filter_index(true).unwrap();
+        let mut prev_fk = Fk::NULL;
+        let mut prev_hash = None;
+        for height in 0..=1 {
+            let header = header_rec(height, prev_fk, prev_hash);
+            let mut txid = [0u8; 32];
+            txid[0] = height as u8 + 1;
+            txid[31] = 0xcb;
+            prev_fk = q
+                .connect_block(
+                    Height(height),
+                    &header,
+                    &[tx_apply(
+                        txid,
+                        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                        vec![OutputRecord::unspent(1, vec![0x51])],
+                    )],
+                )
+                .unwrap();
+            prev_hash = Some(header.hash);
+        }
+
+        let first = Arc::new(read_window(&q, 0, 0).unwrap());
+        let filter = q.basic_filter_from_window(&first, 0).unwrap();
+        q.commit_window_filters(0, &[(filter, first.blocks[0].header_fk)])
+            .unwrap();
+        assert_eq!(q.filter_index_next(), Some(1));
+
+        let called = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let resync = AtomicBool::new(false);
+        let stages = IndexStageMs::default();
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        io_loop(&q, &stop, &resync, &stages, &tx, || {
+            called.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(called.load(Ordering::Relaxed), 0, "next equals the tip");
+
+        let last = Arc::new(read_window(&q, 1, 1).unwrap());
+        let filter = q.basic_filter_from_window(&last, 0).unwrap();
+        q.commit_window_filters(1, &[(filter, last.blocks[0].header_fk)])
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        io_loop(&q, &stop, &resync, &stages, &tx, || {
+            called.fetch_add(1, Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(called.load(Ordering::Relaxed), 1, "next is past the tip");
+
         let _ = std::fs::remove_dir_all(dir.path());
     }
 

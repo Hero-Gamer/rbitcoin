@@ -691,3 +691,29 @@ pub(super) fn fill_planned_create_layout_after_commit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod annotation_match_tests {
+    use super::{annotation_matches, tip_window_start};
+    use rbitcoin_primitives::Fk;
+
+    #[test]
+    fn replay_tip_window_starts_at_genesis_or_last_six_heights() {
+        assert_eq!(tip_window_start(0), 0);
+        assert_eq!(tip_window_start(5), 0);
+        assert_eq!(tip_window_start(20), 15);
+    }
+
+    #[test]
+    fn multi_spender_match_requires_transaction_and_input() {
+        let (dir, query) = rbitcoin_query::testutil::tiny_query_labeled("annotation-match");
+        let node = query.store().spenders.append(Fk(20), 4, Fk::NULL).unwrap();
+
+        assert!(annotation_matches(&query, true, node, 0, Fk(20), 4).unwrap());
+        assert!(!annotation_matches(&query, true, node, 0, Fk(20), 5).unwrap());
+        assert!(!annotation_matches(&query, true, node, 0, Fk(21), 4).unwrap());
+        assert!(!annotation_matches(&query, true, node, 0, Fk(21), 5).unwrap());
+
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+}
