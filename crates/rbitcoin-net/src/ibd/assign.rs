@@ -781,8 +781,9 @@ pub(crate) fn first_pre_hole(
     None
 }
 
-/// Extra racer on a pre-hole only when there is no owner, the request is aged,
-/// or an owner's EWMA is ≤ pack median / 4.
+/// Extra racer on a pre-hole only when there is no owner, every current owner
+/// has held the hash for [`TIP_HOLE_RX_STALE`], or an owner's EWMA is ≤ pack
+/// median / 4.
 pub(crate) fn pre_hole_should_extra_racer(
     st: &IbdWorkState,
     hash: BlockHash,
@@ -794,7 +795,12 @@ pub(crate) fn pre_hole_should_extra_racer(
     if req.peers.is_empty() {
         return true;
     }
-    if Instant::now().duration_since(req.started_at) >= TIP_HOLE_RX_STALE {
+    let now = Instant::now();
+    let aged = req.peers.iter().all(|&pid| {
+        let since = req.owner_asked_at(pid).unwrap_or(req.started_at);
+        now.duration_since(since) >= TIP_HOLE_RX_STALE
+    });
+    if aged {
         return true;
     }
     let (Some(median), _) = pack_ewma_bps(&st.slots, alive) else {
@@ -2446,6 +2452,48 @@ pub(in crate::ibd) mod tests {
         seed_ewma(&mut st.slots[3], 1_700_000);
         let mut req = InflightReq::new(0);
         req.started_at = Instant::now() - Duration::from_secs(31);
+        req.asked_at.insert(0, req.started_at);
+        st.inflight.insert(gap, req);
+        st.slots[0].in_flight.insert(gap);
+        st.slots[0].rate.note_rx(ibd_mono_ms().max(1));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let r = &st.inflight[&gap];
+        assert!(
+            r.holds(0) && !r.peers.contains(&0),
+            "aged owner is retired and still owes the block"
+        );
+        assert_eq!(
+            r.len(),
+            1,
+            "one fresh racer replaces the aged owner; n={}",
+            r.len()
+        );
+        assert_eq!(
+            r.holders(),
+            2,
+            "original ask plus one extra stays within the pre-hole cap"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Request age for an extra racer is how long the current owner has held
+    /// the hash. An old started_at with a fresh ask must stay solo.
+    #[test]
+    fn pre_hole_fresh_owner_is_not_aged_by_the_first_ask() {
+        let _env = lock_default_assign_stop();
+        use super::super::peer_io::ibd_mono_ms;
+        use super::super::state::InflightReq;
+        let (dir, hub, mut st, _gap_ht, gap) = pre_hole_layout(4);
+        seed_ewma(&mut st.slots[0], 2_000_000);
+        seed_ewma(&mut st.slots[1], 1_500_000);
+        seed_ewma(&mut st.slots[2], 1_600_000);
+        seed_ewma(&mut st.slots[3], 1_700_000);
+        let mut req = InflightReq::new(0);
+        req.started_at = Instant::now() - Duration::from_secs(31);
         st.inflight.insert(gap, req);
         st.slots[0].in_flight.insert(gap);
         st.slots[0].rate.note_rx(ibd_mono_ms().max(1));
@@ -2455,7 +2503,10 @@ pub(in crate::ibd) mod tests {
         cfg.per_peer = 16;
         assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
         let n = st.inflight.get(&gap).map(|e| e.len()).unwrap_or(0);
-        assert_eq!(n, 2, "aged first-gap owner gets one extra racer; n={n}");
+        assert_eq!(
+            n, 1,
+            "owner asked just now is not aged by started_at; n={n}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

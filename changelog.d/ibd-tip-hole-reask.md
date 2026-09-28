@@ -22,3 +22,6 @@ Fixed
   slot.** Erasing that record let a later pass ask the same peer again. The
   owner stays retired, and another peer is asked once a slot is free, even
   when the getdata window is already full.
+- **An extra racer on a later gap waits on the current owner's ask.** The
+  30s age was the time since the hash was first requested, so a peer asked
+  just now could look 30s old after an earlier owner was dropped.
