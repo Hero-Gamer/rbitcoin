@@ -588,10 +588,7 @@ fn need_hash_at(
     if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
         return None;
     }
-    if st
-        .inflight
-        .get(&h)
-        .is_some_and(|req| !req.peers.is_empty())
+    if st.inflight.get(&h).is_some_and(|req| !req.peers.is_empty())
         || st.body.is_rejected(&h)
         || st.reorg.invalid.contains(h.to_byte_array())
     {
@@ -2247,12 +2244,7 @@ pub(in crate::ibd) mod tests {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(
-            vec![
-                dummy_slot(0),
-                dummy_slot(1),
-                dummy_slot(2),
-                dummy_slot(3),
-            ],
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2), dummy_slot(3)],
             hub.tip_hash(),
             hub.tip_height(),
         );
