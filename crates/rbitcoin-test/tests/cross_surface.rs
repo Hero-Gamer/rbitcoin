@@ -1948,3 +1948,114 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         Err(_) => panic!("run_p2p did not exit after stop"),
     }
 }
+
+/// Nothing listens here. A pinned `--connect` at genesis still enters tip mode.
+const DEAD_CONNECT: &str = "127.0.0.1:1";
+
+/// `run_p2p` on regtest with an ephemeral P2P bind, no seeds, the one
+/// `--connect` down, and `--max-run-secs 0`: exit once tip entry ends.
+fn listen_and_exit_cfg(datadir: &std::path::Path) -> NodeConfig {
+    let mut cfg = NodeConfig::default()
+        .with_datadir(datadir)
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect = vec![DEAD_CONNECT.parse().unwrap()];
+    cfg.max_run_secs = Some(0);
+    cfg
+}
+
+async fn start_and_exit(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError> {
+    tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg))
+        .await
+        .expect("run_p2p did not exit")
+}
+
+/// One operator datadir restarted through the startup arms `run_p2p` owns
+/// while its one `--connect` peer is down: a junk peer book, a missing then a
+/// valid asmap, the wallet servers up until `stop`, an Electrum port someone
+/// else holds, and a pruned datadir that refuses an unpruned start.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_listen_and_exit() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let peers = dir.join("peers");
+
+    // A copied-in datadir: the peer book is junk and the configured asmap is
+    // not there. Catch-up gives up on the refused peer instead of hanging,
+    // and the book on disk is a real book again.
+    std::fs::write(&peers, b"not-a-valid-peers-blob\xff\x00").unwrap();
+    let dead: SocketAddr = DEAD_CONNECT.parse().unwrap();
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.asmap = Some(dir.join("no-such-asmap"));
+    let mempool = cfg.mempool_path();
+    start_and_exit(cfg)
+        .await
+        .expect("a refused peer is not fatal");
+    assert!(mempool.exists(), "run_p2p opens the mempool");
+    let book = rbitcoin_net::AddrMan::load(&peers).expect("junk book replaced");
+    assert!(
+        book.flags(&dead).failed_last_connect(),
+        "the refused --connect is in the saved book"
+    );
+
+    // The asmap is in place now, the saved book loads, and the wallet servers
+    // answer until the operator stops the node.
+    std::fs::write(dir.join("ip_asn.dat"), rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (electrum_addr, esplora_addr, rpc_addr) =
+        (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.milestone_height = 100;
+    cfg.shindex = true;
+    cfg.listen.electrum = Some(electrum_addr);
+    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
+    cfg.rpc.listen = Some(rpc_addr);
+    cfg.max_run_secs = Some(60);
+    let node = tokio::spawn(run_p2p(cfg));
+    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
+    let (st, height) = http_get(esplora_addr, "/blocks/tip/height").await;
+    assert_eq!((st, height.as_str()), (200, "0"), "esplora on genesis");
+    let mut el = TcpStream::connect(electrum_addr).await.unwrap();
+    let tip = electrum_rpc(&mut el, 1, "blockchain.headers.subscribe", json!([])).await;
+    assert_eq!(tip["result"]["height"], 0, "{tip}");
+    let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+    assert_eq!(count["result"], 0, "{count}");
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
+    assert!(
+        matches!(stopped, Ok(Ok(Ok(())))),
+        "run_p2p did not stop cleanly"
+    );
+
+    // Another process holds the Electrum port. The bind fails with a warning
+    // and the node still starts and exits.
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.shindex = true;
+    cfg.listen.electrum = Some(held.local_addr().unwrap());
+    start_and_exit(cfg)
+        .await
+        .expect("an Electrum bind failure is not fatal");
+    drop(held);
+
+    // Without `--connect` and with seeds on: regtest resolves none, the one
+    // saved peer still refuses, and the node exits short of tip mode.
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.listen.connect.clear();
+    cfg.listen.use_seeds = true;
+    start_and_exit(cfg)
+        .await
+        .expect("no reachable peer is not fatal");
+
+    // Once pruned, the datadir refuses a start without --prune-seqsigwit.
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.prune_seqsigwit = true;
+    start_and_exit(cfg).await.expect("pruned start");
+    let err = start_and_exit(listen_and_exit_cfg(&dir))
+        .await
+        .expect_err("unpruned start on a pruned datadir")
+        .to_string();
+    assert!(err.contains("--prune-seqsigwit"), "{err}");
+}

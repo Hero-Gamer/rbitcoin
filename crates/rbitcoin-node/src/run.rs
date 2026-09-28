@@ -2002,31 +2002,6 @@ mod tests {
             .with_tiny_heads()
     }
 
-    #[test]
-    fn startup_refuses_non_pruned_config_on_pruned_datadir() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-prune-refuse-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = dir.join("store");
-        let q = Query::open_or_create_tiny(&store).unwrap();
-        q.set_prune_seqsigwit(true).unwrap();
-        q.set_pruneheight(Some(rbitcoin_primitives::Height(0)))
-            .unwrap();
-        let mut cfg = tiny_regtest(&dir);
-        cfg.prune_seqsigwit = false;
-        let err = apply_startup_index_mode(&q, &cfg, 0)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("pruned-seqsigwit") || err.contains("--prune-seqsigwit"),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale redial.
     /// A one-shot sleep in the same `select!` is reset on every such wake.
     #[test]
@@ -2663,29 +2638,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_p2p_no_peers_exits_after_catchup() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.max_run_secs = Some(0); // exit after catch-up / tip mode
-        cfg.smoke = false;
-        cfg.mempool.bytes_per_sigop = Some(0);
-        let mempool_path = cfg.mempool_path();
-        // Bound runtime so a hang fails the test suite instead of blocking.
-        // max_run_secs=0 should exit immediately after catch-up; keep bound tight.
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("run_p2p ok with no peers");
-        assert!(mempool_path.exists(), "run_p2p opens the mempool");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
     async fn cancelled_completes_after_request() {
         let sd = Shutdown::new();
         // Already-requested path returns immediately.
@@ -2701,67 +2653,6 @@ mod tests {
         tokio::task::yield_now().await;
         sd2.request();
         j.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_p2p_milestone_and_electrum() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.milestone_height = 100; // exercise milestone log branch
-        cfg.shindex = true;
-        cfg.listen.electrum = Some("127.0.0.1:0".parse().unwrap());
-        // max_run_secs=0 exits after catch-up/tip (tip-follow loop uses 60s poll sleeps).
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("run_p2p with electrum");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn run_p2p_with_esplora_listen() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-esp-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.shindex = true;
-        cfg.listen.esplora = Some(EsploraListen::Tcp("127.0.0.1:0".parse().unwrap()));
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("run_p2p with esplora");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn run_p2p_bad_connect_peer_still_exits() {
-        // Explicit dead --connect so IBD/follow attempts are exercised, then exit.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-conn-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        // Blackhole / closed port: connect fails fast under FOLLOW_CONNECT_SECS.
-        cfg.listen.connect = vec!["127.0.0.1:1".parse().unwrap()];
-        cfg.max_run_secs = Some(0);
-        // Dead connect should fail fast (FOLLOW_CONNECT_SECS); 20s bound for hang detection.
-        let result = tokio::time::timeout(Duration::from_secs(20), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        // Incomplete IBD is ok (warn path); should not hang.
-        let _ = result.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The `IbdConfig` literal in `run_ibd_or_skip` is not built by the config
@@ -2826,43 +2717,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn run_p2p_missing_asmap_still_starts() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-asmap-miss-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.asmap = Some(dir.join("no-such-asmap"));
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("missing asmap must not panic");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn run_p2p_valid_asmap_starts() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-asmap-ok-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ip_asn.dat"), rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("valid asmap start");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn enter_tip_mode_warns_on_leftover_runs_dir() {
         use rbitcoin_query::IndexMode;
@@ -2903,57 +2757,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_p2p_with_peers_file_and_electrum() {
-        use rbitcoin_net::AddrMan;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-peers-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Non-empty peers book so load path logs address count.
-        let mut am = AddrMan::new();
-        am.add("127.0.0.1:18444".parse().unwrap());
-        am.add("127.0.0.1:18445".parse().unwrap());
-        am.save(&dir.join("peers")).unwrap();
-
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        // Peers file is loaded for bookkeeping; do not dial those addrs as --connect
-        // (would stall IBD). Empty connect + no seeds → catch-up complete immediately.
-        cfg.listen.connect.clear();
-        cfg.max_run_secs = Some(0);
-        cfg.shindex = true;
-        cfg.listen.electrum = Some("127.0.0.1:0".parse().unwrap());
-        cfg.milestone_height = 50;
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("run_p2p peers+electrum");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn run_p2p_corrupt_peers_and_dead_connect() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-badpeers-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Corrupt peers file → load error branch starts empty book.
-        std::fs::write(dir.join("peers"), b"not-a-valid-peers-blob\xff\x00").unwrap();
-
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect = vec!["127.0.0.1:1".parse().unwrap()];
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(20), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        let _ = result.unwrap(); // incomplete IBD ok
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
     async fn cancelled_waits_for_request_race() {
         // Cover the while !requested re-check after spurious notify.
         let sd = Shutdown::new();
@@ -2966,50 +2769,6 @@ mod tests {
         sd.request();
         sd.request();
         j.await.unwrap();
-    }
-
-    /// `use_seeds=true` on regtest resolves empty seed set (covers seed inject path).
-    #[tokio::test]
-    async fn run_p2p_use_seeds_regtest_empty() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-seeds-{nanos}"));
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = true; // regtest: resolve_all_seeds → empty
-        cfg.listen.connect.clear();
-        cfg.max_run_secs = Some(0);
-        cfg.milestone_height = 1; // log milestone branch
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        result.unwrap().expect("run_p2p seeds regtest");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Electrum bind failure (port already taken / invalid) → warn path, still exits.
-    #[tokio::test]
-    async fn run_p2p_electrum_bind_fail_warns() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-fail-{nanos}"));
-        // Hold a port so electrum bind fails.
-        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = held.local_addr().unwrap();
-        let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
-        cfg.listen.use_seeds = false;
-        cfg.listen.connect.clear();
-        cfg.shindex = true;
-        cfg.listen.electrum = Some(addr); // already bound → fail
-        cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
-        assert!(result.is_ok(), "run_p2p timed out");
-        // Bind fail is non-fatal warn; run should still complete.
-        result.unwrap().expect("run_p2p despite electrum fail");
-        drop(held);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
