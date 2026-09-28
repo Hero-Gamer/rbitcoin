@@ -79,9 +79,13 @@ three unused subprotocol crates) if it adds nothing.
   not-reactor.
 - Named RAM trade (CONTRIBUTING 9): each session retains, per live
   template, the full witness-serialized non-coinbase txs (≤ ~4 MB × ~3
-  templates × sessions). Retention is required: the mempool may evict a tx
+  templates × capped sessions; ≤ ~96 MB at the default cap of 8).
+  Retention is required: the mempool may evict a tx
   before `RequestTransactionData` or `SubmitSolution` arrives. Stale grace
   (default 10 s) after a tip change, then drop (mirrors sv2-tp).
+- Session cap (always on): the listener accepts at most 8 concurrent
+  sessions and closes the next one after accept, like Electrum's
+  `max_connections` semaphore. Per-IP metering stays out of scope.
 - Per-session budget: weight `MAX_BLOCK_WEIGHT − max(1168 +
   4·coinbase_output_max_additional_size, 2000)` WU (sv2-spec 07 §7.1);
   sigops start at `coinbase_output_max_additional_sigops` (Core
@@ -118,6 +122,11 @@ Mining Protocol server (channels), Job Declaration **Server**, SV1↔SV2
 translator proxy, Job Declarator Client, weak-block targets below nBits,
 extension negotiation, per-IP metering/rate limits. None of these ship;
 nothing here precludes a later JD-server plan.
+
+Core's IPC mining interface (`waitNext`) is also out: TDP push covers
+these clients, and polling clients already have GBT longpoll and the
+Esplora `/block-template` 15 s cache. This replaces the old Q-64 backlog
+row ("GBT longpoll / `waitNext`, then Sv2").
 
 ---
 
@@ -205,13 +214,17 @@ Ships the listener, bootstrap, tip push, transaction data, and
   max_version=2, flags=0}` receives `SetupConnection.Success{used_version=2,
   flags=0}`. Nonzero flags → `SetupConnection.Error` echoing them.
   `protocol != 2` or no version-2 overlap → Error and the connection
-  closes.
+  closes. With the session cap reached, the next connection is closed
+  before the handshake and the existing sessions stay up.
 - **Red:** `cargo test -p rbitcoin-sv2 setup_connection_` — loopback TCP,
-  in-crate test initiator; success, bad-flags, bad-protocol cases.
+  in-crate test initiator; success, bad-flags, bad-protocol, and
+  (cap + 1)th-connection cases.
 - **Green:** `crates/rbitcoin-sv2` (workspace member) with the wire crates
   pinned to the Step 0 set; authority-keypair config, listener task,
   per-connection session task driving the `codec_sv2` handshake then the
-  common-message branch.
+  common-message branch; session-cap semaphore on accept. Add the
+  `rbitcoin-sv2` row to [`CRATES.md`](./CRATES.md) in this commit
+  ([`README.md`](./README.md) rule: row with the new file).
 - **Refactor:** session state as an enum (`Handshake`,
   `AwaitingConstraints`, `Active`), not nested ifs.
 - **Verify:** `cargo test -p rbitcoin-sv2 setup_`
