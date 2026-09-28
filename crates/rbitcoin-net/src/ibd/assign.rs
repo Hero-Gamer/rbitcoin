@@ -399,7 +399,9 @@ fn assign_densify(
     issued += steal_hung_densify(st, hub, alive, tip_batch_hi, &caps);
 
     let mut room = cfg.window.saturating_sub(st.inflight.len());
-    if room == 0 {
+    // A retired holder already occupies a window slot. Adding a racer does not.
+    let reissue_only = room == 0;
+    if reissue_only && !st.inflight.values().any(inflight_needs_racer) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -434,7 +436,8 @@ fn assign_densify(
         return;
     }
     let densify_lo = path_lo.max(st.densify_scan_lo);
-    let densify = collect_height_band(st, hub, densify_lo, band_hi, room.max(1));
+    let collect_cap = if reissue_only { 1 } else { room.max(1) };
+    let densify = collect_height_band(st, hub, densify_lo, band_hi, collect_cap, reissue_only);
     if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -443,18 +446,34 @@ fn assign_densify(
     let ranked = rank_peers_by_speed(&st.slots, alive, &HashSet::new());
     let mut densify_q = densify;
     for &pid in &ranked {
-        if room == 0 || densify_q.is_empty() {
+        if densify_q.is_empty() {
+            break;
+        }
+        let front_reissue = densify_q
+            .front()
+            .is_some_and(|h| st.inflight.get(h).is_some_and(inflight_needs_racer));
+        if room == 0 && !front_reissue {
             break;
         }
         let cap = caps.get(&pid).copied().unwrap_or(1);
-        while room > 0 && !densify_q.is_empty() {
+        while !densify_q.is_empty() {
             if !peer_has_slot(st, pid, cap) {
                 break;
             }
             let Some(h) = pop_need(&mut densify_q, st, hub) else {
                 break;
             };
+            let reissue = st.inflight.get(&h).is_some_and(inflight_needs_racer);
+            if !reissue && room == 0 {
+                densify_q.push_front(h);
+                break;
+            }
+            if st.inflight.get(&h).is_some_and(|req| req.holds(pid)) {
+                densify_q.push_front(h);
+                break;
+            }
             if !issue_one(st, pid, h, &mut room, &mut issued) {
+                densify_q.push_front(h);
                 break;
             }
         }
@@ -486,6 +505,7 @@ fn collect_height_band(
     lo: u32,
     hi: u32,
     cap: usize,
+    reissue_only: bool,
 ) -> VecDeque<BlockHash> {
     let mut out = VecDeque::new();
     if lo > hi || cap == 0 {
@@ -498,7 +518,7 @@ fn collect_height_band(
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        let need = need_hash_at(st, hub, ht);
+        let need = need_hash_at(st, hub, ht, reissue_only);
         if tracking {
             if need.is_none() && densify_prefix_filled(st, hub, ht) {
                 prefix = ht.saturating_add(1);
@@ -553,16 +573,31 @@ fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// **zombie** pending (flag set, wrong/no wire) must demote and re-get — skipping
 /// all pending first left densify-ahead heights frozen (tip advances past tip-batch
 /// cover, soft filled, conf stuck on a later hole).
-fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
+fn inflight_needs_racer(req: &state::InflightReq) -> bool {
+    req.peers.is_empty() && !req.retired.is_empty()
+}
+
+fn need_hash_at(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ht: u32,
+    reissue_only: bool,
+) -> Option<BlockHash> {
     use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
     if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
         return None;
     }
-    if st.inflight.contains_key(&h)
+    if st
+        .inflight
+        .get(&h)
+        .is_some_and(|req| !req.peers.is_empty())
         || st.body.is_rejected(&h)
         || st.reorg.invalid.contains(h.to_byte_array())
     {
+        return None;
+    }
+    if reissue_only && !st.inflight.get(&h).is_some_and(inflight_needs_racer) {
         return None;
     }
     // Class A seed: densify skips re-walk; tip-hole cover re-gets tip batch.
@@ -585,7 +620,9 @@ pub(crate) fn pop_need(
     hub: &ChainHub,
 ) -> Option<BlockHash> {
     while let Some(h) = q.pop_front() {
-        if st.body.skip_download(hub, &h) || st.inflight.contains_key(&h) {
+        if st.body.skip_download(hub, &h)
+            || st.inflight.get(&h).is_some_and(|req| !req.peers.is_empty())
+        {
             continue;
         }
         return Some(h);
@@ -673,7 +710,11 @@ pub(crate) fn issue_batch(
     *issued += batch.len() as u64;
     let new_unique = batch
         .iter()
-        .filter(|h| st.inflight.get(*h).map(|e| e.len() == 1).unwrap_or(false))
+        .filter(|h| {
+            st.inflight
+                .get(*h)
+                .is_some_and(|e| e.len() == 1 && e.retired.is_empty())
+        })
         .count();
     *room = room.saturating_sub(new_unique);
     true
@@ -995,21 +1036,6 @@ fn retire_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
     }
 }
 
-/// Forget that `pid` was asked for `hash` so densify can issue it afresh.
-fn forget_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
-    if let Some(s) = st.slots.iter_mut().find(|s| s.id == pid) {
-        s.in_flight.remove(&hash);
-    }
-    if let Some(req) = st.inflight.get_mut(&hash) {
-        if req.remove_peer(pid) {
-            st.inflight.remove(&hash);
-            if st.body.is_pending(&hash) {
-                st.body.mark_missing(hash);
-            }
-        }
-    }
-}
-
 fn peer_bps(slots: &[PeerSlot], pid: usize) -> u64 {
     slots
         .iter()
@@ -1125,15 +1151,12 @@ fn steal_hung_densify(
             .into_iter()
             .find(|&pid| peer_has_slot(st, pid, densify_caps.get(&pid).copied().unwrap_or(1)));
         let ht = st.hash_height.get(&h).copied();
+        retire_hash_owner(st, h, owner);
         if let Some(pid) = dest {
-            retire_hash_owner(st, h, owner);
             let mut room = 1usize;
             let _ = issue_one(st, pid, h, &mut room, &mut issued);
-        } else {
-            forget_hash_owner(st, h, owner);
-            if let Some(ht) = ht {
-                st.densify_scan_lo = st.densify_scan_lo.min(ht);
-            }
+        } else if let Some(ht) = ht {
+            st.densify_scan_lo = st.densify_scan_lo.min(ht);
         }
     }
     issued
@@ -1376,7 +1399,12 @@ pub(in crate::ibd) mod tests {
         st.inflight.insert(hash, InflightReq::new(1));
         st.body.mark_pending(hash);
 
-        forget_hash_owner(&mut st, hash, 1);
+        let _ = super::super::dial::release_peer_block_work(
+            &mut st.slots,
+            &mut st.inflight,
+            &mut st.body,
+            1,
+        );
 
         assert!(!st.body.is_pending(&hash));
         assert!(st.body.is_missing(&hash));
@@ -2647,6 +2675,86 @@ pub(in crate::ibd) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// No free slot on a faster peer must not erase the hung getdata. Once a
+    /// slot frees, another peer is asked, including when the hash already
+    /// fills the getdata window, and the hung peer is not asked again.
+    #[test]
+    fn steal_hung_densify_keeps_the_request_when_no_slot_is_free() {
+        let _env = lock_default_assign_stop();
+        use super::super::state::InflightReq;
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![dummy_slot(0), dummy_slot(1), dummy_slot(2)],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let mut wire = Vec::new();
+        for s in st.slots.iter_mut() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            s.cmd_tx = tx;
+            wire.push(rx);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 2;
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, 40);
+        hub.query
+            .block_queue_offer(path_lo, h(path_lo).to_byte_array(), 1, &[0u8; 80])
+            .unwrap();
+        st.body.mark_pending(h(path_lo));
+        let hung = h(40);
+        let long_ago = Instant::now() - Duration::from_secs(31);
+        let mut req = InflightReq::new(0);
+        req.started_at = long_ago;
+        req.asked_at.insert(0, long_ago);
+        st.inflight.insert(hung, req);
+        st.slots[0].in_flight.insert(hung);
+        for n in 0..2 {
+            st.slots[1].in_flight.insert(h(300 + n));
+            st.slots[2].in_flight.insert(h(400 + n));
+        }
+        seed_ewma(&mut st.slots[1], 5_000_000);
+        seed_ewma(&mut st.slots[2], 4_000_000);
+        st.densify_scan_lo = 50;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let r = &st.inflight[&hung];
+        assert!(
+            r.holds(0) && r.peers.is_empty(),
+            "no free faster slot retires the hung owner; peers={:?} retired={:?}",
+            r.peers,
+            r.retired
+        );
+        assert!(st.slots[0].in_flight.contains(&hung));
+        seed_ewma(&mut st.slots[0], 9_000_000);
+        st.slots[1].in_flight.clear();
+        cfg.window = 1;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let r = &st.inflight[&hung];
+        assert!(
+            r.peers.contains(&1) && r.holds(0) && !r.peers.contains(&0),
+            "the freed peer is asked; the hung peer stays retired; peers={:?}",
+            r.peers
+        );
+        let asks: Vec<usize> = wire
+            .iter_mut()
+            .map(|rx| {
+                let mut n = 0;
+                while let Ok(cmd) = rx.try_recv() {
+                    if let PeerCmd::GetData { hashes } = cmd {
+                        n += hashes.iter().filter(|&&x| x == hung).count();
+                    }
+                }
+                n
+            })
+            .collect();
+        assert_eq!(asks, vec![0, 1, 0], "hung peer is not asked again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn densify_slow_but_rx_live_not_stolen() {
         let _env = lock_default_assign_stop();
@@ -2753,10 +2861,14 @@ pub(in crate::ibd) mod tests {
         seed_ewma(&mut st.slots[1], 1_000_000);
         st.densify_scan_lo = 90;
         assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let hung_req = &st.inflight[&hung];
         assert!(
-            !st.inflight.contains_key(&hung),
-            "hung hash cleared when faster peer has no slot"
+            hung_req.holds(0) && hung_req.peers.is_empty(),
+            "hung owner stays recorded when no faster slot is free; peers={:?} retired={:?}",
+            hung_req.peers,
+            hung_req.retired
         );
+        assert!(st.slots[0].in_flight.contains(&hung));
         assert!(
             st.densify_scan_lo <= 40,
             "scan_lo must rewind to hung height; scan_lo={}",

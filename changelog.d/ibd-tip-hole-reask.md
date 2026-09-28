@@ -16,5 +16,9 @@ Fixed
 - **Blocks held by a dropped peer are requested again right away.** A
   peer disconnected as stalled or relative-slow, or a notfound, freed its
   blocks, but densify had already moved its scan cursor past them, so they
-  were requested again only once they held up the tip. The cursor now moves
+  were requested again only once they held up the tip.   The cursor now moves
   back to the lowest freed height.
+- **A hung densify block keeps its getdata when no faster peer has a free
+  slot.** Erasing that record let a later pass ask the same peer again. The
+  owner stays retired, and another peer is asked once a slot is free, even
+  when the getdata window is already full.
