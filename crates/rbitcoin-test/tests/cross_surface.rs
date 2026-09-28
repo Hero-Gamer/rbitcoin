@@ -167,6 +167,21 @@ async fn pin_healthz(health_addr: SocketAddr) {
     assert_eq!(st, 404, "unknown health path: {body}");
 }
 
+/// `/readyz` once `run_p2p` is past bring-up (opening … indexing).
+async fn readyz_after_startup(health_addr: SocketAddr) -> (u16, String) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (st, body) = http_get(health_addr, "/readyz").await;
+        let starting = ["opening", "starting", "catch-up", "indexing"]
+            .iter()
+            .any(|p| body == format!("not ready: {p}"));
+        if !starting || Instant::now() >= deadline {
+            return (st, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn pin_address_prefix_404(esplora_addr: SocketAddr) {
     let (st, body) = http_get(esplora_addr, "/address-prefix/bc1").await;
     assert_eq!(st, 404, "address-prefix stays 404: {body}");
@@ -1042,6 +1057,46 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     }
 }
 
+/// A configured listener that did not bind keeps `/readyz` at 503 while the
+/// node follows the tip. RPC only warns on a bind failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn readyz_names_a_listener_that_did_not_bind() {
+    let td = TestDatadir::new().unwrap();
+    {
+        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(
+            &q,
+            &ChainParams::regtest(),
+            Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        q.flush().unwrap();
+    }
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let health_addr = ephemeral_addr();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect.clear();
+    cfg.rpc.listen = Some(taken.local_addr().unwrap());
+    cfg.listen.health = Some(health_addr);
+    cfg.max_run_secs = Some(5);
+    let node = tokio::spawn(run_p2p(cfg));
+    wait_listeners(&[health_addr]).await;
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: rpc not listening".into())
+    );
+    let stopped = tokio::time::timeout(Duration::from_secs(20), node).await;
+    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
+}
+
 /// The health listener binds before the store opens: a taken port stops the
 /// node with nothing written to the datadir.
 #[tokio::test(flavor = "multi_thread")]
@@ -1137,6 +1192,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(count["result"], 106, "{count}");
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], true, "{chain}");
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: initial block download".into()),
+        "/readyz agrees with RPC initialblockdownload"
+    );
     let mpinfo = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
     assert_eq!(mpinfo["result"]["relay_enabled"], false, "{mpinfo}");
     let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
@@ -1830,6 +1890,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     }
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], false, "{chain}");
+    assert_eq!(
+        chain["result"]["headers"], chain["result"]["blocks"],
+        "{chain}"
+    );
+    assert_eq!(http_get(health_addr, "/readyz").await, (200, "ok".into()));
 
     let relay_parent = acs_spend(
         relay_cb,

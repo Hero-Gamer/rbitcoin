@@ -1,5 +1,6 @@
 use crate::config::{parse_btc_to_sat, NodeConfig};
 use crate::error::NodeError;
+use crate::health::{run_health, NodeStatus, Phase};
 use crate::regtest_rpc::HubRegtest;
 use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, ElectrumHandle, TipNotify};
@@ -217,15 +218,17 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// hold the process).
 #[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
+    let status = NodeStatus::new(config.shindex);
     let _health = match config.listen.health {
         Some(addr) => Some(
-            crate::health::run_health(addr)
+            run_health(addr, Arc::clone(&status))
                 .await
                 .map_err(|e| NodeError::Config(format!("health listen {addr}: {e}")))?,
         ),
         None => None,
     };
     let handle = run_node(config.clone())?;
+    status.enter(Phase::Starting);
     let params = config.chain_params()?;
     let milestone = config.milestone();
     if let Some(anchor) = milestone.anchor {
@@ -290,6 +293,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    status.attach_chain(&node.hub);
     for extra in &config.listen.p2p_extra {
         let bound = node
             .add_listen(*extra)
@@ -588,6 +592,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     pinned.extend(dns_resolved);
     let targets = follow_dial_targets(&pinned, &addrman, max_out, &occupied);
     let ibd_targets = follow_dial_targets(&pinned, &addrman, candidate_n, &occupied);
+    status.enter(Phase::CatchUp);
     let catch_up = run_ibd_or_skip(
         &node,
         &ibd_targets,
@@ -617,6 +622,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let mut sh_tip_ready = false;
     let mut index_writebehind = None;
     if catch_up.is_complete() && !shutdown.requested() {
+        status.enter(Phase::Indexing);
         let gates = enter_tip_mode(
             &node.hub.query,
             Some(Arc::clone(&shutdown.flag)),
@@ -919,6 +925,30 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
+        let unbound = [
+            (
+                "rpc",
+                config.rpc.socket || config.rpc.listen.is_some(),
+                rpc_handle.is_some(),
+            ),
+            (
+                "electrum",
+                config.listen.electrum.is_some(),
+                !electrum_handles.is_empty(),
+            ),
+            (
+                "esplora",
+                config.listen.esplora.is_some(),
+                !esplora_handles.is_empty(),
+            ),
+        ];
+        status.follow(
+            unbound
+                .into_iter()
+                .filter(|&(_, configured, bound)| configured && !bound)
+                .map(|(name, ..)| name)
+                .collect(),
+        );
         let deadline = config
             .max_run_secs
             .map(|s| Instant::now() + Duration::from_secs(s));
@@ -1172,6 +1202,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
+    status.enter(Phase::Stopping);
     {
         let end_tip = node.tip_height().unwrap_or(0);
         let blocks_this_run = end_tip.saturating_sub(start_tip);
