@@ -946,6 +946,9 @@ fn drop_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
     if let Some(req) = st.inflight.get_mut(&hash) {
         if req.remove_peer(pid) {
             st.inflight.remove(&hash);
+            if st.body.is_pending(&hash) {
+                st.body.mark_missing(hash);
+            }
         }
     }
 }
@@ -1227,6 +1230,7 @@ pub(crate) fn cover_tip_holes(
 
 #[cfg(test)]
 pub(in crate::ibd) mod tests {
+    use super::super::state::InflightReq;
     use super::super::status::LoopStats;
     use super::*;
     use bitcoin::hashes::Hash;
@@ -1301,6 +1305,20 @@ pub(in crate::ibd) mod tests {
         let mut b = [0u8; 32];
         b[0..4].copy_from_slice(&n.to_le_bytes());
         BlockHash::from_byte_array(b)
+    }
+
+    #[test]
+    fn dropping_last_hash_owner_releases_pending_body() {
+        let hash = h(0x95);
+        let mut st = IbdWorkState::new(vec![dummy_slot(1)], None, None);
+        st.slots[0].in_flight.insert(hash);
+        st.inflight.insert(hash, InflightReq::new(1));
+        st.body.mark_pending(hash);
+
+        drop_hash_owner(&mut st, hash, 1);
+
+        assert!(!st.body.is_pending(&hash));
+        assert!(st.body.is_missing(&hash));
     }
 
     fn dummy_slot(id: usize) -> PeerSlot {

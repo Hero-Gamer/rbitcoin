@@ -1917,6 +1917,26 @@ fn apply_peer_event_body_and_control_surface() {
     );
     assert!(!st.body.is_pending(&h(9)));
 
+    // notfound from the last owner releases both request and pending state.
+    let notfound_hash = h(10);
+    st.body.mark_pending(notfound_hash);
+    st.slots[0].in_flight.insert(notfound_hash);
+    st.inflight.insert(notfound_hash, InflightReq::new(1));
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::NotFound {
+            peer: 1,
+            hashes: vec![notfound_hash],
+        },
+        &write_next,
+        &mut book,
+        local,
+        None,
+    );
+    assert!(!st.body.is_pending(&notfound_hash));
+    assert!(st.body.is_missing(&notfound_hash));
+
     // Headers: attach height from tip parent and order.
     let hdr = dummy_header(gen, 1);
     let hash = hdr.block_hash();
