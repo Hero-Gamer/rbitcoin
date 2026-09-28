@@ -1,0 +1,27 @@
+Fixed
+
+- **IBD no longer re-requests a tip-hole block from a peer that still owes
+  it.** Dropping a tip-hole owner forgot the getdata it was sent, so the
+  next assign pass asked the same peer again. Peers answer every getdata,
+  so on signet with 30 peers they spent 77–85% of upload re-sending blocks
+  already stored, and tip+1 waited behind those copies for up to 55s. A
+  dropped owner now keeps the request and is not asked for that hash again.
+  Peers who still owe the block count toward its race cap, so dropping one
+  does not free a slot for a peer that was never asked.
+- **A tip-hole owner with other getdata queued is dropped only when it
+  is actually slow.** Every peer has several blocks in flight during IBD,
+  so the owner was dropped and replaced on every 50ms assign pass. It is
+  now dropped only after holding the hash for 5s, and only when a free
+  peer's expected drain time is at most half the owner's.
+- **Blocks held by a dropped peer are requested again right away.** A
+  peer disconnected as stalled or relative-slow, or a notfound, freed its
+  blocks, but densify had already moved its scan cursor past them, so they
+  were requested again only once they held up the tip.   The cursor now moves
+  back to the lowest freed height.
+- **A hung densify block keeps its getdata when no faster peer has a free
+  slot.** Erasing that record let a later pass ask the same peer again. The
+  owner stays retired, and another peer is asked once a slot is free, even
+  when the getdata window is already full.
+- **An extra racer on a later gap waits on the current owner's ask.** The
+  30s age was the time since the hash was first requested, so a peer asked
+  just now could look 30s old after an earlier owner was dropped.

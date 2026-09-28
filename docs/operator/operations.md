@@ -303,10 +303,17 @@ block getdata in flight. Tip+1 getdata races up to 4 peers ranked by expected
 drain time (`(queue+1)/EWMA`), not by inflight count. Later contiguous holes
 in that gap get one racer until tip+1 is in hand. A hole owner still serving
 other getdata (densify FIFO) is dropped from that hash so a peer that can start
-the hole can race; a hole owner with no qualifying rx is dropped when a sibling
-is pulling; an aged solo owner is dropped when another peer exists. When
+the hole can race, once it has held the hash ≥5s and a free peer's expected
+drain time is at most half the owner's; a hole owner with no qualifying rx is dropped when a sibling
+is pulling; a solo owner that has held the hash ≥30s is dropped when another
+peer exists. Getdata cannot be cancelled, so a dropped owner keeps the request,
+still counts toward its in-flight queue and toward that hash's race cap,
+and is never asked for that hash again. A hash is sent to at most its cap
+of peers (4 on tip+1, 1 on a later hole in the gap), including peers dropped
+from the race who still owe it. When
 `hole=` is 0, at most one extra racer is added on the first later gap in the
-32-window, and only if that owner is missing, aged ≥30s, or ≤ pack-median/4.
+32-window, and only if that owner is missing, has held the hash ≥30s, or
+≤ pack-median/4.
 Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
 so getdata queues can drain for tip+1);
 16 only for an EWMA outlier at ≥ 2× pack median. WARN
