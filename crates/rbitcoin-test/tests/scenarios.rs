@@ -1052,6 +1052,9 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     assert!(!utxos
         .iter()
         .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0));
+    let mut sh_slot = None;
+    pin_scripthash_views_on_pad(&q, &chain, &mut sh_slot);
+    pin_block_and_tx_surface_on_pad(&q, &chain);
 
     // Extra store/query surface on the same pad (coverage without a second open).
     assert!(q.scripthash_entry_count() > 0);
@@ -1162,6 +1165,7 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
         "wire double-spend: {wire_err}"
     );
     assert_eq!(q.tip_height(), Some(Height(tip_h)));
+    pin_archived_sibling_bodies(&q, &params, &chain, &b_bad);
 
     // Reorg: disconnect tip (spend) → matured coinbase UTXO returns.
     q.disconnect_tip().unwrap();
@@ -1172,6 +1176,11 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
             .iter()
             .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0),
         "after disconnect, matured coinbase should be unspent again"
+    );
+    let slot_utxos = q.scripthash_listunspent_slot(&sh, &mut sh_slot).unwrap();
+    assert_eq!(
+        slot_utxos, utxos2,
+        "a tip change must not serve the join slot pinned before it"
     );
 
     // Snapshot SH creates before reopen (kill mid-Class-C shape).
@@ -1278,6 +1287,102 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     assert_eq!(again, tip_fk);
 
     pin_resume_archived_bodies_after_disconnect(&q, &chain.blocks, tip_h);
+    pin_reconnect_archived_run_extends_height_index(&q, &params, &chain.blocks, tip_h);
+}
+
+fn pin_archived_sibling_bodies(
+    q: &Query,
+    params: &ChainParams,
+    chain: &rbitcoin_test::MatureRegtestChain,
+    double_spend: &Block,
+) {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{ScriptBuf, TxOut};
+    use rbitcoin_consensus::commit_class_a_block;
+
+    let tip_h = chain.tip_height();
+    let bad_hash = double_spend.block_hash().to_byte_array();
+    let (bad_fk, _) = q.get_header_by_hash(&bad_hash).unwrap().unwrap();
+    assert!(q.header_has_class_a_body(bad_fk.0).unwrap());
+    assert!(q.is_block_archived(&bad_hash).unwrap());
+    assert_eq!(q.height_of_hash(&bad_hash).unwrap(), None);
+    assert!(q.clear_archived_body(&bad_hash).unwrap());
+    assert!(!q.clear_archived_body(&bad_hash).unwrap());
+    assert!(!q.is_block_archived(&bad_hash).unwrap());
+    assert!(!q.clear_archived_body(&[0xde; 32]).unwrap());
+
+    let mut p2tr = vec![0x51, 0x20];
+    p2tr.extend_from_slice(&[0x55; 32]);
+    let p2a = vec![0x51, 0x02, 0x4e, 0x73];
+    let mut split = spend_anyone_can_spend(
+        chain.blocks[2].txdata[0].compute_txid(),
+        0,
+        Amount::from_sat(1_0000_0000),
+    );
+    split.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(p2tr),
+        },
+        TxOut {
+            value: Amount::from_sat(240),
+            script_pubkey: ScriptBuf::from_bytes(p2a),
+        },
+    ];
+    let tip = chain.blocks.last().unwrap();
+    let sibling = mine_regtest_block(
+        tip.block_hash(),
+        tip.header.time + 601,
+        tip_h + 1,
+        vec![split],
+    );
+    commit_class_a_block(q, params, Height(tip_h + 1), &sibling, Milestone::NONE).unwrap();
+    let rebuilt = q
+        .reconstruct_archived_block(&sibling.block_hash().to_byte_array())
+        .unwrap()
+        .expect("archived sibling");
+    assert_eq!(
+        serialize(&rebuilt),
+        serialize(&sibling),
+        "P2TR and P2A outputs rebuild to their wire scripts"
+    );
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
+}
+
+fn pin_reconnect_archived_run_extends_height_index(
+    q: &Query,
+    params: &ChainParams,
+    blocks: &[Block],
+    tip_h: u32,
+) {
+    use rbitcoin_consensus::confirm_wire_run;
+
+    let from_h = q.tip_height().unwrap().0;
+    assert_eq!(
+        q.height_of_hash(&blocks[from_h as usize].block_hash().to_byte_array())
+            .unwrap(),
+        Some(Height(from_h))
+    );
+    let _ = q.confirm_stats().take_window();
+    let run: Vec<_> = (from_h + 1..=tip_h)
+        .map(|h| (Height(h), blocks[h as usize].clone()))
+        .collect();
+    confirm_wire_run(q, params, Milestone::NONE, &run).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
+    let merged = q.confirm_stats().take_window();
+    assert_eq!(
+        merged.height_index_full_n, 0,
+        "a merged confirm extends the height index, it does not walk 0..=tip"
+    );
+    assert_eq!(merged.height_index_delta_n, u64::from(tip_h - from_h));
+    assert_eq!(q.process_owned_size_snapshot().h2h_keys, tip_h as usize + 1);
+    for h in from_h..=tip_h {
+        assert_eq!(
+            q.height_of_hash(&blocks[h as usize].block_hash().to_byte_array())
+                .unwrap(),
+            Some(Height(h))
+        );
+    }
 }
 
 fn pin_resume_archived_bodies_after_disconnect(q: &Query, blocks: &[Block], tip_h: u32) {
@@ -1308,6 +1413,281 @@ fn pin_resume_archived_bodies_after_disconnect(q: &Query, blocks: &[Block], tip_
         assert_eq!(e.hash, blocks[h as usize].block_hash().to_byte_array());
         assert!(q.is_block_archived(&e.hash).unwrap());
     }
+}
+
+#[allow(clippy::cognitive_complexity)] // one pad, many scripthash view arms
+fn pin_scripthash_views_on_pad(
+    q: &Query,
+    chain: &rbitcoin_test::MatureRegtestChain,
+    slot: &mut Option<std::sync::Arc<rbitcoin_query::ShJoinSlot>>,
+) {
+    use rbitcoin_query::{HistoryFilter, HistoryOrder};
+    use rbitcoin_store::script_hash;
+
+    let sh = script_hash(&[0x51]);
+    let tip_h = chain.tip_height();
+    let spend_block = &chain.blocks[chain.spend_height as usize];
+    let tip_cb = spend_block.txdata[0].compute_txid().to_byte_array();
+    let spend_txid = spend_block.txdata[1].compute_txid().to_byte_array();
+    let cb1_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let full = q.scripthash_history(&sh).unwrap();
+    assert_eq!(
+        full.len() as u32,
+        tip_h + 1,
+        "an OP_TRUE coinbase at every height past genesis, plus the spend"
+    );
+    assert_eq!(
+        q.scripthash_history_filtered(&sh, &HistoryFilter::open())
+            .unwrap(),
+        full
+    );
+    let heights = |f: &HistoryFilter| -> Vec<i64> {
+        q.scripthash_history_filtered(&sh, f)
+            .unwrap()
+            .iter()
+            .map(|i| i.height)
+            .collect()
+    };
+    assert_eq!(heights(&HistoryFilter::height_window(1, Some(3))), [1, 2]);
+    let top = i64::from(tip_h);
+    assert_eq!(
+        heights(&HistoryFilter::height_window(tip_h - 1, None)),
+        [top - 1, top, top]
+    );
+    let newest = HistoryFilter {
+        from_height: 0,
+        to_height: None,
+        limit: Some(2),
+        after_txid: None,
+        order: HistoryOrder::NewestFirst,
+    };
+    assert_eq!(heights(&newest), [top, top]);
+
+    let view = q.pin_chain_view().unwrap().unwrap();
+    let rows = q
+        .scripthash_history_summary_filtered_in(
+            &sh,
+            &HistoryFilter::esplora_chain_page(None),
+            &view,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 25);
+    let value_of = |txid: [u8; 32]| rows.iter().find(|r| r.txid == txid).unwrap().value;
+    assert_eq!(value_of(tip_cb), 50_0000_0000);
+    assert_eq!(
+        value_of(spend_txid),
+        -1_0000_0000,
+        "net value is funded minus spent on the same scripthash"
+    );
+
+    let stats = q.scripthash_chain_stats(&sh).unwrap();
+    assert_eq!(stats.tx_count as usize, full.len());
+    assert_eq!(stats.funded_txo_count, tip_h + 1);
+    assert_eq!(
+        stats.funded_txo_sum,
+        i64::from(tip_h) * 50_0000_0000 + 49_0000_0000
+    );
+    assert_eq!(stats.spent_txo_count, 1);
+    assert_eq!(stats.spent_txo_sum, 50_0000_0000);
+    let balance = q.scripthash_balance(&sh).unwrap();
+    assert_eq!(
+        balance.confirmed,
+        stats.funded_txo_sum - stats.spent_txo_sum
+    );
+
+    q.store().reset_txid_get_many();
+    let utxos = q.scripthash_listunspent(&sh).unwrap();
+    assert_eq!(utxos.len() as u32, tip_h);
+    assert!(
+        !q.store().txid_get_many_fks().contains(&cb1_fk.0),
+        "listunspent must not load the identity of a spent create"
+    );
+    q.store().reset_tx_full_gets();
+    let scanned = q.scan_unspent_scripts(&[vec![0x51]]).unwrap();
+    assert_eq!(scanned.len(), utxos.len());
+    assert_eq!(
+        scanned
+            .iter()
+            .filter(|u| !u.coinbase)
+            .map(|u| u.txid)
+            .collect::<Vec<_>>(),
+        [spend_txid]
+    );
+    assert!(
+        q.store().tx_full_gets().is_empty(),
+        "coinbase flag comes from the create fk: {:?}",
+        q.store().tx_full_gets()
+    );
+
+    assert_eq!(q.scripthash_balance_slot(&sh, slot).unwrap(), balance);
+    assert_eq!(q.scripthash_history_slot(&sh, slot).unwrap(), full);
+    assert_eq!(q.scripthash_listunspent_slot(&sh, slot).unwrap(), utxos);
+    assert_eq!(q.scripthash_chain_stats_slot(&sh, slot).unwrap(), stats);
+
+    assert_eq!(
+        q.scripthash_tx_fks_at_height(&sh, Height(tip_h)).unwrap(),
+        q.block_tx_fks(Height(tip_h)).unwrap(),
+        "tip coinbase creates and the spend spends the scripthash"
+    );
+    assert!(
+        !q.scripthash_touched_at_height(&sh, Height::GENESIS)
+            .unwrap(),
+        "the genesis coinbase pays a pubkey, not OP_TRUE"
+    );
+    assert!(q.scripthash_touched_at_height(&sh, Height(1)).unwrap());
+    assert!(!q
+        .scripthash_touched_at_height(&script_hash(&[0x52]), Height(tip_h))
+        .unwrap());
+
+    q.set_spend_index(false);
+    let no_spends = q.scripthash_listunspent(&sh).unwrap();
+    q.set_spend_index(true);
+    assert_eq!(
+        no_spends, utxos,
+        "with the spend index off the join falls back to the outpoint spend check"
+    );
+}
+
+#[allow(clippy::cognitive_complexity)] // one pad, many block/tx surface arms
+fn pin_block_and_tx_surface_on_pad(q: &Query, chain: &rbitcoin_test::MatureRegtestChain) {
+    use bitcoin::consensus::encode::serialize;
+    use rbitcoin_consensus::header_to_record;
+    use rbitcoin_query::ConfirmPrepared;
+
+    let spend_h = Height(chain.spend_height);
+    let spend_block = &chain.blocks[chain.spend_height as usize];
+    let tip_hash = spend_block.block_hash().to_byte_array();
+    let fks = q.block_tx_fks(spend_h).unwrap();
+    let txids: Vec<[u8; 32]> = spend_block
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let cb1 = chain.matured_coinbase_txid.to_byte_array();
+    let cb1_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+
+    assert_eq!(q.block_txids(spend_h).unwrap(), txids);
+    assert_eq!(q.block_txid_at(spend_h, 1).unwrap(), txids[1]);
+    assert!(q.block_txid_at(spend_h, 2).is_err());
+    let proof = q.merkle_proof(spend_h, &txids[1]).unwrap();
+    assert_eq!((proof.block_height, proof.pos), (spend_h.0, 1));
+    assert_eq!(proof.merkle, [txids[0]]);
+    assert!(q.merkle_proof(spend_h, &[0xff; 32]).is_err());
+    assert!(q.block_tx_fks(Height(9999)).is_err());
+    assert!(q.block_txids(Height(9999)).is_err());
+
+    for (fk, tx) in fks.iter().zip(&spend_block.txdata) {
+        assert_eq!(q.tx_wire_bytes(*fk).unwrap(), serialize(tx));
+        assert_eq!(&q.reconstruct_tx(*fk).unwrap(), tx);
+    }
+    q.store().reset_tx_full_gets();
+    q.store().reset_txid_get_many();
+    let archived = q.reconstruct_archived_block(&tip_hash).unwrap().unwrap();
+    assert_eq!(serialize(&archived), serialize(spend_block));
+    assert!(
+        q.store().tx_full_gets().is_empty(),
+        "contiguous header_txs span-load: {:?}",
+        q.store().tx_full_gets()
+    );
+    let many = q.store().txid_get_many_fks();
+    assert_eq!(
+        many.iter().filter(|&&id| id == cb1_fk.0).count(),
+        1,
+        "foreign parent txid once: {many:?}"
+    );
+    assert!(!many.contains(&fks[0].0), "same-block create: {many:?}");
+    assert!(q.reconstruct_archived_block(&[0x11; 32]).unwrap().is_none());
+    let (tip_fk, tip_rec) = q.get_header_by_hash(&tip_hash).unwrap().unwrap();
+    assert!(q
+        .reconstruct_archived_block_from_parts(tip_rec, vec![])
+        .is_err());
+    assert_eq!(
+        q.header_tx_fks(tip_fk, Some(&tip_hash)).unwrap(),
+        Some(fks.clone())
+    );
+
+    let spend_rec = q.get_tx(fks[1]).unwrap();
+    assert_eq!(
+        q.tx_input_at_fk(fks[1], &spend_rec, 0).unwrap().create_fk,
+        cb1_fk
+    );
+    assert!(q.tx_input_at_fk(fks[1], &spend_rec, 1).is_err());
+    assert!(q.tx_input(&spend_rec, 1).is_err());
+    q.store().reset_tx_full_gets();
+    assert_eq!(q.tx_output_at_fk(fks[1], 0).unwrap().value, 49_0000_0000);
+    assert!(
+        q.store().tx_full_gets().is_empty(),
+        "tx_output_at_fk is outs-only"
+    );
+    assert!(q.tx_output_at_fk(fks[1], 1).is_err());
+    assert_eq!(q.unspent_create_vouts(fks[1], &[0]).unwrap(), [0]);
+    assert!(q.unspent_create_vouts(cb1_fk, &[0]).unwrap().is_empty());
+    assert_eq!(q.spenders_raw(&cb1, 0).unwrap().len(), 1);
+    let unknown = TxRecord {
+        txid: [0xcd; 32],
+        ..spend_rec
+    };
+    assert!(q.tx_output(&unknown, 0).is_err());
+
+    assert_eq!(q.confirm_block(spend_h, &tip_hash).unwrap(), tip_fk);
+    assert!(q.confirm_blocks_run(&[]).unwrap().is_empty());
+    let prepared = |height: u32, header_fk: Fk| ConfirmPrepared {
+        height: Height(height),
+        header_fk,
+        tx_fks: vec![fks[0]],
+    };
+    for bad in [
+        vec![prepared(spend_h.0 + 1, Fk::NULL)],
+        vec![prepared(spend_h.0 + 5, tip_fk)],
+        vec![
+            prepared(spend_h.0 + 1, tip_fk),
+            prepared(spend_h.0 + 3, tip_fk),
+        ],
+    ] {
+        assert!(q.confirm_blocks_run(&bad).is_err(), "{:?}", bad[0].height);
+    }
+    assert_eq!(q.tip_height(), Some(spend_h));
+
+    assert!(q.header_has_class_a_body(tip_fk.0).unwrap());
+    assert!(!q.header_has_class_a_body(0).unwrap());
+    let orphan = mine_regtest_block(
+        chain.blocks[5].block_hash(),
+        chain.blocks[6].header.time + 1,
+        6,
+        vec![],
+    );
+    let orphan_hash = orphan.block_hash().to_byte_array();
+    let orphan_rec = header_to_record(Fk::NULL, &orphan.header, orphan_hash);
+    let orphan_fk = q.ensure_header(&orphan_rec).unwrap();
+    assert_eq!(q.ensure_header(&orphan_rec).unwrap(), orphan_fk);
+    assert!(!q.header_has_class_a_body(orphan_fk.0).unwrap());
+    assert!(!q.is_block_archived(&orphan_hash).unwrap());
+    assert_eq!(q.height_of_hash(&orphan_hash).unwrap(), None);
+    assert_eq!(q.archived_block_count().unwrap(), u64::from(spend_h.0) + 1);
+
+    q.invalidate_height_by_hash_index();
+    assert_eq!(
+        q.height_of_hash(&chain.blocks[1].block_hash().to_byte_array())
+            .unwrap(),
+        Some(Height(1))
+    );
+    assert!(q
+        .resume_work_path_after_tip(tip_hash, spend_h.0, 0)
+        .unwrap()
+        .is_empty());
+    assert!(q
+        .resume_work_path_after_tip([0xaa; 32], 0, 10)
+        .unwrap()
+        .is_empty());
+    q.archive_class_a_from_wire(&[]).unwrap();
+
+    assert!(!q.confirm_cancelled());
+    q.request_confirm_cancel();
+    assert!(q.confirm_cancelled());
+    q.clear_confirm_cancel();
+    assert!(!q.confirm_cancelled());
+    q.flush_header_archive().unwrap();
+    q.flush_for_shutdown().unwrap();
 }
 
 fn pin_same_run_create_then_spend(

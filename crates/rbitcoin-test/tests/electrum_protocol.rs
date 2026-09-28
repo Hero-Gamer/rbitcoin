@@ -2355,7 +2355,13 @@ fn direct_indexes_then_sh_bulk_at_tip() {
     }
 
     let q = Query::open_or_create_tiny(&store).unwrap();
+    std::fs::write(store.join("ibd_utxo.map"), b"x").unwrap();
+    std::fs::create_dir_all(store.join("point.runs")).unwrap();
     q.enter_direct_index_mode().unwrap();
+    assert!(
+        !store.join("ibd_utxo.map").exists() && !store.join("point.runs").exists(),
+        "direct mode removes leftover catch-up artifacts"
+    );
     let n_rebuild = q.finalize_sh_runs().unwrap();
     assert!(
         n_rebuild > 0 || !q.scripthash_history(&sh).unwrap().is_empty(),
