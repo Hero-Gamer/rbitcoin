@@ -33,6 +33,7 @@ pub use resolved_wire::{BlockQueueWaveIntake, ResolvedWire};
 pub use soft_densify::{
     bq_assign_stop_bytes, soft_ahead_quarter_full, soft_assign_restricted,
     soft_confirm_window_covered, soft_confirm_window_n, soft_densify_band_hi, BQ_SOFT_FREE_BYTES,
+    TIP_HOLE_MIN_AHEAD_BLOCKS,
 };
 pub use sp_tweaks::{ThinTweakRangeLimits, ThinTweakRow};
 pub use tx_precompute::{decode_block_precomputes, pres_for_tip, TxPrecompute};

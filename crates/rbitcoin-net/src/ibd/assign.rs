@@ -4,10 +4,11 @@
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
 //!   request missing hashes (even if soft body-queue depth is over free floor).
 //!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] **on tip+1 only** when the
-//!   body queue is at least a quarter of the smaller soft budget (the
-//!   confirm-time block window, or the ~100 MiB free floor). Fullness is the
-//!   queue's total blocks and bytes; gaps count. Below that quarter the gap
-//!   is the frontier: one owner, and densify continues. Ranked by expected
+//!   body queue meets any of: 1/4 of the confirm-time block window, 1/4 of
+//!   the configured assign-stop (default 1 GiB), or
+//!   [`rbitcoin_query::TIP_HOLE_MIN_AHEAD_BLOCKS`] bodies. Fullness is the
+//!   queue's total blocks and bytes; gaps count. Below all three the gap is
+//!   the frontier: one owner, and densify continues. Ranked by expected
 //!   drain time (`(queue+1)/bps`), not queue count. Later contiguous holes
 //!   in that gap get one racer until the prefix is in hand. An owner
 //!   with other inflight hashes still has densify in the peer FIFO — drop them
@@ -285,7 +286,12 @@ pub(crate) fn assign_work_ordered(
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     let ahead_n = u32::try_from(bq_count).unwrap_or(u32::MAX);
     let race_tip = !tip_holes.is_empty()
-        && rbitcoin_query::soft_ahead_quarter_full(ahead_n, bq_bytes, tip_rate_blocks_per_s);
+        && rbitcoin_query::soft_ahead_quarter_full(
+            ahead_n,
+            bq_bytes,
+            tip_rate_blocks_per_s,
+            bq_stop,
+        );
     if race_tip {
         issued += cover_tip_batch_holes(st, hub, cfg, &alive, &tip_holes);
     }
@@ -1489,7 +1495,7 @@ pub(in crate::ibd) mod tests {
     }
 
     /// 75×80-byte bodies past the tip window. At 5 blk/s the confirm window is
-    /// 300 blocks, so this is a quarter of that window and under the 100 MiB floor.
+    /// 300 blocks, so this is a quarter of that window.
     fn plant_quarter_window(hub: &ChainHub, path_lo: u32) {
         use bitcoin::hashes::Hash as _;
         let start = path_lo.saturating_add(64);
@@ -1795,11 +1801,15 @@ pub(in crate::ibd) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Rate unknown: a quarter of the 100 MiB floor is the hole threshold.
+    /// Rate unknown: a quarter of the configured assign-stop is the byte threshold.
     #[test]
     fn byte_quarter_full_queue_races_tip_and_stops_densify() {
         let _env = lock_default_assign_stop();
         use bitcoin::hashes::Hash as _;
+        // Quarter is 2 MiB. One new hash reserves 4 MiB, so the stop must
+        // still fit that reserve on top of the queued quarter.
+        let stop: u64 = 8 * 1024 * 1024;
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", stop.to_string());
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(
@@ -1816,7 +1826,7 @@ pub(in crate::ibd) mod tests {
         );
         let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
         plant_work_path(&mut st, path_lo, path_lo.saturating_add(80));
-        let n = (rbitcoin_query::BQ_SOFT_FREE_BYTES / 4) as usize;
+        let n = (stop / 4) as usize;
         let payload = vec![0u8; n];
         hub.query
             .block_queue_offer(
@@ -1837,12 +1847,62 @@ pub(in crate::ibd) mod tests {
         let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
         assert_eq!(
             n0, 4,
-            "a quarter of the 100 MiB floor is a tip hole; n0={n0}"
+            "a quarter of the configured assign-stop is a tip hole; n0={n0}"
         );
         assert!(
             !st.inflight
                 .contains_key(&h(path_lo.saturating_add(TIP_HOLE_MAX as u32))),
             "densify stays off at the byte quarter"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rate cold and bytes far under the assign-stop: 1000 queued bodies is
+    /// still a hole. Early blocks are small, so the byte cap would not fill.
+    #[test]
+    fn ahead_block_count_with_cold_rate_is_a_tip_hole() {
+        let _env = lock_default_assign_stop();
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(40));
+        let start = path_lo.saturating_add(64);
+        for i in 0..rbitcoin_query::TIP_HOLE_MIN_AHEAD_BLOCKS {
+            let ht = start.saturating_add(i);
+            hub.query
+                .block_queue_offer(ht, h(ht).to_byte_array(), 1, &[0u8; 80])
+                .unwrap();
+        }
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 4,
+            "1000 queued bodies with a cold rate is a tip hole; n0={n0}"
+        );
+        assert!(
+            !st.inflight
+                .contains_key(&h(path_lo.saturating_add(TIP_HOLE_MAX as u32))),
+            "densify stays off once the ahead-block floor is met"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -39,7 +39,9 @@ pub(crate) struct WorkStructureSizes {
 ///
 /// Near/far densify use a single peer. Tip-hole hashes race up to
 /// [`super::TIP_HOLE_MAX_PEERS`] once the body queue is a quarter of the
-/// smaller soft budget. Below that, the gap is the frontier.
+/// confirm window or the configured assign-stop, or holds
+/// [`rbitcoin_query::TIP_HOLE_MIN_AHEAD_BLOCKS`] bodies. Below that, the gap
+/// is the frontier.
 ///
 /// Getdata cannot be cancelled. A peer dropped from the race moves to
 /// `retired`: it no longer counts as a racer, but it still holds the request,

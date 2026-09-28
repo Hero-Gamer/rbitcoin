@@ -126,32 +126,47 @@ pub fn soft_confirm_window_covered(
     depth_n >= w
 }
 
-/// True when the body queue is at least a quarter of the smaller soft budget.
+/// Queued bodies that make a tip gap a hole when the confirm rate is cold
+/// or the rate window is huge.
 ///
-/// The budgets are the confirm-time block window ([`soft_confirm_window_n`])
-/// and the fixed free floor ([`BQ_SOFT_FREE_BYTES`]). Whichever is smaller at
-/// the queue's current average block size is the one that matters. Fullness
-/// is that queue's aggregate block count and payload bytes, gaps included.
-/// An empty queue is the frontier. No height walk.
+/// Early blocks are small. A quarter of the default 1 GiB assign-stop is
+/// 256 MiB, a very large count of those blocks. A missing tip+1 with this
+/// many bodies already queued is latency-bound, so it is a hole before the
+/// byte cap fills. When the rate window's own quarter is smaller, that
+/// quarter still starts the race.
+pub const TIP_HOLE_MIN_AHEAD_BLOCKS: u32 = 1000;
+
+/// True when the body queue is far enough ahead to treat a tip gap as a hole.
+///
+/// Any one of these is enough. Fullness is the queue's aggregate block count
+/// and payload bytes, gaps included. An empty queue is the frontier. No
+/// height walk.
+///
+/// - [`TIP_HOLE_MIN_AHEAD_BLOCKS`] bodies already queued
+/// - at least 1/4 of the confirm-time block window ([`soft_confirm_window_n`])
+/// - at least 1/4 of `assign_stop_bytes` (default [`BQ_ASSIGN_STOP_BYTES`],
+///   1 GiB). `0` and `u64::MAX` are unlimited, so that side stays off
+///
+/// The ~100 MiB free floor is the densify horizon, not this budget.
 pub fn soft_ahead_quarter_full(
     ahead_n: u32,
     ahead_bytes: u64,
     rate_blocks_per_s: Option<f64>,
+    assign_stop_bytes: u64,
 ) -> bool {
     if ahead_n == 0 {
         return false;
     }
+    if ahead_n >= TIP_HOLE_MIN_AHEAD_BLOCKS {
+        return true;
+    }
     let window_n = soft_confirm_window_n(rate_blocks_per_s);
-    if window_n == 0 {
-        return ahead_bytes.saturating_mul(4) >= BQ_SOFT_FREE_BYTES;
+    if window_n > 0 && u64::from(ahead_n).saturating_mul(4) >= u64::from(window_n) {
+        return true;
     }
-    let variable_smaller = ahead_bytes.saturating_mul(u64::from(window_n))
-        <= BQ_SOFT_FREE_BYTES.saturating_mul(u64::from(ahead_n));
-    if variable_smaller {
-        u64::from(ahead_n).saturating_mul(4) >= u64::from(window_n)
-    } else {
-        ahead_bytes.saturating_mul(4) >= BQ_SOFT_FREE_BYTES
-    }
+    assign_stop_bytes != 0
+        && assign_stop_bytes != u64::MAX
+        && ahead_bytes.saturating_mul(4) >= assign_stop_bytes
 }
 
 #[cfg(test)]
@@ -251,18 +266,50 @@ mod tests {
     }
 
     #[test]
-    fn quarter_full_uses_the_smaller_soft_budget() {
-        let free = BQ_SOFT_FREE_BYTES;
-        assert!(!soft_ahead_quarter_full(0, free, Some(5.0)));
-        assert!(!soft_ahead_quarter_full(0, 0, None));
-        assert!(!soft_ahead_quarter_full(10, free / 4 - 1, None));
-        assert!(soft_ahead_quarter_full(1, free / 4, None));
-        // 5 blk/s → 300 blocks. 80-byte bodies: the block window is smaller.
-        assert!(!soft_ahead_quarter_full(74, 74 * 80, Some(5.0)));
-        assert!(soft_ahead_quarter_full(75, 75 * 80, Some(5.0)));
-        // 1 MiB bodies: 300 MiB of window exceeds the 100 MiB floor.
-        let mib = 1024 * 1024;
-        assert!(!soft_ahead_quarter_full(10, 10 * mib, Some(5.0)));
-        assert!(soft_ahead_quarter_full(30, 30 * mib, Some(5.0)));
+    fn quarter_full_is_rate_window_or_assign_stop_or_ahead_count() {
+        let stop = BQ_ASSIGN_STOP_BYTES;
+        let quarter = stop / 4;
+        assert!(!soft_ahead_quarter_full(0, quarter, None, stop));
+        assert!(!soft_ahead_quarter_full(10, quarter - 1, None, stop));
+        assert!(soft_ahead_quarter_full(1, quarter, None, stop));
+        // The 100 MiB free floor is the densify horizon, not this byte budget.
+        assert!(!soft_ahead_quarter_full(
+            10,
+            BQ_SOFT_FREE_BYTES / 4,
+            None,
+            stop
+        ));
+        assert!(!soft_ahead_quarter_full(10, quarter, None, u64::MAX));
+        assert!(!soft_ahead_quarter_full(10, quarter, None, 0));
+        // 5 blk/s → 300 blocks. Bytes are far under a quarter of 1 GiB.
+        assert!(!soft_ahead_quarter_full(74, 74 * 80, Some(5.0), stop));
+        assert!(soft_ahead_quarter_full(75, 75 * 80, Some(5.0), stop));
+        // Rate cold: 1000 small bodies is a hole; 999 is still the frontier.
+        let min = TIP_HOLE_MIN_AHEAD_BLOCKS;
+        assert!(!soft_ahead_quarter_full(
+            min - 1,
+            u64::from(min - 1) * 80,
+            None,
+            stop
+        ));
+        assert!(soft_ahead_quarter_full(
+            min,
+            u64::from(min) * 80,
+            None,
+            stop
+        ));
+        // 100 blk/s → 6000-block window (quarter 1500). 1000 still races.
+        assert!(!soft_ahead_quarter_full(
+            min - 1,
+            u64::from(min - 1) * 80,
+            Some(100.0),
+            stop
+        ));
+        assert!(soft_ahead_quarter_full(
+            min,
+            u64::from(min) * 80,
+            Some(100.0),
+            stop
+        ));
     }
 }
