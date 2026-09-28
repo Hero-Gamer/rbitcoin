@@ -497,30 +497,23 @@ fn parse_hash_or_height(v: &Value) -> Result<HashOrHeight, Value> {
     ))
 }
 
-pub(crate) fn prevout_from_block_or_query(
-    ctx: &RpcContext,
-    block: &Block,
-    op: &OutPoint,
-) -> Option<TxOut> {
-    for tx in &block.txdata {
-        if tx.compute_txid() == op.txid {
-            return tx.output.get(op.vout as usize).cloned();
-        }
-    }
-    let fk = ctx.query.tx_fk_by_txid(&op.txid.to_byte_array()).ok()??;
-    let out = ctx.query.tx_output_at_fk(fk, op.vout).ok()?;
-    Some(TxOut {
-        value: Amount::from_sat(out.value.max(0) as u64),
-        script_pubkey: ScriptBuf::from_bytes(out.script),
-    })
-}
+type PrevoutMap = std::collections::HashMap<OutPoint, TxOut>;
 
+/// Every non-coinbase input of a connected block resolves: in-block parents
+/// from the block, the rest through the spender's `input.body` edges.
 fn prevout_map_for_block(
     ctx: &RpcContext,
     height: Height,
     block: &Block,
-) -> std::collections::HashMap<OutPoint, TxOut> {
-    let mut map = std::collections::HashMap::new();
+) -> Result<PrevoutMap, Value> {
+    let store_err = |e: rbitcoin_store::StoreError| rpc_error(ERR_MISC, e.to_string());
+    let broken = |what: String| {
+        rpc_error(
+            ERR_MISC,
+            format!("invariant: getblockstats height {} {what}", height.0),
+        )
+    };
+    let mut map = PrevoutMap::new();
     for tx in &block.txdata {
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
@@ -533,36 +526,44 @@ fn prevout_map_for_block(
             );
         }
     }
-    let Ok(fks) = ctx.query.block_tx_fks(height) else {
-        return map;
-    };
-    for (tx, fk) in block.txdata.iter().zip(fks) {
-        let Ok((_, prevs)) = ctx.query.store().get_tx_meta_and_prevouts(fk) else {
-            continue;
-        };
-        for (i, (create_fk, vout)) in prevs.iter().enumerate() {
-            if create_fk.is_null() {
-                continue;
-            }
-            let Some(inp) = tx.input.get(i) else {
-                continue;
-            };
+    let fks = ctx.query.block_tx_fks(height).map_err(store_err)?;
+    if fks.len() != block.txdata.len() {
+        return Err(broken("tx count".into()));
+    }
+    for (tx, fk) in block.txdata.iter().zip(fks).skip(1) {
+        let (_, prevs) = ctx
+            .query
+            .store()
+            .get_tx_meta_and_prevouts(fk)
+            .map_err(store_err)?;
+        if prevs.len() != tx.input.len() {
+            return Err(broken(format!("{} input edge count", tx.compute_txid())));
+        }
+        for (inp, (create_fk, vout)) in tx.input.iter().zip(prevs) {
             let op = inp.previous_output;
             if map.contains_key(&op) {
                 continue;
             }
-            if let Ok(out) = ctx.query.tx_output_at_fk(*create_fk, *vout) {
-                map.insert(
-                    op,
-                    TxOut {
-                        value: Amount::from_sat(out.value.max(0) as u64),
-                        script_pubkey: ScriptBuf::from_bytes(out.script),
-                    },
-                );
+            if create_fk.is_null() {
+                return Err(broken(format!(
+                    "{} input {op} has no parent edge",
+                    tx.compute_txid()
+                )));
             }
+            let out = ctx
+                .query
+                .tx_output_at_fk(create_fk, vout)
+                .map_err(store_err)?;
+            map.insert(
+                op,
+                TxOut {
+                    value: Amount::from_sat(out.value.max(0) as u64),
+                    script_pubkey: ScriptBuf::from_bytes(out.script),
+                },
+            );
         }
     }
-    map
+    Ok(map)
 }
 
 fn stats_for_stamped(
@@ -618,6 +619,7 @@ fn stats_for_connected(
     ctx: &RpcContext,
     height: Height,
     block: &Block,
+    parents: &PrevoutMap,
 ) -> Result<BlockStats, Value> {
     let mediantime = rbitcoin_consensus::median_time_past(ctx.query.as_ref(), height)
         .unwrap_or(block.header.time);
@@ -626,12 +628,8 @@ fn stats_for_connected(
         None => rbitcoin_consensus::ChainParams::for_network(ctx.network),
     };
     let subsidy = rbitcoin_consensus::block_subsidy(height.0, &params);
-    let parents = prevout_map_for_block(ctx, height, block);
     compute_block_stats(height.0, block, mediantime, subsidy, |op| {
-        parents
-            .get(op)
-            .cloned()
-            .or_else(|| prevout_from_block_or_query(ctx, block, op))
+        parents.get(op).cloned()
     })
     .map_err(|e| rpc_error(ERR_MISC, e))
 }
@@ -702,8 +700,9 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
         .query
         .reconstruct_block_at_height(height)
         .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
+    let parents = prevout_map_for_block(ctx, height, &block)?;
     let _ = ctx.query.stamp_txstat_from_block(height, &block);
-    let stats = stats_for_connected(ctx, height, &block)?;
+    let stats = stats_for_connected(ctx, height, &block, &parents)?;
     stats.select(&want)
 }
 
