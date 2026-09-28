@@ -407,7 +407,8 @@ fn chain_ops_coinbase_only_blocks(ctx: &RpcContext) {
     assert_getblock_core_header_keys(&v1, &hdr);
     assert_eq!(v1["nextblockhash"], tip);
     let v2 = dispatch(ctx, "getblock", vec![tip.clone(), json!(2)]).unwrap();
-    assert!(v2["tx"][0]["vin"][0].get("txid").is_some());
+    assert!(v2["tx"][0]["vin"][0].get("coinbase").is_some());
+    assert!(v2["tx"][0]["vin"][0].get("txid").is_none());
     let tip_hdr = dispatch(ctx, "getblockheader", vec![tip]).unwrap();
     assert_getblock_core_header_keys(&v2, &tip_hdr);
     assert!(v2.get("nextblockhash").is_none());
