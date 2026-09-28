@@ -3016,8 +3016,101 @@ async fn node_run_p2p_short() {
         .unwrap_or_else(|_| panic!("node_run_p2p_short wall timeout ({wall:?})"));
 }
 
+const SILENT_AGENT: &str = "/rbitcoin:silent/";
+
+async fn next_ping(raw: &mut rbitcoin_net::V2PlainSession) -> u64 {
+    use bitcoin::p2p::message::NetworkMessage;
+    let ping_id = rbitcoin_net::encode_v2_contents(NetworkMessage::Ping(0)).expect("encode")[0];
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let c = raw.read_contents().await.expect("read");
+            if c.len() == 9 && c[0] == ping_id {
+                return u64::from_le_bytes(c[1..9].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("the node pings")
+}
+
+/// A raw BIP324 inbound answers the node's first ping with a wrong nonce
+/// (the ping stays outstanding) and then the right one. It answers the next
+/// ping with a zero nonce (Core ends the ping) and never pongs again.
+async fn pong_first_ping_then_go_silent(node: &P2PNode) -> rbitcoin_net::V2PlainSession {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::encode_v2_contents;
+
+    let to = node.local_addr;
+    let mut raw = rbitcoin_net::V2PlainSession::outbound_bip324(
+        tokio::net::TcpStream::connect(to).await.expect("dial"),
+    )
+    .await
+    .expect("BIP324");
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&to, ServiceFlags::NONE),
+        sender: Address::new(&to, ServiceFlags::NONE),
+        nonce: 7,
+        user_agent: SILENT_AGENT.into(),
+        start_height: 0,
+        relay: true,
+    };
+    for msg in [NetworkMessage::Version(ver), NetworkMessage::Verack] {
+        raw.write_contents(&encode_v2_contents(msg).expect("encode"))
+            .await
+            .expect("write handshake");
+    }
+    let row = || {
+        node.peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.subver == SILENT_AGENT)
+            .expect("silent peer row")
+    };
+    let pong = |n: u64| encode_v2_contents(NetworkMessage::Pong(n)).expect("encode");
+
+    let nonce = next_ping(&mut raw).await;
+    raw.write_contents(&pong(nonce.wrapping_sub(1)))
+        .await
+        .expect("write pong");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        row().pingwait.is_some(),
+        "a mismatched nonce leaves the ping outstanding: {:?}",
+        row()
+    );
+    raw.write_contents(&pong(nonce)).await.expect("write pong");
+    wait_ms_until(
+        2_000,
+        || {
+            let r = row();
+            r.pingwait.is_none() && r.pingtime.is_some() && r.minping.is_some()
+        },
+        || format!("the matching pong clears pingwait: {:?}", row()),
+    )
+    .await;
+
+    node.peers.set_mock_now(node.peers.now_secs() + 121);
+    next_ping(&mut raw).await;
+    assert!(row().pingwait.is_some(), "{:?}", row());
+    raw.write_contents(&pong(0)).await.expect("write pong");
+    wait_ms_until(
+        2_000,
+        || row().pingwait.is_none(),
+        || format!("a zero nonce ends the ping: {:?}", row()),
+    )
+    .await;
+    raw
+}
+
 /// `feature_bip68_sequence` unconfirmed-inputs: 10× `setmocktime(+600)` plus
-/// generate must not ping-timeout a peer that pongs on localhost.
+/// generate must not ping-timeout a peer that pongs on localhost. A peer that
+/// stops ponging is dropped by the same clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mocktime_generate_keeps_ponging_peer() {
     let fut = async {
@@ -3042,6 +3135,7 @@ async fn mocktime_generate_keeps_ponging_peer() {
             },
         )
         .await;
+        let mut silent = pong_first_ping_then_go_silent(&a).await;
 
         let t0 = a.peers.now_secs();
         let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
@@ -3055,10 +3149,15 @@ async fn mocktime_generate_keeps_ponging_peer() {
             })
             .await
             .expect("join");
+            // Session heartbeats (50ms) ping and time out on this clock step.
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !a.peers.snapshot().is_empty(),
+            a.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.handshake_complete && p.subver != SILENT_AGENT),
             "miner must keep the ponging peer after 6000s mocktime+generate: {:?}",
             a.peers.snapshot()
         );
@@ -3067,6 +3166,7 @@ async fn mocktime_generate_keeps_ponging_peer() {
             "follower must stay connected: {:?}",
             b.peers.snapshot()
         );
+        wait_v2_eof(&mut silent, "a peer that stops ponging must ping-timeout").await;
         a.shutdown().await;
         b.shutdown().await;
     };
