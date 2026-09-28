@@ -213,6 +213,9 @@ fn try_enqueue_ordered_header(
     false
 }
 
+/// After the full batch fails, probe one header before searching.
+///
+/// A rejected first header means no longer prefix can be stored.
 fn accepted_prefix_after_failure<T>(
     len: usize,
     mut probe: impl FnMut(usize) -> Result<Vec<T>, NetError>,
@@ -242,7 +245,9 @@ fn accepted_prefix_after_failure<T>(
 /// Longest prefix [`ChainHub::ensure_headers_batch`] accepts.
 ///
 /// A rejected tail is not stored and must not update path or explore state.
-/// The success path is one batch. A failing tail binary-searches the prefix.
+/// The success path is one batch. A failing batch probes the first header
+/// and stops when that header is rejected. Otherwise the rest of the prefix
+/// is binary-searched.
 fn ensure_accepted_prefix(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
