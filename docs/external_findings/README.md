@@ -53,7 +53,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `mempool_accept_life` |
 | [046](./046-spend-durability.md) | high | Spend slot missing after the tip seal is unspent | fixed | `zeroed_spend_slot_after_tip_seal_rejects_respend` |
 | [045](./045-addr-relay.md) | medium | Addr relay is one or two peers, not every peer | fixed | `hostile_peer_session` |
-| [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_plain_cookie_is_not_sent_when_safecookie_is_absent` |
+| [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_control_onion_lifecycle` |
 | [043](./043-peer-send-buffer.md) | high | Unbounded per-peer outbound queue | fixed | `hostile_peer_session` |
 | [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
 

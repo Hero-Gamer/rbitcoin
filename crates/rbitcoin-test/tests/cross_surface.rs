@@ -15,6 +15,8 @@ use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -2058,4 +2060,384 @@ async fn node_listen_and_exit() {
         .expect_err("unpruned start on a pruned datadir")
         .to_string();
     assert!(err.contains("--prune-seqsigwit"), "{err}");
+}
+
+/// Tor control port stand-in: PROTOCOLINFO advertises `methods`, SAFECOOKIE
+/// answers from `cookie`, and ADD_ONION NEW mints `key{n}` for service `n`.
+/// Every command line lands in `log`. Live Tor is overlay-functional.
+struct FakeTor {
+    addr: SocketAddr,
+    methods: Arc<Mutex<&'static str>>,
+    log: Arc<Mutex<Vec<String>>>,
+    minted: Arc<Mutex<Vec<String>>>,
+}
+
+const TOR_COOKIE: [u8; 32] = [0x2a; 32];
+const TOR_PASSWORD: &str = "s3cret";
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use bitcoin::hashes::{hmac, sha256, HashEngine};
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(key);
+    engine.input(data);
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+}
+
+fn fake_onion_service_id(n: usize) -> String {
+    let pk = [u8::try_from(n + 1).unwrap(); 32];
+    let name = rbitcoin_net::NetAddr::Onion { pk, port: 0 }.to_string();
+    name.trim_end_matches(".onion:0").to_string()
+}
+
+impl FakeTor {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tor = Self {
+            addr: listener.local_addr().unwrap(),
+            methods: Arc::new(Mutex::new("SAFECOOKIE")),
+            log: Arc::default(),
+            minted: Arc::default(),
+        };
+        let (methods, log, minted) = (
+            Arc::clone(&tor.methods),
+            Arc::clone(&tor.log),
+            Arc::clone(&tor.minted),
+        );
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                tokio::spawn(fake_tor_session(
+                    s,
+                    Arc::clone(&methods),
+                    Arc::clone(&log),
+                    Arc::clone(&minted),
+                ));
+            }
+        });
+        tor
+    }
+
+    fn take_log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().unwrap())
+    }
+}
+
+async fn fake_tor_session(
+    s: TcpStream,
+    methods: Arc<Mutex<&'static str>>,
+    log: Arc<Mutex<Vec<String>>>,
+    minted: Arc<Mutex<Vec<String>>>,
+) {
+    use bitcoin::hex::{DisplayHex, FromHex};
+    let (r, mut w) = s.into_split();
+    let mut lines = BufReader::new(r).lines();
+    let mut client_hash: Option<[u8; 32]> = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        log.lock().unwrap().push(line.clone());
+        let reply = if line == "PROTOCOLINFO 1" {
+            let methods = *methods.lock().unwrap();
+            format!("250-PROTOCOLINFO 1\r\n250-AUTH METHODS={methods}\r\n250 OK\r\n")
+        } else if let Some(nonce) = line.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+            let server_nonce = [0x5a; 32];
+            let mut mat = TOR_COOKIE.to_vec();
+            mat.extend(Vec::<u8>::from_hex(nonce).unwrap());
+            mat.extend(server_nonce);
+            client_hash = Some(hmac_sha256(
+                b"Tor safe cookie authentication controller-to-server hash",
+                &mat,
+            ));
+            let server_hash = hmac_sha256(
+                b"Tor safe cookie authentication server-to-controller hash",
+                &mat,
+            );
+            format!(
+                "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                server_hash.to_lower_hex_string(),
+                server_nonce.to_lower_hex_string()
+            )
+        } else if let Some(auth) = line.strip_prefix("AUTHENTICATE ") {
+            let ok = auth == format!("\"{TOR_PASSWORD}\"")
+                || client_hash.is_some_and(|h| auth == h.to_lower_hex_string());
+            if ok {
+                "250 OK\r\n"
+            } else {
+                "515 Authentication failed\r\n"
+            }
+            .to_string()
+        } else if line == "GETINFO version" {
+            "250-version=0.4.8.10\r\n250 OK\r\n".to_string()
+        } else if let Some(rest) = line.strip_prefix("ADD_ONION ") {
+            let spec = rest.split_once(" Port=").map_or(rest, |(s, _)| s);
+            let mut minted = minted.lock().unwrap();
+            if spec == "NEW:ED25519-V3" {
+                let n = minted.len();
+                minted.push(format!("ED25519-V3:key{n}"));
+                format!(
+                    "250-ServiceID={}\r\n250-PrivateKey={}\r\n250 OK\r\n",
+                    fake_onion_service_id(n),
+                    minted[n]
+                )
+            } else if let Some(n) = minted.iter().position(|k| k == spec) {
+                format!("250-ServiceID={}\r\n250 OK\r\n", fake_onion_service_id(n))
+            } else {
+                "512 Invalid onion key\r\n".to_string()
+            }
+        } else {
+            "510 Unrecognized command\r\n".to_string()
+        };
+        if w.write_all(reply.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// I2P SAM stand-in: SESSION CREATE TRANSIENT hands out destination `n`, a
+/// stored destination comes back as itself, and STREAM FORWARD is accepted.
+struct FakeSam {
+    addr: SocketAddr,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+/// A 387-byte public destination with no certificate, distinct per `n`:
+/// I2P base64 of `fake_i2p_public(n)`.
+fn fake_i2p_destination(n: usize) -> String {
+    let first = char::from(b'B' + u8::try_from(n).unwrap());
+    format!("{first}{}", "A".repeat(515))
+}
+
+fn fake_i2p_public(n: usize) -> Vec<u8> {
+    let mut raw = vec![0u8; 387];
+    raw[0] = (u8::try_from(n).unwrap() + 1) << 2;
+    raw
+}
+
+impl FakeSam {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sam = Self {
+            addr: listener.local_addr().unwrap(),
+            log: Arc::default(),
+        };
+        let log = Arc::clone(&sam.log);
+        let transient = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                let (log, transient) = (Arc::clone(&log), Arc::clone(&transient));
+                tokio::spawn(async move {
+                    let (r, mut w) = s.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        log.lock().unwrap().push(line.clone());
+                        let reply = if line.starts_with("HELLO VERSION") {
+                            "HELLO REPLY RESULT=OK VERSION=3.1".to_string()
+                        } else if line.starts_with("SESSION CREATE") {
+                            let asked = line
+                                .split_whitespace()
+                                .find_map(|t| t.strip_prefix("DESTINATION="))
+                                .unwrap_or("TRANSIENT");
+                            let dest = if asked == "TRANSIENT" {
+                                let n = transient.fetch_add(1, Ordering::SeqCst);
+                                fake_i2p_destination(n)
+                            } else {
+                                asked.to_string()
+                            };
+                            format!("SESSION STATUS RESULT=OK DESTINATION={dest}")
+                        } else if line.starts_with("STREAM FORWARD") {
+                            "STREAM STATUS RESULT=OK".to_string()
+                        } else {
+                            "SESSION STATUS RESULT=I2P_ERROR".to_string()
+                        };
+                        if w.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        sam
+    }
+
+    fn take_log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log.lock().unwrap())
+    }
+}
+
+fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+/// An operator publishes P2P, Electrum, and Esplora as onion and I2P
+/// services through a local Tor control port and SAM bridge. A bad or short
+/// cookie, or a Tor that does not offer SAFECOOKIE, stops the start before
+/// any AUTHENTICATE; password auth mints and saves a key per service; a
+/// SAFECOOKIE restart reuses every saved key and destination.
+#[tokio::test(flavor = "multi_thread")]
+async fn tor_control_onion_lifecycle() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let tor = FakeTor::start().await;
+    let sam = FakeSam::start().await;
+    let cookie = dir.join("control.authcookie");
+    let cookie_cfg = |cookie: &std::path::Path| {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(tor.addr);
+        cfg.tor.cookie = Some(cookie.to_path_buf());
+        cfg
+    };
+
+    // A cookie from another Tor, a truncated cookie, and a Tor that only
+    // offers plain COOKIE all refuse the start, and none sends AUTHENTICATE:
+    // the node never hands the raw cookie to whatever owns the port.
+    std::fs::write(&cookie, [0u8; 32]).unwrap();
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("wrong cookie")
+        .to_string();
+    assert!(err.contains("server hash mismatch"), "{err}");
+    std::fs::write(&cookie, [0x2a; 2]).unwrap();
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("short cookie")
+        .to_string();
+    assert!(err.contains("32 bytes"), "{err}");
+    std::fs::write(&cookie, TOR_COOKIE).unwrap();
+    *tor.methods.lock().unwrap() = "COOKIE";
+    let err = start_and_exit(cookie_cfg(&cookie))
+        .await
+        .expect_err("plain COOKIE only")
+        .to_string();
+    assert!(err.contains("SAFECOOKIE"), "{err}");
+    let refused = tor.take_log();
+    assert!(
+        starts_with_any(&refused, "AUTHENTICATE ").is_empty(),
+        "{refused:?}"
+    );
+    assert!(
+        starts_with_any(&refused, "ADD_ONION ").is_empty(),
+        "{refused:?}"
+    );
+
+    // Password auth. Each service gets a fresh onion key, saved 0600 under
+    // the datadir, and an I2P destination; getnetworkinfo lists them all.
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (p2p, electrum, esplora, rpc) = (
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+    );
+    let services_cfg = || {
+        let mut cfg = listen_and_exit_cfg(&dir).with_p2p_listen(p2p);
+        cfg.tor.control = Some(tor.addr);
+        cfg.listen.listen_onion = true;
+        cfg.listen.i2p_sam = Some(sam.addr);
+        cfg.listen.i2p_accept_incoming = true;
+        cfg.shindex = true;
+        cfg.listen.electrum = Some(electrum);
+        cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora));
+        cfg
+    };
+    let mut cfg = services_cfg();
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+    let node = tokio::spawn(run_p2p(cfg));
+    wait_listeners(&[electrum, esplora, rpc]).await;
+    let info = jsonrpc(rpc, "getnetworkinfo", json!([])).await;
+    let local: Vec<(String, u64)> = info["result"]["localaddresses"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{info}"))
+        .iter()
+        .map(|r| {
+            (
+                r["address"].as_str().unwrap().to_string(),
+                r["port"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let regtest_port = Network::Regtest.default_p2p_port();
+    for (n, port) in [(0, regtest_port), (1, electrum.port()), (2, esplora.port())] {
+        let host = format!("{}.onion", fake_onion_service_id(n));
+        assert!(local.contains(&(host, u64::from(port))), "{local:?}");
+    }
+    let i2p_p2p = rbitcoin_net::NetAddr::I2p {
+        dest: bitcoin::hashes::sha256::Hash::hash(&fake_i2p_public(0)).to_byte_array(),
+        port: 0,
+    }
+    .host_str();
+    assert!(local.iter().any(|(a, _)| *a == i2p_p2p), "{local:?}");
+    let _ = jsonrpc(rpc, "stop", json!([])).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
+    assert!(
+        matches!(stopped, Ok(Ok(Ok(())))),
+        "run_p2p did not stop cleanly"
+    );
+
+    let first = tor.take_log();
+    assert!(first.contains(&format!("AUTHENTICATE \"{TOR_PASSWORD}\"")));
+    let onions = starts_with_any(&first, "ADD_ONION ");
+    let targets = [
+        format!("Port={regtest_port},127.0.0.1:{}", p2p.port()),
+        format!("Port={0},127.0.0.1:{0}", electrum.port()),
+        format!("Port={0},127.0.0.1:{0}", esplora.port()),
+    ];
+    assert_eq!(onions.len(), 3, "{onions:?}");
+    for (line, target) in onions.iter().zip(&targets) {
+        assert_eq!(*line, format!("ADD_ONION NEW:ED25519-V3 {target}"));
+    }
+    for (n, name) in ["p2p", "electrum", "esplora"].into_iter().enumerate() {
+        let key = dir.join("onion").join(format!("{name}.priv"));
+        assert_eq!(
+            std::fs::read_to_string(&key).unwrap().trim(),
+            format!("ED25519-V3:key{n}")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} onion key mode");
+        }
+        let dest = dir.join("i2p").join(format!("{name}.priv"));
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap().trim(),
+            fake_i2p_destination(n)
+        );
+    }
+    let forwards = starts_with_any(&sam.take_log(), "STREAM FORWARD");
+    for port in [p2p.port(), electrum.port(), esplora.port()] {
+        assert!(
+            forwards
+                .iter()
+                .any(|f| f.contains(&format!("PORT={port} "))),
+            "{forwards:?}"
+        );
+    }
+
+    // SAFECOOKIE restart: the same three services under the saved keys, and
+    // each SAM session under its saved destination.
+    *tor.methods.lock().unwrap() = "SAFECOOKIE";
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    start_and_exit(cfg).await.expect("SAFECOOKIE restart");
+    let second = tor.take_log();
+    assert_eq!(
+        starts_with_any(&second, "AUTHCHALLENGE SAFECOOKIE ").len(),
+        1,
+        "{second:?}"
+    );
+    let onions = starts_with_any(&second, "ADD_ONION ");
+    assert_eq!(onions.len(), 3, "{onions:?}");
+    for (n, (line, target)) in onions.iter().zip(&targets).enumerate() {
+        assert_eq!(*line, format!("ADD_ONION ED25519-V3:key{n} {target}"));
+    }
+    assert_eq!(tor.minted.lock().unwrap().len(), 3, "no key minted twice");
+    let creates = starts_with_any(&sam.take_log(), "SESSION CREATE");
+    assert_eq!(creates.len(), 3, "{creates:?}");
+    for n in 0..3 {
+        let dest = format!("DESTINATION={} ", fake_i2p_destination(n));
+        assert!(creates.iter().any(|c| c.contains(&dest)), "{creates:?}");
+    }
 }
