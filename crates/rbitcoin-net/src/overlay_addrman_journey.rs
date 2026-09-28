@@ -116,6 +116,61 @@ fn advertise_then_self_announce(hub: &Arc<PeerHub>) {
     }
 }
 
+fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [crate::NetAddr; 3]) {
+    use crate::netaddr::OnlyNet;
+    let [onion, i2p, cjdns] = overlays;
+    let crate::NetAddr::Cjdns { ip, port } = cjdns else {
+        panic!("{cjdns}");
+    };
+    let cjdns_sock = SocketAddr::from((ip, port));
+    let book = am.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    let clear = book.take_dial_candidates(8, &HashSet::new(), &[]);
+    assert!(
+        clear.iter().any(|a| a.ip() == IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+        "{clear:?}"
+    );
+    assert!(
+        !clear.contains(&cjdns_sock),
+        "fc00 must not dial without --cjdns-reachable: {clear:?}"
+    );
+
+    let mut only = book.clone();
+    only.set_only_net(vec![OnlyNet::Onion]);
+    assert_eq!(only.take_dial_candidates_net(8, &HashSet::new(), &[]), vec![onion]);
+    assert!(only.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+
+    let mut only = book.clone();
+    only.set_only_net(vec![OnlyNet::I2p]);
+    let got = only.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    assert!(got.contains(&i2p), "{got:?}");
+    assert!(
+        got.iter().all(|a| matches!(a, crate::NetAddr::I2p { .. })),
+        "{got:?}"
+    );
+    assert!(only.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+
+    let mut only = book.clone();
+    only.set_cjdns_reachable(true);
+    only.set_only_net(vec![OnlyNet::Cjdns]);
+    assert_eq!(only.take_dial_candidates(8, &HashSet::new(), &[]), vec![cjdns_sock]);
+
+    let dir = rbitcoin_query::testutil::TempDir::labeled("overlay-peers").unwrap();
+    let path = dir.join("peers");
+    book.save(&path).unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(body.starts_with("rbitcoin-peers-v2"), "{body}");
+    assert!(body.contains(".b32.i2p:8333") && body.contains("fc00:"), "{body}");
+    let loaded = crate::seeds::AddrMan::load(&path).unwrap();
+    for want in [onion, i2p, cjdns] {
+        assert!(
+            loaded.entries().iter().any(|e| e.addr == want),
+            "{want} must persist, got {:?}",
+            loaded.entries()
+        );
+    }
+}
+
 #[test]
 fn overlay_config() {
     dial_targets_roundtrip();
@@ -165,6 +220,7 @@ fn overlay_config() {
     };
     learn_overlay(&hub, AddrV2::Cjdns(cjdns_ip), 8333, 5);
     assert!(book_has(&am, cjdns));
+    only_net_dials_and_peers_file(&am, [onion, i2p, cjdns]);
 
     let bind = SocketAddr::from(([127, 0, 0, 1], 18444));
     let v1 = hub.addr_response_for_bind(bind);
