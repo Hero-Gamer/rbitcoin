@@ -213,6 +213,32 @@ fn try_enqueue_ordered_header(
     false
 }
 
+fn accepted_prefix_after_failure<T>(
+    len: usize,
+    mut probe: impl FnMut(usize) -> Result<Vec<T>, NetError>,
+) -> (usize, Vec<T>) {
+    let Ok(mut lo_fks) = probe(1) else {
+        return (0, Vec::new());
+    };
+    let mut lo = 1usize;
+    let mut hi = len;
+    for _ in 0..len {
+        let width = hi - lo;
+        if width <= 1 {
+            break;
+        }
+        let mid = lo + width / 2;
+        match probe(mid) {
+            Ok(fks) => {
+                lo = mid;
+                lo_fks = fks;
+            }
+            Err(_) => hi = mid,
+        }
+    }
+    (lo, lo_fks)
+}
+
 /// Longest prefix [`ChainHub::ensure_headers_batch`] accepts.
 ///
 /// A rejected tail is not stored and must not update path or explore state.
@@ -230,25 +256,9 @@ fn ensure_accepted_prefix(
     if headers.len() == 1 {
         return Vec::new();
     }
-    let mut lo = 0usize;
-    let mut lo_fks = Vec::new();
-    let mut hi = headers.len();
-    // A midpoint that does not shrink the window is not a longer prefix.
-    // The batch length caps a stuck step so it returns this `lo`.
-    for _ in 0..headers.len() {
-        let width = hi - lo;
-        if width <= 1 {
-            break;
-        }
-        let mid = lo + width / 2;
-        match hub.ensure_headers_batch(&headers[..mid]) {
-            Ok(fks) => {
-                lo = mid;
-                lo_fks = fks;
-            }
-            Err(_) => hi = mid,
-        }
-    }
+    let (lo, lo_fks) = accepted_prefix_after_failure(headers.len(), |mid| {
+        hub.ensure_headers_batch(&headers[..mid])
+    });
     headers[..lo].iter().copied().zip(lo_fks).collect()
 }
 
