@@ -25,5 +25,5 @@ grant sees.
 `tor_short_cookie_does_not_fall_back_to_raw_hex`,
 `config::tests::builders_paths_milestone_and_ensure`,
 `rbitcoin-rpc` `server::tests::unix_socket_needs_no_http_auth`,
-`rbitcoin-esplora` `server::tests::unix_listen_serves_tip_height`,
+`rbitcoin-esplora` `internal::tests::esplora_unix_internal`,
 `rbitcoin-net` `net_permissions::tests::loopback_grant_does_not_cover_onion_or_i2p`.

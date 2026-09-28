@@ -1265,34 +1265,6 @@ mod tests {
         (status, body)
     }
 
-    fn parse_http_response(buf: &[u8]) -> (u16, String) {
-        let text = String::from_utf8_lossy(buf).into_owned();
-        let status = text
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let body = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        (status, body)
-    }
-
-    #[cfg(unix)]
-    async fn http_get_unix(sock: &std::path::Path, path: &str) -> (u16, String) {
-        use tokio::net::UnixStream;
-        let mut stream = UnixStream::connect(sock).await.expect("unix connect");
-        let req = format!("GET {path} HTTP/1.1\r\nHost: api\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        parse_http_response(&buf)
-    }
-
     #[test]
     fn esplora_listen_parse_tcp_and_path() {
         assert!(matches!(
@@ -1552,33 +1524,6 @@ mod tests {
             !bare.load(Ordering::Relaxed),
             "unix bind changed umask and a temp dir lost search permission"
         );
-    }
-
-    #[tokio::test]
-    async fn unix_listen_serves_tip_height() {
-        let (dir, q) = temp_query("esplora-unix");
-        let (h0, t0) = coinbase(0, Fk::NULL, None);
-        q.connect_block(Height(0), &h0, &[t0]).unwrap();
-        let q = Arc::new(q);
-        let sock = dir.join("esplora.sock");
-        let cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock.clone()), Network::Regtest);
-        let handle = run_esplora(cfg, q, None).await.expect("unix listen");
-        assert!(sock.exists(), "socket file");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
-            assert_eq!(
-                mode, 0o660,
-                "esplora socket is created group-restricted, got {mode:o}"
-            );
-        }
-        let (st, body) = http_get_unix(&sock, "/blocks/tip/height").await;
-        assert_eq!(st, 200, "{body}");
-        assert_eq!(body, "0");
-        let (st, body) = http_get_unix(&sock, "/internal/mempool/txs").await;
-        assert_eq!(st, 200, "{body}");
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
