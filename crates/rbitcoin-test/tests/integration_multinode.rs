@@ -2344,6 +2344,25 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         "{tips:?}"
     );
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+
+    // `feature_chain_tiebreaks.py`: invalidating the tip picks the first-seen
+    // equal-work held sibling, not the last of the 17 and not the stump.
+    hub.invalidate_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "first-seen equal-work held tip must win after invalidate"
+    );
+    hub.precious_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "precious of an invalidated hash is a no-op"
+    );
+    hub.reconsider_block(ext.block_hash()).unwrap();
+    hub.precious_block(ext.block_hash()).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+
     hub.precious_block(sibling.block_hash()).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
     let h1 = BlockHash::from_byte_array(

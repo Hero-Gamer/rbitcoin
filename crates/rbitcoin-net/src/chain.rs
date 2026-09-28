@@ -1840,7 +1840,8 @@ impl ChainHub {
         Ok(())
     }
 
-    /// After invalidate, activate the best remaining fork (held or archive).
+    /// After invalidate, activate the remaining fork (held or archive) with
+    /// the most total chain work. Equal work keeps the first-seen held tip.
     fn try_apply_after_invalidate(&self) -> Result<Option<AcceptOutcome>, NetError> {
         let inv = self.invalidated.set.read().unwrap().clone();
         let mut starts: Vec<BlockHash> = self.fork_tips.read().unwrap().iter().copied().collect();
@@ -1862,7 +1863,7 @@ impl ChainHub {
                 continue;
             }
             let tip = branch.last().map(|b| b.block_hash()).unwrap_or(start);
-            let Ok(w) = self.branch_header_work(&branch) else {
+            let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
             let seq = self.held_bodies.read().unwrap().seq(tip);
@@ -2245,6 +2246,27 @@ impl ChainHub {
         }
         crate::most_work::sum_work(works.into_iter())
             .map_err(|_| NetError::Consensus("work overflow".into()))
+    }
+
+    /// Total chain work of `blocks` connected on their fork point.
+    fn branch_chain_work(&self, blocks: &[Block]) -> Result<Work, NetError> {
+        let branch = self.branch_header_work(blocks)?;
+        let Some(fork_height) = self.accept_branch_fork_height(blocks)? else {
+            return Ok(branch);
+        };
+        self.ensure_chain_work_prefix()?;
+        let base = self
+            .chain_work_prefix
+            .read()
+            .unwrap()
+            .get(fork_height as usize)
+            .copied()
+            .ok_or_else(|| {
+                NetError::Consensus(format!(
+                    "invariant: no chain work at fork height {fork_height}"
+                ))
+            })?;
+        Ok(base + branch)
     }
 
     fn accept_branch_weaker(
