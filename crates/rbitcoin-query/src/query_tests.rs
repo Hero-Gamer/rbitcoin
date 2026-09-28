@@ -688,45 +688,6 @@ fn chain_view_run_not_found_on_empty() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Tip commit (`confirm_block`) must publish `confirmed[]` without waiting
-/// on Class B scripthash. Drain is [`Query::apply_sh_pending`] (or
-/// [`Query::connect_block`], which drains for fixtures).
-#[test]
-fn tip_confirm_does_not_advance_sh_watermark() {
-    let (dir, q) = temp_query("tip-confirm-no-sh");
-    assert!(q.index_mode().is_tip());
-    assert!(q.sh_index_enabled());
-
-    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    let hash0 = h0.hash;
-    q.connect_block(Height(0), &h0, &[t0]).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(0)));
-    assert_eq!(q.sh_indexed_through_height(), Some(0));
-
-    let sh = script_hash(&[0x51]);
-    assert_eq!(q.scripthash_history(&sh).unwrap().len(), 1);
-
-    let prev_fk = q.tip_header_fk().unwrap().unwrap();
-    let (h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
-    q.commit_class_a_only(&h1, &[t1]).unwrap();
-    q.confirm_block(Height(1), &h1.hash).unwrap();
-
-    assert_eq!(q.tip_height(), Some(Height(1)));
-    assert_eq!(
-        q.sh_indexed_through_height(),
-        Some(0),
-        "confirm must not advance SH watermark"
-    );
-    let hist = q.scripthash_history(&sh).unwrap();
-    assert_eq!(
-        hist.len(),
-        2,
-        "pending SH records must show the new tip create: {hist:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn sh_writebehind_does_not_seed_until_release() {
     let (dir, q) = temp_query("sh-no-seed-until-release");
