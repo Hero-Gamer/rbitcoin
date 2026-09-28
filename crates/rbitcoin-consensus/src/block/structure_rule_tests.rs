@@ -341,95 +341,42 @@ fn padded_spend(data_len: usize) -> Transaction {
     }
 }
 
-/// Unspent connected sibling + same create txid is BIP30 (not the 91842/91880
-/// mainnet grandfather). Spentness is durable annotate; this pin is the reject.
-#[test]
-fn bip30_rejects_unspent_connected_sibling() {
-    use crate::block::structural_validate_spends;
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
-    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
-    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("bip30-unspent");
-    q.enter_direct_index_mode().unwrap();
-
-    let first = coinbase(1);
-    let txid = first.compute_txid().to_byte_array();
-    let rec = TxRecord {
-        txid,
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-    };
-    let fk = q
-        .store()
-        .put_tx_full_batch_indexed(
-            &[(
-                rec,
-                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
-                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
-            )],
-            true,
-        )
-        .unwrap()[0];
-    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
-    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
-    q.store().rebuild_height_fence().unwrap();
-
-    let dup = block_with(vec![first]);
-    let ctx = ctx_h(10);
-    let err = structural_validate_spends(
-        &q,
-        &dup,
-        &ctx,
-        Some(&[Fk(2)]),
-        &[],
-        0,
-        &mut OutPointSet::default(),
-        &BatchParents::new(),
-        &mut U32Map::default(),
-        &FkMap::default(),
-        &mut crate::block::StructuralScratch::default(),
-    )
-    .expect_err("unspent sibling must trip BIP30");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("bad-txns-BIP30"),
-        "expected BIP30 reject, got {msg}"
-    );
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-/// Signet activates BIP34 at height 1. Core's empty BIP34 hash still enforces
-/// BIP30 on every signet block.
-fn signet_rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
+/// An unspent connected coinbase with the same txid is BIP30 on regtest (no
+/// 91842/91880 grandfather). Signet activates BIP34 at height 1, and Core's
+/// empty BIP34 hash still enforces BIP30 on every signet block.
+fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
     use crate::block::structural_validate_spends;
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
     let dup = block_with(vec![first.clone()]);
-    let p = Box::leak(Box::new(ChainParams::signet()));
-    let ctx = ValidationContext::at(p, Height(2), Milestone::NONE);
-    let err = structural_validate_spends(
-        q,
-        &dup,
-        &ctx,
-        Some(&[Fk(2)]),
-        &[],
-        0,
-        &mut OutPointSet::default(),
-        &BatchParents::new(),
-        &mut U32Map::default(),
-        &FkMap::default(),
-        &mut crate::block::StructuralScratch::default(),
-    )
-    .expect_err("signet must enforce BIP30 after height 1");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("bad-txns-BIP30"),
-        "expected BIP30 reject, got {msg}"
-    );
+    let signet = Box::leak(Box::new(ChainParams::signet()));
+    for (ctx, net) in [
+        (ctx_h(10), "regtest"),
+        (
+            ValidationContext::at(signet, Height(2), Milestone::NONE),
+            "signet",
+        ),
+    ] {
+        let err = structural_validate_spends(
+            q,
+            &dup,
+            &ctx,
+            Some(&[Fk(2)]),
+            &[],
+            0,
+            &mut OutPointSet::default(),
+            &BatchParents::new(),
+            &mut U32Map::default(),
+            &FkMap::default(),
+            &mut crate::block::StructuralScratch::default(),
+        )
+        .expect_err("an unspent overwrite must trip BIP30");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bad-txns-BIP30"),
+            "{net}: expected BIP30 reject, got {msg}"
+        );
+    }
 }
 
 fn plant_unspent_coinbase(
@@ -1702,7 +1649,7 @@ fn signet_low_work_fork_runs_scripts(q: &rbitcoin_query::Query) {
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (signet_path, signet_q, signet_tx) = plant_unspent_coinbase("buried-signet");
-    signet_rejects_unspent_overwrite(&signet_q, &signet_tx);
+    rejects_unspent_overwrite(&signet_q, &signet_tx);
     signet_low_work_fork_runs_scripts(&signet_q);
     let (main_path, main_q, main_tx) = plant_unspent_coinbase("buried-mainnet");
     mainnet_ancestor_skip_then_miss(&main_q, &main_tx);
