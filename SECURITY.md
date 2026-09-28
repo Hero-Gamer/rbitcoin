@@ -64,6 +64,11 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
+- **Health listener:** `--health-listen` is opt-in, read-only, and
+  unauthenticated (`/healthz`, `/readyz`, and `/metrics` with `--metrics`).
+  It binds before the store opens and keeps the same always-on concurrency,
+  body, and timeout limits. `/metrics` reveals peer counts and mempool size;
+  keep the port on loopback or a probe-only network.
 - **Store / archive:** corruption or incorrect spend/scripthash results that
   mislead a **wallet** backend are in scope. Truncating a sealed mmap after
   it is mapped is fatal external corruption (the next read can SIGBUS), not
