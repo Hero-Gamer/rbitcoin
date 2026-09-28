@@ -1241,7 +1241,8 @@ mod tests {
         let mut both = super::super::state::InflightReq::new(3);
         both.add_peer(4);
         inflight.insert(shared, both);
-        let freed = release_peer_block_work(&mut [slot], &mut inflight, 3);
+        let mut body = super::super::body::BodyPresence::new();
+        let freed = release_peer_block_work(&mut [slot], &mut inflight, &mut body, 3);
         assert_eq!(
             freed,
             vec![sole],

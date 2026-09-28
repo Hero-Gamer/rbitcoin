@@ -2979,7 +2979,7 @@ pub(in crate::ibd) mod tests {
         st.inflight.insert(lost, InflightReq::new(0));
         st.slots[0].in_flight.insert(lost);
         st.densify_scan_lo = 50;
-        let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, 0);
+        let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, &mut st.body, 0);
         assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
         assert!(
             !st.inflight.contains_key(&lost),
