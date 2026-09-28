@@ -1996,6 +1996,8 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
 
 /// Most-work reorg — longer branch wins after disconnect/connect. Basic
 /// filters are truncated with the disconnect and rebuilt for the branch.
+/// Then a peer delivers a longer fork body by body, an equal-work branch waits
+/// for precious, and invalidate / reconsider move between them.
 #[tokio::test]
 async fn reorg_to_longer_branch() {
     use bitcoin::bip158::BlockFilter;
@@ -2069,6 +2071,96 @@ async fn reorg_to_longer_branch() {
         );
     }
     assert_ne!(hub.query.basic_filter_at(3).unwrap().unwrap().0, old_3);
+
+    // `mempool_reorg.py` `trigger_reorg`: 20 side blocks a peer delivers one
+    // at a time beat 19 tip-extends from the same parent.
+    let (mut main_tip, mut main_time) = (p, t);
+    for h in 7..=21u32 {
+        let b = mine_regtest_block(main_tip, main_time + 600, h, vec![]);
+        main_tip = b.block_hash();
+        main_time = b.header.time;
+        hub.accept_block(b).unwrap();
+    }
+    assert_eq!(hub.tip_height(), Some(21));
+    let fork_base = BlockHash::from_byte_array(fork_parent);
+    let fork_base_time = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let side_branch = |offset: u32| {
+        let (mut p, mut t) = (fork_base, fork_base_time + offset);
+        let mut out = Vec::new();
+        for h in 3..=22u32 {
+            let b = mine_regtest_block(p, t + 600, h, vec![]);
+            p = b.block_hash();
+            t = b.header.time;
+            out.push(b);
+        }
+        out
+    };
+    let fork = side_branch(1_000);
+    for b in &fork {
+        hub.accept_received_block(b.clone())
+            .unwrap_or_else(|e| panic!("submit {}: {e}", b.block_hash()));
+    }
+    let fork_tip = fork[19].block_hash();
+    assert_eq!(hub.tip_height(), Some(22), "20-block fork must beat 19");
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+    let tips = hub.chaintips();
+    assert!(
+        tips.iter()
+            .any(|t| t.status == "active" && t.hash == fork_tip && t.branchlen == 0),
+        "{tips:?}"
+    );
+    assert!(
+        tips.iter().any(|t| t.status == "valid-fork"
+            && t.hash == main_tip
+            && t.height == 21
+            && t.branchlen == 19),
+        "the disconnected main is a valid-fork: {tips:?}"
+    );
+    // A once-confirmed loser reconstructs from Class A; hold is never-confirmed
+    // side bodies only.
+    assert!(hub
+        .query
+        .reconstruct_archived_block(&main_tip.to_byte_array())
+        .unwrap()
+        .is_some());
+    assert!(hub.held_body(&main_tip).is_none());
+
+    // An equal-work never-confirmed branch stays held until precious.
+    let eq = side_branch(2_000);
+    for b in &eq {
+        let out = hub.accept_received_block(b.clone()).unwrap();
+        assert!(
+            matches!(
+                out,
+                AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave
+            ),
+            "{out:?}"
+        );
+    }
+    let eq_tip = eq[19].block_hash();
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+    hub.precious_block(eq_tip).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), eq_tip);
+    assert!(hub.held_body(&fork_tip).is_none());
+    hub.precious_block(fork_tip).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+
+    // Invalidate falls to the next most-work branch; reconsider does not park
+    // the old tip as a held body.
+    hub.invalidate_block(fork[1].block_hash()).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), eq_tip);
+    assert!(hub.held_body(&fork_tip).is_none());
+    hub.reconsider_block(fork[1].block_hash()).unwrap();
+    assert!(
+        hub.held_body(&fork_tip).is_none(),
+        "reconsider must not park the old tip"
+    );
 }
 
 /// Leftover/BadPrev: an orphan whose parent is not on the tip must be held, not
