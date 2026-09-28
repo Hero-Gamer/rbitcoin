@@ -1761,14 +1761,6 @@ impl Query {
         self.store.scripthash.entry_count()
     }
 
-    /// Multi-list spend body node count (diagnostic).
-    ///
-    /// Schema v5 **sole** spends do not allocate multi-list rows, so this is
-    /// often 0 even with full spend annotations — do **not** treat as “points empty.”
-    pub fn point_edge_count(&self) -> u64 {
-        self.store.spender_list_count()
-    }
-
     pub fn tip_height(&self) -> Option<Height> {
         self.store.tip_height()
     }
@@ -1940,17 +1932,6 @@ impl Query {
             return Err(StoreError::NotFound);
         }
         outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
-    }
-
-    pub fn put_spend(
-        &self,
-        out_txid: &[u8; 32],
-        out_index: u32,
-        spending_tx_fk: Fk,
-        spending_vin: u32,
-    ) -> Result<Fk, QueryError> {
-        self.store
-            .put_spend(out_txid, out_index, spending_tx_fk, spending_vin)
     }
 
     /// Strong (best-chain confirmed) spenders only.

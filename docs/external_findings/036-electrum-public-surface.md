@@ -18,7 +18,7 @@ index (`tweaks_for_height`), not the scripthash index.
 Outpoint subscriptions stop at the same per-connection cap as scripthash
 subscriptions. Tip restatus looks up those outpoints off the connection task.
 
-**Regression:** `rbitcoin-query` `tests::paged_history_stops_before_the_create_cap`,
+**Regression:** `rbitcoin-query` `tests::sh_history_caps`,
 `rbitcoin-test` `electrum_scripthash_sub_cap_unsubscribe_frees_slot`,
 `surface_tests::silent_payment_log_drops_the_scan_secret`,
 `silent_scan::tests::parse_sub_labels_start_and_networks`,

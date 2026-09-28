@@ -1437,63 +1437,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_class_a_only_does_not_advance_tip() {
-        use rbitcoin_store::HeaderRecord;
-
-        let (dir, q) = temp_query("class-a-only-no-tip");
-        assert!(q.tip_height().is_none());
-        let header = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash: [2u8; 32],
-            size: 0,
-            weight: 0,
-        };
-        let txs = [coinbase_apply(1)];
-        let (block, _) = crate::testutil::block_from_applies(&txs);
-        let hfk = q.commit_class_a_only(&header, &txs).unwrap();
-        assert!(q.tip_height().is_none(), "Class A helper must not set tip");
-        assert!(q.store().header_txs.has_body(hfk).unwrap());
-        let rec = q.store().headers.get(hfk).unwrap();
-        assert_eq!((rec.size, rec.weight), (0, 0));
-        let _ = q.sample_reset_reconstruct_archived();
-        let hit = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(
-            hit,
-            (
-                u32::try_from(block.total_size()).unwrap(),
-                u32::try_from(block.weight().to_wu()).unwrap(),
-            )
-        );
-        assert_eq!(
-            q.sample_reset_reconstruct_archived(),
-            0,
-            "txstat sum must not reconstruct"
-        );
-        let (first, _) = q.store().header_txs.get_range(hfk).unwrap().unwrap();
-        q.store()
-            .write_txstat_row(
-                first,
-                &rbitcoin_store::TxStatRow {
-                    fee_sat: 0,
-                    base: 0,
-                    wit_extra: 0,
-                },
-            )
-            .unwrap();
-        let _ = q.sample_reset_reconstruct_archived();
-        let rebuilt = q.block_size_weight(hfk).unwrap().unwrap();
-        assert_eq!(rebuilt, hit, "a zero txstat cell must not shorten the sum");
-        assert_eq!(q.sample_reset_reconstruct_archived(), 1);
-        assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn commit_class_a_only_writes_packed_ins_from_wire() {
         use rbitcoin_store::HeaderRecord;
 
@@ -1893,29 +1836,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After drain+fence, empty in-flight: TipOnly stamps the connected head.
-    #[test]
-    fn leftover_tiponly_after_fence_clears_pending() {
-        let (dir, q) = temp_query("leftover-fence-clears-pending");
-        let need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlight::new();
-        let plan_a = plan_applies(&q, &need_a, 1, &empty, None).unwrap();
-        let parent_txid = plan_a.batch_creates[0].0;
-        let parent_fk = plan_a.batch_creates[0].1;
-        let header_fk = plan_a.per_header_ranges[0].0;
-        q.archive_commit_plan(plan_a).unwrap();
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
-        q.on_load_pack().unwrap();
-
-        let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xed)])];
-        let plan_b = plan_applies(&q, &need_b, 2, &empty, None)
-            .expect("TipOnly must stamp after fence, without leftover pending");
-        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Leftover miss (unknown parent) hop-dumps once. Lookup TipOnly does not.
     #[test]
     fn leftover_miss_dumps_probe_diag() {
@@ -1968,124 +1888,6 @@ mod tests {
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight binds after fence, before drain");
         assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Prep pin identity: reverse map + range denserels (no sidefile re-read).
-    #[test]
-    fn plan_external_parent_txid_fills_range_denserels_pin() {
-        let (dir, q) = temp_query("plan-parent-txid-ram");
-        let parent = coinbase_apply(7);
-        let parent_txid = parent.tx.txid;
-        let fks = q
-            .store
-            .txs
-            .put_full_batch_indexed(
-                &[(
-                    parent.tx.clone(),
-                    parent.inputs.clone(),
-                    parent.outputs.clone(),
-                )],
-                true,
-            )
-            .unwrap();
-        let parent_fk = fks[0];
-        let pid = parent_fk.get().unwrap();
-        let range = q.store.txs.body_range(parent_fk).unwrap();
-
-        // Simulate plan stamp reverse map (txid→fk invert).
-        let mut plan = super::ArchiveWritePlan::empty();
-        plan.external_parents
-            .insert(pid, crate::ParentIdent::with_body(parent_txid, range));
-
-        let known = plan.external_parent_txid(pid).expect("reverse map");
-        let (rows, _body_ns, _dec_ns, _extend_n, _sqe_n, _guess_n) = q
-            .store
-            .get_outs_by_range_batch(&[(parent_fk, range, known, 1, vec![0])])
-            .unwrap();
-        let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
-        assert_eq!(
-            tx.txid, parent_txid,
-            "API sets known_txid (RAM), not sidefile"
-        );
-        assert_eq!(live.len(), 1);
-        assert_eq!(sparse.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Plan head path stamps create_fk + range only — pin denserels by range;
-    /// commit does not process-seed parents or creates into a pin FIFO.
-    #[test]
-    fn plan_head_resolved_parents_plan_local_only() {
-        let (dir, q) = temp_query("plan-creates-only");
-        // Parent connected (TipOnly plan stamp).
-        use rbitcoin_primitives::Height;
-        use rbitcoin_store::HeaderRecord;
-        let parent = coinbase_apply(1);
-        let parent_txid = parent.tx.txid;
-        let ph = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash: [1u8; 32],
-            size: 0,
-            weight: 0,
-        };
-        q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
-        assert_eq!(q.tx_body_count(), 1);
-
-        let mut child_txid = [0u8; 32];
-        child_txid[0] = 0xcd;
-        let child = TxApply {
-            tx: TxRecord {
-                txid: child_txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord {
-                prev_txid: parent_txid,
-                create_fk: Fk::NULL,
-                prev_index: 0,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }],
-            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
-        };
-        let need = vec![(Fk(2), vec![child])];
-        let plan =
-            plan_applies(&q, &need, 2, &crate::InFlight::new(), None).expect("parent via head");
-        assert_eq!(plan.planned_fks, vec![Fk(2)]);
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
-        assert_eq!(plan.batch_creates.len(), 1);
-        assert_eq!(plan.batch_creates[0].0, child_txid);
-        // Plan stamp is fk+range only — denserels load at pin by offset.
-        assert!(
-            plan.external_parents
-                .get(&1)
-                .and_then(|p| p.body)
-                .is_some_and(|r| r.1 > 0),
-            "plan must record Class A body range for head-resolved parent"
-        );
-        assert_eq!(
-            plan.external_parent_txid(1),
-            Some(parent_txid),
-            "plan reverse map: create_fk → prev_txid from stamp resolve (RAM)"
-        );
-
-        // Commit succeeds; batch_pin retained on plan path only (dropped with plan).
-        let batch_pin_len = plan.batch_pin.len();
-        q.archive_commit_plan(plan).unwrap();
-        assert_eq!(batch_pin_len, 1);
-        assert_eq!(q.tx_body_count(), 2);
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2428,43 +2230,6 @@ mod tests {
             .archive_filter_need_header_fks(&[hfk, hfk, Fk(99)])
             .unwrap();
         assert_eq!(need, vec![Fk(99)], "archived + dup dropped; missing kept");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Stamp emits SpendEdges (create_fk) so pin/write need not walk packed ins.
-    #[test]
-    fn plan_batch_emits_spend_edges() {
-        let (dir, q) = temp_query("plan-spend-edges");
-        let parent = coinbase_apply(1);
-        let parent_txid = parent.tx.txid;
-        let need = vec![(Fk(1), vec![parent, child_spend(parent_txid, 0xee)])];
-        let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), None).expect("plan");
-        assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2)]);
-        let cb = plan.edges.get(&1).expect("coinbase edges");
-        assert_eq!(cb.len(), 1);
-        assert!(cb[0].create_fk.is_null());
-        let edges = plan
-            .edges
-            .get(&2)
-            .expect("plan stamp must emit spend edges");
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].prev_txid, parent_txid);
-        assert_eq!(edges[0].vout, 0);
-        assert_eq!(edges[0].spend_fk, Fk(2));
-        assert_eq!(edges[0].create_fk, Fk(1));
-        let overlay = plan.same_batch_spent_overlay();
-        assert_eq!(overlay.len(), 2);
-        assert_eq!(overlay[0], vec![(0, Fk(2), 0)]);
-        assert!(overlay[1].is_empty());
-        q.archive_commit_plan(plan).unwrap();
-        let (off, _) = q.store().tx_spent_range(Fk(1)).unwrap();
-        let abs0 = rbitcoin_store::spent_abs(off, 0);
-        let bulk = q.store().get_spender_meta_at_abs_batch(&[abs0]).unwrap();
-        assert_eq!(bulk[0].unwrap().0, Fk(2));
-        let (coff, _) = q.store().tx_spent_range(Fk(2)).unwrap();
-        let cabs = rbitcoin_store::spent_abs(coff, 0);
-        let cbulk = q.store().get_spender_meta_at_abs_batch(&[cabs]).unwrap();
-        assert!(cbulk[0].unwrap().0.is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2946,32 +2711,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// After drain+fence, TipOnly stamps without a RAM identity ring.
-    #[test]
-    fn leftover_tiponly_after_commit_skips_when_connected() {
-        let (dir, q) = temp_query("tiponly-after-commit");
-        let need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
-        let empty = crate::InFlight::new();
-        let plan_a = plan_applies(&q, &need_a, 1, &empty, None).unwrap();
-        let parent_txid = plan_a.batch_creates[0].0;
-        let parent_fk = plan_a.batch_creates[0].1;
-        let header_fk = plan_a.per_header_ranges[0].0;
-        q.archive_commit_plan(plan_a).unwrap();
-        q.store()
-            .height_fence_extend(rbitcoin_primitives::Height(0), header_fk)
-            .unwrap();
-        q.on_load_pack().unwrap();
-
-        {
-            let _ = q.confirm_stats().take_window();
-            let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
-            let plan_b =
-                plan_applies(&q, &need_b, 2, &empty, None).expect("TipOnly must stamp after fence");
-            assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Freeze + append: batch-merge is vector concat of frozen commit halves;
     /// external staging maps are dropped (not union-mutated).
     #[test]
@@ -3031,70 +2770,6 @@ mod tests {
         // Contiguous Class A commit of the merged frozen plan.
         assert!(q.archive_commit_plan(plan_a).unwrap());
         assert_eq!(q.tx_body_count(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Second commit after header_txs is linked must not re-append body (partial
-    /// confirm retry / crash recovery).
-    #[test]
-    fn archive_commit_plan_idempotent_when_header_already_has_body() {
-        use rbitcoin_store::HeaderRecord;
-
-        let (dir, q) = temp_query("arch-idempotent");
-        let header = HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 1,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [1u8; 32],
-            hash: [2u8; 32],
-            size: 0,
-            weight: 0,
-        };
-        let hfk = q.ensure_header(&header).unwrap();
-        let need = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan = plan_applies(
-            &q,
-            &need,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
-        assert!(!plan.is_empty());
-        assert!(q.archive_commit_plan(plan).unwrap(), "first commit appends");
-        let n = q.tx_body_count();
-        assert!(n >= 1);
-        assert!(q.store().header_txs.has_body(hfk).unwrap());
-
-        // Rebuild a plan as if lookup incorrectly re-planned the same header.
-        let need2 = vec![(hfk, vec![coinbase_apply(42)])];
-        let plan2 = plan_applies(
-            &q,
-            &need2,
-            q.tx_body_count() + 1,
-            &crate::InFlight::new(),
-            None,
-        )
-        .unwrap();
-        // filter_need empties txs when has_body — plan may be empty. Force a
-        // non-empty plan by planning against a fresh need then swapping ranges.
-        if plan2.is_empty() {
-            // Production path: archive_filter_need_header_fks / has_body clears need → empty plan.
-            // Commit empty is no-op.
-            assert!(!q.archive_commit_plan(plan2).unwrap());
-        } else {
-            assert!(
-                !q.archive_commit_plan(plan2).unwrap(),
-                "second commit must skip re-append"
-            );
-        }
-        assert_eq!(
-            q.tx_body_count(),
-            n,
-            "tx body count must not grow on idempotent re-commit"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

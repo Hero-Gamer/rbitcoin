@@ -395,25 +395,6 @@ mod tests {
         FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    #[test]
-    fn query_index_products_follow_mode_and_flags() {
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-index-products");
-        q.set_sh_index_enabled(true);
-        assert!(
-            q.enqueues_sh_writebehind(),
-            "open default is Tip; shindex on must enqueue SH write-behind"
-        );
-        q.set_sh_index_enabled(false);
-        assert!(!q.enqueues_sh_writebehind());
-        q.set_sh_index_enabled(true);
-        q.enter_direct_index_mode().unwrap();
-        assert!(
-            !q.enqueues_sh_writebehind(),
-            "Direct must not enqueue SH write-behind even with shindex on"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     fn leftover_run_rec(sh0: u8, fk: u64) -> Vec<u8> {
         let mut rec = [0u8; 40];
         rec[..32].fill(sh0);
@@ -500,30 +481,6 @@ mod tests {
             parent_hash = Some(header.hash);
             prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
         }
-    }
-
-    #[test]
-    fn direct_shindex_does_not_collect_runs_until_finalize() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-direct-no-runs");
-        seed_direct_chain(&q, 4);
-        assert!(q.sh_index_enabled());
-        assert!(
-            !q.sh_run_enabled(),
-            "Direct must not start an IBD SH run worker"
-        );
-        assert_eq!(q.scripthash_run_count(), 0);
-        assert!(
-            !q.store.scripthash.has_durable_index(),
-            "durable SH appears only after finalize collect"
-        );
-        let sh = rbitcoin_store::script_hash(&[0x51, 0]);
-        assert!(q.scripthash_history(&sh).unwrap().is_empty());
-        let n_mat = q.finalize_sh_runs().unwrap();
-        assert!(n_mat > 0 || q.store.scripthash.has_durable_index());
-        assert!(!q.scripthash_history(&sh).unwrap().is_empty());
-        assert_eq!(q.scripthash_run_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -651,73 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn scenario_direct_enter_does_not_collect() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-scenario-direct");
-        seed_direct_chain(&q, 3);
-        q.enter_direct_index_mode().unwrap();
-        q.sh_run.refresh_seal();
-        assert_eq!(
-            q.sh_run.sealed_max_create_fk(),
-            0,
-            "Direct enter must not Class A collect"
-        );
-        assert_eq!(q.scripthash_run_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scenario_fresh_ibd_tip_materialize() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-scenario-fresh");
-        seed_direct_chain(&q, 5);
-        let n_mat = q.finalize_sh_runs().unwrap();
-        assert!(
-            n_mat > 0 || q.store.scripthash.has_durable_index() || q.scripthash_run_count() == 0,
-            "fresh tip finalize should settle SH"
-        );
-        let seal1 = q.sh_run.sealed_max_create_fk();
-        let count1 = q.store.scripthash.entry_count();
-        let _n2 = q.finalize_sh_runs().unwrap();
-        assert_eq!(q.sh_run.sealed_max_create_fk(), seal1);
-        assert!(
-            q.store.scripthash.entry_count() >= count1,
-            "repeat finalize must not thrash durable head"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tip_ready_after_materialize_skips_collect_and_finalize() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-tip-ready");
-        seed_direct_chain(&q, 5);
-        let n_mat = q.finalize_sh_runs().expect("materialize");
-        assert!(n_mat > 0 || q.store.scripthash.has_durable_index());
-        q.enter_tip_index_mode();
-        assert!(
-            q.sh_is_tip_ready(),
-            "durable SH after materialize must be tip-ready seal={} hwm={} tip_max={} runs={}",
-            q.sh_run.sealed_max_create_fk(),
-            q.store.scripthash.include_hwm(),
-            q.store.txs.count(),
-            q.sh_run.on_disk_run_count()
-        );
-
-        let seal_before = q.sh_run.sealed_max_create_fk();
-        q.enter_direct_index_mode().unwrap();
-        assert_eq!(
-            q.sh_run.sealed_max_create_fk(),
-            seal_before.max(q.store.scripthash.include_hwm()),
-            "Direct enter must not reset SEAL when HWM covers tip"
-        );
-
-        assert_eq!(q.finalize_sh_runs().unwrap(), 0);
-        assert!(q.sh_is_tip_ready());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn durable_head_hwm_lag_discards_leftover_run() {
         let _g = lock_force_env();
         let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-hwm-lag-skip");
@@ -775,77 +665,6 @@ mod tests {
             "leftover run fk=99 must not become include_hwm"
         );
         assert!(q.sh_is_tip_ready());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tip_mode_connect_advances_sh_watermarks() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-tip-wm");
-        seed_direct_chain(&q, 3);
-        let _ = q.finalize_sh_runs().unwrap();
-        q.enter_tip_index_mode();
-        assert!(!q.sh_run.is_enabled());
-        let tip_max_before = q.store.txs.count();
-        let hwm_before = q.store.scripthash.include_hwm();
-        let seal_before = q.sh_run.sealed_max_create_fk();
-
-        let tip_h = q.tip_height().unwrap().0;
-        let tip_fk = q.store.confirmed.get(Height(tip_h)).unwrap().unwrap();
-        let tip_hash = q.store.get_header(tip_fk).unwrap().hash;
-        let (header, ta) = coinbase_block(tip_h + 1, tip_fk, Some(tip_hash));
-        q.connect_block(Height(tip_h + 1), &header, &[ta])
-            .expect("tip connect");
-
-        let tip_max_after = q.store.txs.count();
-        assert!(tip_max_after > tip_max_before);
-        assert!(
-            q.store.scripthash.include_hwm() >= tip_max_after
-                || q.store.scripthash.include_hwm() > hwm_before,
-            "include_hwm must advance on tip durable SH write hwm={} before={} tip_max={}",
-            q.store.scripthash.include_hwm(),
-            hwm_before,
-            tip_max_after
-        );
-        assert!(
-            q.sh_run.sealed_max_create_fk() >= q.store.scripthash.include_hwm()
-                || q.sh_run.sealed_max_create_fk() > seal_before,
-            "SEAL must advance with tip durable writes"
-        );
-        assert!(
-            q.sh_is_tip_ready(),
-            "after tip follow block, still tip-ready"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn include_hwm_covers_tip_without_seal_match() {
-        let _g = lock_force_env();
-        let (dir, q) = crate::testutil::tiny_query_labeled("q-sh-hwm-floor");
-        seed_direct_chain(&q, 4);
-        let _ = q.finalize_sh_runs().unwrap();
-        let tip_max = q.store.txs.count();
-        q.store.scripthash.note_include_hwm(tip_max).unwrap();
-        let runs_dir = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs_dir).unwrap();
-        store_seal(&runs_dir, tip_max.saturating_sub(10).max(1)).unwrap();
-        q.sh_run.refresh_seal();
-        assert!(q.sh_run.sealed_max_create_fk() < tip_max);
-        assert!(
-            q.sh_is_tip_ready() || {
-                let _ = std::fs::remove_dir_all(&runs_dir);
-                q.sh_run.refresh_seal();
-                q.store.scripthash.note_include_hwm(tip_max).unwrap();
-                q.sync_sh_seal_from_include_hwm().unwrap();
-                q.sh_is_tip_ready()
-            }
-        );
-        q.enter_direct_index_mode().unwrap();
-        assert!(
-            q.sh_run.sealed_max_create_fk() >= tip_max,
-            "Direct enter must raise SEAL to include_hwm covering tip"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

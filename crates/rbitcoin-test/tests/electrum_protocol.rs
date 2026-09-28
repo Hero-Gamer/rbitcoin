@@ -2280,6 +2280,78 @@ async fn electrum_idle_timeout_disconnects_quiet_client() {
     handle.shutdown().await;
 }
 
+/// Direct IBD collects no SH until the tip bulk materialize, and a repeat
+/// finalize leaves the durable head alone.
+fn pin_direct_collects_nothing_until_tip_materialize(q: &Query, sh: &[u8; 32]) {
+    assert!(q.sh_index_enabled());
+    assert!(!q.sh_run_enabled(), "Direct starts no SH run worker");
+    assert!(!q.enqueues_sh_writebehind());
+    q.enter_direct_index_mode().unwrap();
+    assert_eq!(q.scripthash_run_count(), 0);
+    assert!(!q.store().scripthash.has_durable_index());
+    assert!(q.scripthash_history(sh).unwrap().is_empty());
+
+    let n_sh = q.finalize_sh_runs().unwrap();
+    assert!(n_sh > 0, "SH bulk materialize creates≈{n_sh}");
+    assert_eq!(q.scripthash_run_count(), 0);
+    let entries = q.scripthash_entry_count();
+    q.finalize_sh_runs().unwrap();
+    assert_eq!(
+        q.scripthash_entry_count(),
+        entries,
+        "a repeat finalize does not rewrite the durable head"
+    );
+    q.enter_tip_index_mode();
+    assert!(q.sh_is_tip_ready());
+    assert!(q.enqueues_sh_writebehind());
+    q.set_sh_index_enabled(false);
+    assert!(!q.enqueues_sh_writebehind());
+    q.set_sh_index_enabled(true);
+}
+
+/// A tip confirm in Tip mode leaves SH to the write-behind, and the durable
+/// head's `include_hwm` keeps the store tip-ready without a SEAL file.
+fn pin_tip_follow_after_materialize(
+    q: &Query,
+    store: &std::path::Path,
+    tip: bitcoin::BlockHash,
+    time: u32,
+) {
+    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    use rbitcoin_primitives::Height;
+    use rbitcoin_test::mine::mine_regtest_block;
+
+    let params = ChainParams::regtest();
+    let sh = rbitcoin_store::script_hash(&[0x51]);
+    let b6 = mine_regtest_block(tip, time + 600, 6, vec![]);
+    accept_and_connect_block(q, &params, Height(6), &b6, Milestone::NONE).unwrap();
+    assert_eq!(
+        q.sh_indexed_through_height(),
+        Some(5),
+        "tip confirm leaves SH to the write-behind"
+    );
+    assert_eq!(
+        q.scripthash_history(&sh).unwrap().len(),
+        6,
+        "pending SH shows the new tip create"
+    );
+    q.apply_sh_pending().unwrap();
+    assert_eq!(q.sh_indexed_through_height(), Some(6));
+    assert!(q.store().scripthash.include_hwm() >= q.tx_body_count());
+    assert!(q.sh_is_tip_ready());
+
+    let runs = store.join("scripthash.runs");
+    let _ = std::fs::remove_dir_all(&runs);
+    assert!(
+        q.sh_is_tip_ready(),
+        "include_hwm covers the tip without a SEAL file"
+    );
+    q.enter_direct_index_mode().unwrap();
+    assert_eq!(q.finalize_sh_runs().unwrap(), 0);
+    q.enter_tip_index_mode();
+    assert_eq!(q.scripthash_history(&sh).unwrap().len(), 6);
+}
+
 /// Direct IBD leaves live `tx.head` + spend annotations; tip only bulk-loads SH.
 /// `backfill_tx_index` stays available (idempotent rebuild / future rehash) but is
 /// not required for tip entry.
@@ -2322,21 +2394,27 @@ fn direct_indexes_then_sh_bulk_at_tip() {
     let inserted = q.backfill_tx_index(|_, _, _| {}).unwrap();
     assert_eq!(inserted, 0, "no missing head entries after Direct");
 
-    // Direct IBD keeps SH in runs until tip bulk materialize.
-    let n_sh = q.finalize_sh_runs().unwrap();
-    assert!(n_sh > 0, "SH bulk materialize creates≈{n_sh}");
-    q.enter_tip_index_mode();
-
     // OP_TRUE coinbase outputs from mine_regtest_block appear under that scripthash.
     let sh = {
         use rbitcoin_store::script_hash;
         script_hash(&[0x51])
     };
+    pin_direct_collects_nothing_until_tip_materialize(&q, &sh);
     let hist = q.scripthash_history(&sh).unwrap();
-    assert!(
-        !hist.is_empty(),
-        "scripthash history non-empty after SH bulk"
+    assert_eq!(
+        hist.len(),
+        5,
+        "one OP_TRUE coinbase per height past genesis"
     );
+    q.enter_direct_index_mode().unwrap();
+    assert_eq!(
+        q.finalize_sh_runs().unwrap(),
+        0,
+        "Direct re-entry keeps the SEAL the durable head covers"
+    );
+    q.enter_tip_index_mode();
+
+    pin_tip_follow_after_materialize(&q, &dir.path().join("store"), tip, time);
     q.flush().unwrap();
     drop(q);
 
@@ -2355,7 +2433,13 @@ fn direct_indexes_then_sh_bulk_at_tip() {
     }
 
     let q = Query::open_or_create_tiny(&store).unwrap();
+    std::fs::write(store.join("ibd_utxo.map"), b"x").unwrap();
+    std::fs::create_dir_all(store.join("point.runs")).unwrap();
     q.enter_direct_index_mode().unwrap();
+    assert!(
+        !store.join("ibd_utxo.map").exists() && !store.join("point.runs").exists(),
+        "direct mode removes leftover catch-up artifacts"
+    );
     let n_rebuild = q.finalize_sh_runs().unwrap();
     assert!(
         n_rebuild > 0 || !q.scripthash_history(&sh).unwrap().is_empty(),

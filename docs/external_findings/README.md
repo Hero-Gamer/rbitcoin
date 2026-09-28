@@ -29,7 +29,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [022](./022-stack-altstack-share-max-size.md) | high | `MAX_STACK_SIZE` ignored altstack on PushBytes / TUCK | fixed | `stack_and_altstack_share_max_size_on_pushdata` |
 | [023](./023-tapscript-initial-stack-limits.md) | high | Tapscript initial witness stack skipped 1000/520 limits | fixed | `script_path_rejects_initial_stack_over_max_size` |
 | [038](./038-tip-accept-lifetime.md) | high | Async tip-accept job must not borrow a dropped hub | fixed | `owned_job_finishes_after_waiter_abort` |
-| [036](./036-electrum-public-surface.md) | critical | Public Electrum scan secret, join, and subscription caps | fixed | `paged_history_stops_before_the_create_cap` |
+| [036](./036-electrum-public-surface.md) | critical | Public Electrum scan secret, join, and subscription caps | fixed | `sh_history_caps` |
 | [035](./035-bip30-bip34-ancestry.md) | low | BIP30 skipped on signet after height 1 | fixed | `buried_rules_and_a_lying_header_path` |
 | [034](./034-witness-padding-not-cached.md) | high | Witness padding cached as an invalid block hash | fixed | `hostile_peer_session` |
 | [033](./033-ibd-intake-bounds.md) | critical | IBD path state and body bytes before validation | fixed | `rejected_header_batch_does_not_grow_path_or_explore` |

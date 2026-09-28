@@ -18,5 +18,5 @@ that height.
 
 **Regression:** `rbitcoin-consensus`
 `block::structure_rule_tests::buried_rules_and_a_lying_header_path`,
-`params::tests::bip34_hash_gates_bip30_like_core`. Finding 019's
-`bip30_rejects_unspent_connected_sibling` still rejects.
+`params::tests::bip34_hash_gates_bip30_like_core`. Finding 019's regtest
+unspent overwrite still rejects in that same journey.

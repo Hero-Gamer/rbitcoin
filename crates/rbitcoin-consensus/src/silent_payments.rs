@@ -779,105 +779,6 @@ mod tests {
     }
 
     #[test]
-    fn tweaks_for_height_p2wpkh_parent_matches_engine() {
-        use bitcoin::hashes::hash160;
-        use bitcoin::secp256k1::SecretKey;
-
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-
-        let secp_ctx = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
-        let ser = pk.serialize();
-        let h160 = hash160::Hash::hash(&ser);
-        let mut p2wpkh = vec![0x00, 0x14];
-        p2wpkh.extend_from_slice(h160.as_ref());
-        let (xonly, _) = pk.x_only_public_key();
-        let mut p2tr = vec![0x51, 0x20];
-        p2tr.extend_from_slice(&xonly.serialize());
-
-        let mut genesis_txid = [0u8; 32];
-        genesis_txid[31] = 0xcb;
-        let h0 = header(0, Fk::NULL, None);
-        let ta0 = TxApply {
-            tx: TxRecord {
-                txid: genesis_txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
-        };
-        let fk0 = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
-        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
-
-        let mut spend_txid = [0u8; 32];
-        spend_txid[0] = 0x11;
-        spend_txid[31] = 0xcd;
-        let h1 = header(1, fk0, Some(h0.hash));
-        let ta1 = TxApply {
-            tx: TxRecord {
-                txid: spend_txid,
-                version: 2,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord {
-                prev_txid: genesis_txid,
-                create_fk,
-                prev_index: 0,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![vec![0u8; 64], ser.to_vec()],
-            }],
-            outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr.clone())],
-        };
-        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
-
-        let empty0 = tweaks_for_height(&q, &params, Height(0)).unwrap();
-        assert!(empty0.is_empty(), "coinbase is not eligible");
-
-        let got = tweaks_for_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(got.len(), 1);
-        let t = got.get(&spend_txid).expect("spend txid");
-
-        let engine_tx = Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_byte_array(genesis_txid),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::from_slice(&[&[0u8; 64][..], &ser[..]]),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_0000_0000),
-                script_pubkey: ScriptBuf::from_bytes(p2tr),
-            }],
-        };
-        let engine_prev = vec![TxOut {
-            value: Amount::from_sat(50_0000_0000),
-            script_pubkey: ScriptBuf::from_bytes(p2wpkh),
-        }];
-        let expect = tweak_from_tx(&engine_tx, &engine_prev).unwrap();
-        assert_eq!(t.tweak, expect.tweak);
-        assert_eq!(t.output_pubkeys, expect.output_pubkeys);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn thin_compose_matches_engine_outs_without_parents() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
@@ -1054,129 +955,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn indexed_serve_matches_naive_without_parent_walk() {
-        let (dir, q) = tmp_store();
-        let params = ChainParams::regtest();
-        q.set_sptweaks_enabled(true, Height(0)).unwrap();
-        // Build the P2WPKH→P2TR spend via connect_block, then backfill.
-        use bitcoin::hashes::hash160;
-        use bitcoin::secp256k1::SecretKey;
-        let secp_ctx = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
-        let ser = pk.serialize();
-        let h160 = hash160::Hash::hash(&ser);
-        let mut p2wpkh = vec![0x00, 0x14];
-        p2wpkh.extend_from_slice(h160.as_ref());
-        let (xonly, _) = pk.x_only_public_key();
-        let mut p2tr = vec![0x51, 0x20];
-        p2tr.extend_from_slice(&xonly.serialize());
-        let mut genesis_txid = [0u8; 32];
-        genesis_txid[31] = 0xcb;
-        let h0 = header(0, Fk::NULL, None);
-        let fk0 = q
-            .connect_block(
-                Height(0),
-                &h0,
-                &[TxApply {
-                    tx: TxRecord {
-                        txid: genesis_txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 1,
-                        output_start_fk: Fk::NULL,
-                        output_count: 1,
-                    },
-                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-                    outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
-                }],
-            )
-            .unwrap();
-        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
-        let mut spend_txid = [0u8; 32];
-        spend_txid[0] = 0x11;
-        spend_txid[31] = 0xcd;
-        let h1 = header(1, fk0, Some(h0.hash));
-        q.connect_block(
-            Height(1),
-            &h1,
-            &[TxApply {
-                tx: TxRecord {
-                    txid: spend_txid,
-                    version: 2,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: 1,
-                },
-                inputs: vec![InputRecord {
-                    prev_txid: genesis_txid,
-                    create_fk,
-                    prev_index: 0,
-                    sequence: u32::MAX,
-                    script_sig: vec![],
-                    witness: vec![vec![0u8; 64], ser.to_vec()],
-                }],
-                outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
-            }],
-        )
-        .unwrap();
+    struct SpKeys {
+        p2wpkh: Vec<u8>,
+        p2tr: Vec<u8>,
+        pubkey: Vec<u8>,
+    }
 
-        let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(naive.len(), 1);
-        // The window reader gives the same record whether the spent parent is
-        // inside the window (heights 0..=1) or read as an outside parent.
-        let want = vec![Some(naive.get(&spend_txid).unwrap().tweak)];
+    fn sp_keys() -> SpKeys {
+        use bitcoin::hashes::hash160;
+        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(secp(), &sk);
+        let ser = pk.serialize();
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(hash160::Hash::hash(&ser).as_ref());
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend_from_slice(&pk.x_only_public_key().0.serialize());
+        SpKeys {
+            p2wpkh,
+            p2tr,
+            pubkey: ser.to_vec(),
+        }
+    }
+
+    fn sp_spend(
+        tag: u8,
+        prev: ([u8; 32], Fk, u32),
+        witness: Vec<Vec<u8>>,
+        outs: Vec<OutputRecord>,
+    ) -> TxApply {
+        let mut txid = [0u8; 32];
+        txid[0] = tag;
+        TxApply {
+            tx: TxRecord {
+                txid,
+                version: 2,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: outs.len() as u32,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: prev.0,
+                create_fk: prev.1,
+                prev_index: prev.2,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness,
+            }],
+            outputs: outs,
+        }
+    }
+
+    fn seal_tweaks(q: &Query, through: u32) {
+        q.release_index_writebehind(Height(through));
+        crate::build_indexes_released(q).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(through + 1)));
+    }
+
+    /// Height 1 carries two eligible P2WPKH→P2TR spends around a spend with
+    /// fat seqsigwit and a fat output script. The naive walk, the index
+    /// window reader, the engine on the rebuilt wire tx, and the served
+    /// index all give the same tweaks, and the served read spans the
+    /// middle txout but not its seqsigwit.
+    fn pin_tweaks_agree_and_thin_serve_skips_fat_witness(
+        q: &Query,
+        params: &ChainParams,
+        keys: &SpKeys,
+        a: [u8; 32],
+        b: [u8; 32],
+    ) {
+        let naive = tweaks_for_height(q, params, Height(1)).unwrap();
+        assert_eq!(naive.len(), 2, "the OP_TRUE spend is not eligible");
+        let fks = q.block_tx_fks(Height(1)).unwrap();
+        let wire_a = q.reconstruct_tx(fks[0]).unwrap();
+        let engine_prev = [TxOut {
+            value: Amount::from_sat(20_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(keys.p2wpkh.clone()),
+        }];
+        let engine = tweak_from_tx(&wire_a, &engine_prev).unwrap();
+        assert_eq!(naive[&a].tweak, engine.tweak);
+        assert_eq!(naive[&a].output_pubkeys, engine.output_pubkeys);
+
+        let want = vec![Some(naive[&a].tweak), None, Some(naive[&b].tweak)];
         for start in [0, 1] {
             let heights = q.index_heights(start, 1, Some(0)).unwrap();
             let window = q.read_index_window(&heights).unwrap();
             let i = window.blocks.len() - 1;
-            assert_eq!(tweak_records_from_window(&window, i).unwrap(), want);
+            assert_eq!(
+                tweak_records_from_window(&window, i).unwrap(),
+                want,
+                "window from {start}: the parent inside or outside the window"
+            );
         }
-        q.release_index_writebehind(Height(1));
-        crate::build_indexes_released(&q).unwrap();
-        assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
+
+        let mid_seqsigwit = q.store().tx_seqsigwit_range(fks[1]).unwrap().1;
+        let mid_txout = q.store().txs.body_range(fks[1]).unwrap().1;
+        let _ = q.sample_reset_thin_tweak_body_bytes();
         let rows = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
+        let read = q.sample_reset_thin_tweak_body_bytes();
         assert_eq!(
-            rows.len(),
-            1,
-            "ineligible txs must not be joined from Class A"
+            rows.iter().map(|r| r.txid).collect::<Vec<_>>(),
+            [a, b],
+            "ineligible txs are not joined from Class A"
         );
-        assert_eq!(rows[0].txid, spend_txid);
-        let indexed = tweaks_at_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(
-            indexed.get(&spend_txid).unwrap().tweak,
-            naive.get(&spend_txid).unwrap().tweak
+        assert_eq!((rows[0].p2tr.len(), rows[1].p2tr.len()), (2, 1));
+        assert!(
+            read >= mid_txout,
+            "the txout span covers the ineligible hole (read={read} txout={mid_txout})"
         );
-        assert_eq!(
-            indexed.get(&spend_txid).unwrap().output_pubkeys,
-            naive.get(&spend_txid).unwrap().output_pubkeys
+        assert!(
+            read < mid_seqsigwit,
+            "the fat seqsigwit stays out (read={read} seqsigwit={mid_seqsigwit})"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let indexed = tweaks_at_height(q, params, Height(1)).unwrap();
+        for txid in [a, b] {
+            assert_eq!(indexed[&txid].tweak, naive[&txid].tweak);
+            assert_eq!(indexed[&txid].output_pubkeys, naive[&txid].output_pubkeys);
+        }
     }
 
-    /// Fat non-P2TR sibling must not change the P2TR tweak (txout-first filter).
+    fn pin_thin_range_limits_and_hole(q: &Query, a: [u8; 32], c: [u8; 32]) {
+        use rbitcoin_query::ThinTweakRangeLimits;
+
+        let all = q
+            .load_thin_tweaks_range(Height(0), ThinTweakRangeLimits::default())
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|(h, rows)| (h.0, rows.len()))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 2), (2, 1)]
+        );
+        assert_eq!(all[2].1[0].txid, c);
+        for (h, rows) in &all {
+            let single = q.load_thin_tweaks(*h).unwrap().expect("indexed");
+            assert_eq!(single.len(), rows.len());
+            for (s, r) in single.iter().zip(rows) {
+                assert_eq!((s.txid, s.tweak, &s.p2tr), (r.txid, r.tweak, &r.p2tr));
+            }
+        }
+        let limited = |max_heights, max_eligible| {
+            q.load_thin_tweaks_range(
+                Height(1),
+                ThinTweakRangeLimits {
+                    max_heights,
+                    max_eligible,
+                    ..ThinTweakRangeLimits::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(limited(1, 8192).len(), 1);
+        assert_eq!(
+            limited(10, 1).len(),
+            1,
+            "the eligible budget stops after the first height that spends it"
+        );
+        assert!(q
+            .load_thin_tweaks_range(Height(3), ThinTweakRangeLimits::default())
+            .unwrap()
+            .is_empty());
+        let only2 = q
+            .load_thin_tweaks_range(Height(2), ThinTweakRangeLimits::default())
+            .unwrap();
+        assert_eq!(only2.len(), 1);
+        assert_eq!(only2[0].0, Height(2));
+
+        let cut = |cut_through| {
+            q.load_thin_tweaks_range(
+                Height(1),
+                ThinTweakRangeLimits {
+                    cut_through,
+                    ..ThinTweakRangeLimits::default()
+                },
+            )
+            .unwrap()
+        };
+        let kept = cut(true);
+        let row_a = kept[0].1.iter().find(|r| r.txid == a).unwrap();
+        assert_eq!(
+            row_a.p2tr.iter().map(|o| o.0).collect::<Vec<_>>(),
+            [1],
+            "cut-through drops the P2TR output spent at height 2"
+        );
+        let hist = cut(false);
+        assert_eq!(
+            hist[0].1.iter().find(|r| r.txid == a).unwrap().p2tr.len(),
+            2
+        );
+    }
+
+    /// One synthetic chain through the index builder: coinbase at 0, two
+    /// eligible spends around a fat ineligible one at 1, a spend of one of
+    /// those P2TR outputs plus a third eligible spend at 2 (sealed with 1 in
+    /// one window), and at 3 the spend that leaves the first tx all spent.
     #[test]
-    fn tweaks_for_height_skips_seqsigwit_on_non_p2tr_sibling() {
-        use bitcoin::hashes::hash160;
-        use bitcoin::secp256k1::SecretKey;
+    fn sp_tweaks_confirm_life() {
         let (dir, q) = tmp_store();
         let params = ChainParams::regtest();
-        let secp_ctx = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[2u8; 32]).unwrap();
-        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &sk);
-        let ser = pk.serialize();
-        let h160 = hash160::Hash::hash(&ser);
-        let mut p2wpkh = vec![0x00, 0x14];
-        p2wpkh.extend_from_slice(h160.as_ref());
-        let (xonly, _) = pk.x_only_public_key();
-        let mut p2tr = vec![0x51, 0x20];
-        p2tr.extend_from_slice(&xonly.serialize());
-        let mut genesis_txid = [0u8; 32];
-        genesis_txid[31] = 0xcb;
+        let keys = sp_keys();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let sig_wit = || vec![vec![0u8; 64], keys.pubkey.clone()];
+        let p2tr = |sat| OutputRecord::unspent(sat, keys.p2tr.clone());
+
+        let mut cb_txid = [0u8; 32];
+        cb_txid[31] = 0xcb;
         let h0 = header(0, Fk::NULL, None);
         let fk0 = q
             .connect_block(
@@ -1184,76 +1168,95 @@ mod tests {
                 &h0,
                 &[TxApply {
                     tx: TxRecord {
-                        txid: genesis_txid,
+                        txid: cb_txid,
                         version: 1,
                         locktime: 0,
                         input_start_fk: Fk::NULL,
                         input_count: 1,
                         output_start_fk: Fk::NULL,
-                        output_count: 1,
+                        output_count: 4,
                     },
                     inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-                    outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+                    outputs: vec![
+                        OutputRecord::unspent(20_0000_0000, keys.p2wpkh.clone()),
+                        OutputRecord::unspent(20_0000_0000, keys.p2wpkh.clone()),
+                        OutputRecord::unspent(5_0000_0000, vec![0x51]),
+                        OutputRecord::unspent(5_0000_0000, keys.p2wpkh.clone()),
+                    ],
                 }],
             )
             .unwrap();
-        let create_fk = q.block_tx_fks(Height(0)).unwrap()[0];
-        let mut spend_txid = [0u8; 32];
-        spend_txid[0] = 0x11;
-        spend_txid[31] = 0xcd;
-        let mut fat_txid = [0u8; 32];
-        fat_txid[0] = 0x22;
-        let fat_script = vec![0x51; 200];
-        let h1 = header(1, fk0, Some(h0.hash));
-        q.connect_block(
-            Height(1),
-            &h1,
-            &[
-                TxApply {
-                    tx: TxRecord {
-                        txid: fat_txid,
-                        version: 1,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 1,
-                        output_start_fk: Fk::NULL,
-                        output_count: 1,
-                    },
-                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0xaa; 80], vec![])],
-                    outputs: vec![OutputRecord::unspent(1, fat_script)],
-                },
-                TxApply {
-                    tx: TxRecord {
-                        txid: spend_txid,
-                        version: 2,
-                        locktime: 0,
-                        input_start_fk: Fk::NULL,
-                        input_count: 1,
-                        output_start_fk: Fk::NULL,
-                        output_count: 1,
-                    },
-                    inputs: vec![InputRecord {
-                        prev_txid: genesis_txid,
-                        create_fk,
-                        prev_index: 0,
-                        sequence: u32::MAX,
-                        script_sig: vec![],
-                        witness: vec![vec![0u8; 64], ser.to_vec()],
-                    }],
-                    outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
-                },
-            ],
-        )
-        .unwrap();
+        seal_tweaks(&q, 0);
+        assert!(
+            q.load_thin_tweaks(Height(0)).unwrap().unwrap().is_empty(),
+            "a coinbase is not eligible"
+        );
+        let cb = q.block_tx_fks(Height(0)).unwrap()[0];
 
-        let naive = tweaks_for_height(&q, &params, Height(1)).unwrap();
-        assert_eq!(naive.len(), 1, "fat sibling must not be eligible");
-        assert!(naive.contains_key(&spend_txid));
-        assert!(!naive.contains_key(&fat_txid));
-        let only = tweaks_for_height(&q, &params, Height(1)).unwrap();
+        let spend_a = sp_spend(
+            0xaa,
+            (cb_txid, cb, 0),
+            sig_wit(),
+            vec![p2tr(12_0000_0000), p2tr(7_0000_0000)],
+        );
+        let fat = sp_spend(
+            0xfe,
+            (cb_txid, cb, 2),
+            vec![vec![0u8; 16_384]],
+            vec![OutputRecord::unspent(4_0000_0000, vec![0x51; 4096])],
+        );
+        let spend_b = sp_spend(0xbb, (cb_txid, cb, 1), sig_wit(), vec![p2tr(19_0000_0000)]);
+        let (a, b) = (spend_a.tx.txid, spend_b.tx.txid);
+        let h1 = header(1, fk0, Some(h0.hash));
+        let fk1 = q
+            .connect_block(Height(1), &h1, &[spend_a, fat, spend_b])
+            .unwrap();
+        let a_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+
+        let spend_c = sp_spend(0xcc, (cb_txid, cb, 3), sig_wit(), vec![p2tr(4_0000_0000)]);
+        let c = spend_c.tx.txid;
+        let spend_a0 = sp_spend(
+            0xd0,
+            (a, a_fk, 0),
+            vec![vec![0u8; 64]],
+            vec![OutputRecord::unspent(11_0000_0000, keys.p2wpkh.clone())],
+        );
+        let h2 = header(2, fk1, Some(h1.hash));
+        let fk2 = q
+            .connect_block(Height(2), &h2, &[spend_c, spend_a0])
+            .unwrap();
         assert_eq!(
-            only.get(&spend_txid).unwrap().tweak,
-            naive.get(&spend_txid).unwrap().tweak
+            q.sptweaks_next_height(),
+            Some(Height(1)),
+            "confirm writes none"
+        );
+        seal_tweaks(&q, 2);
+
+        pin_tweaks_agree_and_thin_serve_skips_fat_witness(&q, &params, &keys, a, b);
+        pin_thin_range_limits_and_hole(&q, a, c);
+
+        let spend_a1 = sp_spend(
+            0xd1,
+            (a, a_fk, 1),
+            vec![vec![0u8; 64]],
+            vec![OutputRecord::unspent(6_0000_0000, vec![0x51])],
+        );
+        let h3 = header(3, fk2, Some(h2.hash));
+        q.connect_block(Height(3), &h3, &[spend_a1]).unwrap();
+        seal_tweaks(&q, 3);
+        let gone = q
+            .load_thin_tweaks_range(
+                Height(1),
+                rbitcoin_query::ThinTweakRangeLimits {
+                    cut_through: true,
+                    ..rbitcoin_query::ThinTweakRangeLimits::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            gone[0].1.iter().map(|r| r.txid).collect::<Vec<_>>(),
+            [b],
+            "an all-spent eligible tx is omitted"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
