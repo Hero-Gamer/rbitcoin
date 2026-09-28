@@ -303,7 +303,9 @@ async fn two_node_header_and_block_sync() {
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,
 /// obsolete VERSION / pre-verack ping disconnect, full-relay GetAddr cache
 /// (1000 / 23%), AddrFetch GetAddr (no getheaders), one post-verack keepalive
-/// ping/pong, and headers-sync stall replace.
+/// ping/pong, and headers-sync stall replace. A completed session outlives
+/// peertimeout. AddrFetch stays for one addr, times out at 300s, and
+/// completes on a longer list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use bitcoin::p2p::message::NetworkMessage;
@@ -579,6 +581,14 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "pre-verack ping must close at peertimeout=1",
         )
         .await;
+        assert!(
+            seed.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| { p.addr == dummy.local_addr && !p.inbound && !p.subver.is_empty() }),
+            "a completed handshake must outlive peertimeout=1 (seed={:?})",
+            seed.peers.snapshot()
+        );
 
         for id in peer
             .peers
@@ -649,14 +659,62 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "AddrFetch must not GetHeaders: {:?}",
             fetch.bytessent_per_msg
         );
-        for id in peer
-            .peers
-            .snapshot()
-            .into_iter()
-            .filter(|p| p.conn_type == PeerConnType::AddrFetch)
-            .map(|p| p.id)
-        {
-            peer.peers.disconnect_id(id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            peer.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.conn_type == PeerConnType::AddrFetch),
+            "one addr must not complete the fetch: {:?}",
+            peer.peers.snapshot()
+        );
+        let t = peer.peers.now_secs();
+        peer.peers.set_mock_now(t + 301);
+        wait_ms_until(
+            2_000,
+            || {
+                !peer
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.conn_type == PeerConnType::AddrFetch)
+            },
+            || {
+                format!(
+                    "AddrFetch must time out after 300s (peer={:?})",
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        peer.peers.set_mock_now(0);
+
+        let mut many = AddrMan::new();
+        for i in 0..20u8 {
+            many.add(std::net::SocketAddr::from(([1, 2, 4, i], 8333)));
+        }
+        seed.peers.set_addrman(Arc::new(Mutex::new(many)));
+        let t = seed.peers.now_secs();
+        seed.peers.set_mock_now(t + 24 * 60 * 60 + 1);
+        peer.peers
+            .addconnection(seed.local_addr, PeerConnType::AddrFetch)
+            .expect("second addrfetch dial");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_fetch = false;
+        loop {
+            let fetching = peer
+                .peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.conn_type == PeerConnType::AddrFetch);
+            saw_fetch |= fetching;
+            if saw_fetch && !fetching {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("an addr list longer than one must complete the fetch (saw={saw_fetch})");
+            }
+            tokio::task::yield_now().await;
         }
 
         seed.shutdown().await;

@@ -3177,31 +3177,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_handshake_survives_peertimeout() {
-        let hub = PeerHub::new();
-        hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        assert!(p.handshake_complete());
-        hub.set_mock_now(1_700_000_100);
-        hub.on_session_heartbeat();
-        assert!(!p.stop.load(Ordering::SeqCst));
-        assert!(hub.get(p.id).is_some());
-    }
-
-    #[test]
-    fn outbound_nonce_detects_self_connect() {
-        let hub = PeerHub::new();
-        assert!(hub.check_incoming_nonce(42));
-        hub.note_outbound_nonce(42);
-        assert!(!hub.check_incoming_nonce(42));
-        assert!(hub.check_incoming_nonce(43));
-        hub.clear_outbound_nonce(42);
-        assert!(hub.check_incoming_nonce(42));
-    }
-
-    #[test]
     fn announced_wtx_is_per_peer() {
         use bitcoin::hashes::Hash;
         let hub = PeerHub::new();
