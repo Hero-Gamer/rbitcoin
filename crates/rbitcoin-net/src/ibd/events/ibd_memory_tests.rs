@@ -1,7 +1,7 @@
 //! Header-path and body-intake bounds (findings C03, C05).
 
 use super::super::state::IbdWorkState;
-use super::{apply_block_framed, on_headers_batch};
+use super::{accepted_prefix_after_failure, apply_block_framed, on_headers_batch};
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::encode::serialize;
@@ -264,6 +264,88 @@ fn unmapped_stored_run_walks_once_not_per_header() {
             "every stored header is on the path at its height"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn failed_first_prefix_stops_search() {
+    let mut probes = Vec::new();
+    let (lo, values): (usize, Vec<u32>) = accepted_prefix_after_failure(2000, |mid| {
+        probes.push(mid);
+        Err(crate::error::NetError::Protocol("first header rejected"))
+    });
+    assert_eq!(lo, 0);
+    assert!(values.is_empty());
+    assert_eq!(
+        probes,
+        vec![1],
+        "do not retry longer prefixes after first header fails"
+    );
+
+    let mut probes = Vec::new();
+    let (lo, values) = accepted_prefix_after_failure(2000, |mid| {
+        probes.push(mid);
+        if mid <= 731 {
+            Ok((1..=mid).collect::<Vec<_>>())
+        } else {
+            Err(crate::error::NetError::Protocol("rejected tail"))
+        }
+    });
+    assert_eq!(lo, 731);
+    assert_eq!(values.len(), lo);
+    assert_eq!(values[0], 1);
+    assert_eq!(values[lo - 1], 731);
+    assert_eq!(probes[0], 1);
+}
+
+#[test]
+fn unknown_first_header_does_not_retry_longer_prefixes() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let unknown = BlockHash::from_byte_array([0x7d; 32]);
+    let mut chain = Vec::new();
+    let mut prev = unknown;
+    for height in 1..=20 {
+        let header = mine(prev, 1_500_050_000 + height * 600, height).header;
+        prev = header.block_hash();
+        chain.push(header);
+    }
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    on_headers_batch(&mut st, &hub, chain.clone());
+    assert!(st.header_fks.is_empty());
+    for header in &chain {
+        assert!(!st.hash_height.contains_key(&header.block_hash()));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejected_tail_keeps_stored_prefix() {
+    const CAP: u32 = 4;
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let mut chain = Vec::new();
+    let mut prev = gen;
+    for height in 1..=CAP + 8 {
+        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
+        prev = header.block_hash();
+        chain.push(header);
+    }
+    hub.ensure_headers_batch(&chain).unwrap();
+    hub.set_stored_height_walk_cap(CAP);
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let mut rejected = mine(prev, 1_500_030_000 + (CAP + 9) * 600, CAP + 9).header;
+    rejected.time = 0;
+    let mut batch = chain[CAP as usize..].to_vec();
+    batch.push(rejected);
+    let _ = hub.take_stored_height_walk_steps();
+    on_headers_batch(&mut st, &hub, batch);
+    assert!(hub.take_stored_height_walk_steps() >= u64::from(CAP));
+    for header in &chain[CAP as usize..] {
+        assert!(st.header_fks.contains_key(&header.block_hash()));
+    }
+    assert!(!st.header_fks.contains_key(&rejected.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
