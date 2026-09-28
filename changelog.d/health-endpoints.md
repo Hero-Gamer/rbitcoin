@@ -3,10 +3,13 @@ Added
 - **Health probes.** `--health-listen [ADDR]` (default `127.0.0.1:9332`)
   binds before the store opens and serves `GET /healthz` (200 in every
   phase) and `GET /readyz` (200 once the node follows the tip with every
-  configured listener up, the tip within 6 blocks of the best header, and
-  the scripthash index within 6 blocks of the tip; otherwise 503 with the
-  reason). RPC, Electrum, and Esplora bind only after catch-up, so a probe
-  on those would restart a node in the middle of a migration or IBD.
+  configured listener up, the tip within 6 blocks of the best header, the
+  tip fresher than `--max-tip-age`, and the scripthash index within 6
+  blocks of the tip; otherwise 503 with the reason). The stale-tip check
+  does not latch like `initialblockdownload`, so a node that loses every
+  peer after IBD goes unready. RPC, Electrum, and Esplora bind only after
+  catch-up, so a probe on those would restart a node in the middle of a
+  migration or IBD.
 - **Prometheus metrics.** `--metrics` adds `GET /metrics` on the health
   listener. Gauges equal their RPC fields (`blocks`, `headers`,
   `initialblockdownload`, connections, mempool size) and counters are the

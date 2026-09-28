@@ -142,6 +142,8 @@ impl NodeStatus {
             in_ibd: false,
             blocks: 0,
             headers: 0,
+            tip_age_secs: None,
+            max_tip_age_secs: 0,
             sh_lag: None,
         };
         if phase != Phase::Following {
@@ -151,6 +153,10 @@ impl NodeStatus {
             snap.in_ibd = chain.in_ibd();
             snap.blocks = chain.query.tip_height().map_or(0, |h| h.0);
             snap.headers = chain.best_header_height();
+            snap.tip_age_secs = chain
+                .tip_header()
+                .map(|h| chain.clock.now_secs().saturating_sub(u64::from(h.time)));
+            snap.max_tip_age_secs = chain.max_tip_age_secs();
             snap.sh_lag = self.sh_index.then(|| chain.query.sh_lag_heights());
         }
         snap
@@ -166,6 +172,10 @@ struct ReadySnapshot {
     in_ibd: bool,
     blocks: u32,
     headers: u32,
+    /// Seconds since the tip block time; `None` with no tip. `in_ibd` latches
+    /// off after the first exit — this one keeps reporting a stale tip.
+    tip_age_secs: Option<u64>,
+    max_tip_age_secs: u64,
     /// `None` without `--sh-index`.
     sh_lag: Option<u32>,
 }
@@ -180,6 +190,11 @@ fn readiness(s: &ReadySnapshot) -> Result<(), String> {
     }
     if s.in_ibd {
         return Err("initial block download".into());
+    }
+    if let Some(age) = s.tip_age_secs {
+        if age > s.max_tip_age_secs {
+            return Err(format!("tip stale (last block {age}s ago)"));
+        }
     }
     let behind = s.headers.saturating_sub(s.blocks);
     if behind > READY_LAG_BLOCKS {
@@ -289,6 +304,8 @@ mod tests {
             in_ibd: false,
             blocks: 100,
             headers: 100,
+            tip_age_secs: Some(0),
+            max_tip_age_secs: 24 * 60 * 60,
             sh_lag: None,
         }
     }
@@ -352,6 +369,22 @@ mod tests {
         cases.push((
             ReadySnapshot {
                 headers: 90,
+                ..following()
+            },
+            Ok(()),
+        ));
+        let stale = |age: u64| ReadySnapshot {
+            tip_age_secs: Some(age),
+            ..following()
+        };
+        cases.push((stale(24 * 60 * 60), Ok(())));
+        cases.push((
+            stale(24 * 60 * 60 + 1),
+            Err("tip stale (last block 86401s ago)".into()),
+        ));
+        cases.push((
+            ReadySnapshot {
+                tip_age_secs: None,
                 ..following()
             },
             Ok(()),

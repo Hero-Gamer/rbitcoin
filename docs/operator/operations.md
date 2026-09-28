@@ -375,6 +375,7 @@ bind logs a WARN: keep the port on loopback or a probe-only network.
 | `stopping` | Shutdown flush |
 | `rpc not listening` (also `electrum`, `esplora`) | That listener is configured but did not bind. Its start only warns, so the node keeps following |
 | `initial block download` | Same value as RPC `getblockchaininfo.initialblockdownload` (`--max-tip-age`, `--min-chain-work`). Latches off after the first exit, as in Core |
+| `tip stale (last block Ns ago)` | The non-latching half of that check: the tip block is older than `--max-tip-age` (default 24h). This still fires after IBD has latched off, so a node that later loses every peer stops being ready |
 | `tip N blocks behind headers` | `headers - blocks` is over 6 |
 | `scripthash index N blocks behind tip` | With `--sh-index`, the index trails the tip by more than 6 (`sh_lag=` on `tip: accept`) |
 
