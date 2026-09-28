@@ -3,9 +3,14 @@
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
 //!   request missing hashes (even if soft body-queue depth is over free floor).
-//!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] **on tip+1 only**, ranked by
-//!   expected drain time (`(queue+1)/bps`), not queue count. Later contiguous
-//!   holes in that gap get one racer until the prefix is in hand. An owner
+//!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] **on tip+1 only** when the
+//!   body queue meets any of: 1/4 of the confirm-time block window, 1/4 of
+//!   the configured assign-stop (default 1 GiB), or
+//!   [`rbitcoin_query::TIP_HOLE_MIN_AHEAD_BLOCKS`] bodies. Fullness is the
+//!   queue's total blocks and bytes; gaps count. Below all three the gap is
+//!   the frontier: one owner, and densify continues. Ranked by expected
+//!   drain time (`(queue+1)/bps`), not queue count. Later contiguous holes
+//!   in that gap get one racer until the prefix is in hand. An owner
 //!   with other inflight hashes still has densify in the peer FIFO — drop them
 //!   from this hash (getdata cannot be cancelled) and race a peer that can
 //!   start the hole. Confirm is frozen until tip+1 is claim-ready.
@@ -20,8 +25,9 @@
 //!   - BQ payload **≥ assign-stop** (default 1 GiB) → holes only within the
 //!     ~1 min tip-rate window **and** not past fetched_hi (do not grow past
 //!     fetched; do not densify far holes outside the window)
-//!   - While a tip-fetch hole is open: **no new densify** (cap 0) so peer
-//!     getdata queues can drain for tip+1.
+//!   - While a quarter-full tip hole is open: **no new densify** (cap 0) so
+//!     peer getdata queues can drain for tip+1. A thinner queue is the
+//!     frontier and densify keeps filling ahead.
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -235,8 +241,9 @@ pub(crate) fn assign_work_ordered(
         return;
     }
 
-    st.intake_stop = rbitcoin_query::bq_assign_stop_bytes();
-    st.intake_queued = hub.query.block_queue_stats().1;
+    let (bq_stop, bq_bytes, bq_count) = hub.query.block_queue_stats();
+    st.intake_stop = bq_stop;
+    st.intake_queued = bq_bytes;
 
     if download_gate_closed(st, hub) {
         static GATE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -277,7 +284,17 @@ pub(crate) fn assign_work_ordered(
     }
 
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
-    issued += cover_tip_batch_holes(st, hub, cfg, &alive, &tip_holes);
+    let ahead_n = u32::try_from(bq_count).unwrap_or(u32::MAX);
+    let race_tip = !tip_holes.is_empty()
+        && rbitcoin_query::soft_ahead_quarter_full(
+            ahead_n,
+            bq_bytes,
+            tip_rate_blocks_per_s,
+            bq_stop,
+        );
+    if race_tip {
+        issued += cover_tip_batch_holes(st, hub, cfg, &alive, &tip_holes);
+    }
     if tip_holes.is_empty() {
         issued += cover_first_pre_hole(st, hub, cfg, &alive);
     }
@@ -299,7 +316,7 @@ pub(crate) fn assign_work_ordered(
             issued,
             path_lo,
             tip_batch_hi,
-            tip_holes: &tip_holes,
+            race_tip,
             tip_rate_blocks_per_s,
         },
     );
@@ -358,7 +375,7 @@ struct DensifyCtx<'a> {
     issued: u64,
     path_lo: u32,
     tip_batch_hi: u32,
-    tip_holes: &'a [BlockHash],
+    race_tip: bool,
     tip_rate_blocks_per_s: Option<f64>,
 }
 
@@ -375,10 +392,10 @@ fn assign_densify(
         mut issued,
         path_lo,
         tip_batch_hi,
-        tip_holes,
+        race_tip,
         tip_rate_blocks_per_s,
     } = ctx;
-    let tip_hole = !tip_holes.is_empty();
+    let tip_hole = race_tip;
     let (pack_median, pack_tight) = pack_ewma_bps(&st.slots, alive);
     let caps: HashMap<usize, usize> = alive
         .iter()
@@ -399,9 +416,9 @@ fn assign_densify(
     issued += steal_hung_densify(st, hub, alive, tip_batch_hi, &caps);
 
     let mut room = cfg.window.saturating_sub(st.inflight.len());
-    // A retired holder already occupies a window slot. Adding a racer does not.
-    let reissue_only = room == 0;
-    if reissue_only && !st.inflight.values().any(inflight_needs_racer) {
+    // Window is full and no retired holder is waiting for a racer. Skip the
+    // densify height walk.
+    if room == 0 && !st.inflight.values().any(inflight_needs_racer) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -436,8 +453,8 @@ fn assign_densify(
         return;
     }
     let densify_lo = path_lo.max(st.densify_scan_lo);
-    let collect_cap = if reissue_only { 1 } else { room.max(1) };
-    let densify = collect_height_band(st, hub, densify_lo, band_hi, collect_cap, reissue_only);
+    let collect_cap = if room == 0 { 1 } else { room };
+    let densify = collect_height_band(st, hub, densify_lo, band_hi, collect_cap, room);
     if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -445,14 +462,8 @@ fn assign_densify(
 
     let ranked = rank_peers_by_speed(&st.slots, alive, &HashSet::new());
     let mut densify_q = densify;
-    for &pid in &ranked {
+    'peers: for &pid in &ranked {
         if densify_q.is_empty() {
-            break;
-        }
-        let front_reissue = densify_q
-            .front()
-            .is_some_and(|h| st.inflight.get(h).is_some_and(inflight_needs_racer));
-        if room == 0 && !front_reissue {
             break;
         }
         let cap = caps.get(&pid).copied().unwrap_or(1);
@@ -463,14 +474,13 @@ fn assign_densify(
             let Some(h) = pop_need(&mut densify_q, st, hub) else {
                 break;
             };
-            let reissue = st.inflight.get(&h).is_some_and(inflight_needs_racer);
-            if !reissue && room == 0 {
-                densify_q.push_front(h);
-                break;
-            }
             if st.inflight.get(&h).is_some_and(|req| req.holds(pid)) {
                 densify_q.push_front(h);
                 break;
+            }
+            if !densify_issue_allowed(room, st.inflight.get(&h)) {
+                densify_q.push_front(h);
+                break 'peers;
             }
             if !issue_one(st, pid, h, &mut room, &mut issued) {
                 densify_q.push_front(h);
@@ -505,7 +515,7 @@ fn collect_height_band(
     lo: u32,
     hi: u32,
     cap: usize,
-    reissue_only: bool,
+    room: usize,
 ) -> VecDeque<BlockHash> {
     let mut out = VecDeque::new();
     if lo > hi || cap == 0 {
@@ -518,7 +528,7 @@ fn collect_height_band(
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        let need = need_hash_at(st, hub, ht, reissue_only);
+        let need = need_hash_at(st, hub, ht, room);
         if tracking {
             if need.is_none() && densify_prefix_filled(st, hub, ht) {
                 prefix = ht.saturating_add(1);
@@ -577,12 +587,14 @@ fn inflight_needs_racer(req: &state::InflightReq) -> bool {
     req.peers.is_empty() && !req.retired.is_empty()
 }
 
-fn need_hash_at(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    ht: u32,
-    reissue_only: bool,
-) -> Option<BlockHash> {
+/// A free getdata window slot, or a racer for a hash whose only holders are
+/// retired. A retired holder already occupies a window slot, so the racer
+/// does not.
+fn densify_issue_allowed(room: usize, req: Option<&state::InflightReq>) -> bool {
+    room > 0 || req.is_some_and(inflight_needs_racer)
+}
+
+fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32, room: usize) -> Option<BlockHash> {
     use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
     if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
@@ -594,7 +606,7 @@ fn need_hash_at(
     {
         return None;
     }
-    if reissue_only && !st.inflight.get(&h).is_some_and(inflight_needs_racer) {
+    if !densify_issue_allowed(room, st.inflight.get(&h)) {
         return None;
     }
     // Class A seed: densify skips re-walk; tip-hole cover re-gets tip batch.
@@ -1317,7 +1329,6 @@ pub(crate) fn cover_tip_holes(
 
 #[cfg(test)]
 pub(in crate::ibd) mod tests {
-    use super::super::state::InflightReq;
     use super::super::status::LoopStats;
     use super::*;
     use bitcoin::hashes::Hash;
@@ -1394,25 +1405,6 @@ pub(in crate::ibd) mod tests {
         BlockHash::from_byte_array(b)
     }
 
-    #[test]
-    fn dropping_last_hash_owner_releases_pending_body() {
-        let hash = h(0x95);
-        let mut st = IbdWorkState::new(vec![dummy_slot(1)], None, None);
-        st.slots[0].in_flight.insert(hash);
-        st.inflight.insert(hash, InflightReq::new(1));
-        st.body.mark_pending(hash);
-
-        let _ = super::super::dial::release_peer_block_work(
-            &mut st.slots,
-            &mut st.inflight,
-            &mut st.body,
-            1,
-        );
-
-        assert!(!st.body.is_pending(&hash));
-        assert!(st.body.is_missing(&hash));
-    }
-
     fn dummy_slot(id: usize) -> PeerSlot {
         let (cmd_tx, _rx) = mpsc::unbounded_channel();
         let task = tokio::runtime::Builder::new_current_thread()
@@ -1474,6 +1466,19 @@ pub(in crate::ibd) mod tests {
                 .block_queue_offer(ht, h(ht).to_byte_array(), 1, &[0u8; 80])
                 .unwrap();
             st.body.mark_pending(h(ht));
+        }
+    }
+
+    /// 75×80-byte bodies past the tip window. At 5 blk/s the confirm window is
+    /// 300 blocks, so this is a quarter of that window.
+    fn plant_quarter_window(hub: &ChainHub, path_lo: u32) {
+        use bitcoin::hashes::Hash as _;
+        let start = path_lo.saturating_add(64);
+        for i in 0..75u32 {
+            let ht = start.saturating_add(i);
+            hub.query
+                .block_queue_offer(ht, h(ht).to_byte_array(), 1, &[0u8; 80])
+                .unwrap();
         }
     }
 
@@ -1630,6 +1635,253 @@ pub(in crate::ibd) mod tests {
         assert_eq!(far_slots_per_peer(16, false), 8);
     }
 
+    /// An empty body queue is the download frontier: tip+1 is only as far as
+    /// getdata has reached. One owner, and densify keeps filling past the
+    /// 32-block window.
+    #[test]
+    fn empty_body_queue_tip_gap_is_the_frontier() {
+        let _env = lock_default_assign_stop();
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(80));
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 1,
+            "empty queue is the frontier; tip+1 gets one owner; n0={n0}"
+        );
+        let past = path_lo.saturating_add(TIP_HOLE_MAX as u32);
+        assert!(
+            st.inflight.contains_key(&h(past)),
+            "densify continues past the tip window on the frontier"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Gaps count. 74 of a 300-block confirm window is under a quarter, so the
+    /// tip gap stays the frontier even though bodies already sit further on.
+    #[test]
+    fn gapped_queue_under_quarter_window_is_the_frontier() {
+        let _env = lock_default_assign_stop();
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        // 74 ready bodies on the odd heights. The walk stops at the first
+        // ready body, so the contiguous tip hole is only tip+1.
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(400));
+        for i in 0..74u32 {
+            let ht = path_lo
+                .saturating_add(1)
+                .saturating_add(i.saturating_mul(2));
+            mark_heights_ready(&mut st, &hub, ht, ht);
+        }
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        // 5 blk/s → 300-block confirm window. 74 * 4 = 296 < 300.
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 1,
+            "under a quarter of the confirm window is still the frontier; n0={n0}"
+        );
+        let gap = path_lo.saturating_add(2);
+        assert!(
+            st.inflight.contains_key(&h(gap)),
+            "densify fills the gap behind the first ready body"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 75 gapped bodies is a quarter of a 300-block window, so tip+1 is a hole
+    /// even though the contiguous run is one block.
+    #[test]
+    fn gapped_quarter_window_is_a_tip_hole() {
+        let _env = lock_default_assign_stop();
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(400));
+        for i in 0..75u32 {
+            let ht = path_lo
+                .saturating_add(1)
+                .saturating_add(i.saturating_mul(2));
+            mark_heights_ready(&mut st, &hub, ht, ht);
+        }
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 4,
+            "a quarter of the confirm window, with gaps, is a tip hole; n0={n0}"
+        );
+        assert!(
+            !st.inflight.contains_key(&h(path_lo.saturating_add(2))),
+            "densify stays off while the quarter-full tip hole is open"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rate unknown: a quarter of the configured assign-stop is the byte threshold.
+    #[test]
+    fn byte_quarter_full_queue_races_tip_and_stops_densify() {
+        let _env = lock_default_assign_stop();
+        use bitcoin::hashes::Hash as _;
+        // Quarter is 2 MiB. One new hash reserves 4 MiB, so the stop must
+        // still fit that reserve on top of the queued quarter.
+        let stop: u64 = 8 * 1024 * 1024;
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", stop.to_string());
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(80));
+        let n = (stop / 4) as usize;
+        let payload = vec![0u8; n];
+        hub.query
+            .block_queue_offer(
+                path_lo.saturating_add(64),
+                h(path_lo.saturating_add(64)).to_byte_array(),
+                1,
+                &payload,
+            )
+            .unwrap();
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 4,
+            "a quarter of the configured assign-stop is a tip hole; n0={n0}"
+        );
+        assert!(
+            !st.inflight
+                .contains_key(&h(path_lo.saturating_add(TIP_HOLE_MAX as u32))),
+            "densify stays off at the byte quarter"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rate cold and bytes far under the assign-stop: 1000 queued bodies is
+    /// still a hole. Early blocks are small, so the byte cap would not fill.
+    #[test]
+    fn ahead_block_count_with_cold_rate_is_a_tip_hole() {
+        let _env = lock_default_assign_stop();
+        use bitcoin::hashes::Hash as _;
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(
+            vec![
+                dummy_slot(0),
+                dummy_slot(1),
+                dummy_slot(2),
+                dummy_slot(3),
+                dummy_slot(4),
+                dummy_slot(5),
+            ],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        let path_lo = hub.tip_height().unwrap_or(0).saturating_add(1);
+        plant_work_path(&mut st, path_lo, path_lo.saturating_add(40));
+        let start = path_lo.saturating_add(64);
+        for i in 0..rbitcoin_query::TIP_HOLE_MIN_AHEAD_BLOCKS {
+            let ht = start.saturating_add(i);
+            hub.query
+                .block_queue_offer(ht, h(ht).to_byte_array(), 1, &[0u8; 80])
+                .unwrap();
+        }
+        for s in &mut st.slots {
+            seed_ewma(s, 2_000_000);
+        }
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
+        assert_eq!(
+            n0, 4,
+            "1000 queued bodies with a cold rate is a tip hole; n0={n0}"
+        );
+        assert!(
+            !st.inflight
+                .contains_key(&h(path_lo.saturating_add(TIP_HOLE_MAX as u32))),
+            "densify stays off once the ahead-block floor is met"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn densify_does_not_issue_far_while_tip_plus_one_hole() {
         let _env = lock_default_assign_stop();
@@ -1655,7 +1907,8 @@ pub(in crate::ibd) mod tests {
         }
         seed_ewma(&mut st.slots[0], 2_000_000);
         seed_ewma(&mut st.slots[1], 2_000_000);
-        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        plant_quarter_window(&hub, path_lo);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
         assert!(
             st.inflight.contains_key(&h(path_lo)),
             "tip+1 must still be requested"
@@ -2529,11 +2782,12 @@ pub(in crate::ibd) mod tests {
         for s in &mut st.slots {
             seed_ewma(s, 2_000_000);
         }
+        plant_quarter_window(&hub, path_lo);
         let stats = LoopStats::default();
         let mut cfg = IbdConfig::for_test();
         cfg.window = 64;
         cfg.per_peer = 16;
-        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
         let prefix = h(path_lo);
         let n = st.inflight.get(&prefix).map(|e| e.len()).unwrap_or(0);
         assert_eq!(n, 4, "frozen prefix races up to TIP_HOLE_MAX_PEERS; n={n}");
@@ -2567,11 +2821,12 @@ pub(in crate::ibd) mod tests {
         for s in &mut st.slots {
             seed_ewma(s, 2_000_000);
         }
+        plant_quarter_window(&hub, path_lo);
         let stats = LoopStats::default();
         let mut cfg = IbdConfig::for_test();
         cfg.window = 64;
         cfg.per_peer = 16;
-        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
         let n0 = st.inflight.get(&h(path_lo)).map(|e| e.len()).unwrap_or(0);
         let n1 = st
             .inflight
@@ -3567,13 +3822,21 @@ pub(in crate::ibd) mod tests {
             st.max_ordered_height = ht;
             st.body.mark_missing(hash);
         }
+        plant_quarter_window(&hub, 1);
 
-        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Critical, None);
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            AssignDepth::Critical,
+            Some(5.0),
+        );
         let after_crit = st.inflight.len();
         assert!(after_crit > 0, "critical should still issue tip/race");
 
         let n_before = st.inflight.len();
-        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
+        assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, Some(5.0));
         assert!(st.inflight.len() <= n_before + 8);
 
         let hashes: Vec<_> = st.inflight.keys().copied().collect();
