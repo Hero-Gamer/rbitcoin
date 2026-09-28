@@ -2165,6 +2165,7 @@ async fn reorg_to_longer_branch() {
 
 /// Leftover/BadPrev: an orphan whose parent is not on the tip must be held, not
 /// `BLOCK_FAILED`. Applying the full winner path then reconstructs the new tip.
+/// A mutated child of a held sibling is not `BLOCK_FAILED` either.
 #[test]
 fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -2226,6 +2227,52 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
             .unwrap()
             .block_hash(),
         winner[1].block_hash()
+    );
+
+    // A mutated child of a held sibling is BLOCK_MUTATED, not BLOCK_FAILED:
+    // the header hash stays askable and the honest body reorgs onto it.
+    let sibling = mine_regtest_block(
+        winner[1].block_hash(),
+        winner[1].header.time + 900,
+        3,
+        vec![],
+    );
+    assert!(matches!(
+        hub.accept_received_block(sibling.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    let honest = mine_regtest_block(sibling.block_hash(), sibling.header.time + 600, 4, vec![]);
+    let mut mutated = honest.clone();
+    mutated.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x52]);
+    assert_eq!(mutated.block_hash(), honest.block_hash());
+    hub.note_asked_block(honest.block_hash());
+    let err = hub
+        .accept_received_block(mutated)
+        .expect_err("mutated merkle must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("merkle") || msg.contains("bad-txnmrklroot"),
+        "{msg}"
+    );
+    assert!(
+        !hub.is_block_invalid(&honest.block_hash()),
+        "BLOCK_MUTATED must not cache the header hash as BLOCK_FAILED"
+    );
+    assert!(
+        !hub.already_have_or_asked_block(&honest.block_hash()),
+        "a mutated reject forgets the ask so the honest body can be fetched"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
+    assert!(matches!(
+        hub.accept_received_block(honest.clone()).unwrap(),
+        AcceptOutcome::Accepted { height: 4 }
+    ));
+    assert_eq!(
+        hub.query
+            .reconstruct_block_at_height(Height(4))
+            .unwrap()
+            .block_hash(),
+        honest.block_hash()
     );
 }
 
