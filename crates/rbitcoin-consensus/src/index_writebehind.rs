@@ -1,5 +1,9 @@
-//! Post-IBD block index write-behind (`rbtc-idx-wb`): BIP158 basic filters
-//! and BIP-352 tweaks from one read of Class A.
+//! Block index materialize (`rbtc-idx-wb`): BIP158 basic filters and BIP-352
+//! tweaks from one read of Class A when a watermark is behind the tip.
+//!
+//! [`prepare_live_indexes`] seals a restart gap of at most one IBD write
+//! drain before confirm runs. A larger gap stays on this reader. Confirm
+//! batches do not call it.
 //!
 //! The IO thread plans windows of consecutive heights from the lower index
 //! watermark up to the released tip and reads each through
@@ -11,10 +15,12 @@
 //! the watermarks. A wide gap is the materialize; at the tip each release is
 //! a one-height window.
 
-use crate::script_pool::start_for_each_owned_chunk;
+use crate::index_rows::{self, IndexHeightOut, IndexRows};
 use crate::silent_payments::tweak_records_from_window;
 use crate::ConsensusError;
-use rbitcoin_primitives::{Fk, Height};
+#[cfg(test)]
+use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::IndexWindow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +45,106 @@ fn next_needed(query: &Query) -> Option<u32> {
     }
 }
 
-/// Heights `start..` for the next window, capped at `target`.
+/// Heights one IBD write drain can leave unsealed: write queue (14) times
+/// the confirm run cap (144).
+pub const INDEX_STARTUP_GAP_HEIGHTS: u32 = 14 * 144;
+
+/// Tip entry: spawn the materialize only while an enabled watermark is still
+/// behind the tip and live append is off. Advertise filters immediately when
+/// that watermark already covers the tip.
+pub struct IndexTipEntry {
+    pub spawn: bool,
+    pub advertise_filters: bool,
+}
+
+pub fn index_tip_entry(query: &Query) -> IndexTipEntry {
+    let tip = query.tip_height().map(|h| h.0);
+    let behind = |next: Option<u32>| next.is_some_and(|n| tip.is_some_and(|t| n <= t));
+    let caught = |next: Option<u32>| next.is_some_and(|n| tip.is_some_and(|t| n > t));
+    IndexTipEntry {
+        spawn: !query.index_live()
+            && (behind(query.filter_index_next()) || behind(query.tweak_index_next())),
+        advertise_filters: caught(query.filter_index_next()),
+    }
+}
+
+/// Before confirm: seal each enabled index whose gap through the tip fits
+/// [`INDEX_STARTUP_GAP_HEIGHTS`], then set [`Query::index_live`] when every
+/// enabled index is contiguous with the tip.
+pub fn prepare_live_indexes(query: &Query) -> Result<(), ConsensusError> {
+    prepare_live_indexes_limited(query, INDEX_STARTUP_GAP_HEIGHTS)
+}
+
+pub(crate) fn prepare_live_indexes_limited(
+    query: &Query,
+    max_heights: u32,
+) -> Result<(), ConsensusError> {
+    let tip_h = query.tip_height().map(|h| h.0);
+    if let Some(tip) = tip_h {
+        let repair_f = repair_from(query.filter_index_next(), tip, max_heights);
+        let repair_t = repair_from(query.tweak_index_next(), tip, max_heights);
+        if repair_f.is_some() || repair_t.is_some() {
+            seal_through(query, repair_f, repair_t, tip)?;
+        }
+    }
+    let tip_h = query.tip_height().map(|h| h.0);
+    let any_on = query.filter_index_next().is_some() || query.tweak_index_next().is_some();
+    query.set_index_live(
+        any_on
+            && index_caught_up(query.filter_index_next(), tip_h)
+            && index_caught_up(query.tweak_index_next(), tip_h),
+    );
+    Ok(())
+}
+
+fn repair_from(next: Option<u32>, tip: u32, max_heights: u32) -> Option<u32> {
+    let next = next?;
+    if next > tip {
+        return None;
+    }
+    let gap = tip.saturating_add(1).saturating_sub(next);
+    (gap <= max_heights).then_some(next)
+}
+
+fn index_caught_up(next: Option<u32>, tip: Option<u32>) -> bool {
+    match (next, tip) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(n), Some(t)) => n > t,
+    }
+}
+
+/// Read and commit `start..=tip` for the indexes in `filter_from` / `tweak_from`.
+/// `None` means that index is not part of this repair.
+fn seal_through(
+    query: &Query,
+    filter_from: Option<u32>,
+    tweak_from: Option<u32>,
+    tip: u32,
+) -> Result<(), ConsensusError> {
+    let mut start = match (filter_from, tweak_from) {
+        (Some(f), Some(t)) => f.min(t),
+        (Some(f), None) => f,
+        (None, Some(t)) => t,
+        (None, None) => return Ok(()),
+    };
+    while start <= tip {
+        let end = plan_window(query, start, tip)?;
+        let window = Arc::new(read_window_from(query, start, end, tweak_from)?);
+        let rows = assemble_window_from(&window, filter_from, tweak_from)?;
+        if index_rows::commit_index_rows(query, rows)?.moved {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: startup index repair",
+            )));
+        }
+        if end >= tip {
+            break;
+        }
+        start = end + 1;
+    }
+    Ok(())
+}
+
 fn plan_window(query: &Query, start: u32, target: u32) -> Result<u32, ConsensusError> {
     let mut end = start;
     let mut txs = 0u64;
@@ -62,21 +167,21 @@ fn plan_window(query: &Query, start: u32, target: u32) -> Result<u32, ConsensusE
 }
 
 fn read_window(query: &Query, start: u32, end: u32) -> Result<IndexWindow, ConsensusError> {
-    let tweaks_from = query.tweak_index_next();
+    read_window_from(query, start, end, query.tweak_index_next())
+}
+
+fn read_window_from(
+    query: &Query,
+    start: u32,
+    end: u32,
+    tweaks_from: Option<u32>,
+) -> Result<IndexWindow, ConsensusError> {
     let heights = query.index_heights(start, end, tweaks_from)?;
     let mut window = query.read_index_window(&heights)?;
     for block in &mut window.blocks {
         block.hash = query.store().get_header(block.header_fk)?.hash;
     }
     Ok(window)
-}
-
-/// One tx: `None` when it has no tweak (coinbase, no P2TR output, ineligible).
-type HeightTweaks = Vec<Option<[u8; 33]>>;
-
-struct IndexHeightOut {
-    filter: Option<(bitcoin::bip158::BlockFilter, Fk)>,
-    tweaks: Option<(Height, Fk, HeightTweaks)>,
 }
 
 struct IndexHeightJob {
@@ -91,6 +196,7 @@ fn assemble_index_height(job: &IndexHeightJob) -> Result<(), ConsensusError> {
     let block = &job.window.blocks[job.index];
     let filter = if job.want_filter {
         Some((
+            block.height,
             rbitcoin_query::basic_filter_of(&block.hash, &job.window, job.index)?,
             block.header_fk,
         ))
@@ -110,16 +216,17 @@ fn assemble_index_height(job: &IndexHeightJob) -> Result<(), ConsensusError> {
     Ok(())
 }
 
-struct Assembled {
-    filters: Vec<(bitcoin::bip158::BlockFilter, Fk)>,
-    tweaks: Vec<(Height, Fk, HeightTweaks)>,
-}
-
 /// One job per height that still needs a filter or tweaks. The wave joins
 /// before return, so the `Arc` is only shared for that call.
-fn assemble_window(query: &Query, window: &Arc<IndexWindow>) -> Result<Assembled, ConsensusError> {
-    let filter_from = query.filter_index_next();
-    let tweak_from = query.tweak_index_next();
+fn assemble_window(query: &Query, window: &Arc<IndexWindow>) -> Result<IndexRows, ConsensusError> {
+    assemble_window_from(window, query.filter_index_next(), query.tweak_index_next())
+}
+
+fn assemble_window_from(
+    window: &Arc<IndexWindow>,
+    filter_from: Option<u32>,
+    tweak_from: Option<u32>,
+) -> Result<IndexRows, ConsensusError> {
     let mut slots = Vec::with_capacity(window.blocks.len());
     let mut jobs = Vec::new();
     for (index, block) in window.blocks.iter().enumerate() {
@@ -138,23 +245,8 @@ fn assemble_window(query: &Query, window: &Arc<IndexWindow>) -> Result<Assembled
         }
         slots.push(out);
     }
-    if let Some(wave) = start_for_each_owned_chunk(jobs, assemble_index_height, 1)? {
-        wave.finish()?;
-    }
-    let mut filters = Vec::new();
-    let mut tweaks = Vec::new();
-    for slot in &slots {
-        let Some(done) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-            continue;
-        };
-        if let Some(filter) = done.filter {
-            filters.push(filter);
-        }
-        if let Some(tweak) = done.tweaks {
-            tweaks.push(tweak);
-        }
-    }
-    Ok(Assembled { filters, tweaks })
+    index_rows::finish_wave(jobs, assemble_index_height)?;
+    Ok(index_rows::rows_from_slots(&slots))
 }
 
 /// Milliseconds of one interval, or of one tip window.
@@ -246,37 +338,26 @@ fn commit_window(
     window: &Arc<IndexWindow>,
     stages: &IndexStageMs,
 ) -> Result<CommitTimes, ConsensusError> {
-    let Some(first) = window.blocks.first().map(|b| b.height.0) else {
+    if window.blocks.is_empty() {
         return Ok(CommitTimes {
             ok: true,
             build_ns: 0,
             commit_ns: 0,
         });
-    };
+    }
     let t_build = Instant::now();
     let assembled = assemble_window(query, window)?;
     let build_ns = t_build.elapsed().as_nanos() as u64;
-    let t_commit = Instant::now();
-    let committed = (|| {
-        let mut ok = true;
-        if !assembled.filters.is_empty() {
-            let start = query.filter_index_next().unwrap_or(first).max(first);
-            ok &= query.commit_window_filters(start, &assembled.filters)? > 0;
-        }
-        if !assembled.tweaks.is_empty() {
-            ok &= query.commit_window_tweaks(&assembled.tweaks)? > 0;
-        }
-        Ok(ok)
-    })();
-    let commit_ns = t_commit.elapsed().as_nanos() as u64;
+    let committed = index_rows::commit_index_rows(query, assembled)?;
+    let commit_ns = committed.put_ns;
     stages.add_build(build_ns);
     stages.add_commit(commit_ns);
     rbitcoin_query::note_confirm(
         &query.confirm_stats().blockfilter_ns,
         build_ns.saturating_add(commit_ns),
     );
-    committed.map(|ok| CommitTimes {
-        ok,
+    Ok(CommitTimes {
+        ok: !committed.moved,
         build_ns,
         commit_ns,
     })
@@ -626,8 +707,8 @@ mod tests {
         assert_eq!(got.tweaks.len(), 3);
         for (i, block) in window.blocks.iter().enumerate() {
             let serial_f = q.basic_filter_from_window(&window, i).unwrap();
-            assert_eq!(got.filters[i].0.content, serial_f.content, "filter {i}");
-            assert_eq!(got.filters[i].1, block.header_fk);
+            assert_eq!(got.filters[i].1.content, serial_f.content, "filter {i}");
+            assert_eq!(got.filters[i].2, block.header_fk);
             let serial_t = crate::silent_payments::tweak_records_from_window(&window, i).unwrap();
             assert_eq!(got.tweaks[i].2, serial_t, "tweaks {i}");
         }

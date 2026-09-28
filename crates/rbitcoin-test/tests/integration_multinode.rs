@@ -48,6 +48,10 @@ async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
 }
 
 /// Mature regtest pad with basic filters sealed through height 1 only.
+///
+/// Connecting the chain releases the index through the tip. Commit 0..=1
+/// directly and leave live append off, so a later connect does not seal
+/// the rest.
 fn open_padded_query(dir: &TempDir) -> Query {
     use rbitcoin_consensus::accept_and_connect_block;
     use rbitcoin_test::pad_empty_from;
@@ -56,11 +60,27 @@ fn open_padded_query(dir: &TempDir) -> Query {
     let params = ChainParams::regtest();
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let (tip, time) = pad_empty_from(&q, &params, genesis.block_hash(), genesis.header.time, 1, 1);
+    pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        params.coinbase_maturity() + 1,
+    );
     q.set_block_filter_index(true).unwrap();
-    q.release_index_writebehind(Height(1));
-    rbitcoin_consensus::build_indexes_released(&q).expect("filters through height 1");
-    pad_empty_from(&q, &params, tip, time, 2, params.coinbase_maturity() + 1);
+    let heights = q.index_heights(0, 1, None).unwrap();
+    let window = q.read_index_window(&heights).unwrap();
+    let built: Vec<_> = (0..heights.len())
+        .map(|i| {
+            (
+                q.basic_filter_from_window(&window, i).unwrap(),
+                heights[i].header_fk,
+            )
+        })
+        .collect();
+    assert_eq!(q.commit_window_filters(0, &built).unwrap(), 2);
+    assert_eq!(q.basic_filter_hwm().unwrap(), Some(1));
     q
 }
 
@@ -1751,8 +1771,8 @@ async fn ibd_skips_dead_peer() {
 }
 
 /// After IBD, seed announces a new tip; follower picks it up via inv/headers.
-/// With the filter index on, IBD confirm builds no basic filters; the
-/// write-behind appender materializes them, then follows the new tip.
+/// Filters and tweaks enabled before sync are sealed by IBD confirm. A
+/// caught-up follower seals the new tip on the confirm path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
     use std::sync::Arc;
@@ -1769,19 +1789,20 @@ async fn tip_follow_after_ibd() {
         peer.query
             .set_sptweaks_enabled(true, Height(ChainParams::regtest().taproot_height()))
             .unwrap();
+        rbitcoin_consensus::prepare_live_indexes(&peer.query).unwrap();
         sync_ibd(&peer, seed.local_addr).await;
         peer.wait_height(5, Duration::from_secs(10))
             .await
             .expect("ibd");
         assert_eq!(
             peer.query.basic_filter_hwm().unwrap(),
-            None,
-            "IBD confirm leaves basic filters to the appender"
+            Some(5),
+            "IBD confirm seals filters when the index is on from the start"
         );
         assert_eq!(
             peer.query.sptweaks_next_height(),
-            Some(Height(0)),
-            "the confirm write thread writes no tweaks"
+            Some(Height(6)),
+            "IBD confirm seals tweaks from the taproot origin"
         );
         let pq = Arc::clone(&peer.query);
         // Records the filter watermark when a builder first reports caught up.
@@ -1839,29 +1860,19 @@ async fn tip_follow_after_ibd() {
         assert_eq!(peer.query.tip_height(), Some(Height(6)));
         assert_eq!(
             indexed(),
-            (Some(5), Some(Height(6))),
-            "with no builder running, the confirm path writes no index data"
+            (Some(6), Some(Height(7))),
+            "a caught-up confirm seals the new tip"
         );
 
-        let (stop, builder) = spawn_builder();
-        wait_ms_until(
-            5_000,
-            || indexed() == (Some(6), Some(Height(7))),
-            || format!("catch up {:?}", indexed()),
-        )
-        .await;
         let h7 = mine_next(7);
         peer.wait_tip_hash(h7, Duration::from_secs(10))
             .await
             .expect("tip follow");
-        wait_ms_until(
-            5_000,
-            || indexed() == (Some(7), Some(Height(8))),
-            || format!("follow {:?}", indexed()),
-        )
-        .await;
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        builder.join().unwrap();
+        assert_eq!(
+            indexed(),
+            (Some(7), Some(Height(8))),
+            "the next tip is sealed on the confirm path too"
+        );
 
         seed.shutdown().await;
         peer.shutdown().await;

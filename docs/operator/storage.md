@@ -264,10 +264,12 @@ with `value <= SATS` and drops txs that then have none. Default **1000**.
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
 figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
-The index is built after catch-up by the block index builder (`rbtc-idx-wb`,
-shared with `--block-filter-index`) from the taproot origin (709632 on
-mainnet), then sealed per released tip block; the confirm write thread writes
-no tweaks. One IO thread reads windows of heights on one completion session
+IBD seals the index from the taproot origin (709632 on mainnet) when
+`--sp-tweaks` is on from the start, on the confirm write thread, shared with
+`--block-filter-index`. A restart gap of at most one write drain is sealed
+at startup; a later enable still materializes after catch-up
+(`rbtc-idx-wb`). Once the watermark covers the tip, new blocks are sealed on
+the confirm write thread. That materialize is one IO thread reading windows of heights on one completion session
 (`seqsigwit` and parent txids only for P2TR-output txs); one CPU thread
 (`rbtc-idx-cpu`) publishes one job per height to `rbtc-scripts-*` (tweak EC,
 and filter GCS when that index is on) and commits one batched height-blob +

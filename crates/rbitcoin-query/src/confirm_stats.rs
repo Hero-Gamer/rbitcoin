@@ -140,8 +140,10 @@ confirm_window! {
     structural_create_h_ns,
     structural_bip68_ns,
     class_c_ns,
-    // `rbtc-bf-wb` build + commit (off the write thread)
+    // Live idx assemble + put, and materialize build + commit. `tip: accept bf=` is this sum.
     blockfilter_ns,
+    idx_asm_ns,
+    idx_put_ns,
     ensure_layout_ns,
     write_class_c_join_ns,
     write_drain_join_ns,

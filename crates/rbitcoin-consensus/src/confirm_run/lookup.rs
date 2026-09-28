@@ -357,6 +357,7 @@ pub fn confirm_wire_load_from_plan(
             batch_parents,
             script_preverified: preverified.clone(),
             archive_plan: plan,
+            index_want: super::index::index_want(query),
             stats: query.confirm_stats_arc(),
         },
         work_ns,

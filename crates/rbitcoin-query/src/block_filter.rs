@@ -52,30 +52,40 @@ impl BlockFilterWriteBehind {
 
 /// Basic filter of `window.blocks[i]` using a hash the caller already loaded.
 ///
-/// No store IO. Output scripts other than `OP_RETURN`, then each spent prevout
-/// script. A missing prevout is corrupt.
+/// No store IO. A missing prevout is corrupt.
 pub fn basic_filter_of(
     block_hash: &[u8; 32],
     window: &IndexWindow,
     i: usize,
 ) -> Result<BlockFilter, QueryError> {
-    const OP_RETURN: u8 = 0x6a;
     let block = &window.blocks[i];
-    let mut elements: Vec<&[u8]> = Vec::new();
-    for tx in &block.txs {
-        for o in &tx.outs {
-            if o.script.first() != Some(&OP_RETURN) {
-                elements.push(&o.script);
-            }
-        }
-    }
+    let mut spent = Vec::new();
     for e in block.edges.iter().flatten().filter(|e| !e.parent.is_null()) {
         let out = window.prevout(e.parent, e.vout).ok_or(StoreError::Corrupt(
             "invariant: blockfilter prevout missing",
         ))?;
-        elements.push(&out.script);
+        spent.push(out.script.as_slice());
     }
-    encode_basic_filter(block_hash, elements.into_iter())
+    let outputs = block
+        .txs
+        .iter()
+        .flat_map(|tx| tx.outs.iter().map(|o| o.script.as_slice()));
+    basic_filter_from_scripts(block_hash, outputs, spent)
+}
+
+/// GCS-encode a basic filter. Non-`OP_RETURN` output scripts, then each spent
+/// prevout script. `block_hash` is internal byte order.
+pub fn basic_filter_from_scripts<'a>(
+    block_hash: &[u8; 32],
+    output_scripts: impl IntoIterator<Item = &'a [u8]>,
+    spent_scripts: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<BlockFilter, QueryError> {
+    const OP_RETURN: u8 = 0x6a;
+    let elements = output_scripts
+        .into_iter()
+        .filter(|script| script.first() != Some(&OP_RETURN))
+        .chain(spent_scripts);
+    encode_basic_filter(block_hash, elements)
 }
 
 /// GCS-encode a basic filter keyed by `block_hash` (internal byte order).
@@ -305,6 +315,16 @@ impl Query {
         }
         table.put(&recs)?;
         Ok(built.len() as u32)
+    }
+
+    /// Confirm may append filter and tweak rows for batches it connects.
+    pub fn index_live(&self) -> bool {
+        self.index_live.load(Ordering::Acquire)
+    }
+
+    /// The write side of [`Self::index_live`]. Startup sets it; confirm does not.
+    pub fn set_index_live(&self, on: bool) {
+        self.index_live.store(on, Ordering::Release);
     }
 
     /// Next filter height to seal (`None` when the filter index is off).

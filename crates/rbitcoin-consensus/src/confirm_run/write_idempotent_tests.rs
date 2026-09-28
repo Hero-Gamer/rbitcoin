@@ -63,6 +63,7 @@ fn script_ok_append_contiguous_and_gap() {
             ))],
             batch_parents: rbitcoin_query::BatchParents::new(),
             archive_plan: None,
+            index_seal: super::index::IndexSeal::default(),
         }
     }
     let mut a = batch_one(10);
@@ -85,6 +86,7 @@ fn script_ok_append_contiguous_and_gap() {
             wire_blocks: vec![],
             batch_parents: rbitcoin_query::BatchParents::new(),
             archive_plan: None,
+            index_seal: super::index::IndexSeal::default(),
         })
         .is_ok());
     assert_eq!(a.len(), 3);
@@ -95,6 +97,7 @@ fn script_ok_append_contiguous_and_gap() {
         wire_blocks: vec![],
         batch_parents: rbitcoin_query::BatchParents::new(),
         archive_plan: None,
+        index_seal: super::index::IndexSeal::default(),
     };
     assert!(empty.append_contiguous(batch_one(50)).is_ok());
     assert_eq!(empty.len(), 1);
@@ -174,6 +177,7 @@ fn three_stage_write_filter_and_scripts_surface() {
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: ScriptPreverified::new(),
         archive_plan: None,
+        index_want: super::index::IndexWant::default(),
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
     };
     assert!(batch.is_empty());
@@ -226,6 +230,7 @@ fn empty_loaded_batch() -> super::LoadedBatch {
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: super::ScriptPreverified::new(),
         archive_plan: None,
+        index_want: super::index::IndexWant::default(),
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
     }
 }
@@ -326,6 +331,7 @@ fn loaded_at(
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: super::ScriptPreverified::new(),
         archive_plan: None,
+        index_want: super::index::IndexWant::default(),
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
     }
 }
@@ -589,6 +595,7 @@ fn expected_bits_extending_height0_and_no_retarget() {
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: ScriptPreverified::new(),
         archive_plan: None,
+        index_want: super::index::IndexWant::default(),
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
     };
     let ok = confirm_scripts_phase(loaded).unwrap();
@@ -781,6 +788,7 @@ fn script_wave_skips_preverified_txids() {
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: pre,
         archive_plan: None,
+        index_want: super::index::IndexWant::default(),
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
     };
     confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");

@@ -30,11 +30,12 @@
 //!   (plan=None / S0 only), clone, and post-stamp prune on a marked last load
 //!   batch (`load_thr pack/stamp/pin/asm/prune`).
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
-//!   `ibd-confirm`; excludes head-of-line wait for write handoff). `thr script work`
-//!   is that same ns. Recv/send are wait. Publisher parks; it does not `wait_done`
-//!   on steal workers.
+//!   `ibd-confirm`; excludes head-of-line wait for write handoff and `idx_asm=`).
+//!   `idx_asm=` is filter and tweak assemble after that verify. `thr script work`
+//!   is `script=` plus `idx_asm=`. Recv/send are wait. Publisher parks; it does
+//!   not `wait_done` on steal workers.
 //! - **write** = Class A + ensure + structural + class_c + spend
-//!   + `pins=` / `head_sub=` / `drain_join=` / `dequeue=`.
+//!   + `pins=` / `head_sub=` / `drain_join=` / `dequeue=` / `idx_put=`.
 //!     `other=` is write-thread work minus that inventory.
 //!
 //! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
@@ -97,6 +98,9 @@ pub(crate) struct WriteStageSample {
     /// Body-queue dequeue after confirm (`dequeue=`)
     pub dequeue_ms: u64,
     pub dequeue_ns: u64,
+    /// Live filter and tweak put (`idx_put=`)
+    pub idx_put_ms: u64,
+    pub idx_put_ns: u64,
 }
 
 type WriteInvTok = (
@@ -127,6 +131,7 @@ impl WriteStageSample {
         ("class_c_join", |s| s.class_c_join_ms, |s| s.class_c_join_ns),
         ("drain_join", |s| s.drain_join_ms, |s| s.drain_join_ns),
         ("dequeue", |s| s.dequeue_ms, |s| s.dequeue_ns),
+        ("idx_put", |s| s.idx_put_ms, |s| s.idx_put_ns),
     ];
 
     /// Same inventory in nanoseconds (`format_debug` us/blk write=).
@@ -169,6 +174,8 @@ pub(crate) struct IbdPerfSample {
     pub phase_blks: u64,
     pub connect_ms: u64,
     pub script_ms: u64,
+    /// Filter and tweak assemble on the scripts stage (`idx_asm=`).
+    pub idx_asm_ms: u64,
     /// Write-stage exclusive tokens (`write=` = [`WriteStageSample::stage_ms`]).
     pub write: WriteStageSample,
     /// Ensure mix: residency/pin hits vs cold denserels body loads.
@@ -461,6 +468,7 @@ impl Default for IbdPerfSample {
             phase_blks: 0,
             connect_ms: 0,
             script_ms: 0,
+            idx_asm_ms: 0,
             write: WriteStageSample::default(),
             ensure_res_hit: 0,
             ensure_cold_n: 0,
@@ -860,6 +868,8 @@ pub(crate) fn sample(
     let w = stats.take_window();
     let connect_ns = w.connect_ns;
     let script_ns = w.script_ns;
+    let idx_asm_ns = w.idx_asm_ns;
+    let idx_put_ns = w.idx_put_ns;
     let milestone_gate_ns = w.milestone_gate_ns;
     let class_c_ns = w.class_c_ns;
     let strong_ns = w.strong_ns;
@@ -949,6 +959,7 @@ pub(crate) fn sample(
         phase_blks,
         connect_ms: ns_ms(connect_ns),
         script_ms: ns_ms(script_ns),
+        idx_asm_ms: ns_ms(idx_asm_ns),
         write: WriteStageSample {
             class_a_ms: ns_ms(class_a_ns),
             class_a_ns,
@@ -972,6 +983,8 @@ pub(crate) fn sample(
             drain_join_ns,
             dequeue_ms: ns_ms(dequeue_ns),
             dequeue_ns,
+            idx_put_ms: ns_ms(idx_put_ns),
+            idx_put_ns,
         },
         ensure_res_hit,
         ensure_cold_n,
@@ -1298,7 +1311,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let stamp_head_ms = s.stamp_batch_head_fk_ms;
     let stamp_pack_ms = s.thr_load_stamp_ms.saturating_sub(stamp_head_ms);
     out.push_str(&format!(
-        " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) write={}ms \
+        " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) idx_asm={}ms write={}ms \
          lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={}) loc={}ms) other={}ms send_w={}ms) \
          load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
@@ -1309,6 +1322,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.script_ms,
         s.script_jobs,
         s.script_skip,
+        s.idx_asm_ms,
         write_ms,
         thr_lookup_busy,
         s.thr_lookup_claim_ms,

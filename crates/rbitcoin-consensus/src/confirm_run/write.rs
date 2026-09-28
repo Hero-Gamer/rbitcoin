@@ -128,7 +128,7 @@ fn apply_archive_plan(
 }
 
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC
-/// → optional SP tweak index (**Tip write-through only**; Direct defers to backfill).
+/// → live filter and tweak append when `index_live` assembled this batch.
 ///
 /// When `batch.archive_plan` is set (wire lookup/load path), Class A is appended in this
 /// same stage before structural/annotate — single ordered commit era.
@@ -219,6 +219,13 @@ pub fn confirm_write_phase(
                 &query.confirm_stats().write_class_c_join_ns,
                 class_c_join_ns,
             );
+        }
+
+        let seal = std::mem::take(&mut batch.index_seal);
+        let idx_put_ns = super::index::seal_live_indexes(query, seal)?;
+        if idx_put_ns > 0 {
+            rbitcoin_query::note_confirm(&query.confirm_stats().idx_put_ns, idx_put_ns);
+            rbitcoin_query::note_confirm(&query.confirm_stats().blockfilter_ns, idx_put_ns);
         }
 
         let spend_ann_ns = post_commit(query, &slots)?;

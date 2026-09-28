@@ -49,8 +49,12 @@ wire / body-queue
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
+  → index append (filter and tweak bytes from the scripts stage; no store read)
   → abs spend annotate (put_spend_batch_by_abs_meta on spent.body only)
 ```
+
+Startup, before this pipeline, may `read_index_window` to seal a filter or tweak
+gap of at most one IBD write drain. The confirm write thread does not.
 
 IBD thread split (same IO table): lookup **thread** is decode + TipOnly +
 `take_raw` onto loadq. Structure + plan_batch (`confirm_wire_lookup_stamp`)
