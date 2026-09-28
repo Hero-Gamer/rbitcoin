@@ -1151,45 +1151,4 @@ mod tests {
             .expect("zero txid skipped")
             .is_empty());
     }
-
-    #[test]
-    fn plan_none_stamp_archived_pairs_match_metas() {
-        use crate::accept_and_connect_block;
-        use crate::regtest_pad::mine_empty_regtest;
-        use rbitcoin_query::testutil::FixtureChain;
-
-        let (path, q) = tmp_query();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        let (header, txs) =
-            crate::prepare_block_for_archive(&q, &params, &b1).expect("archive prep");
-        q.commit_class_a_only(&header, &txs).expect("Class A only");
-        let items = [(Height(1), Arc::new(b1), None)];
-        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None)
-            .expect("already-archived stamp");
-        assert!(stamped.plan.is_none(), "S1 plan=None");
-        let pairs = stamped.archived_create_pairs();
-        assert_eq!(pairs.len(), stamped.metas[0].txids.len());
-        assert_eq!(pairs[0].0, stamped.metas[0].txids[0]);
-        assert_eq!(pairs[0].1, stamped.metas[0].tx_fks[0]);
-        assert_eq!(stamped.last_height_hash(), Some((1, stamped.metas[0].hash)));
-
-        let hfk = stamped.metas[0].header_fk;
-        let first_fk = stamped.metas[0].tx_fks[0];
-        q.store()
-            .header_txs
-            .put_range(hfk, first_fk, 2)
-            .expect("tamper list length");
-        match confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, None) {
-            Err(ConsensusError::Store(StoreError::Corrupt(m))) => {
-                assert_eq!(m, "invariant: archived stamp tx_fks/txids length");
-            }
-            Err(e) => panic!("populated list/wire mismatch must be length Corrupt, got {e}"),
-            Ok(_) => panic!("populated list/wire mismatch must fail stamp"),
-        }
-
-        let _ = std::fs::remove_dir_all(&path);
-    }
 }

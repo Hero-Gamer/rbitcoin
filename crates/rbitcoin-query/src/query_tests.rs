@@ -688,21 +688,6 @@ fn chain_view_run_not_found_on_empty() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Finish-path stamp-only notes must not wipe leftover_n for the fail pack.
-#[test]
-fn leftover_last_plan_batch_survives_stamp_only_note() {
-    let (_d, q) = crate::testutil::tiny_query_labeled("last-plan-batch");
-    let st = q.confirm_stats();
-    st.note_resolve_counts(1, 1, 7, 3, 0, 0);
-    st.note_resolve_counts(0, 0, 0, 0, 5, 6);
-    let last = st.last_plan_batch();
-    assert_eq!(
-        last.head_need, 7,
-        "stamp-only note_resolve_counts must not clobber leftover LAST"
-    );
-    assert_eq!(last.head_hit, 3);
-}
-
 /// Tip commit (`confirm_block`) must publish `confirmed[]` without waiting
 /// on Class B scripthash. Drain is [`Query::apply_sh_pending`] (or
 /// [`Query::connect_block`], which drains for fixtures).

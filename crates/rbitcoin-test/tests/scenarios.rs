@@ -1088,6 +1088,168 @@ fn pin_leftover_tiponly_one_fk(q: &Query, cb1: bitcoin::Txid, create_fk: Fk) {
     assert_eq!(inflight.get_create_fk(&tid), Some(later));
 }
 
+fn spend_edge_of(plan: &rbitcoin_query::ArchiveWritePlan) -> rbitcoin_query::SpendEdge {
+    *plan
+        .edges
+        .values()
+        .flatten()
+        .find(|e| e.vout != u32::MAX)
+        .expect("spend edge")
+}
+
+/// Before the spend is archived, its connected parent resolves by TipOnly
+/// head: through the leftover probe with no wave, and through every BQ wave
+/// that carries it (a wave skeleton needs no leftover probe).
+fn pin_head_parent_via_waves_and_leftover_stamp(
+    q: &Query,
+    params: &ChainParams,
+    ms: Milestone,
+    cb1: bitcoin::Txid,
+    b_spend: &Block,
+    spend_h: u32,
+) {
+    use bitcoin::consensus::encode::serialize;
+    use rbitcoin_consensus::{
+        confirm_bq_resolve_wave_capped, confirm_wire_lookup_stamp, take_wave_items_for_load,
+        WireLoadPipeline, BQ_RESOLVE_WAVE_MAX_BLOCKS, BQ_RESOLVE_WAVE_MAX_INPUTS,
+    };
+    use rbitcoin_test::mine::spend_anyone_can_spend;
+
+    let parent = cb1.to_byte_array();
+    let head_fk = q.tx_fk_by_txid_tip(&parent).unwrap().expect("connected");
+    let items = [(Height(spend_h), std::sync::Arc::new(b_spend.clone()), None)];
+    let stamped = confirm_wire_lookup_stamp(q, params, ms, &items, None)
+        .expect("a leftover connected parent TipOnly-heads");
+    let edge = spend_edge_of(&stamped.plan.expect("a new body needs a plan"));
+    assert_eq!((edge.prev_txid, edge.create_fk), (parent, head_fk));
+    let leftover = q.confirm_stats().last_plan_batch();
+    assert!(
+        leftover.head_need >= 1 && leftover.head_hit == leftover.head_need,
+        "{leftover:?}"
+    );
+
+    let rival = mine_regtest_block(
+        b_spend.block_hash(),
+        b_spend.header.time + 600,
+        spend_h + 1,
+        vec![spend_anyone_can_spend(
+            cb1,
+            0,
+            Amount::from_sat(48_0000_0000),
+        )],
+    );
+    for (h, b) in [(spend_h, b_spend), (spend_h + 1, &rival)] {
+        q.block_queue_enqueue(
+            h,
+            b.block_hash().to_byte_array(),
+            u64::from(h),
+            &serialize(b),
+        )
+        .unwrap();
+    }
+    let wave = |h: u32| {
+        confirm_bq_resolve_wave_capped(
+            q,
+            params,
+            ms,
+            &[h],
+            BQ_RESOLVE_WAVE_MAX_BLOCKS,
+            BQ_RESOLVE_WAVE_MAX_INPUTS,
+        )
+        .unwrap()
+    };
+    let w1 = wave(spend_h);
+    assert!(w1.stats.hits >= 1);
+    assert!(w1.parent_ids.get(&parent).is_some());
+    let ext = stamp_external_parents(
+        q.store(),
+        &[parent],
+        &InFlight::new(),
+        Some(&w1.parent_ids),
+        q.confirm_stats(),
+    )
+    .unwrap();
+    assert_eq!(
+        ext.head_need_n, 0,
+        "a wave skeleton needs no leftover probe"
+    );
+    let inflight = InFlight::new();
+    let pipe = WireLoadPipeline {
+        path_lo: spend_h,
+        parent_hash: None,
+        next_tx_start: q.tx_body_count().saturating_add(1),
+        in_flight: &inflight,
+        skeleton: Some(w1.parent_ids.clone()),
+        carried_need: w1
+            .items
+            .iter()
+            .flat_map(|(_, _, w)| w.spend_keys.iter().map(|&(t, _)| t))
+            .collect(),
+        carried_header_fks: Vec::new(),
+        carried_header_hashes: Vec::new(),
+    };
+    let stamped = confirm_wire_lookup_stamp(q, params, ms, &items, Some(&pipe)).unwrap();
+    let edge = spend_edge_of(&stamped.plan.expect("a new body needs a plan"));
+    assert_eq!(edge.create_fk, head_fk);
+    take_wave_items_for_load(q, &w1.items).unwrap();
+
+    let w2 = wave(spend_h + 1);
+    assert!(
+        w2.stats.keys >= 1 && w2.stats.hits >= 1,
+        "a second wave TipOnlys the same connected parent again"
+    );
+    assert!(w2.parent_ids.get(&parent).is_some());
+    take_wave_items_for_load(q, &w2.items).unwrap();
+    assert!(!q.block_queue_has_height(spend_h));
+    assert!(!q.block_queue_has_height(spend_h + 1));
+}
+
+/// Once the spend is in Class A, lookup stamps it without a plan: the
+/// archived create pairs are the block's txids and fks. A header whose tx
+/// list no longer matches the wire block refuses as Corrupt.
+fn pin_plan_none_stamp_of_archived_spend(
+    q: &Query,
+    params: &ChainParams,
+    ms: Milestone,
+    b_spend: &Block,
+    spend_h: u32,
+) {
+    use rbitcoin_consensus::{confirm_wire_lookup_stamp, ConsensusError};
+
+    let hash = b_spend.block_hash().to_byte_array();
+    let (hfk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
+    let fks = q.header_tx_fks(hfk, Some(&hash)).unwrap().unwrap();
+    let items = [(Height(spend_h), std::sync::Arc::new(b_spend.clone()), None)];
+    let before = q.confirm_stats().last_plan_batch();
+    let stamped = confirm_wire_lookup_stamp(q, params, ms, &items, None).expect("archived stamp");
+    assert!(stamped.plan.is_none(), "already archived: plan=None");
+    let pairs: Vec<_> = b_spend
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .zip(fks.iter().copied())
+        .collect();
+    assert_eq!(stamped.archived_create_pairs(), pairs);
+    assert_eq!(stamped.last_height_hash(), Some((spend_h, hash)));
+    let after = q.confirm_stats().last_plan_batch();
+    assert_eq!(
+        (after.head_need, after.head_hit),
+        (before.head_need, before.head_hit),
+        "a stamp-only note keeps the last leftover counts"
+    );
+
+    let n = fks.len() as u32;
+    q.store().header_txs.put_range(hfk, fks[0], n + 1).unwrap();
+    match confirm_wire_lookup_stamp(q, params, ms, &items, None) {
+        Err(ConsensusError::Store(StoreError::Corrupt(m))) => {
+            assert_eq!(m, "invariant: archived stamp tx_fks/txids length");
+        }
+        Err(e) => panic!("list/wire length mismatch must be Corrupt, got {e}"),
+        Ok(_) => panic!("list/wire length mismatch must fail the stamp"),
+    }
+    q.store().header_txs.put_range(hfk, fks[0], n).unwrap();
+}
+
 /// Resume: spend archived with create_fk (archive sticky/head); confirm spends.
 #[test]
 fn resume_tx_head_resolves_external_prev() {
@@ -1137,7 +1299,9 @@ fn resume_tx_head_resolves_external_prev() {
             q.tx_fk_by_txid(cb1.as_byte_array()).unwrap().is_some(),
             "tx.head must retain mature coinbase create_fk across reopen"
         );
+        pin_head_parent_via_waves_and_leftover_stamp(&q, &params, ms, cb1, &b_spend, spend_h);
         commit_class_a_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+        pin_plan_none_stamp_of_archived_spend(&q, &params, ms, &b_spend, spend_h);
         let fks = q
             .store()
             .header_txs
@@ -2664,11 +2828,12 @@ fn pin_wire_prep_ahead_cross_batch(
 
     let tip_h = q.tip_height();
     let spend_a = spend_anyone_can_spend(cb, 0, Amount::from_sat(49_0000_0000));
-    let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a]);
-    let a_out_txid = ba.txdata[1].compute_txid();
+    let child_a = spend_anyone_can_spend(spend_a.compute_txid(), 0, Amount::from_sat(48_0000_0000));
+    let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a, child_a]);
+    let a_out_txid = ba.txdata[2].compute_txid();
     let ha_hash = ba.block_hash();
     let hb = ha + 1;
-    let spend_b = spend_anyone_can_spend(a_out_txid, 0, Amount::from_sat(48_0000_0000));
+    let spend_b = spend_anyone_can_spend(a_out_txid, 0, Amount::from_sat(47_0000_0000));
     let bb = mine_regtest_block(ha_hash, tip_time + 1200, hb, vec![spend_b]);
 
     let mut inflight = InFlight::new();
@@ -2708,6 +2873,30 @@ fn pin_wire_prep_ahead_cross_batch(
             "packed and batch_pin must share CreatePin"
         );
     }
+    let cb_fk = q.tx_fk_by_txid_tip(cb.as_byte_array()).unwrap().unwrap();
+    let spend_fk = plan_a.planned_fks[1];
+    assert_eq!(
+        plan_a.packed[1].1[0].create_fk, cb_fk,
+        "a head-resolved parent is stamped by fk"
+    );
+    let edge = plan_a.edges[&spend_fk.0][0];
+    assert_eq!(
+        (edge.prev_txid, edge.vout, edge.spend_fk, edge.create_fk),
+        (*cb.as_byte_array(), 0, spend_fk, cb_fk)
+    );
+    assert!(plan_a.edges[&plan_a.planned_fks[0].0][0]
+        .create_fk
+        .is_null());
+    let same_batch: Vec<_> = plan_a
+        .same_batch_spent_overlay()
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(
+        same_batch,
+        [(0, plan_a.planned_fks[2], 0)],
+        "the in-block child spends the spend's output in this batch"
+    );
     if plan_a.batch_pin.len() == plan_a.planned_fks.len() {
         inflight.note_pins(
             plan_a
@@ -2757,6 +2946,17 @@ fn pin_wire_prep_ahead_cross_batch(
     let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
     confirm_write_phase(q, params, ms, ok_a.batch).expect("write A");
     assert_eq!(q.tip_height(), Some(Height(ha)));
+    assert_eq!(q.block_tx_fks(Height(ha)).unwrap()[1], spend_fk);
+    let (off, _) = q.store().tx_spent_range(cb_fk).unwrap();
+    let meta = q
+        .store()
+        .get_spender_meta_at_abs_batch(&[rbitcoin_store::spent_abs(off, 0)])
+        .unwrap();
+    assert_eq!(
+        meta[0].unwrap().0,
+        spend_fk,
+        "write annotates the spent slot"
+    );
 
     let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
     confirm_write_phase(q, params, ms, ok_b.batch).unwrap_or_else(|e| {
