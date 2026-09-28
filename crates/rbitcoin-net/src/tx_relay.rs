@@ -6,6 +6,7 @@
 //! is not in rust-bitcoin 0.32 `NetworkMessage`; the old private `rbtpkg`
 //! name is gone).
 
+use crate::perf_meter::{PerfCounter, PerfMax};
 use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
@@ -571,10 +572,10 @@ pub struct MempoolHub {
     tx_snapshot: ArcSwap<MempoolTxSnapshot>,
     tx_snap_dirty: AtomicBool,
     tx_snap_refreshing: AtomicBool,
-    meter_accepts: AtomicU64,
-    meter_rejects: AtomicU64,
+    meter_accepts: PerfCounter,
+    meter_rejects: PerfCounter,
     meter_accept_us: AtomicU64,
-    meter_accept_max_us: AtomicU64,
+    meter_accept_max_us: PerfMax,
     meter_accept_lock_us: AtomicU64,
     meter_accept_utxo_us: AtomicU64,
     meter_accept_script_us: AtomicU64,
@@ -726,10 +727,10 @@ impl MempoolHub {
             tx_snapshot: ArcSwap::from_pointee(MempoolTxSnapshot::empty(Instant::now())),
             tx_snap_dirty: AtomicBool::new(true),
             tx_snap_refreshing: AtomicBool::new(false),
-            meter_accepts: AtomicU64::new(0),
-            meter_rejects: AtomicU64::new(0),
+            meter_accepts: PerfCounter::new(),
+            meter_rejects: PerfCounter::new(),
             meter_accept_us: AtomicU64::new(0),
-            meter_accept_max_us: AtomicU64::new(0),
+            meter_accept_max_us: PerfMax::new(),
             meter_accept_lock_us: AtomicU64::new(0),
             meter_accept_utxo_us: AtomicU64::new(0),
             meter_accept_script_us: AtomicU64::new(0),
@@ -999,23 +1000,12 @@ impl MempoolHub {
 
     fn meter_accept_wall(&self, us: u64, ok: bool) {
         if ok {
-            self.meter_accepts.fetch_add(1, Ordering::Relaxed);
+            self.meter_accepts.add(1);
         } else {
-            self.meter_rejects.fetch_add(1, Ordering::Relaxed);
+            self.meter_rejects.add(1);
         }
         self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
-        let mut cur = self.meter_accept_max_us.load(Ordering::Relaxed);
-        while us > cur {
-            match self.meter_accept_max_us.compare_exchange_weak(
-                cur,
-                us,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => cur = c,
-            }
-        }
+        self.meter_accept_max_us.note(us);
     }
 
     fn meter_accept_stages(&self, lock_us: u64, stages: rbitcoin_mempool::AcceptStageUs) {
@@ -1029,13 +1019,20 @@ impl MempoolHub {
             .fetch_add(stages.durable_us, Ordering::Relaxed);
     }
 
-    /// Sample-and-reset mempool/relay counters for the tip-follow 5s DEBUG line.
+    /// Running mempool accepts and rejects for `/metrics`. A
+    /// [`Self::sample_reset_perf`] window does not reset them.
+    pub fn accept_totals(&self) -> (u64, u64) {
+        (self.meter_accepts.total(), self.meter_rejects.total())
+    }
+
+    /// Mempool/relay counters since the previous sample, for the tip-follow
+    /// 5s DEBUG line.
     pub fn sample_reset_perf(&self) -> MempoolPerfSample {
         MempoolPerfSample {
-            accepts: self.meter_accepts.swap(0, Ordering::Relaxed),
-            rejects: self.meter_rejects.swap(0, Ordering::Relaxed),
+            accepts: self.meter_accepts.take_window(),
+            rejects: self.meter_rejects.take_window(),
             accept_us: self.meter_accept_us.swap(0, Ordering::Relaxed),
-            accept_max_us: self.meter_accept_max_us.swap(0, Ordering::Relaxed),
+            accept_max_us: self.meter_accept_max_us.take(),
             accept_lock_us: self.meter_accept_lock_us.swap(0, Ordering::Relaxed),
             accept_utxo_us: self.meter_accept_utxo_us.swap(0, Ordering::Relaxed),
             accept_script_us: self.meter_accept_script_us.swap(0, Ordering::Relaxed),

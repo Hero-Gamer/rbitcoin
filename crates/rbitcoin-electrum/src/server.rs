@@ -6,6 +6,7 @@
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
+use rbitcoin_net::RequestMeter;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::{ChainView, ChainViewKind, HistoryFilter, Query, ShJoinSlot};
@@ -13,7 +14,7 @@ use rbitcoin_store::{script_hash, StoreError};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -35,32 +36,22 @@ pub fn parse_electrum_request_line(line: &str) -> Option<Value> {
     serde_json::from_str(line).ok()
 }
 
-/// Tip-follow 5s DEBUG `tip: perf`: JSON-RPC request count this window.
-static METER_REQ: AtomicU64 = AtomicU64::new(0);
-/// Sum of dispatch walls (µs).
-static METER_US: AtomicU64 = AtomicU64::new(0);
-/// Max single dispatch wall (µs).
-static METER_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Electrum JSON-RPC requests: the `tip: perf` window and the `/metrics` totals.
+static METER: RequestMeter = RequestMeter::new();
 
-/// Sample-and-reset Electrum request meters: `(count, sum_us, max_us)`.
+/// Electrum request meters since the previous sample: `(count, sum_us, max_us)`.
+/// Running totals are untouched ([`perf_totals`]).
 pub fn sample_reset_perf() -> (u64, u64, u64) {
-    (
-        METER_REQ.swap(0, Ordering::Relaxed),
-        METER_US.swap(0, Ordering::Relaxed),
-        METER_MAX_US.swap(0, Ordering::Relaxed),
-    )
+    METER.take_window()
+}
+
+/// Running Electrum totals for `/metrics`: `(requests, sum_us)`.
+pub fn perf_totals() -> (u64, u64) {
+    METER.totals()
 }
 
 fn meter_dispatch_wall(us: u64) {
-    METER_REQ.fetch_add(1, Ordering::Relaxed);
-    METER_US.fetch_add(us, Ordering::Relaxed);
-    let mut cur = METER_MAX_US.load(Ordering::Relaxed);
-    while us > cur {
-        match METER_MAX_US.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(c) => cur = c,
-        }
-    }
+    METER.note(us);
 }
 
 /// Max simultaneous query-surface clients (Electrum / future Esplora).

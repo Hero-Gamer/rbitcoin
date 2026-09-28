@@ -20,6 +20,7 @@ mod netgroup;
 mod peer;
 mod peer_dos;
 mod peers;
+mod perf_meter;
 mod reactor;
 mod seeds;
 mod serve_perf;
@@ -63,6 +64,7 @@ pub use peers::{
     pick_stale_follow_evict, DialRequest, DialTarget, LivePeer, PeerConnType, PeerHub, PeerInfo,
     PeerOut, PingAction,
 };
+pub use perf_meter::RequestMeter;
 pub(crate) use rbitcoin_mempool::MempoolGraphStats;
 pub use rbitcoin_mempool::{AcceptError, Selected};
 pub use reactor::BlockingRegion;
@@ -71,7 +73,9 @@ pub use seeds::{
     resolve_dns_seeds, resolve_fixed_seeds, socks_dns_seed_dests, AddrMan, PeerEntry, PeerFlags,
     MAX_ADDR_MAN,
 };
-pub use serve_perf::{format_serve_perf, sample_reset_serve_perf, ServePerfSample};
+pub use serve_perf::{
+    format_serve_perf, sample_reset_serve_perf, serve_perf_totals, ServePerfSample,
+};
 pub use service::P2PNode;
 pub use socks::{install_i2p_dialer, Dialer};
 pub use tx_relay::{

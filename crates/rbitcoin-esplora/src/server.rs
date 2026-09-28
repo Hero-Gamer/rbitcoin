@@ -14,6 +14,7 @@ use bitcoin::consensus::Encodable;
 use bitcoin::Network;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::MempoolHub;
+use rbitcoin_net::RequestMeter;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
@@ -22,7 +23,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -31,20 +32,18 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-/// Tip-follow 5s DEBUG `tip: perf`: REST request count this window.
-static METER_REQ: AtomicU64 = AtomicU64::new(0);
-/// Sum of REST handler walls (µs).
-static METER_US: AtomicU64 = AtomicU64::new(0);
-/// Max single REST request wall (µs).
-static METER_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Esplora REST requests: the `tip: perf` window and the `/metrics` totals.
+static METER: RequestMeter = RequestMeter::new();
 
-/// Sample-and-reset Esplora REST request meters: `(count, sum_us, max_us)`.
+/// Esplora REST request meters since the previous sample: `(count, sum_us, max_us)`.
+/// Running totals are untouched ([`perf_totals`]).
 pub fn sample_reset_perf() -> (u64, u64, u64) {
-    (
-        METER_REQ.swap(0, Ordering::Relaxed),
-        METER_US.swap(0, Ordering::Relaxed),
-        METER_MAX_US.swap(0, Ordering::Relaxed),
-    )
+    METER.take_window()
+}
+
+/// Running Esplora REST totals for `/metrics`: `(requests, sum_us)`.
+pub fn perf_totals() -> (u64, u64) {
+    METER.totals()
 }
 
 async fn meter_rest(req: Request, next: Next) -> Response {
@@ -58,15 +57,7 @@ async fn meter_rest(req: Request, next: Next) -> Response {
     let resp = next.run(req).await;
     let elapsed = t0.elapsed();
     let us = elapsed.as_micros() as u64;
-    METER_REQ.fetch_add(1, Ordering::Relaxed);
-    METER_US.fetch_add(us, Ordering::Relaxed);
-    let mut cur = METER_MAX_US.load(Ordering::Relaxed);
-    while us > cur {
-        match METER_MAX_US.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(c) => cur = c,
-        }
-    }
+    METER.note(us);
     let status = resp.status();
     let err = if status.is_success() {
         None
@@ -1141,6 +1132,7 @@ mod tests {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::{Query, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::sync::atomic::AtomicU64;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 

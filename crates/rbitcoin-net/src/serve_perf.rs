@@ -1,12 +1,12 @@
 //! Historical `getdata` witness-block serve meters for the 5s `tip: perf` line.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::perf_meter::{PerfCounter, PerfMax};
 
-static SERVE_N: AtomicU64 = AtomicU64::new(0);
-static SERVE_BYTES: AtomicU64 = AtomicU64::new(0);
-static SERVE_TX: AtomicU64 = AtomicU64::new(0);
-static SERVE_WALL_NS: AtomicU64 = AtomicU64::new(0);
-static SERVE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static SERVE_N: PerfCounter = PerfCounter::new();
+static SERVE_BYTES: PerfCounter = PerfCounter::new();
+static SERVE_TX: PerfCounter = PerfCounter::new();
+static SERVE_WALL_NS: PerfCounter = PerfCounter::new();
+static SERVE_MAX_NS: PerfMax = PerfMax::new();
 
 /// One 5s window of historical block-serve reconstruct+encode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -20,28 +20,28 @@ pub struct ServePerfSample {
 
 pub(crate) fn note_serve(tx_count: u32, bytes: usize, wall_ns: u128) {
     let ns = wall_ns.min(u128::from(u64::MAX)) as u64;
-    SERVE_N.fetch_add(1, Ordering::Relaxed);
-    SERVE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    SERVE_TX.fetch_add(u64::from(tx_count), Ordering::Relaxed);
-    SERVE_WALL_NS.fetch_add(ns, Ordering::Relaxed);
-    let mut cur = SERVE_MAX_NS.load(Ordering::Relaxed);
-    while ns > cur {
-        match SERVE_MAX_NS.compare_exchange_weak(cur, ns, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(c) => cur = c,
-        }
+    SERVE_N.add(1);
+    SERVE_BYTES.add(bytes as u64);
+    SERVE_TX.add(u64::from(tx_count));
+    SERVE_WALL_NS.add(ns);
+    SERVE_MAX_NS.note(ns);
+}
+
+/// Serve meters since the previous sample, for `DEBUG tip: perf`. Running
+/// totals are untouched ([`serve_perf_totals`]).
+pub fn sample_reset_serve_perf() -> ServePerfSample {
+    ServePerfSample {
+        n: SERVE_N.take_window(),
+        bytes: SERVE_BYTES.take_window(),
+        tx_count: SERVE_TX.take_window(),
+        wall_ns: SERVE_WALL_NS.take_window(),
+        max_ns: SERVE_MAX_NS.take(),
     }
 }
 
-/// Sample-and-reset serve meters for `DEBUG tip: perf`.
-pub fn sample_reset_serve_perf() -> ServePerfSample {
-    ServePerfSample {
-        n: SERVE_N.swap(0, Ordering::Relaxed),
-        bytes: SERVE_BYTES.swap(0, Ordering::Relaxed),
-        tx_count: SERVE_TX.swap(0, Ordering::Relaxed),
-        wall_ns: SERVE_WALL_NS.swap(0, Ordering::Relaxed),
-        max_ns: SERVE_MAX_NS.swap(0, Ordering::Relaxed),
-    }
+/// Running historical block serves for `/metrics`: `(blocks, bytes)`.
+pub fn serve_perf_totals() -> (u64, u64) {
+    (SERVE_N.total(), SERVE_BYTES.total())
 }
 
 /// `serve n= bytes= tx= avg_us= max_us=` — reconstruct+encode, not BIP324 send.

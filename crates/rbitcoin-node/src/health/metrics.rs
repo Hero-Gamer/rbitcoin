@@ -87,8 +87,56 @@ pub(super) fn render(status: &NodeStatus) -> String {
             "Sum of mempool virtual sizes (getmempoolinfo.bytes).",
             vbytes,
         );
+        let (accepts, rejects) = mempool.accept_totals();
+        out.counter(
+            "rbitcoin_mempool_accepts_total",
+            "Transactions the mempool accepted (tip: perf accepts=).",
+            accepts,
+        );
+        out.counter(
+            "rbitcoin_mempool_rejects_total",
+            "Transactions the mempool rejected (tip: perf rejects=).",
+            rejects,
+        );
     }
+    let (requests, us) = rbitcoin_esplora::perf_totals();
+    out.counter(
+        "rbitcoin_esplora_requests_total",
+        "Esplora REST requests (tip: perf esplora req=).",
+        requests,
+    );
+    out.counter(
+        "rbitcoin_esplora_request_seconds_total",
+        "Esplora REST handler wall time in seconds.",
+        seconds(us),
+    );
+    let (requests, us) = rbitcoin_electrum::perf_totals();
+    out.counter(
+        "rbitcoin_electrum_requests_total",
+        "Electrum JSON-RPC requests (tip: perf electrum req=).",
+        requests,
+    );
+    out.counter(
+        "rbitcoin_electrum_request_seconds_total",
+        "Electrum dispatch wall time in seconds.",
+        seconds(us),
+    );
+    let (blocks, bytes) = rbitcoin_net::serve_perf_totals();
+    out.counter(
+        "rbitcoin_block_serve_total",
+        "Historical blocks served to peers (tip: perf serve n=).",
+        blocks,
+    );
+    out.counter(
+        "rbitcoin_block_serve_bytes_total",
+        "Bytes of historical blocks served to peers (tip: perf serve bytes=).",
+        bytes,
+    );
     out.0
+}
+
+fn seconds(us: u64) -> f64 {
+    us as f64 / 1e6
 }
 
 fn chain_gauges(out: &mut Exposition, chain: &ChainHub, sh_index: bool) {
@@ -139,6 +187,11 @@ impl Exposition {
 
     fn gauge(&mut self, name: &str, help: &str, value: impl Display) {
         self.family(name, "gauge", help);
+        self.sample(name, "", value);
+    }
+
+    fn counter(&mut self, name: &str, help: &str, value: impl Display) {
+        self.family(name, "counter", help);
         self.sample(name, "", value);
     }
 }

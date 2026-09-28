@@ -1985,7 +1985,29 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "{chain}"
     );
     assert_eq!(http_get(health_addr, "/readyz").await, (200, "ok".into()));
-    pin_metrics_equal_rpc(health_addr, rpc_addr, true).await;
+    let metrics_ready = pin_metrics_equal_rpc(health_addr, rpc_addr, true).await;
+    for total in [
+        "rbitcoin_esplora_requests_total",
+        "rbitcoin_esplora_request_seconds_total",
+        "rbitcoin_electrum_requests_total",
+        "rbitcoin_electrum_request_seconds_total",
+        "rbitcoin_block_serve_total",
+        "rbitcoin_block_serve_bytes_total",
+        "rbitcoin_mempool_accepts_total",
+        "rbitcoin_mempool_rejects_total",
+    ] {
+        assert!(
+            metrics_ready[total] >= metrics_in_ibd[total],
+            "{total} counts up: {metrics_in_ibd:?} then {metrics_ready:?}"
+        );
+    }
+    for total in [
+        "rbitcoin_esplora_requests_total",
+        "rbitcoin_electrum_requests_total",
+        "rbitcoin_mempool_accepts_total",
+    ] {
+        assert!(metrics_in_ibd[total] >= 1.0, "{total}: {metrics_in_ibd:?}");
+    }
 
     let relay_parent = acs_spend(
         relay_cb,
