@@ -84,7 +84,7 @@ fn rpc_regtest_chain_ops() {
     chain_ops_mature_pad_work(&ctx);
     chain_ops_template_sigops_and_script_reject(&ctx, &mut cbs);
     chain_ops_prioritise(&ctx, &mut cbs);
-    chain_ops_generateblock_and_parent_first(&ctx, &mut cbs);
+    let fee_block = chain_ops_generateblock_and_parent_first(&ctx, &mut cbs);
     chain_ops_proposal_spends(&ctx, &mut cbs);
     chain_ops_maxfeerate(&ctx, &mut cbs);
     chain_ops_invalidate_and_precious(&ctx, &hub, &mut cbs, &p2wpkh);
@@ -116,6 +116,7 @@ fn rpc_regtest_chain_ops() {
         .unwrap_or_else(|e| panic!("submitblock on mainnet must not be regtest-only: {e}"));
     assert!(r.is_null(), "good submitblock on mainnet: {r}");
     assert_eq!(tip_count(&ctx), before + 1);
+    chain_ops_corrupt_input_edge(&ctx, &store, fee_block);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -757,7 +758,7 @@ fn true_spk() -> ScriptBuf {
     ScriptBuf::from_bytes(vec![0x51])
 }
 
-fn chain_ops_generateblock_and_parent_first(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+fn chain_ops_generateblock_and_parent_first(ctx: &RpcContext, cbs: &mut TrueCoinbases) -> u32 {
     // Core `rpc_generate.py` generateblock reject strings and codes.
     let op_true = "raw(51)";
     let missing = "00".repeat(32);
@@ -852,6 +853,7 @@ fn chain_ops_generateblock_and_parent_first(ctx: &RpcContext, cbs: &mut TrueCoin
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(hex)]).unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_REJECTED);
     assert_eq!(e["message"], "bad-txns-premature-spend-of-coinbase");
+    young + 5
 }
 
 fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
@@ -1010,4 +1012,60 @@ fn chain_ops_invalidate_and_precious(
     let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
     dispatch(ctx, "preciousblock", vec![h1]).unwrap();
     assert_eq!(best_hash(ctx), tip, "precious of less work must not activate");
+}
+
+/// Last beat, because it corrupts the store: a connected spend whose parent
+/// edge in `input.body` is gone is a broken promise, not a txid lookup.
+fn chain_ops_corrupt_input_edge(ctx: &RpcContext, store: &std::path::Path, height: u32) {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::TxStatRow;
+    use std::io::{Seek, SeekFrom, Write};
+    let fks = ctx.query.block_tx_fks(Height(height)).unwrap();
+    let parent = fks[1];
+    assert!(parent.0 < 1024, "one input.loc window: {parent:?}");
+    let db = ctx.query.store();
+    let unstamped = TxStatRow {
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    };
+    for &fk in &fks {
+        db.write_txstat_row(fk, &unstamped).unwrap();
+    }
+    assert!(ctx.query.stamped_txstat_block(Height(height)).unwrap().is_none());
+    let earlier: u64 = (1..parent.0)
+        .map(|id| db.input_edges(Fk(id)).unwrap().map_or(0, |e| e.len() as u64))
+        .sum();
+    let body = walk_for(store, "input.body").expect("input.body");
+    let mut f = std::fs::OpenOptions::new().write(true).open(body).unwrap();
+    f.seek(SeekFrom::Start(16 + 8 * earlier)).unwrap();
+    f.write_all(&[0u8; 8]).unwrap();
+    drop(f);
+    assert!(
+        db.input_edges(parent).unwrap().unwrap()[0].parent.is_null(),
+        "the parent's one edge now reads as a coinbase edge"
+    );
+    for _ in 0..2 {
+        let e = dispatch(ctx, "getblockstats", vec![json!(height)]).unwrap_err();
+        assert_eq!(e["code"], ERR_MISC, "{e}");
+        assert!(
+            e["message"].as_str().unwrap().starts_with("invariant: "),
+            "no txstat is stamped from the broken block either: {e}"
+        );
+    }
+}
+
+fn walk_for(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for ent in std::fs::read_dir(root).ok()?.flatten() {
+        let path = ent.path();
+        if path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(hit) = walk_for(&path, name) {
+                return Some(hit);
+            }
+        }
+    }
+    None
 }
