@@ -2441,3 +2441,135 @@ async fn tor_control_onion_lifecycle() {
         assert!(creates.iter().any(|c| c.contains(&dest)), "{creates:?}");
     }
 }
+
+/// `run_p2p` off the runtime workers, as `cli_main` blocks on it: an empty
+/// datadir connects genesis through tip-accept, which refuses a worker.
+fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>> {
+    tokio::task::spawn_blocking(move || {
+        let _block = rbitcoin_net::BlockingRegion::enter();
+        tokio::runtime::Handle::current().block_on(run_p2p(cfg))
+    })
+}
+
+async fn stop_run_p2p(
+    rpc_addr: SocketAddr,
+    node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
+) {
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    match tokio::time::timeout(Duration::from_secs(15), node).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
+        Ok(Err(e)) => panic!("run_p2p join: {e}"),
+        Err(_) => panic!("run_p2p did not exit after stop"),
+    }
+}
+
+async fn history_len(electrum_addr: SocketAddr, scripthash: &str) -> usize {
+    let mut el = TcpStream::connect(electrum_addr).await.unwrap();
+    let hist = electrum_rpc(
+        &mut el,
+        1,
+        "blockchain.scripthash.get_history",
+        json!([scripthash]),
+    )
+    .await;
+    hist["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{hist}"))
+        .len()
+}
+
+/// One datadir whose operator turns `--sh-index` on and off across
+/// restarts. Blocks mined while it is off are collected from the archive
+/// on the first start with it on; turning it off closes Electrum and keeps
+/// the index; turning it back on after a crash that left a collect run and
+/// a lagging high-water mark resumes the write-behind, discards the run,
+/// and follows the next block.
+#[tokio::test(flavor = "multi_thread")]
+async fn enter_tip_mode_indexes() {
+    let td = TestDatadir::new().unwrap();
+    let dir = td.path();
+    let store = td.store_path();
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    let (electrum_addr, rpc_addr) = (ephemeral_addr(), ephemeral_addr());
+    let start = |shindex: bool| {
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(Network::Regtest)
+            .with_tiny_heads()
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.listen.use_seeds = false;
+        cfg.listen.connect.clear();
+        cfg.shindex = shindex;
+        cfg.listen.electrum = Some(electrum_addr);
+        cfg.rpc.listen = Some(rpc_addr);
+        cfg.max_run_secs = Some(60);
+        spawn_run_p2p(cfg)
+    };
+    let op_true = electrum_scripthash_hex(&[0x51]);
+
+    // No scripthash index: tip follow and RPC run, Electrum does not.
+    let node = start(false);
+    wait_listeners(&[rpc_addr]).await;
+    for _ in 0..3 {
+        let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+        assert!(mined["result"]["hash"].is_string(), "{mined}");
+    }
+    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    stop_run_p2p(rpc_addr, node).await;
+
+    // First start with the index: the three coinbases are collected from the
+    // archive before Electrum opens.
+    let node = start(true);
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    assert_eq!(history_len(electrum_addr, &op_true).await, 3);
+    stop_run_p2p(rpc_addr, node).await;
+
+    // Index off again: Electrum stays closed.
+    let node = start(false);
+    wait_listeners(&[rpc_addr]).await;
+    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    stop_run_p2p(rpc_addr, node).await;
+
+    // A crash left a collect run behind and the write-behind mark short of
+    // the tip. Turning the index off kept it, so it resumes under
+    // write-behind: a recollect would merge the stale run, and instead the
+    // run is discarded, Electrum opens, and the next block lands in history.
+    let runs = store.join("scripthash.runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let stale_sh = [0xee; 32];
+    let mut rec = [0u8; 40];
+    rec[..32].copy_from_slice(&stale_sh);
+    rec[32..].copy_from_slice(&99u64.to_le_bytes());
+    rbitcoin_store::write_sorted_run(&rbitcoin_store::next_run_path(&runs, 50), 40, 40, &rec)
+        .unwrap();
+    let hwm_path = store.join(rbitcoin_store::INCLUDE_HWM_NAME);
+    let hwm = u64::from_le_bytes(std::fs::read(&hwm_path).unwrap().try_into().unwrap());
+    std::fs::write(&hwm_path, (hwm - 2).to_le_bytes()).unwrap();
+    let node = start(true);
+    wait_listeners(&[electrum_addr, rpc_addr]).await;
+    assert_eq!(
+        rbitcoin_store::list_runs(&runs).unwrap().len(),
+        0,
+        "leftover run discarded"
+    );
+    assert_eq!(
+        history_len(
+            electrum_addr,
+            &bitcoin::hex::DisplayHex::to_lower_hex_string(&stale_sh[..])
+        )
+        .await,
+        0
+    );
+    let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
+    assert!(mined["result"]["hash"].is_string(), "{mined}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while history_len(electrum_addr, &op_true).await < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "write-behind did not reach the tip"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop_run_p2p(rpc_addr, node).await;
+}
