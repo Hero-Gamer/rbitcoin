@@ -2018,7 +2018,7 @@ fn pin_both_vouts_of_one_input_parent(
     tip_time: u32,
     cb: bitcoin::Txid,
     split_h: u32,
-) {
+) -> (BlockHash, u32) {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -2117,9 +2117,95 @@ fn pin_both_vouts_of_one_input_parent(
         vec![spend],
     );
     commit_class_a_block(q, params, Height(next_h), &b_next, ms).unwrap();
+    let next = (b_next.block_hash(), b_next.header.time);
     confirm_wire_run(q, params, ms, &[(Height(next_h), b_next)])
         .expect("cross-batch tx.head create_fk resolve must work");
     assert_eq!(q.tip_height(), Some(Height(next_h)));
+    next
+}
+
+fn pin_txstat_rows_after_write(q: &Query, run: &[(Height, Block)], spend_h: u32) {
+    use rbitcoin_store::TxStatRow;
+
+    let genesis_fk = q.block_tx_fks(Height::GENESIS).unwrap()[0];
+    let genesis = regtest_genesis();
+    let g = q.get_txstat(genesis_fk).unwrap().expect("genesis txstat");
+    assert_eq!(g.fee_sat, 0);
+    assert_eq!(g.size() as usize, genesis.txdata[0].total_size());
+    assert_eq!(g.weight(), genesis.txdata[0].weight().to_wu());
+
+    let block = &run.last().unwrap().1;
+    let spend = &block.txdata[1];
+    let fks = q.block_tx_fks(Height(spend_h)).unwrap();
+    let cb1_fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let row = q.get_txstat(fks[1]).unwrap().expect("spend txstat");
+    assert_eq!(row.fee_sat, 1_0000_0000, "fee from the load-stage assemble");
+    assert_eq!(row.size() as usize, spend.total_size());
+    assert_eq!(row.weight(), spend.weight().to_wu());
+    assert_eq!(q.store().input_n_in(fks[1]).unwrap(), Some(1));
+    let rec = q.get_tx(fks[1]).unwrap();
+    let ins = q.tx_input_run_class_a(fks[1], &rec).unwrap();
+    assert_eq!(ins.len(), 1);
+    assert_eq!(ins[0].create_fk, cb1_fk);
+    let no_io = TxRecord {
+        input_count: 0,
+        output_count: 0,
+        ..rec
+    };
+    assert!(q.tx_input_run_class_a(fks[1], &no_io).unwrap().is_empty());
+
+    let zero = TxStatRow {
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    };
+    for &fk in &fks {
+        q.store().write_txstat_row(fk, &zero).unwrap();
+    }
+    assert!(q.get_txstat(fks[1]).unwrap().is_none());
+    let empty = Block {
+        header: block.header,
+        txdata: vec![],
+    };
+    for (h, needle) in [
+        (Height(9999), "stamp txstat missing header"),
+        (Height(spend_h), "stamp txstat fk count"),
+    ] {
+        let err = q.stamp_txstat_from_block(h, &empty).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+    }
+    q.stamp_txstat_from_block(Height(spend_h), block).unwrap();
+    assert_eq!(q.get_txstat(fks[1]).unwrap(), Some(row));
+    assert_eq!(q.get_txstat(fks[0]).unwrap().unwrap().fee_sat, 0);
+    assert!(q.confirm_block(Height(9), &[0xde; 32]).is_err());
+}
+
+/// With the spend index off, Class C commits without annotating the spend.
+/// Accepting the same block again at that height must finish the annotate.
+fn pin_already_at_height_retry_annotates_spend(
+    q: &Query,
+    params: &ChainParams,
+    ms: Milestone,
+    (tip, tip_time): (BlockHash, u32),
+    cb: bitcoin::Txid,
+    h: u32,
+) {
+    q.set_spend_index(false);
+    let spend = spend_anyone_can_spend(cb, 0, Amount::from_sat(49_0000_0000));
+    let b = mine_regtest_block(tip, tip_time + 600, h, vec![spend]);
+    accept_and_connect_block(q, params, Height(h), &b, ms).unwrap();
+    assert!(
+        q.spenders(cb.as_byte_array(), 0).unwrap().is_empty(),
+        "spend index off: Class C does not annotate"
+    );
+    q.set_spend_index(true);
+    accept_and_connect_block(q, params, Height(h), &b, ms).expect("already-at-height retry");
+    assert_eq!(q.tip_height(), Some(Height(h)));
+    assert_eq!(
+        q.spenders(cb.as_byte_array(), 0).unwrap().len(),
+        1,
+        "the retry finishes the spend annotate"
+    );
 }
 
 /// Split load → scripts → write (IBD pipeline stages) on a spend run.
@@ -2190,6 +2276,7 @@ fn three_stage_confirm_and_parent_pin_surface() {
     assert_eq!(fks.len(), run.len());
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+    pin_txstat_rows_after_write(&q, &run, spend_h);
 
     let write = q.confirm_stats().last_write_phases();
     assert!(
@@ -2220,6 +2307,19 @@ fn three_stage_confirm_and_parent_pin_surface() {
         w.script_ns,
         w.script_skip_mempool
     );
+    let other = Query::open_or_create_tiny(td.path().join("other")).unwrap();
+    let idle = other.confirm_stats().take_window();
+    assert_eq!(
+        (
+            idle.phase_blocks,
+            idle.load_blocks,
+            idle.load_ns,
+            idle.script_ns
+        ),
+        (0, 0, 0, 0),
+        "a second engine's window does not see this engine's confirm"
+    );
+    assert_eq!(q.confirm_stats().take_window().load_blocks, 0);
 
     // Tip advance prunes plans/headers ≤ tip (body LRU retains under budget).
     q.advance_parent_cache_tip(spend_h);
@@ -2233,7 +2333,9 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let tip_time = run.last().unwrap().1.header.time;
     let (tip, tip_time) =
         pin_same_run_create_then_spend(&q, &params, ms, tip, tip_time, cb2, spend_h + 1);
-    pin_both_vouts_of_one_input_parent(&q, &params, ms, tip, tip_time, cb3, spend_h + 3);
+    let tip = pin_both_vouts_of_one_input_parent(&q, &params, ms, tip, tip_time, cb3, spend_h + 3);
+    let cb4 = run[3].1.txdata[0].compute_txid();
+    pin_already_at_height_retry_annotates_spend(&q, &params, ms, tip, cb4, spend_h + 6);
 }
 
 /// Load may claim tip+1 while earlier heights are still in-flight (not written).

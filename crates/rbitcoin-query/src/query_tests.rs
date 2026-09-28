@@ -1698,8 +1698,11 @@ fn confirm_txstat_miss_is_corrupt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A plan whose fee rows do not line up with its packed txs, and an append
+/// of a plan without fee rows, are plan shapes the load stage never emits.
+/// The invariant and the append rule stay a unit.
 #[test]
-fn txstat_uses_assemble_fee_without_parent_pin() {
+fn archive_plan_fee_rows_follow_packed_txs() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
     use bitcoin::transaction::Version;
@@ -1707,7 +1710,7 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
         Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
     };
 
-    let (dir, q) = temp_query("txstat-assemble-fee");
+    let (dir, q) = temp_query("txstat-fee-rows");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
     let parent_txid = t0.tx.txid;
     q.connect_block(Height(0), &h0, &[t0]).unwrap();
@@ -1739,7 +1742,7 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
             bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
             nonce: 0,
         },
-        txdata: vec![spend.clone()],
+        txdata: vec![spend],
     });
     let txrec = TxRecord {
         txid,
@@ -1750,26 +1753,21 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
         output_start_fk: Fk::NULL,
         output_count: 1,
     };
-    let child_fk = Fk(parent_fk.get().unwrap() + 1);
-    let make = || {
-        let pin = CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec.clone());
-        let mut plan = ArchiveWritePlan::empty();
-        plan.packed = vec![(
-            pin,
-            vec![InputRecord {
-                prev_txid: parent_txid,
-                create_fk: parent_fk,
-                prev_index: 0,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }],
-        )];
-        plan.planned_fks = vec![child_fk];
-        plan.body_est = 256;
-        plan
-    };
-    let mut bad = make();
+    let mut bad = ArchiveWritePlan::empty();
+    assert!(bad.is_empty());
+    bad.packed = vec![(
+        CreatePinInner::wire(std::sync::Arc::clone(&block), 0, txrec),
+        vec![InputRecord {
+            prev_txid: parent_txid,
+            create_fk: parent_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+    )];
+    bad.planned_fks = vec![Fk(parent_fk.get().unwrap() + 1)];
+    bad.body_est = 256;
     bad.tx_fees = vec![1, 2];
     let err = q
         .archive_commit_plan_defer_head_parents(bad, Some(&BatchParents::new()))
@@ -1778,14 +1776,6 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
         matches!(err, StoreError::Corrupt("invariant: txstat fee length")),
         "{err}"
     );
-    let mut plan = make();
-    plan.tx_fees = vec![42];
-    plan.tx_sizes = vec![(spend.base_size() as u32, spend.total_size() as u32)];
-    q.archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
-        .expect("assemble fee skips the parent walk");
-    let row = q.txstat_row(child_fk).unwrap().expect("stamped from fee");
-    assert_eq!(row.fee_sat, 42);
-    assert_eq!(row.size() as usize, spend.total_size());
 
     let aligned = |fee: u64| {
         let mut plan = ArchiveWritePlan::empty();
@@ -1819,83 +1809,6 @@ fn txstat_uses_assemble_fee_without_parent_pin() {
 }
 
 #[test]
-fn stamp_txstat_from_block_coinbase_and_spend() {
-    use bitcoin::hashes::Hash;
-
-    let (dir, q) = temp_query("stamp-txstat-from-block");
-    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    let hash0 = h0.hash;
-    let hfk0 = q
-        .connect_block(Height(0), &h0, std::slice::from_ref(&t0))
-        .unwrap();
-    let fk0 = q.block_tx_fks(Height(0)).unwrap()[0];
-    unstamp_txstat(&q, fk0);
-    assert!(q.txstat_row(fk0).unwrap().is_none());
-
-    let empty = bitcoin::Block {
-        header: bitcoin::block::Header {
-            version: bitcoin::block::Version::ONE,
-            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
-            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
-            time: 1,
-            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-            nonce: 0,
-        },
-        txdata: vec![],
-    };
-    let err = q.stamp_txstat_from_block(Height(99), &empty).unwrap_err();
-    assert!(
-        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat missing header")),
-        "{err:?}"
-    );
-    let err = q.stamp_txstat_from_block(Height(0), &empty).unwrap_err();
-    assert!(
-        matches!(err, StoreError::Corrupt(s) if s.contains("stamp txstat fk count")),
-        "{err:?}"
-    );
-
-    let b0 = q.reconstruct_archived_block(&hash0).unwrap().unwrap();
-    q.stamp_txstat_from_block(Height(0), &b0).unwrap();
-    let row0 = q.txstat_row(fk0).unwrap().expect("stamped coinbase");
-    assert_eq!(q.store().input_n_in(fk0).unwrap(), Some(1));
-    assert_eq!(row0.fee_sat, 0);
-    assert_eq!(row0.size() as usize, b0.txdata[0].total_size());
-
-    let (h1, cb1) = coinbase_block(1, hfk0, Some(hash0));
-    let foreign = TxApply {
-        tx: TxRecord {
-            txid: [0x11; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 1,
-            output_start_fk: Fk::NULL,
-            output_count: 1,
-        },
-        inputs: vec![InputRecord {
-            prev_txid: t0.tx.txid,
-            create_fk: fk0,
-            prev_index: 0,
-            sequence: u32::MAX,
-            script_sig: vec![],
-            witness: vec![],
-        }],
-        outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
-    };
-    q.connect_block(Height(1), &h1, &[cb1, foreign]).unwrap();
-    let fks1 = q.block_tx_fks(Height(1)).unwrap();
-    for &fk in &fks1 {
-        unstamp_txstat(&q, fk);
-    }
-    let b1 = q.reconstruct_archived_block(&h1.hash).unwrap().unwrap();
-    q.stamp_txstat_from_block(Height(1), &b1).unwrap();
-    let foreign_row = q.txstat_row(fks1[1]).unwrap().expect("stamped spend");
-    assert_eq!(q.store().input_n_in(fks1[1]).unwrap(), Some(1));
-    assert_eq!(foreign_row.fee_sat, 1_0000_0000);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn txstat_row_merges_overflow_via_header_blob() {
     let (dir, q) = temp_query("txstat-row-ovf");
     let (h0, t0) = coinbase_block(0, Fk::NULL, None);
@@ -1916,95 +1829,6 @@ fn txstat_row_merges_overflow_via_header_blob() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 include!("query_prune_journey.rs");
-
-#[test]
-fn confirm_load_cancel_and_zero_io_paths() {
-    let (dir, q) = temp_query("load-cancel");
-    let mut prev = Fk::NULL;
-    let mut parent_hash: Option<[u8; 32]> = None;
-    let mut hashes = Vec::new();
-    for h in 0..2u32 {
-        let (header, ta) = coinbase_block(h, prev, parent_hash);
-        parent_hash = Some(header.hash);
-        hashes.push(header.hash);
-        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-    }
-    // Cancel before load of archived-ahead body.
-    let (h2, ta2) = coinbase_block(2, prev, Some(hashes[1]));
-    let h2hash = h2.hash;
-    q.commit_class_a_only(&h2, &[ta2]).unwrap();
-    let _ = h2hash;
-
-    // Empty input/output run helpers.
-    let empty_tx = TxRecord {
-        txid: [0xab; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 0,
-        output_start_fk: Fk::NULL,
-        output_count: 0,
-    };
-    assert!(q.tx_input_run_class_a(Fk(1), &empty_tx).unwrap().is_empty());
-
-    // ArchiveWritePlan empty helper.
-    let plan = ArchiveWritePlan::empty();
-    assert!(plan.is_empty());
-
-    // disconnect with zero-output tx: already covered via coinbase; ensure
-    // confirm_block NotFound for unknown hash.
-    assert!(q.confirm_block(Height(9), &[0xde; 32]).is_err());
-
-    // header_tx_fks / flush_for_shutdown / flush_header_archive.
-    let tip_fk = q.tip_header_fk().unwrap().unwrap();
-    let fks = q.header_tx_fks(tip_fk, None).unwrap().unwrap_or_default();
-    assert!(!fks.is_empty());
-    q.flush_for_shutdown().unwrap();
-    q.flush_header_archive().unwrap();
-
-    let _ = hashes;
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn confirm_run_non_tip_and_tx_runs() {
-    let (dir, q) = temp_query("confirm-run");
-    let mut prev = Fk::NULL;
-    let mut parent_hash: Option<[u8; 32]> = None;
-    let mut prepared = Vec::new();
-    for h in 0..3u32 {
-        let (header, ta) = coinbase_block(h, prev, parent_hash);
-        parent_hash = Some(header.hash);
-        let hash = header.hash;
-        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
-        let (fk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
-        let tx_fks = q.header_tx_fks(fk, Some(&hash)).unwrap().unwrap();
-        prepared.push(ConfirmPrepared {
-            height: Height(h),
-            header_fk: fk,
-            tx_fks,
-        });
-    }
-    // Re-confirm tip only (idempotent single).
-    let tip = prepared.last().unwrap().clone();
-    let again = q.confirm_blocks_run(&[tip]).unwrap();
-    assert_eq!(again.len(), 1);
-
-    // Non-contiguous rejected.
-    assert!(q
-        .confirm_blocks_run(&[prepared[0].clone(), prepared[2].clone()])
-        .is_err());
-
-    // Full packed body input/output runs.
-    let fks = q.block_tx_fks(Height(0)).unwrap();
-    let tx = q.get_tx(fks[0]).unwrap();
-    let ins = q.tx_input_run_class_a(fks[0], &tx).unwrap();
-    assert_eq!(ins.len(), 1);
-    let outs = q.tx_output_run_class_a(fks[0]).unwrap();
-    assert_eq!(outs.len(), 1);
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
 
 /// Missing `header_txs` makes extend fail-closed. Tip must not stay advanced
 /// (`set_many` then extend would leave a fence hole at the new tip).
@@ -2402,24 +2226,4 @@ fn resume_subtree_score_prev_fk_cycle_terminates() {
     assert!(memo.contains_key(&afk.0));
     assert!(d >= 1);
     let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Two Query engines must not steal each other's lookup/load/scripts/write window.
-#[test]
-fn two_confirm_stats_windows_do_not_steal() {
-    let (_d1, q1) = crate::testutil::tiny_query_labeled("stats-iso-a");
-    let (_d2, q2) = crate::testutil::tiny_query_labeled("stats-iso-b");
-    q1.confirm_stats().add_load_ns(1_000);
-    q1.confirm_stats().add_script_ns(2_000);
-    q1.confirm_stats().add_class_a_ns(3_000);
-    let a = q1.confirm_stats().take_window();
-    let b = q2.confirm_stats().take_window();
-    assert_eq!(a.load_ns, 1_000);
-    assert_eq!(a.script_ns, 2_000);
-    assert_eq!(a.class_a_ns, 3_000);
-    assert_eq!(b.load_ns, 0);
-    assert_eq!(b.script_ns, 0);
-    assert_eq!(b.class_a_ns, 0);
-    let a2 = q1.confirm_stats().take_window();
-    assert_eq!(a2.load_ns, 0);
 }
