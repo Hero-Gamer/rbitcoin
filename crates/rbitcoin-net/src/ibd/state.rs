@@ -38,7 +38,8 @@ pub(crate) struct WorkStructureSizes {
 /// Outstanding getdata for one block hash (one or more peers).
 ///
 /// Near/far densify use a single peer. Tip-hole hashes race up to
-/// [`super::TIP_HOLE_MAX_PEERS`] immediately.
+/// [`super::TIP_HOLE_MAX_PEERS`] once the body queue is a quarter of the
+/// smaller soft budget. Below that, the gap is the frontier.
 ///
 /// Getdata cannot be cancelled. A peer dropped from the race moves to
 /// `retired`: it no longer counts as a racer, but it still holds the request,

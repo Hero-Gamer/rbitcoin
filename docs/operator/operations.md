@@ -300,8 +300,12 @@ Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / pe
 tip+1 to the next in-hand body (confirmed, still on the BQ, or already taken
 onto loadq). Peer speed is one EWMA of all received bytes while that peer has
 block getdata in flight. Tip+1 getdata races up to 4 peers ranked by expected
-drain time (`(queue+1)/EWMA`), not by inflight count. Later contiguous holes
-in that gap get one racer until tip+1 is in hand. A hole owner still serving
+drain time (`(queue+1)/EWMA`), not by inflight count, only once the body queue
+holds at least a quarter of the smaller soft budget: the ~1 min confirm window
+in blocks, or the ~100 MiB free floor. The quarter is the queue's total blocks
+and bytes, so gaps count. Below that, the gap is the frontier: tip+1 gets one
+peer and densify keeps filling ahead. Later contiguous holes
+in a real tip hole get one racer until tip+1 is in hand. A hole owner still serving
 other getdata (densify FIFO) is dropped from that hash so a peer that can start
 the hole can race, once it has held the hash ≥5s and a free peer's expected
 drain time is at most half the owner's; a hole owner with no qualifying rx is dropped when a sibling
@@ -314,8 +318,8 @@ from the race who still owe it. When
 `hole=` is 0, at most one extra racer is added on the first later gap in the
 32-window, and only if that owner is missing, has held the hash ≥30s, or
 ≤ pack-median/4.
-Densify default is 8 in-flight hashes per peer (none while a tip hole is open,
-so getdata queues can drain for tip+1);
+Densify default is 8 in-flight hashes per peer (none while a quarter-full tip
+hole is open, so getdata queues can drain for tip+1);
 16 only for an EWMA outlier at ≥ 2× pack median. WARN
 `ibd: peer[…] stalled` is 30s without qualifying rx (≥64 KiB stream or a
 block / decode-fail / NotFound event) after work start. WARN

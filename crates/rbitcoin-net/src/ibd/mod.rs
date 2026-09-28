@@ -111,11 +111,13 @@ pub fn rehydrate_block_queue_residue(hub: &ChainHub) -> Result<usize, String> {
 
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
-/// Max concurrent getdata peers for **tip+1** (later contiguous holes get 1).
+/// Max concurrent getdata peers for **tip+1** once the body queue is a quarter
+/// of the smaller soft budget (later contiguous holes get 1).
 ///
 /// Tip+1 freezes confirm while densify can run ahead; race enough peers so a
 /// single slow peer cannot pin hole=1 for minutes (mainnet: tip stuck with
-/// hole=1, conf_blks=0, bq growing).
+/// hole=1, conf_blks=0, bq growing). A gap with the queue below that quarter
+/// is the frontier, not this race.
 pub(crate) const TIP_HOLE_MAX_PEERS: usize = 4;
 /// Max concurrent getdata peers for a **pre-hole** (first in-window gap after
 /// a claim-ready prefix). One extra racer vs the frozen-prefix cap of 4.

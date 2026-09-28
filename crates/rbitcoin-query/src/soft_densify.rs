@@ -126,6 +126,34 @@ pub fn soft_confirm_window_covered(
     depth_n >= w
 }
 
+/// True when the body queue is at least a quarter of the smaller soft budget.
+///
+/// The budgets are the confirm-time block window ([`soft_confirm_window_n`])
+/// and the fixed free floor ([`BQ_SOFT_FREE_BYTES`]). Whichever is smaller at
+/// the queue's current average block size is the one that matters. Fullness
+/// is that queue's aggregate block count and payload bytes, gaps included.
+/// An empty queue is the frontier. No height walk.
+pub fn soft_ahead_quarter_full(
+    ahead_n: u32,
+    ahead_bytes: u64,
+    rate_blocks_per_s: Option<f64>,
+) -> bool {
+    if ahead_n == 0 {
+        return false;
+    }
+    let window_n = soft_confirm_window_n(rate_blocks_per_s);
+    if window_n == 0 {
+        return ahead_bytes.saturating_mul(4) >= BQ_SOFT_FREE_BYTES;
+    }
+    let variable_smaller = ahead_bytes.saturating_mul(u64::from(window_n))
+        <= BQ_SOFT_FREE_BYTES.saturating_mul(u64::from(ahead_n));
+    if variable_smaller {
+        u64::from(ahead_n).saturating_mul(4) >= u64::from(window_n)
+    } else {
+        ahead_bytes.saturating_mul(4) >= BQ_SOFT_FREE_BYTES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +248,21 @@ mod tests {
         assert!(!soft_assign_stopped(over, 0));
         assert!(!soft_assign_stopped(over, u64::MAX));
         assert!(soft_assign_stopped(over, stop));
+    }
+
+    #[test]
+    fn quarter_full_uses_the_smaller_soft_budget() {
+        let free = BQ_SOFT_FREE_BYTES;
+        assert!(!soft_ahead_quarter_full(0, free, Some(5.0)));
+        assert!(!soft_ahead_quarter_full(0, 0, None));
+        assert!(!soft_ahead_quarter_full(10, free / 4 - 1, None));
+        assert!(soft_ahead_quarter_full(1, free / 4, None));
+        // 5 blk/s → 300 blocks. 80-byte bodies: the block window is smaller.
+        assert!(!soft_ahead_quarter_full(74, 74 * 80, Some(5.0)));
+        assert!(soft_ahead_quarter_full(75, 75 * 80, Some(5.0)));
+        // 1 MiB bodies: 300 MiB of window exceeds the 100 MiB floor.
+        let mib = 1024 * 1024;
+        assert!(!soft_ahead_quarter_full(10, 10 * mib, Some(5.0)));
+        assert!(soft_ahead_quarter_full(30, 30 * mib, Some(5.0)));
     }
 }
