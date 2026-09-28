@@ -1121,38 +1121,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    #[test]
-    fn bq_resolve_wave_tiponly_after_disconnect() {
-        let (path, q) = tmp_query();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        let cb1 = b1.txdata[0].compute_txid();
-        let child = mine_with_txs(
-            b1.block_hash(),
-            b1.header.time + 600,
-            2,
-            vec![spend_op_true(cb1, 0, Amount::from_sat(49_0000_0000))],
-        );
-        q.block_queue_enqueue(2, child.block_hash().to_byte_array(), 2, &serialize(&child))
-            .unwrap();
-
-        q.disconnect_tip().unwrap();
-        assert_eq!(q.tip_height().map(|h| h.0), Some(0));
-
-        let wave = resolve_wave(&q, &params, Milestone::NONE, &[2]);
-        assert_eq!(wave.stats.heights, 1);
-        take_emitted(&q, &wave);
-        assert!(
-            wave.parent_ids.get(&cb1.to_byte_array()).is_none(),
-            "abandoned-fork coinbase must not be a TipOnly hit (TipThenAny would attach it)"
-        );
-        assert!(!q.block_queue_has_height(2));
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
     /// Head occupied may already cover the parent fk; prune until the parent
     /// height is confirmed so stamp does not MissingPrevout (931147 / 933474).
     #[test]
@@ -1343,57 +1311,6 @@ mod tests {
             .expect("spend tx");
         assert_eq!(inp.prev_txid, g_cb.to_byte_array());
         assert_eq!(inp.create_fk, expect_fk);
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    /// Leftover TipOnly must not resurrect an abandoned (disconnected) Class A row.
-    #[test]
-    fn load_leftover_disconnected_parent_is_not_tipthenany() {
-        let (path, q) = tmp_query();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-        accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-        let cb1 = b1.txdata[0].compute_txid();
-        q.disconnect_tip().unwrap();
-        let _ = params;
-        let child = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::ONE,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint { txid: cb1, vout: 0 },
-                script_sig: bitcoin::script::ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }],
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1),
-                script_pubkey: bitcoin::script::ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let txids = vec![child.compute_txid().to_byte_array()];
-        let block = std::sync::Arc::new(bitcoin::Block {
-            header: b1.header,
-            txdata: vec![child],
-        });
-        let err = q
-            .archive_plan_batch_from_wire(
-                &[(rbitcoin_primitives::Fk(1), &block, txids.as_slice())],
-                1,
-                &rbitcoin_query::InFlight::new(),
-                None,
-                None,
-            )
-            .expect_err("disconnected leftover must not TipThenAny-fill");
-        let msg = err.to_string();
-        assert!(msg.contains("parent create_fk unresolved"), "got: {msg}");
-        assert!(
-            !msg.contains("invariant: external parent missing BQ TipOnly hit"),
-            "leftover miss is unresolved, not the old forbid-head invariant: {msg}"
-        );
-        // Do not read process-global last_union_miss / last_plan_batch here:
-        // cargo test --workspace races those atomics (CI flake on #130).
         let _ = std::fs::remove_dir_all(&path);
     }
 

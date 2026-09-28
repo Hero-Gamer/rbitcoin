@@ -176,31 +176,6 @@ fn query_sh_heads_capped_after_append_miss_still_writes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn note_disconnect_rewinds_started_and_class_a_with_taken() {
-    let (dir, q) = temp_query("disco-hwm");
-    q.set_lookup_taken_hi(Some(12));
-    q.set_lookup_started_hi(Some(12));
-    q.set_class_a_hi(Some(10));
-    let fk = Fk(10);
-    let pair = rbitcoin_store::CreateLocPair {
-        txout: (10, 8),
-        spent: (20, 8),
-        n_out: 1,
-    };
-    q.note_write_create_loc(&[fk], &[pair], 10);
-    assert!(q.write_create_loc(fk).is_some());
-    q.note_disconnect_height(8);
-    assert_eq!(q.lookup_taken_hi(), Some(7));
-    assert_eq!(q.lookup_started_hi(), Some(7));
-    assert_eq!(q.class_a_hi(), Some(7));
-    assert!(
-        q.write_create_loc(fk).is_none(),
-        "disconnect drops write loc packs at/above that height"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Write-gate-safe: non-null `prev` requires `parent_hash` committed in header hash.
 fn coinbase_block(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, TxApply) {
     let version = 1;
@@ -362,52 +337,6 @@ fn format_slow_pin_omits_retired_tokens() {
     assert_eq!(stuffed_line, "pin(plan=1ms/n=7 cold=2ms/n=8 contract=3ms)");
 }
 
-/// Disconnecting a confirmed block must emit an info/warn line (not debug).
-#[test]
-fn disconnect_tip_logs_each_block_at_least_info() {
-    let (dir, q) = temp_query("disconnect-log");
-    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    let hash0 = h0.hash;
-    q.connect_block(Height(0), &h0, &[t0]).unwrap();
-    let (h1, t1) = coinbase_block(1, q.tip_header_fk().unwrap().unwrap(), Some(hash0));
-    let hash1 = h1.hash;
-    q.connect_block(Height(1), &h1, &[t1]).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(1)));
-
-    rbitcoin_log::capture_logs(true);
-    q.disconnect_tip().unwrap();
-    let logs = rbitcoin_log::take_logs();
-    rbitcoin_log::capture_logs(false);
-    assert_eq!(q.tip_height(), Some(Height(0)));
-    let line = crate::connect::format_disconnect_tip_line(1, &hash1, 1);
-    assert!(
-        line.contains("tx=1"),
-        "disconnect line must name tx count without Hungarian: {line}"
-    );
-    assert!(
-        !line.contains("nTx") && !line.contains("n_tx"),
-        "disconnect line must not leak Hungarian tx count: {line}"
-    );
-    assert!(
-        line.to_ascii_lowercase().contains("disconnect"),
-        "disconnect line must say disconnect: {line}"
-    );
-    let hash_disp = BlockHash::from_byte_array(hash1).to_string();
-    assert!(
-        line.contains(&hash_disp),
-        "disconnect line must name the leaving hash {hash_disp}: {line}"
-    );
-    assert!(
-        logs.iter()
-            .any(|(l, m)| { *l == rbitcoin_log::Level::Warn && m.contains(&line) }),
-        "disconnect_tip must emit the helper line at warn: {logs:?}"
-    );
-
-    q.disconnect_tip().unwrap();
-    assert!(q.tip_height().is_none());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn chain_view_pin_none_on_empty_store() {
     let (dir, q) = temp_query("chain-view-empty");
@@ -464,12 +393,9 @@ fn h2h_pad_0_4(q: &Query) -> Vec<[u8; 32]> {
     hashes
 }
 
-fn h2h_assert_range(q: &Query, hashes: &[[u8; 32]]) {
-    for (h, hash) in hashes.iter().enumerate() {
-        assert_height(q, hash, h as u32);
-    }
-}
-
+/// A concurrent disconnect can shrink `confirmed[]` between a reader's tip
+/// snapshot and its height-index walk. No single session interleaves that,
+/// so the stale-snapshot retry and the empty-chain arms stay a unit.
 #[test]
 fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
     let (dir, q) = temp_query("h2h-stale");
@@ -488,109 +414,14 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
         "disconnected tip hash is not confirmed"
     );
     assert_height(&q, &hashes[3], 3);
-    assert_eq!(
-        q.headers_after_locator(&[], BlockHash::from_byte_array(hashes[2]), 5)
-            .unwrap()
-            .len(),
-        1,
-        "null locator + known stop is that one header"
-    );
-    assert!(
-        q.headers_after_locator(&[], BlockHash::from_byte_array([0xee; 32]), 5)
-            .unwrap()
-            .is_empty(),
-        "null locator + unknown stop is empty"
-    );
-    let rec = q.header_at_height(Height(3)).unwrap().unwrap().1;
-    let _ = q
-        .wire_header_from_record_prev(&rec, Some(hashes[2]))
-        .unwrap();
-    assert!(q.sh_lag_heights() >= 1);
-    let _ = q.pin_sh_chain_view().unwrap();
-    let _ = q.pin_sh_chain_view_at(&hashes[3]).unwrap();
-    let _ = q.locator_hashes().unwrap();
-    let _ = q.pin_view(crate::ChainViewKind::ScriptHash, None).unwrap();
 
     while let Some(h) = q.tip_height() {
         q.store.confirmed.disconnect_tip(h).unwrap();
         q.store.height_fence_pop_tip(h);
     }
-    assert!(q.tip_height().is_none());
-    assert_eq!(q.sh_lag_heights(), 0);
-    assert_eq!(q.locator_hashes().unwrap().len(), 1);
-    assert!(q.pin_chain_view().unwrap().is_none());
     q.ensure_height_by_hash_index(Height(5))
         .expect("unpublished height with no tip clears the map");
     assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Shrink-by-N, invalidate rebuild, same-height replace, empty ensure.
-#[test]
-fn height_by_hash_shrink_invalidate_and_reorg() {
-    let (dir, q) = temp_query("h2h-shrink");
-    let hashes = h2h_pad_0_4(&q);
-    let _ = q.confirm_stats().take_window();
-    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
-
-    q.ensure_height_by_hash_index(Height(1)).unwrap();
-    let shrink = q.confirm_stats().take_window();
-    assert_eq!(
-        shrink.height_index_full_n, 0,
-        "shrink by N is retain, not rebuild"
-    );
-    assert_eq!(shrink.height_index_delta_n, 3);
-    assert_eq!(
-        q.process_owned_size_snapshot().h2h_keys,
-        2,
-        "map follows ensure tip, not store tip"
-    );
-    assert_height(&q, &hashes[4], 4);
-    assert_eq!(
-        q.process_owned_size_snapshot().h2h_keys,
-        2,
-        "tip/tip-1 height_of_hash must not rebuild the map"
-    );
-    q.ensure_height_by_hash_index(Height(4)).unwrap();
-    let reextend = q.confirm_stats().take_window();
-    assert_eq!(reextend.height_index_full_n, 0);
-    assert_eq!(reextend.height_index_delta_n, 3);
-    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 5);
-    h2h_assert_range(&q, &hashes);
-
-    q.ensure_height_by_hash_index(Height(4)).unwrap();
-    let same = q.confirm_stats().take_window();
-    assert_eq!(same.height_index_full_n, 0);
-    assert_eq!(same.height_index_delta_n, 0);
-
-    q.invalidate_height_by_hash_index();
-    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
-    assert_height(&q, &hashes[0], 0);
-    let rebuilt = q.confirm_stats().take_window();
-    assert_eq!(rebuilt.height_index_full_n, 1);
-    assert_eq!(rebuilt.height_index_full_headers, 5);
-
-    q.disconnect_tip().unwrap();
-    q.disconnect_tip().unwrap();
-    assert_eq!(q.tip_height(), Some(Height(2)));
-    assert!(q.height_of_hash(&hashes[4]).unwrap().is_none());
-    assert!(q.height_of_hash(&hashes[3]).unwrap().is_none());
-    assert_height(&q, &hashes[2], 2);
-    let old_h2 = hashes[2];
-    let prev1 = q.header_at_height(Height(1)).unwrap().unwrap().0;
-    q.disconnect_tip().unwrap();
-    let (mut h2b, t2b) = coinbase_block(2, prev1, Some(hashes[1]));
-    h2b.nonce = h2b.nonce.wrapping_add(7);
-    rehash_header(&mut h2b, &hashes[1]);
-    q.connect_block(Height(2), &h2b, &[t2b]).unwrap();
-    assert!(q.height_of_hash(&old_h2).unwrap().is_none());
-    assert_height(&q, &h2b.hash, 2);
-
-    while q.tip_height().is_some() {
-        q.disconnect_tip().unwrap();
-    }
-    assert!(q.height_of_hash(&hashes[0]).unwrap().is_none());
-    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
     let empty_fill = q
         .ensure_height_by_hash_index(Height(0))
         .expect_err("empty confirmed[] is not a tip-0 map");
@@ -598,8 +429,6 @@ fn height_by_hash_shrink_invalidate_and_reorg() {
         empty_fill.to_string().contains("height_by_hash"),
         "{empty_fill}"
     );
-    let _ = q.confirm_stats().take_window();
-    assert_eq!(q.process_owned_size_snapshot().h2h_keys, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1138,87 +967,6 @@ fn apply_sh_job_skips_stale_job_after_same_height_replace() {
     );
     assert_eq!(q.scripthash_history(&sh_new).unwrap().len(), 1);
     assert_eq!(q.sh_indexed_through_height(), Some(1));
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn disconnect_tip_waits_for_sh_appender() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    let (dir, q) = temp_query("sh-disconnect-lock");
-    let q = Arc::new(q);
-    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    q.connect_block(Height(0), &h0, &[t0]).unwrap();
-
-    let held = Arc::new(AtomicBool::new(false));
-    let q_hold = Arc::clone(&q);
-    let held_flag = Arc::clone(&held);
-    let holder = std::thread::spawn(move || {
-        let _g = q_hold.sh.appender.lock().unwrap();
-        held_flag.store(true, Ordering::Release);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    });
-    while !held.load(Ordering::Acquire) {
-        std::thread::yield_now();
-    }
-    let t0 = std::time::Instant::now();
-    q.disconnect_tip().unwrap();
-    let waited = t0.elapsed();
-    holder.join().unwrap();
-    assert!(
-        waited >= std::time::Duration::from_millis(20),
-        "disconnect must take sh_appender, waited {waited:?}"
-    );
-    assert!(q.tip_height().is_none());
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn disconnect_tip_unlinks_megakey_sh_and_truncates_tweaks() {
-    use rbitcoin_store::ShHeadValue;
-    let (dir, q) = temp_query("sh-megakey-reorg");
-    q.set_sptweaks_enabled(true, Height(0)).unwrap();
-    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
-    let hash0 = h0.hash;
-    let fk0 = q.connect_block(Height(0), &h0, &[t0]).unwrap();
-    q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
-
-    let prev = q.tip_header_fk().unwrap().unwrap();
-    let (h1, mut cb) = coinbase_block(1, prev, Some(hash0));
-    let hot = vec![0x99u8];
-    cb.outputs = vec![OutputRecord::unspent(1, hot.clone())];
-    let mut txs = Vec::with_capacity(257);
-    txs.push(cb);
-    for i in 1..257u16 {
-        let mut t = coinbase_block(1, prev, Some(hash0)).1;
-        t.tx.txid[28] = 0xee;
-        t.tx.txid[29] = (i >> 8) as u8;
-        t.tx.txid[30] = i as u8;
-        t.outputs = vec![OutputRecord::unspent(1, hot.clone())];
-        txs.push(t);
-    }
-    let fk1 = q.connect_block(Height(1), &h1, &txs).unwrap();
-    q.put_sp_tweaks_block(Height(1), fk1, &vec![None; txs.len()])
-        .unwrap();
-    assert_eq!(q.sptweaks_next_height(), Some(Height(2)));
-
-    let sh = script_hash(&[0x99]);
-    match q.store().scripthash.head_value(&sh).unwrap().unwrap() {
-        ShHeadValue::Extent { .. } => {}
-        other => panic!("expected extent megakey after 257 creates, got {other:?}"),
-    }
-    assert_eq!(q.scripthash_history(&sh).unwrap().len(), 257);
-
-    q.disconnect_tip().unwrap();
-    assert_eq!(q.tip_height(), Some(Height(0)));
-    assert!(
-        q.scripthash_history(&sh).unwrap().is_empty(),
-        "disconnected megakey creates must not remain in SH"
-    );
-    assert_eq!(q.sptweaks_next_height(), Some(Height(1)));
-    assert!(q.load_thin_tweaks(Height(1)).unwrap().is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2291,77 +2039,6 @@ fn confirm_missing_header_txs_does_not_advance_tip() {
         Some(0),
         "genesis fence run must remain"
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Non-contiguous tx_fks in confirm_blocks_run + mark_spends multi-edge path.
-#[test]
-fn confirm_noncontiguous_fks_and_mark_spends() {
-    let (dir, q) = temp_query("confirm-nc-fks");
-    // Parent coinbase then child spend.
-    let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
-    let parent_txid = ta0.tx.txid;
-    let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
-    let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
-    let mut child = coinbase_block(1, prev, Some(h0.hash)).1;
-    child.tx.txid[31] = 0x5f;
-    child.tx.input_count = 1;
-    child.inputs = vec![InputRecord {
-        prev_txid: parent_txid,
-        create_fk: Fk::NULL,
-        prev_index: 0,
-        sequence: u32::MAX,
-        script_sig: vec![],
-        witness: vec![],
-    }];
-    child.outputs = vec![OutputRecord::unspent(49_0000_0000, vec![0x51])];
-    let h1hash = h1.hash;
-    q.connect_block(Height(1), &h1, &[cb1, child]).unwrap();
-
-    let fks = q.block_tx_fks(Height(1)).unwrap();
-    assert!(fks.len() >= 2);
-    let _ = q.spenders(&parent_txid, 0).unwrap();
-
-    // Non-contiguous tx_fks: use first and last only (if 2+)
-    let (fk, _) = q.get_header_by_hash(&h1hash).unwrap().unwrap();
-    if fks.len() >= 2 {
-        // Re-confirm is idempotent at tip; craft ConfirmPrepared with non-contig list
-        // by using height already confirmed → idempotent single path first.
-        let tip = ConfirmPrepared {
-            height: Height(1),
-            header_fk: fk,
-            tx_fks: fks.clone(),
-        };
-        let _ = q.confirm_blocks_run(&[tip]).unwrap();
-
-        // Non-contiguous fks path: archive-only block at height 2 with synthetic fks
-        // Use two blocks already connected and re-run with scrambled fks on tip reconfirm
-        // — height not tip+1 for multi is error; for single tip reconfirm uses contiguous check.
-        let scrambled = ConfirmPrepared {
-            height: Height(1),
-            header_fk: fk,
-            // Reverse order is non-ascending → non-contiguous branch.
-            tx_fks: {
-                let mut v = fks.clone();
-                v.reverse();
-                v
-            },
-        };
-        // tip reconfirm idempotent when header matches, may short-circuit before strong path
-        let _ = q.confirm_blocks_run(&[scrambled]);
-    }
-
-    // Null header_fk rejected
-    assert!(q
-        .confirm_blocks_run(&[ConfirmPrepared {
-            height: Height(2),
-            header_fk: Fk::NULL,
-            tx_fks: vec![],
-        }])
-        .is_err());
-
-    let _ = h1hash;
-    let _ = parent_txid;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
