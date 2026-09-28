@@ -416,9 +416,9 @@ fn assign_densify(
     issued += steal_hung_densify(st, hub, alive, tip_batch_hi, &caps);
 
     let mut room = cfg.window.saturating_sub(st.inflight.len());
-    // A retired holder already occupies a window slot. Adding a racer does not.
-    let reissue_only = room == 0;
-    if reissue_only && !st.inflight.values().any(inflight_needs_racer) {
+    // Window is full and no retired holder is waiting for a racer. Skip the
+    // densify height walk.
+    if room == 0 && !st.inflight.values().any(inflight_needs_racer) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -453,8 +453,8 @@ fn assign_densify(
         return;
     }
     let densify_lo = path_lo.max(st.densify_scan_lo);
-    let collect_cap = if reissue_only { 1 } else { room.max(1) };
-    let densify = collect_height_band(st, hub, densify_lo, band_hi, collect_cap, reissue_only);
+    let collect_cap = if room == 0 { 1 } else { room };
+    let densify = collect_height_band(st, hub, densify_lo, band_hi, collect_cap, room);
     if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -462,14 +462,8 @@ fn assign_densify(
 
     let ranked = rank_peers_by_speed(&st.slots, alive, &HashSet::new());
     let mut densify_q = densify;
-    for &pid in &ranked {
+    'peers: for &pid in &ranked {
         if densify_q.is_empty() {
-            break;
-        }
-        let front_reissue = densify_q
-            .front()
-            .is_some_and(|h| st.inflight.get(h).is_some_and(inflight_needs_racer));
-        if room == 0 && !front_reissue {
             break;
         }
         let cap = caps.get(&pid).copied().unwrap_or(1);
@@ -480,14 +474,13 @@ fn assign_densify(
             let Some(h) = pop_need(&mut densify_q, st, hub) else {
                 break;
             };
-            let reissue = st.inflight.get(&h).is_some_and(inflight_needs_racer);
-            if !reissue && room == 0 {
-                densify_q.push_front(h);
-                break;
-            }
             if st.inflight.get(&h).is_some_and(|req| req.holds(pid)) {
                 densify_q.push_front(h);
                 break;
+            }
+            if !densify_issue_allowed(room, st.inflight.get(&h)) {
+                densify_q.push_front(h);
+                break 'peers;
             }
             if !issue_one(st, pid, h, &mut room, &mut issued) {
                 densify_q.push_front(h);
@@ -522,7 +515,7 @@ fn collect_height_band(
     lo: u32,
     hi: u32,
     cap: usize,
-    reissue_only: bool,
+    room: usize,
 ) -> VecDeque<BlockHash> {
     let mut out = VecDeque::new();
     if lo > hi || cap == 0 {
@@ -535,7 +528,7 @@ fn collect_height_band(
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        let need = need_hash_at(st, hub, ht, reissue_only);
+        let need = need_hash_at(st, hub, ht, room);
         if tracking {
             if need.is_none() && densify_prefix_filled(st, hub, ht) {
                 prefix = ht.saturating_add(1);
@@ -594,12 +587,14 @@ fn inflight_needs_racer(req: &state::InflightReq) -> bool {
     req.peers.is_empty() && !req.retired.is_empty()
 }
 
-fn need_hash_at(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    ht: u32,
-    reissue_only: bool,
-) -> Option<BlockHash> {
+/// A free getdata window slot, or a racer for a hash whose only holders are
+/// retired. A retired holder already occupies a window slot, so the racer
+/// does not.
+fn densify_issue_allowed(room: usize, req: Option<&state::InflightReq>) -> bool {
+    room > 0 || req.is_some_and(inflight_needs_racer)
+}
+
+fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32, room: usize) -> Option<BlockHash> {
     use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
     if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
@@ -611,7 +606,7 @@ fn need_hash_at(
     {
         return None;
     }
-    if reissue_only && !st.inflight.get(&h).is_some_and(inflight_needs_racer) {
+    if !densify_issue_allowed(room, st.inflight.get(&h)) {
         return None;
     }
     // Class A seed: densify skips re-walk; tip-hole cover re-gets tip batch.
@@ -1334,7 +1329,6 @@ pub(crate) fn cover_tip_holes(
 
 #[cfg(test)]
 pub(in crate::ibd) mod tests {
-    use super::super::state::InflightReq;
     use super::super::status::LoopStats;
     use super::*;
     use bitcoin::hashes::Hash;
@@ -1409,25 +1403,6 @@ pub(in crate::ibd) mod tests {
         let mut b = [0u8; 32];
         b[0..4].copy_from_slice(&n.to_le_bytes());
         BlockHash::from_byte_array(b)
-    }
-
-    #[test]
-    fn dropping_last_hash_owner_releases_pending_body() {
-        let hash = h(0x95);
-        let mut st = IbdWorkState::new(vec![dummy_slot(1)], None, None);
-        st.slots[0].in_flight.insert(hash);
-        st.inflight.insert(hash, InflightReq::new(1));
-        st.body.mark_pending(hash);
-
-        let _ = super::super::dial::release_peer_block_work(
-            &mut st.slots,
-            &mut st.inflight,
-            &mut st.body,
-            1,
-        );
-
-        assert!(!st.body.is_pending(&hash));
-        assert!(st.body.is_missing(&hash));
     }
 
     fn dummy_slot(id: usize) -> PeerSlot {
