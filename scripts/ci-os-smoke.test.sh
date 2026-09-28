@@ -35,9 +35,9 @@ assert_ok "dry-run lists seal publish remap" \
 assert_ok "dry-run lists mapped SH BDZ3 occ" \
   grep -q "bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram" <<<"$out"
 assert_ok "dry-run lists query connect-chain confirm" \
-  grep -q "connect_chain_query_surface" <<<"$out"
-assert_ok "dry-run lists query spend-edge confirm" \
-  grep -q "spend_edge_and_confirm_idempotent_path" <<<"$out"
+  grep -q "chain_view_pin_asof_reorg" <<<"$out"
+assert_ok "dry-run lists query SH-cap confirm" \
+  grep -q "sh_history_caps" <<<"$out"
 assert_ok "dry-run has no skips off Windows" \
   grep -qx "skip=" <<<"$out"
 assert_ok "dry-run lists SH RAM / host_mem probes" \
@@ -59,7 +59,7 @@ assert_ok "Windows dry-run still rolls seal + maps fuse" \
 assert_ok "Windows dry-run still maps SH BDZ3 occ" \
   grep -q "bdz::tests::compact_packed_fd_is_bdz3_and_matches_ram" <<<"$out"
 assert_ok "Windows dry-run still confirms a few blocks" \
-  grep -q "connect_chain_query_surface" <<<"$out"
+  grep -q "chain_view_pin_asof_reorg" <<<"$out"
 assert_ok "Windows dry-run lists IOCP session tests" \
   grep -q "io_session_iocp" <<<"$out"
 assert_ok "Windows dry-run pins loc SIMD (SSE2) vs scalar" \
@@ -69,7 +69,7 @@ out="$(CI_OS_SMOKE_DRY_RUN=1 CI_OS_SMOKE_UNAME=Darwin "$RUN")"
 assert_ok "Darwin dry-run runs concurrent grow/read" \
   grep -qx "skip=" <<<"$out"
 assert_ok "Darwin dry-run still confirms a few blocks" \
-  grep -q "connect_chain_query_surface" <<<"$out"
+  grep -q "chain_view_pin_asof_reorg" <<<"$out"
 assert_ok "Darwin dry-run pins loc SIMD (NEON) vs scalar" \
   grep -qx "primitives=loc_simd::tests" <<<"$out"
 

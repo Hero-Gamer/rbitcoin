@@ -26,8 +26,8 @@ STORE_PLATFORM_FILTERS=(
 # session (IOCP / pool). Not the full query suite. Windows and Darwin run
 # the same confirm + seal-roll surface (mmap fuse + a few blocks).
 QUERY_PLATFORM_FILTERS=(
-  connect_chain_query_surface
-  spend_edge_and_confirm_idempotent_path
+  chain_view_pin_asof_reorg
+  sh_history_caps
 )
 # create.loc SSE2 / NEON vs the scalar golden. Linux CI is x86_64 and runs the
 # full workspace suite, so this is appended per-platform below: the Windows

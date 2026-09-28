@@ -132,7 +132,7 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **C05** | Witness data ⇒ commitment | `s8_rejects_missing_witness_commitment` (no witness, no commitment) | same (witness, no commitment) |
 | **C06** | Commitment ⇒ 32-byte nonce | `s8_accepts_witness_commitment_with_reserved_value` | `s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
 | **C07** | Commitment matches witness merkle + nonce | same accept test (`apply_witness_commitment`) | `s8_rejects_wrong_witness_commitment` |
-| **S01** | BIP30 unique unspent creates | every connecting block; exception table `is_bip30_repeat_matches_core` (91842 / 91880) | `bip30_rejects_unspent_connected_sibling` |
+| **S01** | BIP30 unique unspent creates | every connecting block; exception table `is_bip30_repeat_matches_core` (91842 / 91880) | `buried_rules_and_a_lying_header_path` |
 | **S02** | Prevout exists *(merged into S03 in `spec.h`)* | journey OP_TRUE spend of height-1 coinbase | journey: random txid → `MissingPrevout`; journey child-before-parent same-block |
 | **S03** | Prevout still unspent | journey first spend | journey second spend of same outpoint; journey same-block two spends |
 | **S04** | Sigop **cost** `<= 80_000` | `s11_rejects_excessive_legacy_sigops` (20 000×CHECKSIG) | same (`20_001` → cost 80 004); `sigop_cost_tests::*` (P2SH/witness) |
