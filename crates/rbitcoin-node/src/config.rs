@@ -3,7 +3,9 @@ use bitcoin::hex::FromHex;
 use bitcoin::ScriptBuf;
 use rbitcoin_consensus::{mainnet_milestone_anchor, ChainParams, Milestone};
 use rbitcoin_esplora::EsploraListen;
-use rbitcoin_primitives::{Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT};
+use rbitcoin_primitives::{
+    Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT, DEFAULT_HEALTH_PORT,
+};
 use rbitcoin_store::HeadScale;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -85,6 +87,8 @@ pub struct ListenOpts {
     pub p2p_extra: Vec<SocketAddr>,
     pub electrum: Option<SocketAddr>,
     pub esplora: Option<EsploraListen>,
+    /// `--health-listen`: `/healthz` from the start of `run_p2p`.
+    pub health: Option<SocketAddr>,
     pub connect: Vec<rbitcoin_net::NetAddr>,
     /// `--connect` names that are not a `NetAddr` (clearnet DNS, Warnet tanks).
     pub connect_dns: Vec<String>,
@@ -122,6 +126,7 @@ impl Default for ListenOpts {
             p2p_extra: Vec::new(),
             electrum: None,
             esplora: None,
+            health: None,
             connect: Vec::new(),
             connect_dns: Vec::new(),
             seednodes: Vec::new(),
@@ -1005,6 +1010,14 @@ impl NodeConfig {
                 } else {
                     EsploraListen::parse(val, DEFAULT_ESPLORA_PORT)
                         .map_err(|e| NodeError::Config(format!("conf esplora_listen: {e}")))?
+                });
+            }
+            "health_listen" => {
+                self.listen.health = Some(if val.is_empty() {
+                    SocketAddr::from(([127, 0, 0, 1], DEFAULT_HEALTH_PORT))
+                } else {
+                    val.parse()
+                        .map_err(|e| NodeError::Config(format!("conf health_listen: {e}")))?
                 });
             }
             "sh_index" => {
@@ -2113,6 +2126,7 @@ mod tests {
             ("listen=not-an-addr\n", "listen"),
             ("electrum_listen=bad\n", "electrum"),
             ("esplora_listen=bad\n", "esplora"),
+            ("health_listen=bad\n", "health"),
             ("mempool_size_mb=0\n", "mempool"),
             ("log_level=\n", "log_level"),
             ("network=notanet\n", "network"),

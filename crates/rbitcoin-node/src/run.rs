@@ -217,6 +217,14 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 /// hold the process).
 #[allow(clippy::cognitive_complexity)] // node bring-up / P2P follow loop
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
+    let _health = match config.listen.health {
+        Some(addr) => Some(
+            crate::health::run_health(addr)
+                .await
+                .map_err(|e| NodeError::Config(format!("health listen {addr}: {e}")))?,
+        ),
+        None => None,
+    };
     let handle = run_node(config.clone())?;
     let params = config.chain_params()?;
     let milestone = config.milestone();

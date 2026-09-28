@@ -158,6 +158,15 @@ async fn jsonrpc_unix(path: &std::path::Path, method: &str, params: Value) -> Va
     serde_json::from_str(json).unwrap_or_else(|e| panic!("unix rpc {method} json: {e} body={text}"))
 }
 
+/// `--health-listen` answers `GET /healthz` in every phase; nothing else is a route.
+async fn pin_healthz(health_addr: SocketAddr) {
+    assert_eq!(http_get(health_addr, "/healthz").await, (200, "ok".into()));
+    let (st, body) = http_post(health_addr, "/healthz", "").await;
+    assert_eq!(st, 405, "POST /healthz: {body}");
+    let (st, body) = http_get(health_addr, "/nope").await;
+    assert_eq!(st, 404, "unknown health path: {body}");
+}
+
 async fn pin_address_prefix_404(esplora_addr: SocketAddr) {
     let (st, body) = http_get(esplora_addr, "/address-prefix/bc1").await;
     assert_eq!(st, 404, "address-prefix stays 404: {body}");
@@ -1033,6 +1042,25 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     }
 }
 
+/// The health listener binds before the store opens: a taken port stops the
+/// node with nothing written to the datadir.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_listen_bind_failure_stops_before_store_open() {
+    let td = TestDatadir::new().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads();
+    cfg.listen.health = Some(taken.local_addr().unwrap());
+    let err = run_p2p(cfg).await.unwrap_err().to_string();
+    assert!(err.contains("health listen"), "{err}");
+    assert!(
+        !td.store_path().exists(),
+        "store opened before the health bind"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
@@ -1059,6 +1087,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let electrum_addr = ephemeral_addr();
     let esplora_addr = ephemeral_addr();
     let rpc_addr = ephemeral_addr();
+    let health_addr = ephemeral_addr();
 
     let mut cfg = NodeConfig::default()
         .with_datadir(td.path())
@@ -1072,6 +1101,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
+    cfg.listen.health = Some(health_addr);
     // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
     let rpc_sock = td.path().join("run").join("rpc.sock");
     cfg.apply_kv("rpc_socket", rpc_sock.to_str().unwrap())
@@ -1080,7 +1110,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.max_run_secs = Some(90);
 
     let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
+    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr, health_addr]).await;
+    pin_healthz(health_addr).await;
     pin_address_prefix_404(esplora_addr).await;
     #[cfg(unix)]
     {

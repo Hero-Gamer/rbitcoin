@@ -72,6 +72,8 @@ pub fn rbitcoin_subversion(
 pub const DEFAULT_ELECTRUM_PORT: u16 = 50001;
 /// Default Esplora HTTP port when `--esplora-listen` omits ADDR.
 pub const DEFAULT_ESPLORA_PORT: u16 = 3000;
+/// Default health HTTP port when `--health-listen` omits ADDR.
+pub const DEFAULT_HEALTH_PORT: u16 = 9332;
 
 pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 

@@ -124,6 +124,7 @@ fn pin_argv_usage_errors() {
         &["--log-level"],
         &["--log-level", "loud"],
         &["--electrum-listen", "bad"],
+        &["--health-listen", "bad"],
         &["--api-log"],
         &["--asmap"],
         &["--conf"],
