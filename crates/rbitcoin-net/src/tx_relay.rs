@@ -13,8 +13,8 @@ use rbitcoin_mempool::{
     blend_sat_kvb, block_p10_sat_kvb, fine_candidate_rates, flow_for_depth,
     frontier_feerate_from_chunks, historical_far_sat_kvb, hold_defined_then_monotone,
     min_rate_for_capacity, percentile_sat, weight_above_from_chunks, AcceptError, AcceptResult,
-    ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, UtxoProvider,
-    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected,
+    UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -2745,17 +2745,20 @@ impl MempoolHub {
         }
     }
 
-    /// Block template / generate selection: mining-order live txs that fit
-    /// in a block (best chunks first), skipping chunks under `min_sat_kvb`
-    /// (`-blockmintxfee`) on modified fee.
-    pub fn select_block_txs(&self, min_sat_kvb: u64) -> Vec<Transaction> {
+    /// This node's own block budget (GBT / `generate`): template weight and
+    /// the configured sigop reserve, with a `-blockmintxfee` floor.
+    pub fn template_budget(&self, min_sat_kvb: u64) -> SelectBudget {
+        self.lock_read().template_budget(min_sat_kvb)
+    }
+
+    /// Block template selection: mining-order live txs that fit `budget`
+    /// (best chunks first, `prioritisetransaction` deltas applied). Base fee
+    /// and sigop cost come from the same read lock as the selection, so a tx
+    /// evicted afterwards still reports what it was selected with.
+    pub fn select_block_template(&self, budget: SelectBudget) -> Vec<(Transaction, Selected)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let g = self.lock_read();
-        g.select_block_txs_delta(
-            rbitcoin_mempool::TxGraph::template_tx_weight(),
-            min_sat_kvb,
-            |id| deltas.get(&id).copied().unwrap_or(0),
-        )
+        g.select_block_template(budget, |id| deltas.get(&id).copied().unwrap_or(0))
     }
 
     /// Additive `prioritisetransaction` delta (sat). Zero total drops the entry.
@@ -2852,11 +2855,6 @@ impl MempoolHub {
         let g = self.lock_read();
         let bps = g.graph.bytes_per_sigop();
         g.graph.get(txid).map(|e| e.adjusted_weight(bps))
-    }
-
-    /// Full BIP16 + BIP141 sigop cost recorded at admission (GBT `sigops`).
-    pub fn get_live_sigop_cost(&self, txid: &Txid) -> Option<u64> {
-        self.lock_read().graph.get(txid).map(|e| e.sigop_cost)
     }
 
     /// Fee + sigop-adjusted weight for the feefilter announce gate (Core
@@ -4100,10 +4098,14 @@ mod tests {
                 store.flush().unwrap();
             }
             let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
-            assert_eq!(hub.get_live_sigop_cost(&ok.compute_txid()), Some(4));
-            assert_eq!(
-                hub.get_live_sigop_cost(&gone.compute_txid()),
-                None,
+            let picked: Vec<_> = hub
+                .select_block_template(hub.template_budget(0))
+                .into_iter()
+                .map(|(_, s)| (s.txid, s.sigop_cost))
+                .collect();
+            assert_eq!(picked, vec![(ok.compute_txid(), 4)]);
+            assert!(
+                !hub.contains(&gone.compute_txid()),
                 "unresolvable input evicted"
             );
             let _ = std::fs::remove_dir_all(&mp);
@@ -4163,7 +4165,13 @@ mod tests {
                 }],
             };
             hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
-            assert_eq!(hub.get_live_sigop_cost(&tx.compute_txid()), Some(16_004));
+            let picked = hub.select_block_template(hub.template_budget(0));
+            assert_eq!(picked.len(), 1);
+            assert_eq!(picked[0].0, tx);
+            assert_eq!(
+                (picked[0].1.fee_sat, picked[0].1.sigop_cost),
+                (100_000, 16_004)
+            );
             let _ = std::fs::remove_dir_all(&mp);
         }
 
@@ -4736,7 +4744,23 @@ mod tests {
             Some(0),
         )
         .unwrap();
-        assert_eq!(hub.get_live_sigop_cost(&txid), Some(79_920));
+        // GBT's budget carries the configured reserve; each pick carries the
+        // fee and sigop cost read under the selection's lock.
+        let budget = hub.template_budget(0);
+        assert_eq!(budget.reserved_sigops, 0);
+        let picked = hub.select_block_template(budget);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0, tx);
+        assert_eq!(
+            (picked[0].1.fee_sat, picked[0].1.sigop_cost),
+            (4_999_999_001, 79_920)
+        );
+        // A caller reserving Core's 400 for its coinbase cannot fit it.
+        let core_reserve = rbitcoin_mempool::SelectBudget {
+            reserved_sigops: 400,
+            ..budget
+        };
+        assert!(hub.select_block_template(core_reserve).is_empty());
         assert!(hub.contains(&txid));
         let _ = std::fs::remove_dir_all(&mempool_dir);
         let _ = std::fs::remove_dir_all(&store_dir);

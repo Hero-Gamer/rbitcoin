@@ -165,19 +165,30 @@ No new flag; GBT output for an unchanged mempool is unchanged.
 ### A2 — Hub and GBT on the budgeted call
 
 - **Contract:** `MempoolHub::select_block_template(budget)` returns
-  `Vec<(Transaction, fee_sat, sigop_cost)>` from one read lock plus the
-  `prioritisetransaction` deltas. GBT `transactions[].fee` / `sigops` and
-  `coinbasevalue` come from it; `generate` uses the same call. A tx
-  removed after selection still reports its selected fee.
-- **Red:** `cargo test -p rbitcoin-rpc gbt_` — existing GBT tests stay
-  green; new case: evict a selected tx between selection and JSON build
-  (hook or fixture), fee and sigops still match selection.
-- **Green:** hub method; `mempool_block_txs` returns the triples; GBT
-  drops the per-tx `get_live_meta` / `get_live_sigop_cost` reads.
-- **Refactor:** `select_block_txs` callers left over move to the new call
-  or keep a one-line wrapper.
+  `Vec<(Transaction, Selected)>` from one read lock plus the
+  `prioritisetransaction` deltas; `MempoolHub::template_budget(min)` is
+  the node's own budget (template weight, configured reserve). GBT
+  `transactions[].fee` / `sigops` and `coinbasevalue` come from it;
+  `generate` uses the same call. A tx removed after selection still
+  reports its selected fee.
+- **Red:** `cargo test -p rbitcoin-net sigop` plus `hub_live_journey` —
+  extend the existing hub sigop tests to read fee and sigop cost through
+  `select_block_template` (configured reserve 0 fits a 79,920-cost tx; a
+  caller reserving 400 gets nothing), replacing `get_live_sigop_cost`.
+  A non-default budget is Plan B's path, so these stay hub units.
+  The evict-between-selection-and-JSON race is not reachable from a real
+  session without a hook; it is made structurally impossible (GBT no
+  longer re-reads after the lock drops) and not pinned by a hook test.
+  The `rpc_regtest_chain_ops` GBT beat gains `fee == 1_000` beside its
+  `sigops` asserts; the existing sigop-budget GBT test pins
+  `coinbasevalue` via block accept.
+- **Green:** hub `template_budget` / `select_block_template`;
+  `mempool_block_txs` returns `(tx, Selected)`; GBT drops the per-tx
+  `get_live_meta` / `get_live_sigop_cost` reads.
+- **Refactor:** `select_block_txs` (hub and `ActiveMempool`) and
+  `get_live_sigop_cost` go away; no callers left.
 - **Verify:** `cargo test -p rbitcoin-rpc --lib`,
-  `cargo test -p rbitcoin-net select_`
+  `cargo test -p rbitcoin-net --lib sigop`
 
 ---
 

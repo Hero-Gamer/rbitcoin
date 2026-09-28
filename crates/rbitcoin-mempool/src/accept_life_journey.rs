@@ -630,7 +630,7 @@ fn sigop_block_budget(life: &mut Life) {
         .expect("79,520 fits beside the default reserve");
     assert_eq!(
         life.mp
-            .select_block_txs(TxGraph::template_tx_weight())
+            .select_block_template(life.mp.template_budget(0), |_| 0)
             .len(),
         1
     );
@@ -648,7 +648,7 @@ fn sigop_block_budget(life: &mut Life) {
         .expect("79,920 fits when the template reserve is zero");
     assert_eq!(
         life.mp
-            .select_block_txs(TxGraph::template_tx_weight())
+            .select_block_template(life.mp.template_budget(0), |_| 0)
             .len(),
         1
     );

@@ -608,6 +608,7 @@ fn chain_ops_template_sigops_and_script_reject(ctx: &RpcContext, cbs: &mut TrueC
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0]["txid"], tid);
     assert_eq!(txs[0]["sigops"], 4);
+    assert_eq!(txs[0]["fee"], 1_000);
     let lp = tmpl["longpollid"].clone();
     let again = dispatch(ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
     assert_eq!(again["longpollid"], lp);
@@ -786,6 +787,9 @@ fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCo
             .unwrap()
             .set_block_min_tx_fee_sat_kvb(min);
         crate::methods::mine::mempool_block_txs(ctx)
+            .into_iter()
+            .map(|(tx, _)| tx)
+            .collect::<Vec<_>>()
     };
     // 2_000 sat is 0.5 sat/vB at 4_000 vB.
     assert_eq!(keep(500), vec![tx.clone()]);

@@ -1,7 +1,9 @@
 //! Single-tx accept: Libre policy + cluster limits + durable slot write.
 
 use crate::error::MempoolError;
-use crate::graph::{sigops_adjusted_weight, SelectBudget, TxEntry, TxGraph, MAX_BLOCK_SIGOPS_COST};
+use crate::graph::{
+    sigops_adjusted_weight, SelectBudget, Selected, TxEntry, TxGraph, MAX_BLOCK_SIGOPS_COST,
+};
 use crate::orphanage::Orphanage;
 use crate::packed::VinAux;
 use crate::store::Mempool;
@@ -502,7 +504,7 @@ impl ActiveMempool {
         self.graph.set_bytes_per_sigop(bytes_per_sigop);
     }
 
-    /// Set the sigop reserve shared by admission and block-template selection.
+    /// Set the sigop reserve shared by admission and [`Self::template_budget`].
     pub fn set_block_reserved_sigops(&mut self, reserved_sigops: u64) {
         self.graph.set_block_reserved_sigops(reserved_sigops);
     }
@@ -1824,28 +1826,27 @@ impl ActiveMempool {
             .collect()
     }
 
-    /// Mining-order live txs that fit in `max_weight_wu` (best chunks first).
-    pub fn select_block_txs(&self, max_weight_wu: u64) -> Vec<Transaction> {
-        self.select_block_txs_delta(max_weight_wu, 0, |_| 0)
-    }
-
-    /// Like [`Self::select_block_txs`] with `prioritisetransaction` fee deltas
-    /// and a `-blockmintxfee` chunk floor (sat/kvB).
-    pub fn select_block_txs_delta(
-        &self,
-        max_weight_wu: u64,
-        min_sat_kvb: u64,
-        delta: impl Fn(Txid) -> i64,
-    ) -> Vec<Transaction> {
-        let budget = SelectBudget {
-            max_weight_wu,
+    /// This node's own block budget (GBT / `generate`): template weight and
+    /// the admission sigop reserve, with a `-blockmintxfee` floor.
+    pub fn template_budget(&self, min_sat_kvb: u64) -> SelectBudget {
+        SelectBudget {
+            max_weight_wu: TxGraph::template_tx_weight(),
             reserved_sigops: self.graph.block_reserved_sigops(),
             min_sat_kvb,
-        };
+        }
+    }
+
+    /// Mining-order live txs that fit `budget` (best chunks first) with
+    /// `prioritisetransaction` deltas, each with its [`Selected`] meta.
+    pub fn select_block_template(
+        &self,
+        budget: SelectBudget,
+        delta: impl Fn(Txid) -> i64,
+    ) -> Vec<(Transaction, Selected)> {
         self.graph
             .select_block_template(budget, delta)
             .into_iter()
-            .filter_map(|s| self.get_tx(&s.txid).cloned())
+            .filter_map(|s| self.get_tx(&s.txid).map(|tx| (tx.clone(), s)))
             .collect()
     }
 }

@@ -767,7 +767,7 @@ const NAMED_HELP: &[(&str, &str)] = &[
     (
         "getblocktemplate",
         "getblocktemplate (template_request)\n\
-         All networks. Template from select_block_txs; proposal validates \
+         All networks. Template from select_block_template; proposal validates \
          without connecting. rules must include segwit. longpollid waits \
          for a new tip or mempool/priority change. No BIP9 testdummy.",
     ),
