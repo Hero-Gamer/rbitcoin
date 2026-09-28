@@ -229,7 +229,10 @@ pub(crate) async fn run_health(
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     if !local_addr.ip().is_loopback() {
-        warn!("health: {local_addr} is not loopback; /healthz and /readyz are unauthenticated");
+        warn!(
+            "health: {local_addr} is not loopback; /healthz and /readyz{} are unauthenticated",
+            if metrics { " and /metrics" } else { "" }
+        );
     }
     let app = router(status, metrics);
     let task = tokio::spawn(async move {
