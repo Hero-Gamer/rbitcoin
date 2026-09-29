@@ -342,6 +342,9 @@ mod tests {
 
         let started = Arc::new(AtomicBool::new(false));
         let release = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        // A failed assert must still wake the job. The tip-accept thread is
+        // process-wide, and leaving it parked hangs every later test.
+        let _wake = ReleaseOnDrop(Arc::clone(&release));
         let s2 = Arc::clone(&started);
         let r2 = Arc::clone(&release);
         let waiter = tokio::spawn(async move {
@@ -371,8 +374,14 @@ mod tests {
             progressed.is_ok(),
             "JoinOnDrop must not park the tokio worker"
         );
-        {
-            let (lock, cv) = &*release;
+        drop(_wake);
+    }
+
+    struct ReleaseOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.0;
             *lock.lock().unwrap() = true;
             cv.notify_one();
         }
