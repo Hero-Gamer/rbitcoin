@@ -2060,22 +2060,29 @@ pub(crate) fn retire_adopt_if_confirmed(st: &mut IbdWorkState, hub: &ChainHub) {
     let _ = std::fs::remove_file(adopt_path(hub));
 }
 
-/// Read `header.adopt`. A file that does not parse leaves the script skip off.
+/// Read `header.adopt`. A file that does not parse does not restore
+/// checkpoints. Headers already queued and linked from the confirmed tip are
+/// still noted on the milestone path.
 pub(crate) fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     retire_adopt_if_confirmed(st, hub);
     let started = std::time::Instant::now();
     let path = adopt_path(hub);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            renote_stored_path(st, hub);
+            return false;
+        }
         Err(_) => {
             rbitcoin_log::info!("ibd: headers resume failed took={:?}", started.elapsed());
+            renote_stored_path(st, hub);
             return false;
         }
     };
     let took = started.elapsed();
     let Some(parsed) = parse_adopt(&bytes) else {
         rbitcoin_log::info!("ibd: headers resume failed took={took:?}");
+        renote_stored_path(st, hub);
         return false;
     };
     if base_conflicts(st, hub, &parsed) {
@@ -2083,6 +2090,7 @@ pub(crate) fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
             "ibd: headers resume refused height={} took={took:?}",
             parsed.base_height
         );
+        renote_stored_path(st, hub);
         return false;
     }
     st.header_walk = parsed;
@@ -2769,6 +2777,69 @@ mod tests {
             !skips(&hub, 1, h1.block_hash().as_byte_array()),
             "a file that does not parse does not skip scripts by height"
         );
+    }
+
+    #[test]
+    fn a_failed_adopt_still_notes_the_queued_path() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-renote");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 2,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: h2.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        apply(&mut st, &hub, 0, vec![h1, h2]);
+        assert!(skips(&hub, 1, h1.block_hash().as_byte_array()));
+
+        hub.query.clear_milestone_path_above(0);
+        st.header_walk = HeaderWalk::default();
+        assert!(!skips(&hub, 1, h1.block_hash().as_byte_array()));
+        let path = hub.query.store().path().join("header.adopt");
+        std::fs::write(&path, b"not-a-checkpoint-file").unwrap();
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array()),
+            "a queued header stays on the milestone path when header.adopt does not parse"
+        );
+        assert_eq!(
+            hub.query.milestone_header_at(2),
+            Some(h2.block_hash().to_byte_array())
+        );
+        assert!(skips(&hub, 1, h1.block_hash().as_byte_array()));
+
+        hub.query.clear_milestone_path_above(0);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array()),
+            "a missing header.adopt still notes the queued path"
+        );
+
+        hub.query.clear_milestone_path_above(0);
+        st.height_to_hash
+            .insert(2, BlockHash::from_byte_array([0x22; 32]));
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array())
+        );
+        assert_eq!(
+            hub.query.milestone_header_at(2),
+            None,
+            "a height that does not link to the previous header is not the milestone chain"
+        );
+        assert!(!skips(&hub, 1, h1.block_hash().as_byte_array()));
     }
 
     #[test]
