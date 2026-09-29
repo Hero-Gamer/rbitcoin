@@ -198,67 +198,110 @@ pub fn expected_next_bits(
         return Ok(g.header.bits);
     }
 
-    let interval = params.difficulty_adjustment_interval();
     let prev_height = Height(height.0 - 1);
     let (_fk, prev_rec) = query
         .header_at_height(prev_height)?
         .ok_or(ConsensusError::BadPrev)?;
     let prev_bits = CompactTarget::from_consensus(prev_rec.bits);
+    let period_first = period_first_time(query, params, height.0)?;
+    next_work_bits(
+        params,
+        height.0,
+        prev_bits,
+        prev_rec.timestamp,
+        header_time,
+        period_first,
+        |h| {
+            header_bits_at(query, Height(h))
+                .ok()
+                .map(CompactTarget::from_consensus)
+        },
+    )
+    .ok_or(ConsensusError::BadPrev)
+}
 
-    if !height.0.is_multiple_of(interval) {
-        return min_difficulty_or_walk(
-            query,
+/// Difficulty for the header at `height`, from the parent and the period start.
+///
+/// `period_first_time` is the timestamp of the header at `height - interval`
+/// when `height` is a retarget boundary. `bits_at` supplies earlier `nBits`
+/// for the testnet min-difficulty walk. `None` means an ancestor is missing.
+pub fn next_work_bits(
+    params: &ChainParams,
+    height: u32,
+    prev_bits: CompactTarget,
+    prev_time: u32,
+    header_time: u32,
+    period_first_time: Option<u32>,
+    mut bits_at: impl FnMut(u32) -> Option<CompactTarget>,
+) -> Option<CompactTarget> {
+    if height == 0 {
+        return None;
+    }
+    let interval = params.difficulty_adjustment_interval();
+    if interval == 0 || !height.is_multiple_of(interval) {
+        return min_diff_bits(
             params,
             height,
             prev_bits,
-            prev_rec.timestamp,
+            prev_time,
             header_time,
+            &mut bits_at,
         );
     }
     if params.no_pow_retargeting() {
-        return Ok(prev_bits);
+        return Some(prev_bits);
     }
-
-    let first_height = Height(height.0 - interval);
-    let (_fk, first_rec) = query
-        .header_at_height(first_height)?
-        .ok_or(ConsensusError::BadHeader("missing retarget first header"))?;
-
-    let timespan = prev_rec.timestamp.saturating_sub(first_rec.timestamp) as u64;
-    Ok(CompactTarget::from_next_work_required(
+    let first_time = period_first_time?;
+    let timespan = u64::from(prev_time.saturating_sub(first_time));
+    Some(CompactTarget::from_next_work_required(
         prev_bits,
         timespan,
         &params.btc,
     ))
 }
 
-pub(crate) fn min_difficulty_or_walk(
+fn period_first_time(
     query: &Query,
     params: &ChainParams,
-    height: Height,
+    height: u32,
+) -> Result<Option<u32>, ConsensusError> {
+    let interval = params.difficulty_adjustment_interval();
+    if interval == 0 || !height.is_multiple_of(interval) || params.no_pow_retargeting() {
+        return Ok(None);
+    }
+    let (_fk, first_rec) = query
+        .header_at_height(Height(height - interval))?
+        .ok_or(ConsensusError::BadHeader("missing retarget first header"))?;
+    Ok(Some(first_rec.timestamp))
+}
+
+fn min_diff_bits(
+    params: &ChainParams,
+    height: u32,
     prev_bits: CompactTarget,
     prev_time: u32,
     header_time: u32,
-) -> Result<CompactTarget, ConsensusError> {
+    bits_at: &mut impl FnMut(u32) -> Option<CompactTarget>,
+) -> Option<CompactTarget> {
     if !params.allow_min_difficulty_blocks() {
-        return Ok(prev_bits);
+        return Some(prev_bits);
     }
     let limit = params.pow_limit.to_compact_lossy();
     let spacing = params.btc.pow_target_spacing;
     if u64::from(header_time) > u64::from(prev_time).saturating_add(spacing.saturating_mul(2)) {
-        return Ok(limit);
+        return Some(limit);
     }
     let interval = params.difficulty_adjustment_interval();
-    let mut h = height.0 - 1;
+    let mut h = height - 1;
     let mut bits = prev_bits;
-    while !h.is_multiple_of(interval) && bits == limit {
+    while interval > 0 && !h.is_multiple_of(interval) && bits == limit {
         if h == 0 {
             break;
         }
         h -= 1;
-        bits = CompactTarget::from_consensus(header_bits_at(query, Height(h))?);
+        bits = bits_at(h)?;
     }
-    Ok(bits)
+    Some(bits)
 }
 
 fn header_bits_at(query: &Query, height: Height) -> Result<u32, ConsensusError> {
@@ -519,6 +562,56 @@ mod median_time_past_tests {
         assert_eq!(walked.to_consensus(), h0.bits);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_work_bits_walks_back_past_min_difficulty() {
+        let params = ChainParams::testnet();
+        let limit = params.pow_limit.to_compact_lossy();
+        let full = CompactTarget::from_consensus(0x1d00_eeee);
+        assert_ne!(full, limit);
+        let prev_time = 1_000_000u32;
+        let walked = next_work_bits(
+            &params,
+            3,
+            limit,
+            prev_time,
+            prev_time + 100,
+            None,
+            |h| match h {
+                1 => Some(limit),
+                0 => Some(full),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert_eq!(walked, full);
+
+        let spacing = params.btc.pow_target_spacing;
+        let gap = next_work_bits(
+            &params,
+            3,
+            full,
+            prev_time,
+            prev_time + (spacing as u32) * 2 + 1,
+            None,
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(gap, limit);
+
+        let mainnet = ChainParams::mainnet();
+        let kept = next_work_bits(
+            &mainnet,
+            3,
+            full,
+            prev_time,
+            prev_time + (spacing as u32) * 2 + 1,
+            None,
+            |_| Some(limit),
+        )
+        .unwrap();
+        assert_eq!(kept, full);
     }
 
     #[test]
