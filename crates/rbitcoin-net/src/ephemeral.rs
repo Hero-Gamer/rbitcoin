@@ -319,23 +319,57 @@ mod tests {
         splice.abort();
     }
 
+    /// One hub with a mempool and a local tx. The isolated-broadcast loop is
+    /// idle until isolation is on, then survives unknown txids read off the
+    /// reactor, a burst that lags its kick channel, and a local tx with no
+    /// address to send to. A one-shot send that fails does not fall back to
+    /// INV on a standing peer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ephemeral_broadcast_fail_does_not_inv_standing() {
+    async fn ephemeral_broadcast() {
+        use bitcoin::hashes::Hash;
         use bitcoin::p2p::address::Address;
         use bitcoin::p2p::message_network::VersionMessage;
         use bitcoin::p2p::ServiceFlags;
-        use bitcoin::OutPoint;
+        use bitcoin::{OutPoint, Txid};
         use rbitcoin_primitives::Height;
         use tokio::sync::mpsc;
 
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-fail-inv");
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("ephemeral-broadcast");
         hub.ensure_genesis().unwrap();
         hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .expect("pad");
         let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
         mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(mp.clone()).is_ok());
+        let spawn_loop = |am: AddrMan| {
+            spawn_isolated_broadcast_loop(
+                mp.clone(),
+                Dialer::Direct,
+                Arc::new(Mutex::new(am)),
+                Magic::REGTEST,
+                "/rbitcoin:test/".into(),
+            )
+        };
+
+        spawn_loop(AddrMan::new())
+            .await
+            .expect("idle loop returns while isolation is off");
+
         mp.set_isolated_broadcast(true);
-        assert!(hub.attach_mempool(mp).is_ok());
+        let h = spawn_loop(AddrMan::new());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        mp.mark_local_origin(dummy_tx().compute_txid());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !h.is_finished(),
+            "an unknown txid is skipped without panicking on a tokio worker"
+        );
+        for i in 0..40u8 {
+            mp.mark_local_origin(Txid::from_byte_array([i; 32]));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!h.is_finished(), "Lagged kicks must not stop isolated send");
+
         let cb = hub
             .query
             .reconstruct_block_at_height(Height(1))
@@ -356,10 +390,11 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        hub.mempool().unwrap().accept_tx(&local).expect("local");
-        hub.mempool()
-            .unwrap()
-            .mark_local_origin(local.compute_txid());
+        mp.accept_tx(&local).expect("local");
+        mp.mark_local_origin(local.compute_txid());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!h.is_finished(), "a local tx with no targets is a no-op");
+        h.abort();
 
         let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dest = closed.local_addr().unwrap();
@@ -374,7 +409,6 @@ mod tests {
         )
         .await;
         assert!(err.is_err(), "closed listener must fail the one-shot");
-
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let ver = VersionMessage {
             version: 70016,
@@ -403,113 +437,6 @@ mod tests {
             "failed isolated send must not fall back to standing INV"
         );
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn ephemeral_broadcast_loop_idle_when_not_isolated() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-idle");
-        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        let am = Arc::new(Mutex::new(AddrMan::new()));
-        spawn_isolated_broadcast_loop(
-            mp,
-            Dialer::Direct,
-            am,
-            Magic::REGTEST,
-            "/rbitcoin:test/".into(),
-        )
-        .await
-        .unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn isolated_broadcast_loop_reads_mempool_off_reactor() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-reactor");
-        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        mp.set_isolated_broadcast(true);
-        let am = Arc::new(Mutex::new(AddrMan::new()));
-        let h = spawn_isolated_broadcast_loop(
-            mp.clone(),
-            Dialer::Direct,
-            am,
-            Magic::REGTEST,
-            "/rbitcoin:test/".into(),
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        mp.mark_local_origin(dummy_tx().compute_txid());
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(
-            !h.is_finished(),
-            "broadcast task must not panic reading the mempool on a tokio worker"
-        );
-        h.abort();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn ephemeral_broadcast_loop_skips_unknown_txid() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-skip");
-        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        mp.set_isolated_broadcast(true);
-        let am = Arc::new(Mutex::new(AddrMan::new()));
-        let h = spawn_isolated_broadcast_loop(
-            mp.clone(),
-            Dialer::Direct,
-            am,
-            Magic::REGTEST,
-            "/rbitcoin:test/".into(),
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        mp.mark_local_origin(dummy_tx().compute_txid());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        h.abort();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn ephemeral_broadcast_loop_survives_lagged_kicks() {
-        use bitcoin::hashes::Hash;
-        use bitcoin::Txid;
-
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("iso-lag");
-        let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        mp.set_isolated_broadcast(true);
-        let am = Arc::new(Mutex::new(AddrMan::new()));
-        let h = spawn_isolated_broadcast_loop(
-            mp.clone(),
-            Dialer::Direct,
-            am,
-            Magic::REGTEST,
-            "/rbitcoin:test/".into(),
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        for i in 0..40u8 {
-            mp.mark_local_origin(Txid::from_byte_array([i; 32]));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !h.is_finished(),
-            "broadcast Lagged must not stop isolated send"
-        );
-        mp.mark_local_origin(dummy_tx().compute_txid());
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!h.is_finished());
-        h.abort();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn ephemeral_broadcast_known_tx_no_addrman_targets() {
-        let tx = dummy_tx();
-        isolated_broadcast_known_tx(
-            &Dialer::Direct,
-            &Mutex::new(AddrMan::new()),
-            Magic::REGTEST,
-            "/rbitcoin:test/",
-            tx.compute_txid(),
-            tx,
-        )
-        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
