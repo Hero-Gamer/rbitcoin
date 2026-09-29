@@ -1923,9 +1923,11 @@ fn base_conflicts(st: &IbdWorkState, hub: &ChainHub, walk: &HeaderWalk) -> bool 
 
 /// A confirmed reorg under the walk's base drops `header.adopt`. The file must
 /// not bring back a hash from the chain that was disconnected. A reorg under
-/// the milestone height also drops the latched hash, so the next chain can
-/// record its own. A reorg that stays above the milestone puts that hash back
-/// after the path clear.
+/// the milestone height drops the latched hash. Putting that hash back is
+/// unsafe: the walk above the fork can still be the chain that was
+/// disconnected, while the base is still the confirmed block. Script checks
+/// stay on until this chain records the milestone block. A reorg that stays
+/// above the milestone puts that hash back after the path clear.
 pub(crate) fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
     if st.header_walk.base_hash.is_some() && lca_h < st.header_walk.base_height {
         st.header_walk = HeaderWalk::default();
@@ -1937,6 +1939,10 @@ pub(crate) fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: 
     }
     if lca_h < hub.milestone.height {
         if st.header_walk.milestone_hash.take().is_some() {
+            rbitcoin_log::warn!(
+                "ibd: headers milestone dropped lca={lca_h} milestone={} script checks stay on until this chain records that block",
+                hub.milestone.height
+            );
             save_adopt(st, hub);
         }
         return;
@@ -3209,19 +3215,36 @@ mod tests {
         assert_eq!(st.header_walk.base_height, 0);
         assert_eq!(st.header_walk.milestone_hash, Some(a2.block_hash()));
 
+        rbitcoin_log::capture_logs(true);
         hub.query.clear_milestone_path_above(2);
         on_confirmed_rewind(&mut st, &hub, 2);
+        let above = rbitcoin_log::take_logs();
         assert_eq!(st.header_walk.milestone_hash, Some(a2.block_hash()));
         assert_eq!(
             hub.query.milestone_header_at(2),
             Some(a2.block_hash().to_byte_array())
         );
+        assert!(
+            above
+                .iter()
+                .all(|(_, line)| !line.contains("milestone dropped")),
+            "a reorg that stays above the milestone keeps the latched hash"
+        );
 
         hub.query.clear_milestone_path_above(0);
         on_confirmed_rewind(&mut st, &hub, 0);
+        let below = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
         assert!(
             st.header_walk.milestone_hash.is_none(),
-            "a fork under the milestone lets the next chain record its hash"
+            "a fork under the milestone drops the latched hash and does not put it back"
+        );
+        assert!(
+            below.iter().any(|(level, line)| {
+                *level == rbitcoin_log::Level::Warn
+                    && line.contains("ibd: headers milestone dropped")
+            }),
+            "dropping the latch is logged so script checks staying on is visible"
         );
         st.header_walk = HeaderWalk::default();
         assert!(restore_adopt(&mut st, &hub));
