@@ -26,19 +26,29 @@ fn sh_history_caps() {
 
     let (dir, q) = temp_query("sh-history-caps");
     let sh = script_hash(&[0x51]);
+    let probe_sh = script_hash(&[0x52]);
+    let add_probe_output = |ta: &mut TxApply| {
+        ta.tx.output_count += 1;
+        ta.outputs
+            .push(OutputRecord::unspent(1, vec![0x52]));
+    };
     let mut prev = Fk::NULL;
     let mut parent = None;
     let mut cb_txids = Vec::new();
     for h in 0..5u32 {
-        let (header, ta) = coinbase_block(h, prev, parent);
+        let (header, mut ta) = coinbase_block(h, prev, parent);
+        add_probe_output(&mut ta);
         parent = Some(header.hash);
         cb_txids.push(ta.tx.txid);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
     let create0 = q.block_tx_fks(Height(0)).unwrap()[0];
 
-    let (h5, cb5) = coinbase_block(5, prev, parent);
+    let (h5, mut cb5) = coinbase_block(5, prev, parent);
+    add_probe_output(&mut cb5);
     let mut spend = cb5.clone();
+    spend.tx.output_count = 1;
+    spend.outputs.truncate(1);
     spend.tx.txid[30] = 0x5e;
     spend.inputs = vec![InputRecord {
         prev_txid: cb_txids[0],
@@ -60,6 +70,7 @@ fn sh_history_caps() {
     q.apply_sh_pending().unwrap();
     assert!(q.pending_sh_create_fks(&sh).is_empty());
     assert_eq!(q.scripthash_create_count(&sh).unwrap(), 7);
+    let tip_coinbase_fk = q.block_tx_fks(Height(5)).unwrap()[0];
 
     q.set_max_sh_creates(2);
     for err in [
@@ -81,10 +92,16 @@ fn sh_history_caps() {
         [cb_txids[1]],
         "a full page past the cursor closes too"
     );
+    q.store().reset_txid_get_many();
     assert_eq!(
-        sh_page(&q, &sh, HeightAsc, Some(cb_txids[3])).unwrap(),
+        sh_page(&q, &probe_sh, HeightAsc, Some(cb_txids[3])).unwrap(),
         [cb_txids[4]],
-        "a cursor deeper than the cap scans on until its page closes"
+        "a cursor deeper than the cap still returns its next row"
+    );
+    let scanned = q.store().txid_get_many_fks();
+    assert!(
+        !scanned.contains(&tip_coinbase_fk.0),
+        "once the cursor and full page are joined, later creates cannot change the page"
     );
     assert_eq!(
         sh_page(&q, &sh, NewestFirst, None).unwrap(),
