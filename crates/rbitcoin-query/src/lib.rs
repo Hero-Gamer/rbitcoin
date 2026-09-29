@@ -365,8 +365,10 @@ pub struct Query {
     /// Header work-path height → hash plus work through the contiguous tip.
     ///
     /// Second map beside IBD `height_to_hash` so confirm threads can do two
-    /// O(1) milestone lookups without the IBD state lock. RAM is one hash per
-    /// header on that path for the process lifetime of the sync.
+    /// O(1) milestone lookups without the IBD state lock. While the map has
+    /// any height it is the only source: a missing height is not an ancestor
+    /// of the milestone. When it is empty, the confirmed chain is the source.
+    /// RAM is one hash per header on that path for the process lifetime of the sync.
     milestone_path: Mutex<MilestonePath>,
 }
 
@@ -527,18 +529,27 @@ impl Query {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Header hash at `height` on the published header path, else the
-    /// confirmed chain, else a queued body. Missing is not an ancestor.
+    /// Header hash at `height` on one chain.
+    ///
+    /// While the published header path has any hash, that map is the only
+    /// source. A missing height is not an ancestor of the milestone: the
+    /// confirmed chain and the body queue are different chains. When the
+    /// path is empty, the confirmed chain is the source.
     pub fn milestone_header_at(&self, height: u32) -> Option<[u8; 32]> {
-        if let Ok(Some((_, rec))) = self.header_at_height(rbitcoin_primitives::Height(height)) {
-            return Some(rec.hash);
-        }
         let g = self.milestone_path_lock();
-        if let Some(h) = g.by_height.get(&height).copied() {
-            return Some(h);
+        if !g.by_height.is_empty() {
+            return g.by_height.get(&height).copied();
         }
         drop(g);
-        self.block_queue_hash_at_height(height)
+        match self.header_at_height(rbitcoin_primitives::Height(height)) {
+            Ok(Some((_, rec))) => Some(rec.hash),
+            _ => None,
+        }
+    }
+
+    /// True when header intake has published any height on the milestone path.
+    pub fn has_milestone_path(&self) -> bool {
+        !self.milestone_path_lock().by_height.is_empty()
     }
 
     /// Work through the contiguous published header tip, if intake seeded it.
