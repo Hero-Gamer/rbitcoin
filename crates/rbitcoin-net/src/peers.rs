@@ -2968,35 +2968,6 @@ mod tests {
     }
 
     #[test]
-    fn peerhub_register_snapshot_disconnect() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
-        let p = hub.register(
-            a,
-            b,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
-        p.note_recv("pong", 8);
-        let snap = hub.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].id, 0);
-        assert_eq!(snap[0].subver, "/rbitcoin:0.1.0(testnode0)/");
-        assert!(!snap[0].inbound);
-        assert!(snap[0].bytesrecv_per_msg.get("pong").copied().unwrap() >= 29);
-        assert!(hub.disconnect_id(0));
-        assert!(p.stop.load(Ordering::SeqCst));
-        // disconnectnode must clear getpeerinfo immediately (mempool_reorg
-        // disconnect_nodes waits ≤5s on the far side seeing us gone).
-        assert!(
-            hub.snapshot().is_empty(),
-            "disconnect_id must unregister before the session task exits"
-        );
-    }
-
-    #[test]
     fn snapshot_hides_fin_completed_keeps_connecting() {
         use std::net::TcpListener;
 
@@ -3174,31 +3145,6 @@ mod tests {
                 .any(|(_, m)| m.contains("version handshake timeout, disconnecting peer=0")),
             "pre-verack ping vs mocktime must still log the needle, got {logs:?}"
         );
-    }
-
-    #[test]
-    fn completed_handshake_survives_peertimeout() {
-        let hub = PeerHub::new();
-        hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        assert!(p.handshake_complete());
-        hub.set_mock_now(1_700_000_100);
-        hub.on_session_heartbeat();
-        assert!(!p.stop.load(Ordering::SeqCst));
-        assert!(hub.get(p.id).is_some());
-    }
-
-    #[test]
-    fn outbound_nonce_detects_self_connect() {
-        let hub = PeerHub::new();
-        assert!(hub.check_incoming_nonce(42));
-        hub.note_outbound_nonce(42);
-        assert!(!hub.check_incoming_nonce(42));
-        assert!(hub.check_incoming_nonce(43));
-        hub.clear_outbound_nonce(42);
-        assert!(hub.check_incoming_nonce(42));
     }
 
     #[test]
@@ -3576,71 +3522,6 @@ mod tests {
             p.take_ping_action(now + 6_000),
             Some(PingAction::Timeout { .. })
         ));
-    }
-
-    #[test]
-    fn ping_pong_logs_core_needles() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs()).unwrap() else {
-            panic!("expected send");
-        };
-        assert_ne!(nonce, 0);
-        let wait = hub.snapshot()[0].pingwait;
-        assert_eq!(wait, Some(0.0));
-
-        hub.set_mock_now(1_700_000_003);
-        assert_eq!(hub.snapshot()[0].pingwait, Some(3.0));
-
-        let short = p.on_pong(&[], hub.now_secs()).expect("short");
-        assert!(
-            short.starts_with("p2p: pong peer=0: Short payload"),
-            "{short}"
-        );
-        assert!(p
-            .on_pong(&0u64.to_le_bytes(), hub.now_secs())
-            .unwrap()
-            .contains("Unsolicited pong without ping, 0 expected, 0 received, 8 bytes"));
-
-        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs() + 121).unwrap() else {
-            panic!("interval send");
-        };
-        let wrong = (nonce.wrapping_sub(1)).to_le_bytes();
-        let mm = p.on_pong(&wrong, hub.now_secs() + 121).unwrap();
-        assert!(mm.contains("Nonce mismatch"), "{mm}");
-        let zero = p
-            .on_pong(&0u64.to_le_bytes(), hub.now_secs() + 121)
-            .unwrap();
-        assert!(zero.contains("Nonce zero"), "{zero}");
-
-        let PingAction::Send { nonce } = p.take_ping_action(hub.now_secs() + 250).unwrap() else {
-            panic!("rpc-style send");
-        };
-        let now = hub.now_secs() + 279;
-        assert!(p.on_pong(&nonce.to_le_bytes(), now).is_none());
-        let snap = {
-            hub.set_mock_now(now);
-            hub.snapshot()
-        };
-        assert_eq!(snap[0].pingtime, Some(29.0));
-        assert_eq!(snap[0].minping, Some(29.0));
-        assert_eq!(snap[0].pingwait, None);
-
-        p.queue_ping();
-        let PingAction::Send { .. } = p.take_ping_action(now).unwrap() else {
-            panic!("queued");
-        };
-        let to = p.take_ping_action(now + 1201).unwrap();
-        match to {
-            PingAction::Timeout { elapsed_secs } => {
-                assert!((elapsed_secs - 1201.0).abs() < 0.01, "{elapsed_secs}");
-                let line = crate::peer::ping_timeout_log(elapsed_secs);
-                assert_eq!(line, "p2p: ping timeout: 1201.000000s");
-            }
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]

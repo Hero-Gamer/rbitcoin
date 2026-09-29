@@ -3447,16 +3447,16 @@ fn getpeerinfo_mapped_as_when_asmap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every `P2PNode` attaches a dialer, so no session reaches this arm.
+/// `node_run_p2p_short` owns the connected `addnode` / `disconnectnode` results.
 #[test]
-fn addnode_and_disconnectnode_on_table() {
+fn addnode_without_a_dialer_errors() {
     use rbitcoin_net::PeerHub;
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
     ctx.peers = Some(hub);
     let e = dispatch(&ctx, "addnode", vec![json!("127.0.0.1:1"), json!("onetry")]).unwrap_err();
     assert!(e["message"].as_str().unwrap().contains("dialer"), "{e}");
-    let e = dispatch(&ctx, "disconnectnode", vec![json!("127.0.0.1:1")]).unwrap_err();
-    assert_eq!(e["code"], ERR_CLIENT_NODE_NOT_CONNECTED);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3589,73 +3589,6 @@ fn getnodeaddresses_empty_named_filter_and_count() {
     let onion = dispatch(&ctx, "getnodeaddresses", vec![json!(0), json!("onion")]).unwrap();
     assert_eq!(onion.as_array().unwrap().len(), 0);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn addnode_two_nodes_see_each_other() {
-    use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_net::P2PNode;
-    use rbitcoin_query::Query;
-
-    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-2n").expect("temp dir");
-    std::fs::create_dir_all(dir.join("a")).unwrap();
-    std::fs::create_dir_all(dir.join("b")).unwrap();
-    let qa = Query::open_or_create_tiny(dir.join("a/store")).unwrap();
-    let qb = Query::open_or_create_tiny(dir.join("b/store")).unwrap();
-    let params = ChainParams::regtest();
-    let na = P2PNode::start_with_agent(
-        "127.0.0.1:0".parse().unwrap(),
-        qa,
-        params.clone(),
-        Milestone::NONE,
-        "/rbitcoin:0.1.0(testnode0)/".into(),
-        rbitcoin_net::DEFAULT_MAX_INBOUND,
-    )
-    .await
-    .unwrap();
-    let nb = P2PNode::start_with_agent(
-        "127.0.0.1:0".parse().unwrap(),
-        qb,
-        params,
-        Milestone::NONE,
-        "/rbitcoin:0.1.0(testnode1)/".into(),
-        rbitcoin_net::DEFAULT_MAX_INBOUND,
-    )
-    .await
-    .unwrap();
-    let (mut ctx_a, _d0) = ctx_empty();
-    ctx_a.peers = Some(Arc::clone(&na.peers));
-    let (mut ctx_b, _d1) = ctx_empty();
-    ctx_b.peers = Some(Arc::clone(&nb.peers));
-    let baddr = nb.local_addr.to_string();
-    dispatch(&ctx_a, "addnode", vec![json!(baddr), json!("onetry")]).unwrap();
-    let mut saw = false;
-    for _ in 0..80 {
-        let pa = dispatch(&ctx_a, "getpeerinfo", vec![]).unwrap();
-        let pb = dispatch(&ctx_b, "getpeerinfo", vec![]).unwrap();
-        let a_ok = pa.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode1)/" && p["inbound"] == false)
-        });
-        let b_ok = pb.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|p| p["subver"] == "/rbitcoin:0.1.0(testnode0)/" && p["inbound"] == true)
-        });
-        if a_ok && b_ok {
-            saw = true;
-            let pong = pa[0]["bytesrecv_per_msg"]["pong"].as_u64().unwrap_or(0);
-            assert!(pong >= 29, "pong bytes {pong}");
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(saw, "two nodes must see each other via addnode");
-    na.shutdown().await;
-    // nb moved? keep drop
-    let _ = nb;
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(_d0);
-    let _ = std::fs::remove_dir_all(_d1);
 }
 
 #[test]

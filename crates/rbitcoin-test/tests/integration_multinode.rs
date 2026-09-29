@@ -158,6 +158,8 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
 
 /// One live `P2PNode` topology at a time: process-wide `rbtc-scripts` steal
 /// plus confirm OS threads (overlapping abort under llvm-cov heap-corrupts).
+/// Take it before a test's wall timeout so the wall times the test, not the
+/// queue behind other live tests.
 async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -265,8 +267,8 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
 /// Two nodes, seed has genesis+1, peer IBD-syncs the short path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -303,7 +305,9 @@ async fn two_node_header_and_block_sync() {
 /// In-tree P2P client (no Core functional): peertimeout of a v1-magic inbound,
 /// obsolete VERSION / pre-verack ping disconnect, full-relay GetAddr cache
 /// (1000 / 23%), AddrFetch GetAddr (no getheaders), one post-verack keepalive
-/// ping/pong, and headers-sync stall replace.
+/// ping/pong, and headers-sync stall replace. A completed session outlives
+/// peertimeout. AddrFetch stays for one addr, times out at 300s, and
+/// completes on a longer list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use bitcoin::p2p::message::NetworkMessage;
@@ -311,8 +315,8 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
 
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
         let dummy_dir = TempDir::new().unwrap();
@@ -579,6 +583,14 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "pre-verack ping must close at peertimeout=1",
         )
         .await;
+        assert!(
+            seed.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| { p.addr == dummy.local_addr && !p.inbound && !p.subver.is_empty() }),
+            "a completed handshake must outlive peertimeout=1 (seed={:?})",
+            seed.peers.snapshot()
+        );
 
         for id in peer
             .peers
@@ -649,14 +661,62 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "AddrFetch must not GetHeaders: {:?}",
             fetch.bytessent_per_msg
         );
-        for id in peer
-            .peers
-            .snapshot()
-            .into_iter()
-            .filter(|p| p.conn_type == PeerConnType::AddrFetch)
-            .map(|p| p.id)
-        {
-            peer.peers.disconnect_id(id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            peer.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.conn_type == PeerConnType::AddrFetch),
+            "one addr must not complete the fetch: {:?}",
+            peer.peers.snapshot()
+        );
+        let t = peer.peers.now_secs();
+        peer.peers.set_mock_now(t + 301);
+        wait_ms_until(
+            2_000,
+            || {
+                !peer
+                    .peers
+                    .snapshot()
+                    .into_iter()
+                    .any(|p| p.conn_type == PeerConnType::AddrFetch)
+            },
+            || {
+                format!(
+                    "AddrFetch must time out after 300s (peer={:?})",
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        peer.peers.set_mock_now(0);
+
+        let mut many = AddrMan::new();
+        for i in 0..20u8 {
+            many.add(std::net::SocketAddr::from(([1, 2, 4, i], 8333)));
+        }
+        seed.peers.set_addrman(Arc::new(Mutex::new(many)));
+        let t = seed.peers.now_secs();
+        seed.peers.set_mock_now(t + 24 * 60 * 60 + 1);
+        peer.peers
+            .addconnection(seed.local_addr, PeerConnType::AddrFetch)
+            .expect("second addrfetch dial");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_fetch = false;
+        loop {
+            let fetching = peer
+                .peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.conn_type == PeerConnType::AddrFetch);
+            saw_fetch |= fetching;
+            if saw_fetch && !fetching {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("an addr list longer than one must complete the fetch (saw={saw_fetch})");
+            }
+            tokio::task::yield_now().await;
         }
 
         seed.shutdown().await;
@@ -802,8 +862,8 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
     use bitcoin::Amount;
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
         let seed = start_padded(&seed_dir).await;
@@ -1415,8 +1475,8 @@ fn pin_select_node_to_evict_ranking() {
 async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
 
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         rbitcoin_log::capture_logs(true);
         let seed_dir = TempDir::new().unwrap();
         let dummy_dir = TempDir::new().unwrap();
@@ -1473,8 +1533,8 @@ async fn p2p_feeler_completes_and_closes() {
 /// `max_inbound=1`: a second outbound follow is refused; the first session stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_inbound_full_rejects_extra() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         pin_select_node_to_evict_ranking();
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
@@ -1551,8 +1611,8 @@ async fn p2p_inbound_full_rejects_extra() {
 /// Seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_after_restart_via_reconstruct() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -1666,8 +1726,8 @@ fn pin_restart_empty_and_same_process_bq_residue(seed: &P2PNode) {
 /// Mid-node serve after IBD: leaf syncs from mid, not the original seeder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_relay_path() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let d0 = TempDir::new().unwrap();
         let d1 = TempDir::new().unwrap();
         let d2 = TempDir::new().unwrap();
@@ -1699,8 +1759,8 @@ async fn three_node_relay_path() {
 /// IBD with two live seeder peers (8-block seed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ibd_two_peers() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let mid_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -1776,8 +1836,8 @@ async fn ibd_skips_dead_peer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
     use std::sync::Arc;
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -1887,8 +1947,8 @@ async fn tip_follow_after_ibd() {
 /// (not only unsolicited inv/headers announces).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_getheaders_catches_missed_blocks() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
 
@@ -1938,6 +1998,8 @@ async fn tip_follow_getheaders_catches_missed_blocks() {
 
 /// Most-work reorg — longer branch wins after disconnect/connect. Basic
 /// filters are truncated with the disconnect and rebuilt for the branch.
+/// Then a peer delivers a longer fork body by body, an equal-work branch waits
+/// for precious, and invalidate / reconsider move between them.
 #[tokio::test]
 async fn reorg_to_longer_branch() {
     use bitcoin::bip158::BlockFilter;
@@ -2011,10 +2073,101 @@ async fn reorg_to_longer_branch() {
         );
     }
     assert_ne!(hub.query.basic_filter_at(3).unwrap().unwrap().0, old_3);
+
+    // `mempool_reorg.py` `trigger_reorg`: 20 side blocks a peer delivers one
+    // at a time beat 19 tip-extends from the same parent.
+    let (mut main_tip, mut main_time) = (p, t);
+    for h in 7..=21u32 {
+        let b = mine_regtest_block(main_tip, main_time + 600, h, vec![]);
+        main_tip = b.block_hash();
+        main_time = b.header.time;
+        hub.accept_block(b).unwrap();
+    }
+    assert_eq!(hub.tip_height(), Some(21));
+    let fork_base = BlockHash::from_byte_array(fork_parent);
+    let fork_base_time = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let side_branch = |offset: u32| {
+        let (mut p, mut t) = (fork_base, fork_base_time + offset);
+        let mut out = Vec::new();
+        for h in 3..=22u32 {
+            let b = mine_regtest_block(p, t + 600, h, vec![]);
+            p = b.block_hash();
+            t = b.header.time;
+            out.push(b);
+        }
+        out
+    };
+    let fork = side_branch(1_000);
+    for b in &fork {
+        hub.accept_received_block(b.clone())
+            .unwrap_or_else(|e| panic!("submit {}: {e}", b.block_hash()));
+    }
+    let fork_tip = fork[19].block_hash();
+    assert_eq!(hub.tip_height(), Some(22), "20-block fork must beat 19");
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+    let tips = hub.chaintips();
+    assert!(
+        tips.iter()
+            .any(|t| t.status == "active" && t.hash == fork_tip && t.branchlen == 0),
+        "{tips:?}"
+    );
+    assert!(
+        tips.iter().any(|t| t.status == "valid-fork"
+            && t.hash == main_tip
+            && t.height == 21
+            && t.branchlen == 19),
+        "the disconnected main is a valid-fork: {tips:?}"
+    );
+    // A once-confirmed loser reconstructs from Class A; hold is never-confirmed
+    // side bodies only.
+    assert!(hub
+        .query
+        .reconstruct_archived_block(&main_tip.to_byte_array())
+        .unwrap()
+        .is_some());
+    assert!(hub.held_body(&main_tip).is_none());
+
+    // An equal-work never-confirmed branch stays held until precious.
+    let eq = side_branch(2_000);
+    for b in &eq {
+        let out = hub.accept_received_block(b.clone()).unwrap();
+        assert!(
+            matches!(
+                out,
+                AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave
+            ),
+            "{out:?}"
+        );
+    }
+    let eq_tip = eq[19].block_hash();
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+    hub.precious_block(eq_tip).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), eq_tip);
+    assert!(hub.held_body(&fork_tip).is_none());
+    hub.precious_block(fork_tip).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), fork_tip);
+
+    // Invalidate falls to the next most-work branch; reconsider does not park
+    // the old tip as a held body.
+    hub.invalidate_block(fork[1].block_hash()).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), eq_tip);
+    assert!(hub.held_body(&fork_tip).is_none());
+    hub.reconsider_block(fork[1].block_hash()).unwrap();
+    assert!(
+        hub.held_body(&fork_tip).is_none(),
+        "reconsider must not park the old tip"
+    );
 }
 
 /// Leftover/BadPrev: an orphan whose parent is not on the tip must be held, not
 /// `BLOCK_FAILED`. Applying the full winner path then reconstructs the new tip.
+/// A mutated child of a held sibling is not `BLOCK_FAILED` either.
 #[test]
 fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -2076,6 +2229,52 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
             .unwrap()
             .block_hash(),
         winner[1].block_hash()
+    );
+
+    // A mutated child of a held sibling is BLOCK_MUTATED, not BLOCK_FAILED:
+    // the header hash stays askable and the honest body reorgs onto it.
+    let sibling = mine_regtest_block(
+        winner[1].block_hash(),
+        winner[1].header.time + 900,
+        3,
+        vec![],
+    );
+    assert!(matches!(
+        hub.accept_received_block(sibling.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    let honest = mine_regtest_block(sibling.block_hash(), sibling.header.time + 600, 4, vec![]);
+    let mut mutated = honest.clone();
+    mutated.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x52]);
+    assert_eq!(mutated.block_hash(), honest.block_hash());
+    hub.note_asked_block(honest.block_hash());
+    let err = hub
+        .accept_received_block(mutated)
+        .expect_err("mutated merkle must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("merkle") || msg.contains("bad-txnmrklroot"),
+        "{msg}"
+    );
+    assert!(
+        !hub.is_block_invalid(&honest.block_hash()),
+        "BLOCK_MUTATED must not cache the header hash as BLOCK_FAILED"
+    );
+    assert!(
+        !hub.already_have_or_asked_block(&honest.block_hash()),
+        "a mutated reject forgets the ask so the honest body can be fetched"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
+    assert!(matches!(
+        hub.accept_received_block(honest.clone()).unwrap(),
+        AcceptOutcome::Accepted { height: 4 }
+    ));
+    assert_eq!(
+        hub.query
+            .reconstruct_block_at_height(Height(4))
+            .unwrap()
+            .block_hash(),
+        honest.block_hash()
     );
 }
 
@@ -2194,6 +2393,30 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         "{tips:?}"
     );
     assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+
+    // `feature_chain_tiebreaks.py`: invalidating the tip picks the first-seen
+    // equal-work held sibling, not the last of the 17 and not the stump.
+    hub.invalidate_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "first-seen equal-work held tip must win after invalidate"
+    );
+    hub.precious_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "precious of an invalidated hash is a no-op"
+    );
+    hub.reconsider_block(ext.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        sibling.block_hash(),
+        "no-op precious must not leave a preference reconsider would honor"
+    );
+    hub.precious_block(ext.block_hash()).unwrap();
+    assert_eq!(hub.tip_hash().unwrap(), ext.block_hash());
+
     hub.precious_block(sibling.block_hash()).unwrap();
     assert_eq!(hub.tip_hash().unwrap(), sibling.block_hash());
     let h1 = BlockHash::from_byte_array(
@@ -2210,10 +2433,55 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
         sibling.block_hash(),
         "precious of less work must not activate"
     );
-    let err = hub
-        .precious_block(BlockHash::from_byte_array([0xab; 32]))
-        .unwrap_err();
+    let miss = BlockHash::from_byte_array([0xab; 32]);
+    let err = hub.precious_block(miss).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
+    let err = hub.reconsider_block(miss).unwrap_err();
+    assert!(err.to_string().contains("Block not found"), "{err}");
+}
+
+/// A lone side block is not a tip extend, a weaker branch is ignored, and an
+/// unknown parent errors on submit but is held when a peer sends it.
+fn pin_side_weaker_and_unknown_parent(hub: &rbitcoin_net::ChainHub) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let tip_h = hub.tip_height().unwrap();
+    let base = hub
+        .query
+        .header_at_height(Height(tip_h - 3))
+        .unwrap()
+        .unwrap()
+        .1;
+    let side = mine_regtest_block(
+        BlockHash::from_byte_array(base.hash),
+        base.timestamp + 950,
+        tip_h - 2,
+        vec![],
+    );
+    let err = hub.accept_block(side.clone()).unwrap_err();
+    assert!(matches!(err, NetError::SideBlock), "{err}");
+    assert!(matches!(
+        hub.accept_branch(&[side]).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+
+    let orphan = mine_regtest_block(
+        BlockHash::from_byte_array([0xab; 32]),
+        base.timestamp + 960,
+        tip_h + 5,
+        vec![],
+    );
+    assert!(matches!(
+        hub.accept_block(orphan.clone()).unwrap_err(),
+        NetError::UnknownParent
+    ));
+    assert!(matches!(
+        hub.accept_received_block(orphan.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    assert!(hub.held_body(&orphan.block_hash()).is_some());
+    assert!(!hub.has_block(&BlockHash::from_byte_array([0xde; 32])));
+    assert_eq!(hub.tip_height(), Some(tip_h));
 }
 
 /// Product `HeldBodies` cap is 320; 16 vs 17 equal-work siblings all park.
@@ -2347,6 +2615,7 @@ fn reorg_same_height_then_multi_block_branch() {
         other => panic!("expected Accepted {ext_h}, got {other:?}"),
     }
     pin_precious_held_chaintips(&hub, ext, ext_h);
+    pin_side_weaker_and_unknown_parent(&hub);
 }
 
 /// After catch-up (`initialblockdownload` false; `-maxtipage` so the 2011
@@ -2519,8 +2788,8 @@ async fn pin_blocksonly_seeder_tx_disconnects(
 /// while connected. `max_run_secs=0` stays a node-crate unit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         use rbitcoin_node::{run_p2p, NodeConfig};
         use rbitcoin_primitives::Network;
         use serde_json::json;
@@ -2649,8 +2918,18 @@ async fn node_run_p2p_short() {
                 "empty disconnectnode: {miss_empty}"
             );
 
+            let id = rows[0]["id"].as_u64().expect("id");
             let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
             assert!(disc["error"].is_null(), "{disc}");
+            let after = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+            assert!(
+                after["result"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(|p| p["id"].as_u64() != Some(id))),
+                "disconnectnode must clear the row before the session task exits: {after}"
+            );
+            let again = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
+            assert_eq!(again["error"]["code"], -29, "node not connected: {again}");
             let gone_deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
@@ -2662,6 +2941,22 @@ async fn node_run_p2p_short() {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            wait_ms_until(
+                3_000,
+                || {
+                    !seed_peers
+                        .snapshot()
+                        .into_iter()
+                        .any(|p| p.inbound && p.handshake_complete)
+                },
+                || {
+                    format!(
+                        "the seeder must see the disconnect: {:?}",
+                        seed_peers.snapshot()
+                    )
+                },
+            )
+            .await;
 
             let added = jsonrpc(
                 rpc_addr,
@@ -2685,6 +2980,22 @@ async fn node_run_p2p_short() {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            wait_ms_until(
+                3_000,
+                || {
+                    seed_peers
+                        .snapshot()
+                        .into_iter()
+                        .any(|p| p.inbound && p.handshake_complete)
+                },
+                || {
+                    format!(
+                        "the seeder must see the addnode peer inbound: {:?}",
+                        seed_peers.snapshot()
+                    )
+                },
+            )
+            .await;
 
             pin_blocksonly_seeder_tx_disconnects(rpc_addr, &seed_peers).await;
             let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
@@ -2707,12 +3018,105 @@ async fn node_run_p2p_short() {
         .unwrap_or_else(|_| panic!("node_run_p2p_short wall timeout ({wall:?})"));
 }
 
+const SILENT_AGENT: &str = "/rbitcoin:silent/";
+
+async fn next_ping(raw: &mut rbitcoin_net::V2PlainSession) -> u64 {
+    use bitcoin::p2p::message::NetworkMessage;
+    let ping_id = rbitcoin_net::encode_v2_contents(NetworkMessage::Ping(0)).expect("encode")[0];
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let c = raw.read_contents().await.expect("read");
+            if c.len() == 9 && c[0] == ping_id {
+                return u64::from_le_bytes(c[1..9].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("the node pings")
+}
+
+/// A raw BIP324 inbound answers the node's first ping with a wrong nonce
+/// (the ping stays outstanding) and then the right one. It answers the next
+/// ping with a zero nonce (Core ends the ping) and never pongs again.
+async fn pong_first_ping_then_go_silent(node: &P2PNode) -> rbitcoin_net::V2PlainSession {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::encode_v2_contents;
+
+    let to = node.local_addr;
+    let mut raw = rbitcoin_net::V2PlainSession::outbound_bip324(
+        tokio::net::TcpStream::connect(to).await.expect("dial"),
+    )
+    .await
+    .expect("BIP324");
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&to, ServiceFlags::NONE),
+        sender: Address::new(&to, ServiceFlags::NONE),
+        nonce: 7,
+        user_agent: SILENT_AGENT.into(),
+        start_height: 0,
+        relay: true,
+    };
+    for msg in [NetworkMessage::Version(ver), NetworkMessage::Verack] {
+        raw.write_contents(&encode_v2_contents(msg).expect("encode"))
+            .await
+            .expect("write handshake");
+    }
+    let row = || {
+        node.peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.subver == SILENT_AGENT)
+            .expect("silent peer row")
+    };
+    let pong = |n: u64| encode_v2_contents(NetworkMessage::Pong(n)).expect("encode");
+
+    let nonce = next_ping(&mut raw).await;
+    raw.write_contents(&pong(nonce.wrapping_sub(1)))
+        .await
+        .expect("write pong");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        row().pingwait.is_some(),
+        "a mismatched nonce leaves the ping outstanding: {:?}",
+        row()
+    );
+    raw.write_contents(&pong(nonce)).await.expect("write pong");
+    wait_ms_until(
+        2_000,
+        || {
+            let r = row();
+            r.pingwait.is_none() && r.pingtime.is_some() && r.minping.is_some()
+        },
+        || format!("the matching pong clears pingwait: {:?}", row()),
+    )
+    .await;
+
+    node.peers.set_mock_now(node.peers.now_secs() + 121);
+    next_ping(&mut raw).await;
+    assert!(row().pingwait.is_some(), "{:?}", row());
+    raw.write_contents(&pong(0)).await.expect("write pong");
+    wait_ms_until(
+        2_000,
+        || row().pingwait.is_none(),
+        || format!("a zero nonce ends the ping: {:?}", row()),
+    )
+    .await;
+    raw
+}
+
 /// `feature_bip68_sequence` unconfirmed-inputs: 10× `setmocktime(+600)` plus
-/// generate must not ping-timeout a peer that pongs on localhost.
+/// generate must not ping-timeout a peer that pongs on localhost. A peer that
+/// stops ponging is dropped by the same clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mocktime_generate_keeps_ponging_peer() {
+    let _live = live_p2p_lock().await;
     let fut = async {
-        let _live = live_p2p_lock().await;
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
         let a = start_node(&a_dir).await;
@@ -2733,6 +3137,7 @@ async fn mocktime_generate_keeps_ponging_peer() {
             },
         )
         .await;
+        let mut silent = pong_first_ping_then_go_silent(&a).await;
 
         let t0 = a.peers.now_secs();
         let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
@@ -2746,10 +3151,15 @@ async fn mocktime_generate_keeps_ponging_peer() {
             })
             .await
             .expect("join");
+            // Session heartbeats (50ms) ping and time out on this clock step.
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
-            !a.peers.snapshot().is_empty(),
+            a.peers
+                .snapshot()
+                .into_iter()
+                .any(|p| p.handshake_complete && p.subver != SILENT_AGENT),
             "miner must keep the ponging peer after 6000s mocktime+generate: {:?}",
             a.peers.snapshot()
         );
@@ -2758,6 +3168,7 @@ async fn mocktime_generate_keeps_ponging_peer() {
             "follower must stay connected: {:?}",
             b.peers.snapshot()
         );
+        wait_v2_eof(&mut silent, "a peer that stops ponging must ping-timeout").await;
         a.shutdown().await;
         b.shutdown().await;
     };

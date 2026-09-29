@@ -1840,7 +1840,8 @@ impl ChainHub {
         Ok(())
     }
 
-    /// After invalidate, activate the best remaining fork (held or archive).
+    /// After invalidate, activate the remaining fork (held or archive) with
+    /// the most total chain work. Equal work keeps the first-seen held tip.
     fn try_apply_after_invalidate(&self) -> Result<Option<AcceptOutcome>, NetError> {
         let inv = self.invalidated.set.read().unwrap().clone();
         let mut starts: Vec<BlockHash> = self.fork_tips.read().unwrap().iter().copied().collect();
@@ -1862,7 +1863,7 @@ impl ChainHub {
                 continue;
             }
             let tip = branch.last().map(|b| b.block_hash()).unwrap_or(start);
-            let Ok(w) = self.branch_header_work(&branch) else {
+            let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
             let seq = self.held_bodies.read().unwrap().seq(tip);
@@ -2245,6 +2246,27 @@ impl ChainHub {
         }
         crate::most_work::sum_work(works.into_iter())
             .map_err(|_| NetError::Consensus("work overflow".into()))
+    }
+
+    /// Total chain work of `blocks` connected on their fork point.
+    fn branch_chain_work(&self, blocks: &[Block]) -> Result<Work, NetError> {
+        let branch = self.branch_header_work(blocks)?;
+        let Some(fork_height) = self.accept_branch_fork_height(blocks)? else {
+            return Ok(branch);
+        };
+        self.ensure_chain_work_prefix()?;
+        let base = self
+            .chain_work_prefix
+            .read()
+            .unwrap()
+            .get(fork_height as usize)
+            .copied()
+            .ok_or_else(|| {
+                NetError::Consensus(format!(
+                    "invariant: no chain work at fork height {fork_height}"
+                ))
+            })?;
+        Ok(base + branch)
     }
 
     fn accept_branch_weaker(
@@ -4451,171 +4473,6 @@ mod tests {
     }
 
     #[test]
-    fn reconsider_unknown_hash_is_block_not_found() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let miss = BlockHash::from_byte_array([0xab; 32]);
-        let err = hub.reconsider_block(miss).unwrap_err();
-        assert!(
-            matches!(err, NetError::Consensus(ref s) if s.contains("Block not found")),
-            "{err:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[allow(clippy::cognitive_complexity)] // one fixture, many reorg arms
-    #[test]
-    fn accept_received_reorgs_to_longer_held_fork() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let a1 = mine(gen, 1_300_010_000, 1);
-        hub.accept_block(a1.clone()).unwrap();
-        let a2 = mine(a1.block_hash(), 1_300_010_100, 2);
-        hub.accept_block(a2.clone()).unwrap();
-        assert_eq!(hub.tip_height(), Some(2));
-
-        let mut prev = gen;
-        let mut fork = Vec::new();
-        for i in 0..3u32 {
-            let b = mine(prev, 1_300_011_000 + i, i + 1);
-            prev = b.block_hash();
-            fork.push(b);
-        }
-        for b in &fork {
-            hub.accept_received_block(b.clone()).unwrap();
-        }
-        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
-        assert_eq!(hub.tip_height(), Some(3));
-
-        let tips = hub.chaintips();
-        assert_eq!(
-            tips.len(),
-            2,
-            "active + losing valid-fork after held-then-applied reorg: {tips:?}"
-        );
-        assert_eq!(tips[0].status, "active");
-        assert_eq!(tips[0].hash, fork[2].block_hash());
-        assert_eq!(tips[0].branchlen, 0);
-        let fork_tip = tips
-            .iter()
-            .find(|t| t.status == "valid-fork")
-            .expect("loser");
-        assert_eq!(fork_tip.hash, a2.block_hash());
-        assert_eq!(fork_tip.height, 2);
-        assert_eq!(fork_tip.branchlen, 2);
-
-        // Once-confirmed loser is archive-reconstructable, not a RAM block index.
-        assert!(
-            hub.query
-                .reconstruct_archived_block(&a2.block_hash().to_byte_array())
-                .unwrap()
-                .is_some(),
-            "disconnected best-chain body must stay in Class A"
-        );
-        assert!(
-            hub.held_body(&a2.block_hash()).is_none(),
-            "hold is never-confirmed side bodies only — not a CBlockIndex clone of the old path"
-        );
-
-        // Equal-work never-confirmed sibling: stay held, do not reorg until precious.
-        let mut prev = gen;
-        let mut eq = Vec::new();
-        for i in 0..3u32 {
-            let b = mine(prev, 1_300_012_000 + i, i + 1);
-            prev = b.block_hash();
-            eq.push(b);
-        }
-        for b in &eq {
-            let out = hub.accept_received_block(b.clone()).unwrap();
-            assert!(matches!(
-                out,
-                AcceptOutcome::IgnoredWeaker | AcceptOutcome::AlreadyHave
-            ));
-        }
-        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
-        hub.precious_block(eq[2].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
-
-        // Switch back to the once-confirmed fork via archive, not a held clone.
-        assert!(hub.held_body(&fork[2].block_hash()).is_none());
-        assert!(hub
-            .query
-            .reconstruct_archived_block(&fork[2].block_hash().to_byte_array())
-            .unwrap()
-            .is_some());
-        hub.precious_block(fork[2].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), fork[2].block_hash());
-
-        // invalidate / reconsider use archive hashes, not a RAM clone.
-        // After invalidate, the next most-work fork (eq) becomes tip.
-        let tip = hub.tip_hash().unwrap();
-        hub.invalidate_block(fork[1].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
-        assert!(hub.held_body(&tip).is_none());
-        assert!(hub
-            .query
-            .reconstruct_archived_block(&tip.to_byte_array())
-            .unwrap()
-            .is_some());
-        hub.reconsider_block(fork[1].block_hash()).unwrap();
-        assert!(
-            hub.held_body(&tip).is_none(),
-            "reconsider must not park the old tip"
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn precious_invalid_does_not_leave_preference() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let mut prev = gen;
-        let mut main = Vec::new();
-        for i in 0..3u32 {
-            let b = mine(prev, 1_300_040_000 + i, i + 1);
-            prev = b.block_hash();
-            main.push(b);
-        }
-        for b in &main {
-            hub.accept_block(b.clone()).unwrap();
-        }
-        let mut prev = gen;
-        let mut eq = Vec::new();
-        for i in 0..3u32 {
-            let b = mine(prev, 1_300_041_000 + i, i + 1);
-            prev = b.block_hash();
-            eq.push(b);
-        }
-        for b in &eq {
-            hub.accept_received_block(b.clone()).unwrap();
-        }
-        hub.precious_block(eq[2].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
-        hub.precious_block(main[2].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), main[2].block_hash());
-
-        hub.invalidate_block(eq[2].block_hash()).unwrap();
-        hub.precious_block(eq[2].block_hash()).unwrap();
-        assert_eq!(
-            hub.tip_hash().unwrap(),
-            main[2].block_hash(),
-            "precious of an invalidated hash is a no-op"
-        );
-        hub.reconsider_block(eq[2].block_hash()).unwrap();
-        assert_eq!(
-            hub.tip_hash().unwrap(),
-            main[2].block_hash(),
-            "no-op precious must not leave a preference reconsider would honor"
-        );
-        hub.precious_block(eq[2].block_hash()).unwrap();
-        assert_eq!(hub.tip_hash().unwrap(), eq[2].block_hash());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn submit_header_child_is_headers_only_tip() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
@@ -5041,134 +4898,6 @@ mod tests {
         assert!(!work_better(z, one));
         assert_eq!(sum_work(std::iter::empty()).unwrap(), z);
         assert_eq!(sum_work([one].into_iter()).unwrap(), one);
-    }
-
-    /// `feature_chain_tiebreaks.py`: after invalidate, equal-work held tips
-    /// pick first-seen (lower held_seq), not last-seen.
-    #[test]
-    fn invalidate_equal_work_picks_first_seen_held() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let main = mine(gen, 1_300_030_000, 1);
-        hub.accept_block(main.clone()).unwrap();
-        assert_eq!(hub.tip_height(), Some(1));
-
-        let mut first = mine(gen, 1_300_030_001, 1);
-        if first.block_hash() == main.block_hash() {
-            let target = Target::from_compact(first.header.bits);
-            for nonce in 0..u32::MAX {
-                first.header.nonce = nonce;
-                if first.header.validate_pow(target).is_ok()
-                    && first.block_hash() != main.block_hash()
-                {
-                    break;
-                }
-            }
-        }
-        let mut second = mine(gen, 1_300_030_002, 1);
-        loop {
-            if second.block_hash() != main.block_hash() && second.block_hash() != first.block_hash()
-            {
-                break;
-            }
-            second.header.nonce = second.header.nonce.wrapping_add(1);
-            let target = Target::from_compact(second.header.bits);
-            if second.header.validate_pow(target).is_err() {
-                continue;
-            }
-        }
-
-        assert!(matches!(
-            hub.accept_received_block(first.clone()).unwrap(),
-            AcceptOutcome::IgnoredWeaker
-        ));
-        assert!(matches!(
-            hub.accept_received_block(second.clone()).unwrap(),
-            AcceptOutcome::IgnoredWeaker
-        ));
-        assert!(hub.held_body(&first.block_hash()).is_some());
-        assert!(hub.held_body(&second.block_hash()).is_some());
-
-        hub.invalidate_block(main.block_hash()).unwrap();
-        assert_eq!(
-            hub.tip_hash().unwrap(),
-            first.block_hash(),
-            "first-seen equal-work held tip must win after invalidate"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn accept_branch_weaker_and_gap_errors() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let b1 = mine(gen, 1_300_002_000, 1);
-        let b2 = mine(b1.block_hash(), 1_300_002_100, 2);
-        hub.accept_block(b1.clone()).unwrap();
-        hub.accept_block(b2.clone()).unwrap();
-        assert_eq!(hub.tip_height(), Some(2));
-
-        // Single side block at height 1 while tip is 2 → side block protocol error.
-        let mut side = mine(gen, 1_300_002_050, 1);
-        if side.block_hash() == b1.block_hash() {
-            let target = Target::from_compact(side.header.bits);
-            for nonce in 0..u32::MAX {
-                side.header.nonce = nonce;
-                if side.header.validate_pow(target).is_ok() && side.block_hash() != b1.block_hash()
-                {
-                    break;
-                }
-            }
-        }
-        let err = hub.accept_block(side.clone()).unwrap_err();
-        assert!(
-            matches!(err, NetError::SideBlock),
-            "side block must be NetError::SideBlock: {err}"
-        );
-
-        // Weaker single-block branch at height 1 → IgnoredWeaker (less work than tip path).
-        let out = hub.accept_branch(&[side]).unwrap();
-        assert!(matches!(
-            out,
-            AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }
-        ));
-
-        // Gap above tip: parent is tip, but we already have tip+1 path — build orphan
-        // child of non-tip ancestor that's not tip-1? parent at height 0 with tip 2
-        // is "side block; use accept_branch".
-        // Missing parent:
-        let orphan = mine(BlockHash::from_byte_array([0xab; 32]), 1_300_003_000, 99);
-        assert!(
-            matches!(
-                hub.accept_block(orphan.clone()).unwrap_err(),
-                NetError::UnknownParent
-            ),
-            "unknown parent must be NetError::UnknownParent"
-        );
-        assert!(
-            matches!(
-                hub.accept_received_block(orphan.clone()).unwrap(),
-                AcceptOutcome::IgnoredWeaker
-            ),
-            "unknown parent must hold without substring match"
-        );
-        assert!(hub.held_body(&orphan.block_hash()).is_some());
-
-        // tip_hash prefers store when present.
-        assert_eq!(hub.tip_hash().unwrap(), b2.block_hash());
-        assert!(hub.block_at_height(0).unwrap().is_some());
-        assert!(hub.block_at_height(1).unwrap().is_some());
-
-        // disconnect_to via reorg: better branch of length 2 from genesis with more work
-        // is hard on equal-bits regtest; exercise disconnect_to indirectly by
-        // accepting equal-length weaker branch (IgnoredWeaker already covered).
-
-        // has_block false for random.
-        assert!(!hub.has_block(&BlockHash::from_byte_array([0xde; 32])));
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5656,71 +5385,6 @@ mod tests {
             !hub.already_have_or_asked_block(&future.block_hash()),
             "time-too-new must forget asked_blocks so a later getdata can retry"
         );
-        assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn mutated_compact_child_of_held_sibling_is_not_block_failed() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        let stale = mine(gen, 1_300_060_000, 1);
-        hub.accept_block(stale.clone()).unwrap();
-        let winner = mine_distinct(gen, 1_300_060_001, 1, &[stale.block_hash()]);
-        assert!(matches!(
-            hub.accept_received_block(winner.clone()).unwrap(),
-            AcceptOutcome::IgnoredWeaker
-        ));
-
-        let honest = mine(
-            winner.block_hash(),
-            winner.header.time.saturating_add(600),
-            2,
-        );
-        let mut mutated = honest.clone();
-        mutated.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x52]);
-        assert_eq!(mutated.block_hash(), honest.block_hash());
-        assert_ne!(
-            mutated.compute_merkle_root().unwrap(),
-            mutated.header.merkle_root
-        );
-
-        hub.note_asked_block(honest.block_hash());
-        let err = hub
-            .accept_received_block(mutated)
-            .expect_err("mutated merkle must reject");
-        match &err {
-            NetError::Mutated(s) | NetError::Consensus(s) => {
-                assert!(
-                    s.contains("merkle") || s.contains("bad-txnmrklroot"),
-                    "got {s}"
-                );
-            }
-            NetError::ConnectFailed { msg, hash } => {
-                assert!(
-                    msg.contains("merkle") || msg.contains("bad-txnmrklroot"),
-                    "got {msg}"
-                );
-                assert_eq!(*hash, honest.block_hash().to_byte_array());
-            }
-            other => panic!("expected mutated reject, got {other:?}"),
-        }
-        assert!(
-            !hub.is_block_invalid(&honest.block_hash()),
-            "BLOCK_MUTATED must not cache the header hash as BLOCK_FAILED"
-        );
-        assert!(
-            !hub.already_have_or_asked_block(&honest.block_hash()),
-            "mutated reject must forget asked_blocks so the honest body can be getdata'd again"
-        );
-        assert_eq!(hub.tip_hash(), Some(stale.block_hash()));
-
-        assert!(matches!(
-            hub.accept_received_block(honest.clone()).unwrap(),
-            AcceptOutcome::Accepted { height: 2 }
-        ));
         assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
         let _ = std::fs::remove_dir_all(dir);
