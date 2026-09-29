@@ -400,14 +400,35 @@ pub(crate) fn request_headers(
     // Best hashes on the IBD work path (newest first preferred). When tip
     // lags archive, store locators alone re-fetch the same 2000-header window.
     work_tips: &[BlockHash],
-) -> Result<bool, NetError> {
-    let alive: Vec<usize> = slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+    above_height: u32,
+) -> Result<Option<usize>, NetError> {
+    // Fewest blocks in flight. Ties rotate. A peer that does not advertise
+    // past the hash we are asking from is skipped while anyone taller is up.
+    // That peer still receives new block requests afterward.
+    let alive: Vec<&PeerSlot> = slots.iter().filter(|s| s.alive).collect();
     if alive.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
-    let peer = alive[(*seq as usize) % alive.len()];
+    let tall: Vec<&PeerSlot> = alive
+        .iter()
+        .copied()
+        .filter(|s| s.peer_height > above_height)
+        .collect();
+    let pool = if tall.is_empty() { &alive } else { &tall };
+    let min_flight = pool.iter().map(|s| s.in_flight.len()).min().unwrap_or(0);
+    let mut tied: Vec<&PeerSlot> = pool
+        .iter()
+        .copied()
+        .filter(|s| s.in_flight.len() == min_flight)
+        .collect();
+    tied.sort_by_key(|s| s.id);
+    let peer = tied[(*seq as usize) % tied.len()].id;
     *seq = seq.saturating_add(1);
-    request_headers_from(slots, peer, hub, seq, work_tips)
+    if request_headers_from(slots, peer, hub, seq, work_tips)? {
+        Ok(Some(peer))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn request_headers_from(
@@ -574,6 +595,22 @@ pub(crate) fn kick_cooldown_for(strikes: u8) -> Duration {
         2 => STALL_ADDR_COOLDOWN_2,
         _ => STALL_ADDR_COOLDOWN_3,
     }
+}
+
+/// Drop one live peer and cool down its address.
+pub(crate) fn disconnect_peer(
+    slots: &mut [PeerSlot],
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr_strikes: &mut HashMap<SocketAddr, u8>,
+    peer: usize,
+) {
+    let Some(idx) = slots.iter().position(|s| s.id == peer && s.alive) else {
+        return;
+    };
+    let addr = slots[idx].addr;
+    slots[idx].alive = false;
+    let _ = slots[idx].cmd_tx.send(PeerCmd::Shutdown);
+    record_stall_kick(addr_cooldown, addr_strikes, addr, Instant::now());
 }
 
 /// Bump the process-local strike count and set `addr_cooldown`.
@@ -1377,7 +1414,9 @@ mod tests {
     fn request_headers_no_alive_returns_false() {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("dial-hdr");
         let mut seq = 0u32;
-        assert!(!request_headers(&[], &hub, &mut seq, &[]).unwrap());
+        assert!(request_headers(&[], &hub, &mut seq, &[], 0)
+            .unwrap()
+            .is_none());
         let mut dead = dummy_slot(1, addr(1), false);
         dead.alive = false;
         assert!(!request_headers_from(&[dead], 1, &hub, &mut seq, &[]).unwrap());

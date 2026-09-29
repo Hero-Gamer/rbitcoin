@@ -245,6 +245,17 @@ fn plant_next_connected(
 /// getheaders lag can re-root onto the heavier store chain.
 pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     let mut tips = Vec::with_capacity(8);
+    // A full queue looks ahead from the candidate, then earlier checkpoints.
+    // Once the walk has caught every peer, the locator stays on the queue.
+    if st.ordered.len() >= super::ORDERED_HEADERS_SOFT_CAP
+        && super::header_walk::wants_lookahead(st)
+    {
+        for h in st.header_walk.locator_hashes() {
+            if !tips.contains(&h) {
+                tips.push(h);
+            }
+        }
+    }
     // ordered is tip→far; the back is the highest known header on the path.
     let live =
         |h: &BlockHash| !st.reorg.invalid.contains(h.to_byte_array()) && !st.body.is_rejected(h);

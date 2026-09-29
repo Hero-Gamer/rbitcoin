@@ -585,6 +585,18 @@ impl Query {
         }
     }
 
+    /// Work through a checkpoint the header file has not stored.
+    ///
+    /// Later checkpoints replace earlier ones. A lower height does not rewind.
+    pub fn note_milestone_checkpoint_work(&self, height: u32, work_be: [u8; 32]) {
+        let mut g = self.milestone_path_lock();
+        if !g.work_valid || height >= g.work_height {
+            g.work_through = work_be;
+            g.work_height = height;
+            g.work_valid = true;
+        }
+    }
+
     /// Drop path slots above `height`. Unknown work after a rewind does not skip.
     pub fn clear_milestone_path_above(&self, height: u32) {
         let mut g = self.milestone_path_lock();
