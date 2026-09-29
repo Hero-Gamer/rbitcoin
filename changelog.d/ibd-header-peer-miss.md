@@ -1,0 +1,3 @@
+Fixed
+
+- **A header peer that does not answer is not asked forever.** One header request is in flight, including a refill of the download queue. When it expires, the next request skips that peer if another peer advertises a taller chain. A second miss disconnects them. A late reply from the peer that was asked still extends the header walk when it builds on the tip, and that accept is logged. A confirmed reorg below the milestone drops the latched block 840,000 hash and logs that script checks stay on; the old hash is not put back. A restart whose `header.adopt` is missing or does not parse still notes queued headers that link from the confirmed tip. Checkpoints from a file that does not parse are not used.

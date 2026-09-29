@@ -401,10 +401,14 @@ pub(crate) fn request_headers(
     // lags archive, store locators alone re-fetch the same 2000-header window.
     work_tips: &[BlockHash],
     above_height: u32,
+    // Peer whose header ask just expired. Left in the pool when they are
+    // the only candidate.
+    skip: Option<usize>,
 ) -> Result<Option<usize>, NetError> {
     // Fewest blocks in flight. Ties rotate. A peer that does not advertise
     // past the hash we are asking from is skipped while anyone taller is up.
-    // That peer still receives new block requests afterward.
+    // A peer that let the header ask expire is skipped the same way. That
+    // peer still receives new block requests afterward.
     let alive: Vec<&PeerSlot> = slots.iter().filter(|s| s.alive).collect();
     if alive.is_empty() {
         return Ok(None);
@@ -414,7 +418,13 @@ pub(crate) fn request_headers(
         .copied()
         .filter(|s| s.peer_height > above_height)
         .collect();
-    let pool = if tall.is_empty() { &alive } else { &tall };
+    let mut pool = if tall.is_empty() { alive } else { tall };
+    if let Some(skip_id) = skip {
+        let kept: Vec<&PeerSlot> = pool.iter().copied().filter(|s| s.id != skip_id).collect();
+        if !kept.is_empty() {
+            pool = kept;
+        }
+    }
     let min_flight = pool.iter().map(|s| s.in_flight.len()).min().unwrap_or(0);
     let mut tied: Vec<&PeerSlot> = pool
         .iter()
@@ -1414,7 +1424,7 @@ mod tests {
     fn request_headers_no_alive_returns_false() {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("dial-hdr");
         let mut seq = 0u32;
-        assert!(request_headers(&[], &hub, &mut seq, &[], 0)
+        assert!(request_headers(&[], &hub, &mut seq, &[], 0, None)
             .unwrap()
             .is_none());
         let mut dead = dummy_slot(1, addr(1), false);

@@ -400,7 +400,11 @@ fn on_known_headers_batch(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, ba
         )
     {
         let tips = work_path_tips(st);
-        let _ = request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
+        if request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips)
+            .unwrap_or(false)
+        {
+            super::header_walk::note_header_ask(st, peer);
+        }
     }
 }
 
@@ -443,7 +447,7 @@ fn apply_headers_event(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) {
-    let solicited = super::header_walk::take_header_ask(st, peer);
+    let ask = super::header_walk::take_header_ask(st, peer);
     if headers.is_empty() {
         if super::header_walk::note_empty(st, hub, peer) {
             return;
@@ -457,7 +461,7 @@ fn apply_headers_event(
     if super::header_walk::ignore_below_floor(st, hub, &headers) {
         return;
     }
-    if super::header_walk::absorb_lookahead(st, hub, peer, solicited, &headers) {
+    if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers) {
         return;
     }
     if super::header_walk::reject_refill_miss(st, hub, &headers) {
@@ -489,7 +493,11 @@ fn apply_headers_event(
             && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
         {
             let tips = work_path_tips(st);
-            let _ = request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips);
+            if request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips)
+                .unwrap_or(false)
+            {
+                super::header_walk::note_header_ask(st, peer);
+            }
         }
     } else if batch_len == 0 {
         on_empty_headers(st, hub);

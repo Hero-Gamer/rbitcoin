@@ -16,7 +16,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use bitcoin::CompactTarget;
 use bitcoin::Work;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Difficulty state after a header, so a fork or rewind can retarget without
@@ -88,9 +88,15 @@ pub(crate) struct HeaderWalk {
     off_path: std::collections::HashMap<usize, HashSet<BlockHash>>,
     /// The caught-up line has already been logged.
     announced_done: bool,
-    /// Peer and time of the header request a look-ahead reply must answer.
+    /// Peer and time of the header request in flight.
     asked_peer: Option<usize>,
     asked_at: Option<Instant>,
+    /// The ask before this one. A late reply from that peer can still extend
+    /// the walk while the tip has not moved. Not written to `header.adopt`.
+    prev_asked: Option<usize>,
+    /// Header asks this peer let expire without a reply. Not written to
+    /// `header.adopt`.
+    header_misses: HashMap<usize, u8>,
     /// Header at the walk tip, for the next batch's `nBits` and median time.
     tip_header: Option<Header>,
     /// Up to 11 timestamps ending at `tip_header`, oldest first.
@@ -109,9 +115,13 @@ pub(crate) struct HeaderWalk {
     adopt_retired: bool,
 }
 
-/// How long a look-ahead answer may take before the next peer is asked.
+/// How long one header reply may take before another peer is asked.
+/// One request is in flight, including a queue refill. A miss skips that
+/// peer when someone else can be asked. A second miss disconnects them.
 /// Shorter than a stall cooldown: one headers reply, not a silent peer.
 const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
+/// Missed header asks before the peer is disconnected, same as a block stall.
+const HEADER_MISS_DISCONNECT: u8 = 2;
 const DEAD_END_CAP: usize = 1024;
 
 impl HeaderWalk {
@@ -974,7 +984,7 @@ pub(crate) fn absorb_lookahead(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     peer: usize,
-    solicited: bool,
+    ask: HeaderAsk,
     headers: &[Header],
 ) -> bool {
     if headers.is_empty() || st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
@@ -990,7 +1000,7 @@ pub(crate) fn absorb_lookahead(
     if headers[0].prev_blockhash != tip {
         return false;
     }
-    if !solicited {
+    if ask == HeaderAsk::Unsolicited {
         return true;
     }
     if !batch_context_ok(st, hub, headers, &walk_diff(&st.header_walk)) {
@@ -1000,6 +1010,12 @@ pub(crate) fn absorb_lookahead(
     }
     let extended = extend_tip(st, hub, headers);
     st.header_walk.asked_peer = None;
+    if extended && ask == HeaderAsk::Late {
+        rbitcoin_log::info!(
+            "ibd: headers late peer={peer} height={}",
+            st.header_walk.tip_height
+        );
+    }
     extended
 }
 
@@ -1424,17 +1440,39 @@ fn asked_fresh(st: &IbdWorkState, peer: usize) -> bool {
         .is_some_and(|t| t.elapsed() <= LOOKAHEAD_ASK)
 }
 
-/// The asked peer answered. Returns whether that ask was still inside the window.
-pub(crate) fn take_header_ask(st: &mut IbdWorkState, peer: usize) -> bool {
-    let fresh = asked_fresh(st, peer);
-    if st.header_walk.asked_peer == Some(peer) {
-        st.header_walk.asked_peer = None;
-    }
-    fresh
+/// Whether a headers reply is the one we asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderAsk {
+    /// This peer was not asked.
+    Unsolicited,
+    /// Reply inside the window.
+    InWindow,
+    /// The window expired. The tip has not moved, so the reply can still extend it.
+    Late,
 }
 
-fn lookahead_pending(st: &IbdWorkState) -> bool {
-    st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP && asked_fresh_any(st)
+/// The peer answered. A late reply from the peer we asked, or from the peer
+/// we skipped after one miss, is [`HeaderAsk::Late`].
+pub(crate) fn take_header_ask(st: &mut IbdWorkState, peer: usize) -> HeaderAsk {
+    let current = st.header_walk.asked_peer == Some(peer);
+    let previous = st.header_walk.prev_asked == Some(peer);
+    if !current && !previous {
+        return HeaderAsk::Unsolicited;
+    }
+    let fresh = current && asked_fresh(st, peer);
+    if current {
+        st.header_walk.asked_peer = None;
+        st.header_walk.asked_at = None;
+    }
+    if previous {
+        st.header_walk.prev_asked = None;
+    }
+    st.header_walk.header_misses.remove(&peer);
+    if fresh {
+        HeaderAsk::InWindow
+    } else {
+        HeaderAsk::Late
+    }
 }
 
 fn asked_fresh_any(st: &IbdWorkState) -> bool {
@@ -1443,6 +1481,37 @@ fn asked_fresh_any(st: &IbdWorkState) -> bool {
             .header_walk
             .asked_at
             .is_some_and(|t| t.elapsed() <= LOOKAHEAD_ASK)
+}
+
+/// Count an expired ask. The peer is skipped on this pick. A second expiry
+/// disconnects them and is not skipped: they are no longer alive.
+fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
+    let peer = st.header_walk.asked_peer?;
+    st.header_walk.prev_asked = Some(peer);
+    st.header_walk.asked_peer = None;
+    st.header_walk.asked_at = None;
+    let n = {
+        let e = st.header_walk.header_misses.entry(peer).or_insert(0);
+        *e = e.saturating_add(1);
+        *e
+    };
+    if n >= HEADER_MISS_DISCONNECT {
+        st.header_walk.header_misses.remove(&peer);
+        punish_header_peer(st, peer);
+        return None;
+    }
+    Some(peer)
+}
+
+/// Remember which peer must answer the header request now in flight.
+pub(crate) fn note_header_ask(st: &mut IbdWorkState, peer: usize) {
+    if let Some(prev) = st.header_walk.asked_peer {
+        if prev != peer {
+            st.header_walk.prev_asked = Some(prev);
+        }
+    }
+    st.header_walk.asked_peer = Some(peer);
+    st.header_walk.asked_at = Some(Instant::now());
 }
 
 fn punish_header_peer(st: &mut IbdWorkState, peer: usize) {
@@ -1454,27 +1523,25 @@ fn punish_header_peer(st: &mut IbdWorkState, peer: usize) {
     );
 }
 
-/// Ask for headers and remember which peer must answer a look-ahead.
+/// Ask one peer for headers. A request still inside the window is left in
+/// flight. An expired request skips that peer when another tall peer is up,
+/// and a second expiry disconnects them.
 pub(crate) fn send_getheaders(
     st: &mut IbdWorkState,
     hub: &ChainHub,
 ) -> Result<bool, crate::error::NetError> {
-    if lookahead_pending(st) {
+    if asked_fresh_any(st) {
         return Ok(true);
     }
+    let skip = expire_header_ask(st);
     let tips = super::path::work_path_tips(st);
     let above = ask_above(st);
     let Some(peer) =
-        super::dial::request_headers(&st.slots, hub, &mut st.header_req_seq, &tips, above)?
+        super::dial::request_headers(&st.slots, hub, &mut st.header_req_seq, &tips, above, skip)?
     else {
         return Ok(false);
     };
-    if st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
-        st.header_walk.asked_peer = Some(peer);
-        st.header_walk.asked_at = Some(Instant::now());
-    } else {
-        st.header_walk.asked_peer = None;
-    }
+    note_header_ask(st, peer);
     Ok(true)
 }
 
@@ -1856,9 +1923,11 @@ fn base_conflicts(st: &IbdWorkState, hub: &ChainHub, walk: &HeaderWalk) -> bool 
 
 /// A confirmed reorg under the walk's base drops `header.adopt`. The file must
 /// not bring back a hash from the chain that was disconnected. A reorg under
-/// the milestone height also drops the latched hash, so the next chain can
-/// record its own. A reorg that stays above the milestone puts that hash back
-/// after the path clear.
+/// the milestone height drops the latched hash. Putting that hash back is
+/// unsafe: the walk above the fork can still be the chain that was
+/// disconnected, while the base is still the confirmed block. Script checks
+/// stay on until this chain records the milestone block. A reorg that stays
+/// above the milestone puts that hash back after the path clear.
 pub(crate) fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
     if st.header_walk.base_hash.is_some() && lca_h < st.header_walk.base_height {
         st.header_walk = HeaderWalk::default();
@@ -1870,6 +1939,10 @@ pub(crate) fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: 
     }
     if lca_h < hub.milestone.height {
         if st.header_walk.milestone_hash.take().is_some() {
+            rbitcoin_log::warn!(
+                "ibd: headers milestone dropped lca={lca_h} milestone={} script checks stay on until this chain records that block",
+                hub.milestone.height
+            );
             save_adopt(st, hub);
         }
         return;
@@ -1987,22 +2060,29 @@ pub(crate) fn retire_adopt_if_confirmed(st: &mut IbdWorkState, hub: &ChainHub) {
     let _ = std::fs::remove_file(adopt_path(hub));
 }
 
-/// Read `header.adopt`. A file that does not parse leaves the script skip off.
+/// Read `header.adopt`. A file that does not parse does not restore
+/// checkpoints. Headers already queued and linked from the confirmed tip are
+/// still noted on the milestone path.
 pub(crate) fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     retire_adopt_if_confirmed(st, hub);
     let started = std::time::Instant::now();
     let path = adopt_path(hub);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            renote_stored_path(st, hub);
+            return false;
+        }
         Err(_) => {
             rbitcoin_log::info!("ibd: headers resume failed took={:?}", started.elapsed());
+            renote_stored_path(st, hub);
             return false;
         }
     };
     let took = started.elapsed();
     let Some(parsed) = parse_adopt(&bytes) else {
         rbitcoin_log::info!("ibd: headers resume failed took={took:?}");
+        renote_stored_path(st, hub);
         return false;
     };
     if base_conflicts(st, hub, &parsed) {
@@ -2010,6 +2090,7 @@ pub(crate) fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
             "ibd: headers resume refused height={} took={took:?}",
             parsed.base_height
         );
+        renote_stored_path(st, hub);
         return false;
     }
     st.header_walk = parsed;
@@ -2117,6 +2198,8 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         announced_done: false,
         asked_peer: None,
         asked_at: None,
+        prev_asked: None,
+        header_misses: HashMap::new(),
         tip_header,
         tip_times: Vec::new(),
         period_header,
@@ -2697,6 +2780,69 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_adopt_still_notes_the_queued_path() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-renote");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 2,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: h2.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        apply(&mut st, &hub, 0, vec![h1, h2]);
+        assert!(skips(&hub, 1, h1.block_hash().as_byte_array()));
+
+        hub.query.clear_milestone_path_above(0);
+        st.header_walk = HeaderWalk::default();
+        assert!(!skips(&hub, 1, h1.block_hash().as_byte_array()));
+        let path = hub.query.store().path().join("header.adopt");
+        std::fs::write(&path, b"not-a-checkpoint-file").unwrap();
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array()),
+            "a queued header stays on the milestone path when header.adopt does not parse"
+        );
+        assert_eq!(
+            hub.query.milestone_header_at(2),
+            Some(h2.block_hash().to_byte_array())
+        );
+        assert!(skips(&hub, 1, h1.block_hash().as_byte_array()));
+
+        hub.query.clear_milestone_path_above(0);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array()),
+            "a missing header.adopt still notes the queued path"
+        );
+
+        hub.query.clear_milestone_path_above(0);
+        st.height_to_hash
+            .insert(2, BlockHash::from_byte_array([0x22; 32]));
+        assert!(!restore_adopt(&mut st, &hub));
+        assert_eq!(
+            hub.query.milestone_header_at(1),
+            Some(h1.block_hash().to_byte_array())
+        );
+        assert_eq!(
+            hub.query.milestone_header_at(2),
+            None,
+            "a height that does not link to the previous header is not the milestone chain"
+        );
+        assert!(!skips(&hub, 1, h1.block_hash().as_byte_array()));
+    }
+
+    #[test]
     fn header_request_prefers_the_peer_with_fewer_blocks_in_flight() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-7");
         hub.ensure_genesis().unwrap();
@@ -2766,6 +2912,159 @@ mod tests {
         assert_eq!(got[2], 0, "a peer at or below the walk tip is not asked");
         assert_eq!(got[0], 3, "idle peers share header requests");
         assert_eq!(got[1], 3, "idle peers share header requests");
+    }
+
+    fn drain_getheaders(rx: &mut mpsc::UnboundedReceiver<PeerCmd>) -> usize {
+        let mut n = 0usize;
+        loop {
+            match rx.try_recv() {
+                Ok(PeerCmd::GetHeaders { .. }) => n += 1,
+                Ok(_) => {}
+                Err(_) => return n,
+            }
+        }
+    }
+
+    fn age_header_ask(st: &mut IbdWorkState) {
+        st.header_walk.asked_at = Instant::now().checked_sub(Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_quiet_header_peer_is_skipped_then_disconnected() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-peer-miss");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (quiet, mut quiet_rx) = slot(0);
+        let (mut busy, mut busy_rx) = slot(1);
+        busy.in_flight.insert(BlockHash::from_byte_array([9u8; 32]));
+        let quiet_addr = quiet.addr;
+        let mut st = IbdWorkState::new(vec![quiet, busy], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 1);
+        assert_eq!(drain_getheaders(&mut busy_rx), 0);
+
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(
+            drain_getheaders(&mut quiet_rx),
+            0,
+            "one missed header ask skips that peer while another tall peer is up"
+        );
+        assert_eq!(drain_getheaders(&mut busy_rx), 1);
+        assert!(st.slots.iter().any(|s| s.id == 0 && s.alive));
+
+        let _ = take_header_ask(&mut st, 1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 1);
+        assert_eq!(drain_getheaders(&mut busy_rx), 0);
+
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(
+            st.slots.iter().any(|s| s.id == 0 && !s.alive),
+            "a second missed header ask disconnects that peer"
+        );
+        assert!(st.addr_cooldown.contains_key(&quiet_addr));
+        assert!(matches!(quiet_rx.try_recv(), Ok(PeerCmd::Shutdown)));
+        assert_eq!(drain_getheaders(&mut busy_rx), 1);
+    }
+
+    #[test]
+    fn the_only_header_peer_is_disconnected_after_two_misses() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-only-peer");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (only, mut rx) = slot(0);
+        let addr = only.addr;
+        let mut st = IbdWorkState::new(vec![only], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut rx), 1);
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(
+            drain_getheaders(&mut rx),
+            1,
+            "the only tall peer is asked again after one miss"
+        );
+        assert!(st.slots[0].alive);
+        age_header_ask(&mut st);
+        assert!(!send_getheaders(&mut st, &hub).unwrap());
+        assert!(!st.slots[0].alive);
+        assert!(st.addr_cooldown.contains_key(&addr));
+        assert!(matches!(rx.try_recv(), Ok(PeerCmd::Shutdown)));
+    }
+
+    #[test]
+    fn a_refill_ask_waits_then_skips_the_peer_that_missed() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-refill-miss");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (quiet, mut quiet_rx) = slot(0);
+        let (mut busy, mut busy_rx) = slot(1);
+        busy.in_flight.insert(BlockHash::from_byte_array([8u8; 32]));
+        let mut st = IbdWorkState::new(vec![quiet, busy], Some(gen), Some(0));
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(
+            drain_getheaders(&mut quiet_rx),
+            0,
+            "a refill still inside the window is not sent again"
+        );
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 0);
+        assert_eq!(drain_getheaders(&mut busy_rx), 1);
+    }
+
+    #[test]
+    fn a_late_lookahead_from_the_asked_peer_still_extends_the_tip() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-late");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let (quiet, mut quiet_rx) = slot(0);
+        let (mut busy, mut busy_rx) = slot(1);
+        busy.in_flight.insert(BlockHash::from_byte_array([7u8; 32]));
+        let mut st = IbdWorkState::new(vec![quiet, busy], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 1);
+        age_header_ask(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut quiet_rx), 0);
+        assert_eq!(drain_getheaders(&mut busy_rx), 1);
+
+        rbitcoin_log::capture_logs(true);
+        apply(&mut st, &hub, 0, vec![good]);
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert_eq!(
+            st.header_walk.tip_hash,
+            Some(good.block_hash()),
+            "a late look-ahead from the peer that was asked still extends the tip"
+        );
+        assert!(
+            logs.iter()
+                .any(|(level, line)| *level == rbitcoin_log::Level::Info
+                    && line.contains("ibd: headers late")),
+            "a late look-ahead is logged"
+        );
+        assert!(st.slots.iter().any(|s| s.id == 0 && s.alive));
+
+        let next = mine(good.block_hash(), 2);
+        let tip = st.header_walk.tip_hash;
+        apply(&mut st, &hub, 2, vec![next]);
+        assert_eq!(
+            st.header_walk.tip_hash, tip,
+            "a look-ahead from a peer that was not asked is ignored"
+        );
     }
 
     #[test]
@@ -2987,19 +3286,36 @@ mod tests {
         assert_eq!(st.header_walk.base_height, 0);
         assert_eq!(st.header_walk.milestone_hash, Some(a2.block_hash()));
 
+        rbitcoin_log::capture_logs(true);
         hub.query.clear_milestone_path_above(2);
         on_confirmed_rewind(&mut st, &hub, 2);
+        let above = rbitcoin_log::take_logs();
         assert_eq!(st.header_walk.milestone_hash, Some(a2.block_hash()));
         assert_eq!(
             hub.query.milestone_header_at(2),
             Some(a2.block_hash().to_byte_array())
         );
+        assert!(
+            above
+                .iter()
+                .all(|(_, line)| !line.contains("milestone dropped")),
+            "a reorg that stays above the milestone keeps the latched hash"
+        );
 
         hub.query.clear_milestone_path_above(0);
         on_confirmed_rewind(&mut st, &hub, 0);
+        let below = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
         assert!(
             st.header_walk.milestone_hash.is_none(),
-            "a fork under the milestone lets the next chain record its hash"
+            "a fork under the milestone drops the latched hash and does not put it back"
+        );
+        assert!(
+            below.iter().any(|(level, line)| {
+                *level == rbitcoin_log::Level::Warn
+                    && line.contains("ibd: headers milestone dropped")
+            }),
+            "dropping the latch is logged so script checks staying on is visible"
         );
         st.header_walk = HeaderWalk::default();
         assert!(restore_adopt(&mut st, &hub));
