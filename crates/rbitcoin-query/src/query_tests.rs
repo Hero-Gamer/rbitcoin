@@ -972,6 +972,40 @@ fn buried_rules_and_a_lying_header_path() {
     let _ = dir;
 }
 
+#[test]
+fn a_queued_body_off_the_header_path_is_not_the_milestone_chain() {
+    let (dir, q) = temp_query("ms-queue-mix");
+    let anchor = [0x11u8; 32];
+    let block = [0x22u8; 32];
+    let mut one_be = [0u8; 32];
+    one_be[31] = 2;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    q.note_milestone_header(
+        100,
+        anchor,
+        [0; 32],
+        one,
+        Some(bitcoin::Work::from_be_bytes([0; 32])),
+    );
+    let mut work = [0u8; 32];
+    work[31] = 4;
+    q.note_milestone_checkpoint_work(100, work);
+    q.block_queue_enqueue(50, block, 0, &[0u8; 80]).unwrap();
+    assert_eq!(
+        q.milestone_header_at(100),
+        Some(anchor),
+        "the walk still has the milestone hash"
+    );
+    assert_eq!(
+        q.milestone_header_at(50),
+        None,
+        "a queued body that was never on this header path is not an ancestor of the milestone"
+    );
+    q.note_milestone_header(50, block, [0; 32], one, None);
+    assert_eq!(q.milestone_header_at(50), Some(block));
+    let _ = dir;
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many helper arms
 #[test]
 fn index_mode_helpers_and_batch_helpers() {

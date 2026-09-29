@@ -410,36 +410,41 @@ pub(super) fn expected_bits_extending(
         return Ok(genesis_block(params).header.bits);
     }
     let interval = params.difficulty_adjustment_interval();
-    if !height.0.is_multiple_of(interval) {
-        return crate::header::min_difficulty_or_walk(
-            query,
-            params,
-            height,
-            prev_bits,
-            prev_time,
-            header_time,
-        );
-    }
-    if params.no_pow_retargeting() {
-        return Ok(prev_bits);
-    }
-    // Period-start may still be above confirmed tip during tip-ahead multi-block
-    // load (i>0). Lookup/load already put_header_plan for that height — use it.
-    let first_height = Height(height.0 - interval);
-    let first_ts = if let Some((_fk, rec)) = query
-        .header_at_height(first_height)
-        .map_err(ConsensusError::from)?
-    {
-        rec.timestamp
-    } else if let Some(plan) = query.confirm_parent_cache().get_header_plan(first_height.0) {
-        plan.header_rec.timestamp
+    let on_boundary = interval > 0 && height.0.is_multiple_of(interval);
+    let period_first = if on_boundary && !params.no_pow_retargeting() {
+        // Period-start may still be above confirmed tip during tip-ahead
+        // multi-block load (i>0). Lookup/load already put_header_plan.
+        let first_height = Height(height.0 - interval);
+        let first_ts = if let Some((_fk, rec)) = query
+            .header_at_height(first_height)
+            .map_err(ConsensusError::from)?
+        {
+            rec.timestamp
+        } else if let Some(plan) = query.confirm_parent_cache().get_header_plan(first_height.0) {
+            plan.header_rec.timestamp
+        } else {
+            return Err(ConsensusError::BadHeader("missing retarget first header"));
+        };
+        Some(first_ts)
     } else {
-        return Err(ConsensusError::BadHeader("missing retarget first header"));
+        None
     };
-    let timespan = prev_time.saturating_sub(first_ts) as u64;
-    Ok(CompactTarget::from_next_work_required(
+    crate::header::next_work_bits(
+        params,
+        height.0,
         prev_bits,
-        timespan,
-        &params.btc,
-    ))
+        prev_time,
+        header_time,
+        period_first,
+        |h| {
+            if let Some((_fk, rec)) = query.header_at_height(Height(h)).ok().flatten() {
+                return Some(CompactTarget::from_consensus(rec.bits));
+            }
+            query
+                .confirm_parent_cache()
+                .get_header_plan(h)
+                .map(|plan| CompactTarget::from_consensus(plan.header_rec.bits))
+        },
+    )
+    .ok_or(ConsensusError::BadPrev)
 }

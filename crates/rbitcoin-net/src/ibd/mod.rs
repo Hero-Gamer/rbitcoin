@@ -22,6 +22,7 @@ mod confirm;
 mod dial;
 mod events;
 mod exit;
+mod header_walk;
 mod path;
 mod peer_io;
 mod perf_log;
@@ -43,7 +44,7 @@ use cadence::IbdLoopCadence;
 use dial::{
     admit_cooldown_fallback, alive_dial_addrs, apply_dial_result, dial_batch, dial_blocked_addrs,
     disconnect_relative_slow_block_peers, disconnect_stalled_block_peers, expire_addr_cooldown,
-    redial_want, request_headers,
+    redial_want,
 };
 use events::{
     apply_confirm_events, apply_peer_event, disconnect_all_peers, drain_ready_peer_and_body_events,
@@ -53,7 +54,7 @@ use exit::{
     all_peers_dead_action, best_chain_remainder, empty_path_header_fan, header_lag_behind_peers,
     ibd_caught_up, path_drained, should_unlatch_headers_done, AllPeersDead,
 };
-use path::{path_hashes_above_tip, seed_work_path_from_store, work_path_tips};
+use path::{path_hashes_above_tip, seed_work_path_from_store};
 use peer_io::{sample_peer_rates, PeerCmd, PeerEvent, PeerEventSinks};
 use progress::{
     claim_ready, format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput,
@@ -379,11 +380,11 @@ pub async fn ibd_cancellable(
     st.addr_cooldown = boot_cooldown;
     st.addr_strikes = boot_strikes;
     seed_work_path_from_store(&mut st, hub.as_ref());
+    header_walk::restore_adopt(&mut st, hub.as_ref());
 
     // Channel may close if handshake races the first getheaders.
     for _ in 0..st.slots.len().min(4) {
-        let tips = work_path_tips(&st);
-        if request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips).unwrap_or(false) {
+        if header_walk::send_getheaders(&mut st, &hub).unwrap_or(false) {
             break;
         }
     }
@@ -592,13 +593,16 @@ pub async fn ibd_cancellable(
                 known_ready,
                 ready_gap,
                 (window as u32).saturating_mul(4).max(2048),
-            );
+            ) && !st.header_walk.has_checkpoints();
             let under_hard = live < MAX_ORDERED_HEADERS;
             let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
             if should_unlatch_headers_done(&st, hub.tip_height().unwrap_or(0)) {
                 st.headers_done = false;
             }
-            if !st.headers_done && under_hard && (under_soft || need_ready_headroom) {
+            if !st.headers_done
+                && under_hard
+                && (under_soft || need_ready_headroom || header_walk::wants_lookahead(&st))
+            {
                 let tip_h = hub.tip_height().unwrap_or(0);
                 let lag = header_lag_behind_peers(&st, tip_h);
                 let min_cache = window.saturating_mul(8).max(4096);
@@ -608,20 +612,19 @@ pub async fn ibd_cancellable(
                     if fan == 0 {
                         st.headers_done = true;
                     } else {
-                        let tips = work_path_tips(&st);
                         for _ in 0..fan {
-                            if !request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips)
-                                .unwrap_or(false)
-                            {
+                            if !header_walk::send_getheaders(&mut st, &hub).unwrap_or(false) {
                                 break;
                             }
                         }
                     }
                 } else {
-                    let want_more = live < min_cache || lag > 0 || need_ready_headroom;
+                    let want_more = live < min_cache
+                        || lag > 0
+                        || need_ready_headroom
+                        || header_walk::wants_lookahead(&st);
                     if want_more {
-                        let tips = work_path_tips(&st);
-                        let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                        let _ = header_walk::send_getheaders(&mut st, &hub);
                     }
                 }
             }
@@ -653,8 +656,7 @@ pub async fn ibd_cancellable(
                 st.ordered.len()
             );
             st.headers_done = false;
-            let tips = work_path_tips(&st);
-            let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+            let _ = header_walk::send_getheaders(&mut st, &hub);
             cadence.mark_headers(Instant::now());
             last_progress = Instant::now();
         }
@@ -738,9 +740,7 @@ pub async fn ibd_cancellable(
                             );
                             dark_redial_empty = 0;
                             if st.ordered.is_empty() && !st.headers_done {
-                                let tips = work_path_tips(&st);
-                                let _ =
-                                    request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                                let _ = header_walk::send_getheaders(&mut st, &hub);
                             }
                         } else {
                             dark_redial_empty = dark_redial_empty.saturating_add(1);
@@ -862,6 +862,8 @@ pub async fn ibd_cancellable(
                 bq_soft_stop,
             });
             info_bold!("{progress_line}");
+            header_walk::retire_adopt_if_confirmed(&mut st, &hub);
+            header_walk::log_status(&mut st, prog.headers);
             let _ = std::io::Write::flush(&mut std::io::stderr());
 
             last_sample_tip = prog.tip;
@@ -1081,8 +1083,7 @@ pub async fn ibd_cancellable(
                         st.slots.iter().filter(|s| s.alive).count()
                     );
                     st.headers_done = false;
-                    let tips = work_path_tips(&st);
-                    let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                    let _ = header_walk::send_getheaders(&mut st, &hub);
                     last_progress = Instant::now();
                 }
             }

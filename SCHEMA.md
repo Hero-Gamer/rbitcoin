@@ -247,6 +247,7 @@ itself changed.
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index (overflow: header.head.gN)
+    header.adopt                     # IBD checkpoint list + milestone hash (not a header-chain copy)
     txout.body / create.loc / create.off / create.loc.ovf   # Class A outs (hot loc)
     seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness (cold loc)
     seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off)
@@ -384,6 +385,31 @@ Open-address hash head (see [Hash heads](#hash-heads-headerhead--generic)): key 
 **Overflow:** `header.head.g1`, `.g2`, … same slot count as create. Probe newest-first. No schema bump — same 24 B OA slot format.
 
 **Open:** leftover `header.head/` directory (old 256-way shards) is **Layout refuse** (wipe `header.head` and `header.body`, reindex). A **single** file smaller than the create target is rewritten on open at the target slot count: write `header.head.grow`, fsync, rename over the live file (`.mlt` kept; no concurrent probes). Crash during rewrite leaves the previous undersized file. A target-sized gen0 with `occupied==0` and a non-empty `header.body` or `.mlt` is **Layout refuse** (wipe `header.head`, `header.head.mlt`, and `header.body`, reindex) — not a silent empty index.
+
+### `header.adopt`
+
+Sidecar for the IBD header walk. Not a schema bump and not a second copy of `header.body`. Missing is an empty walk. A file that does not parse does not skip scripts by height.
+
+```text
+0..8     magic b"rbtchdr1"
+8..12    u32 LE checkpoint count
+repeat   hash [u8; 32] ‖ height u32 LE ‖ work [u8; 32]
+         ‖ header [u8; 80] (zeros if none)
+         ‖ ntimes u8 ‖ 11 × time u32 LE
+         ‖ period height u32 LE ‖ period-start header [u8; 80] (zeros if none)
+         ‖ full-difficulty height u32 LE ‖ full-difficulty bits u32 LE (0 if none)
+then     milestone hash [u8; 32] (zeros if none)
+         base hash [u8; 32] ‖ base height u32 LE ‖ base work [u8; 32]
+         tip header [u8; 80] (zeros if none)
+         period height u32 LE ‖ period-start header [u8; 80] (zeros if none)
+         full-difficulty height u32 LE ‖ full-difficulty bits u32 LE (0 if none)
+         base period height u32 LE ‖ base period-start header [u8; 80] (zeros if none)
+         base full-difficulty height u32 LE ‖ base full-difficulty bits u32 LE (0 if none)
+```
+
+Each checkpoint is 285 bytes. The tail is 364 bytes. Length is exact: `12 + count × 285 + 364`. An older or shorter file does not parse, and the script skip stays off.
+
+Each checkpoint is the hash, height, and total work at the end of one look-ahead reply past the download queue, plus that reply's last header, up to 11 timestamps ending there, and the difficulty period after that header. `ntimes` is how many of those 11 slots are live, oldest first. The milestone hash is the header at the anchored milestone height when the walk passed it. The base is the stored header the checkpoints were built on. On restart, if that height already has a different hash, the file is ignored. A reorg below the base deletes the file. The per-checkpoint header, timestamps, and period-start header let the next look-ahead, a fork from that hash, or a rewind onto it check `nBits` and median time without a row in `header.body`. Full-difficulty height and bits are the last header in the period whose `nBits` are not the minimum-difficulty limit, so a restart can walk testnet difficulty back. The same pair is stored again for the base, for when every checkpoint has been rewound. The tail's period fields are the walk tip. Headers between the queue and that tip are not in this file.
 
 ---
 

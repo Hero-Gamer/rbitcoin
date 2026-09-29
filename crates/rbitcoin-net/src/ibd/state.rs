@@ -180,6 +180,8 @@ pub(crate) struct IbdWorkState {
     pub(crate) intake_stop: u64,
     /// Body-queue bytes snapshotted with [`Self::intake_stop`].
     pub(crate) intake_queued: u64,
+    /// Checkpoints for headers past the download queue.
+    pub header_walk: super::header_walk::HeaderWalk,
 }
 
 impl IbdWorkState {
@@ -238,6 +240,7 @@ impl IbdWorkState {
             cascade_at: None,
             intake_stop: u64::MAX,
             intake_queued: 0,
+            header_walk: super::header_walk::HeaderWalk::default(),
         }
     }
 

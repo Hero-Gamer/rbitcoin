@@ -5,7 +5,7 @@ use super::assign_plan::{
     remove_from_ordered, should_enqueue_header, want_headers_beyond_soft_cap,
 };
 use super::dial::{
-    note_dead_without_block_bytes, release_peer_block_work, request_headers, request_headers_from,
+    disconnect_peer, note_dead_without_block_bytes, release_peer_block_work, request_headers_from,
 };
 use super::exit::{
     header_lag_behind_peers, should_advance_locator_after_known_batch,
@@ -195,6 +195,11 @@ fn try_enqueue_ordered_header(
     if !st.is_on_path(&hash, ht) || st.ordered.len() >= MAX_ORDERED_HEADERS {
         return false;
     }
+    // Look-ahead checkpoints stay off the queue. The queue refills only until
+    // the soft cap, along the candidate.
+    if st.header_walk.has_checkpoints() && st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
+        return false;
+    }
     if !should_enqueue_header(
         st.ordered_set.contains(&hash),
         st.inflight.contains_key(&hash),
@@ -288,17 +293,27 @@ fn accepted_headers(
 fn on_headers_batch(
     st: &mut IbdWorkState,
     hub: &ChainHub,
+    peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) -> usize {
     let accepted = accepted_headers(st, hub, &headers);
     let mut added = 0usize;
     let mut batch_prev: Option<(BlockHash, u32)> = None;
+    let mut stored = Vec::with_capacity(accepted.len());
     for (hdr, fk) in accepted {
         let hash = hdr.block_hash();
         let prev = hdr.prev_blockhash;
         st.header_fks.insert(hash, fk);
         if let Some(h) = batch_header_height(st, hub, prev, batch_prev) {
             note_header_path(st, hub, hash, h, prev);
+            if !st.is_on_path(&hash, h) && super::header_walk::note_off_path(st, hub, peer, hash) {
+                disconnect_peer(
+                    &mut st.slots,
+                    &mut st.addr_cooldown,
+                    &mut st.addr_strikes,
+                    peer,
+                );
+            }
             if st.is_on_path(&hash, h) {
                 let base = if hub.tip_hash() == Some(prev) {
                     hub.chain_work().ok()
@@ -318,7 +333,9 @@ fn on_headers_batch(
         if try_enqueue_ordered_header(st, hub, hash, prev) {
             added += 1;
         }
+        stored.push(hdr);
     }
+    super::header_walk::note_stored_candidate(st, hub, &stored);
     added
 }
 
@@ -355,12 +372,10 @@ fn on_empty_headers(st: &mut IbdWorkState, hub: &ChainHub) {
             ) {
                 super::path::seed_work_path_from_store(st, hub);
             }
-            let tips = work_path_tips(st);
-            let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
+            let _ = super::header_walk::send_getheaders(st, hub);
         }
     } else if st.empty_header_streak < 8 && st.ordered_set.len() < ORDERED_HEADERS_SOFT_CAP {
-        let tips = work_path_tips(st);
-        let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
+        let _ = super::header_walk::send_getheaders(st, hub);
     } else if st.empty_header_streak >= 8 && lag <= 2 {
         st.headers_done = true;
     }
@@ -428,8 +443,34 @@ fn apply_headers_event(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) {
+    let solicited = super::header_walk::take_header_ask(st, peer);
+    if headers.is_empty() {
+        if super::header_walk::note_empty(st, hub, peer) {
+            return;
+        }
+        on_empty_headers(st, hub);
+        return;
+    }
+    if super::header_walk::suppress_competing_chain(st, hub, peer, &headers) {
+        return;
+    }
+    if super::header_walk::ignore_below_floor(st, hub, &headers) {
+        return;
+    }
+    if super::header_walk::absorb_lookahead(st, hub, peer, solicited, &headers) {
+        return;
+    }
+    if super::header_walk::reject_refill_miss(st, hub, &headers) {
+        return;
+    }
+    let keep = super::header_walk::proven_header_prefix(st, hub, &headers);
+    if keep == 0 {
+        return;
+    }
+    let mut headers = headers;
+    headers.truncate(keep);
     let batch_len = headers.len();
-    let added = on_headers_batch(st, hub, headers);
+    let added = on_headers_batch(st, hub, peer, headers);
     if added > 0 {
         if super::reorg::consider_disconnected_heavier(st, hub).unwrap_or(false) {
             let _ = try_complete_awaiting_reorg(st, hub);
