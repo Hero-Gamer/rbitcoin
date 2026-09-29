@@ -801,6 +801,121 @@ fn empty_locator_needs_a_body(hub: &crate::chain::ChainHub) {
     );
 }
 
+/// A bad block disconnects a plain peer. noban keeps the session and scores nothing.
+async fn noban_bad_block_is_not_punished(
+    hub: &crate::chain::ChainHub,
+    peers: &std::sync::Arc<crate::peers::PeerHub>,
+) {
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(1);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let mut bad_pow =
+        rbitcoin_consensus::mine_regtest_paying(prev, time, height, op_true(), vec![]);
+    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+
+    let plain = live_peer(peers, 18472, 21, true);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(plain.as_ref()),
+        &bad_pow,
+    )
+    .await
+    .unwrap();
+    assert!(
+        plain.stop.load(Ordering::SeqCst),
+        "a plain peer is disconnected"
+    );
+    assert!(misbehavior_disconnects(
+        follow.ban_score,
+        Some(plain.as_ref())
+    ));
+
+    peers.set_noban(true);
+    let kept = live_peer(peers, 18473, 22, true);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(hub, &out_tx, &mut follow, Some(kept.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        !kept.stop.load(Ordering::SeqCst),
+        "Core never disconnects a noban peer for misbehavior"
+    );
+    assert_eq!(follow.ban_score, 0, "a noban peer gathers no score");
+    assert!(
+        !misbehavior_disconnects(BAN_SCORE_THRESHOLD, Some(kept.as_ref())),
+        "a noban peer at the threshold stays connected"
+    );
+    assert!(misbehavior_disconnects(BAN_SCORE_THRESHOLD, None));
+    assert!(!misbehavior_disconnects(BAN_SCORE_THRESHOLD - 1, None));
+    peers.set_noban(false);
+}
+
+/// A block whose header fails contextual checks still logs Core's reject reason.
+async fn rejected_header_logs_core_reason(hub: &crate::chain::ChainHub) {
+    use bitcoin::block::Version;
+    use bitcoin::Target;
+    let tip = hub.tip_height().unwrap();
+    assert!(
+        tip < 111,
+        "the CLTV beat starts below activation, tip={tip}"
+    );
+    if tip < 110 {
+        hub.generate_to_script(110 - tip, op_true(), vec![])
+            .unwrap();
+    }
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time + 1;
+    let mut v3 = rbitcoin_consensus::mine_regtest_paying(prev, time, 111, op_true(), vec![]);
+    v3.header.version = Version::from_consensus(3);
+    let target = Target::from_compact(v3.header.bits);
+    while v3.header.validate_pow(target).is_err() {
+        v3.header.nonce = v3.header.nonce.wrapping_add(1);
+    }
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(v3.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(hub, &out_tx, &mut follow, None, &v3)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let want = format!("{}, bad-version(0x00000003)", v3.block_hash());
+    assert!(
+        lines.iter().any(|(_, l)| l == &want),
+        "missing {want:?} in {lines:?}"
+    );
+
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future = rbitcoin_consensus::mine_regtest_paying(prev, now + 3 * 3600, 111, op_true(), vec![]);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(future.block_hash());
+    rbitcoin_log::capture_logs(true);
+    on_block(hub, &out_tx, &mut follow, None, &future)
+        .await
+        .unwrap();
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l == "Block validation error: time-too-new"),
+        "missing time-too-new in {lines:?}"
+    );
+}
+
 /// A connecting header more than 288 below the tip disconnects. noban stays.
 async fn ancient_weaker_fork_disconnects(
     hub: &crate::chain::ChainHub,
@@ -962,10 +1077,14 @@ fn self_announce_overlay(peers: &std::sync::Arc<crate::peers::PeerHub>) {
 }
 
 /// One peer. Verack order, unknown parents, header floods, minchainwork,
-/// and self-announce share this hub.
+/// and self-announce share this hub. CLTV activates at 111 so a rejected
+/// header can log Core's reason on the same chain.
 #[tokio::test]
 async fn peer_header_dos_and_self_announce() {
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-dos");
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("hdr-dos");
+    let mut params = ChainParams::regtest();
+    params.apply_test_activation_height("cltv", 111).unwrap();
+    let hub = ChainHub::new(q, params, Milestone::NONE);
     hub.ensure_genesis().unwrap();
     let peers = crate::peers::PeerHub::new();
 
@@ -988,6 +1107,8 @@ async fn peer_header_dos_and_self_announce() {
 
     tall_unknown_parent_skips_reconstruct(&hub, &peers).await;
     header_reject_punishes_except_time(&hub).await;
+    noban_bad_block_is_not_punished(&hub, &peers).await;
+    rejected_header_logs_core_reason(&hub).await;
 
     let tip = hub.tip_height().unwrap();
     if tip < 300 {
