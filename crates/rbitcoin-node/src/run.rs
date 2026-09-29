@@ -145,19 +145,20 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     });
 }
 
-/// Backfill historical fee hurdles from up to 1 GiB of txstat rows once relay
-/// is on, off the tip path.
+/// Restore fee history from the mempool dir and read the rest of up to 1 GiB
+/// of txstat rows once relay is on, off the tip path.
 fn spawn_fee_history_backfill(mempool: &Arc<MempoolHub>) {
     let mp = Arc::clone(mempool);
-    info!("mempool: fee history preload started (txstat-only, budget=1 GiB)");
+    info!("mempool: fee history preload started (file, then txstat, budget=1 GiB)");
     tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let t = Instant::now();
         let stats = mp.backfill_block_fee_history();
         info!(
-            "mempool: fee history preload complete: txstat_bytes={}, heights={}, retained={}, samples={}, ready_targets={}/{}, skipped={}, failed={}, range={}..{}, elapsed={:.1?}{}",
+            "mempool: fee history preload complete: txstat_bytes={}, heights={}, from_file={}, retained={}, samples={}, ready_targets={}/{}, skipped={}, failed={}, range={}..{}, elapsed={:.1?}{}",
             stats.txstat_bytes,
             stats.heights_scanned,
+            stats.file_heights,
             stats.retained_heights,
             stats.valid_samples,
             stats.ready_targets,

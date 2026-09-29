@@ -9,6 +9,7 @@ mod ephemeral;
 mod error;
 mod eviction;
 mod fee_history;
+mod fee_history_file;
 mod i2p_sam;
 mod ibd;
 mod most_work;

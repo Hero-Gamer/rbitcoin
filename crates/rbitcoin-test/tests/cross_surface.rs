@@ -959,10 +959,11 @@ async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Val
     serde_json::from_str(&resp_line).unwrap()
 }
 
-/// A node that leaves IBD with relay on preloads fee history from the chain.
-/// With flow cold and too little history for any target, `estimatesmartfee` answers
-/// Core's insufficient-data shape rather than a guess. Rates from a ready
-/// history are pinned on the hub
+/// A node that leaves IBD with relay on preloads fee history from the chain
+/// and keeps it in the mempool dir (snapshot plus per-connect journal), and a
+/// restart preloads again on top of that file. With flow cold and too little history for any target,
+/// `estimatesmartfee` says so rather than guessing from a thin pool. Rates
+/// from a ready history are pinned on the hub
 /// (`far_horizon_follows_block_history_not_pool_tail`): a ready 144-block
 /// target needs ~2200 fee-paying blocks, ~40 s to build in a debug test.
 #[tokio::test(flavor = "multi_thread")]
@@ -975,36 +976,61 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
         q.flush().unwrap();
     }
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
-    let rpc_addr = ephemeral_addr();
-    let mut cfg = NodeConfig::default()
-        .with_datadir(td.path())
-        .with_network(Network::Regtest)
-        .with_tiny_heads()
-        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
-    cfg.listen.use_seeds = false;
-    cfg.listen.connect.clear();
-    cfg.rpc.listen = Some(rpc_addr);
-    cfg.max_run_secs = Some(60);
-    let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[rpc_addr]).await;
+    let mempool_dir = td.path().join("mempool");
+    let file_len = || {
+        ["fee_history", "fee_history.log"]
+            .iter()
+            .map(|f| std::fs::metadata(mempool_dir.join(f)).map_or(0, |m| m.len()))
+            .sum::<u64>()
+    };
+    let mut history_len = 0;
+    for run in ["first start", "restart"] {
+        let rpc_addr = ephemeral_addr();
+        let mut cfg = NodeConfig::default()
+            .with_datadir(td.path())
+            .with_network(Network::Regtest)
+            .with_tiny_heads()
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.listen.use_seeds = false;
+        cfg.listen.connect.clear();
+        cfg.rpc.listen = Some(rpc_addr);
+        cfg.max_run_secs = Some(60);
+        let node = tokio::spawn(run_p2p(cfg));
+        wait_listeners(&[rpc_addr]).await;
 
-    // A fresh tip leaves IBD and turns relay on; the preload follows.
-    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
-    assert!(mined["result"].is_array(), "{mined}");
-    let fee = jsonrpc(rpc_addr, "estimatesmartfee", json!([2])).await;
-    assert!(fee["result"].get("feerate").is_none(), "{fee}");
-    assert_eq!(
-        fee["result"]["errors"][0], "Insufficient data or no feerate found",
-        "{fee}"
-    );
-    assert_eq!(fee["result"]["blocks"], 2, "{fee}");
+        // A fresh tip leaves IBD and turns relay on (a restart is already
+        // out of IBD); the new height lands in the snapshot or the journal.
+        let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+        assert!(mined["result"].is_array(), "{run}: {mined}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let written = loop {
+            let len = file_len();
+            if len > history_len || Instant::now() > deadline {
+                break len;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            written > history_len,
+            "{run}: history file {written} B, was {history_len} B"
+        );
+        history_len = written;
 
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
-    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
-    assert!(
-        matches!(stopped, Ok(Ok(Ok(())))),
-        "run_p2p did not stop cleanly"
-    );
+        let fee = jsonrpc(rpc_addr, "estimatesmartfee", json!([2])).await;
+        assert!(fee["result"].get("feerate").is_none(), "{run}: {fee}");
+        assert_eq!(
+            fee["result"]["errors"][0], "Insufficient data or no feerate found",
+            "{run}: {fee}"
+        );
+        assert_eq!(fee["result"]["blocks"], 2, "{run}: {fee}");
+
+        let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
+        assert!(
+            matches!(stopped, Ok(Ok(Ok(())))),
+            "{run}: run_p2p did not stop cleanly"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

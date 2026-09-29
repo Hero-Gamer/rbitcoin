@@ -87,6 +87,7 @@ when flow warms and how many targets' history is ready.
 | Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
 | Analog band / min neighbors / ready | ×1.25 / 200 / 2000 windows |
 | History budget | 1 GiB of `txstat.body` cells |
+| History file | snapshot every 144 connects + per-connect journal |
 | Bucket edges (sat/kvB) | 100…100000 (+ open top) |
 
 ### Confirm-memory / block history
@@ -126,7 +127,8 @@ windows, not formal statistical guarantees.
 
 **Budget and preload.** History is keyed by height and bounded by 1 GiB of
 `txstat.body` cells (8 B per tx, coinbase included): ~31k mainnet blocks at a
-2026 tip. When relay turns on, the node scans backward from the tip until the budget is met, reading no `spent.body` data or
+2026 tip. When relay turns on, the node restores the history file, then scans
+backward from the tip until the budget is met, reading no `spent.body` data or
 transaction bodies and no height it already holds (~12 s per GiB cold on the
 agent VM). A connect at `h` replaces any branch above it. Analog windows are
 kept in step as blocks are added or dropped at either end; an insert between
@@ -134,8 +136,17 @@ held heights rebuilds them once before the next estimate, and estimates are
 recomputed only after the history changes. RAM: ~5.5 MiB of windows at 11
 targets; CPU: ~2 ms per new block for all targets.
 
-The preload log line reports heights read, skips, failures, ready targets,
-and elapsed time. A restart reads the history from the chain again.
+**History file.** `mempool/fee_history` is a snapshot (height, hurdle, cells
+per height, plus the newest 144 block hashes), rewritten after each preload
+and every 144 connects (~500 KiB, one fsync). `mempool/fee_history.log` is a
+journal of 52-byte records (height, cells, hurdle, block hash, check) appended
+per connect without fsync. On load the journal replays onto the snapshot only
+if it extends that snapshot, stops at a torn record, and everything above the
+newest stored hash still on the best chain is dropped (a reorg while down).
+The file is a cache of `txstat`: a damaged, foreign, or other-version file is
+dropped with a log line and those heights are read from the chain again. The
+preload log line reports heights from the file, heights read, skips,
+failures, ready targets, and elapsed time.
 
 ### Histogram / relayfee
 
@@ -154,7 +165,8 @@ construction, or witness nonces.
   included p10s, not first-seen delay buckets)
 - Full multi-node flow aggregation / peer bandwidth models
 - Changing Libre min relay, dust, or full-RBF defaults
-- Persisting flow meters across process restart (process-local)
+- Persisting flow meters across process restart (process-local; fee
+  history is persisted, flow is not)
 
 ## Related
 
