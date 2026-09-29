@@ -7,9 +7,9 @@
 Mempool admission counted no standard sigop cap before the script
 interpreter, and an invalid script was logged without a ban score.
 
-A transaction whose sigop cost does not fit the configured template budget
-(80_000 minus `--block-reserved-sigops`, default 400) is rejected as
-`bad-txns-too-many-sigops` before `verify_tx_scripts_detached`. This is a
+A transaction whose sigop cost, plus `--block-reserved-sigops` (default
+400), would pass 80_000 is rejected as `bad-txns-too-many-sigops` before
+`verify_tx_scripts_detached`. A total of exactly 80_000 fits. This is a
 local admission/template policy, not a consensus-invalidity test. Core's
 16_000 standard cap (`MAX_BLOCK_SIGOPS_COST / 5`) is not applied. The cost is
 up to ~5x more signature checks per rejected tx; the ban score below bounds

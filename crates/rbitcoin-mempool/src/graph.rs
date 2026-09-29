@@ -978,9 +978,10 @@ impl TxGraph {
     ///
     /// Empty pool or zero weight → `[]`. A high-feerate child chunk pulls in
     /// still-unselected in-mempool ancestors so the block is topological.
-    /// A chunk (plus those ancestors) that would overflow
-    /// `budget.max_weight_wu` or the block sigop limit (80_000 less
-    /// `budget.reserved_sigops`) is skipped; later chunks are still tried.
+    /// A chunk (plus those ancestors) that would exceed
+    /// `budget.max_weight_wu` or the block sigop limit is skipped; later
+    /// chunks are still tried. The limit is 80_000 including
+    /// `budget.reserved_sigops`; a total of exactly 80_000 fits.
     /// Chunks whose modified fee is **negative** are skipped. A chunk whose
     /// modified feerate is under `budget.min_sat_kvb` (`-blockmintxfee`) is
     /// skipped whole (Core `BlockAssembler` chunk floor), so a low-fee parent
@@ -1039,9 +1040,10 @@ impl TxGraph {
                 .fold((0u64, 0u64), |(w, s), e| {
                     (w.saturating_add(e.weight), s.saturating_add(e.sigop_cost))
                 });
-            // Core `TestChunkBlockLimits`: skip this chunk, keep trying smaller ones.
+            // Core `TestChunkBlockLimits`: skip this chunk, keep trying
+            // smaller ones. Consensus allows a cost of exactly 80_000.
             if used.saturating_add(extra_w) > max_weight_wu
-                || sigops.saturating_add(extra_sigops) >= MAX_BLOCK_SIGOPS_COST
+                || sigops.saturating_add(extra_sigops) > MAX_BLOCK_SIGOPS_COST
             {
                 continue;
             }
@@ -1476,9 +1478,10 @@ mod tests {
         );
     }
 
-    /// Sigop budget starts at the caller's reserve; a chunk reaching 80_000
-    /// is skipped (Core `>=`) and a later, cheaper chunk still fits. Each pick
-    /// carries the base fee and sigop cost it was budgeted with.
+    /// Sigop budget starts at the caller's reserve. A running cost of
+    /// exactly 80_000 fits; a chunk that would pass 80_000 is skipped and a
+    /// later, cheaper chunk still fits. Each pick carries the base fee and
+    /// sigop cost it was budgeted with.
     #[test]
     fn select_budgets_sigops_skip_and_continue() {
         let heavy = spend_op([8u8; 32], 50_000, 40_000);
@@ -1504,9 +1507,17 @@ mod tests {
             select_ids(g, b, |_| 0)
         };
         let full = |heavy_cost| at(&pool(heavy_cost), COINBASE_SIGOPS_RESERVE);
-        assert_eq!(full(79_600), vec![lid], "400 + 79_600 hits the limit");
-        assert_eq!(full(79_599), vec![hid], "79_999 fits; +1 reaches 80_000");
-        assert_eq!(full(79_598), vec![hid, lid], "80_000 - 1 total fits");
+        assert_eq!(full(79_601), vec![lid], "400 + 79_601 passes 80_000");
+        assert_eq!(
+            full(79_600),
+            vec![hid],
+            "400 + 79_600 equals 80_000 and fits"
+        );
+        assert_eq!(
+            full(79_599),
+            vec![hid, lid],
+            "light's +1 lands on 80_000 and fits"
+        );
         assert_eq!(full(u64::MAX), vec![lid], "unknown cost never selected");
 
         let g = pool(79_598);
@@ -1525,8 +1536,8 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(at(&g, 401), vec![hid], "a larger reserve drops the tail");
-        assert_eq!(at(&g, 402), vec![lid], "skips heavy, still takes light");
+        assert_eq!(at(&g, 402), vec![hid], "a larger reserve drops the tail");
+        assert_eq!(at(&g, 403), vec![lid], "skips heavy, still takes light");
         assert_eq!(at(&g, 0), vec![hid, lid]);
     }
 

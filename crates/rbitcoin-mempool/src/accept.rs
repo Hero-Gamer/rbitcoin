@@ -346,7 +346,7 @@ fn block_fit_sigop_cost(
         .map(|o| o.script_pubkey.as_bytes())
         .collect();
     let cost = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
-    if reserved_sigops.saturating_add(cost) >= MAX_BLOCK_SIGOPS_COST {
+    if reserved_sigops.saturating_add(cost) > MAX_BLOCK_SIGOPS_COST {
         return Err(AcceptError::TooManySigops { cost });
     }
     Ok(cost)
