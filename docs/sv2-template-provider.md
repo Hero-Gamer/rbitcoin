@@ -8,7 +8,7 @@ previous slice is committed.
 
 | Plan | Outcome | Ships flags |
 |------|---------|-------------|
-| **A** | GBT builds from a caller-budgeted selection that returns fee and sigop cost with each tx | none |
+| **A** | Landed. GBT and `generate` build from `MempoolHub::select_block_template` | none |
 | **B** | A Job Declarator Client mines a block through the node's TP | `--sv2-tp-listen`, `--sv2-tp-authority-sec`, `--sv2-tp-cert-validity`, `--sv2-tp-stale-grace` |
 | **C** | Templates refresh on fee gain with the tip unchanged | `--sv2-tp-fee-delta`, `--sv2-tp-template-interval` |
 
@@ -132,72 +132,33 @@ row ("GBT longpoll / `waitNext`, then Sv2").
 
 ## Plan A — Caller-budgeted template selection
 
-**Goal:** `getblocktemplate` and regtest `generate` build from one
-`MempoolHub` call that takes the weight and sigop budget and returns each
-selected tx with the fee and sigop cost read under the same lock. Today
-`select_block_txs(min_sat_kvb)` fixes the weight at
-`template_tx_weight()`, the sigop reserve is graph-global
-(`set_block_reserved_sigops` at open), and GBT re-reads `fee` / `sigops`
-per tx via `get_live_meta` / `get_live_sigop_cost` after the read lock
-drops. A tx evicted in between reports `fee: 0` / `sigops: 0` and
-understates `coinbasevalue`.
+**Landed.** `getblocktemplate` and regtest `generate` call
+`MempoolHub::select_block_template(budget)`. `template_budget(min)` is
+this node's budget: template weight, the configured sigop reserve, and
+the `-blockmintxfee` floor. The call returns each selected transaction
+with its base fee and admission sigop cost from that same read.
+GBT `transactions[].fee` / `sigops` and `coinbasevalue` come from it, so
+a transaction removed after selection still reports the fee it was
+selected with.
 
-No new flag; GBT output for an unchanged mempool is unchanged.
+`TxGraph::select_block_template(budget, delta)` takes
+`SelectBudget { max_weight_wu, reserved_sigops, min_sat_kvb }` and
+returns `Vec<Selected { txid, fee_sat, sigop_cost }>` in mining order.
+`fee_sat` is the base fee, not the `prioritisetransaction` delta.
+`MempoolHub::select_block_template` applies the node's deltas under the
+same lock and returns `Vec<(Transaction, Selected)>`. A larger
+`reserved_sigops` or a smaller `max_weight_wu` drops what no longer fits
+and still takes a later chunk. A running sigop cost of exactly 80_000
+fits; a chunk that would pass 80_000 is skipped.
 
-### A1 — Budget and per-tx meta through the graph
+No new flag.
 
-- **Contract:** `TxGraph::select_block_template(budget, delta)` with
-  `SelectBudget { max_weight_wu, reserved_sigops, min_sat_kvb }` returns
-  `Vec<Selected { txid, fee_sat, sigop_cost }>` in mining order. At
-  `reserved_sigops = block_reserved_sigops()` and `max_weight_wu =
-  template_tx_weight()` it equals today's `select_block_txids_delta`. A
-  larger `reserved_sigops` skips a chunk that fit before and still takes a
-  later one; a smaller `max_weight_wu` likewise. `fee_sat` is the base fee
-  (not the delta-modified fee).
-- **Red:** `cargo test -p rbitcoin-mempool select_` — the graph selector
-  is a pure unit (no session passes a non-default budget before Plan B).
-  Extend the existing `select_budgets_sigops_skip_and_continue` (per-tx
-  base fee and sigop cost; reserve 401 drops the light tail, 402 skips
-  the heavy chunk and still takes the light one) and pin base fee
-  under a delta in the existing delta unit; fold
-  `selection_uses_configured_sigop_reserve` into it. The weight edge is
-  the existing `select_skips_overweight_chunk_and_continues` on the
-  budget. No new `select_budget_` twin.
-- **Green:** thread the budget through the existing selection loop;
-  `select_block_txids` / `select_block_txids_delta` go away.
-  `ActiveMempool::select_block_txs_delta` passes the admission reserve
-  until A2 moves its caller.
-- **Refactor:** one selection loop; the graph-global reserve is admission
-  only, templates take the caller's.
-- **Verify:** `cargo test -p rbitcoin-mempool select_`
-
-### A2 — Hub and GBT on the budgeted call
-
-- **Contract:** `MempoolHub::select_block_template(budget)` returns
-  `Vec<(Transaction, Selected)>` from one read lock plus the
-  `prioritisetransaction` deltas; `MempoolHub::template_budget(min)` is
-  the node's own budget (template weight, configured reserve). GBT
-  `transactions[].fee` / `sigops` and `coinbasevalue` come from it;
-  `generate` uses the same call. A tx removed after selection still
-  reports its selected fee.
-- **Red:** `cargo test -p rbitcoin-net sigop` plus `hub_live_journey` —
-  extend the existing hub sigop tests to read fee and sigop cost through
-  `select_block_template` (configured reserve 0 fits a 79,920-cost tx; a
-  caller reserving 400 gets nothing), replacing `get_live_sigop_cost`.
-  A non-default budget is Plan B's path, so these stay hub units.
-  The evict-between-selection-and-JSON race is not reachable from a real
-  session without a hook; it is made structurally impossible (GBT no
-  longer re-reads after the lock drops) and not pinned by a hook test.
-  The `rpc_regtest_chain_ops` GBT beat gains `fee == 1_000` beside its
-  `sigops` asserts; the existing sigop-budget GBT test pins
-  `coinbasevalue` via block accept.
-- **Green:** hub `template_budget` / `select_block_template`;
-  `mempool_block_txs` returns `(tx, Selected)`; GBT drops the per-tx
-  `get_live_meta` / `get_live_sigop_cost` reads.
-- **Refactor:** `select_block_txs` (hub and `ActiveMempool`) and
-  `get_live_sigop_cost` go away; no callers left.
-- **Verify:** `cargo test -p rbitcoin-rpc --lib`,
-  `cargo test -p rbitcoin-net --lib sigop`
+`select_budgets_sigops_skip_and_continue` pins the budget, the base fee
+under a delta, and the exact-80_000 edge. `mempool_accept_life` pins
+admission against the same cap. `hub_live_journey` reads fee and sigop
+cost through the hub call (reserve 0 fits a 79,920-cost tx; a caller
+reserving 400 does not). `rpc_regtest_chain_ops` pins GBT `fee` beside
+`sigops`.
 
 ---
 
