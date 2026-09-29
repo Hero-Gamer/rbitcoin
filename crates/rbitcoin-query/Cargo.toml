@@ -14,7 +14,7 @@ rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
 arc-swap = { workspace = true }
 # Attribute only. cargo-mutants reads it; it does not change compiled code.
-mutants = "0.0.3"
+mutants = "0.0.4"
 
 [lints]
 workspace = true
