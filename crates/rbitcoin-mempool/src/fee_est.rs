@@ -356,6 +356,36 @@ pub fn block_p10_sat_kvb(txs: &[(u64, u64)], edges: &[(u32, u32)], min_relay: u6
     percentile_sat(rates, 10)
 }
 
+/// Vsize-weighted p10 of individual transactions in one block.
+pub fn block_individual_p10_sat_kvb(txs: &[(u64, u64)], min_relay: u64) -> Option<u64> {
+    use rbitcoin_consensus::policy::fee_rate_sat_per_kvb;
+
+    let mut rates: Vec<(u64, u64)> = txs
+        .iter()
+        .filter_map(|&(fee, weight)| {
+            if weight == 0 {
+                return None;
+            }
+            let rate = fee_rate_sat_per_kvb(fee, weight);
+            (rate >= min_relay).then_some((rate, weight.saturating_add(3) / 4))
+        })
+        .collect();
+    if rates.is_empty() {
+        return None;
+    }
+    rates.sort_unstable_by_key(|(rate, _)| *rate);
+    let total_vsize = rates.iter().map(|(_, vsize)| *vsize).sum::<u64>();
+    let cutoff = total_vsize.saturating_mul(10).div_ceil(100).max(1);
+    let mut seen = 0u64;
+    for (rate, vsize) in rates {
+        seen = seen.saturating_add(vsize);
+        if seen >= cutoff {
+            return Some(rate);
+        }
+    }
+    None
+}
+
 /// Per-block p10 ring → quantile `100·c(N)` (median if fewer than 12 samples).
 pub fn historical_far_sat_kvb(block_p10s: &[u64], n_blocks: u32) -> Option<u64> {
     if block_p10s.is_empty() {
@@ -555,6 +585,14 @@ mod tests {
         let n144 = historical_far_sat_kvb(&v, 144).unwrap();
         assert!(n1 >= n144, "p99 vs p90: {n1} vs {n144}");
         assert!(n144 >= 1_000);
+    }
+
+    #[test]
+    fn individual_txstat_p10_is_vsize_weighted_and_relay_filtered() {
+        let rows = [(1_000, 400), (5_000, 400), (9_000, 400), (1, 400)];
+        assert_eq!(block_individual_p10_sat_kvb(&rows, 100), Some(10_000));
+        assert_eq!(block_individual_p10_sat_kvb(&[(1, 400)], 100), None);
+        assert_eq!(block_individual_p10_sat_kvb(&[], 100), None);
     }
 
     #[test]
