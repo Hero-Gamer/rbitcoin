@@ -10,11 +10,10 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    blend_sat_kvb, block_p10_sat_kvb, fine_candidate_rates, flow_for_depth,
-    frontier_feerate_from_chunks, historical_far_sat_kvb, hold_defined_then_monotone,
-    min_rate_for_capacity, percentile_sat, weight_above_from_chunks, AcceptError, AcceptResult,
-    ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected,
-    UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    depth_rate_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
+    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, weight_above_from_chunks,
+    AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter,
+    SelectBudget, Selected, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -25,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+
+use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 
 /// Max age of a published fee snapshot before refresh (request path is still Arc-load only
 /// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
@@ -54,8 +55,27 @@ fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
 
 /// Esplora `/fee-estimates` keys + common Electrum depths (after 0–2 → default map).
 const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
-/// Confirmed blocks kept in fee history (the deepest target).
-const FEE_HISTORY_BLOCKS: u32 = 1008;
+/// Txstat body bytes scanned and retained for historical fee estimates.
+const FEE_HISTORY_TXSTAT_BYTE_BUDGET: u64 = 1 << 30;
+
+/// Result summary for the asynchronous historical txstat preload.
+#[derive(Clone, Debug, Default)]
+pub struct FeeHistoryBackfillStats {
+    pub tip_height: Option<u32>,
+    pub oldest_height: Option<u32>,
+    pub heights_scanned: u64,
+    pub valid_samples: u64,
+    pub skipped_heights: u64,
+    pub failed_heights: u64,
+    pub txstat_bytes: u64,
+    /// Snapshot targets whose historical estimate answers after the preload.
+    pub ready_targets: u64,
+    pub total_targets: u64,
+    pub history_exhausted: bool,
+    /// Heights the history already held, counted without a chain read.
+    pub retained_heights: u64,
+    pub first_error: Option<String>,
+}
 
 /// Immutable published fee table + mining chunks (request path never walks the graph).
 #[derive(Clone, Debug)]
@@ -525,9 +545,8 @@ pub struct MempoolHub {
     recent_rejects: Mutex<HashSet<Wtxid>>,
     /// Recently confirmed package feerates (sat/kvB) for N=1 sanity clip.
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
-    /// Per-block p10 package feerate (sat/kvB) by height, read from the chain,
-    /// for the newest [`FEE_HISTORY_BLOCKS`] heights. RAM: ≤1008 entries.
-    block_p10_history: Mutex<BTreeMap<u32, u64>>,
+    /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
+    block_p10_history: Mutex<FeeHistory>,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
     fee_flow: Mutex<FeeFlowMeter>,
     /// Published fee table for Electrum/Esplora (refreshed dirty ∥ max-age, singleflight).
@@ -680,7 +699,10 @@ impl MempoolHub {
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
             recent_rejects: Mutex::new(HashSet::new()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
-            block_p10_history: Mutex::new(BTreeMap::new()),
+            block_p10_history: Mutex::new(FeeHistory::new(
+                FEE_HISTORY_TXSTAT_BYTE_BUDGET,
+                FEE_SNAPSHOT_DEPTHS,
+            )),
             fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             fee_snapshot: ArcSwap::from_pointee(FeeSnapshot::empty(Instant::now())),
             fee_dirty: AtomicBool::new(true),
@@ -2049,10 +2071,10 @@ impl MempoolHub {
         let candidates = fine_candidate_rates();
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
+        let history = self.block_p10_history.lock().unwrap().rates();
 
         let mut ordered: Vec<(u32, Option<u64>)> = Vec::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
         for &depth in FEE_SNAPSHOT_DEPTHS {
-            let hist = self.historical_far_sat_kvb(depth).or(confirm_floor);
             let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
             let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
             let projected = inflow.as_ref().and_then(|inf| {
@@ -2064,7 +2086,11 @@ impl MempoolHub {
                 )
             });
             let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
-            let mut rate = blend_sat_kvb(flow, hist, depth);
+            let hist = history.get(&depth).copied().flatten();
+            let mut rate = depth_rate_sat_kvb(depth, flow, hist);
+            if depth <= 1 {
+                rate = rate.or(confirm_floor);
+            }
             if depth <= 1 {
                 if let (Some(r), Some(floor)) = (rate, confirm_floor) {
                     rate = Some(r.max(floor));
@@ -3445,77 +3471,128 @@ impl MempoolHub {
         }
     }
 
-    /// A block's p10 package feerate from the chain (`txstat` + `spent`).
-    fn block_p10_from_chain(&self, height: Height) -> Result<Option<u64>, String> {
-        let rows = self
+    /// A height's hurdle, from `txstat` alone.
+    fn txstat_fee_block_from_chain(
+        &self,
+        height: Height,
+    ) -> Result<Option<HistoricalFeeBlock>, String> {
+        let block = self
             .query
-            .block_fee_rows(height)
+            .block_txstat_rows(height)
             .map_err(|e| e.to_string())?;
-        Ok(rows.and_then(|b| {
-            block_p10_sat_kvb(
-                &b.rows,
-                &b.edges,
-                rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
-            )
+        Ok(block.map(|block| HistoricalFeeBlock {
+            txstat_bytes: block.txstat_bytes,
+            p10_sat_kvb: block.rows.as_deref().and_then(|rows| {
+                rbitcoin_mempool::block_individual_p10_sat_kvb(
+                    rows,
+                    rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+                )
+            }),
         }))
-    }
-
-    /// Set `height`'s entry and drop heights above it (a connect at `height`
-    /// replaces whatever branch was there) and below the history window.
-    fn record_block_p10(&self, height: u32, p10: Option<u64>) {
-        let mut h = self.block_p10_history.lock().unwrap();
-        h.split_off(&height.saturating_add(1));
-        match p10 {
-            Some(r) => h.insert(height, r.max(1)),
-            None => h.remove(&height),
-        };
-        *h = h.split_off(&height.saturating_sub(FEE_HISTORY_BLOCKS - 1));
     }
 
     /// Record a newly connected block in fee history, read from the chain so it
     /// counts even when this pool never saw its txs.
     pub fn note_block_fee_history(&self, height: Height) {
-        match self.block_p10_from_chain(height) {
-            Ok(p10) => {
-                self.record_block_p10(height.0, p10);
-                self.mark_fee_dirty();
+        let block = match self.txstat_fee_block_from_chain(height) {
+            Ok(block) => block.unwrap_or_default(),
+            Err(e) => {
+                rbitcoin_log::warn!("mempool: fee history @ {}: {e}", height.0);
+                HistoricalFeeBlock::default()
             }
-            Err(e) => rbitcoin_log::warn!("mempool: fee history @ {}: {e}", height.0),
-        }
-    }
-
-    /// Fill fee history for the newest [`FEE_HISTORY_BLOCKS`] confirmed heights
-    /// from the chain, so far targets answer right after a restart. Heights a
-    /// connect already recorded are kept. Returns how many heights got a rate.
-    pub fn backfill_block_fee_history(&self) -> usize {
-        let Some(tip) = self.query.tip_height() else {
-            return 0;
         };
-        let mut n = 0;
-        for height in tip.0.saturating_sub(FEE_HISTORY_BLOCKS - 1)..=tip.0 {
-            match self.block_p10_from_chain(Height(height)) {
-                Ok(Some(p10)) => {
-                    let mut h = self.block_p10_history.lock().unwrap();
-                    h.entry(height).or_insert(p10.max(1));
-                    n += 1;
-                }
-                Ok(None) => {}
-                Err(e) => rbitcoin_log::warn!("mempool: fee history @ {height}: {e}"),
-            }
-        }
-        self.mark_fee_dirty();
-        n
-    }
-
-    fn historical_far_sat_kvb(&self, n_blocks: u32) -> Option<u64> {
-        let v: Vec<u64> = self
-            .block_p10_history
+        self.block_p10_history
             .lock()
             .unwrap()
-            .values()
-            .copied()
-            .collect();
-        historical_far_sat_kvb(&v, n_blocks)
+            .insert(height.0, block);
+        self.mark_fee_dirty();
+    }
+
+    fn backfill_fee_history_height(&self, height: u32, stats: &mut FeeHistoryBackfillStats) {
+        let held = self.block_p10_history.lock().unwrap().get(height);
+        if let Some(block) = held {
+            stats.retained_heights = stats.retained_heights.saturating_add(1);
+            Self::count_backfill_fee_block(&block, stats);
+            return;
+        }
+        match self.txstat_fee_block_from_chain(Height(height)) {
+            Ok(Some(block)) => {
+                Self::count_backfill_fee_block(&block, stats);
+                self.insert_backfill_fee_block(height, block);
+            }
+            Ok(None) => {
+                stats.skipped_heights = stats.skipped_heights.saturating_add(1);
+                self.insert_backfill_fee_block(height, HistoricalFeeBlock::default());
+            }
+            Err(error) => {
+                stats.failed_heights = stats.failed_heights.saturating_add(1);
+                stats.first_error.get_or_insert(error);
+                self.insert_backfill_fee_block(height, HistoricalFeeBlock::default());
+            }
+        }
+    }
+
+    fn count_backfill_fee_block(block: &HistoricalFeeBlock, stats: &mut FeeHistoryBackfillStats) {
+        stats.txstat_bytes = stats.txstat_bytes.saturating_add(block.txstat_bytes);
+        if block.p10_sat_kvb.is_some() {
+            stats.valid_samples = stats.valid_samples.saturating_add(1);
+        } else {
+            stats.skipped_heights = stats.skipped_heights.saturating_add(1);
+        }
+    }
+
+    fn insert_backfill_fee_block(&self, height: u32, block: HistoricalFeeBlock) {
+        self.block_p10_history
+            .lock()
+            .unwrap()
+            .insert_if_absent(height, block);
+    }
+
+    fn log_fee_history_progress(stats: &FeeHistoryBackfillStats, last_progress: &mut Instant) {
+        let now = Instant::now();
+        if now.duration_since(*last_progress) < Duration::from_secs(10) {
+            return;
+        }
+        rbitcoin_log::info!(
+            "mempool: fee history preload progress: {:.1} MiB / 1024 MiB, {} heights, {} valid samples",
+            stats.txstat_bytes as f64 / (1024.0 * 1024.0),
+            stats.heights_scanned,
+            stats.valid_samples
+        );
+        *last_progress = now;
+    }
+
+    /// Fill historical fee hurdles from up to 1 GiB of recent `txstat.body`
+    /// rows. Reads no spent data or transaction bodies, and no height the
+    /// history already holds.
+    pub fn backfill_block_fee_history(&self) -> FeeHistoryBackfillStats {
+        let Some(tip) = self.query.tip_height() else {
+            return FeeHistoryBackfillStats {
+                history_exhausted: true,
+                ..FeeHistoryBackfillStats::default()
+            };
+        };
+        let mut stats = FeeHistoryBackfillStats {
+            tip_height: Some(tip.0),
+            ..FeeHistoryBackfillStats::default()
+        };
+        let mut last_progress = Instant::now();
+        for height in (0..=tip.0).rev() {
+            if stats.txstat_bytes >= FEE_HISTORY_TXSTAT_BYTE_BUDGET {
+                break;
+            }
+            stats.heights_scanned = stats.heights_scanned.saturating_add(1);
+            stats.oldest_height = Some(height);
+            self.backfill_fee_history_height(height, &mut stats);
+            Self::log_fee_history_progress(&stats, &mut last_progress);
+        }
+        stats.history_exhausted =
+            stats.txstat_bytes < FEE_HISTORY_TXSTAT_BYTE_BUDGET && stats.oldest_height == Some(0);
+        let rates = self.block_p10_history.lock().unwrap().rates();
+        stats.total_targets = rates.len() as u64;
+        stats.ready_targets = rates.values().filter(|r| r.is_some()).count() as u64;
+        self.mark_fee_dirty();
+        stats
     }
 }
 
@@ -3546,6 +3623,14 @@ mod tests {
             .as_nanos();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
+    }
+
+    fn record_fee_sample(hub: &MempoolHub, height: u32, rate_sat_kvb: u64) {
+        let block = HistoricalFeeBlock {
+            p10_sat_kvb: Some(rate_sat_kvb),
+            txstat_bytes: 8,
+        };
+        hub.block_p10_history.lock().unwrap().insert(height, block);
     }
 
     #[test]
@@ -5280,14 +5365,64 @@ mod tests {
     }
 
     #[test]
+    fn fee_history_preload_reuses_heights_it_already_holds() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            5,
+            0,
+        );
+        let mp_dir = tmp();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+
+        let first = hub.backfill_block_fee_history();
+        assert_eq!(first.tip_height, Some(5));
+        assert_eq!(first.heights_scanned, 6);
+        assert_eq!(first.retained_heights, 0);
+        assert_eq!(first.txstat_bytes, 6 * 8, "one coinbase cell per block");
+        assert!(first.history_exhausted);
+
+        let again = hub.backfill_block_fee_history();
+        assert_eq!(again.heights_scanned, 6);
+        assert_eq!(again.retained_heights, 6, "held heights are not reread");
+        assert_eq!(again.txstat_bytes, first.txstat_bytes);
+        assert_eq!(again.skipped_heights, first.skipped_heights);
+        assert!(again.history_exhausted);
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn far_horizon_follows_block_history_not_pool_tail() {
         let store_dir = tmp();
         let mp_dir = tmp();
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
         hub.set_relay_enabled(true);
-        hub.record_block_p10(1, Some(2_000));
-        hub.record_block_p10(2, Some(2_000));
+        // Too few pairs for any target: no estimate rather than a guess.
+        for height in 1..=100 {
+            record_fee_sample(&hub, height, 2_000);
+        }
+        hub.mark_fee_dirty();
+        assert!(
+            hub.fee_estimates_btc_per_kb().iter().all(|(_, v)| *v < 0.0),
+            "{:?}",
+            hub.fee_estimates_btc_per_kb()
+        );
+        // 2000 pairs for 1008 blocks: 2000 + 144 lookback + 1008 - 1 hurdles.
+        for height in 101..=3_200 {
+            record_fee_sample(&hub, height, 2_000);
+        }
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
         let sat = |pairs: &[(u32, f64)], d: u32| {
@@ -5301,13 +5436,14 @@ mod tests {
         let s144 = sat(&bulk, 144);
         let s504 = sat(&bulk, 504);
         let s1008 = sat(&bulk, 1008);
+        assert!(s1 > 0.0, "1 must fall back to history, not empty-pool -1");
         assert!(s144 > 0.0, "144 must use history, not empty-pool -1");
         assert!(s504 > 0.0, "504 must use history, not empty-pool -1");
         assert!(s1008 > 0.0, "1008 must use history, not empty-pool -1");
         assert!(s144 <= s1 + 0.05, "monotone far={s144} near={s1}");
         assert!(s504 <= s144 + 0.05, "monotone 504={s504} 144={s144}");
         for i in 0..20u32 {
-            hub.record_block_p10(3 + i, Some(1_000 + u64::from(i) * 100));
+            record_fee_sample(&hub, 3_201 + i, 1_000 + u64::from(i) * 100);
         }
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
@@ -5317,7 +5453,7 @@ mod tests {
         assert!(s1 > 0.0 && s6 > 0.0 && s144 > 0.0);
         assert!(
             s1 >= s6 && s6 >= s144,
-            "confidence fade monotone sat/vB n1={s1} n6={s6} n144={s144}"
+            "target rates monotone sat/vB n1={s1} n6={s6} n144={s144}"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -5327,8 +5463,9 @@ mod tests {
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
         hub.set_relay_enabled(true);
-        hub.record_block_p10(1, Some(1));
-        hub.record_block_p10(2, Some(1));
+        for height in 1..=3_200 {
+            record_fee_sample(&hub, height, 1);
+        }
         hub.mark_fee_dirty();
         let bulk = hub.fee_estimates_btc_per_kb();
         let v144 = bulk

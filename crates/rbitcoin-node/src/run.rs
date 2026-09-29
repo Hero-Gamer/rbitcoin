@@ -145,18 +145,36 @@ fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
     });
 }
 
-/// Backfill far-target fee history from the chain once relay is on, off the
-/// tip path (~1008 blocks of `txstat` + `spent` reads, no bodies).
+/// Backfill historical fee hurdles from up to 1 GiB of txstat rows once relay
+/// is on, off the tip path.
 fn spawn_fee_history_backfill(mempool: &Arc<MempoolHub>) {
     let mp = Arc::clone(mempool);
+    info!("mempool: fee history preload started (txstat-only, budget=1 GiB)");
     tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let t = Instant::now();
-        let n = mp.backfill_block_fee_history();
+        let stats = mp.backfill_block_fee_history();
         info!(
-            "mempool: fee history from the chain: {n} block(s) in {:.1?}",
-            t.elapsed()
+            "mempool: fee history preload complete: txstat_bytes={}, heights={}, retained={}, samples={}, ready_targets={}/{}, skipped={}, failed={}, range={}..{}, elapsed={:.1?}{}",
+            stats.txstat_bytes,
+            stats.heights_scanned,
+            stats.retained_heights,
+            stats.valid_samples,
+            stats.ready_targets,
+            stats.total_targets,
+            stats.skipped_heights,
+            stats.failed_heights,
+            stats.oldest_height.map_or_else(|| "none".to_owned(), |h| h.to_string()),
+            stats.tip_height.map_or_else(|| "none".to_owned(), |h| h.to_string()),
+            t.elapsed(),
+            if stats.history_exhausted { ", history exhausted before budget" } else { "" }
         );
+        if let Some(error) = stats.first_error {
+            warn!(
+                "mempool: fee history preload had {} read error(s); first error: {error}",
+                stats.failed_heights
+            );
+        }
     });
 }
 

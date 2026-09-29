@@ -366,11 +366,15 @@ fn estimatesmartfee_floors_at_mempoolminfee() {
         rate >= minfee,
         "feerate {rate} below mempoolminfee {minfee}: {r}"
     );
+    assert_eq!(r["blocks"], 2, "{r}");
+    let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 2, "only feerate and blocks: {r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Core's result without an estimate: `errors` and `blocks`, and no `feerate`.
-/// The success object (`feerate` and `blocks` only) is the fee-history journey.
+/// The success object (`feerate` and `blocks` only) is pinned with the
+/// `mempoolminfee` floor.
 #[test]
 fn estimatesmartfee_core_result_shape() {
     let (ctx, dir) = ctx_empty();
