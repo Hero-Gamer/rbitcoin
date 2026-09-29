@@ -7,6 +7,7 @@ use bitcoin::{
     Address, Amount, Block, BlockHash, Network as BtcNetwork, OutPoint, ScriptBuf, Transaction,
     Txid,
 };
+use rbitcoin_net::Selected;
 use rbitcoin_primitives::{Height, Network};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -107,7 +108,7 @@ pub(crate) fn hashes_json(hashes: &[BlockHash]) -> Value {
     json!(hashes.iter().map(|h| h.to_string()).collect::<Vec<_>>())
 }
 
-pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
+pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<(Transaction, Selected)> {
     let min = ctx
         .chain
         .as_ref()
@@ -115,7 +116,7 @@ pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<Transaction> {
         .unwrap_or(1);
     ctx.mempool
         .as_ref()
-        .map(|mp| mp.select_block_txs(min))
+        .map(|mp| mp.select_block_template(mp.template_budget(min)))
         .unwrap_or_default()
 }
 
@@ -133,7 +134,10 @@ pub(crate) fn generate_with_mempool(
     script: ScriptBuf,
 ) -> Result<Value, Value> {
     let miner = require_regtest_miner(ctx, "generate")?;
-    let extras = mempool_block_txs(ctx);
+    let extras: Vec<Transaction> = mempool_block_txs(ctx)
+        .into_iter()
+        .map(|(tx, _)| tx)
+        .collect();
     let hashes = miner
         .generate_to_script(nblocks, script, extras.clone())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
@@ -624,16 +628,9 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     let selected = mempool_block_txs(ctx);
     let mut fees = 0u64;
     let mut tx_json = Vec::with_capacity(selected.len());
-    let ids: Vec<Txid> = selected.iter().map(Transaction::compute_txid).collect();
-    for (i, tx) in selected.iter().enumerate() {
-        let txid = ids[i];
-        let fee = ctx
-            .mempool
-            .as_ref()
-            .and_then(|mp| mp.get_live_meta(&txid))
-            .map(|(f, _)| f)
-            .unwrap_or(0);
-        fees = fees.saturating_add(fee);
+    let ids: Vec<Txid> = selected.iter().map(|(_, s)| s.txid).collect();
+    for (tx, sel) in &selected {
+        fees = fees.saturating_add(sel.fee_sat);
         let mut depends = Vec::new();
         for inp in &tx.input {
             if let Some(pos) = ids.iter().position(|t| *t == inp.previous_output.txid) {
@@ -642,15 +639,11 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         }
         tx_json.push(json!({
             "data": serialize_hex(tx),
-            "txid": txid.to_string(),
+            "txid": sel.txid.to_string(),
             "hash": tx.compute_wtxid().to_string(),
             "depends": depends,
-            "fee": fee,
-            "sigops": ctx
-                .mempool
-                .as_ref()
-                .and_then(|mp| mp.get_live_sigop_cost(&txid))
-                .unwrap_or(0),
+            "fee": sel.fee_sat,
+            "sigops": sel.sigop_cost,
             "weight": tx.weight().to_wu(),
         }));
     }
@@ -662,7 +655,7 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     }
     let wtxids: Vec<[u8; 32]> = selected
         .iter()
-        .map(|tx| tx.compute_wtxid().to_byte_array())
+        .map(|(tx, _)| tx.compute_wtxid().to_byte_array())
         .collect();
     let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
     Ok(json!({

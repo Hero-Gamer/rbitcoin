@@ -46,6 +46,28 @@ fn meets_block_min_feerate(modified_sat: i128, adj_weight_wu: u64, min_sat_kvb: 
     modified_sat.saturating_mul(1000) >= i128::from(min_sat_kvb) * i128::from(vsize)
 }
 
+/// Caller's block budget for [`TxGraph::select_block_template`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectBudget {
+    /// Raw weight (WU) available to mempool txs.
+    pub max_weight_wu: u64,
+    /// Sigop cost held back for the coinbase (Core `nBlockSigOpsCost` start).
+    pub reserved_sigops: u64,
+    /// `-blockmintxfee` chunk floor on modified fee (sat/kvB).
+    pub min_sat_kvb: u64,
+}
+
+/// One tx picked by [`TxGraph::select_block_template`], read under the same
+/// graph borrow as the selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selected {
+    pub txid: Txid,
+    /// Base fee (sat), not the `prioritisetransaction`-modified fee.
+    pub fee_sat: u64,
+    /// Full BIP16 + BIP141 sigop cost recorded at admission.
+    pub sigop_cost: u64,
+}
+
 /// One live mempool entry (RAM index; body lives on disk).
 #[derive(Debug, Clone)]
 pub struct TxEntry {
@@ -224,7 +246,7 @@ impl TxGraph {
         self.bytes_per_sigop
     }
 
-    /// Set the shared admission and block-template sigop reserve.
+    /// Set the admission sigop reserve (a tx must fit a block beside it).
     pub(crate) fn set_block_reserved_sigops(&mut self, reserved: u64) {
         self.block_reserved_sigops = reserved;
     }
@@ -951,28 +973,30 @@ impl TxGraph {
         Self::MAX_BLOCK_WEIGHT.saturating_sub(Self::DEFAULT_BLOCK_RESERVED_WEIGHT)
     }
 
-    /// Mining-order txids that fit in `max_weight_wu` (best chunks first).
+    /// Mining-order txs that fit `budget` (best chunks first), ranking by
+    /// `base_fee + delta(txid)`.
     ///
-    /// Empty pool or zero cap → `[]`. A high-feerate child chunk pulls in
+    /// Empty pool or zero weight → `[]`. A high-feerate child chunk pulls in
     /// still-unselected in-mempool ancestors so the block is topological.
-    /// A chunk (plus those ancestors) that would overflow the weight cap or the
-    /// block sigop budget (80_000 less `block_reserved_sigops`) is skipped;
-    /// later chunks are still tried.
-    pub fn select_block_txids(&self, max_weight_wu: u64) -> Vec<Txid> {
-        self.select_block_txids_delta(max_weight_wu, 0, |_| 0)
-    }
-
-    /// Like [`Self::select_block_txids`], ranking by `base_fee + delta(txid)`.
+    /// A chunk (plus those ancestors) that would exceed
+    /// `budget.max_weight_wu` or the block sigop limit is skipped; later
+    /// chunks are still tried. The limit is 80_000 including
+    /// `budget.reserved_sigops`; a total of exactly 80_000 fits.
     /// Chunks whose modified fee is **negative** are skipped. A chunk whose
-    /// modified feerate is under `min_sat_kvb` (`-blockmintxfee`) is skipped
-    /// whole (Core `BlockAssembler` chunk floor), so a low-fee parent and its
-    /// CPFP child go in or out together. `0` admits zero-fee chunks.
-    pub fn select_block_txids_delta(
+    /// modified feerate is under `budget.min_sat_kvb` (`-blockmintxfee`) is
+    /// skipped whole (Core `BlockAssembler` chunk floor), so a low-fee parent
+    /// and its CPFP child go in or out together. `0` admits zero-fee chunks.
+    /// Each [`Selected`] carries the base fee (not the modified fee).
+    pub fn select_block_template(
         &self,
-        max_weight_wu: u64,
-        min_sat_kvb: u64,
+        budget: SelectBudget,
         delta: impl Fn(Txid) -> i64,
-    ) -> Vec<Txid> {
+    ) -> Vec<Selected> {
+        let SelectBudget {
+            max_weight_wu,
+            reserved_sigops,
+            min_sat_kvb,
+        } = budget;
         if max_weight_wu == 0 {
             return Vec::new();
         }
@@ -994,7 +1018,7 @@ impl TxGraph {
         let mut selected = HashSet::new();
         let mut out = Vec::new();
         let mut used = 0u64;
-        let mut sigops = self.block_reserved_sigops;
+        let mut sigops = reserved_sigops;
         for (_, _, ch) in scored {
             let mut add = Vec::new();
             for t in &ch.txids {
@@ -1016,9 +1040,10 @@ impl TxGraph {
                 .fold((0u64, 0u64), |(w, s), e| {
                     (w.saturating_add(e.weight), s.saturating_add(e.sigop_cost))
                 });
-            // Core `TestChunkBlockLimits`: skip this chunk, keep trying smaller ones.
+            // Core `TestChunkBlockLimits`: skip this chunk, keep trying
+            // smaller ones. Consensus allows a cost of exactly 80_000.
             if used.saturating_add(extra_w) > max_weight_wu
-                || sigops.saturating_add(extra_sigops) >= MAX_BLOCK_SIGOPS_COST
+                || sigops.saturating_add(extra_sigops) > MAX_BLOCK_SIGOPS_COST
             {
                 continue;
             }
@@ -1026,7 +1051,13 @@ impl TxGraph {
             sigops = sigops.saturating_add(extra_sigops);
             for t in add {
                 selected.insert(t);
-                out.push(t);
+                if let Some(e) = self.entries.get(&t) {
+                    out.push(Selected {
+                        txid: t,
+                        fee_sat: e.fee_sat,
+                        sigop_cost: e.sigop_cost,
+                    });
+                }
             }
         }
         out
@@ -1294,10 +1325,8 @@ mod tests {
     #[test]
     fn select_block_txids_empty_parent_before_child_and_weight_cap() {
         let g = TxGraph::new();
-        assert!(g
-            .select_block_txids(TxGraph::template_tx_weight())
-            .is_empty());
-        assert!(g.select_block_txids(0).is_empty());
+        assert!(select_ids(&g, budget(TxGraph::template_tx_weight()), |_| 0).is_empty());
+        assert!(select_ids(&g, budget(0), |_| 0).is_empty());
 
         let mut g = TxGraph::new();
         let parent = spend_op([1u8; 32], 50_000, 40_000);
@@ -1321,7 +1350,7 @@ mod tests {
         // Child pays more than parent so its chunk ranks first — still emit parent first.
         g.insert(entry_for(&parent, 1_000, 0), &parent);
         g.insert(entry_for(&child, 10_000, 1), &child);
-        let order = g.select_block_txids(TxGraph::template_tx_weight());
+        let order = select_ids(&g, budget(TxGraph::template_tx_weight()), |_| 0);
         assert_eq!(
             order,
             vec![parent.compute_txid(), child.compute_txid()],
@@ -1335,15 +1364,15 @@ mod tests {
         let wl = lo.weight().to_wu();
         g.insert(entry_for(&hi, 10_000, 0), &hi);
         g.insert(entry_for(&lo, 1_000, 1), &lo);
-        let only_hi = g.select_block_txids(wh);
+        let only_hi = select_ids(&g, budget(wh), |_| 0);
         assert_eq!(only_hi, vec![hi.compute_txid()]);
-        let both = g.select_block_txids(wh.saturating_add(wl));
+        let both = select_ids(&g, budget(wh.saturating_add(wl)), |_| 0);
         assert_eq!(both, vec![hi.compute_txid(), lo.compute_txid()]);
-        assert!(g.select_block_txids(wh.saturating_sub(1)).is_empty());
+        assert!(select_ids(&g, budget(wh.saturating_sub(1)), |_| 0).is_empty());
 
         let hid = hi.compute_txid();
         let lid = lo.compute_txid();
-        let depri = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
+        let depri = select_ids(&g, budget(TxGraph::template_tx_weight()), |id| {
             if id == hid {
                 -10_000
             } else {
@@ -1355,7 +1384,7 @@ mod tests {
             vec![lid, hid],
             "zero modified fee stays selectable; hotter lid ranks first"
         );
-        let depri_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
+        let depri_neg = select_ids(&g, budget(TxGraph::template_tx_weight()), |id| {
             if id == hid {
                 -10_001
             } else {
@@ -1363,7 +1392,7 @@ mod tests {
             }
         });
         assert_eq!(depri_neg, vec![lid], "negative modified fee is not mined");
-        let bump = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
+        let bump = select_ids(&g, budget(TxGraph::template_tx_weight()), |id| {
             if id == lid {
                 86 * 100_000_000
             } else {
@@ -1371,6 +1400,14 @@ mod tests {
             }
         });
         assert_eq!(bump[0], lid, "i64-sized delta reorders selection");
+        let bumped = g.select_block_template(budget(TxGraph::template_tx_weight()), |id| {
+            if id == lid {
+                86 * 100_000_000
+            } else {
+                0
+            }
+        });
+        assert_eq!(bumped[0].fee_sat, 1_000, "selection reports the base fee");
 
         // Child deprioritised to 0 stays out even when it shares a package with parent.
         let mut g = TxGraph::new();
@@ -1396,7 +1433,7 @@ mod tests {
         g.insert(entry_for(&child, 1_000, 1), &child);
         let cid = child.compute_txid();
         let pid = parent.compute_txid();
-        let only_p = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
+        let only_p = select_ids(&g, budget(TxGraph::template_tx_weight()), |id| {
             if id == cid {
                 -1_000
             } else {
@@ -1408,7 +1445,7 @@ mod tests {
             vec![pid, cid],
             "zero-modified child stays selectable with parent"
         );
-        let only_p_neg = g.select_block_txids_delta(TxGraph::template_tx_weight(), 0, |id| {
+        let only_p_neg = select_ids(&g, budget(TxGraph::template_tx_weight()), |id| {
             if id == cid {
                 -1_001
             } else {
@@ -1436,13 +1473,15 @@ mod tests {
         let cap = hot.weight().to_wu() + cold.weight().to_wu();
         assert!(big.weight().to_wu() > cold.weight().to_wu());
         assert_eq!(
-            g.select_block_txids(cap),
+            select_ids(&g, budget(cap), |_| 0),
             vec![hot.compute_txid(), cold.compute_txid()]
         );
     }
 
-    /// Sigop budget starts at the 400 coinbase reserve; a chunk reaching
-    /// 80_000 is skipped (Core `>=`) and a later, cheaper chunk still fits.
+    /// Sigop budget starts at the caller's reserve. A running cost of
+    /// exactly 80_000 fits; a chunk that would pass 80_000 is skipped and a
+    /// later, cheaper chunk still fits. Each pick carries the base fee and
+    /// sigop cost it was budgeted with.
     #[test]
     fn select_budgets_sigops_skip_and_continue() {
         let heavy = spend_op([8u8; 32], 50_000, 40_000);
@@ -1458,29 +1497,63 @@ mod tests {
             let mut e = entry_for(&light, 1_000, 1);
             e.sigop_cost = 1;
             g.insert(e, &light);
-            g.select_block_txids(TxGraph::template_tx_weight())
+            g
         };
-        assert_eq!(pool(79_600), vec![lid], "400 + 79_600 hits the limit");
-        assert_eq!(pool(79_599), vec![hid], "79_999 fits; +1 reaches 80_000");
-        assert_eq!(pool(79_598), vec![hid, lid], "80_000 - 1 total fits");
-        assert_eq!(pool(u64::MAX), vec![lid], "unknown cost never selected");
+        let at = |g: &TxGraph, reserved_sigops| {
+            let b = SelectBudget {
+                reserved_sigops,
+                ..budget(TxGraph::template_tx_weight())
+            };
+            select_ids(g, b, |_| 0)
+        };
+        let full = |heavy_cost| at(&pool(heavy_cost), COINBASE_SIGOPS_RESERVE);
+        assert_eq!(full(79_601), vec![lid], "400 + 79_601 passes 80_000");
+        assert_eq!(
+            full(79_600),
+            vec![hid],
+            "400 + 79_600 equals 80_000 and fits"
+        );
+        assert_eq!(
+            full(79_599),
+            vec![hid, lid],
+            "light's +1 lands on 80_000 and fits"
+        );
+        assert_eq!(full(u64::MAX), vec![lid], "unknown cost never selected");
+
+        let g = pool(79_598);
+        assert_eq!(
+            g.select_block_template(budget(TxGraph::template_tx_weight()), |_| 0),
+            vec![
+                Selected {
+                    txid: hid,
+                    fee_sat: 10_000,
+                    sigop_cost: 79_598
+                },
+                Selected {
+                    txid: lid,
+                    fee_sat: 1_000,
+                    sigop_cost: 1
+                },
+            ]
+        );
+        assert_eq!(at(&g, 402), vec![hid], "a larger reserve drops the tail");
+        assert_eq!(at(&g, 403), vec![lid], "skips heavy, still takes light");
+        assert_eq!(at(&g, 0), vec![hid, lid]);
     }
 
-    #[test]
-    fn selection_uses_configured_sigop_reserve() {
-        let tx = spend_op([0x18u8; 32], 50_000, 49_000);
-        let mut g = TxGraph::new();
-        let mut e = entry_for(&tx, 10_000, 0);
-        e.sigop_cost = 79_999;
-        g.insert(e, &tx);
-        assert!(g
-            .select_block_txids(TxGraph::template_tx_weight())
-            .is_empty());
-        g.set_block_reserved_sigops(0);
-        assert_eq!(
-            g.select_block_txids(TxGraph::template_tx_weight()),
-            vec![tx.compute_txid()]
-        );
+    fn budget(max_weight_wu: u64) -> SelectBudget {
+        SelectBudget {
+            max_weight_wu,
+            reserved_sigops: COINBASE_SIGOPS_RESERVE,
+            min_sat_kvb: 0,
+        }
+    }
+
+    fn select_ids(g: &TxGraph, budget: SelectBudget, delta: impl Fn(Txid) -> i64) -> Vec<Txid> {
+        g.select_block_template(budget, delta)
+            .into_iter()
+            .map(|s| s.txid)
+            .collect()
     }
 
     fn spend_op(seed: [u8; 32], _inv: u64, outv: u64) -> Transaction {
@@ -1789,7 +1862,7 @@ mod tests {
         he.sigop_cost = 1_000; // 20_000 WU at 20 B/sigop
         g.insert(he, &heavy);
         g.insert(entry_for(&light, 1_000, 1), &light);
-        let order = |g: &TxGraph| g.select_block_txids(TxGraph::template_tx_weight());
+        let order = |g: &TxGraph| select_ids(g, budget(TxGraph::template_tx_weight()), |_| 0);
         assert_eq!(order(&g), vec![lid, hid]);
         assert_eq!(g.worst_chunk().unwrap().1.txids, vec![hid]);
         assert_eq!(g.mining_chunks_best_first()[1].weight, 20_000);
@@ -1829,7 +1902,16 @@ mod tests {
         g.insert(entry_for(&p, 0, 0), &p);
         g.insert(entry_for(&c, 100_000, 1), &c);
         g.insert(entry_for(&lone, lv, 2), &lone);
-        let sel = |min| g.select_block_txids_delta(TxGraph::template_tx_weight(), min, |_| 0);
+        let sel = |min| {
+            select_ids(
+                &g,
+                SelectBudget {
+                    min_sat_kvb: min,
+                    ..budget(TxGraph::template_tx_weight())
+                },
+                |_| 0,
+            )
+        };
         let (cid, lid) = (c.compute_txid(), lone.compute_txid());
         assert_eq!(sel(1_000), vec![pid, cid, lid]);
         assert_eq!(sel(1_001), vec![pid, cid]);
@@ -1849,7 +1931,7 @@ mod tests {
         }
         let cap = a.weight().to_wu() + b.weight().to_wu();
         assert!(cap < 20_000);
-        assert_eq!(g.select_block_txids(cap).len(), 2);
+        assert_eq!(select_ids(&g, budget(cap), |_| 0).len(), 2);
     }
 
     /// Post-migrate recompute: filling an unknown (`u64::MAX`) cost re-ranks
@@ -1866,13 +1948,13 @@ mod tests {
         g.insert(entry_for(&poor, 100, 1), &poor);
         assert_eq!(g.worst_chunk().unwrap().1.txids, vec![rid]);
         assert_eq!(
-            g.select_block_txids(TxGraph::template_tx_weight()),
+            select_ids(&g, budget(TxGraph::template_tx_weight()), |_| 0),
             vec![pid]
         );
         g.set_sigop_cost(&rid, 0);
         assert_eq!(g.worst_chunk().unwrap().1.txids, vec![pid]);
         assert_eq!(
-            g.select_block_txids(TxGraph::template_tx_weight()),
+            select_ids(&g, budget(TxGraph::template_tx_weight()), |_| 0),
             vec![rid, pid]
         );
     }

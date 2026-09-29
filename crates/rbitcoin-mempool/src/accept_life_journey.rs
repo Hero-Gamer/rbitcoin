@@ -630,35 +630,54 @@ fn sigop_block_budget(life: &mut Life) {
         .expect("79,520 fits beside the default reserve");
     assert_eq!(
         life.mp
-            .select_block_txs(TxGraph::template_tx_weight())
+            .select_block_template(life.mp.template_budget(0), |_| 0)
             .len(),
         1
     );
     life.mp
         .remove_for_block(&[fits_default.compute_txid()])
         .unwrap();
-    assert!(matches!(
-        life.mp.accept_tx(&exact_default_budget, &utxos, TIP_OK),
-        Err(AcceptError::TooManySigops { cost: 79_600 })
-    ));
-    life.mp.set_block_reserved_sigops(0);
-    let fits_without_reserve = multisig_outputs_tx(op, 999);
     life.mp
-        .accept_tx(&fits_without_reserve, &utxos, TIP_OK)
-        .expect("79,920 fits when the template reserve is zero");
+        .accept_tx(&exact_default_budget, &utxos, TIP_OK)
+        .expect("79,600 beside the default reserve is exactly 80,000");
     assert_eq!(
         life.mp
-            .select_block_txs(TxGraph::template_tx_weight())
+            .select_block_template(life.mp.template_budget(0), |_| 0)
             .len(),
         1
     );
     life.mp
-        .remove_for_block(&[fits_without_reserve.compute_txid()])
+        .remove_for_block(&[exact_default_budget.compute_txid()])
         .unwrap();
     assert!(matches!(
         life.mp
-            .accept_tx(&multisig_outputs_tx(op, 1000), &utxos, TIP_OK),
-        Err(AcceptError::TooManySigops { cost: 80_000 })
+            .accept_tx(&multisig_outputs_tx(op, 996), &utxos, TIP_OK),
+        Err(AcceptError::TooManySigops { cost: 79_680 })
+    ));
+    life.mp.set_block_reserved_sigops(0);
+    let fits_without_reserve = multisig_outputs_tx(op, 999);
+    let exact_block = multisig_outputs_tx(op, 1000);
+    life.mp
+        .accept_tx(&fits_without_reserve, &utxos, TIP_OK)
+        .expect("79,920 fits when the template reserve is zero");
+    life.mp
+        .remove_for_block(&[fits_without_reserve.compute_txid()])
+        .unwrap();
+    life.mp
+        .accept_tx(&exact_block, &utxos, TIP_OK)
+        .expect("80,000 fits when the template reserve is zero");
+    assert_eq!(
+        life.mp
+            .select_block_template(life.mp.template_budget(0), |_| 0)
+            .len(),
+        1
+    );
+    life.mp
+        .remove_for_block(&[exact_block.compute_txid()])
+        .unwrap();
+    assert!(matches!(
+        life.mp.accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK),
+        Err(AcceptError::TooManySigops { cost: 80_080 })
     ));
     assert_eq!(life.mp.live_count(), 0);
     restore_sigop_knobs(&mut life.mp);
