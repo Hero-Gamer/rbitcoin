@@ -84,560 +84,6 @@ fn note_archived_creates_from_pairs_does_not_need_store() {
     );
 }
 
-/// Mainnet 187: first pack writes (drain+fence), next pack spends those creates.
-/// Stamp skips body_range when in-flight still has CreatePin outs; pin needs
-/// those outs. Drive the shipped confirm engine (not a source-order pin).
-#[test]
-fn confirm_engine_pins_spend_of_just_written_pack() {
-    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
-
-    use crate::ibd::status::LoopStats;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use rbitcoin_consensus::{mine_regtest_paying, pad_empty_from, ChainParams};
-
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("engine-187");
-    hub0.query.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let hub = Arc::new(hub0);
-    hub.ensure_genesis().unwrap();
-    let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
-    let maturity = params.coinbase_maturity();
-    let (tip, tip_time, cbs) =
-        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
-    let matured = cbs[0];
-    let spend = |prev: Txid, val: Amount| Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let h_parent = maturity + 2;
-    let parent = mine_regtest_paying(
-        tip,
-        tip_time + 600,
-        h_parent,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(matured, Amount::from_sat(49_0000_0000))],
-    );
-    let parent_spend_txid = parent.txdata[1].compute_txid();
-    let child = mine_regtest_paying(
-        parent.block_hash(),
-        parent.header.time + 600,
-        h_parent + 1,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
-    );
-    let child_h = h_parent + 1;
-    let child_hash = child.block_hash();
-
-    let feed = Arc::new(ConfirmFeed::new());
-    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-    let accepted = Arc::new(AtomicU32::new(0));
-    let (engine, _queues) = spawn_confirm_engine(
-        Arc::clone(&hub),
-        Arc::clone(&feed),
-        ev_tx,
-        accepted,
-        Arc::new(LoopStats::default()),
-    );
-
-    let wait_tip = |want: u32| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if hub.tip_height() == Some(want) {
-                return;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ConfirmEvent::Reject { height, err, .. }) => {
-                    panic!("confirm reject @{height}: {err}");
-                }
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
-                }
-            }
-        }
-    };
-
-    // Two packs: write parent (drain+fence) before the child is even offered.
-    // Production path is BQ raw → lookup take → loadq (not feed.note_wire).
-    use bitcoin::consensus::encode::serialize;
-    hub.query
-        .block_queue_enqueue(
-            h_parent,
-            parent.block_hash().to_byte_array(),
-            1,
-            &serialize(&parent),
-        )
-        .unwrap();
-    feed.note(h_parent, parent.block_hash());
-    wait_tip(h_parent);
-    hub.query
-        .block_queue_enqueue(child_h, child_hash.to_byte_array(), 1, &serialize(&child))
-        .unwrap();
-    feed.note(child_h, child_hash);
-    wait_tip(child_h);
-
-    feed.request_stop();
-    feed.notify();
-    let _ = engine.join();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Mainnet 496: parent, intervening empties, and child are all in the BQ
-/// before any write (one lookup wave). Each height is its own write so loc
-/// must survive intervening prunes until the last started height writes.
-#[test]
-fn confirm_engine_pins_spend_across_same_wave_intervening_writes() {
-    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
-
-    use crate::ibd::status::LoopStats;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use rbitcoin_consensus::{
-        mine_empty_regtest, mine_regtest_paying, pad_empty_from, ChainParams,
-    };
-
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("engine-496");
-    hub0.query.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let hub = Arc::new(hub0);
-    hub.ensure_genesis().unwrap();
-    let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
-    let maturity = params.coinbase_maturity();
-    let (tip, tip_time, cbs) =
-        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
-    let matured = cbs[0];
-    let spend = |prev: Txid, val: Amount| Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let h_parent = maturity + 2;
-    let parent = mine_regtest_paying(
-        tip,
-        tip_time + 600,
-        h_parent,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(matured, Amount::from_sat(49_0000_0000))],
-    );
-    let parent_spend_txid = parent.txdata[1].compute_txid();
-    let empty1 = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, h_parent + 1);
-    let empty2 = mine_empty_regtest(empty1.block_hash(), empty1.header.time + 600, h_parent + 2);
-    let child_h = h_parent + 3;
-    let child = mine_regtest_paying(
-        empty2.block_hash(),
-        empty2.header.time + 600,
-        child_h,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
-    );
-
-    let feed = Arc::new(ConfirmFeed::new());
-    feed.request_single_block(u32::MAX - 1);
-    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-    let accepted = Arc::new(AtomicU32::new(0));
-    let (engine, _queues) = spawn_confirm_engine(
-        Arc::clone(&hub),
-        Arc::clone(&feed),
-        ev_tx,
-        accepted,
-        Arc::new(LoopStats::default()),
-    );
-
-    let wait_tip = |want: u32| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if hub.tip_height() == Some(want) {
-                return;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ConfirmEvent::Reject { height, err, .. }) => {
-                    panic!("confirm reject @{height}: {err}");
-                }
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
-                }
-            }
-        }
-    };
-
-    let blocks = [
-        (h_parent, parent.clone()),
-        (h_parent + 1, empty1),
-        (h_parent + 2, empty2),
-        (child_h, child),
-    ];
-    for (h, b) in &blocks {
-        hub.query
-            .block_queue_enqueue(*h, b.block_hash().to_byte_array(), 1, &serialize(b))
-            .unwrap();
-        feed.note(*h, b.block_hash());
-    }
-    wait_tip(child_h);
-
-    feed.request_stop();
-    feed.notify();
-    let _ = engine.join();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Mainnet 905: parent write finishes, an intervening height writes (RAM loc
-/// prune at keep_until), then a later lookup wave spends that parent.
-/// InFlight still holds the create so load ignores TipOnly loc; write must
-/// still ensure abs.
-#[test]
-fn confirm_engine_pins_spend_after_later_wave_intervening_write() {
-    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
-
-    use crate::ibd::status::LoopStats;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use rbitcoin_consensus::{
-        mine_empty_regtest, mine_regtest_paying, pad_empty_from, ChainParams,
-    };
-
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("engine-905");
-    hub0.query.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let hub = Arc::new(hub0);
-    hub.ensure_genesis().unwrap();
-    let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
-    let maturity = params.coinbase_maturity();
-    let (tip, tip_time, cbs) =
-        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
-    let matured = cbs[0];
-    let spend = |prev: Txid, val: Amount| Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let h_parent = maturity + 2;
-    let parent = mine_regtest_paying(
-        tip,
-        tip_time + 600,
-        h_parent,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(matured, Amount::from_sat(49_0000_0000))],
-    );
-    let parent_spend_txid = parent.txdata[1].compute_txid();
-    let empty = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, h_parent + 1);
-    let child_h = h_parent + 2;
-    let child = mine_regtest_paying(
-        empty.block_hash(),
-        empty.header.time + 600,
-        child_h,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
-    );
-
-    let feed = Arc::new(ConfirmFeed::new());
-    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-    let accepted = Arc::new(AtomicU32::new(0));
-    let (engine, _queues) = spawn_confirm_engine(
-        Arc::clone(&hub),
-        Arc::clone(&feed),
-        ev_tx,
-        accepted,
-        Arc::new(LoopStats::default()),
-    );
-
-    let wait_tip = |want: u32| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if hub.tip_height() == Some(want) {
-                return;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ConfirmEvent::Reject { height, err, .. }) => {
-                    panic!("confirm reject @{height}: {err}");
-                }
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
-                }
-            }
-        }
-    };
-
-    let enqueue = |h: u32, b: &bitcoin::Block| {
-        hub.query
-            .block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b))
-            .unwrap();
-        feed.note(h, b.block_hash());
-    };
-
-    enqueue(h_parent, &parent);
-    wait_tip(h_parent);
-    enqueue(h_parent + 1, &empty);
-    wait_tip(h_parent + 1);
-    enqueue(child_h, &child);
-    wait_tip(child_h);
-
-    feed.request_stop();
-    feed.notify();
-    let _ = engine.join();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Mainnet 133433: lookup of the child wave starts before the parent is in
-/// `tx.head`, so TipOnly misses. InFlight still has the pin; write loc is
-/// already pruned. Offer the child after lookup has taken the parent, without
-/// waiting for tip (write may still be in flight / head may lag).
-#[test]
-fn confirm_engine_pins_spend_when_lookup_ahead_of_write() {
-    use super::{spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
-
-    use crate::ibd::status::LoopStats;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use rbitcoin_consensus::{
-        mine_empty_regtest, mine_regtest_paying, pad_empty_from, ChainParams,
-    };
-
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("engine-133433");
-    hub0.query.enter_direct_index_mode().unwrap();
-    let params = ChainParams::regtest();
-    let hub = Arc::new(hub0);
-    hub.ensure_genesis().unwrap();
-    let genesis = hub.tip_hash().expect("genesis");
-    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-        .header
-        .time;
-    let maturity = params.coinbase_maturity();
-    let (tip, tip_time, cbs) =
-        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 1, 1);
-    let matured = cbs[0];
-    let spend = |prev: Txid, val: Amount| Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev,
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: val,
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let h_parent = maturity + 2;
-    let parent = mine_regtest_paying(
-        tip,
-        tip_time + 600,
-        h_parent,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(matured, Amount::from_sat(49_0000_0000))],
-    );
-    let parent_spend_txid = parent.txdata[1].compute_txid();
-    let empty = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, h_parent + 1);
-    let child_h = h_parent + 2;
-    let child = mine_regtest_paying(
-        empty.block_hash(),
-        empty.header.time + 600,
-        child_h,
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![spend(parent_spend_txid, Amount::from_sat(48_0000_0000))],
-    );
-
-    let feed = Arc::new(ConfirmFeed::new());
-    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-    let accepted = Arc::new(AtomicU32::new(0));
-    let (engine, _queues) = spawn_confirm_engine(
-        Arc::clone(&hub),
-        Arc::clone(&feed),
-        ev_tx,
-        accepted,
-        Arc::new(LoopStats::default()),
-    );
-
-    let wait_tip = |want: u32| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if hub.tip_height() == Some(want) {
-                return;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ConfirmEvent::Reject { height, err, .. }) => {
-                    panic!("confirm reject @{height}: {err}");
-                }
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for tip={want} (have {:?})",
-                            hub.tip_height()
-                        );
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before tip={want} (have {:?})",
-                        hub.tip_height()
-                    );
-                }
-            }
-        }
-    };
-
-    let wait_taken = |want: u32| {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if hub.query.lookup_taken_hi() >= Some(want) {
-                return;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(ConfirmEvent::Reject { height, err, .. }) => {
-                    panic!("confirm reject @{height}: {err}");
-                }
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if Instant::now() > deadline {
-                        panic!(
-                            "timeout waiting for lookup_taken_hi>={want} (have {:?})",
-                            hub.query.lookup_taken_hi()
-                        );
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "confirm engine exited before lookup_taken_hi={want} (have {:?})",
-                        hub.query.lookup_taken_hi()
-                    );
-                }
-            }
-        }
-    };
-
-    let enqueue = |h: u32, b: &bitcoin::Block| {
-        hub.query
-            .block_queue_enqueue(h, b.block_hash().to_byte_array(), 1, &serialize(b))
-            .unwrap();
-        feed.note(h, b.block_hash());
-    };
-
-    enqueue(h_parent, &parent);
-    wait_taken(h_parent);
-    enqueue(h_parent + 1, &empty);
-    enqueue(child_h, &child);
-    wait_tip(child_h);
-
-    feed.request_stop();
-    feed.notify();
-    let _ = engine.join();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Drain can lead fence; tip prune must still keep the unconfirmed height.
 #[test]
 fn prune_inflight_keeps_unconfirmed_after_occupied_jumps() {
@@ -1639,24 +1085,6 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
     assert_eq!(super::write_drain_max_parts(0), 1);
 }
 
-#[test]
-fn write_batch_is_stale_after_tip_moves() {
-    use super::write_batch_is_stale;
-
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("write-stale");
-    hub.ensure_genesis().unwrap();
-    assert!(!write_batch_is_stale(&hub, 1), "tip+1 is live");
-    assert!(
-        write_batch_is_stale(&hub, 0),
-        "already-confirmed height is stale"
-    );
-    assert!(
-        write_batch_is_stale(&hub, 2),
-        "ahead of tip+1 is not the live batch"
-    );
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 /// A plan queued before rewind must be dropped so it cannot commit as fk mismatch.
 #[test]
 fn confirm_feed_clear_drops_queued_plans() {
@@ -1989,55 +1417,277 @@ fn lookup_ready_hash_none_when_missing() {
     assert_eq!(super::lookup_ready_hash(&feed, 10), Some(h));
 }
 
-/// Post-Class-C session fault: write thread finishes annotate in place
-/// (stale-plan would drop; requeue cannot). Then BQ dequeue like `Ok`.
+/// One direct-index regtest chain through the confirm engine. Four spends of
+/// a freshly written parent, each in a mainnet ordering of lookup and write,
+/// must confirm (187, 905, 133433, and 496 under single-block isolate). Then,
+/// at that tip, the fault paths: a stale write batch, a write fault after
+/// Class C, a failed load wave, a stale load queue, and a load session fault.
 #[test]
-fn write_session_fault_after_class_c_finishes_annotate_in_place() {
-    use super::{finish_connected_write_after_session_fault, write_batch_is_stale};
-    use bitcoin::hashes::Hash;
-    use bitcoin::BlockHash;
-    use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::testutil::FixtureChain;
-    use rbitcoin_query::TxApply;
+fn ibd_confirm_pin_fault() {
+    use super::{
+        finish_connected_write_after_session_fault, load_fail_rewind_wave,
+        reoffer_blocks_to_body_queue, spawn_confirm_engine, write_batch_is_stale, ConfirmEvent,
+        LoadAheadState,
+    };
+    use crate::ibd::status::LoopStats;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use rbitcoin_consensus::{
+        mine_empty_regtest, mine_regtest_paying, pad_empty_from, ChainParams,
+    };
+    use rbitcoin_primitives::Height;
+    use rbitcoin_query::testutil::FixtureChain as _;
+    use rbitcoin_query::{ArchiveWritePlan, TxApply};
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicU32;
+    use std::time::{Duration, Instant};
 
-    let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("write-fault-c");
-    hub.query.set_spend_index(false);
-
-    let h0 = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 0x207fffff,
-        nonce: 0,
-        merkle_root: [0xab; 32],
-        hash: [0xab; 32],
-        size: 0,
-        weight: 0,
+    let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("confirm-pin-fault");
+    hub0.query.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let hub = Arc::new(hub0);
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().expect("genesis");
+    let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let maturity = params.coinbase_maturity();
+    let (mut tip, mut tip_time, cbs) =
+        pad_empty_from(&hub.query, &params, genesis, gen_time, 1, maturity + 4, 5);
+    let spend = |prev: Txid, val: Amount| Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: val,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
     };
-    let mut txid0 = [0u8; 32];
-    txid0[31] = 0xcb;
-    let ta0 = TxApply {
-        tx: TxRecord {
-            txid: txid0,
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 1,
-            output_start_fk: Fk::NULL,
-            output_count: 1,
-        },
-        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    // Parent spends a matured coinbase, `gap` empty blocks follow, and the
+    // child spends the parent's spend.
+    let mut story = |cb: Txid, gap: u32| {
+        let mut h = hub.tip_height().unwrap() + 1;
+        let parent = mine_regtest_paying(
+            tip,
+            tip_time + 600,
+            h,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![spend(cb, Amount::from_sat(49_0000_0000))],
+        );
+        let mut blocks = vec![(h, parent.clone())];
+        for _ in 0..gap {
+            let (_, prev) = blocks.last().unwrap();
+            let b = mine_empty_regtest(prev.block_hash(), prev.header.time + 600, h + 1);
+            h += 1;
+            blocks.push((h, b));
+        }
+        let (_, prev) = blocks.last().unwrap();
+        let child = mine_regtest_paying(
+            prev.block_hash(),
+            prev.header.time + 600,
+            h + 1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![spend(
+                parent.txdata[1].compute_txid(),
+                Amount::from_sat(48_0000_0000),
+            )],
+        );
+        blocks.push((h + 1, child.clone()));
+        tip = child.block_hash();
+        tip_time = child.header.time;
+        blocks
     };
-    let hfk0 = hub.query.connect_block(Height(0), &h0, &[ta0]).unwrap();
-    let create_fk = hub.query.block_tx_fks(Height(0)).unwrap()[0];
 
-    let hash1 = rbitcoin_store::block_header_hash(1, &h0.hash, &[0x11; 32], 2, 0x207fffff, 1);
+    let feed = Arc::new(ConfirmFeed::new());
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    let (engine, _queues) = spawn_confirm_engine(
+        Arc::clone(&hub),
+        Arc::clone(&feed),
+        ev_tx,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(LoopStats::default()),
+    );
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !done() {
+            match ev_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(ConfirmEvent::Reject { height, err, .. }) => {
+                    panic!("confirm reject @{height}: {err}");
+                }
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                    Instant::now() < deadline,
+                    "timeout waiting for {what} (tip {:?})",
+                    hub.tip_height()
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("confirm engine exited before {what}")
+                }
+            }
+        }
+    };
+    let wait_tip = |want: u32| wait(&format!("tip={want}"), &|| hub.tip_height() == Some(want));
+    let enqueue = |(h, b): &(u32, bitcoin::Block)| {
+        hub.query
+            .block_queue_enqueue(*h, b.block_hash().to_byte_array(), 1, &serialize(b))
+            .unwrap();
+        feed.note(*h, b.block_hash());
+    };
+
+    // 187: the parent's pack writes before the child is even offered.
+    let blocks = story(cbs[0], 0);
+    enqueue(&blocks[0]);
+    wait_tip(blocks[0].0);
+    enqueue(&blocks[1]);
+    wait_tip(blocks[1].0);
+
+    // 905: parent writes, an empty height writes (RAM loc prune), then a
+    // later lookup wave spends the parent.
+    let blocks = story(cbs[1], 1);
+    for b in &blocks {
+        enqueue(b);
+        wait_tip(b.0);
+    }
+
+    // 133433: the child's lookup starts once the parent is taken, before
+    // the parent is in the tx head.
+    let blocks = story(cbs[2], 1);
+    enqueue(&blocks[0]);
+    wait(&format!("lookup_taken_hi>={}", blocks[0].0), &|| {
+        hub.query.lookup_taken_hi() >= Some(blocks[0].0)
+    });
+    enqueue(&blocks[1]);
+    enqueue(&blocks[2]);
+    wait_tip(blocks[2].0);
+
+    // 496: one lookup wave, one write per height under single-block
+    // isolate. Loc must survive the intervening prunes.
+    feed.request_single_block(u32::MAX - 1);
+    let blocks = story(cbs[3], 2);
+    for b in &blocks {
+        enqueue(b);
+    }
+    wait_tip(blocks.last().unwrap().0);
+
+    feed.request_stop();
+    feed.notify();
+    let _ = engine.join();
+
+    // Only tip+1 is the live write batch.
+    let t = hub.tip_height().unwrap();
+    assert!(!write_batch_is_stale(&hub, t + 1), "tip+1 is live");
+    assert!(write_batch_is_stale(&hub, t), "a confirmed height is stale");
+    assert!(
+        write_batch_is_stale(&hub, t + 2),
+        "past tip+1 is not the live batch"
+    );
+
+    // A load wave fails at tip+1: pins clear, the epoch drops same-wave
+    // loads, lookup rewinds to the tip, and the tail body goes back on the
+    // body queue, not feed.ready.
+    let fail_feed = ConfirmFeed::new();
+    let mut st = LoadAheadState::new(&hub);
+    let body0 = hub.query.tx_body_count();
+    let mut plan = ArchiveWritePlan::empty();
+    plan.planned_fks = vec![Fk(body0 + 10)];
+    st.note_lookup_ok(&plan, t + 1, [1u8; 32]);
+    let pin = test_pin(body0 + 10);
+    st.in_flight
+        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(t + 1));
+    assert!(st.in_flight.entry_count() > 0);
+    {
+        let mut g = fail_feed.inner.lock().unwrap();
+        g.inflight.insert(t + 1);
+        g.inflight.insert(t + 2);
+    }
+    let tail = mine_empty_regtest(tip, tip_time + 600, t + 1);
+    hub.query.set_lookup_taken_hi(Some(t + 2));
+    load_fail_rewind_wave(
+        &fail_feed,
+        &hub,
+        &mut st,
+        t + 1,
+        std::iter::once((t + 2, tail.block_hash(), &tail)),
+    );
+    assert_eq!(st.in_flight.entry_count(), 0, "pin/stamp fail clears all");
+    assert_eq!(fail_feed.epoch(), 1);
+    assert_eq!(hub.query.lookup_taken_hi(), Some(t));
+    assert_eq!(
+        hub.query.block_queue_payload(t + 2).unwrap().as_deref(),
+        Some(serialize(&tail).as_slice())
+    );
+    assert_eq!(
+        hub.query
+            .block_queue_unresolved_heights(t + 2, &HashSet::new(), 4),
+        vec![t + 2],
+        "the tail is claimable again"
+    );
+    {
+        let g = fail_feed.inner.lock().unwrap();
+        assert!(!g.ready.contains_key(&(t + 1)) && !g.ready.contains_key(&(t + 2)));
+    }
+    hub.query.block_queue_dequeue_height(t + 2).unwrap();
+
+    // A stale load queue only restores the body queue; lookup stays taken.
+    hub.query.set_lookup_taken_hi(Some(t + 3));
+    reoffer_blocks_to_body_queue(&hub, std::iter::once((t + 3, tail.block_hash(), &tail)));
+    assert_eq!(
+        hub.query.block_queue_payload(t + 3).unwrap().as_deref(),
+        Some(serialize(&tail).as_slice())
+    );
+    assert_eq!(hub.query.lookup_taken_hi(), Some(t + 3));
+    hub.query.block_queue_dequeue_height(t + 3).unwrap();
+    hub.query.set_lookup_taken_hi(None);
+
+    // A load session fault after lookup noted speculative fks resets the
+    // next fk to the one after the durable bodies.
+    let mut st = LoadAheadState::new(&hub);
+    let durable = hub.query.tx_body_count() + 1;
+    let mut plan = ArchiveWritePlan::empty();
+    plan.planned_fks = vec![Fk(durable + 10)];
+    st.note_lookup_ok(&plan, t + 1, [1u8; 32]);
+    let pin = test_pin(durable + 10);
+    st.in_flight
+        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(t + 1));
+    assert!(st.next_tx_start > durable && st.in_flight.entry_count() > 0);
+    st.on_uring_recover(&hub);
+    assert_eq!(st.next_tx_start, durable);
+    assert_eq!(st.in_flight.entry_count(), 0);
+
+    // A write session fault after Class C connected tip+1 with the spend
+    // index off: the write thread finishes the spend annotate in place,
+    // then the body leaves the queue as on Ok.
+    let (tip_fk, _) = hub
+        .query
+        .get_header_by_hash(&tip.to_byte_array())
+        .unwrap()
+        .unwrap();
+    let cb_fk = hub.query.block_tx_fks(Height(5)).unwrap()[0];
+    let cb_txid = cbs[4].to_byte_array();
+    let hash1 = rbitcoin_store::block_header_hash(
+        1,
+        &tip.to_byte_array(),
+        &[0x11; 32],
+        tip_time + 600,
+        0x207fffff,
+        1,
+    );
     let h1 = HeaderRecord {
-        prev_fk: hfk0,
+        prev_fk: tip_fk,
         version: 1,
-        timestamp: 2,
+        timestamp: tip_time + 600,
         bits: 0x207fffff,
         nonce: 1,
         merkle_root: [0x11; 32],
@@ -2047,7 +1697,6 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
     };
     let mut spend_txid = [0u8; 32];
     spend_txid[0] = 0x11;
-    spend_txid[31] = 0xcd;
     let ta1 = TxApply {
         tx: TxRecord {
             txid: spend_txid,
@@ -2059,8 +1708,8 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
             output_count: 1,
         },
         inputs: vec![InputRecord {
-            prev_txid: txid0,
-            create_fk,
+            prev_txid: cb_txid,
+            create_fk: cb_fk,
             prev_index: 0,
             sequence: u32::MAX,
             script_sig: vec![],
@@ -2068,153 +1717,34 @@ fn write_session_fault_after_class_c_finishes_annotate_in_place() {
         }],
         outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
     };
-    hub.query.connect_block(Height(1), &h1, &[ta1]).unwrap();
-    let spend_fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
-    let (multi, field, _vin) = hub
+    hub.query.set_spend_index(false);
+    hub.query.connect_block(Height(t + 1), &h1, &[ta1]).unwrap();
+    let spend_fk = hub.query.block_tx_fks(Height(t + 1)).unwrap()[0];
+    let (multi, field, _) = hub
         .query
         .store()
         .txs
-        .get_output_spender_meta(create_fk, 0)
+        .get_output_spender_meta(cb_fk, 0)
         .unwrap();
-    assert!(!multi);
-    assert!(field.is_null());
+    assert!(!multi && field.is_null());
     hub.query.set_spend_index(true);
-
-    assert!(
-        write_batch_is_stale(&hub, 1),
-        "tip already at height 1; requeue/stale would drop this batch"
-    );
+    assert!(write_batch_is_stale(&hub, t + 1), "tip is already t+1");
     assert!(hub.is_connected(&BlockHash::from_byte_array(hash1)));
-
     let hfk1 = hub.query.get_header_by_hash(&hash1).unwrap().unwrap().0;
     hub.query
-        .block_queue_offer(1, hash1, hfk1.0, &[0u8; 80])
+        .block_queue_offer(t + 1, hash1, hfk1.0, &[0u8; 80])
         .unwrap();
-    assert!(hub.query.block_queue_has_height(1));
-
-    finish_connected_write_after_session_fault(&hub.query, &[(1, hash1)]).expect("in-place finish");
-
-    let (multi2, field2, _vin2) = hub
+    finish_connected_write_after_session_fault(&hub.query, &[(t + 1, hash1)])
+        .expect("in-place finish");
+    let (multi, field, _) = hub
         .query
         .store()
         .txs
-        .get_output_spender_meta(create_fk, 0)
+        .get_output_spender_meta(cb_fk, 0)
         .unwrap();
-    assert!(!multi2);
-    assert_eq!(field2, spend_fk);
-    assert_eq!(hub.query.block_queue_dequeue_height(1).unwrap(), 1);
-    assert!(!hub.query.block_queue_has_height(1));
-}
+    assert!(!multi);
+    assert_eq!(field, spend_fk);
+    assert_eq!(hub.query.block_queue_dequeue_height(t + 1).unwrap(), 1);
 
-#[test]
-fn load_fail_rewind_reoffers_tail_to_bq() {
-    use super::{load_fail_rewind_wave, ConfirmFeed, LoadAheadState};
-    use bitcoin::consensus::encode::serialize;
-    use rbitcoin_query::ArchiveWritePlan;
-    use std::collections::HashSet;
-
-    let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("load-fail-rewind");
-    hub.ensure_genesis().unwrap();
-    let mut st = LoadAheadState::new(&hub);
-    let body0 = hub.query.tx_body_count();
-    let mut plan = ArchiveWritePlan::empty();
-    plan.planned_fks = vec![Fk(body0.saturating_add(10).max(10))];
-    st.note_lookup_ok(&plan, 10, [1u8; 32]);
-    let pin = test_pin(body0.saturating_add(10).max(10));
-    st.in_flight
-        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(10));
-    assert!(st.in_flight.entry_count() > 0);
-
-    let feed = ConfirmFeed::new();
-    {
-        let mut g = feed.inner.lock().unwrap();
-        g.inflight.insert(10);
-        g.inflight.insert(11);
-    }
-    let prev = hub.tip_hash().unwrap();
-    let body = rbitcoin_consensus::mine_empty_regtest(prev, 1_300_000_000, 1);
-    let hash = body.block_hash();
-    hub.query.set_lookup_taken_hi(Some(11));
-    load_fail_rewind_wave(&feed, &hub, &mut st, 10, std::iter::once((11, hash, &body)));
-    assert_eq!(
-        st.in_flight.entry_count(),
-        0,
-        "pin/stamp fail must clear_all"
-    );
-    assert_eq!(
-        feed.epoch(),
-        1,
-        "epoch bump drops in-channel same-wave loadq"
-    );
-    assert_eq!(
-        hub.query.lookup_taken_hi(),
-        hub.tip_height(),
-        "lookup must be able to select BQ heights again"
-    );
-    assert!(
-        hub.query.block_queue_has_height(11),
-        "tail wire belongs on the body queue, not feed.ready"
-    );
-    assert_eq!(
-        hub.query.block_queue_payload(11).unwrap().as_deref(),
-        Some(serialize(&body).as_slice())
-    );
-    let skip = HashSet::new();
-    assert_eq!(
-        hub.query.block_queue_unresolved_heights(11, &skip, 4),
-        vec![11],
-        "taken_hi rewind + BQ offer must make the tail claimable"
-    );
-    let g = feed.inner.lock().unwrap();
-    assert!(!g.ready.contains_key(&10));
-    assert!(
-        !g.ready.contains_key(&11),
-        "production lookup does not read feed.ready wire"
-    );
-}
-
-#[test]
-fn stale_loadq_reoffers_decoded_bodies_to_bq() {
-    use super::reoffer_blocks_to_body_queue;
-    use bitcoin::consensus::encode::serialize;
-
-    let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("stale-loadq-bq");
-    hub.ensure_genesis().unwrap();
-    let prev = hub.tip_hash().unwrap();
-    let body = rbitcoin_consensus::mine_empty_regtest(prev, 1_300_000_100, 1);
-    let hash = body.block_hash();
-    hub.query.set_lookup_taken_hi(Some(12));
-    reoffer_blocks_to_body_queue(&hub, std::iter::once((12, hash, &body)));
-    assert!(hub.query.block_queue_has_height(12));
-    assert_eq!(
-        hub.query.block_queue_payload(12).unwrap().as_deref(),
-        Some(serialize(&body).as_slice())
-    );
-    assert_eq!(
-        hub.query.lookup_taken_hi(),
-        Some(12),
-        "stale drop restores BQ only; stamp/pin fail already rewound taken_hi"
-    );
-}
-
-#[test]
-fn load_session_fault_after_note_lookup_ok_clears_speculative_fks() {
-    use super::LoadAheadState;
-    use rbitcoin_query::ArchiveWritePlan;
-
-    let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("load-fk-reset");
-    let mut st = LoadAheadState::new(&hub);
-    let body0 = hub.query.tx_body_count();
-    let durable = body0.saturating_add(1).max(1);
-    let mut plan = ArchiveWritePlan::empty();
-    plan.planned_fks = vec![Fk(body0.saturating_add(10).max(10))];
-    st.note_lookup_ok(&plan, 1, [1u8; 32]);
-    let pin = test_pin(body0.saturating_add(10).max(10));
-    st.in_flight
-        .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(1));
-    assert!(st.next_tx_start > durable);
-    assert!(st.in_flight.entry_count() > 0);
-    st.on_uring_recover(&hub);
-    assert_eq!(st.next_tx_start, durable);
-    assert_eq!(st.in_flight.entry_count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }

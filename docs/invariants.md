@@ -177,5 +177,5 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
 | `direct_write_skips_create_pin_map_idx_without_recent` | Direct skips `write_create_pins`; Class A idx holds body range |
 | `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |
-| `confirm_engine_pins_spend_of_just_written_pack` / `confirm_engine_pins_spend_across_same_wave_intervening_writes` / `confirm_engine_pins_spend_after_later_wave_intervening_write` / `confirm_engine_pins_spend_when_lookup_ahead_of_write` | IBD load: child spend of just-written pack (187); same-wave intervening writes (496); later-wave intervening write still has InFlight so TipOnly loc must ride the stamp (905); lookup-ahead child wave (133433) |
+| `ibd_confirm_pin_fault` | IBD load: child spend of just-written pack (187); same-wave intervening writes (496); later-wave intervening write still has InFlight so TipOnly loc must ride the stamp (905); lookup-ahead child wave (133433) |
 | `ibd_bad_prev_fork` | fk mismatch / connect height not tip+1 cascade requeue; store invariant engine-fault (requeue once then halt); only consensus-invalid blacklisted |
