@@ -369,8 +369,8 @@ fn estimatesmartfee_floors_at_mempoolminfee() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Core's result: `feerate` and `blocks` with an estimate; `errors` and
-/// `blocks`, and no `feerate`, without one.
+/// Core's result without an estimate: `errors` and `blocks`, and no `feerate`.
+/// The success object (`feerate` and `blocks` only) is the fee-history journey.
 #[test]
 fn estimatesmartfee_core_result_shape() {
     let (ctx, dir) = ctx_empty();
@@ -384,16 +384,6 @@ fn estimatesmartfee_core_result_shape() {
         "{r}"
     );
     assert_eq!(r["blocks"], 2, "{r}");
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (hex, _) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 10_000);
-    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
-    assert!(r["feerate"].as_f64().is_some_and(|f| f > 0.0), "{r}");
-    assert_eq!(r["blocks"], 2, "{r}");
-    let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 2, "only feerate and blocks: {r}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
