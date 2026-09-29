@@ -114,6 +114,16 @@ let
   ++ optional cfg.pruneSeqSigWit "--prune-seqsigwit"
   ++ optional (cfg.milestone != null) "--milestone"
   ++ optional (cfg.milestone != null) (toString cfg.milestone)
+  ++ lib.optionals cfg.sv2.tp.enable [
+    "--sv2-tp-listen"
+    (socket cfg.sv2.tp.address cfg.sv2.tp.port)
+    "--sv2-tp-authority-sec-file"
+    (toString cfg.sv2.tp.authoritySecretFile)
+    "--sv2-tp-cert-validity"
+    (toString cfg.sv2.tp.certValidity)
+    "--sv2-tp-stale-grace"
+    (toString cfg.sv2.tp.staleGrace)
+  ]
   ++ cfg.extraArgs;
 in
 {
@@ -479,6 +489,47 @@ in
         description = "ADD_ONION for Esplora when --esplora-listen is on. Implies tor.control 127.0.0.1:9051 if unset. REST and /ws share the TCP port.";
       };
     };
+
+    sv2.tp = {
+      enable = mkEnableOption "the Stratum v2 Template Provider (TDP over Noise)";
+
+      address = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        description = "Address on which to serve SV2 templates.";
+      };
+
+      port = mkOption {
+        type = types.port;
+        default = 8442;
+        description = "SV2 Template Provider listen port.";
+      };
+
+      authoritySecretFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/keys/sv2-authority";
+        description = "Runtime path to the 64-hex secp256k1 authority secret, readable by the service user. Passed as --sv2-tp-authority-sec-file so the key stays out of argv. A store path (including an interpolated `./key`) is refused: the store is world-readable.";
+      };
+
+      certValidity = mkOption {
+        type = types.ints.positive;
+        default = 3600;
+        description = "Seconds each per-connection Noise certificate is valid.";
+      };
+
+      staleGrace = mkOption {
+        type = types.ints.unsigned;
+        default = 10;
+        description = "Seconds a replaced tip's templates still answer RequestTransactionData and SubmitSolution.";
+      };
+
+      openFirewall = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Open the SV2 Template Provider port in the NixOS firewall.";
+      };
+    };
   };
 
   config = mkIf cfg.enable {
@@ -506,6 +557,16 @@ in
       {
         assertion = !cfg.metrics || cfg.health.enable;
         message = "services.rbitcoin.metrics requires health.enable (--metrics needs --health-listen)";
+      }
+      {
+        assertion = !cfg.sv2.tp.enable || cfg.sv2.tp.authoritySecretFile != null;
+        message = "services.rbitcoin.sv2.tp.enable requires sv2.tp.authoritySecretFile";
+      }
+      {
+        assertion =
+          cfg.sv2.tp.authoritySecretFile == null
+          || !lib.hasPrefix "${builtins.storeDir}/" cfg.sv2.tp.authoritySecretFile;
+        message = "services.rbitcoin.sv2.tp.authoritySecretFile must not be a store path (the store is world-readable)";
       }
     ];
 
@@ -583,7 +644,8 @@ in
       optional (cfg.p2p.openFirewall && cfg.p2p.listen) cfg.p2p.port
       ++ optional (cfg.electrum.enable && cfg.electrum.openFirewall) cfg.electrum.port
       ++ optional (cfg.esplora.enable && cfg.esplora.openFirewall) cfg.esplora.port
-      ++ optional (cfg.health.enable && cfg.health.openFirewall) cfg.health.port;
+      ++ optional (cfg.health.enable && cfg.health.openFirewall) cfg.health.port
+      ++ optional (cfg.sv2.tp.enable && cfg.sv2.tp.openFirewall) cfg.sv2.tp.port;
 
     services.prometheus.scrapeConfigs = mkIf (cfg.metrics && config.services.prometheus.enable) [
       {

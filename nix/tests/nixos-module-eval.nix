@@ -69,6 +69,14 @@ let
           };
           health.enable = true;
           metrics = true;
+          sv2.tp = {
+            enable = true;
+            port = 18447;
+            authoritySecretFile = "/run/keys/sv2-authority";
+            certValidity = 600;
+            staleGrace = 0;
+            openFirewall = true;
+          };
         };
       }
     ];
@@ -185,6 +193,24 @@ let
     ];
   };
   restOnExec = restOnSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart;
+  # "${./key}" interpolation copies the secret into the world-readable store.
+  sv2KeyInStore = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          sv2.tp = {
+            enable = true;
+            authoritySecretFile = "${builtins.storeDir}/0000000000000000000000000000000-sv2-authority";
+          };
+        };
+      }
+    ];
+  };
+  sv2KeyNotInStore = "services.rbitcoin.sv2.tp.authoritySecretFile must not be a store path (the store is world-readable)";
   failedAssertions =
     sys: map (a: a.message) (builtins.filter (a: !a.assertion) sys.config.assertions);
 in
@@ -215,12 +241,18 @@ assert defaultCfg.health.address == "127.0.0.1";
 assert defaultCfg.health.port == 9332;
 assert defaultCfg.health.openFirewall == false;
 assert defaultCfg.metrics == false;
+assert defaultCfg.sv2.tp.enable == false;
+assert defaultCfg.sv2.tp.port == 8442;
+assert defaultCfg.sv2.tp.authoritySecretFile == null;
+assert defaultCfg.sv2.tp.certValidity == 3600;
+assert defaultCfg.sv2.tp.staleGrace == 10;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
   builtins.sort builtins.lessThan cfg.networking.firewall.allowedTCPPorts == [
     3000
     18444
+    18447
     50001
   ];
 assert service.environment.RBITCOIN_IO == "uring";
@@ -287,6 +319,12 @@ assert builtins.match ".*--health-listen.*" (
 assert builtins.match ".*--metrics.*" (
   defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
 ) == null;
+assert builtins.match ".*--sv2-tp-listen 127.0.0.1:18447.*" execStart != null;
+assert builtins.match ".*--sv2-tp-authority-sec-file /run/keys/sv2-authority.*" execStart != null;
+assert builtins.match ".*--sv2-tp-authority-sec .*" execStart == null;
+assert builtins.match ".*--sv2-tp-cert-validity 600.*" execStart != null;
+assert builtins.match ".*--sv2-tp-stale-grace 0.*" execStart != null;
+assert builtins.match ".*--max-outbound 8$" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
 assert builtins.elem "i2pd.service" service.after;
@@ -301,9 +339,12 @@ assert !builtins.elem metricsNeedHealth (failedAssertions system);
 assert builtins.elem cookieTcpOnly (failedAssertions cookieWithoutTcp);
 assert builtins.elem metricsNeedHealth (failedAssertions metricsWithoutHealth);
 assert builtins.elem "127.0.0.1:9332" (builtins.head rbitcoinScrape.static_configs).targets;
+assert !builtins.elem sv2KeyNotInStore (failedAssertions system);
+assert builtins.elem sv2KeyNotInStore (failedAssertions sv2KeyInStore);
 assert cookieDataDirMode == "0700";
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
 assert builtins.match ".*--no-discover.*" listenOffExec != null;
+assert builtins.match ".*--sv2-tp.*" listenOffExec == null;
 assert listenOffSystem.config.networking.firewall.allowedTCPPorts == [ ];
 pkgs.runCommand "rbitcoin-nixos-module-eval" { } "touch $out"
