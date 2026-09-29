@@ -1,12 +1,13 @@
-//! Checkpoints for the header chain past the download queue.
+//! Checkpoints for the header chain ahead of the blocks.
 //!
-//! The queue stays at [`ORDERED_HEADERS_SOFT_CAP`] and keeps filling along the
-//! candidate. Headers beyond the queue are not written. Each look-ahead reply
-//! records one checkpoint: hash, height, total work, and the difficulty period
-//! at that hash. One competing chain is kept the same way until it loses or
-//! replaces the candidate. Work for a stored header between checkpoints is
-//! the previous checkpoint plus those stored headers. That replay runs only
-//! when a competing headers batch forks there.
+//! Look-ahead runs while any peer advertises a header past the walk. The
+//! download queue still stops at [`ORDERED_HEADERS_SOFT_CAP`]. A reply is
+//! written only when it continues the queue tail and the queue has room.
+//! Every other look-ahead reply records one checkpoint: hash, height, total
+//! work, and the difficulty period at that hash. One competing chain is kept
+//! the same way until it loses or replaces the candidate. Work for a stored
+//! header between checkpoints is the previous checkpoint plus those stored
+//! headers. That replay runs only when a competing headers batch forks there.
 
 use super::state::IbdWorkState;
 use super::ORDERED_HEADERS_SOFT_CAP;
@@ -232,11 +233,7 @@ pub(crate) fn log_status(st: &mut IbdWorkState, horizon: u32) {
     let height = st.header_walk.tip_height;
     let pct = super::progress::ibd_pct(height, horizon.max(height));
     let work = if st.header_walk.proven { "ok" } else { "below" };
-    let phase = if st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
-        "walk"
-    } else {
-        "write"
-    };
+    let phase = if wants_lookahead(st) { "walk" } else { "write" };
     rbitcoin_log::info!(
         "ibd: headers height={height} ({pct}%) horizon={horizon} work={work} phase={phase}"
     );
@@ -246,15 +243,15 @@ pub(crate) fn log_status(st: &mut IbdWorkState, horizon: u32) {
     }
 }
 
-/// The queue is full and peers still advertise headers past the candidate.
+/// Peers still advertise a header past the walk, so the next request extends it.
 pub(crate) fn wants_lookahead(st: &IbdWorkState) -> bool {
-    st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP && st.max_peer_height > st.header_walk.tip_height()
+    st.max_peer_height > st.header_walk.tip_height()
 }
 
-/// Height a header peer must advertise past: the walk tip while the queue is
-/// full, otherwise the queue tail.
+/// Height a header peer must advertise past: the walk tip until that walk
+/// reaches every peer, otherwise the queue tail.
 pub(crate) fn ask_above(st: &IbdWorkState) -> u32 {
-    if st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
+    if wants_lookahead(st) {
         return st.header_walk.tip_height();
     }
     st.ordered
@@ -978,6 +975,17 @@ fn forget_queue_hashes(st: &mut IbdWorkState, drop: &[BlockHash]) {
     }
 }
 
+/// The walk tip is past the last queued header, so a further reply is not a refill.
+fn walk_ahead_of_queue(st: &IbdWorkState) -> bool {
+    let Some(tail) = st.ordered.back().copied() else {
+        return false;
+    };
+    let Some(&tail_h) = st.hash_height.get(&tail) else {
+        return false;
+    };
+    st.header_walk.origin && st.header_walk.tip_height > tail_h
+}
+
 /// Record a look-ahead batch as a checkpoint. True when the batch was consumed
 /// and must not be written.
 pub(crate) fn absorb_lookahead(
@@ -987,7 +995,12 @@ pub(crate) fn absorb_lookahead(
     ask: HeaderAsk,
     headers: &[Header],
 ) -> bool {
-    if headers.is_empty() || st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
+    let queue_full = st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP;
+    // A solicited look-ahead that is already past the queue stays a checkpoint
+    // when confirm has drained a slot. A reply that still has to fill the queue
+    // is stored.
+    let keep_checkpoint = queue_full || (ask != HeaderAsk::Unsolicited && walk_ahead_of_queue(st));
+    if headers.is_empty() || !keep_checkpoint {
         return false;
     }
     ensure_origin(st, hub);
@@ -2456,6 +2469,58 @@ mod tests {
     }
 
     #[test]
+    fn lookahead_keeps_walking_while_the_queue_has_room() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-room");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let second = mine(first.block_hash(), 2);
+        let (s0, mut rx) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![first]);
+        assert_eq!(st.header_walk.tip_hash, Some(first.block_hash()));
+
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        let tail = st.ordered.back().copied().unwrap();
+        st.hash_height.insert(tail, 0);
+        assert!(st.header_walk.tip_height > 0);
+        assert!(st.ordered.len() < ORDERED_HEADERS_SOFT_CAP);
+        assert!(
+            wants_lookahead(&st),
+            "peers past the walk keep look-ahead on while the queue has room"
+        );
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        match rx.try_recv() {
+            Ok(PeerCmd::GetHeaders { locator }) => {
+                assert_eq!(
+                    locator[0],
+                    first.block_hash(),
+                    "the next request still starts at the walk tip"
+                );
+            }
+            Ok(_) => panic!("expected getheaders"),
+            Err(_) => panic!("peer was not asked for headers"),
+        }
+
+        let before = hub.query.store().header_count();
+        let queued = st.ordered.len();
+        apply(&mut st, &hub, 0, vec![second]);
+        assert_eq!(
+            hub.query.store().header_count(),
+            before,
+            "a walk extension is not written while peers are still ahead"
+        );
+        assert_eq!(st.ordered.len(), queued);
+        assert!(!st.ordered_set.contains(&second.block_hash()));
+        assert_eq!(st.header_walk.tip_hash, Some(second.block_hash()));
+    }
+
+    #[test]
     fn short_chain_rewinds_and_the_next_peer_is_followed() {
         let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-2");
         hub.ensure_genesis().unwrap();
@@ -2670,11 +2735,14 @@ mod tests {
             let dropped = st.ordered.pop_front().unwrap();
             st.ordered_set.remove(&dropped);
         }
-        let queue_tip = *st.ordered.back().unwrap();
         assert!(send_getheaders(&mut st, &hub).unwrap());
         match rx.try_recv() {
             Ok(PeerCmd::GetHeaders { locator }) => {
-                assert_eq!(locator[0], queue_tip, "locator starts at the queue tip");
+                assert_eq!(
+                    locator[0],
+                    good.block_hash(),
+                    "look-ahead keeps the walk tip while peers are still ahead"
+                );
             }
             Ok(_) => panic!("expected getheaders"),
             Err(_) => panic!("peer was not asked for headers"),
@@ -3861,10 +3929,11 @@ mod tests {
         match rx.try_recv() {
             Ok(PeerCmd::GetHeaders { locator }) => {
                 assert_eq!(
-                    locator[0], prev,
-                    "a refill locator names the competing tip before the queue tail"
+                    locator[0],
+                    candidate_tip.unwrap(),
+                    "look-ahead keeps the walk tip while peers are still ahead"
                 );
-                assert_ne!(locator[0], candidate_tip.unwrap());
+                assert_ne!(locator[0], prev);
             }
             Ok(_) => panic!("expected getheaders"),
             Err(_) => panic!("peer was not asked for headers"),
