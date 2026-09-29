@@ -342,41 +342,32 @@ mod tests {
         assert!(work_path_tips(&empty).is_empty());
     }
 
+    /// One hub: with no tip there is nothing to plant. After genesis, a
+    /// connected child and its extension known only by hash height are
+    /// planted as the work path.
     #[test]
-    fn plant_valid_tip_child_no_tip_is_noop() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("plant-none");
-        let mut st = IbdWorkState::new(Vec::new(), None, None);
-        super::plant_valid_tip_child(&mut st, &hub);
-        assert!(st.ordered.is_empty());
-        assert!(st.height_to_hash.is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn plant_valid_tip_child_extends_connected_headers() {
+    fn plant_valid_tip_child_from_no_tip_to_connected_headers() {
         use bitcoin::absolute::LockTime;
         use bitcoin::block::{Header, Version};
         use bitcoin::script::ScriptBuf;
         use bitcoin::transaction::Version as TxVersion;
         use bitcoin::{
-            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
-            Witness,
+            Amount, Block, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
         };
 
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("plant-ext");
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
+        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("plant-tip-child");
+        let mut st = IbdWorkState::new(Vec::new(), None, None);
+        super::plant_valid_tip_child(&mut st, &hub);
+        assert!(st.ordered.is_empty());
+        assert!(st.height_to_hash.is_empty());
 
-        fn coinbase(height: u32) -> Transaction {
-            let mut ss = if height == 0 {
-                vec![0x00]
-            } else {
-                rbitcoin_consensus::bip34_height_script(height)
-            };
+        hub.ensure_genesis().unwrap();
+        let mine = |prev: BlockHash, time: u32, height: u32| {
+            let mut ss = rbitcoin_consensus::bip34_height_script(height);
             while ss.len() < 2 {
                 ss.push(0x00);
             }
-            Transaction {
+            let coinbase = Transaction {
                 version: TxVersion::ONE,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -389,34 +380,23 @@ mod tests {
                     value: Amount::from_sat(50_0000_0000),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            }
-        }
-        fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
-            let bits = CompactTarget::from_consensus(0x207f_ffff);
-            let header = Header {
-                version: Version::from_consensus(4),
-                prev_blockhash: prev,
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
-                time,
-                bits,
-                nonce: 0,
             };
             let mut block = Block {
-                header,
-                txdata: vec![coinbase(height)],
+                header: Header {
+                    version: Version::from_consensus(4),
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                    time,
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce: 0,
+                },
+                txdata: vec![coinbase],
             };
             block.header.merkle_root = block.compute_merkle_root().unwrap();
-            let target = Target::from_compact(bits);
-            for nonce in 0..u32::MAX {
-                block.header.nonce = nonce;
-                if block.header.validate_pow(target).is_ok() {
-                    break;
-                }
-            }
+            rbitcoin_consensus::grind_regtest_pow(&mut block.header);
             block
-        }
-
-        let child = mine(gen, 1_300_000_600, 1);
+        };
+        let child = mine(hub.tip_hash().unwrap(), 1_300_000_600, 1);
         let ext = mine(child.block_hash(), 1_300_001_200, 2);
         hub.ensure_header(&child.header).unwrap();
         hub.ensure_header(&ext.header).unwrap();
