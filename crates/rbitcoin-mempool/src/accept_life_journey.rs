@@ -462,9 +462,237 @@ fn full_pool_evicts_worst_chunks(life: &mut Life) {
     assert!(life.mp.graph.total_weight() <= life.mp.max_weight);
 }
 
+fn drop_live(mp: &mut ActiveMempool) {
+    let ids: Vec<Txid> = mp.graph.iter().map(|(t, _)| *t).collect();
+    if !ids.is_empty() {
+        mp.remove_for_block(&ids).unwrap();
+    }
+}
+
+fn restore_sigop_knobs(mp: &mut ActiveMempool) {
+    mp.set_bytes_per_sigop(crate::graph::DEFAULT_BYTES_PER_SIGOP);
+    mp.set_block_reserved_sigops(crate::graph::COINBASE_SIGOPS_RESERVE);
+    mp.max_weight = DEFAULT_MAX_MEMPOOL_WEIGHT;
+}
+
+/// Admitted vsize is `max(ceil(sigops × bps / 4), serialized vsize)`.
+fn sigop_adjusted_vsize_boundary(life: &mut Life) {
+    for (bps, n) in [(20u64, 69usize), (20, 222), (43, 101), (81, 142)] {
+        let target = (n as u64 * bps).div_ceil(4);
+        let base = vsize_of(&witness_sigops_spend(n, 256).1);
+        let pad = 256 + usize::try_from(target - base).unwrap();
+        for (bytes, want) in [(pad, target), (pad + 1, target + 1), (pad - 1, target)] {
+            let (utxos, tx) = witness_sigops_spend(n, bytes);
+            if bytes == pad {
+                assert_eq!(vsize_of(&tx), target, "padding lands on the boundary");
+            }
+            life.mp.set_bytes_per_sigop(bps);
+            let r = life.mp.accept_tx(&tx, &utxos, TIP_OK).expect("admits");
+            assert_eq!(
+                policy::get_virtual_size(r.weight),
+                want,
+                "bps={bps} n={n} pad={bytes}"
+            );
+            life.mp.remove_for_block(&[tx.compute_txid()]).unwrap();
+        }
+    }
+    restore_sigop_knobs(&mut life.mp);
+}
+
+fn sigop_min_relay_and_pool_floor(life: &mut Life) {
+    let (utxos, mut tx) = witness_sigops_spend(222, 1);
+    // 100 sat pays the raw size at 0.1 sat/vB, not 1_110 adjusted vB.
+    tx.output[0].value = Amount::from_sat(1_000_000 - 100);
+    assert!(matches!(
+        life.mp.accept_tx(&tx, &utxos, TIP_OK),
+        Err(AcceptError::Policy("min relay fee"))
+    ));
+    life.mp.set_bytes_per_sigop(0);
+    life.mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
+    drop_live(&mut life.mp);
+
+    life.mp.max_weight = policy::MAX_STANDARD_TX_WEIGHT - 1;
+    restore_sigop_knobs_keep_weight(&mut life.mp);
+    assert!(life.mp.mempool_min_fee_sat_kvb() > life.mp.min_relay_sat_kvb());
+    assert!(matches!(
+        life.mp.accept_tx(&tx, &utxos, TIP_OK),
+        Err(AcceptError::Policy("mempool min fee"))
+    ));
+    life.mp.set_bytes_per_sigop(0);
+    life.mp
+        .accept_tx(&tx, &utxos, TIP_OK)
+        .expect("raw vsize pays");
+    drop_live(&mut life.mp);
+    restore_sigop_knobs(&mut life.mp);
+}
+
+/// `restore_sigop_knobs` also resets `max_weight`. The floor beat needs the
+/// tight cap left in place.
+fn restore_sigop_knobs_keep_weight(mp: &mut ActiveMempool) {
+    let weight = mp.max_weight;
+    restore_sigop_knobs(mp);
+    mp.max_weight = weight;
+}
+
+fn sigop_rbf_package_and_cluster(life: &mut Life) {
+    let (op, _, utxos) = chain_utxo(100_000);
+    let old = spend_tx(op, 99_000);
+    let mut heavy = multisig_outputs_tx(op, 10);
+    heavy.output[0].value = Amount::from_sat(100_000 - 3_000 - 9);
+    for (bps, replaces) in [(20u64, false), (0, true)] {
+        life.mp.set_bytes_per_sigop(bps);
+        life.mp.accept_tx(&old, &utxos, TIP_OK).unwrap();
+        let r = life.mp.accept_tx(&heavy, &utxos, TIP_OK);
+        if replaces {
+            assert_eq!(r.unwrap().replaced, vec![old.compute_txid()]);
+        } else {
+            assert!(matches!(r, Err(AcceptError::RbfInsufficient)));
+        }
+        drop_live(&mut life.mp);
+    }
+    restore_sigop_knobs(&mut life.mp);
+
+    let (parent, child) = cpfp_heavy_child(op);
+    let pkg = [parent.clone(), child.clone()];
+    let min = policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+    assert!(!ActiveMempool::package_meets_min_relay(
+        &pkg, &utxos, min, 20
+    ));
+    assert!(ActiveMempool::package_meets_min_relay(&pkg, &utxos, min, 0));
+    assert!(matches!(
+        life.mp.accept_package(&pkg, &utxos, TIP_OK),
+        Err(AcceptError::Policy("min relay fee"))
+    ));
+    life.mp.set_bytes_per_sigop(0);
+    assert_eq!(
+        life.mp.accept_package(&pkg, &utxos, TIP_OK).unwrap().len(),
+        2
+    );
+    drop_live(&mut life.mp);
+    restore_sigop_knobs(&mut life.mp);
+
+    let pid = parent.compute_txid();
+    let missing = BTreeSet::from([pid]);
+    assert!(matches!(
+        life.mp.accept_tx(&parent, &utxos, TIP_OK),
+        Err(AcceptError::Policy("min relay fee"))
+    ));
+    assert_eq!(
+        life.mp.try_one_parent_package(&child, &missing, &utxos),
+        None
+    );
+    life.mp.set_bytes_per_sigop(0);
+    assert_eq!(
+        life.mp.try_one_parent_package(&child, &missing, &utxos),
+        Some(parent)
+    );
+    restore_sigop_knobs(&mut life.mp);
+
+    let (wide_op, _, wide_utxos) = chain_utxo(1_000_000);
+    let mut wide = multisig_outputs_tx(wide_op, 501);
+    wide.output[0] = TxOut {
+        value: Amount::from_sat(900_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let wid = wide.compute_txid();
+    let wide_child = spend_tx(OutPoint { txid: wid, vout: 0 }, 800_000);
+    let r = life
+        .mp
+        .accept_tx(&wide, &wide_utxos, TIP_OK)
+        .expect("parent admits");
+    assert_eq!(policy::get_virtual_size(r.weight), 200_000);
+    life.mp
+        .accept_tx(&wide_child, &wide_utxos, TIP_OK)
+        .expect("child admits");
+    assert_eq!(
+        life.mp.graph.cluster_of(&wid).unwrap().total_weight,
+        wide.weight().to_wu() + wide_child.weight().to_wu()
+    );
+    drop_live(&mut life.mp);
+}
+
+fn sigop_block_budget(life: &mut Life) {
+    let (op, _, utxos) = chain_utxo(100_000);
+    let err = life
+        .mp
+        .accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK)
+        .unwrap_err();
+    assert!(
+        matches!(err, AcceptError::TooManySigops { cost: 80_080 }),
+        "got {err}"
+    );
+    assert_eq!(err.to_string(), "bad-txns-too-many-sigops");
+    assert_eq!(life.mp.live_count(), 0);
+    let fits_default = multisig_outputs_tx(op, 994);
+    let exact_default_budget = multisig_outputs_tx(op, 995);
+    life.mp
+        .accept_tx(&fits_default, &utxos, TIP_OK)
+        .expect("79,520 fits beside the default reserve");
+    assert_eq!(
+        life.mp
+            .select_block_txs(TxGraph::template_tx_weight())
+            .len(),
+        1
+    );
+    life.mp
+        .remove_for_block(&[fits_default.compute_txid()])
+        .unwrap();
+    assert!(matches!(
+        life.mp.accept_tx(&exact_default_budget, &utxos, TIP_OK),
+        Err(AcceptError::TooManySigops { cost: 79_600 })
+    ));
+    life.mp.set_block_reserved_sigops(0);
+    let fits_without_reserve = multisig_outputs_tx(op, 999);
+    life.mp
+        .accept_tx(&fits_without_reserve, &utxos, TIP_OK)
+        .expect("79,920 fits when the template reserve is zero");
+    assert_eq!(
+        life.mp
+            .select_block_txs(TxGraph::template_tx_weight())
+            .len(),
+        1
+    );
+    life.mp
+        .remove_for_block(&[fits_without_reserve.compute_txid()])
+        .unwrap();
+    assert!(matches!(
+        life.mp
+            .accept_tx(&multisig_outputs_tx(op, 1000), &utxos, TIP_OK),
+        Err(AcceptError::TooManySigops { cost: 80_000 })
+    ));
+    assert_eq!(life.mp.live_count(), 0);
+    restore_sigop_knobs(&mut life.mp);
+}
+
+fn sigop_reopen_and_compact(life: &mut Life, dir: &rbitcoin_store::testutil::TempDir) {
+    let (utxos, p2sh, p2wsh) = p2sh_p2wsh_multisig_spends();
+    life.mp.accept_tx(&p2sh, &utxos, TIP_OK).unwrap();
+    life.mp.accept_tx(&p2wsh, &utxos, TIP_OK).unwrap();
+    life.mp.flush().unwrap();
+    life.mp = ActiveMempool::open_or_create(dir).unwrap();
+    assert_eq!(live_sigops(&life.mp, &p2sh), 8);
+    assert_eq!(live_sigops(&life.mp, &p2wsh), 2);
+    life.mp.compact().unwrap();
+    assert_eq!(live_sigops(&life.mp, &p2sh), 8, "compact re-ingest");
+    drop_live(&mut life.mp);
+
+    let (op, _, cutxos) = chain_utxo(100_000);
+    let tx = spend_tx(op, 90_000);
+    life.mp.set_bytes_per_sigop(7);
+    life.mp.set_block_reserved_sigops(12);
+    life.mp.accept_tx(&tx, &cutxos, TIP_OK).unwrap();
+    life.mp.remove_for_block(&[tx.compute_txid()]).unwrap();
+    let _ = life.mp.maybe_compact().unwrap();
+    assert_eq!(life.mp.graph.bytes_per_sigop(), 7);
+    assert_eq!(life.mp.graph.block_reserved_sigops(), 12);
+    restore_sigop_knobs(&mut life.mp);
+    assert_eq!(life.mp.live_count(), 0);
+}
+
 /// One mempool from the first orphan to a full pool: relay order, RBF,
 /// cluster caps, packages, a block, a reorg, a raised `-minrelaytxfee`, and
-/// eviction, against one chain view.
+/// eviction, against one chain view. Sigop-adjusted size, the shared block
+/// sigop budget, and overlay reopen/compact run first on that same pool.
 #[test]
 fn mempool_accept_life() {
     let dir = tmp_dir();
@@ -476,6 +704,11 @@ fn mempool_accept_life() {
             mtp: u32::MAX,
         },
     };
+    sigop_adjusted_vsize_boundary(&mut life);
+    sigop_min_relay_and_pool_floor(&mut life);
+    sigop_rbf_package_and_cluster(&mut life);
+    sigop_block_budget(&mut life);
+    sigop_reopen_and_compact(&mut life, &dir);
     orphan_parks_then_promotes(&mut life);
     invalid_or_spent_parent_does_not_park(&mut life);
     let (rbf_coin, rbf_winner) = full_rbf_and_staged_commit(&mut life);

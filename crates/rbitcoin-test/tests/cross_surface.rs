@@ -1008,6 +1008,9 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
         .as_f64()
         .unwrap_or_else(|| panic!("144-block estimate after relay start: {fee}"));
     assert_eq!((got * 100_000_000.0).round() as u64, rate, "{fee}");
+    let keys: Vec<&String> = fee["result"].as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 2, "only feerate and blocks: {fee}");
+    assert!(fee["result"]["blocks"].is_number(), "{fee}");
 
     // A later block not assembled from the mempool confirms a CPFP package.
     // Its parent and child share the package rate; the unrelated spend keeps

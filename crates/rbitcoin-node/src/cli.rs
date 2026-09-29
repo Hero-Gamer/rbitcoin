@@ -563,50 +563,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bytes_per_sigop_flag_sets_mempool_overlay() {
-        assert_eq!(
-            ready_config(["rbitcoin-node"]).mempool.bytes_per_sigop,
-            None
-        );
-        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop", "0"]);
-        assert_eq!(cfg.mempool.bytes_per_sigop, Some(0));
-        let cfg = ready_config(["rbitcoin-node", "--bytes-per-sigop=40"]);
-        assert_eq!(cfg.mempool.bytes_per_sigop, Some(40));
-        assert_exit(
-            cli_main(["rbitcoin-node", "--bytes-per-sigop=x"]),
-            ExitCode::from(2),
-        );
-    }
-
-    #[test]
-    fn block_reserved_sigops_flag_configures_shared_budget() {
-        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "0"]);
-        assert_eq!(cfg.mempool.block_reserved_sigops, Some(0));
-        let cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops=400"]);
-        assert_eq!(cfg.mempool.block_reserved_sigops, Some(400));
-        let mut cfg = ready_config(["rbitcoin-node", "--block-reserved-sigops", "80001"]);
-        assert!(cfg.validate().is_err());
-        cfg.mempool.block_reserved_sigops = Some(80_000);
-        cfg.validate().expect("consensus maximum is accepted");
-    }
-
-    /// Tweaks need the scriptSig and witness data seqsigwit pruning drops,
-    /// so the pair is refused from the CLI and from the conf file alike.
-    #[test]
-    fn sp_tweaks_refuses_prune_seqsigwit() {
-        let cli = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
-        let err = cli.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
-            "{err}"
-        );
-        let mut conf = NodeConfig::default();
-        conf.apply_kv("prune_seqsigwit", "1").unwrap();
-        conf.apply_kv("sp_tweaks", "1").unwrap();
-        assert!(conf.validate().is_err());
-    }
-
     /// What argv and the conf file assemble before `run_node`. The smoke
     /// journey (`node_cli_and_surface_smoke`) sees only the exit code and
     /// the datadir; these values and the help text are not reported by any
@@ -916,6 +872,54 @@ mod tests {
             bound.listen.p2p_bind_addr(Network::Regtest),
             Some("127.0.0.1:18445".parse().unwrap())
         );
+
+        assert_eq!(
+            ready_config(["rbitcoin-node"]).mempool.bytes_per_sigop,
+            None
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--bytes-per-sigop", "0"])
+                .mempool
+                .bytes_per_sigop,
+            Some(0)
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--bytes-per-sigop=40"])
+                .mempool
+                .bytes_per_sigop,
+            Some(40)
+        );
+        assert_exit(
+            cli_main(["rbitcoin-node", "--bytes-per-sigop=x"]),
+            ExitCode::from(2),
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--block-reserved-sigops", "0"])
+                .mempool
+                .block_reserved_sigops,
+            Some(0)
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--block-reserved-sigops=400"])
+                .mempool
+                .block_reserved_sigops,
+            Some(400)
+        );
+        let mut over = ready_config(["rbitcoin-node", "--block-reserved-sigops", "80001"]);
+        assert!(over.validate().is_err());
+        over.mempool.block_reserved_sigops = Some(80_000);
+        over.validate().expect("consensus maximum is accepted");
+
+        let tweaks = ready_config(["rbitcoin-node", "--sp-tweaks", "--prune-seqsigwit"]);
+        let err = tweaks.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("--sp-tweaks") && err.contains("--prune-seqsigwit"),
+            "{err}"
+        );
+        let mut conf = NodeConfig::default();
+        conf.apply_kv("prune_seqsigwit", "1").unwrap();
+        conf.apply_kv("sp_tweaks", "1").unwrap();
+        assert!(conf.validate().is_err());
     }
 
     include!("overlay_config_journey.rs");

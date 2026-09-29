@@ -83,6 +83,9 @@ fn rpc_regtest_chain_ops() {
     dispatch(&ctx, "generate", vec![json!(120)]).unwrap();
     chain_ops_mature_pad_work(&ctx);
     chain_ops_template_sigops_and_script_reject(&ctx, &mut cbs);
+    chain_ops_sigop_adjusted_entry_and_min_fee(&ctx, &mut cbs);
+    chain_ops_submitpackage_sigop_vsize(&ctx, &mut cbs);
+    chain_ops_big_sigops_cluster(&ctx, &mut cbs);
     chain_ops_prioritise(&ctx, &mut cbs);
     let fee_block = chain_ops_generateblock_and_parent_first(&ctx, &mut cbs);
     chain_ops_proposal_spends(&ctx, &mut cbs);
@@ -696,6 +699,249 @@ fn chain_ops_template_sigops_and_script_reject(ctx: &RpcContext, cbs: &mut TrueC
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&bad_sig))]).unwrap_err();
     assert_eq!(e["code"], ERR_VERIFY_REJECTED);
     assert_eq!(e["message"], reason);
+}
+
+/// Ten bare 20-sigop outputs: cost 800, policy size 4_000 vB at 20 B/sigop.
+fn sigop_heavy_spend(ctx: &RpcContext, height: u32, fee: u64) -> Transaction {
+    use bitcoin::TxOut;
+    let cb = generated_coinbase_value(ctx, height);
+    let mut tx = spend_generated_coinbase(ctx, height, 0, ScriptBuf::new()).1;
+    tx.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_000),
+            // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+        };
+        10
+    ];
+    tx.output[0].value = Amount::from_sat(cb - fee - 9_000);
+    assert_eq!(
+        rbitcoin_consensus::tx_sigop_cost(&tx, &[], false, false),
+        800
+    );
+    tx
+}
+
+fn chain_ops_restore_sigop_mining_knobs(ctx: &RpcContext) {
+    // Hub opened at graph default 20 B/sigop and blockmintxfee 1 sat/kvB.
+    ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(20);
+    ctx.chain
+        .as_ref()
+        .unwrap()
+        .set_block_min_tx_fee_sat_kvb(1);
+}
+
+fn chain_ops_mine_pool_empty(ctx: &RpcContext) {
+    for _ in 0..4 {
+        if dispatch(ctx, "getrawmempool", vec![])
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            return;
+        }
+        dispatch(ctx, "generate", vec![json!(1)]).unwrap();
+    }
+    assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+}
+
+/// `getmempoolentry` vsize is sigop-adjusted; weight and the Esplora/Electrum
+/// surfaces stay raw. `blockmintxfee` uses the adjusted size.
+fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+    let tx = sigop_heavy_spend(ctx, cbs.take(), 2_000);
+    let tid = tx.compute_txid();
+    dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&tx))]).unwrap();
+    let raw_w = tx.weight().to_wu();
+    assert!(raw_w < 16_000);
+    let e = dispatch(
+        ctx,
+        "getmempoolentry",
+        vec![json!(hash_hex_display(&tid.to_byte_array()))],
+    )
+    .unwrap();
+    assert_eq!(e["vsize"], 4_000);
+    assert_eq!(e["weight"], raw_w);
+    assert_eq!(e["ancestorsize"], 4_000);
+    let info = dispatch(ctx, "getmempoolinfo", vec![]).unwrap();
+    assert_eq!(
+        (info["size"].clone(), info["bytes"].clone()),
+        (json!(1), json!(4_000))
+    );
+    assert_eq!(info["total_fee"], json!(0.00002));
+    // Newest accept: the journey already admitted earlier spends into this ring.
+    let recent = ctx.mempool.as_ref().unwrap().recent_accepts();
+    assert_eq!(
+        recent.first().map(|r| (r.txid, r.weight)),
+        Some((tid, raw_w))
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    let raw_vb = raw_w.div_ceil(4);
+    assert_eq!(mp.fee_histogram(), vec![(500, raw_vb)]);
+    assert_eq!(mp.mempool_live_totals(), (1, raw_vb, 2_000));
+
+    let keep = |min| {
+        ctx.chain
+            .as_ref()
+            .unwrap()
+            .set_block_min_tx_fee_sat_kvb(min);
+        crate::methods::mine::mempool_block_txs(ctx)
+    };
+    // 2_000 sat is 0.5 sat/vB at 4_000 vB.
+    assert_eq!(keep(500), vec![tx.clone()]);
+    assert_eq!(keep(501), Vec::<Transaction>::new());
+    ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(0);
+    assert_eq!(keep(501), vec![tx]);
+    chain_ops_restore_sigop_mining_knobs(ctx);
+    chain_ops_mine_pool_empty(ctx);
+}
+
+/// Package-retry `vsize` is sigop-adjusted. The zero-fee parent fails min
+/// relay alone and is admitted with its paying child.
+fn chain_ops_submitpackage_sigop_vsize(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let h = cbs.take();
+    let cb = generated_coinbase_value(ctx, h);
+    let mut parent = spend_generated_coinbase(ctx, h, 0, ScriptBuf::new()).1;
+    parent.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+        };
+        11
+    ];
+    parent.output[0] = TxOut {
+        value: Amount::from_sat(cb - 10_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let mut child = parent.clone();
+    child.input = vec![TxIn {
+        previous_output: OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    }];
+    child.output = vec![TxOut {
+        value: Amount::from_sat(cb - 10_000 - 50_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    }];
+    let hexes = [&parent, &child].map(|t| json!(tx_hex(t)));
+    let r = dispatch(ctx, "submitpackage", vec![json!(hexes)]).unwrap();
+    assert_eq!(r["package_msg"], "success", "{r}");
+    let row = |t: &Transaction| {
+        r["tx-results"][hash_hex_display(&t.compute_wtxid().to_byte_array())].clone()
+    };
+    assert!(parent.weight().to_wu() < 16_000);
+    assert_eq!(row(&parent)["vsize"], 4_000, "{r}");
+    assert_eq!(row(&child)["vsize"], child.vsize(), "{r}");
+    chain_ops_mine_pool_empty(ctx);
+}
+
+/// Core `CreateBigSigOpsCluster`: 1 parent + 50 children, legacy cost
+/// 20_001 * 4. The template stays under the block sigop budget.
+fn chain_ops_big_sigops_cluster(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::script::Builder;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{CompactTarget, OutPoint, Sequence, TxIn, TxMerkleNode, TxOut, Witness};
+    let h = cbs.take();
+    let cb_val = generated_coinbase_value(ctx, h);
+    let mut parent = spend_generated_coinbase(ctx, h, 0, ScriptBuf::new()).1;
+    // OP_0 OP_0 OP_CHECKSIG OP_1: one legacy sigop in the scriptSig.
+    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00, 0xac, 0x51]);
+    parent.output = (0..50)
+        .map(|_| TxOut {
+            value: Amount::from_sat(cb_val / 50),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        })
+        .collect();
+    parent.output[0].value -= Amount::from_sat(100_000);
+    let pid = parent.compute_txid();
+    let mut txs = vec![parent];
+    for i in 0..50u32 {
+        let mut out = vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+            };
+            20
+        ];
+        let fee = 10_000 + 100 * u64::from(50 - i);
+        out[0].value = txs[0].output[i as usize].value - Amount::from_sat(fee + 19_000);
+        txs.push(Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: pid, vout: i },
+                script_sig: ScriptBuf::from_bytes(vec![0x51]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: out,
+        });
+    }
+    let legacy: u64 = txs
+        .iter()
+        .map(|t| rbitcoin_consensus::tx_sigop_cost(t, &[], false, false))
+        .sum();
+    assert_eq!(legacy, 20_001 * 4);
+    for t in &txs {
+        dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(t))]).unwrap();
+    }
+
+    let tmpl = dispatch(ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let ttxs = tmpl["transactions"].as_array().unwrap();
+    let sigops: u64 = ttxs.iter().map(|t| t["sigops"].as_u64().unwrap()).sum();
+    // Parent + 49 children: 400 + 4 + 49 * 1_600 < 80_000; a 50th reaches 80_404.
+    assert_eq!(ttxs.len(), 50, "{tmpl}");
+    assert_eq!(sigops, 4 + 49 * 1_600);
+    assert!(sigops <= 80_000 - 400);
+
+    let next_h = tmpl["height"].as_u64().unwrap();
+    let coinbase = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: Builder::new()
+                .push_int(next_h as i64)
+                .push_int(1)
+                .into_script(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(tmpl["coinbasevalue"].as_u64().unwrap()),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut txdata = vec![coinbase];
+    for t in ttxs {
+        let raw = hex_decode(t["data"].as_str().unwrap()).unwrap();
+        txdata.push(deserialize(&raw).unwrap());
+    }
+    let prev = parse_hash32_display(tmpl["previousblockhash"].as_str().unwrap()).unwrap();
+    let mut block = Block {
+        header: Header {
+            version: BlockVersion::from_consensus(tmpl["version"].as_i64().unwrap() as i32),
+            prev_blockhash: bitcoin::BlockHash::from_byte_array(prev),
+            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            time: tmpl["curtime"].as_u64().unwrap() as u32,
+            bits: CompactTarget::from_consensus(
+                u32::from_str_radix(tmpl["bits"].as_str().unwrap(), 16).unwrap(),
+            ),
+            nonce: 0,
+        },
+        txdata,
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    assert_eq!(crate::methods::mine::gbt_check_proposal(ctx, &block), Ok(()));
+    chain_ops_mine_pool_empty(ctx);
 }
 
 fn chain_ops_prioritise(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
