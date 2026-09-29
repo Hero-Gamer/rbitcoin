@@ -4,13 +4,15 @@ use super::*;
 use crate::U64Map;
 use std::time::Instant;
 
-/// A confirmed block's fee facts for fee history (coinbase excluded).
+const TXSTAT_BODY_ROW_BYTES: u64 = 8;
+
+/// Stamped fee/weight rows from `txstat.body`; `None` means at least one row
+/// in the block is unstamped. Byte count includes the coinbase cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockFeeRows {
-    /// `(fee_sat, weight)` per tx, block order.
-    pub rows: Vec<(u64, u64)>,
-    /// In-block `(parent, child)` spends, indices into `rows`.
-    pub edges: Vec<(u32, u32)>,
+pub struct BlockTxStatRows {
+    pub hash: [u8; 32],
+    pub rows: Option<Vec<(u64, u64)>>,
+    pub txstat_bytes: u64,
 }
 
 /// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
@@ -44,6 +46,48 @@ fn block_size_weight_from_txstat(
 }
 
 impl Query {
+    /// Read confirmed block fee/weight rows from txstat only, without spent data.
+    pub fn block_txstat_rows(&self, height: Height) -> Result<Option<BlockTxStatRows>, QueryError> {
+        let Some((header_fk, header)) = self.header_at_height(height)? else {
+            return Ok(None);
+        };
+        let hash = header.hash;
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        if n == 0 {
+            return Ok(Some(BlockTxStatRows {
+                hash,
+                rows: None,
+                txstat_bytes: 0,
+            }));
+        }
+        let last = first
+            .0
+            .checked_add(u64::from(n - 1))
+            .ok_or(StoreError::Corrupt("invariant: header_txs last fk"))?;
+        let packed = self.store.txstat_range(header_fk, first.0, last)?;
+        let txstat_bytes = u64::from(n).saturating_mul(TXSTAT_BODY_ROW_BYTES);
+        if packed.len() != n as usize || packed.iter().any(Option::is_none) {
+            return Ok(Some(BlockTxStatRows {
+                hash,
+                rows: None,
+                txstat_bytes,
+            }));
+        }
+        let rows = packed
+            .into_iter()
+            .skip(1)
+            .flatten()
+            .map(|r| (r.fee_sat, r.weight()))
+            .collect();
+        Ok(Some(BlockTxStatRows {
+            hash,
+            rows: Some(rows),
+            txstat_bytes,
+        }))
+    }
+
     fn load_body_from_store(
         &self,
         fk: Fk,
@@ -496,50 +540,6 @@ impl Query {
             rows: packed.into_iter().map(|r| r.unwrap()).collect(),
             n_outs,
         }))
-    }
-
-    /// Fee rows and in-block spend edges for a confirmed height, from `txstat`
-    /// and one `spent.body` span (plus `spent.ovf` for multi-spender slots).
-    /// No bodies. `None` when a row is unstamped or the height has no txs.
-    pub fn block_fee_rows(&self, height: Height) -> Result<Option<BlockFeeRows>, QueryError> {
-        let Some((header_fk, _)) = self.header_at_height(height)? else {
-            return Ok(None);
-        };
-        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
-            return Ok(None);
-        };
-        if n == 0 {
-            return Ok(None);
-        }
-        let last = first
-            .0
-            .checked_add(u64::from(n - 1))
-            .ok_or(StoreError::Corrupt("invariant: header_txs last fk"))?;
-        let packed = self.store.txstat_range(header_fk, first.0, last)?;
-        if packed.len() != n as usize || packed.iter().any(Option::is_none) {
-            return Ok(None);
-        }
-        let fks: Vec<Fk> = (first.0..=last).map(Fk).collect();
-        let spent = self
-            .store
-            .tx_spent_range_batch(&fks)?
-            .into_iter()
-            .map(|r| r.ok_or(StoreError::Corrupt("invariant: block tx spent range")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let edges = self
-            .store
-            .in_block_spend_edges(first, &spent)?
-            .into_iter()
-            .filter(|&(p, c)| p > 0 && c > 0)
-            .map(|(p, c)| (p - 1, c - 1))
-            .collect();
-        let rows = packed
-            .into_iter()
-            .skip(1)
-            .flatten()
-            .map(|r| (r.fee_sat, r.weight()))
-            .collect();
-        Ok(Some(BlockFeeRows { rows, edges }))
     }
 
     /// Sum of non-coinbase output values (first fk is coinbase). Reads `txout` only.

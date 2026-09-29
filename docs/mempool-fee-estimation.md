@@ -13,10 +13,12 @@ The **default** fee estimate this node advertises answers:
 | Esplora fee endpoints (primary) | Same |
 | Optional target-depth knobs | **Near:** flow invert. **Far:** block history. Blended. |
 
-Near (1–6 blocks) is live stock + capped admit-EMA. Far (144/504/1008) is
-**what recent blocks actually paid** (per-block p10 of confirmed packages),
-not min-relay and not the cheapest live chunk. Mid depths blend
-`w(N)=exp(-(N-1)/6)`.
+Once flow is warm, the 1-block target is live stock and capped admit-EMA at
+99.9% confidence, conditional on the next block arriving within 10 minutes;
+history answers only when flow has nothing to say. Targets from 2 blocks blend
+the flow rate with the 99% historical rate as `w·R_flow + (1-w)·R_hist`,
+`w(N)=exp(-(N-1)/6)`, so neither is a floor for the other (`w(2)≈0.85`). While
+flow is cold, history answers alone and the live pool may only raise it.
 
 ## Non-blocking vs accept (published snapshot)
 
@@ -43,26 +45,29 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    package/chunk weight per second (`FeeFlowMeter` on successful accept).
 4. **Include at R** when
    `stock_above(R) + λ(c)·projected_inflow(R, min(N×600s, 600s)) ≤ fill(c) × N × 4e6`.
-   `c(N)` is 0.99 at N=1, linear to 0.90 at N=6, then flat. `fill(0.99)=0.80`,
-   `fill(0.90)=0.95`; `λ(0.99)=2`, `λ(0.90)=1`. Inflow horizon is capped at
+   `c(N)` is 0.999 at N=1 and 0.99 for N≥2. `fill(0.999)=0.80`,
+   `fill(0.99)=0.95`; `λ(0.999)=2`, `λ(0.99)=1`. Inflow horizon is capped at
    ~4 admit half-lives so a 150 s EMA is not stretched to a week.
 5. **Frontier** is the marginal chunk at `N×4e6` WU. If the pool is thinner
    than N blocks, stock does **not** set a far rate (no last-chunk-as-far).
-   Near depths (`w≥0.5`, N=1–5) with any live stock still answer min-relay
-   (the next few blocks have room).
-6. **Far / blend:** `R = w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`.
-   `R_hist` is the `100·c(N)` percentile (median if <12 samples) of per-block
-   p10 confirmed package feerates. Then enforce `R(1) ≥ R(2) ≥ …`.
-7. **N=1** may additionally clip to the confirm-memory **p90** (64-sample
-   ring; not max-of-64). Long N does not.
+   With warm flow, near depths (`w≥0.5`, N=1–5) with any live stock still
+   answer min-relay (the next few blocks have room).
+6. **Blend (warm flow):** N=1 is `R_flow`, or `R_hist` when flow is undefined.
+   N≥2 is `w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`; a missing side
+   drops out. Then enforce `R(1)≥R(2)≥…`.
+7. **N=1** with warm flow may additionally clip to the confirm-memory **p90**
+   (64-sample ring; not max-of-64), and falls back to it when neither flow nor
+   history has a rate. Long N does not.
 
-**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits),
-`R_flow` is frontier, or min-relay on an under-full **near** depth with live
-stock. If **no** depth has a defined rate (empty pool, no hist), APIs return
-insufficient (RPC / Electrum `-1`; Esplora leaves the target out and
-answers **503** when no target has a rate). If a nearer depth is defined and later
-N is not (pool thinner than N, no hist), **hold the last defined rate**
-so far targets do not drop out while a nearer one has a rate.
+**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits), a
+restarted pool can be thin or missing what peers relayed while the node was
+down, so each target is `R_hist`, raised to the frontier when the pool reaches
+that deep, and never lowered by the pool. A target whose history is not ready
+has no rate. If **no** depth has a rate, APIs return insufficient (RPC /
+Electrum `-1`; Esplora leaves the target out and answers **503** when no
+target has a rate). If a nearer depth is defined and a later one is not,
+**hold the last defined rate** so far targets do not drop out. The node logs
+when flow warms and how many targets' history is ready.
 
 ### Parameters (code constants, not env)
 
@@ -70,14 +75,19 @@ so far targets do not drop out while a nearer one has a rate.
 |-----------|--------|
 | Block weight capacity | 4_000_000 WU |
 | Seconds per planned block | 600 |
-| Capacity fill at c=0.99 / 0.90 | 80% / 95% of N×4e6 |
-| Inflow λ multiplier at c=0.99 / 0.90 | 2.0 / 1.0 |
-| Inclusion confidence | 0.99 at N=1 → 0.90 at N≥6 |
+| Capacity fill at c=0.999 / 0.99 | 80% / 95% of N×4e6 |
+| Inflow λ multiplier at c=0.999 / 0.99 | 2.0 / 1.0 |
+| Inclusion confidence | 0.999 at N=1; 0.99 at N≥2 |
 | Admit EMA half-life | ~150 s |
 | Inflow horizon cap | 600 s |
 | Blend N0 | 6 blocks |
 | Fine candidates | 100 sat/kvB steps to 10 sat/vB |
 | Warm | 60 s + 32 admits |
+| Historical confidence | 0.999 at N=1; 0.99 at N≥2 |
+| Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
+| Analog band / min neighbors / ready | ×1.25 / 200 / 2000 windows |
+| History budget | 1 GiB of `txstat.body` cells |
+| History file | snapshot every 144 connects + per-connect journal |
 | Bucket edges (sat/kvB) | 100…100000 (+ open top) |
 
 ### Confirm-memory / block history
@@ -85,18 +95,58 @@ so far targets do not drop out while a nearer one has a rate.
 Confirmed mempool entries' feerates on `remove_for_block` fill a 64-sample
 ring (**N=1 p90 clip**). Process-local.
 
-`R_hist` reads the **chain**, not this pool. Each block's p10 comes from its
-stored `txstat` fee/weight rows and in-block spend edges (one `spent.body`
-span, rare `spent.ovf` walk), so it counts txs this node never saw.
-Every tx gets the rate of the ancestor set it was selected with: within
-each in-block package, the tx whose in-package ancestor set pays best takes
-that set, so a CPFP parent counts at its package rate and a cheap child does
-not pull its parent down. Packages over 64 txs share one aggregate rate.
-Rates below min relay (out-of-band or zero-fee inclusions) are dropped
-before the p10. History is keyed by height (a connect at `h` replaces any
-branch above it) and holds the newest 1008 blocks. It is backfilled from
-the chain when relay turns on, so far targets answer right after a restart.
-Core persists `fee_estimates.dat` for the same reason; this needs no file.
+`R_hist` reads the **chain**, not this pool. Each block's hurdle is the
+vsize-weighted p10 of individual confirmed transaction feerates, from its
+stored `txstat` rows alone; rates below min relay (out-of-band or zero-fee
+inclusions) are dropped first. A block with no hurdle left (coinbase-only, or
+every tx below min relay) is not an observation: windows count only blocks
+that carried transactions, so an N-block confidence is conditional on those
+blocks carrying transactions. On mainnet such blocks are ~0.1% and almost
+always isolated; counting them as misses made the 99.9% 1-block target
+unanswerable about half the time.
+
+**Analog windows.** For target N, each window of N hurdle blocks pairs the
+median hurdle of the `L = clamp(N/4, 3, 144)` blocks before it with the lowest
+hurdle inside it (a tx at that rate would have beaten some block's p10). An
+estimate keeps the windows whose lookback median is within ×1.25 of the
+current lookback median (at least the 200 nearest) and takes the 99% quantile
+of their lowest hurdles (99.9% at N=1). Windows that started inside a spike
+stop steering a calm market, and a spike in progress finds the windows that
+started inside past spikes. A target answers once it holds 2000 windows: at
+least 2000 + L + N − 1 hurdle blocks.
+
+On a mainnet backtest over ~2.9 years of `txstat` (every 36 blocks, each
+estimate from the 1 GiB before it, scored against the next N hurdle blocks),
+analog windows covered 99.1–99.5% at 2–144 blocks and 99.91% at 1 block
+(99.9% target), at a median 2.0–3.3× the realized hurdle (7.1× at 1 block).
+Flat quantiles over the same history covered 98.5–99.8% at 9–20× (46× at 1
+block), because a spike kept steering estimates for months. Long targets
+(504/1008) cover ~97.7%; their windows overlap so heavily that about a
+hundred are independent. These are empirical predictions from overlapping
+windows, not formal statistical guarantees.
+
+**Budget and preload.** History is keyed by height and bounded by 1 GiB of
+`txstat.body` cells (8 B per tx, coinbase included): ~31k mainnet blocks at a
+2026 tip. When relay turns on, the node restores the history file, then scans
+backward from the tip until the budget is met, reading no `spent.body` data or
+transaction bodies and no height it already holds (~12 s per GiB cold on the
+agent VM). A connect at `h` replaces any branch above it. Analog windows are
+kept in step as blocks are added or dropped at either end; an insert between
+held heights rebuilds them once before the next estimate, and estimates are
+recomputed only after the history changes. RAM: ~5.5 MiB of windows at 11
+targets; CPU: ~2 ms per new block for all targets.
+
+**History file.** `mempool/fee_history` is a snapshot (height, hurdle, cells
+per height, plus the newest 144 block hashes), rewritten after each preload
+and every 144 connects (~500 KiB, one fsync). `mempool/fee_history.log` is a
+journal of 52-byte records (height, cells, hurdle, block hash, check) appended
+per connect without fsync. On load the journal replays onto the snapshot only
+if it extends that snapshot, stops at a torn record, and everything above the
+newest stored hash still on the best chain is dropped (a reorg while down).
+The file is a cache of `txstat`: a damaged, foreign, or other-version file is
+dropped with a log line and those heights are read from the chain again. The
+preload log line reports heights from the file, heights read, skips,
+failures, ready targets, and elapsed time.
 
 ### Histogram / relayfee
 
@@ -115,7 +165,8 @@ construction, or witness nonces.
   included p10s, not first-seen delay buckets)
 - Full multi-node flow aggregation / peer bandwidth models
 - Changing Libre min relay, dust, or full-RBF defaults
-- Persisting flow meters across process restart (process-local)
+- Persisting flow meters across process restart (process-local; fee
+  history is persisted, flow is not)
 
 ## Related
 

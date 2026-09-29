@@ -11,11 +11,9 @@ pub const BLOCK_WEIGHT_WU: u64 = 4_000_000;
 pub const SECONDS_PER_BLOCK: u64 = 600;
 
 /// Inclusion confidence at N=1 (10-minute default). Higher → higher sat/vB.
-pub const CONFIDENCE_NEAR: f64 = 0.99;
-/// Inclusion confidence at N≥6 (mid and far). Held flat from there.
-pub const CONFIDENCE_FAR: f64 = 0.90;
-/// First N where `c(N) = CONFIDENCE_FAR`.
-pub const CONFIDENCE_FADE_BLOCKS: u32 = 6;
+pub const CONFIDENCE_NEAR: f64 = 0.999;
+/// Inclusion confidence for historical/blended targets from N=2 onward.
+pub const CONFIDENCE_FAR: f64 = 0.99;
 /// Fraction of `N×4e6` WU to fill at `CONFIDENCE_NEAR` (leave shock room).
 pub const FILL_AT_NEAR: f64 = 0.80;
 /// Fraction of `N×4e6` WU to fill at `CONFIDENCE_FAR` (today's 95% haircut).
@@ -75,14 +73,13 @@ pub fn horizon_secs(n_blocks: u32) -> u64 {
     n.saturating_mul(SECONDS_PER_BLOCK)
 }
 
-/// Inclusion confidence `c(N)`: 0.99 at N=1, linear to 0.90 at N=6, then flat.
+/// Flow capacity confidence: 0.999 at N=1 and 0.99 at every farther depth.
 fn inclusion_confidence(n_blocks: u32) -> f64 {
-    let n = n_blocks.max(1);
-    if n >= CONFIDENCE_FADE_BLOCKS {
-        return CONFIDENCE_FAR;
+    if n_blocks <= 1 {
+        CONFIDENCE_NEAR
+    } else {
+        CONFIDENCE_FAR
     }
-    let t = f64::from(n - 1) / f64::from(CONFIDENCE_FADE_BLOCKS - 1);
-    CONFIDENCE_NEAR + t * (CONFIDENCE_FAR - CONFIDENCE_NEAR)
 }
 
 fn lerp_conf(c: f64, y_near: f64, y_far: f64) -> f64 {
@@ -242,19 +239,6 @@ pub fn flow_for_depth(
     flow
 }
 
-/// `w·flow + (1-w)·hist`. Missing side drops out.
-pub fn blend_sat_kvb(flow: Option<u64>, hist: Option<u64>, n_blocks: u32) -> Option<u64> {
-    match (flow, hist) {
-        (Some(f), Some(h)) => {
-            let w = blend_weight(n_blocks);
-            Some((w * f as f64 + (1.0 - w) * h as f64).round() as u64)
-        }
-        (Some(f), None) => Some(f),
-        (None, Some(h)) => Some(h),
-        (None, None) => None,
-    }
-}
-
 /// `pct` in 0..=100. Empty → None.
 pub fn percentile_sat(mut v: Vec<u64>, pct: u8) -> Option<u64> {
     if v.is_empty() {
@@ -266,107 +250,69 @@ pub fn percentile_sat(mut v: Vec<u64>, pct: u8) -> Option<u64> {
     Some(v[i])
 }
 
-/// In-block package larger than this shares one aggregate rate instead of
-/// ancestor-set chunking, which is quadratic in the package size.
-pub const BLOCK_PACKAGE_MAX_TXS: usize = 64;
-
-/// Package-aware rate (sat/kvB) of each block tx, from `(fee_sat, weight)`
-/// rows and in-block `(parent, child)` spend edges (indices into `txs`).
-///
-/// Each connected package is split greedily: the remaining tx whose
-/// in-package ancestor set has the best rate takes that set at that rate, as
-/// a miner selecting by ancestor feerate would. A CPFP parent gets its
-/// child's package rate; a cheap child does not drag down its parent.
-pub fn block_package_rates(txs: &[(u64, u64)], edges: &[(u32, u32)]) -> Vec<u64> {
+/// Vsize-weighted p10 of individual transactions in one block.
+pub fn block_individual_p10_sat_kvb(txs: &[(u64, u64)], min_relay: u64) -> Option<u64> {
     use rbitcoin_consensus::policy::fee_rate_sat_per_kvb;
-    let n = txs.len();
-    let mut parents: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut root: Vec<usize> = (0..n).collect();
-    fn find(root: &mut [usize], mut i: usize) -> usize {
-        while root[i] != i {
-            root[i] = root[root[i]];
-            i = root[i];
-        }
-        i
-    }
-    for &(p, c) in edges {
-        let (p, c) = (p as usize, c as usize);
-        if p >= n || c >= n || p == c {
-            continue;
-        }
-        parents[c].push(p);
-        let (rp, rc) = (find(&mut root, p), find(&mut root, c));
-        root[rp] = rc;
-    }
-    let mut packages: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for i in 0..n {
-        let r = find(&mut root, i);
-        packages.entry(r).or_default().push(i);
-    }
-    let mut rates = vec![0u64; n];
-    for members in packages.into_values() {
-        if members.len() > BLOCK_PACKAGE_MAX_TXS {
-            let fee = members.iter().map(|&i| txs[i].0).sum();
-            let weight = members.iter().map(|&i| txs[i].1).sum();
+
+    let mut rates: Vec<(u64, u64)> = txs
+        .iter()
+        .filter_map(|&(fee, weight)| {
+            if weight == 0 {
+                return None;
+            }
             let rate = fee_rate_sat_per_kvb(fee, weight);
-            for i in members {
-                rates[i] = rate;
-            }
-            continue;
-        }
-        let mut left: std::collections::BTreeSet<usize> = members.into_iter().collect();
-        while !left.is_empty() {
-            let mut best: Option<(u64, Vec<usize>)> = None;
-            for &tip in &left {
-                let mut set = vec![tip];
-                let mut i = 0;
-                while i < set.len() {
-                    for &p in &parents[set[i]] {
-                        if left.contains(&p) && !set.contains(&p) {
-                            set.push(p);
-                        }
-                    }
-                    i += 1;
-                }
-                let fee = set.iter().map(|&j| txs[j].0).sum();
-                let weight = set.iter().map(|&j| txs[j].1).sum();
-                let rate = fee_rate_sat_per_kvb(fee, weight);
-                if best.as_ref().is_none_or(|(r, _)| rate > *r) {
-                    best = Some((rate, set));
-                }
-            }
-            let (rate, set) = best.expect("left is not empty");
-            for j in set {
-                rates[j] = rate;
-                left.remove(&j);
-            }
-        }
-    }
-    rates
-}
-
-/// A block's p10 package rate (sat/kvB) over txs at or above `min_relay`.
-/// Rates below it (out-of-band or zero-fee inclusions) are not market rates.
-pub fn block_p10_sat_kvb(txs: &[(u64, u64)], edges: &[(u32, u32)], min_relay: u64) -> Option<u64> {
-    let rates = block_package_rates(txs, edges)
-        .into_iter()
-        .filter(|&r| r >= min_relay)
+            (rate >= min_relay).then_some((rate, weight.saturating_add(3) / 4))
+        })
         .collect();
-    percentile_sat(rates, 10)
-}
-
-/// Per-block p10 ring → quantile `100·c(N)` (median if fewer than 12 samples).
-pub fn historical_far_sat_kvb(block_p10s: &[u64], n_blocks: u32) -> Option<u64> {
-    if block_p10s.is_empty() {
+    if rates.is_empty() {
         return None;
     }
-    let pct = if block_p10s.len() >= 12 {
-        (inclusion_confidence(n_blocks) * 100.0).round() as u8
+    rates.sort_unstable_by_key(|(rate, _)| *rate);
+    let total_vsize = rates.iter().map(|(_, vsize)| *vsize).sum::<u64>();
+    let cutoff = total_vsize.saturating_mul(10).div_ceil(100).max(1);
+    let mut seen = 0u64;
+    for (rate, vsize) in rates {
+        seen = seen.saturating_add(vsize);
+        if seen >= cutoff {
+            return Some(rate);
+        }
+    }
+    None
+}
+
+/// `w·flow + (1-w)·hist` with `w = blend_weight(N)`. Missing side drops out.
+fn blend_sat_kvb(flow: Option<u64>, hist: Option<u64>, n_blocks: u32) -> Option<u64> {
+    match (flow, hist) {
+        (Some(f), Some(h)) => {
+            let w = blend_weight(n_blocks);
+            Some((w * f as f64 + (1.0 - w) * h as f64).round() as u64)
+        }
+        (flow, hist) => flow.or(hist),
+    }
+}
+
+/// One target's rate (sat/kvB) before the monotone pass.
+///
+/// Once flow is warm, the 1-block target is flow (history only when flow has
+/// nothing to say) and farther targets blend flow with history by `w(N)`, so
+/// neither is a floor for the other. While flow is cold, history answers
+/// alone and the live pool may only raise it: a restarted pool can be thin
+/// or missing what peers relayed while this node was down.
+pub fn depth_rate_sat_kvb(
+    n_blocks: u32,
+    flow_warm: bool,
+    flow: Option<u64>,
+    frontier: Option<u64>,
+    hist: Option<u64>,
+) -> Option<u64> {
+    if !flow_warm {
+        return hist.map(|h| frontier.map_or(h, |f| h.max(f)));
+    }
+    if n_blocks <= 1 {
+        flow.or(hist)
     } else {
-        50
-    };
-    percentile_sat(block_p10s.to_vec(), pct)
+        blend_sat_kvb(flow, hist, n_blocks)
+    }
 }
 
 /// Enforce R(1) ≥ R(2) ≥ … in place (depths already sorted ascending).
@@ -470,58 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn blend_is_flow_at_one_and_hist_at_far() {
-        assert!((blend_weight(1) - 1.0).abs() < 1e-9);
-        assert!(blend_weight(144) < 0.01);
-        let r1 = blend_sat_kvb(Some(5_000), Some(2_000), 1).unwrap();
-        let r144 = blend_sat_kvb(Some(5_000), Some(2_000), 144).unwrap();
-        assert!((r1 as i64 - 5_000).abs() < 50, "{r1}");
-        assert!((r144 as i64 - 2_000).abs() < 50, "{r144}");
-        assert!(r1 > r144);
-        assert_eq!(blend_sat_kvb(Some(9_000), None, 6), Some(9_000));
-        assert_eq!(blend_sat_kvb(None, Some(3_000), 6), Some(3_000));
-        assert_eq!(blend_sat_kvb(None, None, 6), None);
-        let mid = blend_sat_kvb(Some(10_000), Some(0), 6).unwrap();
-        assert!(mid > 0 && mid < 10_000, "{mid}");
-        assert!((blend_weight(0) - blend_weight(1)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn historical_far_uses_high_percentile_when_warm() {
-        let mut v = vec![1_000u64; 12];
-        v[11] = 8_000;
-        let far = historical_far_sat_kvb(&v, 144).unwrap();
-        assert!(far >= 1_000);
-        let cold: Vec<u64> = (1..=11).map(|i| i * 1_000).collect();
-        let warm: Vec<u64> = (1..=12).map(|i| i * 1_000).collect();
-        let cold_p = historical_far_sat_kvb(&cold, 144).unwrap();
-        let warm_p = historical_far_sat_kvb(&warm, 144).unwrap();
-        assert!(
-            warm_p > cold_p,
-            "12 samples use p85, 11 use median: warm={warm_p} cold={cold_p}"
-        );
-        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 0), Some(1));
-        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 100), Some(5));
-        assert_eq!(percentile_sat(vec![1, 2, 3, 4, 5], 255), Some(5));
-        assert!(historical_far_sat_kvb(&[], 144).is_none());
-        assert_eq!(historical_far_sat_kvb(&[1_000, 2_000], 144), Some(1_000));
-    }
-
-    #[test]
     fn confidence_schedule_and_fill() {
-        assert!((inclusion_confidence(1) - 0.99).abs() < 1e-12);
-        assert!((inclusion_confidence(6) - 0.90).abs() < 1e-12);
-        assert!((inclusion_confidence(144) - 0.90).abs() < 1e-12);
-        assert!(inclusion_confidence(1) > inclusion_confidence(3));
-        assert!(inclusion_confidence(3) > inclusion_confidence(6));
-        assert!((fill_frac(0.99) - 0.80).abs() < 1e-12);
-        assert!((fill_frac(0.90) - 0.95).abs() < 1e-12);
-        assert!((lambda_mult(0.99) - 2.0).abs() < 1e-12);
-        assert!((lambda_mult(0.90) - 1.0).abs() < 1e-12);
+        assert!((inclusion_confidence(1) - 0.999).abs() < 1e-12);
+        assert!((inclusion_confidence(2) - 0.99).abs() < 1e-12);
+        assert!((inclusion_confidence(1008) - 0.99).abs() < 1e-12);
+        assert!((fill_frac(0.999) - 0.80).abs() < 1e-12);
+        assert!((fill_frac(0.99) - 0.95).abs() < 1e-12);
+        assert!((lambda_mult(0.999) - 2.0).abs() < 1e-12);
+        assert!((lambda_mult(0.99) - 1.0).abs() < 1e-12);
         assert_eq!(effective_capacity_wu(1), 3_200_000);
         assert_eq!(
-            effective_capacity_wu(6),
-            (6.0_f64 * 4_000_000.0 * 0.95).round() as u64
+            effective_capacity_wu(2),
+            (2.0_f64 * 4_000_000.0 * 0.95).round() as u64
         );
     }
 
@@ -549,12 +455,64 @@ mod tests {
     }
 
     #[test]
-    fn hist_quantile_is_higher_at_n1_than_n144() {
-        let v: Vec<u64> = (0..20).map(|i| 1_000 + i * 100).collect();
-        let n1 = historical_far_sat_kvb(&v, 1).unwrap();
-        let n144 = historical_far_sat_kvb(&v, 144).unwrap();
-        assert!(n1 >= n144, "p99 vs p90: {n1} vs {n144}");
-        assert!(n144 >= 1_000);
+    fn individual_txstat_p10_is_vsize_weighted_and_relay_filtered() {
+        let rows = [(1_000, 400), (5_000, 400), (9_000, 400), (1, 400)];
+        assert_eq!(block_individual_p10_sat_kvb(&rows, 100), Some(10_000));
+        assert_eq!(block_individual_p10_sat_kvb(&[(1, 400)], 100), None);
+        assert_eq!(block_individual_p10_sat_kvb(&[], 100), None);
+    }
+
+    #[test]
+    fn blend_is_flow_at_one_and_hist_at_far() {
+        assert_eq!(blend_sat_kvb(Some(5_000), Some(2_000), 1), Some(5_000));
+        let r144 = blend_sat_kvb(Some(5_000), Some(2_000), 144).unwrap();
+        assert!((r144 as i64 - 2_000).abs() < 5, "{r144}");
+        let r2 = blend_sat_kvb(Some(5_000), Some(2_000), 2).unwrap();
+        assert!(r2 > 4_000 && r2 < 5_000, "w(2) is mostly flow: {r2}");
+        assert_eq!(blend_sat_kvb(Some(9_000), None, 6), Some(9_000));
+        assert_eq!(blend_sat_kvb(None, Some(3_000), 6), Some(3_000));
+        assert_eq!(blend_sat_kvb(None, None, 6), None);
+    }
+
+    #[test]
+    fn warm_flow_drives_near_targets_without_a_history_floor() {
+        // 1 block: flow alone, even far under history
+        assert_eq!(
+            depth_rate_sat_kvb(1, true, Some(1_000), None, Some(9_000)),
+            Some(1_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(1, true, None, None, Some(9_000)),
+            Some(9_000)
+        );
+        // 2 blocks: a blend, pulled mostly toward flow
+        let r2 = depth_rate_sat_kvb(2, true, Some(1_000), Some(1_000), Some(9_000)).unwrap();
+        assert!(r2 > 1_000 && r2 < 3_000, "{r2}");
+        let r2 = depth_rate_sat_kvb(2, true, Some(9_000), Some(9_000), Some(1_000)).unwrap();
+        assert!(
+            r2 > 7_000 && r2 < 9_000,
+            "history does not floor flow either: {r2}"
+        );
+    }
+
+    #[test]
+    fn cold_flow_serves_history_that_the_pool_can_only_raise() {
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, Some(100), Some(100), Some(4_000)),
+            Some(4_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(1, false, Some(100), None, Some(4_000)),
+            Some(4_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, None, Some(6_000), Some(4_000)),
+            Some(6_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, Some(6_000), Some(6_000), None),
+            None
+        );
     }
 
     #[test]
@@ -608,87 +566,5 @@ mod tests {
             flow_for_depth(None, Some(3_000), true, 144, min_r),
             Some(3_000)
         );
-    }
-
-    // (fee_sat, weight_wu); 1000 WU = 250 vB, so fee 250 is 1000 sat/kvB.
-    #[test]
-    fn block_package_rates_for_independent_txs_are_their_own() {
-        let txs = [(250, 1_000), (2_500, 1_000)];
-        assert_eq!(block_package_rates(&txs, &[]), vec![1_000, 10_000]);
-        assert_eq!(
-            block_package_rates(&txs, &[(2, 0), (0, 2)]),
-            [1_000, 10_000],
-            "out-of-range block edges are ignored"
-        );
-    }
-
-    #[test]
-    fn block_package_rates_give_a_cpfp_parent_its_package_rate() {
-        // zero-fee parent, child pays for both: 5000 sat / 500 vB
-        let txs = [(0, 1_000), (5_000, 1_000)];
-        assert_eq!(block_package_rates(&txs, &[(0, 1)]), vec![10_000, 10_000]);
-    }
-
-    #[test]
-    fn block_package_rates_do_not_average_a_cheap_child_into_its_parent() {
-        // parent mines alone at 40000; the cheap child is its own chunk
-        let txs = [(10_000, 1_000), (250, 1_000)];
-        assert_eq!(block_package_rates(&txs, &[(0, 1)]), vec![40_000, 1_000]);
-    }
-
-    #[test]
-    fn block_package_rates_take_the_best_ancestor_set_first() {
-        // a -> b -> c: {a,b,c} = 12000/750 vB = 16000 beats {a} = 4000
-        // and {a,b} = 2000/500 vB = 4000
-        let txs = [(1_000, 1_000), (1_000, 1_000), (10_000, 1_000)];
-        let rates = block_package_rates(&txs, &[(0, 1), (1, 2)]);
-        assert_eq!(rates, vec![16_000, 16_000, 16_000]);
-
-        let tied = block_p10_sat_kvb(
-            &[(250, 1_000), (500, 1_000), (500, 1_000), (250, 1_000)],
-            &[(0, 1), (0, 2), (1, 3), (2, 3)],
-            100,
-        );
-        assert_eq!(tied, Some(1_000));
-    }
-
-    #[test]
-    fn block_package_rates_share_one_rate_past_the_component_cap() {
-        let component = |n: usize| {
-            let txs = (0..n)
-                .map(|i| (if i + 1 == n { 0 } else { 250 }, 1_000))
-                .collect::<Vec<_>>();
-            let edges = (1..n)
-                .map(|i| ((i - 1) as u32, i as u32))
-                .collect::<Vec<_>>();
-            (txs, edges)
-        };
-
-        let (txs, edges) = component(BLOCK_PACKAGE_MAX_TXS);
-        let mut below_cap = vec![1_000; BLOCK_PACKAGE_MAX_TXS - 1];
-        below_cap.push(0);
-        assert_eq!(block_package_rates(&txs, &edges), below_cap);
-
-        let n = BLOCK_PACKAGE_MAX_TXS + 1;
-        let n_u64 = n as u64;
-        let (txs, edges) = component(n);
-        let fee: u64 = txs.iter().map(|t| t.0).sum();
-        let whole = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, n_u64 * 1_000);
-        assert!(block_package_rates(&txs, &edges)
-            .iter()
-            .all(|&r| r == whole));
-    }
-
-    #[test]
-    fn block_p10_drops_rates_below_min_relay() {
-        // an out-of-band zero-fee tx is dropped; a CPFP'd zero-fee parent counts
-        let mut txs = vec![(0, 1_000), (0, 1_000), (5_000, 1_000)];
-        let edges = [(1, 2)];
-        for i in 1..=9u64 {
-            txs.push((i * 250, 1_000));
-        }
-        // rates: 10000, 10000 and 1000..=9000; p10 of 11 samples is index 1
-        assert_eq!(block_p10_sat_kvb(&txs, &edges, 100), Some(2_000));
-        assert_eq!(block_p10_sat_kvb(&[(0, 1_000)], &[], 100), None);
     }
 }

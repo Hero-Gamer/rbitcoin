@@ -938,15 +938,45 @@ fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> 
         return Ok(json!({ "errors": ["mempool unavailable"], "blocks": blocks }));
     };
     let rate = mp.estimate_fee_btc_per_kb(conf_target);
+    Ok(smart_fee_json(blocks, rate, mp.mempool_min_fee_sat_kvb()))
+}
+
+/// Core's result for `rate` (BTC/kvB; negative = no estimate): `feerate` and
+/// `blocks`, or `errors` and `blocks`. An estimate is at least
+/// `mempoolminfee`, which includes `minrelaytxfee`.
+fn smart_fee_json(blocks: u32, rate: f64, mempool_min_fee_sat_kvb: u64) -> Value {
     if rate < 0.0 {
-        return Ok(json!({
+        return json!({
             "errors": ["Insufficient data or no feerate found"],
             "blocks": blocks,
-        }));
+        });
     }
-    // Core: an estimate is at least mempoolminfee (which includes minrelaytxfee).
-    let sat_kvb = ((rate * 100_000_000.0).round() as u64).max(mp.mempool_min_fee_sat_kvb());
-    Ok(json!({ "feerate": sat_btc_json(sat_kvb as i64), "blocks": blocks }))
+    let sat_kvb = ((rate * 100_000_000.0).round() as u64).max(mempool_min_fee_sat_kvb);
+    json!({ "feerate": sat_btc_json(sat_kvb as i64), "blocks": blocks })
+}
+
+#[cfg(test)]
+mod smart_fee_tests {
+    use super::*;
+
+    /// A session answers only once fee history or flow is warm (thousands
+    /// of blocks or a minute of relay), so the success shape is pinned here.
+    #[test]
+    fn an_estimate_is_feerate_and_blocks_floored_at_mempoolminfee() {
+        let r = smart_fee_json(2, 0.000_020_00, 1_000);
+        assert_eq!(r["feerate"], sat_btc_json(2_000), "{r}");
+        assert_eq!(r["blocks"], 2, "{r}");
+        assert_eq!(
+            r.as_object().unwrap().len(),
+            2,
+            "only feerate and blocks: {r}"
+        );
+        let floored = smart_fee_json(2, 0.000_001_00, 5_000);
+        assert_eq!(floored["feerate"], sat_btc_json(5_000), "{floored}");
+        let none = smart_fee_json(6, -1.0, 5_000);
+        assert!(none.get("feerate").is_none(), "{none}");
+        assert_eq!(none["blocks"], 6, "{none}");
+    }
 }
 
 /// Same 10-minute product as [`estimatesmartfee`] under the Core name.

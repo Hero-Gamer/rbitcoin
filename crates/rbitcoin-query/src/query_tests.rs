@@ -871,11 +871,10 @@ fn spend_apply(tag: u8, prev_txid: [u8; 32], keep_sat: i64) -> TxApply {
     }
 }
 
-/// Fee history rows: stamped (fee, weight) per non-coinbase tx and in-block
-/// (parent, child) edges, read from spent slots, including a multi-spender
-/// slot left by a reorged-away double spend (`spent.ovf`).
+/// Fee history rows from `txstat` alone: stamped (fee, weight) per
+/// non-coinbase tx, the block hash, and cell bytes including the coinbase.
 #[test]
-fn block_fee_rows_have_fees_and_in_block_spend_edges() {
+fn block_txstat_rows_have_fees_hash_and_cell_bytes() {
     let (dir, q) = temp_query("fee-rows");
     let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
     let cb0_txid = cb0.tx.txid;
@@ -884,34 +883,26 @@ fn block_fee_rows_have_fees_and_in_block_spend_edges() {
     let (h1, cb1) = coinbase_block(1, hfk0, Some(h0.hash));
     let parent = spend_apply(0x11, cb0_txid, 50_0000_0000 - 10_000);
     let child = spend_apply(0x22, parent.tx.txid, 50_0000_0000 - 60_000);
-    let parent_txid = parent.tx.txid;
-    let hfk1 = q
-        .connect_block(Height(1), &h1, &[cb1, parent, child])
+    q.connect_block(Height(1), &h1, &[cb1, parent, child])
         .unwrap();
 
-    let b1 = q.block_fee_rows(Height(1)).unwrap().expect("stamped");
+    let b1 = q.block_txstat_rows(Height(1)).unwrap().expect("stamped");
+    assert_eq!(b1.hash, h1.hash);
+    assert_eq!(b1.txstat_bytes, 3 * 8);
+    let rows = b1.rows.expect("every row stamped");
     assert_eq!(
-        b1.rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
         vec![10_000, 50_000]
     );
-    assert!(b1.rows.iter().all(|r| r.1 > 0), "{b1:?}");
-    assert_eq!(b1.edges, vec![(0, 1)]);
-    let b0 = q.block_fee_rows(Height(0)).unwrap().expect("coinbase only");
-    assert!(b0.rows.is_empty() && b0.edges.is_empty());
-
-    // A competing spend of the parent's output in a block later disconnected
-    // turns that slot into a multi-spender list.
-    let (h2, cb2) = coinbase_block(2, hfk1, Some(h1.hash));
-    let rival = spend_apply(0x33, parent_txid, 50_0000_0000 - 20_000);
-    q.connect_block(Height(2), &h2, &[cb2, rival]).unwrap();
-    q.disconnect_tip().unwrap();
-    let parent_fk = q.block_tx_fks(Height(1)).unwrap()[1];
-    assert_eq!(q.store().spenders_create(parent_fk, 0).unwrap().len(), 2);
-    let b1 = q.block_fee_rows(Height(1)).unwrap().expect("stamped");
-    assert_eq!(
-        b1.edges,
-        vec![(0, 1)],
-        "in-block child found through spent.ovf"
+    assert!(rows.iter().all(|r| r.1 > 0), "{rows:?}");
+    let b0 = q
+        .block_txstat_rows(Height(0))
+        .unwrap()
+        .expect("coinbase only");
+    assert_eq!((b0.rows, b0.txstat_bytes), (Some(vec![]), 8));
+    assert!(
+        q.block_txstat_rows(Height(2)).unwrap().is_none(),
+        "above the tip"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
