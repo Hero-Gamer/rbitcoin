@@ -255,11 +255,12 @@ pub(crate) fn ask_above(st: &IbdWorkState) -> u32 {
 
 /// A proven-chain reply that must not be written.
 ///
-/// After the work floor, a heavier chain that passes the low-work check
-/// replaces the checkpoints. The queue drops hashes that are not on it. A
-/// low-work or lighter chain is not stored. Returns true when the reply was
-/// consumed. A heavier chain whose queue has room is not consumed: the caller
-/// stores it because those blocks will be fetched.
+/// A heavier chain replaces the checkpoints, including one that forks from a
+/// confirmed ancestor while that ancestor is still below `-minimumchainwork`.
+/// The queue drops hashes that are not on it. A lighter chain is not stored.
+/// Returns true when the reply was consumed. A heavier chain whose queue has
+/// room is not consumed: the caller stores it because those blocks will be
+/// fetched.
 pub(crate) fn suppress_competing_chain(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -295,7 +296,10 @@ pub(crate) fn suppress_competing_chain(
             }
         }
     }
-    if headers.iter().any(|h| hub.header_below_anti_dos(h)) {
+    // The first header of a real chain is below `-minimumchainwork` for most
+    // of IBD. Compare the batch when the parent work is known; only an
+    // uncomparable low-work header is dropped here.
+    if work_at(st, hub, prev).is_none() && headers.iter().any(|h| hub.header_below_anti_dos(h)) {
         return true;
     }
     // `Some(false)`: adopted, and the queue has room so the caller stores it.
@@ -765,7 +769,21 @@ fn work_at(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<Work> {
     if hub.tip_hash() == Some(hash) {
         return hub.chain_work().ok();
     }
-    stored_path_state(st, hub, hash).map(|(work, _)| work)
+    if let Some(found) = stored_path_state(st, hub, hash) {
+        return Some(found.0);
+    }
+    // Not the tip, and not on the download path. A confirmed ancestor still
+    // has work, so a heavier chain can fork below the tip.
+    confirmed_ancestor_work(hub, hash)
+}
+
+fn confirmed_ancestor_work(hub: &ChainHub, hash: BlockHash) -> Option<Work> {
+    let height = hub
+        .query
+        .height_of_hash(hash.as_byte_array())
+        .ok()
+        .flatten()?;
+    hub.work_through_height(height.0).ok()
 }
 
 /// Work and difficulty at a header the download path has stored.
@@ -3893,5 +3911,92 @@ mod tests {
             "the adopted fork becomes the download path"
         );
         assert!(!skips(&hub, 6, h6.block_hash().as_byte_array()));
+    }
+
+    /// Block that extends `prev` at `height`, with a real coinbase.
+    fn mine_block(prev: BlockHash, height: u32) -> bitcoin::Block {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+        let mut ss = rbitcoin_consensus::bip34_height_script(height);
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: mine(prev, height),
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+        block
+    }
+
+    #[test]
+    fn a_heavier_chain_from_a_confirmed_ancestor_replaces_the_candidate() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-ancestor");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let stale = mine_block(gen, 1);
+        hub.accept_block(stale.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(1));
+        let stale_hash = stale.block_hash();
+        let stale_next = mine(stale_hash, 2);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 2,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: stale_next.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        // Mainnet sets this above the confirmed tip for most of IBD. One
+        // header on that tip is below the threshold; the chain is not.
+        hub.set_minimum_chain_work(Some([0xff; 32]));
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], hub.tip_hash(), hub.tip_height());
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![stale_next]);
+        assert!(st.header_walk.proven);
+        assert!(
+            skips(&hub, 2, stale_next.block_hash().as_byte_array()),
+            "the first chain through the anchor may skip until a heavier one wins"
+        );
+
+        let mut prev = gen;
+        let mut honest = Vec::new();
+        for n in 10..16 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            honest.push(hdr);
+        }
+        let heavy = prev;
+        apply(&mut st, &hub, 0, honest);
+        assert!(
+            st.slots[0].alive,
+            "a heavier chain forking below the confirmed tip does not disconnect"
+        );
+        assert_eq!(st.header_walk.tip_hash, Some(heavy));
+        assert_eq!(st.header_walk.tip_height, 6);
+        assert!(
+            !skips(&hub, 2, stale_next.block_hash().as_byte_array()),
+            "script skip does not stay on the chain that lost"
+        );
     }
 }
