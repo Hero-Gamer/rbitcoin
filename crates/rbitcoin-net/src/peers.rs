@@ -2769,192 +2769,6 @@ mod tests {
     }
 
     #[test]
-    fn maybe_select_hb_writes_sendcmpct_when_writer_attached() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(
-            a,
-            a,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            true,
-            PeerConnType::Inbound,
-        );
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        p.attach_out(tx);
-        hub.maybe_select_hb(p.id);
-        assert!(p.hb_to.load(Ordering::Relaxed));
-        match rx.try_recv().expect("sendcmpct").expect_msg() {
-            NetworkMessage::SendCmpct(sc) => {
-                assert!(sc.send_compact);
-                assert_eq!(sc.version, 2);
-            }
-            other => panic!("expected sendcmpct HB, got {other:?}"),
-        }
-        assert_eq!(p.pending_sendcmpct.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn maybe_select_hb_pending_when_no_writer_and_evicts_fourth_inbound() {
-        let hub = PeerHub::new();
-        hub.maybe_select_hb(9_999);
-        let peers: Vec<_> = (18444u16..18447)
-            .map(|port| {
-                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
-            })
-            .collect();
-        for p in &peers {
-            hub.maybe_select_hb(p.id);
-            hub.maybe_select_hb(p.id);
-            assert!(p.hb_to.load(Ordering::Relaxed));
-            assert_eq!(
-                p.pending_sendcmpct.load(Ordering::Relaxed),
-                PendingSendCmpct::Hb as u8
-            );
-        }
-        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
-        let fourth = hub.register(
-            fourth_addr,
-            fourth_addr,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            true,
-            PeerConnType::Inbound,
-        );
-        hub.maybe_select_hb(fourth.id);
-        assert!(
-            !peers[0].hb_to.load(Ordering::Relaxed),
-            "oldest inbound must be evicted when a fourth inbound is selected"
-        );
-        assert_eq!(
-            peers[0].pending_sendcmpct.load(Ordering::Relaxed),
-            PendingSendCmpct::Lb as u8
-        );
-        assert!(peers[1].hb_to.load(Ordering::Relaxed));
-        assert!(peers[2].hb_to.load(Ordering::Relaxed));
-        assert!(fourth.hb_to.load(Ordering::Relaxed));
-        assert_eq!(
-            fourth.pending_sendcmpct.load(Ordering::Relaxed),
-            PendingSendCmpct::Hb as u8
-        );
-    }
-
-    #[test]
-    fn maybe_select_hb_inbound_keeps_lone_outbound() {
-        let hub = PeerHub::new();
-        let out_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let outbound = hub.register(
-            out_addr,
-            out_addr,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            false,
-            PeerConnType::OutboundFullRelay,
-        );
-        hub.maybe_select_hb(outbound.id);
-        let mut inbounds = Vec::new();
-        for port in 18445u16..18448 {
-            let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-            let p = hub.register(
-                a,
-                a,
-                &ver("/rbitcoin:0.1.0(testnode0)/"),
-                true,
-                PeerConnType::Inbound,
-            );
-            hub.maybe_select_hb(p.id);
-            inbounds.push(p);
-        }
-        assert!(outbound.hb_to.load(Ordering::Relaxed));
-        assert!(
-            !inbounds[0].hb_to.load(Ordering::Relaxed),
-            "lone outbound stays; first inbound is the eviction"
-        );
-        assert!(inbounds[1].hb_to.load(Ordering::Relaxed));
-        assert!(inbounds[2].hb_to.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn maybe_select_hb_lru_refresh_protects_recent_inbound() {
-        let hub = PeerHub::new();
-        let peers: Vec<_> = (18444u16..18447)
-            .map(|port| {
-                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
-            })
-            .collect();
-        for p in &peers {
-            hub.maybe_select_hb(p.id);
-        }
-        hub.maybe_select_hb(peers[0].id);
-        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
-        let fourth = hub.register(
-            fourth_addr,
-            fourth_addr,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            true,
-            PeerConnType::Inbound,
-        );
-        hub.maybe_select_hb(fourth.id);
-        assert!(
-            peers[0].hb_to.load(Ordering::Relaxed),
-            "re-selected inbound must stay HB (Core LRU)"
-        );
-        assert!(
-            !peers[1].hb_to.load(Ordering::Relaxed),
-            "oldest unre-selected inbound is evicted"
-        );
-        assert!(peers[2].hb_to.load(Ordering::Relaxed));
-        assert!(fourth.hb_to.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn unregister_releases_hb_slot() {
-        let hub = PeerHub::new();
-        let peers: Vec<_> = (18444u16..18447)
-            .map(|port| {
-                let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-                hub.register(
-                    a,
-                    a,
-                    &ver("/rbitcoin:0.1.0(testnode0)/"),
-                    true,
-                    PeerConnType::Inbound,
-                )
-            })
-            .collect();
-        for p in &peers {
-            hub.maybe_select_hb(p.id);
-        }
-        hub.unregister(peers[1].id);
-        let fourth_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
-        let fourth = hub.register(
-            fourth_addr,
-            fourth_addr,
-            &ver("/rbitcoin:0.1.0(testnode0)/"),
-            true,
-            PeerConnType::Inbound,
-        );
-        hub.maybe_select_hb(fourth.id);
-        assert!(
-            peers[0].hb_to.load(Ordering::Relaxed),
-            "live HB peer must not be evicted to fill a disconnect hole"
-        );
-        assert!(peers[2].hb_to.load(Ordering::Relaxed));
-        assert!(fourth.hb_to.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn trying_connection_log_is_p2p_not_v1() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(25, 0, 0, 1)), 8333);
         assert_eq!(
@@ -3147,125 +2961,167 @@ mod tests {
         );
     }
 
+    /// One PeerHub while peers come and go: compact high-bandwidth
+    /// selection and its evictions, compact fill slots, per-peer block and
+    /// header marks, the single initial headers-sync peer, and each peer's
+    /// announced-wtxid set.
+    #[allow(clippy::cognitive_complexity)] // one hub, many peer-state arms
     #[test]
-    fn announced_wtx_is_per_peer() {
-        use bitcoin::hashes::Hash;
+    fn peerhub_hb_select() {
         let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let w = Wtxid::from_byte_array([0x11; 32]);
-        assert!(!p.has_announced_wtx(&w));
-        p.note_announced_wtx(w);
-        assert!(p.has_announced_wtx(&w));
-        assert!(!p.has_announced_wtx(&Wtxid::from_byte_array([0x22; 32])));
-        assert!(!p.take_tx_inv_due(1_700_000_000));
-        assert!(!p.take_tx_inv_due(1_700_000_010));
-        assert!(p.take_tx_inv_due(1_700_000_040));
-        p.request_tx_inv();
-        assert!(p.take_tx_inv_due(1_700_000_041));
-    }
-
-    #[test]
-    fn announced_wtx_rolls_oldest_at_cap() {
-        use bitcoin::hashes::Hash;
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let wtxid_n = |i: u32| {
-            let mut b = [0u8; 32];
-            b[..4].copy_from_slice(&i.to_le_bytes());
-            Wtxid::from_byte_array(b)
+        let join = |port: u16, inbound: bool| {
+            let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let conn = if inbound {
+                PeerConnType::Inbound
+            } else {
+                PeerConnType::OutboundFullRelay
+            };
+            hub.register(a, a, &ver("/rbitcoin:0.1.0(testnode0)/"), inbound, conn)
         };
-        for i in 0..=50_000 {
-            p.note_announced_wtx(wtxid_n(i));
-        }
-        assert!(!p.has_announced_wtx(&wtxid_n(0)));
-        assert!(p.has_announced_wtx(&wtxid_n(1)));
-        assert!(p.has_announced_wtx(&wtxid_n(50_000)));
-    }
+        let hb = |p: &LivePeer| p.hb_to.load(Ordering::Relaxed);
+        let pending = |p: &LivePeer| p.pending_sendcmpct.load(Ordering::Relaxed);
+        let sendcmpct = |rx: &mut mpsc::UnboundedReceiver<PeerOut>| match rx
+            .try_recv()
+            .expect("sendcmpct")
+            .expect_msg()
+        {
+            NetworkMessage::SendCmpct(sc) => {
+                assert_eq!(sc.version, 2);
+                sc.send_compact
+            }
+            other => panic!("expected sendcmpct, got {other:?}"),
+        };
 
-    #[test]
-    fn cmpct_fill_release_one_inbound_keeps_other() {
-        let hub = PeerHub::new();
-        let h = BlockHash::from_byte_array([0x11; 32]);
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(!hub.try_cmpct_fill_slot(h, true));
-        hub.release_cmpct_fill(h, true);
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(!hub.try_cmpct_fill_slot(h, true));
-        hub.release_cmpct_fill(h, true);
-        hub.release_cmpct_fill(h, true);
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(!hub.try_cmpct_fill_slot(h, true));
-    }
+        // An unknown id is ignored. A lone outbound is selected first.
+        hub.maybe_select_hb(9_999);
+        let out = join(18444, false);
+        hub.maybe_select_hb(out.id);
+        assert!(hb(&out));
 
-    #[test]
-    fn unregister_releases_cmpct_fill() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let h = BlockHash::from_byte_array([0x22; 32]);
-        assert!(p.try_cmpct_fill(h));
-        hub.unregister(p.id);
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(hub.try_cmpct_fill_slot(h, true));
-        assert!(!hub.try_cmpct_fill_slot(h, true));
-    }
+        // Without a writer the HB choice waits as pending; with one it goes
+        // out as sendcmpct at once.
+        let a = join(18445, true);
+        hub.maybe_select_hb(a.id);
+        hub.maybe_select_hb(a.id);
+        assert!(hb(&a));
+        assert_eq!(pending(&a), PendingSendCmpct::Hb as u8);
+        let b = join(18446, true);
+        let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+        b.attach_out(b_tx);
+        hub.maybe_select_hb(b.id);
+        assert!(hb(&b) && sendcmpct(&mut b_rx));
+        assert_eq!(pending(&b), 0);
 
-    #[test]
-    fn skip_announce_of_block_this_peer_sent() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let h = BlockHash::from_byte_array([0xab; 32]);
-        assert!(!p.take_block_from_peer(&h));
-        p.note_block_from_peer(h);
-        assert!(p.take_block_from_peer(&h));
-        assert!(!p.take_block_from_peer(&h));
-        assert!(p.try_ask_headers_for_inv());
-        assert!(!p.try_ask_headers_for_inv());
-        p.note_best_header_sent(h);
-        p.note_best_known(h);
-        assert_eq!(p.header_marks(), (Some(h), Some(h)));
-        assert!(p.advertises_network());
-    }
-
-    #[test]
-    fn only_one_initial_headers_sync_peer_when_tip_is_old() {
-        let hub = PeerHub::new();
-        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
-        let p1 = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let p2 = hub.register(b, b, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
-        let now = 1_700_000_000;
-        // genesis-era header: not caught up.
-        assert!(hub.try_start_headers_sync(&p1, now, 1_231_006_505));
-        assert!(p1.is_sync_started());
-        assert!(!hub.try_start_headers_sync(&p2, now, 1_231_006_505));
-        assert!(!p2.is_sync_started());
-        let h1 = BlockHash::from_byte_array([1u8; 32]);
-        let h2 = BlockHash::from_byte_array([2u8; 32]);
-        // Sync peer always gets inv-triggered getheaders.
-        assert!(hub.should_getheaders_for_inv(&p1, h1));
-        // First extra peer for this hash.
-        assert!(hub.should_getheaders_for_inv(&p2, h1));
-        let p3 = hub.register(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3),
-            b,
-            &ver("/rbitcoin:0.1.0/"),
-            true,
-            PeerConnType::Inbound,
+        // A third inbound evicts the oldest inbound and keeps the lone
+        // outbound. The evicted peer's LB choice waits as pending.
+        let c = join(18447, true);
+        hub.maybe_select_hb(c.id);
+        assert!(hb(&out) && hb(&b) && hb(&c));
+        assert!(
+            !hb(&a),
+            "lone outbound stays; first inbound is the eviction"
         );
-        // Same hash: no third peer.
-        assert!(!hub.should_getheaders_for_inv(&p3, h1));
-        // New hash: remaining peer.
-        assert!(hub.should_getheaders_for_inv(&p3, h2));
-        hub.unregister(p1.id);
-        assert!(!p1.is_sync_started());
-        // After the sync peer leaves, another inbound may start.
-        assert!(hub.try_start_headers_sync(&p2, now, 1_231_006_505));
+        assert_eq!(pending(&a), PendingSendCmpct::Lb as u8);
+
+        // Re-selecting b refreshes it (Core LRU), so the next inbound evicts c.
+        hub.maybe_select_hb(b.id);
+        let d = join(18448, true);
+        hub.maybe_select_hb(d.id);
+        assert!(hb(&b), "re-selected inbound stays HB");
+        assert!(!hb(&c), "oldest unrefreshed inbound is evicted");
+        assert!(hb(&d));
+
+        // d leaves. Its slot is free, so e does not evict a live HB peer.
+        hub.unregister(d.id);
+        let e = join(18449, true);
+        hub.maybe_select_hb(e.id);
+        assert!(hb(&out) && hb(&b) && hb(&e));
+
+        // The outbound leaves too. With no outbound the oldest HB peer, b,
+        // is evicted, and its writer gets sendcmpct LB.
+        hub.unregister(out.id);
+        let f = join(18450, true);
+        hub.maybe_select_hb(f.id);
+        let g = join(18451, true);
+        hub.maybe_select_hb(g.id);
+        assert!(!hb(&b) && !sendcmpct(&mut b_rx));
+        assert_eq!(pending(&b), 0);
+        assert!(hb(&e) && hb(&f) && hb(&g));
+
+        // Two compact fill slots per block. A release frees one; a peer that
+        // leaves releases its slot.
+        let blk = BlockHash::from_byte_array([0x11; 32]);
+        assert!(hub.try_cmpct_fill_slot(blk, true));
+        assert!(hub.try_cmpct_fill_slot(blk, true));
+        assert!(!hub.try_cmpct_fill_slot(blk, true));
+        hub.release_cmpct_fill(blk, true);
+        assert!(hub.try_cmpct_fill_slot(blk, true));
+        assert!(!hub.try_cmpct_fill_slot(blk, true));
+        hub.release_cmpct_fill(blk, true);
+        hub.release_cmpct_fill(blk, true);
+        let blk = BlockHash::from_byte_array([0x22; 32]);
+        assert!(g.try_cmpct_fill(blk));
+        hub.unregister(g.id);
+        assert!(hub.try_cmpct_fill_slot(blk, true));
+        assert!(hub.try_cmpct_fill_slot(blk, true));
+        assert!(!hub.try_cmpct_fill_slot(blk, true));
+
+        // A block e sent is not announced back to e, once. Header marks.
+        let blk = BlockHash::from_byte_array([0xab; 32]);
+        assert!(!e.take_block_from_peer(&blk));
+        e.note_block_from_peer(blk);
+        assert!(e.take_block_from_peer(&blk));
+        assert!(!e.take_block_from_peer(&blk));
+        assert!(e.try_ask_headers_for_inv());
+        assert!(!e.try_ask_headers_for_inv());
+        e.note_best_header_sent(blk);
+        e.note_best_known(blk);
+        assert_eq!(e.header_marks(), (Some(blk), Some(blk)));
+        assert!(e.advertises_network());
+
+        // With an old tip only one peer runs initial headers sync. Inv adds
+        // at most one extra getheaders peer per hash. When the sync peer
+        // leaves, another may start.
+        let now = 1_700_000_000;
+        let genesis_time = 1_231_006_505;
+        assert!(hub.try_start_headers_sync(&a, now, genesis_time));
+        assert!(a.is_sync_started());
+        assert!(!hub.try_start_headers_sync(&c, now, genesis_time));
+        assert!(!c.is_sync_started());
+        let (h1, h2) = (
+            BlockHash::from_byte_array([1u8; 32]),
+            BlockHash::from_byte_array([2u8; 32]),
+        );
+        assert!(hub.should_getheaders_for_inv(&a, h1));
+        assert!(hub.should_getheaders_for_inv(&c, h1));
+        assert!(!hub.should_getheaders_for_inv(&f, h1));
+        assert!(hub.should_getheaders_for_inv(&f, h2));
+        hub.unregister(a.id);
+        assert!(!a.is_sync_started());
+        assert!(hub.try_start_headers_sync(&c, now, genesis_time));
+
+        // Announced wtxids are per peer, roll the oldest at the cap, and
+        // tx inv is due on a timer or on request.
+        let wtxid_n = |i: u32| {
+            let mut w = [0u8; 32];
+            w[..4].copy_from_slice(&i.to_le_bytes());
+            Wtxid::from_byte_array(w)
+        };
+        e.note_announced_wtx(wtxid_n(0));
+        assert!(e.has_announced_wtx(&wtxid_n(0)));
+        assert!(!e.has_announced_wtx(&wtxid_n(1)));
+        assert!(!f.has_announced_wtx(&wtxid_n(0)));
+        assert!(!e.take_tx_inv_due(1_700_000_000));
+        assert!(!e.take_tx_inv_due(1_700_000_010));
+        assert!(e.take_tx_inv_due(1_700_000_040));
+        e.request_tx_inv();
+        assert!(e.take_tx_inv_due(1_700_000_041));
+        for i in 1..=50_000 {
+            e.note_announced_wtx(wtxid_n(i));
+        }
+        assert!(!e.has_announced_wtx(&wtxid_n(0)));
+        assert!(e.has_announced_wtx(&wtxid_n(1)));
+        assert!(e.has_announced_wtx(&wtxid_n(50_000)));
     }
 
     #[test]

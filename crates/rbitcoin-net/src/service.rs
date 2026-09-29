@@ -807,11 +807,18 @@ mod tests {
         assert_eq!(max.load(Ordering::SeqCst), 1);
     }
 
+    /// One datadir, two node lifetimes. The first is dropped without
+    /// shutdown. The second binds loopback as with onion listen, adds a
+    /// second listener, and shuts down with one session task that finishes
+    /// in the grace window and one that would linger.
     #[tokio::test]
-    async fn drop_does_not_pin_and_hub_is_shared() {
+    async fn service_listen_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
         let _live = live_p2p_lock().await;
         let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-p2p-drop-{}-{}",
+            "rbitcoin-p2p-listen-shutdown-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -820,10 +827,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
+
         let node = P2PNode::start(
             "127.0.0.1:0".parse().unwrap(),
-            q,
+            Query::open_or_create_tiny(&dir).unwrap(),
             ChainParams::regtest(),
             Milestone::NONE,
         )
@@ -833,121 +840,49 @@ mod tests {
         let t0 = std::time::Instant::now();
         drop(node);
         assert!(
-            t0.elapsed() < std::time::Duration::from_secs(2),
+            t0.elapsed() < Duration::from_secs(2),
             "dropping the node must abort connect-retry without waiting out the runtime"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[tokio::test]
-    async fn shutdown_aborts_lingering_session_task() {
-        let _live = live_p2p_lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-p2p-shutdown-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
-        let mut node = P2PNode::start(
+        let mut node = P2PNode::start_with_dialer(
             "127.0.0.1:0".parse().unwrap(),
-            q,
+            Query::open_or_create_tiny(&dir).unwrap(),
             ChainParams::regtest(),
             Milestone::NONE,
+            "/rbitcoin:0.1.0(onion)/".into(),
+            crate::DEFAULT_MAX_INBOUND,
+            crate::socks::Dialer::Direct,
         )
         .await
         .unwrap();
-        let sleeper = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        });
-        node.tasks.push(sleeper);
-        let t0 = std::time::Instant::now();
-        node.shutdown().await;
-        assert!(
-            t0.elapsed() < Duration::from_secs(2),
-            "shutdown must not wait out a 30s session task"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn shutdown_lets_short_session_task_finish() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let _live = live_p2p_lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-p2p-shutdown-grace-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
-        let mut node = P2PNode::start(
-            "127.0.0.1:0".parse().unwrap(),
-            q,
-            ChainParams::regtest(),
-            Milestone::NONE,
-        )
-        .await
-        .unwrap();
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let sleeper = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            flag.store(true, Ordering::SeqCst);
-        });
-        node.tasks.push(sleeper);
-        let t0 = std::time::Instant::now();
-        node.shutdown().await;
-        assert!(
-            done.load(Ordering::SeqCst),
-            "shutdown must not abort a session task that finishes within the grace window"
-        );
-        assert!(
-            t0.elapsed() < Duration::from_secs(2),
-            "shutdown must still bound wait"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn add_listen_binds_a_second_socket() {
-        let _live = live_p2p_lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-p2p-extra-listen-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = rbitcoin_query::Query::open_or_create_tiny(&dir).unwrap();
-        let mut node = P2PNode::start(
-            "127.0.0.1:0".parse().unwrap(),
-            q,
-            ChainParams::regtest(),
-            Milestone::NONE,
-        )
-        .await
-        .unwrap();
+        assert_eq!(node.local_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(node.local_addr.port(), 0);
         let extra = node
             .add_listen("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         assert_ne!(extra, node.local_addr);
         assert!(std::net::TcpStream::connect(extra).is_ok());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        node.tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            flag.store(true, Ordering::SeqCst);
+        }));
+        node.tasks.push(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }));
+        let t0 = std::time::Instant::now();
         node.shutdown().await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "shutdown lets a task that finishes within the grace window finish"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait out a 30s session task"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1012,33 +947,6 @@ mod tests {
         follower.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
         assert!(linked, "outbound-only follower must handshake the seeder");
-    }
-
-    #[tokio::test]
-    async fn listen_onion_binds_loopback_when_nolisten() {
-        let _live = live_p2p_lock().await;
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-listen-onion-bind-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create_tiny(&dir).unwrap();
-        let node = P2PNode::start_with_dialer(
-            "127.0.0.1:0".parse().unwrap(),
-            q,
-            ChainParams::regtest(),
-            Milestone::NONE,
-            "/rbitcoin:0.1.0(onion)/".into(),
-            crate::DEFAULT_MAX_INBOUND,
-            crate::socks::Dialer::Direct,
-        )
-        .await
-        .unwrap();
-        assert_eq!(node.local_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
-        assert_ne!(node.local_addr.port(), 0);
-        node.shutdown().await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

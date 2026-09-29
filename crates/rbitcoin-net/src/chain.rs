@@ -3218,9 +3218,7 @@ mod tests {
     };
     use rbitcoin_consensus::{confirm_scripts_phase, ChainParams, Milestone};
     use rbitcoin_mempool::UtxoProvider;
-    use rbitcoin_query::Query;
     use rbitcoin_store::HeadScale;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shared_tiny_regtest_hub_is_tiny_unique_regtest_and_drop_cleans() {
@@ -3284,16 +3282,63 @@ mod tests {
         worker.join().expect("job");
     }
 
+    fn attach_mp(dir: &std::path::Path, hub: &ChainHub) -> Arc<crate::tx_relay::MempoolHub> {
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+        mp
+    }
+
+    /// A tx spending the coinbase at `height`.
+    fn mature_spend_tx(hub: &ChainHub, height: u32) -> Transaction {
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(height))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9999_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    /// One regtest hub with DERSIG at 102 and CLTV at 111, mined forward:
+    /// the compact prefill knob, a mock clock behind the tip, the SH index
+    /// after generate, the version floors, and which txs a generated or
+    /// submitted block prefills.
     #[test]
-    fn reconstruct_prefill_plan_requires_knob_and_tip_child() {
-        let (_dir, hub) = tmp_hub();
+    fn chain_hub_prefill_and_version() {
+        use bitcoin::block::Version;
+        use rbitcoin_consensus::mine_regtest_paying;
+        use rbitcoin_store::script_hash;
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("prefill-version");
+        let mut params = ChainParams::regtest();
+        params.apply_test_activation_height("dersig", 102).unwrap();
+        params.apply_test_activation_height("cltv", 111).unwrap();
+        let hub = ChainHub::new(q, params, Milestone::NONE);
         hub.ensure_genesis().unwrap();
+        let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+
+        // A prefill plan is kept only with the knob on and only for a tip
+        // child, and the knob off neither shows nor overwrites it.
         let tip = hub.tip_hash().expect("genesis");
         let child = BlockHash::from_byte_array([2; 32]);
         hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
         assert!(
             hub.cmpct_prefill_indexes(&child).is_none(),
-            "default knob off stores nothing"
+            "default knob off"
         );
         hub.set_prefill_compact(true);
         hub.remember_cmpct_prefill(child, tip, vec![0, 1]);
@@ -3316,96 +3361,90 @@ mod tests {
             Some(vec![0, 1]),
             "off remember must not overwrite"
         );
-    }
+        hub.set_prefill_compact(false);
 
-    fn mature_spend_tx(hub: &ChainHub) -> Transaction {
-        let cb = hub
-            .query
-            .reconstruct_block_at_height(Height(1))
-            .unwrap()
-            .txdata[0]
-            .compute_txid();
-        Transaction {
-            version: TxVersion::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint { txid: cb, vout: 0 },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_9999_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        }
-    }
+        // Two blocks put the tip 10,000 s past the median time. A mock clock
+        // between them still mines, stamped from the mock (Core UpdateTime).
+        let mid = 1_300_000_000u32;
+        let tip_time = mid + 10_000;
+        let h1 = mine(tip, mid, 1);
+        hub.accept_block(h1.clone()).unwrap();
+        hub.accept_block(mine(h1.block_hash(), tip_time, 2))
+            .unwrap();
+        let mock = i64::from(tip_time) - 3_000;
+        assert!(mock as u32 > mid, "mock must sit above MTP");
+        hub.clock.set_mock(mock);
+        assert_eq!(
+            hub.generate_to_script(1, op_true(), vec![]).unwrap().len(),
+            1
+        );
+        let t = hub.tip_header().unwrap().time;
+        assert!(
+            t >= mock as u32 && t < tip_time,
+            "expected mock-based stamp, got {t} tip={tip_time} mock={mock}"
+        );
+        hub.clock.set_mock(0);
 
-    fn attach_mp(dir: &std::path::Path, hub: &ChainHub) -> Arc<crate::tx_relay::MempoolHub> {
-        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
-        mp.set_relay_enabled(true);
-        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
-        mp
-    }
+        // Generate drains the SH write-behind, so its coinbase is indexed.
+        let sh_script = ScriptBuf::from_bytes(vec![0x52]);
+        let sh = script_hash(sh_script.as_bytes());
+        hub.generate_to_script(1, sh_script, vec![]).unwrap();
+        let hist = hub.query.scripthash_history(&sh).unwrap();
+        assert!(
+            hist.iter().any(|row| row.height == 4),
+            "generate must drain SH so the height-4 coinbase is indexed, got {hist:?}"
+        );
 
-    #[test]
-    fn generate_remembers_prefill_for_tx_not_in_mempool() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
-        let _mp = attach_mp(dir.path(), &hub);
+        // `feature_dersig.py`: from 102 a version-2 block is `bad-version`.
+        hub.generate_to_script(97, op_true(), vec![]).unwrap();
+        assert_eq!(hub.tip_height(), Some(101));
+        let bad_version = |height: u32, version: i32| {
+            let prev = hub.tip_hash().unwrap();
+            let time = hub.tip_header().unwrap().time + 1;
+            let mut block = mine_regtest_paying(prev, time, height, op_true(), vec![]);
+            block.header.version = Version::from_consensus(version);
+            rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+            let hash = block.block_hash();
+            let err = hub
+                .accept_block(block)
+                .expect_err("bad version")
+                .to_string();
+            let needle = format!("bad-version(0x{version:08x})");
+            assert!(err.contains(&needle), "shipped reject: {err}");
+            assert_eq!(
+                rbitcoin_consensus::block_reject_log_line(hash, &needle),
+                format!("{hash}, {needle}")
+            );
+        };
+        bad_version(102, 2);
+
+        // With the knob on and a mempool attached, a generated block
+        // prefills a tx the mempool lacks, not one it already has; a
+        // submitted block prefills one the mempool lacks.
+        let mp = attach_mp(dir.path(), &hub);
         hub.set_prefill_compact(true);
-        let extra = mature_spend_tx(&hub);
         let hashes = hub
-            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![extra])
-            .expect("generate");
+            .generate_to_script(1, op_true(), vec![mature_spend_tx(&hub, 1)])
+            .unwrap();
         assert_eq!(
             hub.cmpct_prefill_indexes(&hashes[0]),
             Some(vec![0, 1]),
-            "tx absent from mempool must ride the generate announce"
+            "tx absent from mempool rides the generate announce"
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn generate_omits_live_mempool_tx_from_prefill() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
-        let mp = attach_mp(dir.path(), &hub);
-        hub.set_prefill_compact(true);
-        let extra = mature_spend_tx(&hub);
-        mp.accept_tx(&extra).expect("in mempool");
-        let hashes = hub
-            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![extra])
-            .expect("generate");
+        let live = mature_spend_tx(&hub, 2);
+        mp.accept_tx(&live).expect("in mempool");
+        let hashes = hub.generate_to_script(1, op_true(), vec![live]).unwrap();
         assert_eq!(
             hub.cmpct_prefill_indexes(&hashes[0]),
             Some(vec![0]),
-            "live mempool hit must stay coinbase-only after strip"
+            "live mempool hit stays coinbase-only after strip"
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn submit_remembers_prefill_for_tx_not_in_mempool() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        hub.generate_to_script(102, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad");
-        let _mp = attach_mp(dir.path(), &hub);
-        hub.set_prefill_compact(true);
-        let extra = mature_spend_tx(&hub);
-        let tip = hub.tip_hash().expect("tip");
-        let tip_time = hub.tip_header().expect("hdr").time;
         let block = mine_regtest_paying(
-            tip,
-            tip_time + 600,
-            103,
-            ScriptBuf::from_bytes(vec![0x51]),
-            vec![extra],
+            hub.tip_hash().unwrap(),
+            hub.tip_header().unwrap().time + 600,
+            104,
+            op_true(),
+            vec![mature_spend_tx(&hub, 3)],
         );
         let hash = block.block_hash();
         match hub.accept_received_block(block) {
@@ -3413,6 +3452,12 @@ mod tests {
             other => panic!("submit must connect: {other:?}"),
         }
         assert_eq!(hub.cmpct_prefill_indexes(&hash), Some(vec![0, 1]));
+
+        // `feature_cltv.py`: from 111 a version-3 block is `bad-version`.
+        hub.generate_to_script(6, op_true(), vec![]).unwrap();
+        assert_eq!(hub.tip_height(), Some(110));
+        bad_version(111, 3);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3684,50 +3729,6 @@ mod tests {
         assert!(
             comms.iter().any(|c| c.starts_with("rbtc-scripts-")),
             "tip connect must publish script jobs to steal workers, comms={comms:?}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn generate_uses_mock_when_behind_tip_but_above_mtp() {
-        use bitcoin::ScriptBuf;
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let gen = hub.tip_hash().unwrap();
-        // Three headers so MTP is the middle time, not the tip (len/2).
-        let mid = 1_300_000_000u32;
-        let tip_time = mid + 10_000;
-        let h1 = mine(gen, mid, 1);
-        hub.accept_block(h1.clone()).unwrap();
-        hub.accept_block(mine(h1.block_hash(), tip_time, 2))
-            .unwrap();
-        let mock = i64::from(tip_time) - 3_000;
-        assert!(mock as u32 > mid, "mock must sit above MTP");
-        hub.clock.set_mock(mock);
-        let hashes = hub
-            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("Core UpdateTime: mock behind tip still mines when mock > MTP");
-        assert_eq!(hashes.len(), 1);
-        let t = hub.tip_header().unwrap().time;
-        assert!(
-            t >= mock as u32 && t < tip_time,
-            "expected mock-based stamp, got {t} tip={tip_time} mock={mock}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    #[test]
-    fn generate_to_script_drains_sh_writebehind() {
-        use bitcoin::ScriptBuf;
-        use rbitcoin_store::script_hash;
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let script = ScriptBuf::from_bytes(vec![0x51]);
-        let sh = script_hash(script.as_bytes());
-        hub.generate_to_script(1, script, vec![]).expect("generate");
-        let hist = hub.query.scripthash_history(&sh).unwrap();
-        assert!(
-            hist.iter().any(|row| row.height == 1),
-            "generate must drain SH so height-1 coinbase is indexed, got {hist:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -4791,98 +4792,6 @@ mod tests {
             0,
             "invalidate below maturity must evict the coinbase spend and its child"
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// `feature_dersig.py`: after dersig@102, a version-2 block is `bad-version`.
-    #[test]
-    fn dersig_rejects_version2_and_logs_core_needle() {
-        use bitcoin::block::Version;
-        use rbitcoin_consensus::mine_regtest_paying;
-
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-dersig-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
-        let mut params = ChainParams::regtest();
-        params.apply_test_activation_height("dersig", 102).unwrap();
-        let hub = ChainHub::new(q, params, Milestone::NONE);
-        hub.ensure_genesis().unwrap();
-        hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad to height 101");
-        assert_eq!(hub.tip_height(), Some(101));
-
-        let prev = hub.tip_hash().unwrap();
-        let time = hub.tip_header().unwrap().time + 1;
-        let mut block =
-            mine_regtest_paying(prev, time, 102, ScriptBuf::from_bytes(vec![0x51]), vec![]);
-        block.header.version = Version::from_consensus(2);
-        let bits = block.header.bits;
-        let target = Target::from_compact(bits);
-        for nonce in 0..u32::MAX {
-            block.header.nonce = nonce;
-            if block.header.validate_pow(target).is_ok() {
-                break;
-            }
-        }
-        let hash = block.block_hash();
-        let err = hub.accept_block(block).expect_err("v2 at height 102");
-        let s = err.to_string();
-        assert!(s.contains("bad-version(0x00000002)"), "shipped reject: {s}");
-        let line = rbitcoin_consensus::block_reject_log_line(hash, "bad-version(0x00000002)");
-        assert_eq!(line, format!("{hash}, bad-version(0x00000002)"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// `feature_cltv.py`: after cltv@111, a version-3 block is `bad-version`.
-    #[test]
-    fn cltv_rejects_version3_and_logs_core_needle() {
-        use bitcoin::block::Version;
-        use rbitcoin_consensus::mine_regtest_paying;
-
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-cltv-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
-        let mut params = ChainParams::regtest();
-        params.apply_test_activation_height("cltv", 111).unwrap();
-        let hub = ChainHub::new(q, params, Milestone::NONE);
-        hub.ensure_genesis().unwrap();
-        hub.generate_to_script(110, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("pad to height 110");
-        assert_eq!(hub.tip_height(), Some(110));
-
-        let prev = hub.tip_hash().unwrap();
-        let time = hub.tip_header().unwrap().time + 1;
-        let mut block =
-            mine_regtest_paying(prev, time, 111, ScriptBuf::from_bytes(vec![0x51]), vec![]);
-        block.header.version = Version::from_consensus(3);
-        let bits = block.header.bits;
-        let target = Target::from_compact(bits);
-        for nonce in 0..u32::MAX {
-            block.header.nonce = nonce;
-            if block.header.validate_pow(target).is_ok() {
-                break;
-            }
-        }
-        let hash = block.block_hash();
-        let err = hub.accept_block(block).expect_err("v3 at height 111");
-        let s = err.to_string();
-        assert!(s.contains("bad-version(0x00000003)"), "shipped reject: {s}");
-        let line = rbitcoin_consensus::block_reject_log_line(hash, "bad-version(0x00000003)");
-        assert_eq!(line, format!("{hash}, bad-version(0x00000003)"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
