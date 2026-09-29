@@ -615,6 +615,11 @@ mod tests {
     fn block_package_rates_for_independent_txs_are_their_own() {
         let txs = [(250, 1_000), (2_500, 1_000)];
         assert_eq!(block_package_rates(&txs, &[]), vec![1_000, 10_000]);
+        assert_eq!(
+            block_package_rates(&txs, &[(2, 0), (0, 2)]),
+            [1_000, 10_000],
+            "out-of-range block edges are ignored"
+        );
     }
 
     #[test]
@@ -638,15 +643,37 @@ mod tests {
         let txs = [(1_000, 1_000), (1_000, 1_000), (10_000, 1_000)];
         let rates = block_package_rates(&txs, &[(0, 1), (1, 2)]);
         assert_eq!(rates, vec![16_000, 16_000, 16_000]);
+
+        let tied = block_p10_sat_kvb(
+            &[(250, 1_000), (500, 1_000), (500, 1_000), (250, 1_000)],
+            &[(0, 1), (0, 2), (1, 3), (2, 3)],
+            100,
+        );
+        assert_eq!(tied, Some(1_000));
     }
 
     #[test]
     fn block_package_rates_share_one_rate_past_the_component_cap() {
-        let n = BLOCK_PACKAGE_MAX_TXS as u32 + 1;
-        let txs: Vec<(u64, u64)> = (0..n).map(|i| (u64::from(i) * 100, 1_000)).collect();
-        let edges: Vec<(u32, u32)> = (1..n).map(|i| (i - 1, i)).collect();
+        let component = |n: usize| {
+            let txs = (0..n)
+                .map(|i| (if i + 1 == n { 0 } else { 250 }, 1_000))
+                .collect::<Vec<_>>();
+            let edges = (1..n)
+                .map(|i| ((i - 1) as u32, i as u32))
+                .collect::<Vec<_>>();
+            (txs, edges)
+        };
+
+        let (txs, edges) = component(BLOCK_PACKAGE_MAX_TXS);
+        let mut below_cap = vec![1_000; BLOCK_PACKAGE_MAX_TXS - 1];
+        below_cap.push(0);
+        assert_eq!(block_package_rates(&txs, &edges), below_cap);
+
+        let n = BLOCK_PACKAGE_MAX_TXS + 1;
+        let n_u64 = n as u64;
+        let (txs, edges) = component(n);
         let fee: u64 = txs.iter().map(|t| t.0).sum();
-        let whole = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, u64::from(n) * 1_000);
+        let whole = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, n_u64 * 1_000);
         assert!(block_package_rates(&txs, &edges)
             .iter()
             .all(|&r| r == whole));
