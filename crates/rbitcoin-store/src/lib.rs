@@ -82,7 +82,8 @@ pub use idx_body_pipeline::{BodyMode as IdxBodyMode, IdxBodyJob};
 pub use index_build_uring::{read_index_window, IndexBlock, IndexHeight, IndexWindow};
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{
-    merkle_branch, merkle_root_from_txids, merkle_root_mutated, VERIFY_TIP_BLOCKS,
+    merkle_branch, merkle_root_from_branch, merkle_root_from_txids, merkle_root_mutated,
+    VERIFY_TIP_BLOCKS,
 };
 pub use io_backend::{ReadIoBackend, WriteIoBackend};
 pub use point_table::PointRecord;
