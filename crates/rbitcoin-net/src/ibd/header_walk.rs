@@ -975,15 +975,20 @@ fn forget_queue_hashes(st: &mut IbdWorkState, drop: &[BlockHash]) {
     }
 }
 
-/// The walk tip is past the last queued header, so a further reply is not a refill.
-fn walk_ahead_of_queue(st: &IbdWorkState) -> bool {
-    let Some(tail) = st.ordered.back().copied() else {
+/// Queue tail, or the confirmed tip when the queue is empty.
+fn path_top(st: &IbdWorkState, hub: &ChainHub) -> Option<(BlockHash, u32)> {
+    if let Some(tail) = st.ordered.back().copied() {
+        return st.hash_height.get(&tail).copied().map(|h| (tail, h));
+    }
+    Some((hub.tip_hash()?, hub.tip_height()?))
+}
+
+/// The walk tip is past the stored path, so a further reply is not a refill.
+fn walk_ahead_of_queue(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    let Some((_, top_h)) = path_top(st, hub) else {
         return false;
     };
-    let Some(&tail_h) = st.hash_height.get(&tail) else {
-        return false;
-    };
-    st.header_walk.origin && st.header_walk.tip_height > tail_h
+    st.header_walk.origin && st.header_walk.tip_height > top_h
 }
 
 /// Record a look-ahead batch as a checkpoint. True when the batch was consumed
@@ -999,7 +1004,8 @@ pub(crate) fn absorb_lookahead(
     // A solicited look-ahead that is already past the queue stays a checkpoint
     // when confirm has drained a slot. A reply that still has to fill the queue
     // is stored.
-    let keep_checkpoint = queue_full || (ask != HeaderAsk::Unsolicited && walk_ahead_of_queue(st));
+    let keep_checkpoint =
+        queue_full || (ask != HeaderAsk::Unsolicited && walk_ahead_of_queue(st, hub));
     if headers.is_empty() || !keep_checkpoint {
         return false;
     }
@@ -2518,6 +2524,39 @@ mod tests {
         assert_eq!(st.ordered.len(), queued);
         assert!(!st.ordered_set.contains(&second.block_hash()));
         assert_eq!(st.header_walk.tip_hash, Some(second.block_hash()));
+    }
+
+    #[test]
+    fn empty_queue_lookahead_still_checkpoints() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-empty");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let second = mine(first.block_hash(), 2);
+        let (s0, mut rx) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![first]);
+        assert_eq!(st.header_walk.tip_hash, Some(first.block_hash()));
+        assert!(st.header_walk.tip_height > hub.tip_height().unwrap_or(0));
+
+        st.ordered.clear();
+        st.ordered_set.clear();
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, 0, vec![second]);
+        assert_eq!(
+            hub.query.store().header_count(),
+            before,
+            "a walk extension is a checkpoint, not a header row"
+        );
+        assert!(st.ordered.is_empty());
+        assert_eq!(st.header_walk.tip_hash, Some(second.block_hash()));
+        assert_eq!(st.header_walk.tip_height, 2);
     }
 
     #[test]
