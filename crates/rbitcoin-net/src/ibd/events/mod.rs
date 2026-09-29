@@ -463,6 +463,12 @@ fn apply_headers_event(
     if super::header_walk::reject_refill_miss(st, hub, &headers) {
         return;
     }
+    let keep = super::header_walk::proven_header_prefix(st, hub, &headers);
+    if keep == 0 {
+        return;
+    }
+    let mut headers = headers;
+    headers.truncate(keep);
     let batch_len = headers.len();
     let added = on_headers_batch(st, hub, peer, headers);
     if added > 0 {

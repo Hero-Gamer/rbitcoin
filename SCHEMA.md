@@ -396,16 +396,20 @@ Sidecar for the IBD header walk. Not a schema bump and not a second copy of `hea
 repeat   hash [u8; 32] ‖ height u32 LE ‖ work [u8; 32]
          ‖ header [u8; 80] (zeros if none)
          ‖ ntimes u8 ‖ 11 × time u32 LE
+         ‖ period height u32 LE ‖ period-start header [u8; 80] (zeros if none)
+         ‖ full-difficulty height u32 LE ‖ full-difficulty bits u32 LE (0 if none)
 then     milestone hash [u8; 32] (zeros if none)
          base hash [u8; 32] ‖ base height u32 LE ‖ base work [u8; 32]
          tip header [u8; 80] (zeros if none)
          period height u32 LE ‖ period-start header [u8; 80] (zeros if none)
          full-difficulty height u32 LE ‖ full-difficulty bits u32 LE (0 if none)
+         base period height u32 LE ‖ base period-start header [u8; 80] (zeros if none)
+         base full-difficulty height u32 LE ‖ base full-difficulty bits u32 LE (0 if none)
 ```
 
-Each checkpoint is 193 bytes. The tail is 272 bytes. Length is exact: `12 + count × 193 + 272`. An older or shorter file does not parse, and the script skip stays off.
+Each checkpoint is 285 bytes. The tail is 364 bytes. Length is exact: `12 + count × 285 + 364`. An older or shorter file does not parse, and the script skip stays off.
 
-Each checkpoint is the hash, height, and total work at the end of one look-ahead reply past the download queue, plus that reply's last header and up to 11 timestamps ending there. `ntimes` is how many of those 11 slots are live, oldest first. The milestone hash is the header at the anchored milestone height when the walk passed it. The base is the stored header the checkpoints were built on. On restart, if that height already has a different hash, the file is ignored. A reorg below the base deletes the file. The per-checkpoint header and timestamps, the tip header, and the period-start header let the next look-ahead check `nBits` and median time without a row in `header.body`. Full-difficulty height and bits are the last header in the period whose `nBits` are not the minimum-difficulty limit, so a restart can walk testnet difficulty back. Headers between the queue and that tip are not in this file.
+Each checkpoint is the hash, height, and total work at the end of one look-ahead reply past the download queue, plus that reply's last header, up to 11 timestamps ending there, and the difficulty period after that header. `ntimes` is how many of those 11 slots are live, oldest first. The milestone hash is the header at the anchored milestone height when the walk passed it. The base is the stored header the checkpoints were built on. On restart, if that height already has a different hash, the file is ignored. A reorg below the base deletes the file. The per-checkpoint header, timestamps, and period-start header let the next look-ahead, a fork from that hash, or a rewind onto it check `nBits` and median time without a row in `header.body`. Full-difficulty height and bits are the last header in the period whose `nBits` are not the minimum-difficulty limit, so a restart can walk testnet difficulty back. The same pair is stored again for the base, for when every checkpoint has been rewound. The tail's period fields are the walk tip. Headers between the queue and that tip are not in this file.
 
 ---
 

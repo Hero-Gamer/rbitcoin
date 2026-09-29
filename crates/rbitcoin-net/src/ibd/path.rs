@@ -255,6 +255,12 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
                 tips.push(h);
             }
         }
+    } else if let Some(h) = st.header_walk.challenger_tip() {
+        // Refill locators name the competing tip, then the queue tail. The
+        // look-ahead tip stays off this locator so candidate peers still refill.
+        if !tips.contains(&h) {
+            tips.push(h);
+        }
     }
     // ordered is tip→far; the back is the highest known header on the path.
     let live =

@@ -2,7 +2,11 @@
 //!
 //! The queue stays at [`ORDERED_HEADERS_SOFT_CAP`] and keeps filling along the
 //! candidate. Headers beyond the queue are not written. Each look-ahead reply
-//! records one checkpoint: hash, height, and total work.
+//! records one checkpoint: hash, height, total work, and the difficulty period
+//! at that hash. One competing chain is kept the same way until it loses or
+//! replaces the candidate. Work for a stored header between checkpoints is
+//! the previous checkpoint plus those stored headers. That replay runs only
+//! when a competing headers batch forks there.
 
 use super::state::IbdWorkState;
 use super::ORDERED_HEADERS_SOFT_CAP;
@@ -15,6 +19,18 @@ use bitcoin::Work;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+/// Difficulty state after a header, so a fork or rewind can retarget without
+/// the abandoned tip's period.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiffSnap {
+    /// Header that opened the current difficulty period.
+    period_header: Option<Header>,
+    period_height: u32,
+    /// Last header in this period whose `nBits` are not the min-difficulty limit.
+    full_diff_bits: Option<CompactTarget>,
+    full_diff_height: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Checkpoint {
     hash: BlockHash,
@@ -25,6 +41,28 @@ pub(crate) struct Checkpoint {
     header: Option<Header>,
     /// Up to 11 timestamps ending at `header`, oldest first.
     times: Vec<u32>,
+    /// Difficulty after this reply. A later fork from this hash retargets
+    /// from here, not from the walk tip.
+    diff: DiffSnap,
+}
+
+/// One competing header chain. Checkpoints match the candidate: one per reply,
+/// not every header. Replaced when a different fork has more work, or when it
+/// beats the candidate.
+#[derive(Clone, Debug)]
+struct Challenger {
+    fork_hash: BlockHash,
+    fork_height: u32,
+    tip_hash: BlockHash,
+    tip_height: u32,
+    tip_work: [u8; 32],
+    tip_header: Option<Header>,
+    tip_times: Vec<u32>,
+    diff: DiffSnap,
+    checkpoints: Vec<Checkpoint>,
+    milestone_hash: Option<BlockHash>,
+    milestone_prev: BlockHash,
+    milestone_header: Option<Header>,
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +101,10 @@ pub(crate) struct HeaderWalk {
     /// Last header in this period whose `nBits` are not the min-difficulty limit.
     full_diff_bits: Option<CompactTarget>,
     full_diff_height: u32,
+    /// Difficulty at `base_hash`, restored when every checkpoint is rewound.
+    base_diff: DiffSnap,
+    /// Heavier-so-far alternate that has not yet passed the candidate.
+    challenger: Option<Challenger>,
     /// Confirmed chain already proved the anchor; stop stat'ing the sidecar.
     adopt_retired: bool,
 }
@@ -91,6 +133,11 @@ impl HeaderWalk {
         if let Some(h) = self.tip_hash {
             out.push(h);
         }
+        if let Some(ch) = &self.challenger {
+            if !out.contains(&ch.tip_hash) {
+                out.push(ch.tip_hash);
+            }
+        }
         let mut step = 1usize;
         let mut i = self.checkpoints.len();
         while i > 0 && out.len() < 8 {
@@ -105,6 +152,11 @@ impl HeaderWalk {
             step = step.saturating_mul(2);
         }
         out
+    }
+
+    /// Tip of the one competing chain, when a later reply may still extend it.
+    pub(crate) fn challenger_tip(&self) -> Option<BlockHash> {
+        self.challenger.as_ref().map(|ch| ch.tip_hash)
     }
 }
 
@@ -152,6 +204,7 @@ fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
         note_period(st, hub, h, height);
         note_full_diff(st, hub, &h, height);
     }
+    st.header_walk.base_diff = walk_diff(&st.header_walk);
 }
 
 fn below_floor(hub: &ChainHub, work: &[u8; 32]) -> bool {
@@ -230,34 +283,23 @@ pub(crate) fn suppress_competing_chain(
     if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP && st.ordered.back().copied() == Some(prev) {
         return false;
     }
+    if challenger_extends(st, prev) {
+        return extend_challenger(st, hub, Some(peer), headers);
+    }
+    // A batch that has not met the next checkpoint is not a competing chain.
+    // Treating it as one would evict a real fork that has less work so far.
+    if st.header_walk.proven && !below && candidate_prev(st, prev) {
+        if let Some(start_h) = height_of(st, hub, prev) {
+            if matches!(path_agree(st, start_h, headers), PathAgree::Short) {
+                return true;
+            }
+        }
+    }
     if headers.iter().any(|h| hub.header_below_anti_dos(h)) {
         return true;
     }
-    let Some(parent) = work_at(st, hub, prev) else {
-        return false;
-    };
-    let mut work = parent;
-    let mut link = prev;
-    for hdr in headers {
-        if hdr.prev_blockhash != link {
-            break;
-        }
-        work = work + hdr.work();
-        link = hdr.block_hash();
-    }
-    if link == prev || work <= Work::from_be_bytes(st.header_walk.tip_work) {
-        note_dead(st, link);
-        return true;
-    }
-    if parent_header(st, hub, prev).is_none() {
-        return true;
-    }
-    if !batch_context_ok(st, hub, headers) {
-        punish_header_peer(st, peer);
-        return true;
-    }
-    adopt_heavier(st, hub, prev, headers, work);
-    st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP
+    // `Some(false)`: adopted, and the queue has room so the caller stores it.
+    offer_alternate(st, hub, Some(peer), headers).unwrap_or_default()
 }
 
 fn clear_off_path(st: &mut IbdWorkState) {
@@ -292,6 +334,7 @@ fn rewind_above(st: &mut IbdWorkState, hub: &ChainHub, height: u32) {
     let keep = st.header_walk.tip_height;
     forget_milestone_below(st, hub, keep);
     restore_tip_header(st, hub);
+    retain_challenger(st);
     let drop: Vec<BlockHash> = st
         .ordered
         .iter()
@@ -315,6 +358,395 @@ fn batch_ends_on_checkpoint(st: &IbdWorkState, headers: &[Header]) -> bool {
         || st.header_walk.checkpoints.iter().any(|c| c.hash == hash)
 }
 
+fn challenger_extends(st: &IbdWorkState, prev: BlockHash) -> bool {
+    st.header_walk
+        .challenger
+        .as_ref()
+        .is_some_and(|ch| ch.tip_hash == prev)
+}
+
+/// `None` when this reply is not a chain we can compare. `Some(true)` when the
+/// caller must not write it. `Some(false)` when it was adopted and the queue
+/// has room for those headers.
+fn offer_alternate(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: Option<usize>,
+    headers: &[Header],
+) -> Option<bool> {
+    if headers.is_empty() || !pow_linked(headers) {
+        return None;
+    }
+    let prev = headers[0].prev_blockhash;
+    let parent = work_at(st, hub, prev)?;
+    let fork_height = height_of(st, hub, prev)?;
+    if parent_header(st, hub, prev).is_none() {
+        return Some(true);
+    }
+    let diff = diff_at(st, hub, prev);
+    if !batch_context_ok(st, hub, headers, &diff) {
+        if let Some(peer) = peer {
+            punish_header_peer(st, peer);
+        }
+        return Some(true);
+    }
+    let work = chain_work_after(parent, headers);
+    if work > Work::from_be_bytes(st.header_walk.tip_work) {
+        adopt_heavier(st, hub, prev, headers, work);
+        return Some(st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP);
+    }
+    note_challenger(st, hub, prev, fork_height, parent, headers);
+    Some(true)
+}
+
+fn chain_work_after(parent: Work, headers: &[Header]) -> Work {
+    let mut work = parent;
+    let mut link = headers[0].prev_blockhash;
+    for hdr in headers {
+        if hdr.prev_blockhash != link {
+            break;
+        }
+        work = work + hdr.work();
+        link = hdr.block_hash();
+    }
+    work
+}
+
+struct WalkTip {
+    hash: BlockHash,
+    height: u32,
+    work: Work,
+    header: Option<Header>,
+    times: Vec<u32>,
+    diff: DiffSnap,
+    milestone_hash: Option<BlockHash>,
+    milestone_prev: BlockHash,
+    milestone_header: Option<Header>,
+}
+
+fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
+    for hdr in headers {
+        if hdr.prev_blockhash != tip.hash {
+            break;
+        }
+        tip.work = tip.work + hdr.work();
+        tip.height = tip.height.saturating_add(1);
+        let prev = tip.hash;
+        tip.hash = hdr.block_hash();
+        if hub.milestone.height > 0 && tip.height == hub.milestone.height {
+            tip.milestone_hash = Some(tip.hash);
+            tip.milestone_prev = prev;
+            tip.milestone_header = Some(*hdr);
+        }
+        push_times(&mut tip.times, *hdr);
+        note_period_snap(&mut tip.diff, hub, *hdr, tip.height);
+        note_full_diff_snap(&mut tip.diff, hub, hdr, tip.height);
+        tip.header = Some(*hdr);
+    }
+}
+
+fn push_times(times: &mut Vec<u32>, header: Header) {
+    times.push(header.time);
+    if times.len() > 11 {
+        times.remove(0);
+    }
+}
+
+fn checkpoint_at(tip: &WalkTip) -> Checkpoint {
+    Checkpoint {
+        hash: tip.hash,
+        height: tip.height,
+        work: tip.work.to_be_bytes(),
+        header: tip.header,
+        times: tip.times.clone(),
+        diff: tip.diff,
+    }
+}
+
+fn note_challenger(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    fork_hash: BlockHash,
+    fork_height: u32,
+    parent_work: Work,
+    headers: &[Header],
+) {
+    let end = chain_work_after(parent_work, headers);
+    if st
+        .header_walk
+        .challenger
+        .as_ref()
+        .is_some_and(|ch| end <= Work::from_be_bytes(ch.tip_work))
+    {
+        return;
+    }
+    let mut tip = WalkTip {
+        hash: fork_hash,
+        height: fork_height,
+        work: parent_work,
+        header: parent_header(st, hub, fork_hash),
+        times: times_ending_at(st, hub, fork_hash),
+        diff: diff_at(st, hub, fork_hash),
+        milestone_hash: None,
+        milestone_prev: BlockHash::from_byte_array([0; 32]),
+        milestone_header: None,
+    };
+    advance_tip(&mut tip, hub, headers);
+    st.header_walk.challenger = Some(Challenger {
+        fork_hash,
+        fork_height,
+        tip_hash: tip.hash,
+        tip_height: tip.height,
+        tip_work: tip.work.to_be_bytes(),
+        tip_header: tip.header,
+        tip_times: tip.times.clone(),
+        diff: tip.diff,
+        checkpoints: vec![checkpoint_at(&tip)],
+        milestone_hash: tip.milestone_hash,
+        milestone_prev: tip.milestone_prev,
+        milestone_header: tip.milestone_header,
+    });
+}
+
+fn extend_challenger(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: Option<usize>,
+    headers: &[Header],
+) -> bool {
+    let Some(ch) = st.header_walk.challenger.as_ref() else {
+        return false;
+    };
+    let diff = ch.diff;
+    if !batch_context_ok(st, hub, headers, &diff) {
+        if let Some(peer) = peer {
+            punish_header_peer(st, peer);
+        }
+        return true;
+    }
+    let Some(ch) = st.header_walk.challenger.as_ref() else {
+        return true;
+    };
+    let mut tip = WalkTip {
+        hash: ch.tip_hash,
+        height: ch.tip_height,
+        work: Work::from_be_bytes(ch.tip_work),
+        header: ch.tip_header,
+        times: ch.tip_times.clone(),
+        diff: ch.diff,
+        milestone_hash: ch.milestone_hash,
+        milestone_prev: ch.milestone_prev,
+        milestone_header: ch.milestone_header,
+    };
+    advance_tip(&mut tip, hub, headers);
+    let beat = tip.work > Work::from_be_bytes(st.header_walk.tip_work);
+    let Some(ch) = st.header_walk.challenger.as_mut() else {
+        return true;
+    };
+    if ch.milestone_hash.is_none() {
+        ch.milestone_hash = tip.milestone_hash;
+        ch.milestone_prev = tip.milestone_prev;
+        ch.milestone_header = tip.milestone_header;
+    }
+    ch.tip_hash = tip.hash;
+    ch.tip_height = tip.height;
+    ch.tip_work = tip.work.to_be_bytes();
+    ch.tip_header = tip.header;
+    ch.tip_times = tip.times.clone();
+    ch.diff = tip.diff;
+    ch.checkpoints.push(checkpoint_at(&tip));
+    if beat {
+        promote_challenger(st, hub);
+    }
+    true
+}
+
+fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
+    let Some(ch) = st.header_walk.challenger.take() else {
+        return;
+    };
+    forget_milestone_below(st, hub, ch.fork_height);
+    st.header_walk
+        .checkpoints
+        .retain(|c| c.height <= ch.fork_height);
+    st.header_walk.checkpoints.extend(ch.checkpoints);
+    st.header_walk.tip_hash = Some(ch.tip_hash);
+    st.header_walk.tip_height = ch.tip_height;
+    st.header_walk.tip_work = ch.tip_work;
+    install_diff(&mut st.header_walk, ch.diff);
+    st.header_walk.tip_header = ch.tip_header;
+    st.header_walk.tip_times = ch.tip_times;
+    if st.header_walk.milestone_hash.is_none() {
+        if let Some(hash) = ch.milestone_hash {
+            st.header_walk.milestone_hash = Some(hash);
+            if let Some(hdr) = ch.milestone_header {
+                hub.query.note_milestone_header(
+                    hub.milestone.height,
+                    hash.to_byte_array(),
+                    ch.milestone_prev.to_byte_array(),
+                    hdr.work(),
+                    None,
+                );
+            }
+        }
+    }
+    publish_work(st, hub);
+    st.header_walk.emptied.clear();
+    st.header_walk.dead_ends.clear();
+    clear_off_path(st);
+    save_adopt(st, hub);
+    drop_path_above(st, ch.fork_height, &HashSet::new());
+}
+
+/// Drop stored path slots and queued hashes above a fork we just left.
+///
+/// A queued hash with no height is not known to be at or below the fork, so
+/// it leaves with the old chain. The new headers then fit on the download path.
+fn drop_path_above(st: &mut IbdWorkState, fork_height: u32, keep: &HashSet<BlockHash>) {
+    let mut drop: HashSet<BlockHash> = st
+        .ordered
+        .iter()
+        .copied()
+        .filter(|h| {
+            if keep.contains(h) {
+                return false;
+            }
+            !matches!(st.hash_height.get(h), Some(ht) if *ht <= fork_height)
+        })
+        .collect();
+    for (ht, hash) in &st.height_to_hash {
+        if *ht > fork_height && !keep.contains(hash) {
+            drop.insert(*hash);
+        }
+    }
+    let drop: Vec<BlockHash> = drop.into_iter().collect();
+    forget_queue_hashes(st, &drop);
+}
+
+fn walk_diff(walk: &HeaderWalk) -> DiffSnap {
+    DiffSnap {
+        period_header: walk.period_header,
+        period_height: walk.period_height,
+        full_diff_bits: walk.full_diff_bits,
+        full_diff_height: walk.full_diff_height,
+    }
+}
+
+fn install_diff(walk: &mut HeaderWalk, diff: DiffSnap) {
+    walk.period_header = diff.period_header;
+    walk.period_height = diff.period_height;
+    walk.full_diff_bits = diff.full_diff_bits;
+    walk.full_diff_height = diff.full_diff_height;
+}
+
+/// Difficulty to use for a batch that builds on `hash`.
+///
+/// The walk tip's latch is only for the tip. A fork from an earlier checkpoint
+/// retargets from that checkpoint's period, never from the chain being left.
+fn diff_at(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> DiffSnap {
+    if st.header_walk.tip_hash == Some(hash) {
+        return walk_diff(&st.header_walk);
+    }
+    if let Some(c) = st
+        .header_walk
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.hash == hash)
+    {
+        return c.diff;
+    }
+    if let Some(ch) = &st.header_walk.challenger {
+        if ch.tip_hash == hash {
+            return ch.diff;
+        }
+        if let Some(c) = ch.checkpoints.iter().rev().find(|c| c.hash == hash) {
+            return c.diff;
+        }
+    }
+    if st.header_walk.base_hash == Some(hash) {
+        return st.header_walk.base_diff;
+    }
+    stored_path_state(st, hub, hash)
+        .map(|(_, diff)| diff)
+        .unwrap_or_default()
+}
+
+fn note_period_snap(diff: &mut DiffSnap, hub: &ChainHub, header: Header, height: u32) {
+    let interval = hub.params.difficulty_adjustment_interval();
+    if interval > 0 && height.is_multiple_of(interval) {
+        diff.period_header = Some(header);
+        diff.period_height = height;
+    }
+}
+
+fn note_full_diff_snap(diff: &mut DiffSnap, hub: &ChainHub, header: &Header, height: u32) {
+    let limit = hub.params.pow_limit.to_compact_lossy();
+    if header.bits != limit {
+        diff.full_diff_bits = Some(header.bits);
+        diff.full_diff_height = height;
+    }
+}
+
+fn times_ending_at(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Vec<u32> {
+    if st
+        .header_walk
+        .tip_header
+        .is_some_and(|h| h.block_hash() == hash)
+        && !st.header_walk.tip_times.is_empty()
+    {
+        return st.header_walk.tip_times.clone();
+    }
+    if let Some(ch) = &st.header_walk.challenger {
+        if ch.tip_header.is_some_and(|h| h.block_hash() == hash) && !ch.tip_times.is_empty() {
+            return ch.tip_times.clone();
+        }
+        if let Some(c) = ch.checkpoints.iter().rev().find(|c| c.hash == hash) {
+            if !c.times.is_empty() {
+                return c.times.clone();
+            }
+        }
+    }
+    if let Some(c) = st
+        .header_walk
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|c| c.hash == hash)
+    {
+        if !c.times.is_empty() {
+            return c.times.clone();
+        }
+    }
+    let Some(parent) = parent_header(st, hub, hash) else {
+        return Vec::new();
+    };
+    let mut times = vec![parent.time];
+    let mut prev_hash = parent.prev_blockhash;
+    for _ in 0..10 {
+        let Some(prev) = parent_header(st, hub, prev_hash) else {
+            break;
+        };
+        times.push(prev.time);
+        prev_hash = prev.prev_blockhash;
+    }
+    times.reverse();
+    times
+}
+
+/// Drop a competing chain whose fork is no longer on the candidate.
+fn retain_challenger(st: &mut IbdWorkState) {
+    let keep = st.header_walk.challenger.as_ref().is_some_and(|ch| {
+        let fork = ch.fork_hash;
+        st.header_walk.base_hash == Some(fork)
+            || st.header_walk.tip_hash == Some(fork)
+            || st.header_walk.checkpoints.iter().any(|c| c.hash == fork)
+    });
+    if !keep {
+        st.header_walk.challenger = None;
+    }
+}
+
 fn work_at(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<Work> {
     if st.header_walk.base_hash == Some(hash) {
         return Some(Work::from_be_bytes(st.header_walk.base_work));
@@ -322,10 +754,126 @@ fn work_at(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<Work> {
     if let Some(c) = st.header_walk.checkpoints.iter().find(|c| c.hash == hash) {
         return Some(Work::from_be_bytes(c.work));
     }
+    if let Some(ch) = &st.header_walk.challenger {
+        if ch.tip_hash == hash {
+            return Some(Work::from_be_bytes(ch.tip_work));
+        }
+        if let Some(c) = ch.checkpoints.iter().find(|c| c.hash == hash) {
+            return Some(Work::from_be_bytes(c.work));
+        }
+    }
     if hub.tip_hash() == Some(hash) {
         return hub.chain_work().ok();
     }
-    None
+    stored_path_state(st, hub, hash).map(|(work, _)| work)
+}
+
+/// Work and difficulty at a header the download path has stored.
+///
+/// A checkpoint knows both. A header between checkpoints does not, so a
+/// heavier chain that forks there cannot be compared. Replay from the
+/// nearest earlier checkpoint, the walk base, or the confirmed tip.
+fn stored_path_state(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+) -> Option<(Work, DiffSnap)> {
+    let height = *st.hash_height.get(&hash)?;
+    if st.height_to_hash.get(&height) != Some(&hash) {
+        return None;
+    }
+    for c in st.header_walk.checkpoints.iter().rev() {
+        if c.height > height {
+            continue;
+        }
+        if let Some(found) = fold_stored_anchor(
+            st,
+            hub,
+            StoredAnchor {
+                height: c.height,
+                hash: c.hash,
+                work: Work::from_be_bytes(c.work),
+                diff: c.diff,
+            },
+            height,
+            hash,
+        ) {
+            return Some(found);
+        }
+    }
+    if let Some(base) = st.header_walk.base_hash {
+        if st.header_walk.base_height <= height {
+            if let Some(found) = fold_stored_anchor(
+                st,
+                hub,
+                StoredAnchor {
+                    height: st.header_walk.base_height,
+                    hash: base,
+                    work: Work::from_be_bytes(st.header_walk.base_work),
+                    diff: st.header_walk.base_diff,
+                },
+                height,
+                hash,
+            ) {
+                return Some(found);
+            }
+        }
+    }
+    let tip_h = hub.tip_height()?;
+    let tip = hub.tip_hash()?;
+    if tip_h > height {
+        return None;
+    }
+    fold_stored_anchor(
+        st,
+        hub,
+        StoredAnchor {
+            height: tip_h,
+            hash: tip,
+            work: hub.chain_work().ok()?,
+            diff: DiffSnap::default(),
+        },
+        height,
+        hash,
+    )
+}
+
+struct StoredAnchor {
+    height: u32,
+    hash: BlockHash,
+    work: Work,
+    diff: DiffSnap,
+}
+
+fn fold_stored_anchor(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    anchor: StoredAnchor,
+    height: u32,
+    hash: BlockHash,
+) -> Option<(Work, DiffSnap)> {
+    let StoredAnchor {
+        height: anchor_h,
+        hash: anchor_hash,
+        mut work,
+        mut diff,
+    } = anchor;
+    if anchor_h == height {
+        return (anchor_hash == hash).then_some((work, diff));
+    }
+    let mut prev = anchor_hash;
+    for h in anchor_h.saturating_add(1)..=height {
+        let next = *st.height_to_hash.get(&h)?;
+        let hdr = hub.header_of(&next)?;
+        if hdr.prev_blockhash != prev {
+            return None;
+        }
+        work = work + hdr.work();
+        note_period_snap(&mut diff, hub, hdr, h);
+        note_full_diff_snap(&mut diff, hub, &hdr, h);
+        prev = next;
+    }
+    (prev == hash).then_some((work, diff))
 }
 
 fn adopt_heavier(
@@ -335,21 +883,18 @@ fn adopt_heavier(
     headers: &[Header],
     work: Work,
 ) {
-    let fork_height = if st.header_walk.base_hash == Some(prev) {
-        st.header_walk.base_height
-    } else {
-        st.header_walk
-            .checkpoints
-            .iter()
-            .find(|c| c.hash == prev)
-            .map(|c| c.height)
-            .unwrap_or(st.header_walk.base_height)
+    let Some(fork_height) = height_of(st, hub, prev) else {
+        return;
     };
+    // Capture the fork's period and timestamps before the challenger is dropped.
+    let diff = diff_at(st, hub, prev);
+    seed_fork_times(st, hub, prev);
+    install_diff(&mut st.header_walk, diff);
+    st.header_walk.challenger = None;
     forget_milestone_below(st, hub, fork_height);
     st.header_walk
         .checkpoints
         .retain(|c| c.height <= fork_height);
-    seed_fork_times(st, hub, prev);
     let mut height = fork_height;
     let mut link = prev;
     let mut hash = prev;
@@ -377,6 +922,7 @@ fn adopt_heavier(
         work: work_be,
         header: last,
         times: st.header_walk.tip_times.clone(),
+        diff: walk_diff(&st.header_walk),
     });
     publish_work(st, hub);
     st.header_walk.emptied.clear();
@@ -384,18 +930,7 @@ fn adopt_heavier(
     clear_off_path(st);
     save_adopt(st, hub);
     let keep: HashSet<BlockHash> = headers.iter().map(|h| h.block_hash()).collect();
-    let drop: Vec<BlockHash> = st
-        .ordered
-        .iter()
-        .copied()
-        .filter(|h| {
-            if keep.contains(h) {
-                return false;
-            }
-            !matches!(st.hash_height.get(h), Some(ht) if *ht <= fork_height)
-        })
-        .collect();
-    forget_queue_hashes(st, &drop);
+    drop_path_above(st, fork_height, &keep);
 }
 
 fn forget_queue_hashes(st: &mut IbdWorkState, drop: &[BlockHash]) {
@@ -440,7 +975,7 @@ pub(crate) fn absorb_lookahead(
     if !solicited {
         return true;
     }
-    if !batch_context_ok(st, hub, headers) {
+    if !batch_context_ok(st, hub, headers, &walk_diff(&st.header_walk)) {
         punish_header_peer(st, peer);
         st.header_walk.asked_peer = None;
         return true;
@@ -497,6 +1032,18 @@ pub(crate) fn reject_refill_miss(
     let Some(&tail_h) = st.hash_height.get(&tail) else {
         return false;
     };
+    // A proven walk is the most-work header chain so far. A refill that
+    // disagrees with it is not allowed to erase that proof. Headers that
+    // have not met the next checkpoint are not on that chain yet, so they
+    // are not written. Below the floor the candidate is still a guess, and
+    // a contradictory refill replaces it.
+    if st.header_walk.proven && !below_floor(hub, &st.header_walk.tip_work) {
+        return match path_agree(st, tail_h, headers) {
+            PathAgree::Diverges => keep_proven_walk(st, hub, headers),
+            PathAgree::Short => true,
+            PathAgree::Checkpoint(_) => false,
+        };
+    }
     if !refill_misses_checkpoint(st, tail_h, headers) {
         return false;
     }
@@ -504,12 +1051,125 @@ pub(crate) fn reject_refill_miss(
     false
 }
 
+/// A checkpoint this batch meets is an ancestor of the milestone walk.
+/// Headers past that checkpoint, or a batch that never meets one, are not.
+enum PathAgree {
+    Checkpoint(u32),
+    Short,
+    Diverges,
+}
+
+fn candidate_prev(st: &IbdWorkState, prev: BlockHash) -> bool {
+    st.ordered.back().copied() == Some(prev)
+        || st.header_walk.base_hash == Some(prev)
+        || st.header_walk.tip_hash == Some(prev)
+        || st.header_walk.checkpoints.iter().any(|c| c.hash == prev)
+        || st
+            .hash_height
+            .get(&prev)
+            .is_some_and(|h| st.height_to_hash.get(h) == Some(&prev))
+}
+
+fn path_agree(st: &IbdWorkState, start_h: u32, headers: &[Header]) -> PathAgree {
+    let Some(first) = headers.first() else {
+        return PathAgree::Short;
+    };
+    let mut height = start_h;
+    let mut prev = first.prev_blockhash;
+    let mut agreed: Option<u32> = None;
+    let mut any = false;
+    for hdr in headers {
+        if hdr.prev_blockhash != prev {
+            break;
+        }
+        any = true;
+        height = height.saturating_add(1);
+        let hash = hdr.block_hash();
+        if let Some(c) = st
+            .header_walk
+            .checkpoints
+            .iter()
+            .find(|c| c.height == height)
+        {
+            if c.hash != hash {
+                return PathAgree::Diverges;
+            }
+            agreed = Some(height);
+        } else if let Some(want) = st.height_to_hash.get(&height) {
+            if *want != hash {
+                return PathAgree::Diverges;
+            }
+        } else if agreed.is_some() {
+            break;
+        }
+        prev = hash;
+    }
+    if !any {
+        return PathAgree::Short;
+    }
+    match agreed {
+        Some(h) => PathAgree::Checkpoint(h),
+        None => PathAgree::Short,
+    }
+}
+
+/// How many headers of a proven-chain reply may be written.
+///
+/// The whole reply stays writable below the work floor, and when it does not
+/// build on the candidate. On a proven candidate, only the prefix through the
+/// checkpoint the reply actually met is on the chain toward the milestone.
+pub(crate) fn proven_header_prefix(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> usize {
+    if headers.is_empty()
+        || !st.header_walk.proven
+        || below_floor(hub, &st.header_walk.tip_work)
+        || !st.header_walk.origin
+        || st.header_walk.checkpoints.is_empty()
+    {
+        return headers.len();
+    }
+    let prev = headers[0].prev_blockhash;
+    if !candidate_prev(st, prev) {
+        return headers.len();
+    }
+    let Some(start_h) = height_of(st, hub, prev) else {
+        return headers.len();
+    };
+    let stop = match path_agree(st, start_h, headers) {
+        PathAgree::Checkpoint(stop) => stop,
+        // A queue refill that never meets a checkpoint is not an ancestor.
+        PathAgree::Short => return 0,
+        // A fork that is not the queue-tail refill stays in the header store.
+        // The proven tail path already consumed its own divergent refill.
+        PathAgree::Diverges => return headers.len(),
+    };
+    let mut height = start_h;
+    let mut link = prev;
+    let mut n = 0usize;
+    for hdr in headers {
+        if hdr.prev_blockhash != link {
+            break;
+        }
+        height = height.saturating_add(1);
+        if height > stop {
+            break;
+        }
+        n += 1;
+        link = hdr.block_hash();
+    }
+    n
+}
+
+/// True when the divergent refill was consumed. False when a heavier chain
+/// was adopted and the queue has room to store this batch.
+fn keep_proven_walk(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
+    offer_alternate(st, hub, None, headers).unwrap_or(true)
+}
+
 fn refill_misses_checkpoint(st: &IbdWorkState, tail_h: u32, headers: &[Header]) -> bool {
     let checkpoints = st.header_walk.checkpoints();
     let Some(mut next_i) = checkpoints.iter().position(|c| c.height > tail_h) else {
         return false;
     };
-    let mut matched = false;
     let mut height = tail_h;
     let mut prev = headers[0].prev_blockhash;
     for hdr in headers {
@@ -521,7 +1181,6 @@ fn refill_misses_checkpoint(st: &IbdWorkState, tail_h: u32, headers: &[Header]) 
             if hdr.block_hash() != checkpoints[next_i].hash {
                 return true;
             }
-            matched = true;
             next_i += 1;
             if next_i >= checkpoints.len() {
                 return false;
@@ -529,7 +1188,10 @@ fn refill_misses_checkpoint(st: &IbdWorkState, tail_h: u32, headers: &[Header]) 
         }
         prev = hdr.block_hash();
     }
-    !matched
+    // A linked prefix that has not reached the next checkpoint is the same
+    // chain, still short of the proof. Only a hash at a checkpoint height
+    // that is not the checkpoint is a miss.
+    false
 }
 
 /// Every alive peer answered empty before the work floor. True when the walk
@@ -613,6 +1275,7 @@ fn extend_tip(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool
         work: st.header_walk.tip_work,
         header: last,
         times: st.header_walk.tip_times.clone(),
+        diff: walk_diff(&st.header_walk),
     });
     st.header_walk.emptied.clear();
     publish_work(st, hub);
@@ -654,12 +1317,7 @@ fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         return;
     }
     let opened = !st.header_walk.proven;
-    hub.query
-        .note_milestone_checkpoint_work(st.header_walk.tip_height, st.header_walk.tip_work);
     st.header_walk.proven = true;
-    if !opened {
-        return;
-    }
     let Some(anchor) = hub.milestone.anchor else {
         return;
     };
@@ -667,11 +1325,18 @@ fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         return;
     };
     if hash != anchor.hash {
-        rbitcoin_log::warn!(
-            "ibd: headers anchor mismatch height={} hash={hash} anchor={}",
-            hub.milestone.height,
-            anchor.hash
-        );
+        if opened {
+            rbitcoin_log::warn!(
+                "ibd: headers anchor mismatch height={} hash={hash} anchor={}",
+                hub.milestone.height,
+                anchor.hash
+            );
+        }
+        return;
+    }
+    hub.query
+        .note_milestone_checkpoint_work(st.header_walk.tip_height, st.header_walk.tip_work);
+    if !opened {
         return;
     }
     rbitcoin_log::info!(
@@ -699,6 +1364,7 @@ fn rewind(st: &mut IbdWorkState, hub: &ChainHub) {
     let keep = st.header_walk.tip_height;
     forget_milestone_below(st, hub, keep);
     restore_tip_header(st, hub);
+    retain_challenger(st);
     drop_queue_past(st, keep, dead);
     st.header_walk.emptied.clear();
     clear_off_path(st);
@@ -802,6 +1468,20 @@ fn parent_header(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<H
     {
         return st.header_walk.tip_header;
     }
+    if let Some(ch) = &st.header_walk.challenger {
+        if ch.tip_header.is_some_and(|h| h.block_hash() == hash) {
+            return ch.tip_header;
+        }
+        if let Some(hdr) = ch
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.hash == hash)
+            .and_then(|c| c.header)
+        {
+            return Some(hdr);
+        }
+    }
     if let Some(hdr) = st
         .header_walk
         .checkpoints
@@ -821,6 +1501,17 @@ fn height_of(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<u32> 
     }
     if st.header_walk.base_hash == Some(hash) {
         return Some(st.header_walk.base_height);
+    }
+    if let Some(ch) = &st.header_walk.challenger {
+        if ch.tip_hash == hash {
+            return Some(ch.tip_height);
+        }
+        if ch.fork_hash == hash {
+            return Some(ch.fork_height);
+        }
+        if let Some(c) = ch.checkpoints.iter().find(|c| c.hash == hash) {
+            return Some(c.height);
+        }
     }
     if let Some(c) = st.header_walk.checkpoints.iter().find(|c| c.hash == hash) {
         return Some(c.height);
@@ -859,63 +1550,63 @@ fn push_tip_time(st: &mut IbdWorkState, header: Header) {
 }
 
 fn note_period(st: &mut IbdWorkState, hub: &ChainHub, header: Header, height: u32) {
-    let interval = hub.params.difficulty_adjustment_interval();
-    if interval > 0 && height.is_multiple_of(interval) {
-        st.header_walk.period_header = Some(header);
-        st.header_walk.period_height = height;
-    }
+    let mut diff = walk_diff(&st.header_walk);
+    note_period_snap(&mut diff, hub, header, height);
+    install_diff(&mut st.header_walk, diff);
 }
 
 fn seed_fork_times(st: &mut IbdWorkState, hub: &ChainHub, prev: BlockHash) {
-    let saved = st
-        .header_walk
-        .checkpoints
-        .iter()
-        .find(|c| c.hash == prev)
-        .and_then(|c| c.header.map(|h| (h, c.times.clone())));
-    if let Some((header, times)) = saved {
-        st.header_walk.tip_header = Some(header);
-        st.header_walk.tip_times = times;
+    let Some(header) = parent_header(st, hub, prev) else {
+        st.header_walk.tip_header = None;
+        st.header_walk.tip_times.clear();
+        return;
+    };
+    let times = times_ending_at(st, hub, prev);
+    if times.is_empty() {
+        seed_tip_times(st, hub, header);
         return;
     }
-    if let Some(parent) = parent_header(st, hub, prev) {
-        seed_tip_times(st, hub, parent);
-    }
+    st.header_walk.tip_header = Some(header);
+    st.header_walk.tip_times = times;
 }
 
 fn restore_tip_header(st: &mut IbdWorkState, hub: &ChainHub) {
-    let saved = st
-        .header_walk
-        .checkpoints
-        .last()
-        .map(|c| (c.header, c.times.clone(), c.hash));
-    if let Some((header, times, hash)) = saved {
-        if let Some(header) = header {
+    let saved = st.header_walk.checkpoints.last().cloned();
+    if let Some(c) = saved {
+        install_diff(&mut st.header_walk, c.diff);
+        if let Some(header) = c.header {
             st.header_walk.tip_header = Some(header);
-            st.header_walk.tip_times = times;
+            st.header_walk.tip_times = c.times;
             return;
         }
-        if let Some(header) = hub.header_of(&hash) {
+        if let Some(header) = hub.header_of(&c.hash) {
             seed_tip_times(st, hub, header);
             return;
         }
-    } else if let Some(header) = st.header_walk.base_hash.and_then(|h| hub.header_of(&h)) {
-        seed_tip_times(st, hub, header);
-        return;
+    } else {
+        let base = st.header_walk.base_diff;
+        install_diff(&mut st.header_walk, base);
+        if let Some(header) = st.header_walk.base_hash.and_then(|h| hub.header_of(&h)) {
+            seed_tip_times(st, hub, header);
+            return;
+        }
     }
     st.header_walk.tip_header = None;
     st.header_walk.tip_times.clear();
 }
 
 fn note_full_diff(st: &mut IbdWorkState, hub: &ChainHub, header: &Header, height: u32) {
-    let limit = hub.params.pow_limit.to_compact_lossy();
-    if header.bits != limit {
-        st.header_walk.full_diff_bits = Some(header.bits);
-        st.header_walk.full_diff_height = height;
-    }
+    let mut diff = walk_diff(&st.header_walk);
+    note_full_diff_snap(&mut diff, hub, header, height);
+    install_diff(&mut st.header_walk, diff);
 }
 
-fn batch_context_ok(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
+fn batch_context_ok(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    headers: &[Header],
+    diff: &DiffSnap,
+) -> bool {
     if headers.is_empty() {
         return false;
     }
@@ -925,26 +1616,7 @@ fn batch_context_ok(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bo
     let Some(mut height) = height_of(st, hub, parent.block_hash()) else {
         return false;
     };
-    let mut times = if st
-        .header_walk
-        .tip_header
-        .is_some_and(|h| h.block_hash() == parent.block_hash())
-        && !st.header_walk.tip_times.is_empty()
-    {
-        st.header_walk.tip_times.clone()
-    } else {
-        let mut times = vec![parent.time];
-        let mut prev_hash = parent.prev_blockhash;
-        for _ in 0..10 {
-            let Some(prev) = parent_header(st, hub, prev_hash) else {
-                break;
-            };
-            times.push(prev.time);
-            prev_hash = prev.prev_blockhash;
-        }
-        times.reverse();
-        times
-    };
+    let mut times = times_ending_at(st, hub, parent.block_hash());
     let mut parent_hash = parent.block_hash();
     for hdr in headers {
         let hash = hdr.block_hash();
@@ -965,7 +1637,7 @@ fn batch_context_ok(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bo
             rbitcoin_primitives::median_time_past_times(&times)
         };
         parent_hash = hash;
-        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st) else {
+        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st, diff) else {
             return false;
         };
         if rbitcoin_consensus::validate_header_on_parent(
@@ -994,6 +1666,7 @@ fn expected_lookahead_bits(
     parent: &Header,
     header_time: u32,
     st: &IbdWorkState,
+    diff: &DiffSnap,
 ) -> Option<CompactTarget> {
     rbitcoin_consensus::next_work_bits(
         &hub.params,
@@ -1001,20 +1674,25 @@ fn expected_lookahead_bits(
         parent.bits,
         parent.time,
         header_time,
-        period_first_time(hub, height, st),
-        |h| lookahead_bits_at(st, hub, h),
+        period_first_time(hub, height, st, diff),
+        |h| lookahead_bits_at(diff, st, hub, h),
     )
 }
 
-fn period_first_time(hub: &ChainHub, height: u32, st: &IbdWorkState) -> Option<u32> {
+fn period_first_time(
+    hub: &ChainHub,
+    height: u32,
+    st: &IbdWorkState,
+    diff: &DiffSnap,
+) -> Option<u32> {
     let params = &hub.params;
     let interval = params.difficulty_adjustment_interval();
     if interval == 0 || !height.is_multiple_of(interval) || params.no_pow_retargeting() {
         return None;
     }
     let start_h = height - interval;
-    let first = if st.header_walk.period_height == start_h {
-        st.header_walk.period_header
+    let first = if diff.period_height == start_h {
+        diff.period_header
     } else {
         None
     };
@@ -1023,20 +1701,25 @@ fn period_first_time(hub: &ChainHub, height: u32, st: &IbdWorkState) -> Option<u
         .map(|h| h.time)
 }
 
-fn lookahead_bits_at(st: &IbdWorkState, hub: &ChainHub, height: u32) -> Option<CompactTarget> {
+fn lookahead_bits_at(
+    diff: &DiffSnap,
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    height: u32,
+) -> Option<CompactTarget> {
     let limit = hub.params.pow_limit.to_compact_lossy();
-    if let Some(bits) = st.header_walk.full_diff_bits {
-        if height == st.header_walk.full_diff_height {
+    if let Some(bits) = diff.full_diff_bits {
+        if height == diff.full_diff_height {
             return Some(bits);
         }
-        if height > st.header_walk.full_diff_height && bits != limit {
+        if height > diff.full_diff_height && bits != limit {
             return Some(limit);
         }
     }
     if let Some(hdr) = header_on_store(st, hub, height) {
         return Some(hdr.bits);
     }
-    if hub.params.allow_min_difficulty_blocks() && st.header_walk.full_diff_bits.is_none() {
+    if hub.params.allow_min_difficulty_blocks() && diff.full_diff_bits.is_none() {
         return Some(limit);
     }
     None
@@ -1049,11 +1732,25 @@ fn header_on_store(st: &IbdWorkState, hub: &ChainHub, height: u32) -> Option<Hea
         }
     }
     if st.header_walk.base_height == height {
-        return st.header_walk.base_hash.and_then(|h| hub.header_of(&h));
+        if let Some(hdr) = st.header_walk.base_hash.and_then(|h| hub.header_of(&h)) {
+            return Some(hdr);
+        }
     }
-    st.height_to_hash
+    if let Some(hdr) = st
+        .height_to_hash
         .get(&height)
         .and_then(|h| hub.header_of(h))
+    {
+        return Some(hdr);
+    }
+    let hash = hub
+        .query
+        .header_at_height(rbitcoin_primitives::Height(height))
+        .ok()
+        .flatten()?
+        .1
+        .hash;
+    hub.header_of(&BlockHash::from_byte_array(hash))
 }
 
 fn pow_linked(headers: &[Header]) -> bool {
@@ -1069,6 +1766,8 @@ fn pow_linked(headers: &[Header]) -> bool {
 }
 
 const ADOPT_MAGIC: &[u8; 8] = b"rbtchdr1";
+/// period height u32 ‖ period header 80 ‖ full-diff height u32 ‖ full-diff bits u32.
+const DIFF_SNAP_LEN: usize = 4 + 80 + 4 + 4;
 
 fn adopt_path(hub: &ChainHub) -> std::path::PathBuf {
     hub.query.store().path().join("header.adopt")
@@ -1090,6 +1789,31 @@ fn read_header(raw: &[u8]) -> Option<Header> {
         return None;
     }
     bitcoin::consensus::deserialize(raw).ok()
+}
+
+fn write_diff(buf: &mut Vec<u8>, diff: &DiffSnap) {
+    buf.extend_from_slice(&diff.period_height.to_le_bytes());
+    write_header(buf, diff.period_header);
+    buf.extend_from_slice(&diff.full_diff_height.to_le_bytes());
+    let bits = diff.full_diff_bits.map(|b| b.to_consensus()).unwrap_or(0);
+    buf.extend_from_slice(&bits.to_le_bytes());
+}
+
+fn read_diff(bytes: &[u8]) -> Option<DiffSnap> {
+    if bytes.len() < DIFF_SNAP_LEN {
+        return None;
+    }
+    let period_height = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let period_header = read_header(&bytes[4..84]);
+    let full_diff_height = u32::from_le_bytes(bytes[84..88].try_into().ok()?);
+    let full_bits = u32::from_le_bytes(bytes[88..92].try_into().ok()?);
+    let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
+    Some(DiffSnap {
+        period_header,
+        period_height,
+        full_diff_bits,
+        full_diff_height,
+    })
 }
 
 fn base_conflicts(st: &IbdWorkState, hub: &ChainHub, walk: &HeaderWalk) -> bool {
@@ -1135,6 +1859,11 @@ pub(crate) fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: 
     let Some(hash) = st.header_walk.milestone_hash else {
         return;
     };
+    // An empty path means the confirmed chain is the source. Inserting only
+    // this hash would hide every earlier block on that chain.
+    if !hub.query.has_milestone_path() {
+        return;
+    }
     hub.query.note_milestone_header(
         hub.milestone.height,
         hash.to_byte_array(),
@@ -1158,6 +1887,7 @@ fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
         buf.extend_from_slice(&c.work);
         write_header(&mut buf, c.header);
         write_times(&mut buf, &c.times);
+        write_diff(&mut buf, &c.diff);
     }
     let milestone = st
         .header_walk
@@ -1183,6 +1913,7 @@ fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
         .map(|b| b.to_consensus())
         .unwrap_or(0);
     buf.extend_from_slice(&full_bits.to_le_bytes());
+    write_diff(&mut buf, &st.header_walk.base_diff);
     let path = adopt_path(hub);
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, &buf).is_ok() {
@@ -1222,13 +1953,17 @@ pub(crate) fn retire_adopt_if_confirmed(st: &mut IbdWorkState, hub: &ChainHub) {
         return;
     }
     st.header_walk.adopt_retired = true;
-    hub.query.note_milestone_header(
-        hub.milestone.height,
-        rec.hash,
-        [0u8; 32],
-        Work::from_be_bytes([0u8; 32]),
-        None,
-    );
+    // The confirmed chain already contains the anchor. Noting only that hash
+    // into an empty path would hide the confirmed ancestors.
+    if hub.query.has_milestone_path() {
+        hub.query.note_milestone_header(
+            hub.milestone.height,
+            rec.hash,
+            [0u8; 32],
+            Work::from_be_bytes([0u8; 32]),
+            None,
+        );
+    }
     hub.query
         .note_milestone_checkpoint_work(tip_h, work.to_be_bytes());
     let _ = std::fs::remove_file(adopt_path(hub));
@@ -1273,11 +2008,7 @@ pub(crate) fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
             );
         }
     }
-    if !below_floor(hub, &st.header_walk.tip_work) {
-        hub.query
-            .note_milestone_checkpoint_work(st.header_walk.tip_height, st.header_walk.tip_work);
-        st.header_walk.proven = true;
-    }
+    publish_work(st, hub);
     let work = if st.header_walk.proven { "ok" } else { "below" };
     rbitcoin_log::info!(
         "ibd: headers resume height={} work={work} took={took:?}",
@@ -1291,9 +2022,9 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         return None;
     }
     let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-    const CKPT: usize = 32 + 4 + 32 + 80 + 1 + 11 * 4;
+    const CKPT: usize = 32 + 4 + 32 + 80 + 1 + 11 * 4 + DIFF_SNAP_LEN;
     let body = 12 + n * CKPT;
-    const TAIL: usize = 32 + 32 + 4 + 32 + 80 + 4 + 80 + 4 + 4;
+    const TAIL: usize = 32 + 32 + 4 + 32 + 80 + 4 + 80 + 4 + 4 + DIFF_SNAP_LEN;
     if bytes.len() != body + TAIL {
         return None;
     }
@@ -1312,12 +2043,15 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         off += 80;
         let times = read_times(&bytes[off..off + 1 + 11 * 4])?;
         off += 1 + 11 * 4;
+        let diff = read_diff(&bytes[off..off + DIFF_SNAP_LEN])?;
+        off += DIFF_SNAP_LEN;
         checkpoints.push(Checkpoint {
             hash: BlockHash::from_byte_array(hash),
             height,
             work,
             header,
             times,
+            diff,
         });
     }
     let mut milestone = [0u8; 32];
@@ -1341,7 +2075,9 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
     let full_diff_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
     off += 4;
     let full_bits = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    off += 4;
     let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
+    let base_diff = read_diff(&bytes[off..off + DIFF_SNAP_LEN])?;
     let (tip_hash, tip_height, tip_work) = match checkpoints.last() {
         Some(c) => (Some(c.hash), c.height, c.work),
         None => (None, 0, [0u8; 32]),
@@ -1369,6 +2105,8 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         period_height,
         full_diff_bits,
         full_diff_height,
+        base_diff,
+        challenger: None,
         adopt_retired: false,
     })
 }
@@ -1848,7 +2586,11 @@ mod tests {
         let after = hub.query.store().header_count();
         apply(&mut st, &hub, 0, vec![miss]);
         assert_eq!(hub.query.store().header_count(), after);
-        assert!(st.header_walk.dead_ends.contains(&miss.block_hash()));
+        assert!(
+            !st.header_walk.dead_ends.contains(&miss.block_hash()),
+            "a lighter valid chain stays available for a later heavier extension"
+        );
+        assert!(st.slots[0].alive);
         assert_eq!(st.header_walk.tip_hash, Some(good.block_hash()));
         assert!(hub
             .query
@@ -2571,5 +3313,585 @@ mod tests {
         apply(&mut st, &hub, 0, heavier);
         assert_eq!(st.header_walk.tip_hash, Some(heavy_tip));
         assert!(st.slots[0].alive);
+    }
+
+    fn arm_retarget(hub: &mut crate::chain::ChainHub) {
+        hub.params.btc.no_pow_retargeting = false;
+        hub.params.btc.allow_min_difficulty_blocks = false;
+        let spacing = hub.params.btc.pow_target_spacing;
+        hub.params.btc.pow_target_timespan = spacing.saturating_mul(20);
+    }
+
+    fn chain_time(genesis_time: u32, spacing: u32, height: u32) -> u32 {
+        genesis_time.saturating_add(spacing.saturating_mul(height))
+    }
+
+    fn bits_for(
+        hub: &crate::chain::ChainHub,
+        genesis: &Header,
+        prior: &[Header],
+        height: u32,
+        time: u32,
+        parent: &Header,
+    ) -> CompactTarget {
+        let interval = hub.params.difficulty_adjustment_interval();
+        let period_first = if interval > 0 && height.is_multiple_of(interval) {
+            let start = height - interval;
+            if start == 0 {
+                Some(genesis.time)
+            } else {
+                prior.get((start as usize) - 1).map(|h| h.time)
+            }
+        } else {
+            None
+        };
+        rbitcoin_consensus::next_work_bits(
+            &hub.params,
+            height,
+            parent.bits,
+            parent.time,
+            time,
+            period_first,
+            |_| None,
+        )
+        .expect("difficulty bits")
+    }
+
+    fn mine_bits(prev: BlockHash, n: u32, time: u32, bits: CompactTarget, salt: u8) -> Header {
+        let mut merkle = [salt; 32];
+        merkle[28..32].copy_from_slice(&n.to_le_bytes());
+        let mut h = Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::from_byte_array(merkle),
+            time,
+            bits,
+            nonce: 0,
+        };
+        rbitcoin_consensus::grind_regtest_pow(&mut h);
+        h
+    }
+
+    /// Headers at heights `prior.len()+1` onward. `prior` is the shared prefix
+    /// (height 1 first). Difficulty matches `hub.params`.
+    fn extend_chain(
+        hub: &crate::chain::ChainHub,
+        genesis: &Header,
+        prior: &[Header],
+        extra: u32,
+        salt: u8,
+    ) -> Vec<Header> {
+        let spacing = hub.params.btc.pow_target_spacing as u32;
+        let mut all = prior.to_vec();
+        let mut parent = prior.last().copied().unwrap_or(*genesis);
+        let start = prior.len() as u32;
+        let mut out = Vec::with_capacity(extra as usize);
+        for n in 1..=extra {
+            let height = start + n;
+            let time = chain_time(genesis.time, spacing, height);
+            let bits = bits_for(hub, genesis, &all, height, time, &parent);
+            let hdr = mine_bits(parent.block_hash(), height, time, bits, salt);
+            all.push(hdr);
+            out.push(hdr);
+            parent = hdr;
+        }
+        out
+    }
+
+    #[test]
+    fn heavier_fork_across_a_gap_retarget_is_adopted() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-retarget-fork");
+        hub.ensure_genesis().unwrap();
+        arm_retarget(&mut hub);
+        let gen_hash = hub.tip_hash().unwrap();
+        let genesis = hub.header_of(&gen_hash).unwrap();
+        floor_unreachable(&mut hub);
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen_hash), Some(0));
+        fill_queue(&mut st);
+        assert_eq!(hub.params.difficulty_adjustment_interval(), 20);
+        let chain = extend_chain(&hub, &genesis, &[], 45, 1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[..20].to_vec());
+        assert!(st.slots[0].alive, "the first period is valid");
+        assert_eq!(st.header_walk.tip_height, 20);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[20..40].to_vec());
+        assert!(
+            st.slots[0].alive,
+            "the retarget at the period start is valid"
+        );
+        assert_eq!(st.header_walk.tip_height, 40);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[40..].to_vec());
+        assert!(st.slots[0].alive, "the walk continues past that retarget");
+        assert_eq!(st.header_walk.tip_height, 45);
+
+        let fork = extend_chain(&hub, &genesis, &chain[..20], 30, 2);
+        let fork_tip = fork.last().unwrap().block_hash();
+        apply(&mut st, &hub, 0, fork);
+        assert!(
+            st.slots[0].alive,
+            "a heavier fork whose period start is only on the fork checkpoint is valid"
+        );
+        assert_eq!(st.header_walk.tip_height, 50);
+        assert_eq!(st.header_walk.tip_hash, Some(fork_tip));
+    }
+
+    #[test]
+    fn rewind_restores_difficulty_before_the_next_retarget() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-retarget-rewind");
+        hub.ensure_genesis().unwrap();
+        arm_retarget(&mut hub);
+        let gen_hash = hub.tip_hash().unwrap();
+        let genesis = hub.header_of(&gen_hash).unwrap();
+        floor_unreachable(&mut hub);
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen_hash), Some(0));
+        fill_queue(&mut st);
+        assert_eq!(hub.params.difficulty_adjustment_interval(), 20);
+        let chain = extend_chain(&hub, &genesis, &[], 46, 1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[..16].to_vec());
+        assert!(st.slots[0].alive);
+        assert_eq!(st.header_walk.tip_height, 16);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[16..36].to_vec());
+        assert!(
+            st.slots[0].alive,
+            "the retarget inside the second reply is valid"
+        );
+        assert_eq!(st.header_walk.tip_height, 36);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, chain[36..].to_vec());
+        assert!(st.slots[0].alive);
+        assert_eq!(st.header_walk.tip_height, 46);
+
+        apply(&mut st, &hub, 0, vec![]);
+        assert_eq!(
+            st.header_walk.tip_height, 36,
+            "an empty reply below the floor steps back one checkpoint"
+        );
+        let next = extend_chain(&hub, &genesis, &chain[..36], 20, 3);
+        let tip = next.last().unwrap().block_hash();
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, next);
+        assert!(
+            st.slots[0].alive,
+            "the period start on the checkpoint we rewound to still checks nBits"
+        );
+        assert_eq!(st.header_walk.tip_height, 56);
+        assert_eq!(st.header_walk.tip_hash, Some(tip));
+    }
+
+    #[test]
+    fn a_heavier_chain_arriving_in_two_batches_replaces_the_candidate() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-two-batch");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        floor_unreachable(&mut hub);
+        let (s0, mut rx) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        fill_queue(&mut st);
+        let mut prev = gen;
+        let mut candidate = Vec::new();
+        for n in 1..=4 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            candidate.push(hdr);
+        }
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, candidate);
+        let candidate_tip = st.header_walk.tip_hash;
+        assert_eq!(st.header_walk.tip_height, 4);
+        let before = hub.query.store().header_count();
+
+        let mut prev = gen;
+        let mut first = Vec::new();
+        for n in 20..22 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            first.push(hdr);
+        }
+        apply(&mut st, &hub, 0, first);
+        assert_eq!(
+            st.header_walk.tip_hash, candidate_tip,
+            "a short valid batch does not replace a heavier candidate"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+        assert!(st.slots[0].alive);
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        match rx.try_recv() {
+            Ok(PeerCmd::GetHeaders { locator }) => {
+                assert_eq!(
+                    locator[0], prev,
+                    "a refill locator names the competing tip before the queue tail"
+                );
+                assert_ne!(locator[0], candidate_tip.unwrap());
+            }
+            Ok(_) => panic!("expected getheaders"),
+            Err(_) => panic!("peer was not asked for headers"),
+        }
+
+        let mut second = Vec::new();
+        for n in 22..26 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            second.push(hdr);
+        }
+        let heavy = prev;
+        apply(&mut st, &hub, 0, second);
+        assert!(
+            st.slots[0].alive,
+            "feeding the heavier chain does not disconnect"
+        );
+        assert_eq!(st.header_walk.tip_height, 6);
+        assert_eq!(st.header_walk.tip_hash, Some(heavy));
+        assert_eq!(
+            hub.query.store().header_count(),
+            before,
+            "headers past the full queue stay off header.body"
+        );
+    }
+
+    #[test]
+    fn a_fork_from_the_confirmed_tip_keeps_that_height() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-fork-height");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let h3 = mine(h2.block_hash(), 3);
+        floor_unreachable(&mut hub);
+        hub.milestone.height = 2;
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        apply(&mut st, &hub, 0, vec![h1, h2]);
+        fill_to_cap(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h3]);
+        assert_eq!(st.header_walk.base_height, 2);
+        assert_eq!(st.header_walk.tip_height, 3);
+        assert_eq!(st.header_walk.milestone_hash, Some(h2.block_hash()));
+
+        let mut prev = gen;
+        let mut fork = Vec::new();
+        for n in 30..35 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            fork.push(hdr);
+        }
+        let on_milestone = fork[1].block_hash();
+        hub.milestone.anchor = Some(rbitcoin_consensus::MilestoneAnchor {
+            hash: on_milestone,
+            min_work_be: [0xff; 32],
+        });
+        apply(&mut st, &hub, 0, fork);
+        assert!(st.slots[0].alive);
+        assert_eq!(
+            st.header_walk.tip_height, 5,
+            "the fork height is the confirmed tip, not the queue tail"
+        );
+        assert_eq!(
+            st.header_walk.milestone_hash,
+            Some(on_milestone),
+            "a fork under the milestone drops the abandoned hash"
+        );
+        assert!(!st.ordered_set.contains(&h2.block_hash()));
+    }
+
+    #[test]
+    fn a_short_refill_keeps_the_lookahead() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-short-refill");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let a1 = mine(gen, 1);
+        let a2 = mine(a1.block_hash(), 2);
+        let a3 = mine(a2.block_hash(), 3);
+        let a4 = mine(a3.block_hash(), 4);
+        floor_unreachable(&mut hub);
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        queue_at_cap_ending_on(&mut st, &hub, a1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![a2, a3]);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![a4]);
+        assert_eq!(st.header_walk.checkpoints().len(), 2);
+        let tip = st.header_walk.tip_hash;
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, 0, vec![a2]);
+        assert_eq!(hub.query.store().header_count(), before + 1);
+        assert!(st.ordered_set.contains(&a2.block_hash()));
+        assert_eq!(st.header_walk.checkpoints().len(), 2);
+        assert_eq!(
+            st.header_walk.tip_hash, tip,
+            "a prefix that has not reached the next checkpoint is not a contradiction"
+        );
+    }
+
+    #[test]
+    fn a_divergent_refill_does_not_drop_a_proven_lookahead() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-proven-refill");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let a1 = mine(gen, 1);
+        let a2 = mine(a1.block_hash(), 2);
+        let sibling = mine(a1.block_hash(), 9);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 2,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: a2.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        queue_at_cap_ending_on(&mut st, &hub, a1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![a2]);
+        assert!(st.header_walk.proven);
+        assert_eq!(st.header_walk.tip_hash, Some(a2.block_hash()));
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, 0, vec![sibling]);
+        assert_eq!(hub.query.store().header_count(), before);
+        assert_eq!(st.header_walk.tip_hash, Some(a2.block_hash()));
+        assert!(st
+            .header_walk
+            .checkpoints()
+            .iter()
+            .any(|c| c.hash == a2.block_hash()));
+        assert!(hub
+            .query
+            .get_header_by_hash(sibling.block_hash().as_byte_array())
+            .unwrap()
+            .is_none());
+        assert!(st.slots[0].alive);
+    }
+
+    #[test]
+    fn a_header_between_checkpoints_does_not_skip_scripts() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-between-skip");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let h3 = mine(h2.block_hash(), 3);
+        let h4 = mine(h3.block_hash(), 4);
+        let side = mine(h1.block_hash(), 9);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 4,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: h4.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        queue_at_cap_ending_on(&mut st, &hub, h1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h2, h3, h4]);
+        assert!(st.header_walk.proven);
+        assert!(
+            skips(&hub, 1, h1.block_hash().as_byte_array()),
+            "the queued ancestor of the milestone skips"
+        );
+        let before = hub.query.store().header_count();
+
+        apply(&mut st, &hub, 0, vec![side]);
+        assert_eq!(hub.query.store().header_count(), before);
+        assert_eq!(hub.query.milestone_header_at(2), None);
+        assert!(!skips(&hub, 2, side.block_hash().as_byte_array()));
+        assert!(
+            st.header_walk.challenger_tip().is_none(),
+            "a one-block fork does not replace a real competing chain"
+        );
+        assert_eq!(st.header_walk.tip_hash, Some(h4.block_hash()));
+        assert!(st.slots[0].alive);
+
+        for _ in 0..3 {
+            let dropped = st.ordered.pop_front().unwrap();
+            st.ordered_set.remove(&dropped);
+        }
+        apply(&mut st, &hub, 0, vec![side]);
+        assert_eq!(
+            hub.query.store().header_count(),
+            before,
+            "a refill that has not reached the next checkpoint is not stored"
+        );
+        assert!(!st.ordered_set.contains(&side.block_hash()));
+        assert!(!st.is_on_path(&side.block_hash(), 2));
+        assert!(!skips(&hub, 2, side.block_hash().as_byte_array()));
+        assert!(skips(&hub, 1, h1.block_hash().as_byte_array()));
+        assert_eq!(st.header_walk.tip_hash, Some(h4.block_hash()));
+        assert!(st.slots[0].alive);
+
+        apply(&mut st, &hub, 0, vec![h2, h3, h4]);
+        assert!(st.ordered_set.contains(&h2.block_hash()));
+        assert!(
+            skips(&hub, 2, h2.block_hash().as_byte_array()),
+            "a refill that meets the milestone checkpoint skips"
+        );
+        assert!(skips(&hub, 4, h4.block_hash().as_byte_array()));
+    }
+
+    #[test]
+    fn a_refill_stops_at_the_agreed_checkpoint() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-stop-at-ckpt");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let h3 = mine(h2.block_hash(), 3);
+        let h4 = mine(h3.block_hash(), 4);
+        let h5 = mine(h4.block_hash(), 5);
+        let h6 = mine(h5.block_hash(), 6);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 6,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: h6.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        queue_at_cap_ending_on(&mut st, &hub, h1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h2, h3]);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h4, h5, h6]);
+        assert!(st.header_walk.proven);
+        assert_eq!(st.header_walk.tip_hash, Some(h6.block_hash()));
+
+        for _ in 0..3 {
+            let dropped = st.ordered.pop_front().unwrap();
+            st.ordered_set.remove(&dropped);
+        }
+        apply(&mut st, &hub, 0, vec![h2, h3, h4]);
+        assert!(hub
+            .query
+            .get_header_by_hash(h3.block_hash().as_byte_array())
+            .unwrap()
+            .is_some());
+        assert!(
+            hub.query
+                .get_header_by_hash(h4.block_hash().as_byte_array())
+                .unwrap()
+                .is_none(),
+            "headers past the checkpoint this refill met are not stored"
+        );
+        assert_eq!(st.ordered.back().copied(), Some(h3.block_hash()));
+        assert!(!skips(&hub, 4, h4.block_hash().as_byte_array()));
+        assert!(skips(&hub, 3, h3.block_hash().as_byte_array()));
+
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        let mut prev = h3.block_hash();
+        let mut fork = Vec::new();
+        for n in 40..44 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            fork.push(hdr);
+        }
+        let heavy = prev;
+        apply(&mut st, &hub, 0, fork);
+        assert!(
+            st.slots[0].alive,
+            "a heavier fork from the agreed checkpoint does not disconnect"
+        );
+        assert_eq!(st.header_walk.tip_height, 7);
+        assert_eq!(st.header_walk.tip_hash, Some(heavy));
+        assert!(st
+            .header_walk
+            .checkpoints()
+            .iter()
+            .all(|c| c.hash != h6.block_hash()));
+    }
+
+    #[test]
+    fn a_heavier_fork_from_a_stored_gap_header_is_adopted() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-gap-fork");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let h1 = mine(gen, 1);
+        let h2 = mine(h1.block_hash(), 2);
+        let h3 = mine(h2.block_hash(), 3);
+        let h4 = mine(h3.block_hash(), 4);
+        let h5 = mine(h4.block_hash(), 5);
+        let h6 = mine(h5.block_hash(), 6);
+        let mut floor = [0u8; 32];
+        floor[31] = 1;
+        hub.milestone = rbitcoin_consensus::Milestone {
+            height: 6,
+            anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+                hash: h6.block_hash(),
+                min_work_be: floor,
+            }),
+        };
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+        queue_at_cap_ending_on(&mut st, &hub, h1);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h2, h3]);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![h4, h5, h6]);
+        assert!(st.header_walk.proven);
+        assert_eq!(st.header_walk.tip_hash, Some(h6.block_hash()));
+
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        apply(&mut st, &hub, 0, vec![h2, h3, h4]);
+        assert_eq!(
+            st.ordered.back().copied(),
+            Some(h2.block_hash()),
+            "one free slot stops the tail on the stored header before the checkpoint"
+        );
+        assert!(st
+            .header_walk
+            .checkpoints()
+            .iter()
+            .all(|c| c.hash != h2.block_hash()));
+        assert!(hub
+            .query
+            .get_header_by_hash(h2.block_hash().as_byte_array())
+            .unwrap()
+            .is_some());
+
+        let dropped = st.ordered.pop_front().unwrap();
+        st.ordered_set.remove(&dropped);
+        let mut prev = h2.block_hash();
+        let mut fork = Vec::new();
+        for n in 40..45 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            fork.push(hdr);
+        }
+        let heavy = prev;
+        let fork_child = fork[0].block_hash();
+        apply(&mut st, &hub, 0, fork);
+        assert!(
+            st.slots[0].alive,
+            "a heavier fork from a stored header between checkpoints does not disconnect"
+        );
+        assert_eq!(st.header_walk.tip_height, 7);
+        assert_eq!(st.header_walk.tip_hash, Some(heavy));
+        assert!(
+            st.is_on_path(&fork_child, 3),
+            "the adopted fork becomes the download path"
+        );
+        assert!(!skips(&hub, 6, h6.block_hash().as_byte_array()));
     }
 }
