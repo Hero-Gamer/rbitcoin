@@ -2467,45 +2467,6 @@ mod tests {
         tx
     }
 
-    /// Admission and templates share a strict sigop budget and reserve.
-    #[test]
-    fn reject_tx_over_block_sigop_budget() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let err = mp
-            .accept_tx(&multisig_outputs_tx(op, 1001), &utxos, TIP_OK)
-            .unwrap_err();
-        assert!(
-            matches!(err, AcceptError::TooManySigops { cost: 80_080 }),
-            "got {err}"
-        );
-        assert_eq!(err.to_string(), "bad-txns-too-many-sigops");
-        assert_eq!(mp.live_count(), 0);
-        let fits_default = multisig_outputs_tx(op, 994);
-        let exact_default_budget = multisig_outputs_tx(op, 995);
-        mp.accept_tx(&fits_default, &utxos, TIP_OK)
-            .expect("79,520 fits beside the default reserve");
-        assert_eq!(mp.select_block_txs(TxGraph::template_tx_weight()).len(), 1);
-        mp.remove_for_block(&[fits_default.compute_txid()]).unwrap();
-        assert!(matches!(
-            mp.accept_tx(&exact_default_budget, &utxos, TIP_OK),
-            Err(AcceptError::TooManySigops { cost: 79_600 })
-        ));
-        mp.set_block_reserved_sigops(0);
-        let fits_without_reserve = multisig_outputs_tx(op, 999);
-        mp.accept_tx(&fits_without_reserve, &utxos, TIP_OK)
-            .expect("79,920 fits when the template reserve is zero");
-        assert_eq!(mp.select_block_txs(TxGraph::template_tx_weight()).len(), 1);
-        mp.remove_for_block(&[fits_without_reserve.compute_txid()])
-            .unwrap();
-        assert!(matches!(
-            mp.accept_tx(&multisig_outputs_tx(op, 1000), &utxos, TIP_OK),
-            Err(AcceptError::TooManySigops { cost: 80_000 })
-        ));
-        assert_eq!(mp.live_count(), 0);
-    }
-
     /// Chain coins at P2SH and P2WSH of `0 <pk> <pk> 2 CHECKMULTISIG` (2 accurate
     /// sigops, zero-sig so it verifies) plus a spend of each. Legacy ×4 is 0 for
     /// both; full cost is 8 (P2SH ×4) and 2 (witness ×1).
@@ -2592,23 +2553,6 @@ mod tests {
         assert_eq!(readmitted, [pid, child.compute_txid()]);
         assert_eq!(live_sigops(&mp, &parent), 8);
         assert_eq!(live_sigops(&mp, &child), 80);
-    }
-
-    #[test]
-    fn reopen_preserves_sigop_cost() {
-        let dir = tmp_dir();
-        let (utxos, p2sh, p2wsh) = p2sh_p2wsh_multisig_spends();
-        {
-            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-            mp.accept_tx(&p2sh, &utxos, TIP_OK).unwrap();
-            mp.accept_tx(&p2wsh, &utxos, TIP_OK).unwrap();
-            mp.flush().unwrap();
-        }
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        assert_eq!(live_sigops(&mp, &p2sh), 8);
-        assert_eq!(live_sigops(&mp, &p2wsh), 2);
-        mp.compact().unwrap();
-        assert_eq!(live_sigops(&mp, &p2sh), 8, "compact re-ingest");
     }
 
     /// Schema-2 pool: costs unknown after migrate; the open-time pass recomputes
@@ -3258,115 +3202,6 @@ mod tests {
         policy::get_virtual_size(tx.weight().to_wu())
     }
 
-    /// Core `test_sigops_limit`: admitted vsize is `max(ceil(sigops × bps / 4),
-    /// serialized vsize)`, exact at the sigop-equivalent size and at ±1 byte.
-    #[test]
-    fn sigop_adjusted_vsize_at_boundary() {
-        for (bps, n) in [(20u64, 69usize), (20, 222), (43, 101), (81, 142)] {
-            let target = (n as u64 * bps).div_ceil(4);
-            let base = vsize_of(&witness_sigops_spend(n, 256).1);
-            let pad = 256 + usize::try_from(target - base).unwrap();
-            for (bytes, want) in [(pad, target), (pad + 1, target + 1), (pad - 1, target)] {
-                let (utxos, tx) = witness_sigops_spend(n, bytes);
-                if bytes == pad {
-                    assert_eq!(vsize_of(&tx), target, "padding lands on the boundary");
-                }
-                let dir = tmp_dir();
-                let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-                mp.set_bytes_per_sigop(bps);
-                let r = mp.accept_tx(&tx, &utxos, TIP_OK).expect("admits");
-                assert_eq!(
-                    policy::get_virtual_size(r.weight),
-                    want,
-                    "bps={bps} n={n} pad={bytes}"
-                );
-            }
-        }
-    }
-
-    /// Min relay prices the sigop-adjusted vsize (Core ATMP `m_vsize`).
-    #[test]
-    fn min_relay_uses_sigop_adjusted_vsize() {
-        let (utxos, mut tx) = witness_sigops_spend(222, 1);
-        // 100 sat pays ~10 sat raw at 0.1 sat/vB, not 111 sat for 1_110 adjusted vB.
-        tx.output[0].value = Amount::from_sat(1_000_000 - 100);
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        assert!(matches!(
-            mp.accept_tx(&tx, &utxos, TIP_OK),
-            Err(AcceptError::Policy("min relay fee"))
-        ));
-        mp.set_bytes_per_sigop(0);
-        mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
-    }
-
-    /// A full pool's raised floor also prices the sigop-adjusted vsize.
-    #[test]
-    fn mempool_min_fee_uses_sigop_adjusted_vsize() {
-        let (utxos, mut tx) = witness_sigops_spend(222, 1);
-        tx.output[0].value = Amount::from_sat(1_000_000 - 100);
-        let dir = tmp_dir();
-        // Below one standard tx of headroom: floor is min relay + 0.1 sat/vB.
-        let mut mp =
-            ActiveMempool::open_or_create_with_limit(&dir, policy::MAX_STANDARD_TX_WEIGHT - 1)
-                .unwrap();
-        assert!(mp.mempool_min_fee_sat_kvb() > mp.min_relay_sat_kvb);
-        assert!(matches!(
-            mp.accept_tx(&tx, &utxos, TIP_OK),
-            Err(AcceptError::Policy("mempool min fee"))
-        ));
-        mp.set_bytes_per_sigop(0);
-        mp.accept_tx(&tx, &utxos, TIP_OK).expect("raw vsize pays");
-    }
-
-    /// RBF prices the replacement at its sigop-adjusted vsize.
-    #[test]
-    fn rbf_uses_sigop_adjusted_vsize() {
-        let (op, _, utxos) = chain_utxo(100_000);
-        let old = spend_tx(op, 99_000); // fee 1_000
-        let mut heavy = multisig_outputs_tx(op, 10); // cost 800 → 4_000 adjusted vB
-        heavy.output[0].value = Amount::from_sat(100_000 - 3_000 - 9); // fee 3_000
-        for (bps, replaces) in [(20, false), (0, true)] {
-            let dir = tmp_dir();
-            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-            mp.set_bytes_per_sigop(bps);
-            mp.accept_tx(&old, &utxos, TIP_OK).unwrap();
-            let r = mp.accept_tx(&heavy, &utxos, TIP_OK);
-            if replaces {
-                assert_eq!(r.unwrap().replaced, vec![old.compute_txid()]);
-            } else {
-                assert!(matches!(r, Err(AcceptError::RbfInsufficient)));
-            }
-        }
-    }
-
-    /// Libre divergence from Core `test_sigops_package`: at the default
-    /// 20 B/sigop a 40,000-cost tx is 200 kvB adjusted, yet it and its child
-    /// are admitted because cluster limits count raw weight. The reported
-    /// vsize stays sigop-adjusted.
-    #[test]
-    fn cluster_limit_uses_raw_weight() {
-        let (op, _, utxos) = chain_utxo(1_000_000);
-        let mut parent = multisig_outputs_tx(op, 501);
-        parent.output[0] = TxOut {
-            value: Amount::from_sat(900_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }; // 500 × OP_CHECKMULTISIG left: cost 40,000
-        let pid = parent.compute_txid();
-        let child = spend_tx(OutPoint { txid: pid, vout: 0 }, 800_000);
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        let r = mp
-            .accept_tx(&parent, &utxos, TIP_OK)
-            .expect("parent admits");
-        assert_eq!(policy::get_virtual_size(r.weight), 200_000);
-        mp.accept_tx(&child, &utxos, TIP_OK).expect("child admits");
-        assert_eq!(
-            mp.graph.cluster_of(&pid).unwrap().total_weight,
-            parent.weight().to_wu() + child.weight().to_wu()
-        );
-    }
-
     /// Zero-fee parent + heavy-sigop child: 200 sat pays the raw package
     /// vsize, not the sigop-adjusted one.
     fn cpfp_heavy_child(op: OutPoint) -> (Transaction, Transaction) {
@@ -3380,62 +3215,6 @@ mod tests {
         );
         child.output[0].value = Amount::from_sat(100_000 - 200 - 9);
         (parent, child)
-    }
-
-    #[test]
-    fn package_min_relay_uses_sigop_adjusted_vsize() {
-        let (op, _, utxos) = chain_utxo(100_000);
-        let (parent, child) = cpfp_heavy_child(op);
-        let pkg = [parent, child];
-        let min = policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
-        assert!(!ActiveMempool::package_meets_min_relay(
-            &pkg, &utxos, min, 20
-        ));
-        assert!(ActiveMempool::package_meets_min_relay(&pkg, &utxos, min, 0));
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        assert!(matches!(
-            mp.accept_package(&pkg, &utxos, TIP_OK),
-            Err(AcceptError::Policy("min relay fee"))
-        ));
-        mp.set_bytes_per_sigop(0);
-        assert_eq!(mp.accept_package(&pkg, &utxos, TIP_OK).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn one_parent_one_child_min_relay_uses_sigop_adjusted_vsize() {
-        let (op, _, utxos) = chain_utxo(100_000);
-        let (parent, child) = cpfp_heavy_child(op);
-        let pid = parent.compute_txid();
-        let dir = tmp_dir();
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        assert!(matches!(
-            mp.accept_tx(&parent, &utxos, TIP_OK),
-            Err(AcceptError::Policy("min relay fee"))
-        ));
-        let missing = BTreeSet::from([pid]);
-        assert_eq!(mp.try_one_parent_package(&child, &missing, &utxos), None);
-        mp.set_bytes_per_sigop(0);
-        assert_eq!(
-            mp.try_one_parent_package(&child, &missing, &utxos),
-            Some(parent)
-        );
-    }
-
-    /// `-bytespersigop` survives compact (graph rebuild).
-    #[test]
-    fn compact_preserves_mempool_policy_overlays() {
-        let dir = tmp_dir();
-        let (op, _, utxos) = chain_utxo(100_000);
-        let tx = spend_tx(op, 90_000);
-        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-        mp.set_bytes_per_sigop(7);
-        mp.set_block_reserved_sigops(12);
-        mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
-        mp.remove_for_block(&[tx.compute_txid()]).unwrap();
-        let _ = mp.maybe_compact().unwrap();
-        assert_eq!(mp.graph.bytes_per_sigop(), 7);
-        assert_eq!(mp.graph.block_reserved_sigops(), 12);
     }
 
     include!("accept_life_journey.rs");

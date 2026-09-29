@@ -3655,10 +3655,11 @@ mod tests {
         assert!(idx.txs_for(&[3u8; 32]).next().is_none());
     }
 
-    /// One 11-coinbase pad covers reorg-reaccept, unbroadcast persist and the
+    /// One 12-coinbase pad covers reorg-reaccept, unbroadcast persist and the
     /// confirm-before-broadcast log, local-origin isolation, SH reopen, live
     /// accept/fee/package, recent accepts and rejects, 1p1c admit and
-    /// rollback, unknown-SH delta, accept-stage meters, and expiry.
+    /// rollback, unknown-SH delta, accept-stage meters, expiry, and a
+    /// 16_004-sigop admit over Core's standard cap.
     #[allow(clippy::cognitive_complexity)] // one fixture, many mempool journey arms
     #[test]
     fn hub_live_journey() {
@@ -3671,7 +3672,7 @@ mod tests {
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        const N_CB: u32 = 11;
+        const N_CB: u32 = 12;
         let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
             &q,
             &params,
@@ -4135,6 +4136,34 @@ mod tests {
             hub.set_relay_enabled(true);
             assert_eq!(hub.remove_for_block(&[tid]), 1);
             assert_eq!(hub.confirm_memory_floor_sat_per_kvb(), Some(2_000));
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+
+        // 4001 legacy CHECKSIG × 4 = 16004: over Core's standard cap, under
+        // the block limit, so Libre policy admits it.
+        {
+            let mp = tmp();
+            let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+            hub.set_relay_enabled(true);
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: cbs[11],
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - 100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
+                }],
+            };
+            hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
+            assert_eq!(hub.get_live_sigop_cost(&tx.compute_txid()), Some(16_004));
             let _ = std::fs::remove_dir_all(&mp);
         }
 
@@ -4640,53 +4669,6 @@ mod tests {
             "compact-seen extra must fill short-ids"
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
-    #[test]
-    fn hub_admits_sigops_over_core_standard_cap() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
-        let mp = tmp();
-        let hub = MempoolHub::open(&mp, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        // 4001 legacy CHECKSIG × 4 = 16004 sigop cost: over Core's standard
-        // cap, under the block limit, so Libre policy admits it.
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: cbs[0],
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000 - 100_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
-            }],
-        };
-        hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
-        assert_eq!(hub.get_live_sigop_cost(&tx.compute_txid()), Some(16_004));
-        let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
