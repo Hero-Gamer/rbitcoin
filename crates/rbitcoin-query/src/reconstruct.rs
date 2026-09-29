@@ -4,6 +4,8 @@ use super::*;
 use crate::U64Map;
 use std::time::Instant;
 
+const TXSTAT_BODY_ROW_BYTES: u64 = 8;
+
 /// A confirmed block's fee facts for fee history (coinbase excluded).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockFeeRows {
@@ -11,6 +13,15 @@ pub struct BlockFeeRows {
     pub rows: Vec<(u64, u64)>,
     /// In-block `(parent, child)` spends, indices into `rows`.
     pub edges: Vec<(u32, u32)>,
+}
+
+/// Stamped fee/weight rows from `txstat.body`; `None` means at least one row
+/// in the block is unstamped. Byte count includes the coinbase cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockTxStatRows {
+    pub hash: [u8; 32],
+    pub rows: Option<Vec<(u64, u64)>>,
+    pub txstat_bytes: u64,
 }
 
 /// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
@@ -44,6 +55,48 @@ fn block_size_weight_from_txstat(
 }
 
 impl Query {
+    /// Read confirmed block fee/weight rows from txstat only, without spent data.
+    pub fn block_txstat_rows(&self, height: Height) -> Result<Option<BlockTxStatRows>, QueryError> {
+        let Some((header_fk, header)) = self.header_at_height(height)? else {
+            return Ok(None);
+        };
+        let hash = header.hash;
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        if n == 0 {
+            return Ok(Some(BlockTxStatRows {
+                hash,
+                rows: None,
+                txstat_bytes: 0,
+            }));
+        }
+        let last = first
+            .0
+            .checked_add(u64::from(n - 1))
+            .ok_or(StoreError::Corrupt("invariant: header_txs last fk"))?;
+        let packed = self.store.txstat_range(header_fk, first.0, last)?;
+        let txstat_bytes = u64::from(n).saturating_mul(TXSTAT_BODY_ROW_BYTES);
+        if packed.len() != n as usize || packed.iter().any(Option::is_none) {
+            return Ok(Some(BlockTxStatRows {
+                hash,
+                rows: None,
+                txstat_bytes,
+            }));
+        }
+        let rows = packed
+            .into_iter()
+            .skip(1)
+            .flatten()
+            .map(|r| (r.fee_sat, r.weight()))
+            .collect();
+        Ok(Some(BlockTxStatRows {
+            hash,
+            rows: Some(rows),
+            txstat_bytes,
+        }))
+    }
+
     fn load_body_from_store(
         &self,
         fk: Fk,

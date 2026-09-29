@@ -917,6 +917,43 @@ fn block_fee_rows_have_fees_and_in_block_spend_edges() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fee history rows from `txstat` alone: stamped (fee, weight) per
+/// non-coinbase tx, the block hash, and cell bytes including the coinbase.
+#[test]
+fn block_txstat_rows_have_fees_hash_and_cell_bytes() {
+    let (dir, q) = temp_query("fee-rows");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let cb0_txid = cb0.tx.txid;
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+
+    let (h1, cb1) = coinbase_block(1, hfk0, Some(h0.hash));
+    let parent = spend_apply(0x11, cb0_txid, 50_0000_0000 - 10_000);
+    let child = spend_apply(0x22, parent.tx.txid, 50_0000_0000 - 60_000);
+    q.connect_block(Height(1), &h1, &[cb1, parent, child])
+        .unwrap();
+
+    let b1 = q.block_txstat_rows(Height(1)).unwrap().expect("stamped");
+    assert_eq!(b1.hash, h1.hash);
+    assert_eq!(b1.txstat_bytes, 3 * 8);
+    let rows = b1.rows.expect("every row stamped");
+    assert_eq!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![10_000, 50_000]
+    );
+    assert!(rows.iter().all(|r| r.1 > 0), "{rows:?}");
+    let b0 = q
+        .block_txstat_rows(Height(0))
+        .unwrap()
+        .expect("coinbase only");
+    assert_eq!((b0.rows, b0.txstat_bytes), (Some(vec![]), 8));
+    assert!(
+        q.block_txstat_rows(Height(2)).unwrap().is_none(),
+        "above the tip"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (dir, q) = temp_query("ms-work");
