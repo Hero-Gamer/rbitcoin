@@ -30,6 +30,14 @@ impl NodeClock {
     pub fn set_mock(&self, t: i64) {
         self.mock.store(t.max(0), Ordering::SeqCst);
     }
+
+    /// Run `f` with [`current_now`] pinned to one sample of this clock
+    /// (see [`with_now`]). [`Self::now_secs`] is not pinned. The prior
+    /// override returns when `f` exits; the scope is synchronous and does not
+    /// span an `.await`.
+    pub fn with_frozen<R>(&self, f: impl FnOnce() -> R) -> R {
+        with_now(self.now_secs(), f)
+    }
 }
 
 pub fn wall_now() -> u64 {
@@ -89,5 +97,15 @@ mod tests {
     #[should_panic(expected = "system clock before Unix epoch")]
     fn unix_secs_panics_before_epoch() {
         unix_secs(UNIX_EPOCH - std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn with_frozen_pins_clock_sample_then_restores_prior() {
+        let c = NodeClock::new();
+        c.set_mock(2_000_000_000);
+        with_now(42, || {
+            c.with_frozen(|| assert_eq!(current_now(), 2_000_000_000));
+            assert_eq!(current_now(), 42);
+        });
     }
 }
