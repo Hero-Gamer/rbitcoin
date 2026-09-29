@@ -1018,6 +1018,7 @@ dependencies = [
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
+ "rbitcoin-sv2",
  "serde_json",
  "tokio",
  "tower-http",
@@ -1095,6 +1096,7 @@ dependencies = [
 name = "rbitcoin-test"
 version = "0.7.99"
 dependencies = [
+ "binary_sv2",
  "bitcoin",
  "rbitcoin-cli",
  "rbitcoin-consensus",
@@ -1107,7 +1109,9 @@ dependencies = [
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
+ "rbitcoin-sv2",
  "serde_json",
+ "template_distribution_sv2",
  "tokio",
 ]
 
