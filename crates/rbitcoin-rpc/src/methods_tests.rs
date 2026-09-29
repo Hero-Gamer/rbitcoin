@@ -347,34 +347,9 @@ fn cln_bcli_rpc_shapes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Core floors an estimate at `mempoolminfee`: a rate the full pool would
-/// evict is not an answer.
-#[test]
-fn estimatesmartfee_floors_at_mempoolminfee() {
-    let (ctx, dir, _hub) = ctx_regtest_hub_with_weight(1_000);
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
-    let cb = generated_coinbase_value(&ctx, 1);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (hex, _) = spend_generated_coinbase(&ctx, 1, cb - 100_000, spk);
-    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    let info = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
-    let minfee = info["mempoolminfee"].as_f64().unwrap();
-    assert!(minfee > info["minrelaytxfee"].as_f64().unwrap(), "{info}");
-    let r = dispatch(&ctx, "estimatesmartfee", vec![json!(2)]).unwrap();
-    let rate = r["feerate"].as_f64().expect("estimate with a live pool");
-    assert!(
-        rate >= minfee,
-        "feerate {rate} below mempoolminfee {minfee}: {r}"
-    );
-    assert_eq!(r["blocks"], 2, "{r}");
-    let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 2, "only feerate and blocks: {r}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Core's result without an estimate: `errors` and `blocks`, and no `feerate`.
-/// The success object (`feerate` and `blocks` only) is pinned with the
-/// `mempoolminfee` floor.
+/// The success object and the `mempoolminfee` floor are pinned on
+/// `smart_fee_json`.
 #[test]
 fn estimatesmartfee_core_result_shape() {
     let (ctx, dir) = ctx_empty();

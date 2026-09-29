@@ -20,7 +20,7 @@ use rbitcoin_query::Query;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -547,6 +547,8 @@ pub struct MempoolHub {
     confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
     block_p10_history: Mutex<FeeHistory>,
+    /// Last logged `(flow warm << 16) | ready targets`, to log changes once.
+    fee_readiness: AtomicU32,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
     fee_flow: Mutex<FeeFlowMeter>,
     /// Published fee table for Electrum/Esplora (refreshed dirty ∥ max-age, singleflight).
@@ -703,6 +705,7 @@ impl MempoolHub {
                 FEE_HISTORY_TXSTAT_BYTE_BUDGET,
                 FEE_SNAPSHOT_DEPTHS,
             )),
+            fee_readiness: AtomicU32::new(u32::MAX),
             fee_flow: Mutex::new(FeeFlowMeter::new(Instant::now())),
             fee_snapshot: ArcSwap::from_pointee(FeeSnapshot::empty(Instant::now())),
             fee_dirty: AtomicBool::new(true),
@@ -2072,6 +2075,7 @@ impl MempoolHub {
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
         let history = self.block_p10_history.lock().unwrap().rates();
+        let flow_warm = inflow.is_some();
 
         let mut ordered: Vec<(u32, Option<u64>)> = Vec::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
         for &depth in FEE_SNAPSHOT_DEPTHS {
@@ -2087,8 +2091,8 @@ impl MempoolHub {
             });
             let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
             let hist = history.get(&depth).copied().flatten();
-            let mut rate = depth_rate_sat_kvb(depth, flow, hist);
-            if depth <= 1 {
+            let mut rate = depth_rate_sat_kvb(depth, flow_warm, flow, frontier, hist);
+            if depth <= 1 && flow_warm {
                 rate = rate.or(confirm_floor);
             }
             if depth <= 1 {
@@ -2098,6 +2102,7 @@ impl MempoolHub {
             }
             ordered.push((depth, rate.map(|r| r.max(min_r))));
         }
+        self.log_fee_readiness(flow_warm, &history);
         let mut held: Vec<Option<u64>> = ordered.iter().map(|(_, r)| *r).collect();
         hold_defined_then_monotone(&mut held);
         let mut by_depth = HashMap::with_capacity(ordered.len());
@@ -3548,6 +3553,19 @@ impl MempoolHub {
             .insert_if_absent(height, block);
     }
 
+    /// Log when flow warms up or a target's history becomes ready.
+    fn log_fee_readiness(&self, flow_warm: bool, history: &HashMap<u32, Option<u64>>) {
+        let ready = history.values().filter(|r| r.is_some()).count() as u32;
+        let code = (u32::from(flow_warm) << 16) | ready;
+        if self.fee_readiness.swap(code, Ordering::Relaxed) != code {
+            rbitcoin_log::info!(
+                "mempool: fee estimates: flow {}, history ready for {ready}/{} targets",
+                if flow_warm { "warm" } else { "cold" },
+                history.len()
+            );
+        }
+    }
+
     fn log_fee_history_progress(stats: &FeeHistoryBackfillStats, last_progress: &mut Instant) {
         let now = Instant::now();
         if now.duration_since(*last_progress) < Duration::from_secs(10) {
@@ -3986,13 +4004,11 @@ mod tests {
             let e1 = hub.estimate_fee_btc_per_kb(1);
             let e5 = hub.estimate_fee_btc_per_kb(5);
             let e144 = hub.estimate_fee_btc_per_kb(144);
+            // Flow is cold on a fresh hub and the chain has no fee history:
+            // a thin live pool alone does not set a guess.
             assert!(
-                e1 >= 0.0 && e5 >= 0.0 && e144 >= 0.0,
-                "live stock defines near and holds far: e1={e1} e5={e5} e144={e144}"
-            );
-            assert!(
-                e1 >= e5 && e5 >= e144,
-                "must not bounce up at far (Esplora 1.0 sentinel): e1={e1} e5={e5} e144={e144}"
+                e1 < 0.0 && e5 < 0.0 && e144 < 0.0,
+                "cold flow without history: e1={e1} e5={e5} e144={e144}"
             );
             let spent = hub.spent_outpoints();
             assert!(spent.contains(&op0));
@@ -4007,8 +4023,8 @@ mod tests {
             let e1b = hub.estimate_fee_btc_per_kb(1);
             let e144b = hub.estimate_fee_btc_per_kb(144);
             assert!(
-                e1b >= 0.0 && e144b >= 0.0 && e1b >= e144b,
-                "after confirm, N=1 must stay ≥ N=144: e1={e1b} e144={e144b}"
+                e1b < 0.0 && e144b < 0.0,
+                "a confirm does not warm flow or add history: e1={e1b} e144={e144b}"
             );
             assert!(
                 !hub.contains_wtxid(&wtxid),

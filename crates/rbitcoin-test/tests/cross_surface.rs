@@ -960,7 +960,7 @@ async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Val
 }
 
 /// A node that leaves IBD with relay on preloads fee history from the chain.
-/// With an empty pool and too little history for any target, `estimatesmartfee` answers
+/// With flow cold and too little history for any target, `estimatesmartfee` answers
 /// Core's insufficient-data shape rather than a guess. Rates from a ready
 /// history are pinned on the hub
 /// (`far_horizon_follows_block_history_not_pool_tail`): a ready 144-block
@@ -1637,16 +1637,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         }),
         "mempool/recent missing package tx: {body}"
     );
+    // Flow is cold and the chain holds too little fee history: the live
+    // pool alone does not set a rate, so no target answers.
     let (st, body) = http_get(esplora_addr, "/fee-estimates").await;
-    assert_eq!(st, 200, "GET /fee-estimates: {body}");
-    let fees: Value = serde_json::from_str(&body).unwrap();
-    for key in ["1", "5", "144", "504", "1008"] {
-        let v = fees[key].as_f64().unwrap_or(-1.0);
-        assert!(v > 0.0, "{key} sat/vB: {fees}");
-    }
-    let near = fees["1"].as_f64().unwrap();
-    let far = fees["144"].as_f64().unwrap();
-    assert!(near > 0.0 && far > 0.0, "near={near} far={far}: {fees}");
+    assert_eq!(st, 503, "GET /fee-estimates: {body}");
 
     let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();

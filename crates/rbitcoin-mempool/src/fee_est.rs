@@ -293,10 +293,21 @@ fn blend_sat_kvb(flow: Option<u64>, hist: Option<u64>, n_blocks: u32) -> Option<
 
 /// One target's rate (sat/kvB) before the monotone pass.
 ///
-/// The 1-block target is flow (history only when flow has nothing to say)
-/// and farther targets blend flow with history by `w(N)`, so neither is a
-/// floor for the other.
-pub fn depth_rate_sat_kvb(n_blocks: u32, flow: Option<u64>, hist: Option<u64>) -> Option<u64> {
+/// Once flow is warm, the 1-block target is flow (history only when flow has
+/// nothing to say) and farther targets blend flow with history by `w(N)`, so
+/// neither is a floor for the other. While flow is cold, history answers
+/// alone and the live pool may only raise it: a restarted pool can be thin
+/// or missing what peers relayed while this node was down.
+pub fn depth_rate_sat_kvb(
+    n_blocks: u32,
+    flow_warm: bool,
+    flow: Option<u64>,
+    frontier: Option<u64>,
+    hist: Option<u64>,
+) -> Option<u64> {
+    if !flow_warm {
+        return hist.map(|h| frontier.map_or(h, |f| h.max(f)));
+    }
     if n_blocks <= 1 {
         flow.or(hist)
     } else {
@@ -464,17 +475,43 @@ mod tests {
     }
 
     #[test]
-    fn flow_drives_near_targets_without_a_history_floor() {
+    fn warm_flow_drives_near_targets_without_a_history_floor() {
         // 1 block: flow alone, even far under history
-        assert_eq!(depth_rate_sat_kvb(1, Some(1_000), Some(9_000)), Some(1_000));
-        assert_eq!(depth_rate_sat_kvb(1, None, Some(9_000)), Some(9_000));
+        assert_eq!(
+            depth_rate_sat_kvb(1, true, Some(1_000), None, Some(9_000)),
+            Some(1_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(1, true, None, None, Some(9_000)),
+            Some(9_000)
+        );
         // 2 blocks: a blend, pulled mostly toward flow
-        let r2 = depth_rate_sat_kvb(2, Some(1_000), Some(9_000)).unwrap();
+        let r2 = depth_rate_sat_kvb(2, true, Some(1_000), Some(1_000), Some(9_000)).unwrap();
         assert!(r2 > 1_000 && r2 < 3_000, "{r2}");
-        let r2 = depth_rate_sat_kvb(2, Some(9_000), Some(1_000)).unwrap();
+        let r2 = depth_rate_sat_kvb(2, true, Some(9_000), Some(9_000), Some(1_000)).unwrap();
         assert!(
             r2 > 7_000 && r2 < 9_000,
             "history does not floor flow either: {r2}"
+        );
+    }
+
+    #[test]
+    fn cold_flow_serves_history_that_the_pool_can_only_raise() {
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, Some(100), Some(100), Some(4_000)),
+            Some(4_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(1, false, Some(100), None, Some(4_000)),
+            Some(4_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, None, Some(6_000), Some(4_000)),
+            Some(6_000)
+        );
+        assert_eq!(
+            depth_rate_sat_kvb(2, false, Some(6_000), Some(6_000), None),
+            None
         );
     }
 

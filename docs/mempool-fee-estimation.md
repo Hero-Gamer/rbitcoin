@@ -13,11 +13,12 @@ The **default** fee estimate this node advertises answers:
 | Esplora fee endpoints (primary) | Same |
 | Optional target-depth knobs | **Near:** flow invert. **Far:** block history. Blended. |
 
-The 1-block target is live stock and capped admit-EMA at 99.9% confidence,
-conditional on the next block arriving within 10 minutes; history answers
-only when flow has nothing to say. Targets from 2 blocks blend the flow rate
-with the 99% historical rate as `w·R_flow + (1-w)·R_hist`,
-`w(N)=exp(-(N-1)/6)`, so neither is a floor for the other (`w(2)≈0.85`).
+Once flow is warm, the 1-block target is live stock and capped admit-EMA at
+99.9% confidence, conditional on the next block arriving within 10 minutes;
+history answers only when flow has nothing to say. Targets from 2 blocks blend
+the flow rate with the 99% historical rate as `w·R_flow + (1-w)·R_hist`,
+`w(N)=exp(-(N-1)/6)`, so neither is a floor for the other (`w(2)≈0.85`). While
+flow is cold, history answers alone and the live pool may only raise it.
 
 ## Non-blocking vs accept (published snapshot)
 
@@ -49,23 +50,24 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    ~4 admit half-lives so a 150 s EMA is not stretched to a week.
 5. **Frontier** is the marginal chunk at `N×4e6` WU. If the pool is thinner
    than N blocks, stock does **not** set a far rate (no last-chunk-as-far).
-   Near depths (`w≥0.5`, N=1–5) with any live stock still answer min-relay
-   (the next few blocks have room).
-6. **Blend:** N=1 is `R_flow`, or `R_hist` when flow is undefined.
+   With warm flow, near depths (`w≥0.5`, N=1–5) with any live stock still
+   answer min-relay (the next few blocks have room).
+6. **Blend (warm flow):** N=1 is `R_flow`, or `R_hist` when flow is undefined.
    N≥2 is `w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`; a missing side
    drops out. Then enforce `R(1)≥R(2)≥…`.
-7. **N=1** may additionally clip to the confirm-memory **p90** (64-sample
-   ring; not max-of-64), and falls back to it when neither flow nor history
-   has a rate. Long N does not.
+7. **N=1** with warm flow may additionally clip to the confirm-memory **p90**
+   (64-sample ring; not max-of-64), and falls back to it when neither flow nor
+   history has a rate. Long N does not.
 
-**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits),
-`R_flow` is frontier, or min-relay on an under-full **near** depth with live
-stock. If **no** depth has a defined rate (empty pool, no hist), APIs return
-insufficient (RPC / Electrum `-1`; Esplora leaves the target out and
-answers **503** when no target has a rate). If a nearer depth is defined and later
-N is not (pool thinner than N, no hist), **hold the last defined rate**
-so far targets do not drop out while a nearer one has a rate. A target whose history is not ready has no
-historical rate.
+**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits), a
+restarted pool can be thin or missing what peers relayed while the node was
+down, so each target is `R_hist`, raised to the frontier when the pool reaches
+that deep, and never lowered by the pool. A target whose history is not ready
+has no rate. If **no** depth has a rate, APIs return insufficient (RPC /
+Electrum `-1`; Esplora leaves the target out and answers **503** when no
+target has a rate). If a nearer depth is defined and a later one is not,
+**hold the last defined rate** so far targets do not drop out. The node logs
+when flow warms and how many targets' history is ready.
 
 ### Parameters (code constants, not env)
 
