@@ -32,10 +32,11 @@ clients that already know their addresses/scripthashes or exact txids/block
 ids).
 
 **0.8:** drop-in **mempool/electrs or Blockstream electrs HTTP** so nginx
-`/api/` can retire electrs. Core JSON-RPC for that stack is unix
-`{datadir}/rpc.sock` (filesystem auth) plus a documented mempool `CORE_RPC`
-socket patch — not cookie/Basic TCP. mempool.space **Node `/api/v1/`**
-(MariaDB, cubes, mining, lightning) stays their process. Address-prefix
+`/api/` can retire electrs. Core JSON-RPC for that stack is TCP plus an
+opt-in Core cookie (`--rpc-cookie-file`), which stock mempool `CORE_RPC`
+uses unpatched; a unix-socket patch (filesystem auth) stays optional.
+mempool.space **Node `/api/v1/`** (MariaDB, cubes, mining, lightning) stays
+their process. Address-prefix
 search is **not** in 0.8 (**404**). Surface table below.
 
 **Non-goal (stays):** address-prefix autocomplete, Liquid/assets, in-binary
@@ -73,7 +74,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | Mining template RPC | `getblocktemplate` / `getmininginfo` / `prioritisetransaction` (selector; no stratum) | GBT + stratum / pool stack |
 | Wallets | Electrum clients (requires `--shindex`) | Descriptor + legacy |
 | Scripthash index | Optional (`--shindex`, default **off**); bulk at tip when on | External ElectrumX / Fulcrum; Core `-txindex` is different (txid→block) |
-| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); cookie/user-pass; `rbitcoin-cli`. `--rpc-work-queue` defaults to **16** (HTTP occupancy, 503 when full; **0** is that default); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
+| JSON-RPC | Documented **subset** ([`docs/rpc.md`](./docs/rpc.md)); Bearer token or opt-in Core cookie (`--rpc-cookie-file`), no `--rpcuser` / `--rpcpassword`; `rbitcoin-cli`. `--rpc-work-queue` defaults to **16** (HTTP occupancy, 503 when full; **0** is that default); a JSON-RPC array is one POST | Full Core RPC; `-rpcworkqueue` is in-flight HTTP jobs (503) |
 | GetData serve | Reconstruct/serve **16** (`MAX_SERVE_BLOCKS`) hashes per inbound message; leftover hashes in that `getdata` are dropped (RAM cap) | Core `ProcessGetData` can keep serving leftover hashes |
 | Inbound eviction victim | After Core-shaped protect (netgroup / recent block / recent tx / min-ping), disconnect the **longest-connected** remaining inbound | Core `SelectNodeToEvict` youngest in the oldest netgroup |
 | `--sptweaks-dust` | Serve-time floor default **1000** sat (omit P2TR outs `value <=` floor). **546** matches Cake electrs. Not Cake/Electrum protocol | n/a (Electrum tweaks are not Core) |
@@ -281,4 +282,5 @@ shipped (see above); stratum / pool software is not.
 **Permanent non-goals for Electrum/Esplora:** address-prefix autocomplete,
 Liquid/assets, in-binary mempool.space `/api/v1/` (MariaDB cubes / mining /
 lightning). **0.8** is electrs HTTP drop-in except prefix. Core RPC for that
-stack is `rpc.sock` plus the mempool patch.
+stack is TCP plus an opt-in Core cookie (`--rpc-cookie-file`, stock mempool);
+the unix-socket patch is optional.

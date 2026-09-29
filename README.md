@@ -67,8 +67,9 @@ using or packaging this tree. 1.0 gates:
 
 **0.8:** drop-in for **mempool/electrs or Blockstream electrs HTTP** (not
 address-prefix, not their `/api/v1/` Node process). Core RPC for that stack
-is unix `{datadir}/rpc.sock` plus a documented mempool `CORE_RPC` socket
-patch, not cookie. Product surface: [`COMPAT.md`](./COMPAT.md).
+is TCP plus an opt-in Core cookie (`--rpc-cookie-file`), so stock mempool
+`CORE_RPC` works unpatched; a unix-socket patch stays optional. Product
+surface: [`COMPAT.md`](./COMPAT.md).
 
 **Authorship:** first-party code is **AI-written** (Grok / xAI) under
 **Brandon Black** ([@reardencode](https://github.com/reardencode)) prompting —

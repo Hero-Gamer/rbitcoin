@@ -47,6 +47,7 @@ sections below and [`COMPAT.md`](../../COMPAT.md).
 Routine knobs are **CLI / conf**, not required env vars. `rbitcoin-node` flags are
 kebab-case (`--max-inbound`). Conf keys are snake_case (`max_inbound=`).
 RPC auth is a unix socket (`--rpc`) or Bearer `{datadir}/rpc.token` (TCP).
+`--rpc-cookie-file` additionally accepts a Core `username:password` cookie over TCP.
 There is no `--rpcuser` / `--rpcpassword`.
 Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
 `-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
@@ -103,6 +104,7 @@ Clean smoke:
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
 | `--rpc-token-file PATH` | `rpc_token_file=` | `{datadir}/rpc.token` (CSPRNG hex; TCP Bearer) |
+| `--rpc-cookie-file PATH` | `rpc_cookie_file=` | disabled — existing Core `username:password` cookie (no trailing newline) enables TCP HTTP Basic alongside Bearer |
 | `--rpc-work-queue N` | `rpc_work_queue=` | **16** in-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (array batches still run). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 | `--min-relay-tx-fee BTC` | `min_relay_tx_fee=` | unset — Libre default 100 sat/kvB; `0` = no floor; garbage/negatives fail start |
 | `--mempool-expiry HOURS` | `mempool_expiry=` | unset — hub default; min 1 |

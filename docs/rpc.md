@@ -26,12 +26,14 @@ history.
 | `--rpc-socket PATH` / conf `rpc_socket=` | **off** | Bind the unix socket at PATH (mode **0660**, group may connect) instead of `{datadir}/rpc.sock`. Implies `--rpc`. For a client running as another user, such as mempool's Node. |
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
+| `--rpc-cookie-file PATH` / conf `rpc_cookie_file=` | **off** | Existing Core-format `username:password` file (no trailing newline) accepted as TCP HTTP Basic in addition to Bearer; it is never created or logged |
 | `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
 | `--block-filter-index` | **off** | BIP158 basic. IBD seals them when the flag is on from the start. A later enable still materializes after catch-up. `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip (`getnetworkinfo` lists `COMPACT_FILTERS`), then for the life of the process. `getblockfilter` and `/rest/blockfilter/` serve heights the watermark already covers. Independent of `--sh-index` |
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 
 TLS is external (reverse proxy). Unix socket needs no HTTP header. TCP is
-Bearer-authenticated (`{datadir}/rpc.token`). `GET /rest/…` is on the same
+Bearer-authenticated (`{datadir}/rpc.token`) and, only when `--rpc-cookie-file`
+is configured, also accepts Core cookie HTTP Basic. `GET /rest/…` is on the same
 binds. TCP `/rest/` skips Bearer, matching Core. Routes: `chaininfo.json`,
 `blockhashbyheight/<height>.<bin|hex|json>`, `headers/<count>/<hash>.*`,
 `block/<hash>.*`, `block/notxdetails/<hash>.*`, `tx/<txid>.*` (chain and

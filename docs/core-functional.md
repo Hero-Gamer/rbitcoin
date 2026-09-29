@@ -41,7 +41,8 @@ never calls this.
 127.0.0.1, `--no-seeds`. The node writes `{datadir}/rpc.token` (Bearer);
 the shim mirrors `__cookie__:<token>` to `{datadir}/.cookie` so Core
 TestNode cookie + HTTP Basic still work on the **proxy** public port. The
-proxy forwards `Authorization: Bearer` to the node (TCP is Bearer-only).
+proxy forwards `Authorization: Bearer` to the node (TCP is Bearer, plus
+Basic only with `--rpc-cookie-file`).
 Node stdio goes to `regtest/debug.log`; only
 `Error:` lines (UA / init) are copied to the shim stderr so TestNode’s
 clean-stop check matches Core. Unknown Core flags fail parse. The shim maps

@@ -244,6 +244,8 @@ pub struct RpcOpts {
     pub socket_path: Option<PathBuf>,
     /// Override `{datadir}/rpc.token`.
     pub token_file: Option<PathBuf>,
+    /// Opt-in Core-format `username:password` cookie accepted as TCP HTTP Basic.
+    pub cookie_file: Option<PathBuf>,
     pub work_queue: Option<usize>,
 }
 
@@ -255,6 +257,7 @@ impl Default for RpcOpts {
             socket: false,
             socket_path: None,
             token_file: None,
+            cookie_file: None,
             work_queue: Some(rbitcoin_rpc::DEFAULT_RPC_WORK_QUEUE),
         }
     }
@@ -600,7 +603,24 @@ impl NodeConfig {
             ));
         }
         self.validate_only_net()?;
-        self.validate_hidden_inbound()
+        self.validate_hidden_inbound()?;
+        self.validate_rpc_cookie()
+    }
+
+    /// Check `--rpc-cookie-file` at startup. RPC itself only binds after
+    /// catch-up, so a bad cookie found there would be a warning a day late.
+    fn validate_rpc_cookie(&self) -> Result<(), NodeError> {
+        let Some(path) = &self.rpc.cookie_file else {
+            return Ok(());
+        };
+        if self.rpc.listen.is_none() && !self.rpc.listen_default {
+            return Err(NodeError::Config(
+                "--rpc-cookie-file applies to TCP only; add --rpc-listen".into(),
+            ));
+        }
+        rbitcoin_rpc::read_cookie_file(path)
+            .map(drop)
+            .map_err(NodeError::Config)
     }
 
     fn validate_only_net(&self) -> Result<(), NodeError> {
@@ -688,6 +708,11 @@ impl NodeConfig {
             .token_file
             .clone()
             .unwrap_or_else(|| rbitcoin_rpc::default_token_path(self.datadir.path()))
+    }
+
+    /// Configured Core cookie file for TCP HTTP Basic authentication.
+    pub fn rpc_cookie_path(&self) -> Option<PathBuf> {
+        self.rpc.cookie_file.clone()
     }
 
     /// `--rpc-socket`, else `{datadir}/rpc.sock`.
@@ -1038,7 +1063,8 @@ impl NodeConfig {
             }
             "rpcuser" | "rpcpassword" => {
                 return Err(NodeError::Config(
-                    "rpcuser/rpcpassword removed; unix socket --rpc or Bearer {datadir}/rpc.token"
+                    "rpcuser/rpcpassword removed; unix socket --rpc, Bearer {datadir}/rpc.token, \
+                     or Core cookie --rpc-cookie-file"
                         .into(),
                 ));
             }
@@ -1056,6 +1082,14 @@ impl NodeConfig {
                     ));
                 }
                 self.rpc.token_file = Some(PathBuf::from(val));
+            }
+            "rpc_cookie_file" => {
+                if val.is_empty() {
+                    return Err(NodeError::Config(
+                        "conf rpc_cookie_file requires a path".into(),
+                    ));
+                }
+                self.rpc.cookie_file = Some(PathBuf::from(val));
             }
             "ua_comment" => self.uacomments.push(val.to_string()),
             "test_activation_height" => {
@@ -1924,6 +1958,28 @@ mod tests {
             msg.contains("store") || msg.contains("datadir") || msg.contains("File exists"),
             "{msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_checks_rpc_cookie_at_startup() {
+        let dir = tmp();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join("rpc.cookie");
+        let mut cfg = NodeConfig::default().with_datadir(dir.clone());
+        cfg.rpc.cookie_file = Some(cookie.clone());
+        cfg.rpc.listen_default = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("read RPC cookie"), "missing file: {err}");
+        std::fs::write(&cookie, "__cookie__:secret\n").unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("line ending"), "{err}");
+        std::fs::write(&cookie, "__cookie__:secret").unwrap();
+        cfg.validate()
+            .expect("Core-format cookie with --rpc-listen");
+        cfg.rpc.listen_default = false;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("TCP only"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

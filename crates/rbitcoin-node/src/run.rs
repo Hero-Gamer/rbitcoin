@@ -858,6 +858,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             datadir: config.datadir.path.clone(),
             network: config.network,
             token_path: Some(config.rpc_token_path()),
+            cookie_path: config.rpc_cookie_path(),
             work_queue: config.rpc.work_queue,
             subversion: Some(
                 rbitcoin_primitives::rbitcoin_subversion(

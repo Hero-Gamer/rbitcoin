@@ -1,4 +1,4 @@
-//! RPC auth: datadir token file (Bearer).
+//! RPC authentication: Bearer token plus optional Core cookie credentials.
 
 use std::fs;
 use std::io::Write;
@@ -22,6 +22,18 @@ impl RpcAuth {
     }
 }
 
+/// Core-format `username:password` cookie accepted by an opted-in TCP listener.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RpcCookie {
+    credentials: String,
+}
+
+impl RpcCookie {
+    pub fn matches_credentials(&self, credentials: &str) -> bool {
+        ct_eq(self.credentials.as_bytes(), credentials.as_bytes())
+    }
+}
+
 /// Compare two byte strings without returning on the first mismatch.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
@@ -37,6 +49,34 @@ pub fn default_token_path(datadir: &Path) -> PathBuf {
 
 pub fn default_socket_path(datadir: &Path) -> PathBuf {
     datadir.join("rpc.sock")
+}
+
+/// Read a Core-format RPC cookie. The configured file is never created or logged.
+///
+/// The file must be exactly `username:password` with no line ending, as Core
+/// writes it. bitcoin-cli reads the cookie with `getline`, but mempool sends the
+/// raw file bytes as Basic credentials, so a trailing newline would make the two
+/// clients disagree. Refusing it here turns mempool's endless 401 into a startup
+/// error.
+pub fn read_cookie_file(path: &Path) -> Result<RpcCookie, String> {
+    let credentials =
+        fs::read_to_string(path).map_err(|e| format!("read RPC cookie {}: {e}", path.display()))?;
+    if credentials.ends_with(['\n', '\r']) {
+        return Err(format!(
+            "RPC cookie {}: ends with a line ending; write it without one (Core format, e.g. printf not echo)",
+            path.display()
+        ));
+    }
+    if credentials.is_empty()
+        || credentials.contains(['\n', '\r'])
+        || !matches!(credentials.split_once(':'), Some((user, password)) if !user.is_empty() && !password.is_empty())
+    {
+        return Err(format!(
+            "RPC cookie {}: expected username:password",
+            path.display()
+        ));
+    }
+    Ok(RpcCookie { credentials })
 }
 
 /// Read an existing token or write a new CSPRNG token (mode 0600).
@@ -92,6 +132,24 @@ pub fn parse_bearer_auth(header: &str) -> Option<&str> {
         .or_else(|| header.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty())
+}
+
+/// Decode `Authorization: Basic …` into Core cookie credentials.
+pub fn parse_basic_auth(header: &str) -> Option<String> {
+    use base64::Engine;
+
+    let encoded = header
+        .trim()
+        .strip_prefix("Basic ")
+        .or_else(|| header.trim().strip_prefix("basic "))?
+        .trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 fn random_token() -> String {
@@ -166,6 +224,11 @@ mod tests {
         assert_eq!(parse_bearer_auth("bearer xyz"), Some("xyz"));
         assert!(parse_bearer_auth("Bearer ").is_none());
         assert!(parse_bearer_auth("Basic abc").is_none());
+        assert_eq!(
+            parse_basic_auth("Basic dXNlcjpwYXNz").as_deref(),
+            Some("user:pass")
+        );
+        assert!(parse_basic_auth("Basic !!!").is_none());
         let a = RpcAuth::new("s3cret");
         assert!(a.matches_token("s3cret"));
         assert!(!a.matches_token("nope"));
@@ -203,6 +266,36 @@ mod tests {
         let path = dir.join("rpc.token");
         fs::write(&path, "  \n").unwrap();
         assert!(read_token_file(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cookie_file_requires_one_nonempty_credential_line() {
+        let dir = tmp();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".cookie");
+        fs::write(&path, "mempool:secret").unwrap();
+        let cookie = read_cookie_file(&path).unwrap();
+        assert!(cookie.matches_credentials("mempool:secret"));
+        assert!(!cookie.matches_credentials("mempool:wrong"));
+        for contents in [
+            "",
+            "\n",
+            "mempool",
+            ":secret",
+            "mempool:",
+            "mempool:secret\nnext",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(read_cookie_file(&path).is_err(), "{contents:?}");
+        }
+        // mempool sends the file verbatim, so a line ending would never match:
+        // refuse it with an error that names the fix.
+        for contents in ["mempool:secret\n", "mempool:secret\r\n", "mempool:secret\r"] {
+            fs::write(&path, contents).unwrap();
+            let err = read_cookie_file(&path).err().expect("line ending rejected");
+            assert!(err.contains("line ending"), "{contents:?}: {err}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

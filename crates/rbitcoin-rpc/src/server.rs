@@ -1,6 +1,8 @@
-//! HTTP JSON-RPC server (axum) with Bearer token auth on TCP; unix socket is filesystem-auth.
+//! HTTP JSON-RPC server (axum) with Bearer or opted-in Core cookie auth on TCP.
 
-use crate::auth::{parse_bearer_auth, resolve_rpc_auth, RpcAuth};
+use crate::auth::{
+    parse_basic_auth, parse_bearer_auth, read_cookie_file, resolve_rpc_auth, RpcAuth, RpcCookie,
+};
 use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -47,6 +49,8 @@ pub struct RpcConfig {
     pub network: Network,
     /// Override token path (default `{datadir}/rpc.token`).
     pub token_path: Option<PathBuf>,
+    /// Optional Core-format `username:password` file accepted as HTTP Basic on TCP.
+    pub cookie_path: Option<PathBuf>,
     /// `getnetworkinfo.subversion`. Empty → `/rbitcoin:VERSION/`.
     pub subversion: Option<String>,
     /// HTTP occupancy cap. `None` and `0` are [`DEFAULT_RPC_WORK_QUEUE`].
@@ -85,6 +89,7 @@ impl RpcHandle {
 struct AppState {
     ctx: Arc<RpcContext>,
     auth: RpcAuth,
+    cookie: Option<RpcCookie>,
     work_queue: Arc<tokio::sync::Semaphore>,
     require_auth: bool,
 }
@@ -110,10 +115,18 @@ pub async fn run_rpc(
     if config.listen.is_none() && config.socket_path.is_none() {
         return Err("rpc: need --rpc (socket) or --rpc-listen (TCP)".into());
     }
+    if config.cookie_path.is_some() && config.listen.is_none() {
+        return Err("rpc: --rpc-cookie-file applies to TCP only; add --rpc-listen".into());
+    }
     let (auth, token_path) = resolve_rpc_auth(&config.datadir, config.token_path.as_deref())?;
     if auth.token.is_empty() {
         return Err("RPC token empty".into());
     }
+    let cookie = config
+        .cookie_path
+        .as_deref()
+        .map(read_cookie_file)
+        .transpose()?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(AtomicU64::new(0));
@@ -158,6 +171,7 @@ pub async fn run_rpc(
         let state = AppState {
             ctx: Arc::clone(&ctx),
             auth: auth.clone(),
+            cookie: cookie.clone(),
             work_queue: work_queue.clone(),
             require_auth: true,
         };
@@ -191,6 +205,7 @@ pub async fn run_rpc(
         let state = AppState {
             ctx: Arc::clone(&ctx),
             auth: auth.clone(),
+            cookie,
             work_queue,
             require_auth: false,
         };
@@ -289,14 +304,20 @@ async fn reject_unauthorized(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Core REST is unauthenticated on TCP. POST / stays Bearer.
+    // Core REST is unauthenticated on TCP. POST / requires configured RPC auth.
     if req.uri().path().starts_with("/rest/") {
         return next.run(req).await;
     }
-    if state.require_auth && !authorized(&state.auth, req.headers()) {
+    if state.require_auth && !authorized(&state.auth, state.cookie.as_ref(), req.headers()) {
+        // Challenge with the scheme a client can actually use here.
+        let challenge = if state.cookie.is_some() {
+            "Basic realm=\"jsonrpc\""
+        } else {
+            "Bearer realm=\"jsonrpc\""
+        };
         return (
             StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer realm=\"jsonrpc\"")],
+            [(header::WWW_AUTHENTICATE, challenge)],
             "Unauthorized\n",
         )
             .into_response();
@@ -692,17 +713,20 @@ fn handle_request_dispatch(
     crate::methods::dispatch(ctx, method, params)
 }
 
-fn authorized(auth: &RpcAuth, headers: &HeaderMap) -> bool {
-    let Some(val) = headers
+fn authorized(auth: &RpcAuth, cookie: Option<&RpcCookie>, headers: &HeaderMap) -> bool {
+    let Some(value) = headers
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
     else {
         return false;
     };
-    if let Some(tok) = parse_bearer_auth(val) {
-        return auth.matches_token(tok);
+    if let Some(token) = parse_bearer_auth(value) {
+        return auth.matches_token(token);
     }
-    false
+    let Some(cookie) = cookie else {
+        return false;
+    };
+    parse_basic_auth(value).is_some_and(|credentials| cookie.matches_credentials(&credentials))
 }
 
 #[cfg(test)]
@@ -776,6 +800,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
 
@@ -909,6 +934,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
 
@@ -989,6 +1015,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -1028,6 +1055,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -1093,6 +1121,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -1230,6 +1259,7 @@ mod tests {
                 datadir: dir.path().to_path_buf(),
                 network: Network::Regtest,
                 token_path: None,
+                cookie_path: None,
                 subversion: None,
                 work_queue: None,
                 alert_notify: None,
@@ -1292,6 +1322,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: Some(1),
 
@@ -1373,6 +1404,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -1512,47 +1544,152 @@ mod tests {
         (status, parsed)
     }
 
+    async fn post_with_authorization(addr: SocketAddr, authorization: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
     #[tokio::test]
-    async fn tcp_bearer_succeeds_and_basic_is_rejected() {
+    async fn tcp_accepts_bearer_and_opted_in_core_cookie_basic() {
+        use base64::Engine;
+
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-token").expect("temp dir");
         std::fs::write(dir.path().join("rpc.token"), "pass").unwrap();
-        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-        let cfg = RpcConfig {
+        let query = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let without_cookie = RpcConfig {
             listen: Some("127.0.0.1:0".parse().unwrap()),
             socket_path: None,
             socket_shared: false,
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
         };
-        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let handle = run_rpc(
+            without_cookie,
+            Arc::clone(&query),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let addr = tcp_addr(&handle);
         let count = post_rpc(addr, &handle.auth, "getblockcount", serde_json::json!([]))
             .await
             .unwrap();
         assert_eq!(count["result"], 0, "{count}");
-        use base64::Engine;
-        let basic = base64::engine::general_purpose::STANDARD.encode("ignored:pass");
-        let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
-        let req = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic {basic}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        stream.write_all(req.as_bytes()).await.unwrap();
-        stream.write_all(body).await.unwrap();
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        let text = String::from_utf8_lossy(&buf);
+        let basic = base64::engine::general_purpose::STANDARD.encode("mempool:secret");
+        let rejected = post_with_authorization(addr, &format!("Basic {basic}")).await;
+        assert!(rejected.contains("401 Unauthorized"), "{rejected}");
         assert!(
-            text.contains("401") || text.contains("Unauthorized"),
-            "Basic must not authorize TCP RPC, got {text}"
+            rejected
+                .to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{rejected}"
         );
+        handle.shutdown().await;
+
+        let cookie_path = dir.path().join(".cookie");
+        let with_cookie = || RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: Some(cookie_path.clone()),
+            subversion: None,
+            work_queue: None,
+            alert_notify: None,
+        };
+        // The cookie is TCP-only: a socket-only listener must not silently ignore it.
+        std::fs::write(&cookie_path, "mempool:secret").unwrap();
+        let socket_only = RpcConfig {
+            listen: None,
+            socket_path: Some(dir.path().join("cookie-socket-only.sock")),
+            ..with_cookie()
+        };
+        let err = match run_rpc(
+            socket_only,
+            Arc::clone(&query),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("cookie without --rpc-listen must not start the listener"),
+            Err(e) => e,
+        };
+        assert!(err.contains("TCP only"), "{err}");
+
+        // mempool would send the newline as part of the password: refuse to start.
+        std::fs::write(&cookie_path, "mempool:secret\n").unwrap();
+        let err = match run_rpc(
+            with_cookie(),
+            Arc::clone(&query),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("cookie with a trailing newline must not start the listener"),
+            Err(e) => e,
+        };
+        assert!(err.contains("line ending"), "{err}");
+
+        std::fs::write(&cookie_path, "mempool:secret").unwrap();
+        let handle = run_rpc(with_cookie(), query, None, None, None, None, None)
+            .await
+            .unwrap();
+        let addr = tcp_addr(&handle);
+        let accepted = post_with_authorization(addr, &format!("Basic {basic}")).await;
+        assert!(accepted.contains("200 OK"), "{accepted}");
+        assert!(accepted.contains("\"result\":0"), "{accepted}");
+        let bad = base64::engine::general_purpose::STANDARD.encode("mempool:wrong");
+        let rejected = post_with_authorization(addr, &format!("Basic {bad}")).await;
+        assert!(rejected.contains("401 Unauthorized"), "{rejected}");
+        assert!(
+            rejected
+                .to_ascii_lowercase()
+                .contains("www-authenticate: basic"),
+            "{rejected}"
+        );
+        // mempool drops its cached cookie only when a 401 body is not JSON
+        // (rpc-api/jsonrpc.js), so a rotated cookie is re-read.
+        let body = rejected.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        assert!(!body.is_empty(), "{rejected}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(body).is_err(),
+            "{rejected}"
+        );
+        let newline = base64::engine::general_purpose::STANDARD.encode("mempool:secret\n");
+        let rejected = post_with_authorization(addr, &format!("Basic {newline}")).await;
+        assert!(rejected.contains("401 Unauthorized"), "{rejected}");
+        let malformed = post_with_authorization(addr, "Basic !!!").await;
+        assert!(malformed.contains("401 Unauthorized"), "{malformed}");
         handle.shutdown().await;
     }
 
@@ -1625,6 +1762,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
@@ -1651,6 +1789,7 @@ mod tests {
             datadir: dir.path().to_path_buf(),
             network: Network::Regtest,
             token_path: None,
+            cookie_path: None,
             subversion: None,
             work_queue: None,
             alert_notify: None,
