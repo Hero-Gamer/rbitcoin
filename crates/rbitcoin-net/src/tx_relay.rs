@@ -4744,8 +4744,6 @@ mod tests {
             Some(0),
         )
         .unwrap();
-        // GBT's budget carries the configured reserve; each pick carries the
-        // fee and sigop cost read under the selection's lock.
         let budget = hub.template_budget(0);
         assert_eq!(budget.reserved_sigops, 0);
         let picked = hub.select_block_template(budget);
