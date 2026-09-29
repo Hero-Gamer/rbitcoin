@@ -85,8 +85,8 @@ and at most ~80 lines of tail. `--quiet` is enough to confirm green.
 Owner: [`docs/how-we-plan.md`](docs/how-we-plan.md) (Agent RAM).
 
 **Agent disk:** `rearden-grok[bot]` follows [`rearden-vm-HOST.md`](rearden-vm-HOST.md)
-(one worktree, shared silo, no cargo in the Cursor checkout). Other
-identities: ignore that file; use `$PWD/target/dev`.
+(one worktree and `$PWD/target/dev` per session, no cargo in the Cursor
+checkout). Other identities: ignore that file; use `$PWD/target/dev`.
 
 One production implementation at the lowest crate that owns the concept.
 Extract is a move: [`docs/code-shape.md`](docs/code-shape.md). Core-facing
@@ -114,9 +114,12 @@ These wreck a session even when the skill was not opened:
   (`gh run rerun` instead).
 - `rearden-grok[bot]` only (ignore [`rearden-vm-HOST.md`](rearden-vm-HOST.md)
   otherwise): never `git remote set-url origin`; HTTPS `HEAD:<branch>` push,
-  not `git push origin`, no `-u`; one `/tmp/rbtc-<session>` worktree;
-  `CARGO_TARGET_DIR=/tmp/rbtc-target/dev` before `nix-shell`; do not cargo
-  in the Cursor checkout. Owner: [`rearden-vm-HOST.md`](rearden-vm-HOST.md).
+  not `git push origin`, no `-u`; one `/tmp/rbtc-<session>` worktree per
+  session; leave `CARGO_TARGET_DIR` unset so the nix hook uses that
+  worktree's `$PWD/target/dev`; delete that target's `debug/incremental`
+  on each branch switch and `cargo clean` it when its hashed bins will
+  not be reused; do not cargo in the Cursor checkout. Owner:
+  [`rearden-vm-HOST.md`](rearden-vm-HOST.md).
 
 Playbooks:
 

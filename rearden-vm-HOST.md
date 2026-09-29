@@ -21,23 +21,27 @@ Worktree-only (do not change the Cursor checkout `user.name`):
 
 Re-auth (~1 h token): `~/.config/rbitcoin-grok/gh-login.sh`.
 
-## Disk and cargo silo
+## Disk and cargo
 
-Root is ~40 G. Git worktrees already share `.git` objects. They do **not**
-share `target/dev` (~9 G warm) or a `third_party/bitcoin` working copy.
-Extra worktrees and cargo in the editor tree are what fill the disk.
+Root is ~40 G. Git worktrees already share `.git` objects. Each session
+has its own worktree and its own `target/dev` (~9 G once warm). Several
+sessions build and test at the same time. Abandoned worktrees, a target
+that keeps bins from a previous branch, and cargo in the editor tree are
+what fill the disk.
 
-| Share | How |
-|-------|-----|
-| One session worktree | `/tmp/rbtc-<session>` for the session. Next PR is `git switch -C`, not `git worktree add`. |
-| One dev silo | Export **`CARGO_TARGET_DIR=/tmp/rbtc-target/dev`** *before* `nix-shell` / `nix develop` (the hook only sets `$PWD/target/dev` when unset). Registry/git deps occupy disk once; workspace crates re-fingerprint if the source path changes. |
-| Editor tree | `/home/agent/workspace/rearden-bitcoin` is the Cursor checkout. Do not cargo there. Do not `git worktree add` from it for a second PR. |
-| One cargo at a time | A second cargo **waits** on `target/.cargo-lock` (serialized, not a torn rlib). Do not `cargo clean` under another cargo. Unhashed binaries (`debug/rbitcoin-node`) are last-writer-wins. |
-| ENOSPC | Skip production-scale body tests (`sp_tweaks` and similar multi‑GiB `/tmp` files). Skip `cargo test --workspace` when free space is a few GiB. Never `./scripts/coverage.sh` here (`target/cov` is another silo). Targeted `-p` tests plus clippy are enough to push. |
-| Session end | `git worktree remove` leftover `/tmp/rbtc-*`. `rm -rf /tmp/rbitcoin-*` test dirs. Do not `cargo clean` the shared silo unless artifacts are stale. |
+| Rule | How |
+|------|-----|
+| One worktree per session | `/tmp/rbtc-<session>`. Another agent uses another directory. The next PR in this session is `git switch -C` in this worktree. |
+| One target per session | Leave `CARGO_TARGET_DIR` unset. The nix hook sets `$PWD/target/dev` inside that worktree. Each target has its own lock and its own bins, so concurrent cargos stay apart. Leave `CARGO_HOME` at the default: `~/.cargo` is the shared registry and git-dep cache. |
+| Editor tree | `/home/agent/workspace/rearden-bitcoin` is the Cursor checkout. Do not cargo there. The session branch lives in its `/tmp/rbtc-<session>` worktree. |
+| Clean this target | On one branch, dep rlibs and incremental are the warm cache. On each `git switch -C`, `rm -rf target/dev/debug/incremental`. Do that mid-branch too when `debug/incremental` is multiple GiB: those files grow with every edit, and the old CGUs are not reused. `cargo clean` this session's target when the dep graph or `RUSTFLAGS` changed, or when `debug/deps` still holds hashed bins from the previous branch. That clean hits only this worktree. |
+| Other sessions | Do not `cargo clean` or delete another session's `target/`. A live session is a `/tmp/rbtc-*` worktree with a cargo or rustc whose cwd is that tree, or a held `target/.cargo-lock`. |
+| Legacy shared dir | `/tmp/rbtc-target` is the old shared silo. Leave it on disk. Do not point `CARGO_TARGET_DIR` at it, do not delete it, and do not `cargo clean` it. |
+| ENOSPC | Before the first cargo of a session, `df /`. Clean this session's incremental and stale dep bins first. Skip production-scale body tests (`sp_tweaks` and similar multi‑GiB `/tmp` files). Skip `cargo test --workspace` when free space is a few GiB. Never `./scripts/coverage.sh` here (`target/cov` is another silo). Targeted `-p` tests plus clippy are enough to push. |
+| Session end | `git worktree remove` this session's `/tmp/rbtc-<session>` (that removes its `target/dev`). `rm -rf` the `/tmp/rbitcoin-*` test dirs this session created. |
 
-Do not change `shell.nix` / `flake.nix` defaults to `/tmp/rbtc-target/dev`.
-Those stay `$PWD/target/dev` for humans and CI.
+Do not change `shell.nix` / `flake.nix` defaults. Those stay
+`$PWD/target/dev` for humans, CI, and this VM.
 
 ## Session worktree
 
@@ -47,11 +51,13 @@ git fetch origin
 git worktree add /tmp/rbtc-<session> origin/master
 cd /tmp/rbtc-<session>
 git switch -c <area>/<short-name>
-export CARGO_TARGET_DIR=/tmp/rbtc-target/dev
+# CARGO_TARGET_DIR stays unset; nix-shell sets $PWD/target/dev
 ~/.config/rbitcoin-grok/configure-worktree.sh .
 
-# next PR in the same session (do not add another worktree)
+# next PR in the same session (same worktree, same target path)
 git fetch origin
+rm -rf target/dev/debug/incremental
+# cargo clean   # when the dep graph, RUSTFLAGS, or hashed dep bins changed
 git switch -C <area>/<next-short> origin/master
 ```
 
