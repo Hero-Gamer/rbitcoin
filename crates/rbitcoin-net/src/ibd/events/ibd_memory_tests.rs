@@ -186,17 +186,15 @@ fn unsolicited_body_is_not_copied_into_the_queue() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A peer answering an overlapping `getheaders` re-sends headers this IBD
-/// already stored. Those were accepted when first seen, so they must not go
-/// back through `ensure_headers_batch`: each stored header there walks its
-/// ancestors back to the connected tip, and on mainnet that made every batch
-/// slower than the last until IBD stalled at 16 blocks.
+/// One genesis chain. A re-sent stored run does not walk, an unmapped run
+/// walks once, an unknown parent is not retried, and a lowered walk cap keeps
+/// the stored prefix while a run past the cap still walks once.
 #[test]
-fn resent_stored_headers_do_not_walk_to_the_connected_tip() {
+fn stored_header_resends_walk_once() {
+    const CAP: u32 = 4;
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
-    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     let mut chain = Vec::new();
     let mut prev = gen;
     for height in 1..=240u32 {
@@ -204,16 +202,16 @@ fn resent_stored_headers_do_not_walk_to_the_connected_tip() {
         prev = header.block_hash();
         chain.push(header);
     }
+
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     on_headers_batch(&mut st, &hub, chain[..200].to_vec());
     let _ = hub.take_stored_height_walk_steps();
-
     on_headers_batch(&mut st, &hub, chain[100..200].to_vec());
     assert_eq!(
         hub.take_stored_height_walk_steps(),
         0,
         "a re-sent run of stored headers walks no ancestors"
     );
-
     on_headers_batch(&mut st, &hub, chain.clone());
     assert_eq!(
         hub.take_stored_height_walk_steps(),
@@ -227,41 +225,66 @@ fn resent_stored_headers_do_not_walk_to_the_connected_tip() {
             "every header, stored or new, stays on the path at its height"
         );
     }
-    let _ = std::fs::remove_dir_all(dir);
-}
 
-/// `header_fks` is bounded and `hygiene` can drop an entry for a stored
-/// header, so a re-sent run can still reach `ensure_headers_batch`. There a
-/// stored header takes its height from its parent earlier in the same batch
-/// instead of walking ancestors per header: one walk opens the run, not one
-/// per row.
-#[test]
-fn unmapped_stored_run_walks_once_not_per_header() {
-    let (dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let gen = hub.tip_hash().unwrap();
-    let mut chain = Vec::new();
-    let mut prev = gen;
-    for height in 1..=200u32 {
-        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
-        prev = header.block_hash();
-        chain.push(header);
-    }
-    hub.ensure_headers_batch(&chain).unwrap();
-    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let mut fresh = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     let _ = hub.take_stored_height_walk_steps();
-
-    on_headers_batch(&mut st, &hub, chain.clone());
+    on_headers_batch(&mut fresh, &hub, chain[..200].to_vec());
     assert_eq!(
         hub.take_stored_height_walk_steps(),
         1,
         "a stored run outside header_fks walks only its first header"
     );
-    for (height, header) in (1u32..).zip(&chain) {
+    for (height, header) in (1u32..).zip(&chain[..200]) {
         assert_eq!(
-            st.hash_height.get(&header.block_hash()),
+            fresh.hash_height.get(&header.block_hash()),
             Some(&height),
             "every stored header is on the path at its height"
+        );
+    }
+
+    let unknown = BlockHash::from_byte_array([0x7d; 32]);
+    let mut side = Vec::new();
+    let mut prev = unknown;
+    for height in 1..=20u32 {
+        let header = mine(prev, 1_500_050_000 + height * 600, height).header;
+        prev = header.block_hash();
+        side.push(header);
+    }
+    let mut side_st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    on_headers_batch(&mut side_st, &hub, side.clone());
+    assert!(side_st.header_fks.is_empty());
+    for header in &side {
+        assert!(!side_st.hash_height.contains_key(&header.block_hash()));
+    }
+
+    hub.set_stored_height_walk_cap(CAP);
+    let parent = chain[(CAP + 7) as usize].block_hash();
+    let mut rejected = mine(parent, 1_500_030_000 + (CAP + 9) * 600, CAP + 9).header;
+    rejected.time = 0;
+    let mut batch = chain[CAP as usize..(CAP as usize + 8)].to_vec();
+    batch.push(rejected);
+    let mut tail = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let _ = hub.take_stored_height_walk_steps();
+    on_headers_batch(&mut tail, &hub, batch);
+    assert!(hub.take_stored_height_walk_steps() >= u64::from(CAP));
+    for header in &chain[CAP as usize..CAP as usize + 8] {
+        assert!(tail.header_fks.contains_key(&header.block_hash()));
+    }
+    assert!(!tail.header_fks.contains_key(&rejected.block_hash()));
+
+    let above = (CAP as usize)..(CAP as usize + 2);
+    let mut past = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let _ = hub.take_stored_height_walk_steps();
+    on_headers_batch(&mut past, &hub, chain[above.clone()].to_vec());
+    assert_eq!(
+        hub.take_stored_height_walk_steps(),
+        u64::from(CAP),
+        "a stored run past the walk cap walks once, not once per header"
+    );
+    for header in &chain[above] {
+        assert!(
+            past.header_fks.contains_key(&header.block_hash()),
+            "a header past the cap is still accepted"
         );
     }
     let _ = std::fs::remove_dir_all(dir);
@@ -296,95 +319,4 @@ fn failed_first_prefix_stops_search() {
     assert_eq!(values[0], 1);
     assert_eq!(values[lo - 1], 731);
     assert_eq!(probes[0], 1);
-}
-
-#[test]
-fn unknown_first_header_does_not_retry_longer_prefixes() {
-    let (dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let unknown = BlockHash::from_byte_array([0x7d; 32]);
-    let mut chain = Vec::new();
-    let mut prev = unknown;
-    for height in 1..=20 {
-        let header = mine(prev, 1_500_050_000 + height * 600, height).header;
-        prev = header.block_hash();
-        chain.push(header);
-    }
-    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    on_headers_batch(&mut st, &hub, chain.clone());
-    assert!(st.header_fks.is_empty());
-    for header in &chain {
-        assert!(!st.hash_height.contains_key(&header.block_hash()));
-    }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn rejected_tail_keeps_stored_prefix() {
-    const CAP: u32 = 4;
-    let (dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let gen = hub.tip_hash().unwrap();
-    let mut chain = Vec::new();
-    let mut prev = gen;
-    for height in 1..=CAP + 8 {
-        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
-        prev = header.block_hash();
-        chain.push(header);
-    }
-    hub.ensure_headers_batch(&chain).unwrap();
-    hub.set_stored_height_walk_cap(CAP);
-    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    let mut rejected = mine(prev, 1_500_030_000 + (CAP + 9) * 600, CAP + 9).header;
-    rejected.time = 0;
-    let mut batch = chain[CAP as usize..].to_vec();
-    batch.push(rejected);
-    let _ = hub.take_stored_height_walk_steps();
-    on_headers_batch(&mut st, &hub, batch);
-    assert!(hub.take_stored_height_walk_steps() >= u64::from(CAP));
-    for header in &chain[CAP as usize..] {
-        assert!(st.header_fks.contains_key(&header.block_hash()));
-    }
-    assert!(!st.header_fks.contains_key(&rejected.block_hash()));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// `stored_header_height` stops after a cap (10,000 in production). A stored
-/// run that opens above that cap must walk once; later headers stay
-/// unresolved instead of each walking to the cap. The hub cap is lowered so
-/// this does not mine thousands of headers — the branch is the same.
-#[test]
-fn unmapped_run_past_the_walk_cap_walks_once() {
-    const CAP: u32 = 4;
-    let (dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let gen = hub.tip_hash().unwrap();
-    let mut chain = Vec::new();
-    let mut prev = gen;
-    // Two headers past the cap, plus a further tip so neither re-sent hash
-    // is the header tip (`header_height` would resolve that one without a walk).
-    for height in 1..=CAP + 3 {
-        let header = mine(prev, 1_500_030_000 + height * 600, height).header;
-        prev = header.block_hash();
-        chain.push(header);
-    }
-    hub.ensure_headers_batch(&chain).unwrap();
-    hub.set_stored_height_walk_cap(CAP);
-    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    let _ = hub.take_stored_height_walk_steps();
-
-    let above = (CAP as usize)..(CAP as usize + 2);
-    on_headers_batch(&mut st, &hub, chain[above.clone()].to_vec());
-    assert_eq!(
-        hub.take_stored_height_walk_steps(),
-        u64::from(CAP),
-        "a stored run past the walk cap walks once, not once per header"
-    );
-    for header in &chain[above] {
-        assert!(
-            st.header_fks.contains_key(&header.block_hash()),
-            "a header past the cap is still accepted"
-        );
-    }
-    let _ = std::fs::remove_dir_all(dir);
 }
