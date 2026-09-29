@@ -1365,7 +1365,7 @@ pub(in crate::ibd) mod tests {
         BlockHash::from_byte_array(b)
     }
 
-    fn dummy_slot(id: usize) -> PeerSlot {
+    pub(in crate::ibd) fn dummy_slot(id: usize) -> PeerSlot {
         let (cmd_tx, _rx) = mpsc::unbounded_channel();
         let task = tokio::runtime::Builder::new_current_thread()
             .enable_all()
