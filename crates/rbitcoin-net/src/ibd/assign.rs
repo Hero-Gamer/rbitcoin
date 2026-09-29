@@ -3204,8 +3204,10 @@ pub(in crate::ibd) mod tests {
         }
     }
 
+    /// Tuple fields drop in order: the env is restored before the lock is
+    /// released, so the next holder's own setting survives.
     pub(in crate::ibd) fn lock_default_assign_stop(
-    ) -> (std::sync::MutexGuard<'static, ()>, AssignStopEnvRestore) {
+    ) -> (AssignStopEnvRestore, std::sync::MutexGuard<'static, ()>) {
         let g = BQ_ASSIGN_STOP_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3215,7 +3217,7 @@ pub(in crate::ibd) mod tests {
         );
         std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES");
         std::env::remove_var("RBITCOIN_BLOCK_QUEUE_GB");
-        (g, restore)
+        (restore, g)
     }
 
     /// Over assign-stop: densify within confirm window ∩ fetched; not past window.
