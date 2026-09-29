@@ -23,10 +23,11 @@ One `/tmp/rbtc-<session>` for the session. The next PR is `git switch -C`
 from current `origin/master`, not another worktree. Never commit the plan
 onto `master`. Worktrees share `origin`. Never `git remote set-url origin`.
 
-`rearden-grok[bot]`: silo, identity, HTTPS `HEAD:<branch>` push, and session
-end are [`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md). If you are not
-that identity, ignore that file. Use `$PWD/target/dev` and push the topic
-branch with ordinary `git push`.
+`rearden-grok[bot]`: per-session cargo target, identity, HTTPS
+`HEAD:<branch>` push, and session end are
+[`rearden-vm-HOST.md`](../../../rearden-vm-HOST.md). If you are not that
+identity, ignore that file. Use `$PWD/target/dev` and push the topic branch
+with ordinary `git push`.
 
 After merge, delete the topic branch only. Keep the session worktree until
 the session ends. Do not delete a branch that still has an open PR. Do not

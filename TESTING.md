@@ -129,11 +129,11 @@ reads it; rustup users export it). Override coverage dir:
 Cargo incremental stays on in `target/dev`. Stale objects: `cargo clean -p
 <crate>` or wipe the silo.
 
-Humans and CI keep `$PWD/target/dev` (this table, CONTRIBUTING, `shell.nix` /
-`flake.nix`). Constrained VMs may export a shared silo *before* `nix-shell`
-(the hook only sets `$PWD/target/dev` when unset). `rearden-grok[bot]` on
-the operator VM: [`rearden-vm-HOST.md`](rearden-vm-HOST.md). Other agents:
-ignore that file.
+Humans, CI, and `rearden-grok[bot]` keep `$PWD/target/dev` (this table,
+CONTRIBUTING, `shell.nix` / `flake.nix`). The nix hook sets that path when
+`CARGO_TARGET_DIR` is unset. `rearden-grok[bot]` on the operator VM, one
+worktree per session: [`rearden-vm-HOST.md`](rearden-vm-HOST.md). Other
+agents: ignore that file.
 
 **Default vs heavy tiers**
 
