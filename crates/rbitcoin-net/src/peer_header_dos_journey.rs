@@ -811,7 +811,14 @@ async fn noban_bad_block_is_not_punished(
     let height = hub.tip_height().unwrap().saturating_add(1);
     let mut bad_pow =
         rbitcoin_consensus::mine_regtest_paying(prev, time, height, op_true(), vec![]);
-    bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+    // Regtest accepts about half of nonces, so +1 is often still valid work.
+    let target = bitcoin::Target::from_compact(bad_pow.header.bits);
+    loop {
+        bad_pow.header.nonce = bad_pow.header.nonce.wrapping_add(1);
+        if bad_pow.header.validate_pow(target).is_err() {
+            break;
+        }
+    }
     let (out_tx, _rx) = mpsc::unbounded_channel();
 
     let plain = live_peer(peers, 18472, 21, true);
