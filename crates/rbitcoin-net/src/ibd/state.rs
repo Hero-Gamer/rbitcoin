@@ -180,6 +180,8 @@ pub(crate) struct IbdWorkState {
     pub(crate) intake_stop: u64,
     /// Body-queue bytes snapshotted with [`Self::intake_stop`].
     pub(crate) intake_queued: u64,
+    /// Recent block payload lengths, oldest first. Per-peer byte cap only.
+    pub(crate) block_lens: VecDeque<u32>,
     /// Checkpoints for headers past the download queue.
     pub header_walk: super::header_walk::HeaderWalk,
 }
@@ -240,6 +242,7 @@ impl IbdWorkState {
             cascade_at: None,
             intake_stop: u64::MAX,
             intake_queued: 0,
+            block_lens: VecDeque::new(),
             header_walk: super::header_walk::HeaderWalk::default(),
         }
     }

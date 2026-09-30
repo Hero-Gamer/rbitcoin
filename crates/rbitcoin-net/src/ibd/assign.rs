@@ -639,11 +639,52 @@ pub(crate) fn pop_need(
     None
 }
 
+/// How many recent block bodies the per-peer byte cap remembers.
+const BLOCK_LEN_SAMPLES: usize = 32;
+/// Below this many samples the byte cap charges [`BLOCK_LEN_STAND_IN`].
+const BLOCK_LEN_MIN_SAMPLES: usize = 8;
+/// Stand-in payload so the count cap binds before any bodies have arrived.
+const BLOCK_LEN_STAND_IN: u64 = 1024;
+/// Outstanding getdata payload on one peer.
+pub(crate) const PER_PEER_BLOCK_BYTE_CAP: u64 = 16 * 1024 * 1024;
+
+/// Remember one received block body. The ring stays at [`BLOCK_LEN_SAMPLES`].
+pub(crate) fn note_block_len(st: &mut IbdWorkState, len: usize) {
+    if st.block_lens.len() == BLOCK_LEN_SAMPLES {
+        st.block_lens.pop_front();
+    }
+    st.block_lens
+        .push_back(u32::try_from(len).unwrap_or(u32::MAX));
+}
+
+/// Median recent payload, or [`BLOCK_LEN_STAND_IN`] before enough samples.
+pub(crate) fn block_len_estimate(st: &IbdWorkState) -> u64 {
+    if st.block_lens.len() < BLOCK_LEN_MIN_SAMPLES {
+        return BLOCK_LEN_STAND_IN;
+    }
+    let mut lens: Vec<u32> = st.block_lens.iter().copied().collect();
+    lens.sort_unstable();
+    u64::from(lens[lens.len() / 2])
+}
+
+/// Room for one more getdata hash: under the count cap, and the next
+/// estimated body still fits in [`PER_PEER_BLOCK_BYTE_CAP`].
+pub(crate) fn peer_has_block_room(in_flight: usize, per_peer: usize, estimate: u64) -> bool {
+    if in_flight >= per_peer {
+        return false;
+    }
+    let next = (in_flight as u64)
+        .saturating_mul(estimate)
+        .saturating_add(estimate);
+    next <= PER_PEER_BLOCK_BYTE_CAP
+}
+
 fn peer_has_slot(st: &IbdWorkState, pid: usize, per_peer: usize) -> bool {
+    let estimate = block_len_estimate(st);
     st.slots
         .iter()
         .find(|s| s.id == pid && s.alive)
-        .is_some_and(|s| s.in_flight.len() < per_peer)
+        .is_some_and(|s| peer_has_block_room(s.in_flight.len(), per_peer, estimate))
 }
 
 pub(crate) fn issue_one(
@@ -919,6 +960,7 @@ fn fifo_blocked_owner_to_drop(
     hash: &BlockHash,
     slots: &[PeerSlot],
     per_peer: usize,
+    estimate: u64,
 ) -> Option<usize> {
     if slots.iter().filter(|s| s.alive).count() <= 1 {
         return None;
@@ -929,7 +971,7 @@ fn fifo_blocked_owner_to_drop(
             s.alive
                 && !req.holds(s.id)
                 && !s.in_flight.contains(hash)
-                && s.in_flight.len() < per_peer
+                && peer_has_block_room(s.in_flight.len(), per_peer, estimate)
         })
         .map(|s| (s.in_flight.len(), peer_bps(slots, s.id)))
         .min_by(|&(qa, ba), &(qb, bb)| tip_hole_drain_cmp(qa, ba, qb, bb))?;
@@ -982,13 +1024,14 @@ pub(crate) fn tip_hole_owner_to_drop(
     hash: &BlockHash,
     slots: &[PeerSlot],
     per_peer: usize,
+    estimate: u64,
 ) -> Option<usize> {
     let owners: Vec<usize> = req.peers.iter().copied().collect();
     let owners = owners.as_slice();
     if owners.is_empty() {
         return None;
     }
-    if let Some(id) = fifo_blocked_owner_to_drop(req, hash, slots, per_peer) {
+    if let Some(id) = fifo_blocked_owner_to_drop(req, hash, slots, per_peer, estimate) {
         return Some(id);
     }
     let solo_since = owners
@@ -1282,7 +1325,9 @@ pub(crate) fn cover_tip_holes(
         demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
         let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
-            if let Some(pid) = tip_hole_owner_to_drop(req, &h, &st.slots, cfg.per_peer) {
+            if let Some(pid) =
+                tip_hole_owner_to_drop(req, &h, &st.slots, cfg.per_peer, block_len_estimate(st))
+            {
                 retire_hash_owner(st, h, pid);
                 avoid.insert(pid);
             }
@@ -1311,7 +1356,11 @@ pub(crate) fn cover_tip_holes(
             if st.inflight.get(&h).is_some_and(|e| e.holds(pid)) {
                 continue;
             }
-            if st.slots[idx].in_flight.len() >= cfg.per_peer {
+            if !peer_has_block_room(
+                st.slots[idx].in_flight.len(),
+                cfg.per_peer,
+                block_len_estimate(st),
+            ) {
                 continue;
             }
             let mut room = 1usize;
@@ -1644,6 +1693,39 @@ pub(in crate::ibd) mod tests {
         assert!(bq_pipeline_saturated(0, true));
         assert!(bq_pipeline_saturated(15, true));
         assert!(!bq_pipeline_saturated(32, true));
+    }
+
+    #[test]
+    fn peer_block_room_is_count_until_bodies_have_a_size() {
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stand_in = block_len_estimate(&st);
+        assert_eq!(stand_in, 1024);
+        assert!(
+            peer_has_block_room(16, 64, stand_in),
+            "sixteen small hashes are under both caps"
+        );
+        assert!(
+            !peer_has_block_room(64, 64, stand_in),
+            "the count cap is 64 before any size samples"
+        );
+
+        for _ in 0..8 {
+            note_block_len(&mut st, 1024 * 1024);
+        }
+        let mib = block_len_estimate(&st);
+        assert_eq!(mib, 1024 * 1024);
+        assert!(
+            !peer_has_block_room(16, 64, mib),
+            "sixteen 1 MiB bodies are the 16 MiB cap"
+        );
+
+        st.block_lens.clear();
+        for _ in 0..8 {
+            note_block_len(&mut st, 1024);
+        }
+        let kib = block_len_estimate(&st);
+        assert!(peer_has_block_room(63, 64, kib));
+        assert!(!peer_has_block_room(64, 64, kib));
     }
 
     fn drain_block_queue(hub: &ChainHub) {

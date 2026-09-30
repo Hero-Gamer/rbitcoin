@@ -96,11 +96,12 @@ pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
 /// At early-block confirm rates this is several header round trips of blocks.
 pub(crate) const ORDERED_REFILL_LOW: usize = ORDERED_HEADERS_SOFT_CAP / 4;
 
-/// Max blocks in flight to a single peer (Core `MAX_BLOCKS_IN_TRANSIT_PER_PEER`).
+/// Max blocks in flight to a single peer.
 ///
-/// Keeping this at 16 avoids overloading peers with large getdata batches; total
-/// concurrency scales with peer count (`peers × 16`), not by piling work on few hosts.
-pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+/// Early blocks are small, so a fast peer can take a burst this wide. The
+/// 16 MiB payload cap in assign stops the same peer holding 64 large bodies.
+/// Total concurrency still scales with peer count.
+pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 64;
 
 /// Replay leftover in-RAM body-queue rows with a fresh work state.
 ///

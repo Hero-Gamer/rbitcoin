@@ -95,8 +95,10 @@ is over target.
 window, outstanding requests remain finite (per-peer in-flight window).
 Enqueueing those bodies cannot create a truly unbounded leak; the backlog
 drains as confirm dequeues. Bound queue size by **not requesting**, not by
-**not reading**. A tight slow pack keeps eight densify getdata per peer and
-is allowed to finish them. While `hole=` is open, assign issues **no new**
+**not reading**. A tight slow pack keeps half the per-peer count cap of
+densify getdata (32 at the 64-block ceiling, and never past 16 MiB of
+estimated block payload on that peer) and is allowed to finish them. While
+`hole=` is open, assign issues **no new**
 densify (existing in-flight requests may complete).
 
 Do not add a second Class A path, or a large process-resident archive cache
