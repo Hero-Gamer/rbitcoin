@@ -179,11 +179,6 @@ impl HeaderWalk {
         }
         out
     }
-
-    /// Tip of the one competing chain, when a later reply may still extend it.
-    pub(crate) fn challenger_tip(&self) -> Option<BlockHash> {
-        self.challenger.as_ref().map(|ch| ch.tip_hash)
-    }
 }
 
 fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
@@ -4655,7 +4650,7 @@ mod tests {
         assert_eq!(hub.query.milestone_header_at(2), None);
         assert!(!skips(&hub, 2, side.block_hash().as_byte_array()));
         assert!(
-            st.header_walk.challenger_tip().is_none(),
+            st.header_walk.challenger.is_none(),
             "a one-block fork does not replace a real competing chain"
         );
         assert_eq!(st.header_walk.tip_hash, Some(h4.block_hash()));
