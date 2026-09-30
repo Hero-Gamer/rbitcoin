@@ -8,7 +8,7 @@ Summary from your run:
 - 6 crates/rbitcoin-node/src/run.rs -> mostly log/perf
 - 5 crates/rbitcoin-store/src/bdz.rs -> log/perf LEAVE
 - 4+4+4 peer.rs, spender_table, scripthash_head -> mix
-- 3 peers.rs, service.rs, seeds.rs -> node-time MIGRATE (Steps 2/3)
+- 3 peers.rs:1249 mock_now Acquire/Release + set_mock_now() bypasses hub.clock -> CRITICAL MIGRATE (split-brain), tx_relay.rs:625 mock_now Relaxed + note_mock_now() bypasses hub.clock -> CRITICAL MIGRATE, service.rs/seeds.rs -> node-time
 - 2 tx_relay.rs -> 1x node-time (928 manual mock -> NodeClock), 1x log/perf (3753 tmp uniqueness) LEAVE
 
 Legend per Rearden #688 item 2.1:
@@ -53,7 +53,7 @@ Legend per Rearden #688 item 2.1:
 | crates/rbitcoin-net/src/service.rs | 892 | `let n = std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock | |
 | crates/rbitcoin-net/src/service.rs | 959 | `let n = std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock | |
 | crates/rbitcoin-net/src/tx_relay.rs | 3753 | `let n = SystemTime::now()` | log/perf - LEAVE (tmp path uniqueness) | |
-| crates/rbitcoin-net/src/tx_relay.rs | 928 | `std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock (manual mock check -> use NodeClock) | |
+| crates/rbitcoin-net/src/tx_relay.rs | 923 | `std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock (manual mock check -> use NodeClock) | |
 | crates/rbitcoin-node/src/cli.rs | 533 | `let n = SystemTime::now()` | log/perf - LEAVE | |
 | crates/rbitcoin-node/src/config.rs | 1430 | `let n = SystemTime::now()` | log/perf - LEAVE | |
 | crates/rbitcoin-node/src/lock.rs | 101 | `let n = SystemTime::now()` | log/perf - LEAVE | |
