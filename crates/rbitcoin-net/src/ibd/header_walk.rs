@@ -1,12 +1,14 @@
 //! Checkpoints for the header chain ahead of the blocks.
 //!
 //! Two header requests can be in flight. The walk lane runs while any peer
-//! advertises a header past the walk. Its reply is a checkpoint once the walk
-//! is ahead of the stored path, at any queue length. The refill lane asks
-//! from the queue tail while the queue is under [`ORDERED_HEADERS_SOFT_CAP`].
-//! A reply that continues the walk at that stored top is written, and the
-//! walk advances with it. One competing chain is kept the same way until it
-//! loses or replaces the candidate. Work for a stored header between
+//! advertises a header past the walk. The first ask starts at the stored tip.
+//! A solicited reply that continues that tip is a checkpoint, and so is any
+//! solicited reply once the walk is ahead of the stored path, at any queue
+//! length. The refill lane asks from the queue tail while the queue is under
+//! [`ORDERED_HEADERS_SOFT_CAP`]. A later reply that continues the walk at that
+//! stored top is written, and the walk advances with it. One competing chain
+//! is kept the same way until it loses or replaces the candidate. Work for a
+//! stored header between
 //! checkpoints is the previous checkpoint plus those stored headers. That
 //! replay runs only when a competing headers batch forks there.
 
@@ -186,35 +188,40 @@ fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
     let mut work = hub
         .chain_work()
         .unwrap_or_else(|_| Work::from_be_bytes([0u8; 32]));
+    // An empty queue starts at the confirmed tip. Indexed heights above it
+    // are not on the download path. A non-empty queue still walks the index
+    // up to its tail, including when that tail has no height of its own.
     let queue_tail = st
         .ordered
         .back()
         .and_then(|h| st.hash_height.get(h).copied());
-    while let Some(next_h) = height.checked_add(1) {
-        if queue_tail.is_some_and(|tail| next_h > tail) {
-            break;
+    if !st.ordered.is_empty() {
+        while let Some(next_h) = height.checked_add(1) {
+            if queue_tail.is_some_and(|tail| next_h > tail) {
+                break;
+            }
+            let Some(next) = st.height_to_hash.get(&next_h).copied() else {
+                break;
+            };
+            let Some(hdr) = hub.header_of(&next) else {
+                break;
+            };
+            if hash.is_some_and(|h| hdr.prev_blockhash != h) {
+                break;
+            }
+            work = work + hdr.work();
+            if hub.milestone.height == next_h {
+                let mut latch = st.header_walk.tip.clone();
+                latch.height = next_h;
+                latch.hash = Some(next);
+                remember_milestone(&mut latch, hub, hdr.prev_blockhash, &hdr);
+                st.header_walk.tip.milestone_hash = latch.milestone_hash;
+                st.header_walk.tip.milestone_prev = latch.milestone_prev;
+                st.header_walk.tip.milestone_header = latch.milestone_header;
+            }
+            height = next_h;
+            hash = Some(next);
         }
-        let Some(next) = st.height_to_hash.get(&next_h).copied() else {
-            break;
-        };
-        let Some(hdr) = hub.header_of(&next) else {
-            break;
-        };
-        if hash.is_some_and(|h| hdr.prev_blockhash != h) {
-            break;
-        }
-        work = work + hdr.work();
-        if hub.milestone.height == next_h {
-            let mut latch = st.header_walk.tip.clone();
-            latch.height = next_h;
-            latch.hash = Some(next);
-            remember_milestone(&mut latch, hub, hdr.prev_blockhash, &hdr);
-            st.header_walk.tip.milestone_hash = latch.milestone_hash;
-            st.header_walk.tip.milestone_prev = latch.milestone_prev;
-            st.header_walk.tip.milestone_header = latch.milestone_header;
-        }
-        height = next_h;
-        hash = Some(next);
     }
     let milestone_hash = st.header_walk.tip.milestone_hash;
     let milestone_prev = st.header_walk.tip.milestone_prev;
@@ -1158,10 +1165,12 @@ pub(crate) fn classify(
     let on_top = stored_top_hash(st, hub) == Some(prev);
     let under = st.ordered.len() < ORDERED_HEADERS_SOFT_CAP;
     let solicited = ask != HeaderAsk::Unsolicited;
-    // Full queue, or a solicited look-ahead: the reply is a checkpoint.
-    // An unsolicited reply is consumed only in that case. With room, and the
-    // walk not ahead, a continuation of the walk tip is stored.
-    let checkpoint = !under || (solicited && walk_ahead_of_queue(st, hub));
+    // Full queue, a solicited reply while the walk is ahead, or the first
+    // solicited continuation of the stored tip. That first checkpoint is what
+    // puts the walk ahead. A later caught-up continuation is stored.
+    let checkpoint = !under
+        || (solicited && walk_ahead_of_queue(st, hub))
+        || (solicited && on_walk && st.header_walk.checkpoints.is_empty());
     if st
         .header_walk
         .tip
@@ -1764,6 +1773,9 @@ pub(crate) fn send_getheaders(
     st: &mut IbdWorkState,
     hub: &ChainHub,
 ) -> Result<bool, crate::error::NetError> {
+    // The first ask is the stored tip, so a continuation of it can checkpoint
+    // and the status line has a height. Later asks leave an origin in place.
+    ensure_origin(st, hub);
     // A walk that is already past the stored path needs those headers back on
     // the queue. An empty reply before any walk must be able to finish.
     if walk_ahead_of_queue(st, hub) {
@@ -2740,6 +2752,71 @@ mod tests {
         assert_eq!(st.header_walk.tip_height(), 2);
     }
 
+    #[test]
+    fn the_walk_starts_at_the_stored_tip() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-start");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let second = mine(first.block_hash(), 2);
+        let (s0, mut rx0) = slot(0);
+        let (s1, mut rx1) = slot(1);
+        let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(
+            st.header_walk.origin,
+            "the first ask starts the walk at the stored tip"
+        );
+        assert_eq!(st.header_walk.tip_hash(), Some(gen));
+        rbitcoin_log::capture_logs(true);
+        log_status(&mut st, &hub, 50_000);
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert!(
+            logs.iter()
+                .any(|(_, line)| line.contains("ibd: headers height=")),
+            "the status line starts with the stored tip"
+        );
+        let asked = st.header_walk.walk.peer.expect("walk lane");
+        let front = if asked == 0 {
+            locator_front(&mut rx0)
+        } else {
+            locator_front(&mut rx1)
+        };
+        assert_eq!(front, Some(gen), "the first locator is the stored tip");
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, asked, vec![first, second]);
+        assert_eq!(
+            hub.query.store().header_count(),
+            before,
+            "the first look-ahead is a checkpoint"
+        );
+        assert!(st.ordered.is_empty());
+        assert_eq!(st.header_walk.tip_hash(), Some(second.block_hash()));
+        assert!(walk_ahead_of_queue(&st, &hub));
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let walk_peer = st.header_walk.walk.peer.expect("walk lane");
+        let refill_peer = st.header_walk.refill.peer.expect("refill lane");
+        assert_ne!(walk_peer, refill_peer);
+        let walk_front = if walk_peer == 0 {
+            locator_front(&mut rx0)
+        } else {
+            locator_front(&mut rx1)
+        };
+        let refill_front = if refill_peer == 0 {
+            locator_front(&mut rx0)
+        } else {
+            locator_front(&mut rx1)
+        };
+        assert_eq!(walk_front, Some(second.block_hash()));
+        assert_eq!(
+            refill_front,
+            Some(gen),
+            "refill asks from the stored tip, behind the walk"
+        );
+    }
+
     fn locator_front(rx: &mut mpsc::UnboundedReceiver<PeerCmd>) -> Option<BlockHash> {
         match rx.try_recv() {
             Ok(PeerCmd::GetHeaders { locator }) => locator.first().copied(),
@@ -3501,6 +3578,7 @@ mod tests {
         let (mut short, mut rx_short) = slot(2);
         short.peer_height = 10;
         let mut st = IbdWorkState::new(vec![a, b, short], Some(gen), Some(0));
+        st.header_walk.origin = true;
         st.header_walk.tip.height = 100;
         st.ordered.clear();
         for _ in 0..ORDERED_HEADERS_SOFT_CAP {
