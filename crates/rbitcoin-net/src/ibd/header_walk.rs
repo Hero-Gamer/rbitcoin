@@ -1597,6 +1597,54 @@ fn lane_fresh(lane: &Lane) -> bool {
     lane.peer.is_some() && lane.at.is_some_and(|t| t.elapsed() <= LOOKAHEAD_ASK)
 }
 
+/// Lanes still inside their ask window when a reply arrives. Time spent
+/// handling that reply is not part of the window: a slow store must not
+/// rotate a peer who has not missed.
+pub(crate) struct InFlight {
+    walk: Option<(usize, Instant)>,
+    refill: Option<(usize, Instant)>,
+    started: Instant,
+    held: bool,
+}
+
+impl InFlight {
+    pub(crate) fn capture(st: &IbdWorkState) -> Self {
+        Self {
+            walk: fresh_mark(&st.header_walk.walk),
+            refill: fresh_mark(&st.header_walk.refill),
+            started: Instant::now(),
+            held: false,
+        }
+    }
+
+    /// Move a still-waiting lane's start forward by the time since [`capture`].
+    pub(crate) fn hold(&mut self, st: &mut IbdWorkState) {
+        if self.held {
+            return;
+        }
+        self.held = true;
+        let paused = self.started.elapsed();
+        hold_mark(&mut st.header_walk.walk, self.walk, paused);
+        hold_mark(&mut st.header_walk.refill, self.refill, paused);
+    }
+}
+
+fn fresh_mark(lane: &Lane) -> Option<(usize, Instant)> {
+    if !lane_fresh(lane) {
+        return None;
+    }
+    Some((lane.peer?, lane.at?))
+}
+
+fn hold_mark(lane: &mut Lane, saved: Option<(usize, Instant)>, paused: Duration) {
+    let Some((peer, at)) = saved else {
+        return;
+    };
+    if lane.peer == Some(peer) && lane.at == Some(at) {
+        lane.at = at.checked_add(paused);
+    }
+}
+
 fn release_lane(lane: &mut Lane) {
     if let Some(peer) = lane.peer.take() {
         lane.prev_peer = Some(peer);
