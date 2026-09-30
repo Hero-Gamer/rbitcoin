@@ -12,12 +12,8 @@ Added
   migration or IBD.
 - **Prometheus metrics.** `--metrics` adds `GET /metrics` on the health
   listener. Gauges equal their RPC fields (`blocks`, `headers`,
-  `initialblockdownload`, connections, mempool size) and counters are the
-  `tip: perf` meters as running totals.
-
-Changed
-
-- **`tip: perf` meters are running totals.** Esplora and Electrum
-  requests, historical block serves, and mempool accepts and rejects count
-  up for the life of the process. The 5 s DEBUG line still prints the
-  change since the previous line.
+  `initialblockdownload`, connections, mempool size). Counters are the
+  `tip: perf` meters (Esplora and Electrum requests, historical block
+  serves, mempool accepts and rejects), which now count up for the life
+  of the process; the 5 s DEBUG line still prints the change since the
+  previous line.
