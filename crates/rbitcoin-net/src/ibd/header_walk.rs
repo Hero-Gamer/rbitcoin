@@ -2967,6 +2967,17 @@ mod tests {
         apply(&mut st, &hub, 0, vec![first]);
         assert_eq!(st.header_walk.tip_hash, Some(first.block_hash()));
 
+        // Mining this batch is slower than the 5s ask window under CI load.
+        // Build it before the lanes are armed.
+        let mut headers = vec![first];
+        let mut prev = first.block_hash();
+        for n in 2..=crate::codec::MAX_HEADERS_RESULTS as u32 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            headers.push(hdr);
+        }
+        assert_eq!(headers.len(), crate::codec::MAX_HEADERS_RESULTS);
+
         floor_unreachable(&mut hub);
         st.ordered.clear();
         st.ordered_set.clear();
@@ -2981,15 +2992,10 @@ mod tests {
         for rx in &mut rxs {
             let _ = rx.try_recv();
         }
-
-        let mut headers = vec![first];
-        let mut prev = first.block_hash();
-        for n in 2..=crate::codec::MAX_HEADERS_RESULTS as u32 {
-            let hdr = mine(prev, n);
-            prev = hdr.block_hash();
-            headers.push(hdr);
-        }
-        assert_eq!(headers.len(), crate::codec::MAX_HEADERS_RESULTS);
+        // The window starts at the ask. Storing the batch must not age it out.
+        let asked = Instant::now();
+        st.header_walk.walk.at = Some(asked);
+        st.header_walk.refill.at = Some(asked);
         let before = hub.query.store().header_count();
         apply(&mut st, &hub, refill_peer, headers);
         assert_eq!(
