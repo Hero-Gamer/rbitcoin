@@ -1,7 +1,11 @@
 //! Checkpoints for the header chain ahead of the blocks.
 //!
-//! Two header requests can be in flight. The walk lane runs while any peer
-//! advertises a header past the walk. The first ask starts at the stored tip.
+//! Two header requests can be in flight. The walk lane runs while a connected
+//! peer is still ahead of the walk and has not failed to extend it. Above the
+//! work floor, one short reply that leaves the candidate unextended retires
+//! that peer from the walk. A full 2,000-header window does not, so a lighter
+//! fork can still catch up, and a later block inv puts the peer back. The
+//! first ask starts at the stored tip.
 //! A solicited reply that continues that tip is a checkpoint, and so is any
 //! solicited reply once the walk is ahead of the stored path, at any queue
 //! length. The refill lane asks from the queue tail while the queue is under
@@ -80,6 +84,10 @@ pub(crate) struct HeaderWalk {
     off_path: std::collections::HashMap<usize, HashSet<BlockHash>>,
     /// The caught-up line has already been logged.
     announced_done: bool,
+    /// Peers retired from the walk after a short reply that did not extend
+    /// the candidate. A block inv or a redial clears the bit. Not written
+    /// to `header.adopt`.
+    walk_quiet: HashSet<usize>,
     /// Header request for the walk tip. Not written to `header.adopt`.
     walk: Lane,
     /// Header request for the queue tail. Not written to `header.adopt`.
@@ -256,27 +264,86 @@ fn below_floor(hub: &ChainHub, work: &[u8; 32]) -> bool {
 
 /// Operator line for the header walk, about every 5 seconds.
 pub(crate) fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {
-    if !st.header_walk.origin || st.header_walk.announced_done {
+    if !st.header_walk.origin {
         return;
     }
+    let looking = wants_lookahead(st);
+    if st.header_walk.announced_done && !looking {
+        return;
+    }
+    st.header_walk.announced_done = false;
     let height = st.header_walk.tip_height();
     let pct = super::progress::ibd_pct(height, horizon.max(height));
     let stored = path_top(st, hub).map(|(_, h)| h).unwrap_or(0);
     let queue = st.ordered.len();
     let work = if st.header_walk.proven { "ok" } else { "below" };
-    let phase = if wants_lookahead(st) { "walk" } else { "write" };
+    let phase = if looking { "walk" } else { "write" };
     rbitcoin_log::info!(
         "ibd: headers height={height} ({pct}%) horizon={horizon} stored={stored} queue={queue} work={work} phase={phase}"
     );
-    if st.header_walk.proven && st.max_peer_height > 0 && height >= st.max_peer_height {
+    if st.header_walk.proven && !wants_lookahead(st) {
         st.header_walk.announced_done = true;
         rbitcoin_log::info!("ibd: headers done height={height} horizon={horizon}");
     }
 }
 
-/// Peers still advertise a header past the walk, so the next request extends it.
+/// A live peer is still ahead of the walk and has not been retired from it.
+///
+/// Before the origin is known, the advertised high-water mark is enough to
+/// send the first ask. After that, advertised height alone does not keep the
+/// lane on.
 pub(crate) fn wants_lookahead(st: &IbdWorkState) -> bool {
-    st.max_peer_height > st.header_walk.tip_height()
+    let tip = st.header_walk.tip_height();
+    if !st.header_walk.origin {
+        return st.max_peer_height > tip;
+    }
+    st.slots
+        .iter()
+        .any(|s| s.alive && s.peer_height > tip && !st.header_walk.walk_quiet.contains(&s.id))
+}
+
+/// Candidate hash before a headers reply is applied.
+pub(crate) fn candidate_tip(st: &IbdWorkState) -> Option<BlockHash> {
+    st.header_walk.tip_hash()
+}
+
+/// Retire `peer` from the walk when this reply did not extend the candidate.
+///
+/// A full [`crate::codec::MAX_HEADERS_RESULTS`] window stays, so a lighter
+/// fork can grow across more than one locator. Below the work floor the
+/// empty-reply rewind still owns the peer. An extension, a block inv, or
+/// peer death clears a previous retirement.
+pub(crate) fn settle_walk_peer(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    tip_before: Option<BlockHash>,
+    queued_before: usize,
+    batch_len: usize,
+) {
+    // A stored continuation of the download path is not a failed walk.
+    let extended = st.header_walk.tip_hash() != tip_before || st.ordered.len() > queued_before;
+    if extended {
+        st.header_walk.walk_quiet.remove(&peer);
+    }
+    if batch_len >= crate::codec::MAX_HEADERS_RESULTS || !st.header_walk.origin {
+        return;
+    }
+    if below_floor(hub, &st.header_walk.tip_work()) || extended {
+        return;
+    }
+    st.header_walk.walk_quiet.insert(peer);
+}
+
+/// A block announcement may be a header this peer did not have. One ask
+/// follows; the next short miss retires them again.
+pub(crate) fn note_block_inv(st: &mut IbdWorkState, peer: usize) {
+    st.header_walk.walk_quiet.remove(&peer);
+}
+
+/// A redialed slot can reuse this id. Do not inherit the previous walk retirement.
+pub(crate) fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
+    st.header_walk.walk_quiet.remove(&peer);
 }
 
 /// Walk while a peer is taller than the walk. Refill while the walk is ahead
@@ -302,13 +369,15 @@ fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
 fn distinct_header_peers(st: &IbdWorkState, hub: &ChainHub) -> bool {
     let walk_h = st.header_walk.tip_height();
     let top_h = path_top(st, hub).map(|(_, h)| h).unwrap_or(0);
-    let above = |height: u32| {
-        st.slots
-            .iter()
-            .filter(move |s| s.alive && s.peer_height > height)
-            .map(|s| s.id)
-    };
-    above(walk_h).any(|walk_peer| above(top_h).any(|top_peer| top_peer != walk_peer))
+    st.slots.iter().any(|walk| {
+        walk.alive
+            && walk.peer_height > walk_h
+            && !st.header_walk.walk_quiet.contains(&walk.id)
+            && st
+                .slots
+                .iter()
+                .any(|top| top.alive && top.peer_height > top_h && top.id != walk.id)
+    })
 }
 
 /// A proven-chain reply that must not be written.
@@ -1819,6 +1888,11 @@ fn arm_lane(
         AskLane::Walk => st.header_walk.tip_height(),
         AskLane::Refill => path_top(st, hub).map(|(_, height)| height).unwrap_or(0),
     };
+    // Walk-quiet ids are collected first: the ask borrows `slots` and `seq`.
+    let quiet: Vec<usize> = match id {
+        AskLane::Walk => st.header_walk.walk_quiet.iter().copied().collect(),
+        AskLane::Refill => Vec::new(),
+    };
     let Some(peer) = super::dial::request_headers(
         &st.slots,
         hub,
@@ -1827,6 +1901,7 @@ fn arm_lane(
         above,
         skip,
         hold,
+        &quiet,
     )?
     else {
         return Ok(false);
@@ -2415,6 +2490,7 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         proven: false,
         off_path: std::collections::HashMap::new(),
         announced_done: false,
+        walk_quiet: HashSet::new(),
         walk: Lane::default(),
         refill: Lane::default(),
         header_misses: HashMap::new(),
@@ -2623,6 +2699,11 @@ mod tests {
         assert_eq!(st.header_walk.checkpoints().len(), 1);
         assert_eq!(st.header_walk.tip_hash(), Some(good.block_hash()));
         assert!(wants_lookahead(&st));
+        log_status(&mut st, &hub, 50_000);
+        assert!(
+            !st.header_walk.announced_done,
+            "peers still advertise headers past the candidate"
+        );
 
         assert!(send_getheaders(&mut st, &hub).unwrap());
         match rx.try_recv() {
@@ -2654,17 +2735,120 @@ mod tests {
             "peers still advertise headers past the candidate"
         );
         let tip = st.header_walk.tip_height();
-        st.max_peer_height = 0;
-        log_status(&mut st, &hub, tip);
-        assert!(!st.header_walk.announced_done);
         st.max_peer_height = tip;
         log_status(&mut st, &hub, tip);
         assert!(
+            !st.header_walk.announced_done,
+            "advertised height alone does not end the walk"
+        );
+        st.slots[0].peer_height = tip;
+        log_status(&mut st, &hub, tip);
+        assert!(
             st.header_walk.announced_done,
-            "the done line fires once the header tip has caught the peers"
+            "the done line fires once no connected peer is ahead of the walk"
         );
         log_status(&mut st, &hub, tip);
         assert!(st.header_walk.announced_done);
+    }
+
+    #[test]
+    fn a_taller_peer_that_cannot_extend_the_candidate_leaves_the_walk() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-quiet");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let (mut tall, mut rx) = slot(0);
+        tall.peer_height = 100_000;
+        let mut st = IbdWorkState::new(vec![tall], Some(gen), Some(0));
+        // A full queue keeps the refill lane idle, so the empty reply cannot
+        // hide a walk ask behind a queue refill.
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![good]);
+        assert_eq!(st.header_walk.tip_hash(), Some(good.block_hash()));
+        assert!(
+            wants_lookahead(&st),
+            "an advertisement past the walk keeps the lane on"
+        );
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(
+            !wants_lookahead(&st),
+            "one empty reply from a taller peer ends the walk"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the walk does not ask that peer again"
+        );
+        log_status(&mut st, &hub, 100_000);
+        assert!(st.header_walk.announced_done);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 0,
+                hashes: vec![good.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(
+            wants_lookahead(&st),
+            "a later block announcement puts the peer back on the walk"
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(matches!(rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })));
+
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Dead {
+                peer: 0,
+                reason: "drop".into(),
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        st.slots[0].alive = true;
+        assert!(
+            wants_lookahead(&st),
+            "a redialed peer is a candidate until they fail once"
+        );
+    }
+
+    #[test]
+    fn a_short_lighter_fork_does_not_keep_the_walk_asking() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-light");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let fork = mine(gen, 2);
+        let (mut tall, mut rx) = slot(0);
+        tall.peer_height = 100_000;
+        let mut st = IbdWorkState::new(vec![tall], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![good]);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![fork]);
+        assert_eq!(st.header_walk.tip_hash(), Some(good.block_hash()));
+        assert!(
+            !wants_lookahead(&st),
+            "a short fork that does not beat the candidate ends the walk"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

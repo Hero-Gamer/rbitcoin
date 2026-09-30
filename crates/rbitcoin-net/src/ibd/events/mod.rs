@@ -426,6 +426,11 @@ pub(crate) fn apply_peer_event(
         ),
         PeerEvent::BlockDecodeFailed { peer, hash } => apply_block_decode_failed(st, peer, hash),
         PeerEvent::NotFound { peer, hashes } => apply_notfound(st, peer, hashes),
+        PeerEvent::BlocksInv { peer, hashes } => {
+            if !hashes.is_empty() {
+                super::header_walk::note_block_inv(st, peer);
+            }
+        }
         PeerEvent::Addrs { peer, addrs } => {
             inject_learned_addrs(peer_book, &addrs, local_addr, peer);
         }
@@ -434,6 +439,25 @@ pub(crate) fn apply_peer_event(
 }
 
 fn apply_headers_event(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    headers: Vec<bitcoin::block::Header>,
+) {
+    let tip_before = super::header_walk::candidate_tip(st);
+    let queued_before = st.ordered.len();
+    let batch_len = headers.len();
+    // An empty reply cannot extend. Retire before the empty handler asks again.
+    if batch_len == 0 {
+        super::header_walk::settle_walk_peer(st, hub, peer, tip_before, queued_before, batch_len);
+    }
+    apply_headers_reply(st, hub, peer, headers);
+    if batch_len > 0 {
+        super::header_walk::settle_walk_peer(st, hub, peer, tip_before, queued_before, batch_len);
+    }
+}
+
+fn apply_headers_reply(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     peer: usize,
@@ -640,6 +664,7 @@ fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
 
 fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, reason: String) {
     warn!("ibd: peer[{peer}] dead: {reason}");
+    super::header_walk::forget_walk_peer(st, peer);
     if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
         note_dead_without_block_bytes(
             peer_book,

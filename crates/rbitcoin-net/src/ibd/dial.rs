@@ -408,6 +408,9 @@ pub(crate) fn request_headers(
     // Peer already asked on the other header lane. Not used when excluding
     // them would leave nobody to ask.
     hold: Option<usize>,
+    // Walk lane: peers whose last short reply did not extend the candidate.
+    // Dropped even when they are the only one left. Refill passes empty.
+    quiet: &[usize],
 ) -> Result<Option<usize>, NetError> {
     // Fewest blocks in flight. Ties rotate. A peer that does not advertise
     // past the hash we are asking from is skipped while anyone taller is up.
@@ -431,6 +434,17 @@ pub(crate) fn request_headers(
     }
     if let Some(hold_id) = hold {
         let kept: Vec<&PeerSlot> = pool.iter().copied().filter(|s| s.id != hold_id).collect();
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        pool = kept;
+    }
+    if !quiet.is_empty() {
+        let kept: Vec<&PeerSlot> = pool
+            .iter()
+            .copied()
+            .filter(|s| !quiet.contains(&s.id))
+            .collect();
         if kept.is_empty() {
             return Ok(None);
         }
@@ -1435,9 +1449,11 @@ mod tests {
     fn request_headers_no_alive_returns_false() {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("dial-hdr");
         let mut seq = 0u32;
-        assert!(request_headers(&[], &hub, &mut seq, &[], 0, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            request_headers(&[], &hub, &mut seq, &[], 0, None, None, &[])
+                .unwrap()
+                .is_none()
+        );
         let mut dead = dummy_slot(1, addr(1), false);
         dead.alive = false;
         assert!(!request_headers_from(&[dead], 1, &hub, &mut seq, &[]).unwrap());

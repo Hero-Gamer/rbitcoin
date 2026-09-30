@@ -24,6 +24,16 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// Block and witness-block entries from an `inv` or `notfound`.
+fn block_inventory_hashes(inv: &[Inventory]) -> Vec<BlockHash> {
+    inv.iter()
+        .filter_map(|i| match i {
+            Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(*h),
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) enum PeerCmd {
     GetHeaders { locator: Vec<BlockHash> },
     GetData { hashes: Vec<BlockHash> },
@@ -52,6 +62,11 @@ pub(crate) enum PeerEvent {
     },
     /// Peer answered `notfound` for these block hashes (does not have them).
     NotFound {
+        peer: usize,
+        hashes: Vec<BlockHash>,
+    },
+    /// Block `inv` during IBD. A peer retired from the header walk can rejoin.
+    BlocksInv {
         peer: usize,
         hashes: Vec<BlockHash>,
     },
@@ -265,14 +280,7 @@ pub(crate) async fn spawn_peer(
                                         });
                                     }
                                     NetworkMessage::NotFound(inv) => {
-                                        let hashes: Vec<BlockHash> = inv
-                                            .iter()
-                                            .filter_map(|i| match i {
-                                                Inventory::Block(h)
-                                                | Inventory::WitnessBlock(h) => Some(*h),
-                                                _ => None,
-                                            })
-                                            .collect();
+                                        let hashes = block_inventory_hashes(&inv);
                                         if !hashes.is_empty() {
                                             sinks_d.send_body(PeerEvent::NotFound {
                                                 peer: id,
@@ -295,6 +303,15 @@ pub(crate) async fn spawn_peer(
                                     NetworkMessage::SendAddrV2 => {}
                                     // Blocks must not reach decode (handled above).
                                     NetworkMessage::Block(_) => {}
+                                    NetworkMessage::Inv(inv) => {
+                                        let hashes = block_inventory_hashes(&inv);
+                                        if !hashes.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::BlocksInv {
+                                                peer: id,
+                                                hashes,
+                                            });
+                                        }
+                                    }
                                     _other => {}
                                 }
                             },
@@ -589,6 +606,19 @@ mod tests {
         note_block_progress(std::slice::from_mut(&mut s), 99);
         note_block_rx(std::slice::from_mut(&mut s), 99, 1);
         assert!(ibd_mono_ms() > 0);
+    }
+
+    #[test]
+    fn block_inventory_hashes_keeps_blocks_only() {
+        let block = BlockHash::from_byte_array([1u8; 32]);
+        let witness = BlockHash::from_byte_array([2u8; 32]);
+        let tx = bitcoin::Txid::from_byte_array([3u8; 32]);
+        let inv = vec![
+            Inventory::Transaction(tx),
+            Inventory::Block(block),
+            Inventory::WitnessBlock(witness),
+        ];
+        assert_eq!(block_inventory_hashes(&inv), vec![block, witness]);
     }
 
     #[test]
