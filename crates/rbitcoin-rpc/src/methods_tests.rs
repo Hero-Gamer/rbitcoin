@@ -2615,7 +2615,7 @@ fn getnetworkinfo_localaddresses_from_externalip() {
     use std::net::{IpAddr, Ipv4Addr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     hub.set_listen_port(18445);
     hub.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
     ctx.peers = Some(hub);
@@ -2637,7 +2637,7 @@ fn getnetworkinfo_includes_electrum_onion() {
     use rbitcoin_net::PeerHub;
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     hub.set_discover(false);
     hub.set_wallet_onion(
         "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion".into(),
@@ -2665,7 +2665,7 @@ fn getnetworkinfo_includes_p2p_onion() {
     use rbitcoin_net::PeerHub;
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     hub.set_discover(false);
     hub.set_p2p_onion(
         "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(),
@@ -2688,7 +2688,7 @@ fn getnetworkinfo_includes_p2p_i2p() {
     use rbitcoin_net::{NetAddr, PeerHub};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     hub.set_discover(false);
     let i2p = NetAddr::I2p {
         dest: [0x11; 32],
@@ -2714,7 +2714,7 @@ fn getpeerinfo_lists_registered_session() {
 
     let (mut ctx, dir) = ctx_empty();
     assert_eq!(dispatch(&ctx, "getpeerinfo", vec![]).unwrap(), json!([]));
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let ver = VersionMessage {
@@ -2818,7 +2818,7 @@ fn getpeerinfo_connecting_has_unknown_sync_and_zero_offset() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let live = hub.register_connecting(addr, bind, false, PeerConnType::OutboundFullRelay);
@@ -2843,7 +2843,7 @@ fn getpeerinfo_synced_heights_from_best_known() {
 
     let (mut ctx, dir, chain) = ctx_regtest_hub();
     let genesis = chain.tip_hash().expect("genesis");
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let live = hub.register(
@@ -2876,7 +2876,7 @@ fn getpeerinfo_synced_heights_via_query_without_chain() {
     let (mut ctx, dir, chain) = ctx_regtest_hub();
     let genesis = chain.tip_hash().expect("genesis");
     ctx.chain = None;
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let live = hub.register(
@@ -2909,7 +2909,7 @@ fn getpeerinfo_header_only_best_known_is_not_synced_blocks() {
     let child = mine_regtest_paying(prev, time, 1, script, vec![]);
     let hex = rbitcoin_primitives::hex_encode(serialize(&child));
     dispatch(&ctx, "submitheader", vec![json!(hex)]).unwrap();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let live = hub.register(
@@ -2934,8 +2934,8 @@ fn getpeerinfo_and_getnetworkinfo_timeoffset_from_version() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     hub.register(
@@ -2975,8 +2975,8 @@ fn getnetworkinfo_timeoffset_median_of_outbound() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     for (i, offset) in [10i64, 20, 40].into_iter().enumerate() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19000 + i as u16);
@@ -3000,8 +3000,8 @@ fn getpeerinfo_timeoffset_when_peer_clock_behind() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     hub.register(
@@ -3025,8 +3025,8 @@ fn getnetworkinfo_timeoffset_even_n_and_inbound_only() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     for (i, offset) in [10i64, 20].into_iter().enumerate() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19100 + i as u16);
@@ -3043,8 +3043,8 @@ fn getnetworkinfo_timeoffset_even_n_and_inbound_only() {
     assert_eq!(net["timeoffset"], json!(20), "even N uses upper middle");
 
     let (mut ctx, dir2) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     hub.register(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18500),
         bind,
@@ -3068,8 +3068,8 @@ fn getpeerinfo_sent_pingwait_and_limited_services() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
+    hub.clock.set_mock(1_700_000_000);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let ver = VersionMessage {
@@ -3097,7 +3097,7 @@ fn getpeerinfo_sent_pingwait_and_limited_services() {
     assert!(names.iter().any(|n| n == "NETWORK_LIMITED"), "{names:?}");
 
     assert!(live.on_pong(&nonce.to_le_bytes(), 1_700_000_029).is_none());
-    hub.set_mock_now(1_700_000_029);
+    hub.clock.set_mock(1_700_000_029);
     let info = dispatch(&ctx, "getpeerinfo", vec![]).unwrap();
     let row = &info.as_array().unwrap()[0];
     assert_eq!(row["pingtime"], json!(29.0));
@@ -3131,7 +3131,7 @@ fn getpeerinfo_mapped_as_when_asmap() {
     use std::sync::Arc;
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     hub.set_asmap(Some(Arc::new(
         AsMap::from_bytes(TWO_PREFIX_ASMAP.to_vec()).expect("fixture"),
     )));
@@ -3161,7 +3161,7 @@ fn getpeerinfo_mapped_as_when_asmap() {
 fn addnode_without_a_dialer_errors() {
     use rbitcoin_net::PeerHub;
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     ctx.peers = Some(hub);
     let e = dispatch(&ctx, "addnode", vec![json!("127.0.0.1:1"), json!("onetry")]).unwrap_err();
     assert!(e["message"].as_str().unwrap().contains("dialer"), "{e}");
@@ -3174,7 +3174,7 @@ fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     let (mut ctx, dir) = ctx_empty();
-    let hub = PeerHub::new();
+    let hub = PeerHub::new(rbitcoin_consensus::NodeClock::new());
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
     let onion: rbitcoin_net::NetAddr =

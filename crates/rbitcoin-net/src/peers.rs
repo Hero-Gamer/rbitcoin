@@ -6,6 +6,8 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Wtxid};
+#[allow(unused_imports)]
+use rbitcoin_consensus::NodeClock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -1245,8 +1247,8 @@ pub struct PeerHub {
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
     /// Peers we asked to send us compact (BIP152 HB, max 3, prefer outbound).
     hb_selected: Mutex<Vec<u64>>,
-    /// `setmocktime` seconds; `0` means wall clock.
-    mock_now: AtomicU64,
+    /// Unified clock - wire to basement master (NodeClock). Single source of truth.
+    pub clock: std::sync::Arc<NodeClock>,
     /// Count of sessions currently in headers-sync.
     headers_sync_peers: AtomicU64,
     /// Last inv hash that started headers sync with a not-yet-sync peer.
@@ -1344,7 +1346,7 @@ fn ip_is_advertisable(ip: &IpAddr, cjdns_reachable: bool) -> bool {
 }
 
 impl PeerHub {
-    pub fn new() -> Arc<Self> {
+    pub fn new(clock: std::sync::Arc<NodeClock>) -> Arc<Self> {
         Arc::new(Self {
             next_id: AtomicU64::new(0),
             live: RwLock::new(HashMap::new()),
@@ -1354,7 +1356,7 @@ impl PeerHub {
             connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
-            mock_now: AtomicU64::new(0),
+            clock,
             headers_sync_peers: AtomicU64::new(0),
             last_inv_headers_sync: Mutex::new(None),
             noban: AtomicBool::new(false),
@@ -1842,14 +1844,19 @@ impl PeerHub {
     }
 
     pub fn now_secs(&self) -> u64 {
-        let mock = self.mock_now.load(Ordering::Acquire);
-        if mock != 0 {
-            return mock;
-        }
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+        self.clock.now_secs()
+    }
+
+    #[cfg(test)]
+    pub fn set_mock(&self, ts: u64) {
+        self.clock.set_mock(ts as i64);
+        self.request_all_tx_inv();
+        self.on_session_heartbeat();
+    }
+
+    pub fn on_clock_jump(&self) {
+        self.request_all_tx_inv();
+        self.on_session_heartbeat();
     }
 
     /// Ask every live session to flush due tx INVs (`p2p_blocksonly` RPC relay).
@@ -1858,17 +1865,6 @@ impl PeerHub {
         for p in g.values() {
             p.request_tx_inv();
         }
-    }
-
-    pub fn set_mock_now(&self, ts: u64) {
-        self.mock_now.store(ts, Ordering::Release);
-        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-        for p in g.values() {
-            p.request_tx_inv();
-            p.queue_self_announce_if_due();
-        }
-        drop(g);
-        self.on_session_heartbeat();
     }
 
     /// Session 50ms heartbeat: replace a stalling initial-headers-sync peer.
@@ -2792,7 +2788,7 @@ mod tests {
         drop(far);
         let _ = local.shutdown(std::net::Shutdown::Both);
 
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let connecting = hub.register_connecting(a, a, true, PeerConnType::Inbound);
         connecting.attach_tcp_shutdown(local.try_clone().unwrap());
@@ -2828,7 +2824,7 @@ mod tests {
         far.set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
 
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
         let p = hub.register(
@@ -2868,15 +2864,16 @@ mod tests {
     #[test]
     fn connecting_peer_v2_timeout_log_before_transport() {
         rbitcoin_log::capture_logs(true);
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
+        hub.set_mock(1_700_000_000);
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let p = hub.register_connecting(a, a, true, PeerConnType::Inbound);
         assert!(!p.handshake_complete());
-        hub.set_mock_now(1_700_000_002);
+        hub.set_mock(1_700_000_002);
+        hub.on_session_heartbeat();
         assert!(!p.stop.load(Ordering::SeqCst), "still inside peertimeout");
-        hub.set_mock_now(1_700_000_003);
+        hub.set_mock(1_700_000_003);
         let logs = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
         assert!(
@@ -2897,9 +2894,9 @@ mod tests {
     #[test]
     fn p2p_timeouts_v2_logs_all_three_connecting_peer_ids() {
         rbitcoin_log::capture_logs(true);
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
+        hub.set_mock(1_700_000_000);
         let addr = |p| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), p);
         let peers: Vec<_> = (1..=3)
             .map(|p| {
@@ -2909,7 +2906,7 @@ mod tests {
             })
             .collect();
         assert_eq!(peers.iter().map(|p| p.id).collect::<Vec<_>>(), [0, 1, 2]);
-        hub.set_mock_now(1_700_000_003);
+        hub.set_mock(1_700_000_003);
         let logs = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
         let got: Vec<u64> = logs
@@ -2932,15 +2929,15 @@ mod tests {
     #[test]
     fn handshake_timeout_tick_logs_when_stop_already_set() {
         rbitcoin_log::capture_logs(true);
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         hub.set_peer_timeout_secs(3);
-        hub.set_mock_now(1_700_000_000);
+        hub.set_mock(1_700_000_000);
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let p = hub.register_connecting(a, a, true, PeerConnType::Inbound);
         p.mark_v2_transport_ready();
         p.request_disconnect();
         let _ = rbitcoin_log::take_logs();
-        hub.mock_now.store(1_700_000_003, Ordering::Release);
+        hub.set_mock(1_700_000_003);
         let policy = crate::peer::HandshakePolicy {
             hub: None,
             peers: Some(&hub),
@@ -2968,7 +2965,7 @@ mod tests {
     #[allow(clippy::cognitive_complexity)] // one hub, many peer-state arms
     #[test]
     fn peerhub_hb_select() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let join = |port: u16, inbound: bool| {
             let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             let conn = if inbound {
@@ -3126,7 +3123,7 @@ mod tests {
 
     #[test]
     fn session_heartbeat_keeps_sole_preferred_headers_sync_peer() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let outbound = hub.register(
             a,
@@ -3153,7 +3150,7 @@ mod tests {
     }
 
     fn pin_noban_headers_timeout_keep(via_cidr: bool) {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         if via_cidr {
             let mut t = crate::NetPermTable::default();
             t.whitelist
@@ -3182,7 +3179,7 @@ mod tests {
         inbound.note_awaiting_headers();
         assert!(inbound.is_awaiting_headers());
         let deadline = crate::chain::headers_download_timeout_secs(now, best);
-        hub.set_mock_now(deadline + 1);
+        hub.set_mock(deadline + 1);
         assert!(
             !inbound.stop.load(Ordering::SeqCst),
             "noban stall must keep the TCP session (via_cidr={via_cidr})"
@@ -3203,7 +3200,7 @@ mod tests {
 
     #[test]
     fn snapshot_permissions_are_cidr_table_not_hub_noban() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
         hub.register(
@@ -3227,7 +3224,7 @@ mod tests {
 
     #[test]
     fn cidr_noban_is_per_peer_not_hub_wide() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
         let local = hub.register(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444),
@@ -3262,7 +3259,7 @@ mod tests {
 
     #[test]
     fn addnode_unknown_command() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         assert!(hub.addnode(a, "nope").is_err());
     }
@@ -3293,7 +3290,7 @@ mod tests {
 
     #[test]
     fn addnode_add_keeps_unresolved_host_for_redial() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
         hub.set_dialer(tx);
         hub.addnode_host("not-a-real-host.invalid", "add", 18444)
@@ -3311,7 +3308,7 @@ mod tests {
 
     #[test]
     fn redial_same_endpoint_in_addnode_and_connect_dials_once() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let (tx, mut rx) = mpsc::unbounded_channel();
         hub.set_dialer(tx);
         hub.addnode_host("127.0.0.1:18444", "add", 18444).unwrap();
@@ -3329,7 +3326,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_redial_resolve_does_not_stall_runtime() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         hub.set_connect_hosts(vec!["slow.example".into()], 18444);
         let flag = Arc::new(AtomicBool::new(false));
         let flag2 = Arc::clone(&flag);
@@ -3357,8 +3354,8 @@ mod tests {
     /// `setmocktime` jump cannot drop peers (`feature_bip68_sequence.py`).
     #[test]
     fn ping_timeout_waits_for_the_peer_timeout() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
+        let hub = PeerHub::new(NodeClock::new());
+        hub.set_mock(1_700_000_000);
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
         let p = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
         let now = hub.now_secs();
@@ -3413,7 +3410,7 @@ mod tests {
 
     #[test]
     fn outbound_full_relay_ids_skips_inbound_and_noban() {
-        let hub = PeerHub::new();
+        let hub = PeerHub::new(NodeClock::new());
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         let c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
@@ -3462,8 +3459,8 @@ mod tests {
 
     #[test]
     fn getaddr_cache_bind_key_and_ttl() {
-        let hub = PeerHub::new();
-        hub.set_mock_now(1_700_000_000);
+        let hub = PeerHub::new(NodeClock::new());
+        hub.set_mock(1_700_000_000);
         hub.set_addrman(Arc::new(Mutex::new(fill_addrman(5_000))));
         let a = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
         let b = addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18445))));
@@ -3482,7 +3479,7 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
-        hub.set_mock_now(1_700_000_000 + 24 * 60 * 60);
+        hub.set_mock(1_700_000_000 + 24 * 60 * 60);
         let expired =
             addr_ips(&hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444))));
         assert_eq!(expired.len(), 1000);
