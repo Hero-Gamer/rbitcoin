@@ -53,7 +53,7 @@ Legend per Rearden #688 item 2.1:
 | crates/rbitcoin-net/src/service.rs | 892 | `let n = std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock | |
 | crates/rbitcoin-net/src/service.rs | 959 | `let n = std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock | |
 | crates/rbitcoin-net/src/tx_relay.rs | 3753 | `let n = SystemTime::now()` | log/perf - LEAVE (tmp path uniqueness) | |
-| crates/rbitcoin-net/src/tx_relay.rs | 923 | `std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock (manual mock check -> use NodeClock) | |
+| crates/rbitcoin-net/src/tx_relay.rs | 928 | `std::time::SystemTime::now()` | node-time - MIGRATE to NodeClock (manual mock check -> use NodeClock) | |
 | crates/rbitcoin-node/src/cli.rs | 533 | `let n = SystemTime::now()` | log/perf - LEAVE | |
 | crates/rbitcoin-node/src/config.rs | 1430 | `let n = SystemTime::now()` | log/perf - LEAVE | |
 | crates/rbitcoin-node/src/lock.rs | 101 | `let n = SystemTime::now()` | log/perf - LEAVE | |
