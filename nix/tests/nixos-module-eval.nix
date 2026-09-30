@@ -143,8 +143,10 @@ assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "07
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
 assert builtins.match ".*--esplora-onion.*" execStart != null;
-assert builtins.match ".*--shindex.*" execStart != null;
-assert builtins.match ".*--sptweaks.*" execStart != null;
+assert builtins.match ".*--sh-index.*" execStart != null;
+assert builtins.match ".*--sp-tweaks.*" execStart != null;
+assert builtins.match ".*--shindex.*" execStart == null;
+assert builtins.match ".*--sptweaks.*" execStart == null;
 assert builtins.match ".*--log-level debug.*" execStart != null;
 assert builtins.match ".*--max-outbound 8.*" execStart != null;
 assert builtins.match ".*--proxy 127.0.0.1:9050.*" execStart != null;
