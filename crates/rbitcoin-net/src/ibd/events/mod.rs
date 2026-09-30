@@ -447,23 +447,42 @@ fn apply_headers_event(
         on_empty_headers(st, hub);
         return;
     }
-    if super::header_walk::suppress_competing_chain(st, hub, peer, &headers) {
-        return;
-    }
-    if super::header_walk::ignore_below_floor(st, hub, &headers) {
-        return;
-    }
-    if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers) {
-        return;
-    }
-    if super::header_walk::reject_refill_miss(st, hub, &headers) {
-        return;
-    }
-    let keep = super::header_walk::proven_header_prefix(st, hub, &headers);
+    let class = super::header_walk::classify(st, hub, ask, &headers);
+    let mut headers = headers;
+    let keep = match class {
+        super::header_walk::HeaderClass::WalkAbsorb => {
+            if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers) {
+                return;
+            }
+            headers.len()
+        }
+        super::header_walk::HeaderClass::WalkStore => headers.len(),
+        super::header_walk::HeaderClass::Stray => {
+            // A heavier fork is offered before a below-floor batch is dropped.
+            if super::header_walk::suppress_competing_chain(st, hub, peer, &headers) {
+                return;
+            }
+            return;
+        }
+        super::header_walk::HeaderClass::Refill => {
+            if super::header_walk::reject_refill_miss(st, hub, &headers) {
+                return;
+            }
+            super::header_walk::proven_header_prefix(st, hub, &headers)
+        }
+        super::header_walk::HeaderClass::Fork => {
+            if super::header_walk::suppress_competing_chain(st, hub, peer, &headers) {
+                return;
+            }
+            if super::header_walk::reject_refill_miss(st, hub, &headers) {
+                return;
+            }
+            super::header_walk::proven_header_prefix(st, hub, &headers)
+        }
+    };
     if keep == 0 {
         return;
     }
-    let mut headers = headers;
     headers.truncate(keep);
     let batch_len = headers.len();
     let added = on_headers_batch(st, hub, peer, headers);

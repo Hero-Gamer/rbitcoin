@@ -322,7 +322,7 @@ pub(crate) fn suppress_competing_chain(
     if st.header_walk.tip_hash == Some(prev) || batch_ends_on_checkpoint(st, headers) {
         return false;
     }
-    if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP && st.ordered.back().copied() == Some(prev) {
+    if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP && stored_top_hash(st, hub) == Some(prev) {
         return false;
     }
     if challenger_extends(st, prev) {
@@ -1025,8 +1025,80 @@ fn walk_ahead_of_queue(st: &IbdWorkState, hub: &ChainHub) -> bool {
     st.header_walk.origin && st.header_walk.tip_height > top_h
 }
 
+/// Queue tail, or the confirmed tip when the queue is empty.
+fn stored_top_hash(st: &IbdWorkState, hub: &ChainHub) -> Option<BlockHash> {
+    st.ordered.back().copied().or_else(|| hub.tip_hash())
+}
+
+/// What a headers batch is, from the hash it builds on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderClass {
+    /// Checkpoint. The batch is not a header row.
+    WalkAbsorb,
+    /// Continues the walk at the stored top. Write it and advance the walk.
+    WalkStore,
+    /// Continues the stored top while the walk is ahead.
+    Refill,
+    /// A competing chain, or a batch from before the walk has a tip.
+    Fork,
+    /// Below the work floor, and parent of neither the walk nor the stored top.
+    Stray,
+}
+
+/// One class per batch. The lane only says whether the peer was asked.
+pub(crate) fn classify(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    ask: HeaderAsk,
+    headers: &[Header],
+) -> HeaderClass {
+    if headers.is_empty() || !pow_linked(headers) {
+        return HeaderClass::Fork;
+    }
+    if !st.header_walk.origin {
+        if st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP {
+            return HeaderClass::WalkAbsorb;
+        }
+        if stored_top_hash(st, hub) == Some(headers[0].prev_blockhash) {
+            return HeaderClass::Refill;
+        }
+        return HeaderClass::Fork;
+    }
+    let prev = headers[0].prev_blockhash;
+    let on_walk = st.header_walk.tip_hash == Some(prev);
+    let on_top = stored_top_hash(st, hub) == Some(prev);
+    let under = st.ordered.len() < ORDERED_HEADERS_SOFT_CAP;
+    let solicited = ask != HeaderAsk::Unsolicited;
+    // Full queue, or a solicited look-ahead: the reply is a checkpoint.
+    // An unsolicited reply is consumed only in that case. With room, and the
+    // walk not ahead, a continuation of the walk tip is stored.
+    let checkpoint = !under || (solicited && walk_ahead_of_queue(st, hub));
+    if st
+        .header_walk
+        .tip_hash
+        .is_some_and(|tip| st.header_walk.dead_ends.contains(&tip))
+        && checkpoint
+    {
+        return HeaderClass::WalkAbsorb;
+    }
+    if on_walk && checkpoint {
+        return HeaderClass::WalkAbsorb;
+    }
+    if on_walk && under {
+        return HeaderClass::WalkStore;
+    }
+    if on_top && under {
+        return HeaderClass::Refill;
+    }
+    if ignore_below_floor(st, hub, headers) {
+        return HeaderClass::Stray;
+    }
+    HeaderClass::Fork
+}
+
 /// Record a look-ahead batch as a checkpoint. True when the batch was consumed
-/// and must not be written.
+/// and must not be written. The caller has already decided this is a walk
+/// checkpoint: queue length does not choose again.
 pub(crate) fn absorb_lookahead(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1034,13 +1106,7 @@ pub(crate) fn absorb_lookahead(
     ask: HeaderAsk,
     headers: &[Header],
 ) -> bool {
-    let queue_full = st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP;
-    // A solicited look-ahead that is already past the queue stays a checkpoint
-    // when confirm has drained a slot. A reply that still has to fill the queue
-    // is stored.
-    let keep_checkpoint =
-        queue_full || (ask != HeaderAsk::Unsolicited && walk_ahead_of_queue(st, hub));
-    if headers.is_empty() || !keep_checkpoint {
+    if headers.is_empty() {
         return false;
     }
     ensure_origin(st, hub);
@@ -1090,7 +1156,7 @@ pub(crate) fn ignore_below_floor(st: &IbdWorkState, hub: &ChainHub, headers: &[H
     if prev == tip {
         return false;
     }
-    if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP && st.ordered.back().copied() == Some(prev) {
+    if st.ordered.len() < ORDERED_HEADERS_SOFT_CAP && stored_top_hash(st, hub) == Some(prev) {
         return false;
     }
     true
@@ -1126,7 +1192,7 @@ pub(crate) fn reject_refill_miss(
     // a contradictory refill replaces it.
     if st.header_walk.proven && !below_floor(hub, &st.header_walk.tip_work) {
         return match path_agree(st, tail_h, headers) {
-            PathAgree::Diverges => keep_proven_walk(st, hub, headers),
+            PathAgree::Diverges => offer_alternate(st, hub, None, headers).unwrap_or(true),
             PathAgree::Short => true,
             PathAgree::Checkpoint(_) => false,
         };
@@ -1246,12 +1312,6 @@ pub(crate) fn proven_header_prefix(st: &IbdWorkState, hub: &ChainHub, headers: &
     n
 }
 
-/// True when the divergent refill was consumed. False when a heavier chain
-/// was adopted and the queue has room to store this batch.
-fn keep_proven_walk(st: &mut IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
-    offer_alternate(st, hub, None, headers).unwrap_or(true)
-}
-
 fn refill_misses_checkpoint(st: &IbdWorkState, tail_h: u32, headers: &[Header]) -> bool {
     let checkpoints = st.header_walk.checkpoints();
     let Some(mut next_i) = checkpoints.iter().position(|c| c.height > tail_h) else {
@@ -1300,11 +1360,11 @@ pub(crate) fn note_empty(st: &mut IbdWorkState, hub: &ChainHub, peer: usize) -> 
         tall
     };
     if alive.is_empty() || alive.iter().any(|id| !st.header_walk.emptied.contains(id)) {
-        ask_from_candidate(st, hub);
+        let _ = send_getheaders(st, hub);
         return true;
     }
     rewind(st, hub);
-    ask_from_candidate(st, hub);
+    let _ = send_getheaders(st, hub);
     true
 }
 
@@ -1470,10 +1530,6 @@ fn drop_queue_past(st: &mut IbdWorkState, keep_height: u32, dead: BlockHash) {
         return;
     }
     forget_queue_hashes(st, &drop);
-}
-
-fn ask_from_candidate(st: &mut IbdWorkState, hub: &ChainHub) {
-    let _ = send_getheaders(st, hub);
 }
 
 fn forget_milestone_below(st: &mut IbdWorkState, hub: &ChainHub, height: u32) {
@@ -2853,6 +2909,46 @@ mod tests {
             Some(tail),
             "one peer refills once the queue falls below the low water"
         );
+    }
+
+    #[test]
+    fn caught_up_walk_reply_is_stored() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-caught");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let second = mine(first.block_hash(), 2);
+        let (slot0, mut rx) = slot(0);
+        let mut st = IbdWorkState::new(vec![slot0], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![first]);
+        assert_eq!(st.header_walk.tip_hash, Some(first.block_hash()));
+
+        st.ordered.clear();
+        st.ordered_set.clear();
+        st.ordered.push_back(gen);
+        st.ordered_set.insert(gen);
+        st.hash_height.insert(gen, 0);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![first]);
+        assert_eq!(st.ordered.back().copied(), Some(first.block_hash()));
+        assert!(st.ordered.len() < ORDERED_HEADERS_SOFT_CAP);
+        assert!(!walk_ahead_of_queue(&st, &hub));
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        let before = hub.query.store().header_count();
+        let queued = st.ordered.len();
+        apply(&mut st, &hub, 0, vec![second]);
+        assert!(
+            hub.query.store().header_count() > before,
+            "a reply that continues the stored walk tip is written"
+        );
+        assert!(st.ordered.len() > queued);
+        assert_eq!(st.header_walk.tip_hash, Some(second.block_hash()));
     }
 
     #[test]
