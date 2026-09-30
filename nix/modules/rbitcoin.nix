@@ -84,8 +84,8 @@ let
   ++ optional cfg.electrum.enable (socket cfg.electrum.address cfg.electrum.port)
   ++ optional cfg.esplora.enable "--esplora-listen"
   ++ optional cfg.esplora.enable (socket cfg.esplora.address cfg.esplora.port)
-  ++ optional (cfg.scripthashIndex || cfg.electrum.enable || cfg.esplora.enable) "--shindex"
-  ++ optional cfg.silentPaymentIndex "--sptweaks"
+  ++ optional (cfg.scripthashIndex || cfg.electrum.enable || cfg.esplora.enable) "--sh-index"
+  ++ optional cfg.silentPaymentIndex "--sp-tweaks"
   ++ optional (cfg.proxy != null) "--proxy"
   ++ optional (cfg.proxy != null) cfg.proxy
   ++ optional (cfg.onionProxy != null) "--onion"
