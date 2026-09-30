@@ -54,7 +54,7 @@ use exit::{
     all_peers_dead_action, best_chain_remainder, empty_path_header_fan, header_lag_behind_peers,
     ibd_caught_up, path_drained, should_unlatch_headers_done, AllPeersDead,
 };
-use path::{path_hashes_above_tip, seed_work_path_from_store};
+use path::seed_work_path_from_store;
 use peer_io::{sample_peer_rates, PeerCmd, PeerEvent, PeerEventSinks};
 use progress::{
     claim_ready, format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput,
@@ -92,6 +92,9 @@ pub(crate) const MAX_ORDERED_HEADERS: usize = 500_000;
 /// expensive Headers events (drain livelock → multi-minute freezes, getdata starved).
 /// ~64k is ample cache for window=1024 archive race + tip holes.
 pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
+/// One header peer serves the queue below this and the walk above it.
+/// At early-block confirm rates this is several header round trips of blocks.
+pub(crate) const ORDERED_REFILL_LOW: usize = ORDERED_HEADERS_SOFT_CAP / 4;
 
 /// Max blocks in flight to a single peer (Core `MAX_BLOCKS_IN_TRANSIT_PER_PEER`).
 ///
@@ -612,11 +615,7 @@ pub async fn ibd_cancellable(
                     if fan == 0 {
                         st.headers_done = true;
                     } else {
-                        for _ in 0..fan {
-                            if !header_walk::send_getheaders(&mut st, &hub).unwrap_or(false) {
-                                break;
-                            }
-                        }
+                        let _ = header_walk::send_getheaders(&mut st, &hub);
                     }
                 } else {
                     let want_more = live < min_cache
@@ -633,20 +632,7 @@ pub async fn ibd_cancellable(
 
         // Hard reset only when ordered is empty — a full queue still waiting on getdata is not stalled.
         if last_progress.elapsed() > cfg.stall.saturating_mul(6) && path_drained(&st) {
-            let tip_now = hub.tip_height().unwrap_or(0);
-            let mut rebuilt = 0usize;
-            for (_ht, h) in path_hashes_above_tip(&st, tip_now) {
-                if hub.has_block(&h) || st.body.is_rejected(&h) {
-                    continue;
-                }
-                if st.ordered.len() >= MAX_ORDERED_HEADERS {
-                    break;
-                }
-                if st.ordered_set.insert(h) {
-                    st.ordered.push_back(h);
-                    rebuilt += 1;
-                }
-            }
+            let rebuilt = path::reseed_ordered_from_path(&mut st, hub.as_ref());
             let before_seed = st.ordered.len();
             seed_work_path_from_store(&mut st, hub.as_ref());
             let seeded = st.ordered.len().saturating_sub(before_seed);
@@ -863,7 +849,7 @@ pub async fn ibd_cancellable(
             });
             info_bold!("{progress_line}");
             header_walk::retire_adopt_if_confirmed(&mut st, &hub);
-            header_walk::log_status(&mut st, prog.headers);
+            header_walk::log_status(&mut st, &hub, prog.headers);
             let _ = std::io::Write::flush(&mut std::io::stderr());
 
             last_sample_tip = prog.tip;
