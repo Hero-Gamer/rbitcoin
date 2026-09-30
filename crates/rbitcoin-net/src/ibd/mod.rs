@@ -849,7 +849,7 @@ pub async fn ibd_cancellable(
             });
             info_bold!("{progress_line}");
             header_walk::retire_adopt_if_confirmed(&mut st, &hub);
-            header_walk::log_status(&mut st, prog.headers);
+            header_walk::log_status(&mut st, &hub, prog.headers);
             let _ = std::io::Write::flush(&mut std::io::stderr());
 
             last_sample_tip = prog.tip;

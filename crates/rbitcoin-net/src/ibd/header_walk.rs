@@ -1,13 +1,14 @@
 //! Checkpoints for the header chain ahead of the blocks.
 //!
-//! Look-ahead runs while any peer advertises a header past the walk. The
-//! download queue still stops at [`ORDERED_HEADERS_SOFT_CAP`]. A reply is
-//! written only when it continues the queue tail and the queue has room.
-//! Every other look-ahead reply records one checkpoint: hash, height, total
-//! work, and the difficulty period at that hash. One competing chain is kept
-//! the same way until it loses or replaces the candidate. Work for a stored
-//! header between checkpoints is the previous checkpoint plus those stored
-//! headers. That replay runs only when a competing headers batch forks there.
+//! Two header requests can be in flight. The walk lane runs while any peer
+//! advertises a header past the walk. Its reply is a checkpoint once the walk
+//! is ahead of the stored path, at any queue length. The refill lane asks
+//! from the queue tail while the queue is under [`ORDERED_HEADERS_SOFT_CAP`].
+//! A reply that continues the walk at that stored top is written, and the
+//! walk advances with it. One competing chain is kept the same way until it
+//! loses or replaces the candidate. Work for a stored header between
+//! checkpoints is the previous checkpoint plus those stored headers. That
+//! replay runs only when a competing headers batch forks there.
 
 use super::state::IbdWorkState;
 use super::{ORDERED_HEADERS_SOFT_CAP, ORDERED_REFILL_LOW};
@@ -240,16 +241,18 @@ fn below_floor(hub: &ChainHub, work: &[u8; 32]) -> bool {
 }
 
 /// Operator line for the header walk, about every 5 seconds.
-pub(crate) fn log_status(st: &mut IbdWorkState, horizon: u32) {
+pub(crate) fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {
     if !st.header_walk.origin || st.header_walk.announced_done {
         return;
     }
     let height = st.header_walk.tip_height;
     let pct = super::progress::ibd_pct(height, horizon.max(height));
+    let stored = path_top(st, hub).map(|(_, h)| h).unwrap_or(0);
+    let queue = st.ordered.len();
     let work = if st.header_walk.proven { "ok" } else { "below" };
     let phase = if wants_lookahead(st) { "walk" } else { "write" };
     rbitcoin_log::info!(
-        "ibd: headers height={height} ({pct}%) horizon={horizon} work={work} phase={phase}"
+        "ibd: headers height={height} ({pct}%) horizon={horizon} stored={stored} queue={queue} work={work} phase={phase}"
     );
     if st.header_walk.proven && st.max_peer_height > 0 && height >= st.max_peer_height {
         st.header_walk.announced_done = true;
@@ -2583,7 +2586,7 @@ mod tests {
         let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
         fill_queue(&mut st);
         let before = hub.query.store().header_count();
-        log_status(&mut st, 50_000);
+        log_status(&mut st, &hub, 50_000);
         assert!(
             !st.header_walk.announced_done,
             "the status line stays quiet until the walk has a candidate"
@@ -2626,22 +2629,22 @@ mod tests {
         assert_eq!(st.ordered.len(), ORDERED_HEADERS_SOFT_CAP);
         assert!(st.ordered_set.contains(&good.block_hash()));
 
-        log_status(&mut st, 50_000);
+        log_status(&mut st, &hub, 50_000);
         assert!(
             !st.header_walk.announced_done,
             "peers still advertise headers past the candidate"
         );
         let tip = st.header_walk.tip_height;
         st.max_peer_height = 0;
-        log_status(&mut st, tip);
+        log_status(&mut st, &hub, tip);
         assert!(!st.header_walk.announced_done);
         st.max_peer_height = tip;
-        log_status(&mut st, tip);
+        log_status(&mut st, &hub, tip);
         assert!(
             st.header_walk.announced_done,
             "the done line fires once the header tip has caught the peers"
         );
-        log_status(&mut st, tip);
+        log_status(&mut st, &hub, tip);
         assert!(st.header_walk.announced_done);
     }
 
@@ -3017,6 +3020,39 @@ mod tests {
     }
 
     #[test]
+    fn status_line_names_the_stored_height_and_the_queue() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-status");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let (slot0, mut rx) = slot(0);
+        let mut st = IbdWorkState::new(vec![slot0], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = rx.try_recv();
+        apply(&mut st, &hub, 0, vec![first]);
+        let tail = st.ordered.back().copied().unwrap();
+        st.hash_height.insert(tail, 76_000);
+        rbitcoin_log::capture_logs(true);
+        log_status(&mut st, &hub, 200_000);
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let line = logs
+            .iter()
+            .find_map(|(_, line)| line.contains("ibd: headers height=").then_some(line))
+            .expect("status line");
+        assert!(
+            line.contains("stored=76000"),
+            "the stored path is on the status line: {line}"
+        );
+        assert!(
+            line.contains(&format!("queue={}", ORDERED_HEADERS_SOFT_CAP)),
+            "the queue length is on the status line: {line}"
+        );
+        assert!(line.contains("phase=walk"), "{line}");
+    }
+
+    #[test]
     fn short_chain_rewinds_and_the_next_peer_is_followed() {
         let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-2");
         hub.ensure_genesis().unwrap();
@@ -3042,7 +3078,7 @@ mod tests {
         assert!(send_getheaders(&mut st, &hub).unwrap());
         apply(&mut st, &hub, 0, vec![a1, a2]);
         assert_eq!(hub.query.store().header_count(), before);
-        log_status(&mut st, 50_000);
+        log_status(&mut st, &hub, 50_000);
         assert!(!st.header_walk.proven, "work is still below the floor");
         assert_eq!(st.header_walk.tip_hash, Some(a2.block_hash()));
         plant_on_queue(&mut st, a1.block_hash(), 1);
@@ -3056,7 +3092,7 @@ mod tests {
         );
         apply(&mut st, &hub, 1, vec![]);
         assert_eq!(st.header_walk.tip_hash, Some(gen));
-        log_status(&mut st, 50_000);
+        log_status(&mut st, &hub, 50_000);
         assert!(!st.header_walk.announced_done);
         assert!(!st.ordered_set.contains(&a1.block_hash()));
         assert!(!st.ordered_set.contains(&a2.block_hash()));
