@@ -55,6 +55,11 @@ pub(crate) enum PeerEvent {
         peer: usize,
         hashes: Vec<BlockHash>,
     },
+    /// Block `inv` during IBD. A peer retired from the header walk can rejoin.
+    BlocksInv {
+        peer: usize,
+        hashes: Vec<BlockHash>,
+    },
     /// Addresses learned from `addr` / `addrv2` (for IBD redial pool growth).
     Addrs {
         peer: usize,
@@ -295,6 +300,22 @@ pub(crate) async fn spawn_peer(
                                     NetworkMessage::SendAddrV2 => {}
                                     // Blocks must not reach decode (handled above).
                                     NetworkMessage::Block(_) => {}
+                                    NetworkMessage::Inv(inv) => {
+                                        let hashes: Vec<BlockHash> = inv
+                                            .iter()
+                                            .filter_map(|i| match i {
+                                                Inventory::Block(h)
+                                                | Inventory::WitnessBlock(h) => Some(*h),
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        if !hashes.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::BlocksInv {
+                                                peer: id,
+                                                hashes,
+                                            });
+                                        }
+                                    }
                                     _other => {}
                                 }
                             },
