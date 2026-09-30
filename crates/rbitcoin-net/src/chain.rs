@@ -853,12 +853,17 @@ impl ChainHub {
         for h in self.fork_tips.read().unwrap().iter().copied() {
             record(&mut out, h, "valid-fork");
         }
+        // The header and held walks below re-read `header_tips` and
+        // `held_bodies` (`prev_of`, `load_side_body`), so each set is copied
+        // out and its guard dropped first; see `best_header_height`.
         {
-            let headers = self.header_tips.read().unwrap();
+            let (covered, hashes): (HashSet<BlockHash>, Vec<BlockHash>) = {
+                let headers = self.header_tips.read().unwrap();
+                (headers.prevs().collect(), headers.hashes().collect())
+            };
             // Only header *tips* (a later submitblock of an ancestor must not
             // re-list that ancestor alongside its descendant).
-            let covered: HashSet<BlockHash> = headers.prevs().collect();
-            for hash in headers.hashes() {
+            for hash in hashes {
                 if covered.contains(&hash) {
                     continue;
                 }
@@ -871,10 +876,14 @@ impl ChainHub {
             }
         }
         {
-            let held = self.held_bodies.read().unwrap();
-            let parents: HashSet<BlockHash> =
-                held.blocks().map(|b| b.header.prev_blockhash).collect();
-            for hash in held.keys() {
+            let (parents, hashes): (HashSet<BlockHash>, Vec<BlockHash>) = {
+                let held = self.held_bodies.read().unwrap();
+                (
+                    held.blocks().map(|b| b.header.prev_blockhash).collect(),
+                    held.keys().collect(),
+                )
+            };
+            for hash in hashes {
                 if parents.contains(&hash) {
                     continue;
                 }
@@ -989,14 +998,18 @@ impl ChainHub {
     }
 
     /// Best known header height (may lead `blocks` after `submitheader`).
+    ///
+    /// Copies the tips out before walking: `prev_of` read-locks `header_tips`
+    /// again, and std's `RwLock` refuses a new reader while a writer waits, so
+    /// a walk under the guard deadlocks against `note_header_tip`.
     pub fn best_header_height(&self) -> u32 {
         let mut best = self.tip_height().unwrap_or(0);
-        let headers = self.header_tips.read().unwrap();
-        for (hash, h) in headers.entries() {
-            if self.header_ancestry_invalid(hash) {
-                continue;
+        let tips: Vec<(BlockHash, u32)> = self.header_tips.read().unwrap().entries().collect();
+        for (hash, h) in tips {
+            // Only a taller tip can raise `best`; the walk is for those alone.
+            if h > best && !self.header_ancestry_invalid(hash) {
+                best = h;
             }
-            best = best.max(h);
         }
         best
     }
@@ -4494,6 +4507,65 @@ mod tests {
         assert_eq!(hub.best_header_height(), 2);
         assert_eq!(hub.tip_height(), Some(1));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `best_header_height` and `chaintips` walk ancestry through `prev_of`,
+    /// which read-locks `header_tips` and (via `load_side_body`)
+    /// `held_bodies`. std's `RwLock` refuses a new reader while a writer
+    /// waits, so a walk that holds one of those guards deadlocks against a
+    /// writer: the writer waits for the held read, and the walk's second read
+    /// waits for the writer.
+    #[test]
+    fn ancestry_walks_never_reread_a_held_chain_lock() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let (_dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_030_000, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        // A header-only tip (`header_tips`) and a parked side body (`held_bodies`).
+        let child = mine(b1.block_hash(), 1_300_030_100, 2);
+        hub.ensure_header(&child.header).unwrap();
+        let side = mine(gen, 1_300_030_200, 1);
+        hub.hold_unconnected_body(side.clone());
+        assert!(hub.held_body(&side.block_hash()).is_some());
+        let tip = child.block_hash();
+
+        let hub = ChainHub::into_arc(hub);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (hub, stop) = (hub.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(hub.header_tips.write().unwrap());
+                    drop(hub.held_bodies.write().unwrap());
+                }
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let hub = hub.clone();
+            thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until {
+                    assert_eq!(hub.best_header_height(), 2);
+                    assert!(hub.chaintips().iter().any(|t| t.hash == tip));
+                }
+                let _ = done_tx.send(());
+            });
+        }
+        let outcome = done_rx.recv_timeout(Duration::from_secs(20));
+        stop.store(true, Ordering::Relaxed);
+        match outcome {
+            Ok(()) => writer.join().unwrap(),
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("an ancestry walk deadlocked against a chain-lock writer")
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!("the walk thread panicked"),
+        }
     }
 
     #[test]
