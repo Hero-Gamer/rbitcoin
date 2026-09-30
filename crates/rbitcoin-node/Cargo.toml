@@ -26,7 +26,6 @@ bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 mimalloc = { workspace = true }

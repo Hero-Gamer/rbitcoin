@@ -361,13 +361,18 @@ hours (IBD). The health listener answers through all of it.
 | `GET /metrics` | Prometheus text format with `--metrics`; 404 without it |
 
 Other paths are 404 and other methods 405. Requests carry no body and no
-auth. Concurrency, body, and timeout limits are always on. A non-loopback
-bind logs a WARN: keep the port on loopback or a probe-only network.
+auth, and time out after 5 s (408). `/readyz` runs at most 4 checks at
+once and `/metrics` one render at a time; past that a request answers 503
+at once (`not ready: busy`, `metrics: a scrape is already running`)
+instead of queueing, and a timed-out check keeps its slot until it
+returns. A non-loopback bind logs a WARN: keep the port on loopback or a
+probe-only network.
 
 `/readyz` reports the first failing check, in this order:
 
 | Reason | Meaning |
 |--------|---------|
+| `busy` | 4 checks are already running, so this one did not start |
 | `opening` | Store open: schema migration, backfill, spend replay |
 | `starting` | P2P, mempool, and proxy bring-up |
 | `catch-up` | Initial block download |

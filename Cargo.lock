@@ -782,7 +782,6 @@ dependencies = [
  "rbitcoin-store",
  "serde_json",
  "tokio",
- "tower",
  "tower-http",
 ]
 

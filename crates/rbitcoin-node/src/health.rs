@@ -20,13 +20,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
-use tower::limit::ConcurrencyLimitLayer;
+use tokio::sync::Semaphore;
+use tokio::task::{JoinError, JoinHandle};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
-/// Probes in flight at once. Probers send one request per period.
-const MAX_CONCURRENT: usize = 16;
+/// `/readyz` checks running at once. Probers send one request per period;
+/// past this a probe answers 503 at once instead of queueing.
+const READYZ_IN_FLIGHT: usize = 4;
 /// Per-request wall. Probe timeouts are usually 1s.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tip and scripthash index lag that `/readyz` still calls ready.
@@ -244,7 +245,31 @@ pub(crate) async fn run_health(
     Ok(HealthHandle { task })
 }
 
+/// Router state: the node's status and the gates on blocking work.
+#[derive(Clone)]
+struct Health {
+    status: Arc<NodeStatus>,
+    readyz: Arc<Semaphore>,
+    /// One render at a time, so a scrape never starts a second mempool fold
+    /// while one is running.
+    scrape: Arc<Semaphore>,
+}
+
+impl Health {
+    fn new(status: Arc<NodeStatus>) -> Self {
+        Self {
+            status,
+            readyz: Arc::new(Semaphore::new(READYZ_IN_FLIGHT)),
+            scrape: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
 fn router(status: Arc<NodeStatus>, metrics: bool) -> Router {
+    router_for(Health::new(status), metrics)
+}
+
+fn router_for(health: Health, metrics: bool) -> Router {
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz));
@@ -253,46 +278,72 @@ fn router(status: Arc<NodeStatus>, metrics: bool) -> Router {
     } else {
         routes
     };
+    // Outer → inner: timeout → body (GET only, so none). The timeout covers
+    // the whole request. The blocking work is capped by `gated`, not by a
+    // concurrency layer: tower's queues without a bound, and axum builds one
+    // per route.
     routes
-        // Outer → inner: concurrency → body (GET only, so none) → timeout.
+        .layer(RequestBodyLimitLayer::new(0))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(RequestBodyLimitLayer::new(0))
-        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT))
-        .with_state(status)
+        .with_state(health)
+}
+
+/// Run `f` on the blocking pool under a permit from `gate`, or `None` at
+/// once when every permit is taken.
+///
+/// The permit moves into the task. A blocking task cannot be cancelled, so
+/// a request that times out drops only its wait, and the gate stays closed
+/// until `f` returns: timed-out requests cannot stack chain or mempool
+/// readers behind the cap.
+async fn gated<T: Send + 'static>(
+    gate: &Arc<Semaphore>,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<Result<T, JoinError>> {
+    let permit = Arc::clone(gate).try_acquire_owned().ok()?;
+    Some(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _g = BlockingRegion::enter();
+            f()
+        })
+        .await,
+    )
 }
 
 async fn healthz() -> &'static str {
     "ok\n"
 }
 
-async fn scrape(State(status): State<Arc<NodeStatus>>) -> Response {
-    let body = tokio::task::spawn_blocking(move || {
-        let _g = BlockingRegion::enter();
-        metrics::render(&status)
-    })
-    .await;
-    match body {
-        Ok(body) => ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("metrics: {e}\n")).into_response(),
+async fn scrape(State(health): State<Health>) -> Response {
+    let status = Arc::clone(&health.status);
+    match gated(&health.scrape, move || metrics::render(&status)).await {
+        Some(Ok(body)) => ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response(),
+        Some(Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("metrics: {e}\n")).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics: a scrape is already running\n",
+        )
+            .into_response(),
     }
 }
 
-async fn readyz(State(status): State<Arc<NodeStatus>>) -> (StatusCode, String) {
-    let snap = tokio::task::spawn_blocking(move || {
-        let _g = BlockingRegion::enter();
-        status.ready_snapshot()
-    })
-    .await;
-    match snap.as_ref().map(readiness) {
-        Ok(Ok(())) => (StatusCode::OK, "ok\n".into()),
-        Ok(Err(reason)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("not ready: {reason}\n"),
-        ),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}\n")),
+async fn readyz(State(health): State<Health>) -> (StatusCode, String) {
+    let status = Arc::clone(&health.status);
+    match gated(&health.readyz, move || status.ready_snapshot()).await {
+        Some(Ok(snap)) => match readiness(&snap) {
+            Ok(()) => (StatusCode::OK, "ok\n".into()),
+            Err(reason) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("not ready: {reason}\n"),
+            ),
+        },
+        Some(Err(e)) => (StatusCode::SERVICE_UNAVAILABLE, format!("not ready: {e}\n")),
+        None => (StatusCode::SERVICE_UNAVAILABLE, "not ready: busy\n".into()),
     }
 }
 
@@ -411,6 +462,85 @@ mod tests {
             get(addr, "/readyz").await,
             "HTTP/1.1 503 Service Unavailable|not ready: opening\n"
         );
+    }
+
+    /// A blocking task cannot be cancelled, so a request that times out must
+    /// leave its permit with the task. Otherwise each timed-out request frees
+    /// a slot for another reader while the first still runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_work_keeps_its_permit_past_a_dropped_request() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            gated(&gate, move || wait.recv().unwrap()),
+        )
+        .await;
+        assert!(dropped.is_err(), "the request gave up while the work ran");
+        assert_eq!(gate.available_permits(), 0);
+        let turned_away = tokio::time::timeout(Duration::from_secs(2), gated(&gate, || ()))
+            .await
+            .expect("a full gate answers at once");
+        assert!(turned_away.is_none());
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the permit returns when the work ends");
+        let ran = gated(&gate, || 7).await.expect("a free gate runs");
+        assert_eq!(ran.unwrap(), 7);
+    }
+
+    /// With its gate full, `/readyz` or `/metrics` answers 503 at once rather
+    /// than queue; with the gate free, it answers from the node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_gate_answers_503_without_queueing() {
+        let health = Health::new(NodeStatus::new(Network::Regtest, false));
+        let addr = serve(router_for(health.clone(), true)).await;
+
+        let held = Arc::clone(&health.readyz)
+            .acquire_many_owned(READYZ_IN_FLIGHT as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_soon(addr, "/readyz").await,
+            "HTTP/1.1 503 Service Unavailable|not ready: busy\n"
+        );
+        drop(held);
+        assert_eq!(
+            get_soon(addr, "/readyz").await,
+            "HTTP/1.1 503 Service Unavailable|not ready: opening\n"
+        );
+
+        let held = Arc::clone(&health.scrape).acquire_owned().await.unwrap();
+        assert_eq!(
+            get_soon(addr, "/metrics").await,
+            "HTTP/1.1 503 Service Unavailable|metrics: a scrape is already running\n"
+        );
+        drop(held);
+        let scraped = get_soon(addr, "/metrics").await;
+        assert!(
+            scraped.starts_with("HTTP/1.1 200 OK|# HELP rbitcoin_build_info"),
+            "{scraped}"
+        );
+    }
+
+    async fn serve(app: Router) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// [`get`], failing rather than hanging if the answer waits for a permit.
+    async fn get_soon(addr: SocketAddr, path: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(2), get(addr, path))
+            .await
+            .expect("answered without queueing")
     }
 
     async fn get(addr: SocketAddr, path: &str) -> String {
