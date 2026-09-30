@@ -236,7 +236,7 @@ pub(crate) fn assign_work_ordered(
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
-    let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+    let alive = super::header_walk::peers_for_blocks(st);
     if alive.is_empty() {
         return;
     }

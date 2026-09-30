@@ -393,79 +393,6 @@ pub(crate) fn replacement_available(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub(crate) fn request_headers(
-    slots: &[PeerSlot],
-    hub: &ChainHub,
-    seq: &mut u32,
-    // Best hashes on the IBD work path (newest first preferred). When tip
-    // lags archive, store locators alone re-fetch the same 2000-header window.
-    work_tips: &[BlockHash],
-    above_height: u32,
-    // Peer whose header ask just expired. Left in the pool when they are
-    // the only candidate.
-    skip: Option<usize>,
-    // Peer already asked on the other header lane. Not used when excluding
-    // them would leave nobody to ask.
-    hold: Option<usize>,
-    // Walk lane: peers whose last short reply did not extend the candidate.
-    // Dropped even when they are the only one left. Refill passes empty.
-    quiet: &[usize],
-) -> Result<Option<usize>, NetError> {
-    // Fewest blocks in flight. Ties rotate. A peer that does not advertise
-    // past the hash we are asking from is skipped while anyone taller is up.
-    // A peer that let the header ask expire is skipped the same way. That
-    // peer still receives new block requests afterward.
-    let alive: Vec<&PeerSlot> = slots.iter().filter(|s| s.alive).collect();
-    if alive.is_empty() {
-        return Ok(None);
-    }
-    let tall: Vec<&PeerSlot> = alive
-        .iter()
-        .copied()
-        .filter(|s| s.peer_height > above_height)
-        .collect();
-    let mut pool = if tall.is_empty() { alive } else { tall };
-    if let Some(skip_id) = skip {
-        let kept: Vec<&PeerSlot> = pool.iter().copied().filter(|s| s.id != skip_id).collect();
-        if !kept.is_empty() {
-            pool = kept;
-        }
-    }
-    if let Some(hold_id) = hold {
-        let kept: Vec<&PeerSlot> = pool.iter().copied().filter(|s| s.id != hold_id).collect();
-        if kept.is_empty() {
-            return Ok(None);
-        }
-        pool = kept;
-    }
-    if !quiet.is_empty() {
-        let kept: Vec<&PeerSlot> = pool
-            .iter()
-            .copied()
-            .filter(|s| !quiet.contains(&s.id))
-            .collect();
-        if kept.is_empty() {
-            return Ok(None);
-        }
-        pool = kept;
-    }
-    let min_flight = pool.iter().map(|s| s.in_flight.len()).min().unwrap_or(0);
-    let mut tied: Vec<&PeerSlot> = pool
-        .iter()
-        .copied()
-        .filter(|s| s.in_flight.len() == min_flight)
-        .collect();
-    tied.sort_by_key(|s| s.id);
-    let peer = tied[(*seq as usize) % tied.len()].id;
-    *seq = seq.saturating_add(1);
-    if request_headers_from(slots, peer, hub, seq, work_tips)? {
-        Ok(Some(peer))
-    } else {
-        Ok(None)
-    }
-}
-
 pub(crate) fn request_headers_from(
     slots: &[PeerSlot],
     peer: usize,
@@ -1449,11 +1376,6 @@ mod tests {
     fn request_headers_no_alive_returns_false() {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("dial-hdr");
         let mut seq = 0u32;
-        assert!(
-            request_headers(&[], &hub, &mut seq, &[], 0, None, None, &[])
-                .unwrap()
-                .is_none()
-        );
         let mut dead = dummy_slot(1, addr(1), false);
         dead.alive = false;
         assert!(!request_headers_from(&[dead], 1, &hub, &mut seq, &[]).unwrap());
