@@ -2952,6 +2952,71 @@ mod tests {
     }
 
     #[test]
+    fn full_batch_does_not_restir_a_fresh_lane() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-restir");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let first = mine(gen, 1);
+        let (s0, rx0) = slot(0);
+        let (s1, rx1) = slot(1);
+        let mut rxs = [rx0, rx1];
+        let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        for rx in &mut rxs {
+            let _ = rx.try_recv();
+        }
+        apply(&mut st, &hub, 0, vec![first]);
+        assert_eq!(st.header_walk.tip_hash, Some(first.block_hash()));
+
+        floor_unreachable(&mut hub);
+        st.ordered.clear();
+        st.ordered_set.clear();
+        st.ordered.push_back(gen);
+        st.ordered_set.insert(gen);
+        st.hash_height.insert(gen, 0);
+        assert!(walk_ahead_of_queue(&st, &hub));
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let walk_peer = st.header_walk.walk.peer.expect("walk lane");
+        let refill_peer = st.header_walk.refill.peer.expect("refill lane");
+        assert_ne!(walk_peer, refill_peer);
+        for rx in &mut rxs {
+            let _ = rx.try_recv();
+        }
+
+        let mut headers = vec![first];
+        let mut prev = first.block_hash();
+        for n in 2..=crate::codec::MAX_HEADERS_RESULTS as u32 {
+            let hdr = mine(prev, n);
+            prev = hdr.block_hash();
+            headers.push(hdr);
+        }
+        assert_eq!(headers.len(), crate::codec::MAX_HEADERS_RESULTS);
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, refill_peer, headers);
+        assert_eq!(
+            hub.query.store().header_count(),
+            before + crate::codec::MAX_HEADERS_RESULTS as u64,
+            "the full refill is stored"
+        );
+        assert_eq!(
+            st.header_walk.walk.peer,
+            Some(walk_peer),
+            "the walk peer stays asked"
+        );
+        assert_eq!(
+            drain_getheaders(&mut rxs[walk_peer]),
+            0,
+            "a lane still inside its window is not asked again"
+        );
+        assert_eq!(
+            drain_getheaders(&mut rxs[refill_peer]),
+            0,
+            "the refill reply does not replace the walk request"
+        );
+    }
+
+    #[test]
     fn short_chain_rewinds_and_the_next_peer_is_followed() {
         let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-2");
         hub.ensure_genesis().unwrap();
