@@ -554,6 +554,9 @@ fn apply_block_framed(
     note_block_rx(&mut st.slots, peer, wire_bytes);
     // Unsolicited wire is not a body we asked for. Drop it before any copy.
     let requested = st.inflight.contains_key(&hash);
+    if requested {
+        super::assign::note_block_len(st, wire_bytes);
+    }
     if !requested {
         return;
     }
