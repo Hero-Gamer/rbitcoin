@@ -393,6 +393,7 @@ pub(crate) fn replacement_available(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(crate) fn request_headers(
     slots: &[PeerSlot],
     hub: &ChainHub,
@@ -404,6 +405,9 @@ pub(crate) fn request_headers(
     // Peer whose header ask just expired. Left in the pool when they are
     // the only candidate.
     skip: Option<usize>,
+    // Peer already asked on the other header lane. Not used when excluding
+    // them would leave nobody to ask.
+    hold: Option<usize>,
 ) -> Result<Option<usize>, NetError> {
     // Fewest blocks in flight. Ties rotate. A peer that does not advertise
     // past the hash we are asking from is skipped while anyone taller is up.
@@ -424,6 +428,13 @@ pub(crate) fn request_headers(
         if !kept.is_empty() {
             pool = kept;
         }
+    }
+    if let Some(hold_id) = hold {
+        let kept: Vec<&PeerSlot> = pool.iter().copied().filter(|s| s.id != hold_id).collect();
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        pool = kept;
     }
     let min_flight = pool.iter().map(|s| s.in_flight.len()).min().unwrap_or(0);
     let mut tied: Vec<&PeerSlot> = pool
@@ -1424,7 +1435,7 @@ mod tests {
     fn request_headers_no_alive_returns_false() {
         let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("dial-hdr");
         let mut seq = 0u32;
-        assert!(request_headers(&[], &hub, &mut seq, &[], 0, None)
+        assert!(request_headers(&[], &hub, &mut seq, &[], 0, None, None)
             .unwrap()
             .is_none());
         let mut dead = dummy_slot(1, addr(1), false);

@@ -239,27 +239,14 @@ fn plant_next_connected(
     (p == parent).then_some(n)
 }
 
-/// Highest hashes on the download path (newest first) for getheaders locators.
+/// Highest hashes on the download path (newest first) for a queue refill.
 ///
+/// The walk tip is a separate locator. An empty deque refills from the
+/// confirmed tip, which the header locator appends when this list is empty.
 /// Includes proactive exploration tips (greater-work sibling path) so empty
 /// getheaders lag can re-root onto the heavier store chain.
 pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     let mut tips = Vec::with_capacity(8);
-    // Look-ahead names the walk tip, then earlier checkpoints. Once the walk
-    // has caught every peer, the locator stays on the queue.
-    if super::header_walk::wants_lookahead(st) {
-        for h in st.header_walk.locator_hashes() {
-            if !tips.contains(&h) {
-                tips.push(h);
-            }
-        }
-    } else if let Some(h) = st.header_walk.challenger_tip() {
-        // Refill locators name the competing tip, then the queue tail. The
-        // look-ahead tip stays off this locator so candidate peers still refill.
-        if !tips.contains(&h) {
-            tips.push(h);
-        }
-    }
     // ordered is tip→far; the back is the highest known header on the path.
     let live =
         |h: &BlockHash| !st.reorg.invalid.contains(h.to_byte_array()) && !st.body.is_rejected(h);
@@ -279,7 +266,10 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
             break;
         }
     }
-    if tips.is_empty() {
+    // Ghosts in the deque are not a path. A hash known only by height still
+    // names the next window. An empty deque does not: those entries are not
+    // the connected work path.
+    if tips.is_empty() && !st.ordered.is_empty() {
         if let Some((&h, _)) = st
             .hash_height
             .iter()
@@ -290,6 +280,29 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
         }
     }
     tips
+}
+
+/// Put connected work-path hashes back on an empty queue, tip toward far.
+/// No-op while the queue still holds headers. Returns how many were restored.
+pub(crate) fn reseed_ordered_from_path(st: &mut IbdWorkState, hub: &ChainHub) -> usize {
+    if !st.ordered.is_empty() {
+        return 0;
+    }
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let mut rebuilt = 0usize;
+    for (_ht, h) in path_hashes_above_tip(st, tip_h) {
+        if hub.has_block(&h) || st.body.is_rejected(&h) {
+            continue;
+        }
+        if st.ordered.len() >= super::MAX_ORDERED_HEADERS {
+            break;
+        }
+        if st.ordered_set.insert(h) {
+            st.ordered.push_back(h);
+            rebuilt += 1;
+        }
+    }
+    rebuilt
 }
 
 /// Connected work-path hashes strictly above `tip_h` (`height_to_hash` occupants).

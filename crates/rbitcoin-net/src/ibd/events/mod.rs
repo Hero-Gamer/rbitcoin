@@ -4,15 +4,12 @@ use super::assign::clear_hash_inflight;
 use super::assign_plan::{
     remove_from_ordered, should_enqueue_header, want_headers_beyond_soft_cap,
 };
-use super::dial::{
-    disconnect_peer, note_dead_without_block_bytes, release_peer_block_work, request_headers_from,
-};
+use super::dial::{disconnect_peer, note_dead_without_block_bytes, release_peer_block_work};
 use super::exit::{
     header_lag_behind_peers, should_advance_locator_after_known_batch,
     should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
     should_reseed_work_path_on_empty_lag,
 };
-use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
 use super::status::LoopStats;
@@ -381,7 +378,7 @@ fn on_empty_headers(st: &mut IbdWorkState, hub: &ChainHub) {
     }
 }
 
-fn on_known_headers_batch(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, batch_len: usize) {
+fn on_known_headers_batch(st: &mut IbdWorkState, hub: &ChainHub, _peer: usize, batch_len: usize) {
     let live = st.ordered_set.len();
     let need_ready_headroom = want_headers_beyond_soft_cap(
         live,
@@ -399,12 +396,7 @@ fn on_known_headers_batch(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, ba
             need_ready_headroom,
         )
     {
-        let tips = work_path_tips(st);
-        if request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips)
-            .unwrap_or(false)
-        {
-            super::header_walk::note_header_ask(st, peer);
-        }
+        let _ = super::header_walk::send_getheaders(st, hub);
     }
 }
 
@@ -492,12 +484,7 @@ fn apply_headers_event(
             && live < MAX_ORDERED_HEADERS
             && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
         {
-            let tips = work_path_tips(st);
-            if request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, &tips)
-                .unwrap_or(false)
-            {
-                super::header_walk::note_header_ask(st, peer);
-            }
+            let _ = super::header_walk::send_getheaders(st, hub);
         }
     } else if batch_len == 0 {
         on_empty_headers(st, hub);
