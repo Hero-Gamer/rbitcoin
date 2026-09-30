@@ -445,6 +445,7 @@ fn apply_headers_event(
     headers: Vec<bitcoin::block::Header>,
 ) {
     let tip_before = super::header_walk::candidate_tip(st);
+    let work_before = super::header_walk::candidate_work(st);
     let queued_before = st.ordered.len();
     let batch_len = headers.len();
     // An empty reply cannot extend. Retire before the empty handler asks again.
@@ -455,6 +456,7 @@ fn apply_headers_event(
     if batch_len > 0 {
         super::header_walk::settle_walk_peer(st, hub, peer, tip_before, queued_before, batch_len);
     }
+    super::header_walk::note_reservation(st, hub, peer, tip_before, work_before);
 }
 
 fn apply_headers_reply(

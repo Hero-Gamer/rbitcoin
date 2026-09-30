@@ -1,11 +1,13 @@
 //! Checkpoints for the header chain ahead of the blocks.
 //!
-//! Two header requests can be in flight. The walk lane runs while a connected
-//! peer is still ahead of the walk and has not failed to extend it. Above the
-//! work floor, one short reply that leaves the candidate unextended retires
-//! that peer from the walk. A full 2,000-header window does not, so a lighter
-//! fork can still catch up, and a later block inv puts the peer back. The
-//! first ask starts at the stored tip.
+//! One peer serves the walk and the queue refill. Every other peer downloads
+//! blocks. That peer is the lowest time to a first block byte among peers
+//! that have not failed the walk. Above the work floor, one short reply that
+//! leaves the candidate unextended retires that peer and the reservation
+//! moves. A full 2,000-header window does not, so a lighter fork can still
+//! catch up. A block inv from someone else is one challenge ask: a reply that
+//! beats the candidate takes the reservation, and any other reply leaves it
+//! where it was. The first ask starts at the stored tip.
 //! A solicited reply that continues that tip is a checkpoint, and so is any
 //! solicited reply once the walk is ahead of the stored path, at any queue
 //! length. The refill lane asks from the queue tail while the queue is under
@@ -88,6 +90,12 @@ pub(crate) struct HeaderWalk {
     /// the candidate. A block inv or a redial clears the bit. Not written
     /// to `header.adopt`.
     walk_quiet: HashSet<usize>,
+    /// Peer that serves the walk and the refill. Not written to `header.adopt`.
+    reserved: Option<usize>,
+    /// One walk ask owed after a block inv from a peer who is not reserved.
+    challenge: Option<usize>,
+    /// Challenge ask already sent. Judged when that peer replies or times out.
+    challenge_open: Option<usize>,
     /// Header request for the walk tip. Not written to `header.adopt`.
     walk: Lane,
     /// Header request for the queue tail. Not written to `header.adopt`.
@@ -335,26 +343,92 @@ pub(crate) fn settle_walk_peer(
     st.header_walk.walk_quiet.insert(peer);
 }
 
-/// A block announcement may be a header this peer did not have. One ask
-/// follows; the next short miss retires them again.
+/// A block announcement may be a header this peer did not have. One walk
+/// ask follows when they are not already the reserved peer.
 pub(crate) fn note_block_inv(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
+    if st.header_walk.reserved != Some(peer) {
+        st.header_walk.challenge = Some(peer);
+    }
 }
 
 /// A redialed slot can reuse this id. Do not inherit the previous walk retirement.
 pub(crate) fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
+    if st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
+    if st.header_walk.challenge == Some(peer) {
+        st.header_walk.challenge = None;
+    }
+    if st.header_walk.challenge_open == Some(peer) {
+        st.header_walk.challenge_open = None;
+    }
+}
+
+/// Chainwork of the candidate, for judging a challenge reply.
+pub(crate) fn candidate_work(st: &IbdWorkState) -> [u8; 32] {
+    st.header_walk.tip_work()
+}
+
+/// Move the reservation when this reply beat the candidate, or retire a
+/// challenge that did not. A reserved peer who was just retired loses it.
+pub(crate) fn note_reservation(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    tip_before: Option<BlockHash>,
+    work_before: [u8; 32],
+) {
+    let beat = st.header_walk.tip_hash() != tip_before && st.header_walk.tip_work() > work_before;
+    if st.header_walk.challenge_open == Some(peer) {
+        st.header_walk.challenge_open = None;
+        if beat {
+            st.header_walk.reserved = Some(peer);
+            st.header_walk.walk_quiet.remove(&peer);
+        } else if !below_floor(hub, &st.header_walk.tip_work()) {
+            st.header_walk.walk_quiet.insert(peer);
+            if st.header_walk.reserved == Some(peer) {
+                st.header_walk.reserved = None;
+            }
+        }
+        return;
+    }
+    if st.header_walk.walk_quiet.contains(&peer) && st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
+}
+
+/// Peers that may receive block getdata. The reserved header peer is left
+/// out while another peer is connected. A single peer still does both.
+pub(crate) fn peers_for_blocks(st: &IbdWorkState) -> Vec<usize> {
+    let alive: Vec<usize> = st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect();
+    let Some(reserved) = st.header_walk.reserved else {
+        return alive;
+    };
+    if alive.len() <= 1 {
+        return alive;
+    }
+    let rest: Vec<usize> = alive.iter().copied().filter(|&id| id != reserved).collect();
+    if rest.is_empty() {
+        alive
+    } else {
+        rest
+    }
 }
 
 /// Walk while a peer is taller than the walk. Refill while the walk is ahead
-/// of the stored path and the queue is under the soft cap. One peer serves
-/// the queue below [`ORDERED_REFILL_LOW`] and the walk above it.
+/// of the stored path and the queue is under the soft cap. The reserved peer
+/// refills below [`ORDERED_REFILL_LOW`] and walks above it. A pending block-inv
+/// challenge is a walk ask, ahead of that refill.
 fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
     let ahead = walk_ahead_of_queue(st, hub);
     let under_cap = st.ordered.len() < ORDERED_HEADERS_SOFT_CAP;
     let mut want_walk = wants_lookahead(st);
     let mut want_refill = under_cap && ahead;
-    if want_walk && want_refill && !distinct_header_peers(st, hub) {
+    if st.header_walk.challenge.is_some() && want_walk {
+        want_refill = false;
+    } else if want_walk && want_refill {
         if st.ordered.len() < ORDERED_REFILL_LOW {
             want_walk = false;
         } else {
@@ -362,22 +436,6 @@ fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
         }
     }
     (want_walk, want_refill)
-}
-
-/// A peer tall enough for the walk, and a different peer tall enough for the
-/// stored path. The walk bar is the stricter one while the walk is ahead.
-fn distinct_header_peers(st: &IbdWorkState, hub: &ChainHub) -> bool {
-    let walk_h = st.header_walk.tip_height();
-    let top_h = path_top(st, hub).map(|(_, h)| h).unwrap_or(0);
-    st.slots.iter().any(|walk| {
-        walk.alive
-            && walk.peer_height > walk_h
-            && !st.header_walk.walk_quiet.contains(&walk.id)
-            && st
-                .slots
-                .iter()
-                .any(|top| top.alive && top.peer_height > top_h && top.id != walk.id)
-    })
 }
 
 /// A proven-chain reply that must not be written.
@@ -1806,6 +1864,19 @@ fn expire_lane(st: &mut IbdWorkState, id: AskLane) -> Option<usize> {
         *e = e.saturating_add(1);
         *e
     };
+    if st.header_walk.challenge_open == Some(peer) {
+        st.header_walk.challenge_open = None;
+        if n >= HEADER_MISS_DISCONNECT {
+            st.header_walk.header_misses.remove(&(id, peer));
+            punish_header_peer(st, peer);
+        } else {
+            st.header_walk.walk_quiet.insert(peer);
+        }
+        return None;
+    }
+    if st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
     if n >= HEADER_MISS_DISCONNECT {
         st.header_walk.header_misses.remove(&(id, peer));
         punish_header_peer(st, peer);
@@ -1834,10 +1905,11 @@ fn punish_header_peer(st: &mut IbdWorkState, peer: usize) {
     );
 }
 
-/// Ask for the walk, the queue, or both. A lane still inside the window is
-/// left in flight. An expired lane skips that peer when another tall peer is
-/// up, and a second expiry on that lane disconnects them. One peer is never
-/// asked for both lanes at once.
+/// Ask the reserved peer for the walk or the queue. A lane still inside the
+/// window is left in flight. One miss moves the reservation when another
+/// peer can take it. A second miss disconnects. A block-inv challenge is
+/// one walk ask to that peer and does not replace the reservation until the
+/// reply beats the candidate.
 pub(crate) fn send_getheaders(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1876,10 +1948,6 @@ fn arm_lane(
         return Ok(true);
     }
     let skip = expire_lane(st, id);
-    let hold = match id {
-        AskLane::Walk => st.header_walk.refill.peer,
-        AskLane::Refill => st.header_walk.walk.peer,
-    };
     let tips = match id {
         AskLane::Walk => st.header_walk.locator_hashes(),
         AskLane::Refill => super::path::work_path_tips(st),
@@ -1888,24 +1956,92 @@ fn arm_lane(
         AskLane::Walk => st.header_walk.tip_height(),
         AskLane::Refill => path_top(st, hub).map(|(_, height)| height).unwrap_or(0),
     };
-    // Walk-quiet ids are collected first: the ask borrows `slots` and `seq`.
-    let quiet: Vec<usize> = match id {
-        AskLane::Walk => st.header_walk.walk_quiet.iter().copied().collect(),
-        AskLane::Refill => Vec::new(),
-    };
-    let Some(peer) = super::dial::request_headers(
-        &st.slots,
-        hub,
-        &mut st.header_req_seq,
-        &tips,
-        above,
-        skip,
-        hold,
-        &quiet,
-    )?
-    else {
+    if id == AskLane::Walk {
+        if let Some(peer) = take_challenge(st) {
+            if ask_header_peer(st, hub, id, peer, &tips)? {
+                st.header_walk.challenge_open = Some(peer);
+                return Ok(true);
+            }
+        }
+    }
+    ensure_reserved(st, above, skip);
+    let Some(peer) = st.header_walk.reserved else {
         return Ok(false);
     };
+    ask_header_peer(st, hub, id, peer, &tips)
+}
+
+/// Time from connect to the first block body. `None` until a body arrives.
+fn header_ttfb(slot: &super::peer_io::PeerSlot) -> Option<u64> {
+    if slot.first_data_ms == 0 {
+        None
+    } else {
+        Some(slot.first_data_ms.saturating_sub(slot.connected_ms))
+    }
+}
+
+fn peer_can_head(st: &IbdWorkState, id: usize, above: u32) -> bool {
+    st.slots.iter().any(|s| {
+        s.alive && s.id == id && s.peer_height > above && !st.header_walk.walk_quiet.contains(&id)
+    })
+}
+
+/// Lowest time-to-first-byte among peers still on the walk. A peer with no
+/// body yet sorts after one who has delivered. `skip` is the peer whose ask
+/// just expired, unless they are the only one left.
+fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> Option<usize> {
+    let mut best: Option<(u8, u64, usize)> = None;
+    for slot in &st.slots {
+        if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
+            continue;
+        }
+        let key = match header_ttfb(slot) {
+            Some(ttfb) => (0u8, ttfb, slot.id),
+            None => (1u8, 0, slot.id),
+        };
+        if best.is_none_or(|cur| key < cur) {
+            best = Some(key);
+        }
+    }
+    if let Some((_, _, id)) = best {
+        return Some(id);
+    }
+    skip.filter(|&id| peer_can_head(st, id, above))
+}
+
+fn ensure_reserved(st: &mut IbdWorkState, above: u32, skip: Option<usize>) {
+    if let Some(id) = st.header_walk.reserved {
+        if peer_can_head(st, id, above) && skip != Some(id) {
+            return;
+        }
+    }
+    st.header_walk.reserved = pick_header_peer(st, above, skip);
+}
+
+/// A challenge peer who is still connected and not retired.
+fn take_challenge(st: &mut IbdWorkState) -> Option<usize> {
+    let peer = st.header_walk.challenge.take()?;
+    let usable = st
+        .slots
+        .iter()
+        .any(|s| s.alive && s.id == peer && !st.header_walk.walk_quiet.contains(&peer));
+    if usable {
+        Some(peer)
+    } else {
+        None
+    }
+}
+
+fn ask_header_peer(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    id: AskLane,
+    peer: usize,
+    tips: &[BlockHash],
+) -> Result<bool, crate::error::NetError> {
+    if !super::dial::request_headers_from(&st.slots, peer, hub, &mut st.header_req_seq, tips)? {
+        return Ok(false);
+    }
     note_lane(st, id, peer);
     Ok(true)
 }
@@ -2491,6 +2627,9 @@ fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         off_path: std::collections::HashMap::new(),
         announced_done: false,
         walk_quiet: HashSet::new(),
+        reserved: None,
+        challenge: None,
+        challenge_open: None,
         walk: Lane::default(),
         refill: Lane::default(),
         header_misses: HashMap::new(),
@@ -2980,20 +3119,17 @@ mod tests {
         assert!(walk_ahead_of_queue(&st, &hub));
 
         assert!(send_getheaders(&mut st, &hub).unwrap());
-        let walk_peer = st.header_walk.walk.peer.expect("walk lane");
+        assert!(
+            st.header_walk.walk.peer.is_none(),
+            "an empty queue is refilled before the walk continues"
+        );
         let refill_peer = st.header_walk.refill.peer.expect("refill lane");
-        assert_ne!(walk_peer, refill_peer);
-        let walk_front = if walk_peer == 0 {
-            locator_front(&mut rx0)
-        } else {
-            locator_front(&mut rx1)
-        };
+        assert_eq!(refill_peer, asked);
         let refill_front = if refill_peer == 0 {
             locator_front(&mut rx0)
         } else {
             locator_front(&mut rx1)
         };
-        assert_eq!(walk_front, Some(second.block_hash()));
         assert_eq!(
             refill_front,
             Some(gen),
@@ -3065,14 +3201,13 @@ mod tests {
                 fronts.push(h);
             }
         }
-        assert!(
-            fronts.contains(&first.block_hash()),
-            "one request starts at the walk tip: {fronts:?}"
+        assert_eq!(
+            fronts,
+            vec![first.block_hash()],
+            "above the low water mark the reserved peer walks and the other is not asked: {fronts:?}"
         );
-        assert!(
-            fronts.contains(&tail),
-            "the other request starts at the queue tail: {fronts:?}"
-        );
+        assert!(st.header_walk.refill.peer.is_none());
+        let _ = tail;
     }
 
     #[test]
@@ -3116,14 +3251,12 @@ mod tests {
                 fronts.push(h);
             }
         }
-        assert!(
-            fronts.contains(&hub.tip_hash().unwrap()),
-            "an empty queue refills from the confirmed tip: {fronts:?}"
+        assert_eq!(
+            fronts,
+            vec![hub.tip_hash().unwrap()],
+            "an empty queue refills from the confirmed tip before the walk: {fronts:?}"
         );
-        assert!(
-            fronts.contains(&first.block_hash()),
-            "the walk keeps its own request: {fronts:?}"
-        );
+        let _ = first;
     }
 
     #[test]
@@ -3259,16 +3392,16 @@ mod tests {
         st.hash_height.insert(gen, 0);
         assert!(walk_ahead_of_queue(&st, &hub));
         assert!(send_getheaders(&mut st, &hub).unwrap());
-        let walk_peer = st.header_walk.walk.peer.expect("walk lane");
         let refill_peer = st.header_walk.refill.peer.expect("refill lane");
-        assert_ne!(walk_peer, refill_peer);
+        assert!(st.header_walk.walk.peer.is_none());
         for rx in &mut rxs {
             let _ = rx.try_recv();
         }
-        // The window starts at the ask. Storing the batch must not age it out.
-        let asked = Instant::now();
-        st.header_walk.walk.at = Some(asked);
-        st.header_walk.refill.at = Some(asked);
+        // A walk ask already in its window must survive the store of this batch.
+        let asked_at = Instant::now();
+        let walk_peer = 1 - refill_peer;
+        st.header_walk.walk.peer = Some(walk_peer);
+        st.header_walk.walk.at = Some(asked_at);
         let before = hub.query.store().header_count();
         apply(&mut st, &hub, refill_peer, headers);
         assert_eq!(
@@ -3279,7 +3412,7 @@ mod tests {
         assert_eq!(
             st.header_walk.walk.peer,
             Some(walk_peer),
-            "the walk peer stays asked"
+            "a walk ask still inside its window stays asked"
         );
         assert_eq!(
             drain_getheaders(&mut rxs[walk_peer]),
@@ -3717,39 +3850,54 @@ mod tests {
     }
 
     #[test]
-    fn header_request_prefers_the_peer_with_fewer_blocks_in_flight() {
+    fn one_peer_takes_headers_and_the_other_takes_blocks() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-7");
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
-        let (mut busy, mut busy_rx) = slot(0);
-        let (quiet, mut quiet_rx) = slot(1);
-        busy.in_flight.insert(BlockHash::from_byte_array([9u8; 32]));
-        let mut st = IbdWorkState::new(vec![busy, quiet], Some(gen), Some(0));
+        let (mut slow, mut slow_rx) = slot(0);
+        let (mut fast, mut fast_rx) = slot(1);
+        slow.first_data_ms = 5_000;
+        fast.first_data_ms = 50;
+        let mut st = IbdWorkState::new(vec![slow, fast], Some(gen), Some(0));
         assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(slow_rx.try_recv().is_err(), "the slower peer is not asked");
         assert!(
-            busy_rx.try_recv().is_err(),
-            "the busy peer is not asked first"
+            matches!(fast_rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })),
+            "the lowest time-to-first-byte peer takes the walk"
         );
-        match quiet_rx.try_recv() {
-            Ok(PeerCmd::GetHeaders { .. }) => {}
-            Ok(_) => panic!("expected getheaders"),
-            Err(_) => panic!("the quiet peer was not asked for headers"),
-        }
-        let block = BlockHash::from_byte_array([7u8; 32]);
-        let mut room = 8usize;
-        let mut issued = 0u64;
-        assert!(crate::ibd::assign::issue_batch(
+        assert_eq!(st.header_walk.reserved, Some(1));
+
+        let hash = {
+            let mut b = [0u8; 32];
+            b[0..4].copy_from_slice(&1u32.to_le_bytes());
+            BlockHash::from_byte_array(b)
+        };
+        st.record_height(hash, 1);
+        st.height_to_hash.insert(1, hash);
+        st.ordered_set.insert(hash);
+        st.ordered.push_back(hash);
+        st.max_ordered_height = 1;
+        st.body.mark_missing(hash);
+        let cfg = crate::ibd::IbdConfig::for_test();
+        let stats = crate::ibd::status::LoopStats::default();
+        crate::ibd::assign::assign_work_ordered(
             &mut st,
-            1,
-            vec![block],
-            &mut room,
-            &mut issued
-        ));
-        match quiet_rx.try_recv() {
-            Ok(PeerCmd::GetData { hashes }) => assert_eq!(hashes, vec![block]),
-            Ok(_) => panic!("expected getdata"),
-            Err(_) => panic!("the headers peer was not offered a block"),
-        }
+            &hub,
+            &cfg,
+            &stats,
+            crate::ibd::assign::AssignDepth::Full,
+            None,
+        );
+        assert!(
+            st.slots[0].in_flight.contains(&hash),
+            "block getdata goes to the peer who is not walking headers"
+        );
+        assert!(
+            !st.slots[1].in_flight.contains(&hash),
+            "the reserved header peer is not given a block"
+        );
+        assert!(matches!(slow_rx.try_recv(), Ok(PeerCmd::GetData { .. })));
+        assert!(fast_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3785,8 +3933,135 @@ mod tests {
             }
         }
         assert_eq!(got[2], 0, "a peer at or below the walk tip is not asked");
-        assert_eq!(got[0], 3, "idle peers share header requests");
-        assert_eq!(got[1], 3, "idle peers share header requests");
+        assert_eq!(got[0], 6, "one peer keeps the walk until they miss");
+        assert_eq!(got[1], 0, "a second tall peer is not asked in parallel");
+    }
+
+    #[test]
+    fn a_short_miss_moves_the_reservation_without_disconnecting() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-one-peer-move");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 1);
+        apply(&mut st, &hub, 0, vec![good]);
+        assert_eq!(st.header_walk.reserved, Some(0));
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 1);
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(st.slots[0].alive, "less work does not disconnect");
+        assert_eq!(drain_getheaders(&mut first_rx), 0);
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        assert_eq!(st.header_walk.reserved, Some(1));
+    }
+
+    #[test]
+    fn a_heavier_challenge_takes_the_reservation() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-one-peer-heavy");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let fork_a = mine(gen, 2);
+        let fork_b = mine(fork_a.block_hash(), 3);
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, vec![good]);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![fork_b.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 0);
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        apply(&mut st, &hub, 1, vec![fork_a, fork_b]);
+        assert_eq!(st.header_walk.tip_hash(), Some(fork_b.block_hash()));
+        assert_eq!(st.header_walk.reserved, Some(1));
+        assert!(st.slots[0].alive);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 0);
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+    }
+
+    #[test]
+    fn a_lighter_challenge_restores_the_reserved_peer() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-one-peer-light");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let good = mine(gen, 1);
+        let fork = mine(gen, 2);
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, vec![good]);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![fork.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        apply(&mut st, &hub, 1, vec![fork]);
+        assert_eq!(st.header_walk.tip_hash(), Some(good.block_hash()));
+        assert_eq!(st.header_walk.reserved, Some(0));
+        assert!(st.header_walk.walk_quiet.contains(&1));
+        assert!(st.slots[1].alive);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 1);
+        assert_eq!(drain_getheaders(&mut second_rx), 0);
+        let _ = take_header_ask(&mut st, 0);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 1);
+        assert_eq!(drain_getheaders(&mut second_rx), 0);
+    }
+
+    #[test]
+    fn refill_under_the_low_water_mark_stays_on_the_reserved_peer() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-one-peer-refill");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        st.header_walk.origin = true;
+        st.header_walk.tip.height = 100;
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut first_rx), 1);
+        assert_eq!(drain_getheaders(&mut second_rx), 0);
+        assert_eq!(st.header_walk.reserved, Some(0));
+        assert!(st.header_walk.refill.peer == Some(0));
+        assert!(st.header_walk.walk.peer.is_none());
     }
 
     fn drain_getheaders(rx: &mut mpsc::UnboundedReceiver<PeerCmd>) -> usize {
@@ -3836,9 +4111,13 @@ mod tests {
         assert_eq!(drain_getheaders(&mut busy_rx), 1);
         assert!(st.slots.iter().any(|s| s.id == 0 && s.alive));
 
-        let _ = take_header_ask(&mut st, 1);
+        age_header_ask(&mut st);
         assert!(send_getheaders(&mut st, &hub).unwrap());
-        assert_eq!(drain_getheaders(&mut quiet_rx), 1);
+        assert_eq!(
+            drain_getheaders(&mut quiet_rx),
+            1,
+            "the next miss moves the reservation back"
+        );
         assert_eq!(drain_getheaders(&mut busy_rx), 0);
 
         age_header_ask(&mut st);
