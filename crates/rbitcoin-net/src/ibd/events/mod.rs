@@ -440,7 +440,9 @@ fn apply_headers_event(
     headers: Vec<bitcoin::block::Header>,
 ) {
     let ask = super::header_walk::take_header_ask(st, peer);
+    let mut inflight = super::header_walk::InFlight::capture(st);
     if headers.is_empty() {
+        inflight.hold(st);
         if super::header_walk::note_empty(st, hub, peer) {
             return;
         }
@@ -503,11 +505,14 @@ fn apply_headers_event(
             && live < MAX_ORDERED_HEADERS
             && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
         {
+            inflight.hold(st);
             let _ = super::header_walk::send_getheaders(st, hub);
         }
     } else if batch_len == 0 {
+        inflight.hold(st);
         on_empty_headers(st, hub);
     } else {
+        inflight.hold(st);
         on_known_headers_batch(st, hub, peer, batch_len);
     }
 }
