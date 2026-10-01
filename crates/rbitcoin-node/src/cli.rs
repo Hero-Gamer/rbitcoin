@@ -783,6 +783,40 @@ mod tests {
             assert_eq!(cfg.network, Network::Mainnet);
             assert_eq!(cfg.milestone(), Milestone::NONE);
         }
+        // Conf `sp_tweaks` and `sp_tweaks_dust`, including dust 0 (serve every
+        // output) and a value that does not parse.
+        let sp = dir.join("sp.conf");
+        std::fs::write(&sp, "sp_tweaks=1\n").unwrap();
+        let sp_cfg = ready_config(["rbitcoin-node", "--conf", sp.to_str().unwrap()]);
+        assert!(sp_cfg.sptweaks);
+        assert_eq!(
+            sp_cfg.sptweaks_dust,
+            rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST
+        );
+        sp_cfg.validate().expect("conf sp_tweaks=1");
+        let dust = dir.join("dust.conf");
+        std::fs::write(&dust, "sp_tweaks_dust=546\n").unwrap();
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--conf", dust.to_str().unwrap()]).sptweaks_dust,
+            546
+        );
+        let dust0 = dir.join("dust0.conf");
+        std::fs::write(&dust0, "sp_tweaks_dust=0\n").unwrap();
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--conf", dust0.to_str().unwrap()]).sptweaks_dust,
+            0
+        );
+        let bad_dust = dir.join("dust-bad.conf");
+        std::fs::write(&bad_dust, "sp_tweaks_dust=nope\n").unwrap();
+        let err = NodeConfig::default()
+            .merge_conf_file(&bad_dust)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sp_tweaks_dust"), "{err}");
+        match operator_config_from_args(["rbitcoin-node", "--conf", bad_dust.to_str().unwrap()]) {
+            Err(code) => assert_exit(code, ExitCode::from(2)),
+            Ok(other) => panic!("bad sp_tweaks_dust conf assembled: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
         let explicit = ready_config(["rbitcoin-node", "--milestone", "840000"]);
         assert!(explicit.milestone().anchor.is_none());
@@ -934,6 +968,22 @@ mod tests {
         conf.apply_kv("prune_seqsigwit", "1").unwrap();
         conf.apply_kv("sp_tweaks", "1").unwrap();
         assert!(conf.validate().is_err());
+
+        // Electrum and Esplora do not require the scripthash index. The index
+        // may also stand alone, or run with either listener.
+        for argv in [
+            &["--electrum-listen"][..],
+            &["--esplora-listen"],
+            &["--sh-index"],
+            &["--sh-index", "--electrum-listen"],
+            &["--sh-index", "--esplora-listen"],
+        ] {
+            let mut args = vec!["rbitcoin-node", "--network", "regtest"];
+            args.extend_from_slice(argv);
+            ready_config(args)
+                .validate()
+                .unwrap_or_else(|e| panic!("{argv:?} must validate: {e}"));
+        }
     }
 
     include!("overlay_config_journey.rs");
