@@ -588,7 +588,11 @@ pub async fn ibd_cancellable(
         // (sparse far-ready used to look empty forever → header flood / drain livelock).
         // Full-batch continuation still fires from apply_peer_event; this is the poll.
         let path_empty = st.ordered.is_empty() && !st.headers_done;
-        if cadence.headers_due(now_cadence, path_empty) {
+        // A block inv is not a queue-depth event. Ask on this turn, not
+        // after the 500 ms header period, or the announced header waits
+        // behind a full queue.
+        let challenge_due = header_walk::inv_challenge_due(&st);
+        if cadence.headers_due(now_cadence, path_empty || challenge_due) {
             let live = st.ordered_set.len();
             let known_ready = st.body.known_len();
             let ready_gap = st.max_ordered_height.saturating_sub(st.max_ready_height);
@@ -598,35 +602,31 @@ pub async fn ibd_cancellable(
                 ready_gap,
                 (window as u32).saturating_mul(4).max(2048),
             ) && !st.header_walk.has_checkpoints();
-            let under_hard = live < MAX_ORDERED_HEADERS;
-            let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
             if should_unlatch_headers_done(&st, hub.tip_height().unwrap_or(0)) {
                 st.headers_done = false;
             }
-            if !st.headers_done
-                && under_hard
-                && (under_soft || need_ready_headroom || header_walk::wants_lookahead(&st))
-            {
-                let tip_h = hub.tip_height().unwrap_or(0);
-                let lag = header_lag_behind_peers(&st, tip_h);
-                let min_cache = window.saturating_mul(8).max(4096);
-                let alive = st.slots.iter().filter(|s| s.alive).count();
-                if live == 0 {
-                    let fan = empty_path_header_fan(&st, tip_h, alive);
-                    if fan == 0 {
-                        st.headers_done = true;
-                    } else {
-                        let _ = header_walk::send_getheaders(&mut st, &hub);
-                    }
-                } else {
-                    let want_more = live < min_cache
-                        || lag > 0
-                        || need_ready_headroom
-                        || header_walk::wants_lookahead(&st);
-                    if want_more {
-                        let _ = header_walk::send_getheaders(&mut st, &hub);
-                    }
+            let tip_h = hub.tip_height().unwrap_or(0);
+            let lag = header_lag_behind_peers(&st, tip_h);
+            let min_cache = window.saturating_mul(8).max(4096);
+            let alive = st.slots.iter().filter(|s| s.alive).count();
+            let fan = empty_path_header_fan(&st, tip_h, alive);
+            match header_walk::header_poll(
+                &st,
+                header_walk::HeaderPollIn {
+                    live,
+                    need_ready_headroom,
+                    lag,
+                    min_cache,
+                    fan,
+                },
+            ) {
+                header_walk::HeaderPoll::Ask => {
+                    let _ = header_walk::send_getheaders(&mut st, &hub);
                 }
+                header_walk::HeaderPoll::LatchDone => {
+                    st.headers_done = true;
+                }
+                header_walk::HeaderPoll::Wait => {}
             }
             cadence.mark_headers(now_cadence);
         }
@@ -795,11 +795,12 @@ pub async fn ibd_cancellable(
             let now = Instant::now();
             let window_secs = last_status.elapsed().as_secs_f64().max(0.001);
             let scan_t0 = Instant::now();
+            let horizon = header_walk::peer_horizon(&st);
             let prog = work_chain_progress(
                 hub.as_ref(),
                 &st.height_to_hash,
                 &mut st.body,
-                st.max_peer_height,
+                horizon,
                 st.max_ready_height,
             );
             loop_stats

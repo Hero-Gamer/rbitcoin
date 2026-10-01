@@ -66,7 +66,8 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 Do not enter Tip until IBD catch-up complete: no best-chain remainder
 (ordered / `height_to_hash` above tip / BQ ready ahead / awaiting reorg /
 on-path getdata) and path high water at or within 1 of max peer height
-(one-block version chatter only when `headers_done`). Competing
+(one-block version chatter only when `headers_done`), or a proven header
+walk at the tip that no connected peer can extend. Competing
 `hash_height` and leftover explore getdata are not remainder. Tip entry
 bulk-materializes SH (two Class A `txout` scans → identity-map key spills
 then fuse-hit postings → BDZ `scripthash.head/NN`; extract workers capped at

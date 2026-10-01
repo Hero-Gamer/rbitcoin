@@ -135,11 +135,16 @@ pub fn path_drained(st: &IbdWorkState) -> bool {
 ///
 /// `max_peer_height` may sit far above that path (less-work high-height fork
 /// or bogus `version.start_height`). Empty-EOF (`headers_done`) means we do
-/// not chase that height. A 2-block connecting-header hole still holds exit.
+/// not chase that height. Neither does a proven header walk at the tip that no
+/// connected peer can extend. A 2-block connecting-header hole still holds
+/// exit.
 #[inline]
 pub fn ibd_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
     if tip_h == 0 || best_chain_remainder(st, tip_h) {
         return false;
+    }
+    if super::header_walk::headers_complete(st, tip_h) {
+        return true;
     }
     match header_lag_behind_peers(st, tip_h) {
         0 => true,

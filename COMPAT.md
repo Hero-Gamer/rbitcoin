@@ -77,7 +77,7 @@ Full `/tx/:txid` JSON still has `vin[]`. Electrum has no outspend-vin surface.
 | GetData serve | Reconstruct/serve **16** (`MAX_SERVE_BLOCKS`) hashes per inbound message; leftover hashes in that `getdata` are dropped (RAM cap) | Core `ProcessGetData` can keep serving leftover hashes |
 | Inbound eviction victim | After Core-shaped protect (netgroup / recent block / recent tx / min-ping), disconnect the **longest-connected** remaining inbound | Core `SelectNodeToEvict` youngest in the oldest netgroup |
 | `--sptweaks-dust` | Serve-time floor default **1000** sat (omit P2TR outs `value <=` floor). **546** matches Cake electrs. Not Cake/Electrum protocol | n/a (Electrum tweaks are not Core) |
-| IBD empty-headers EOF | Empty `headers` to **our locator** + idle path latches `headers_done` even if a peer advertises a taller less-work height / junk `version.start_height` | Core header sync follows most-work; advertised `start_height` is not a remaining header count |
+| IBD empty-headers EOF | Empty `headers` to **our locator** + idle path latches `headers_done` even if a peer advertises a taller less-work height / junk `version.start_height`. A proven header walk at the tip that every taller peer failed to extend also ends IBD | Core header sync follows most-work; advertised `start_height` is not a remaining header count |
 
 Compact reconstruct fills short-ids from the live mempool graph, the
 orphanage, and a small `extra_compact` ring (cap 100): RBF-replaced and

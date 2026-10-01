@@ -5,9 +5,10 @@
 //! that have not failed the walk. Above the work floor, one short reply that
 //! leaves the candidate unextended retires that peer and the reservation
 //! moves. A full 2,000-header window does not, so a lighter fork can still
-//! catch up. A block inv from someone else is one challenge ask: a reply that
-//! beats the candidate takes the reservation, and any other reply leaves it
-//! where it was. The first ask starts at the stored tip.
+//! catch up. A block inv is one challenge ask when that peer is not already
+//! the walk's next ask: a reply that beats the candidate takes the
+//! reservation, and any other reply leaves it where it was. The first ask
+//! starts at the stored tip.
 //! A solicited reply that continues that tip is a checkpoint, and so is any
 //! solicited reply once the walk is ahead of the stored path, at any queue
 //! length. The refill lane asks from the queue tail while the queue is under
@@ -92,7 +93,7 @@ pub(crate) struct HeaderWalk {
     walk_quiet: HashSet<usize>,
     /// Peer that serves the walk and the refill. Not written to `header.adopt`.
     reserved: Option<usize>,
-    /// One walk ask owed after a block inv from a peer who is not reserved.
+    /// One walk ask owed after a block inv.
     challenge: Option<usize>,
     /// Challenge ask already sent. Judged when that peer replies or times out.
     challenge_open: Option<usize>,
@@ -310,6 +311,30 @@ pub(crate) fn wants_lookahead(st: &IbdWorkState) -> bool {
         .any(|s| s.alive && s.peer_height > tip && !st.header_walk.walk_quiet.contains(&s.id))
 }
 
+/// The proven walk is at or below the confirmed tip, and every connected
+/// peer that advertised more has failed to extend it.
+pub(crate) fn headers_complete(st: &IbdWorkState, tip_h: u32) -> bool {
+    st.header_walk.origin
+        && st.header_walk.proven
+        && st.header_walk.tip_height() <= tip_h
+        && !wants_lookahead(st)
+}
+
+/// Height the progress line counts toward. Before the walk has an origin,
+/// the advertised high-water mark. After that, the walk tip or the tallest
+/// connected peer still on the walk: a peer that disconnected or failed to
+/// extend the walk no longer sets it. Exit still uses `max_peer_height`.
+pub(crate) fn peer_horizon(st: &IbdWorkState) -> u32 {
+    if !st.header_walk.origin {
+        return st.max_peer_height;
+    }
+    st.slots
+        .iter()
+        .filter(|s| s.alive && !st.header_walk.walk_quiet.contains(&s.id))
+        .map(|s| s.peer_height)
+        .fold(st.header_walk.tip_height(), u32::max)
+}
+
 /// Candidate hash before a headers reply is applied.
 pub(crate) fn candidate_tip(st: &IbdWorkState) -> Option<BlockHash> {
     st.header_walk.tip_hash()
@@ -343,11 +368,19 @@ pub(crate) fn settle_walk_peer(
     st.header_walk.walk_quiet.insert(peer);
 }
 
-/// A block announcement may be a header this peer did not have. One walk
-/// ask follows when they are not already the reserved peer.
+/// A block announcement may be a header this peer has and we do not.
+///
+/// The reserved peer is already the walk's ask while some peer is still
+/// above the walk and this peer can serve it. Once that stops, their inv
+/// is the challenge: connect-time height does not move when a new block
+/// is found.
 pub(crate) fn note_block_inv(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
-    if st.header_walk.reserved != Some(peer) {
+    let above = st.header_walk.tip_height();
+    let walk_will_ask = st.header_walk.reserved == Some(peer)
+        && wants_lookahead(st)
+        && peer_can_head(st, peer, above);
+    if !walk_will_ask {
         st.header_walk.challenge = Some(peer);
     }
 }
@@ -420,13 +453,15 @@ pub(crate) fn peers_for_blocks(st: &IbdWorkState) -> Vec<usize> {
 /// Walk while a peer is taller than the walk. Refill while the walk is ahead
 /// of the stored path and the queue is under the soft cap. The reserved peer
 /// refills below [`ORDERED_REFILL_LOW`] and walks above it. A pending block-inv
-/// challenge is a walk ask, ahead of that refill.
+/// challenge is a walk ask, ahead of that refill, even when no peer's
+/// `version.start_height` is past the walk: that height is from connect time.
 fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
     let ahead = walk_ahead_of_queue(st, hub);
     let under_cap = st.ordered.len() < ORDERED_HEADERS_SOFT_CAP;
-    let mut want_walk = wants_lookahead(st);
+    let challenged = st.header_walk.challenge.is_some();
+    let mut want_walk = challenged || wants_lookahead(st);
     let mut want_refill = under_cap && ahead;
-    if st.header_walk.challenge.is_some() && want_walk {
+    if challenged {
         want_refill = false;
     } else if want_walk && want_refill {
         if st.ordered.len() < ORDERED_REFILL_LOW {
@@ -436,6 +471,63 @@ fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
         }
     }
     (want_walk, want_refill)
+}
+
+/// Inputs for one main-loop header poll. The loop owns the cadence clock.
+pub(crate) struct HeaderPollIn {
+    pub live: usize,
+    pub need_ready_headroom: bool,
+    pub lag: u32,
+    pub min_cache: usize,
+    pub fan: usize,
+}
+
+/// What the header poll should do with `headers_done` and `send_getheaders`.
+pub(crate) enum HeaderPoll {
+    /// Send getheaders.
+    Ask,
+    /// Empty path and peers are not ahead: latch `headers_done`.
+    LatchDone,
+    /// Leave header sync alone this turn.
+    Wait,
+}
+
+/// A block inv is waiting, and the walk lane is not already in flight.
+///
+/// An in-flight ask keeps the challenge until the lane clears. The poll
+/// must not call `send_getheaders` on every block event during that window.
+pub(crate) fn inv_challenge_due(st: &IbdWorkState) -> bool {
+    st.header_walk.challenge.is_some() && !lane_fresh(&st.header_walk.walk)
+}
+
+/// Decide the main-loop header poll.
+///
+/// A pending block-inv challenge is an ask even when the queue is at the
+/// soft cap, `headers_done` is latched, or no peer's connect-time height
+/// is past the walk.
+pub(crate) fn header_poll(st: &IbdWorkState, poll: HeaderPollIn) -> HeaderPoll {
+    if inv_challenge_due(st) {
+        return HeaderPoll::Ask;
+    }
+    if st.headers_done || poll.live >= super::MAX_ORDERED_HEADERS {
+        return HeaderPoll::Wait;
+    }
+    let under_soft = poll.live < ORDERED_HEADERS_SOFT_CAP;
+    if !(under_soft || poll.need_ready_headroom || wants_lookahead(st)) {
+        return HeaderPoll::Wait;
+    }
+    if poll.live == 0 {
+        return if poll.fan == 0 {
+            HeaderPoll::LatchDone
+        } else {
+            HeaderPoll::Ask
+        };
+    }
+    if poll.live < poll.min_cache || poll.lag > 0 || poll.need_ready_headroom || wants_lookahead(st)
+    {
+        return HeaderPoll::Ask;
+    }
+    HeaderPoll::Wait
 }
 
 /// A proven-chain reply that must not be written.
@@ -2988,6 +3080,159 @@ mod tests {
             "a short fork that does not beat the candidate ends the walk"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// One peer advertised a height no chain has. Once the walk is at the
+    /// confirmed tip and that peer cannot extend it, IBD is caught up.
+    #[test]
+    fn a_false_peer_height_does_not_hold_ibd_at_the_tip() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-exit");
+        hub.ensure_genesis().unwrap();
+        let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let third = rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            3,
+            op_true.clone(),
+            vec![],
+        );
+        let third_hash = third.block_hash();
+        let fourth =
+            rbitcoin_consensus::mine_regtest_paying(third_hash, time + 1, 4, op_true, vec![]);
+        let (mut liar, mut liar_rx) = slot(0);
+        liar.peer_height = 100_000;
+        let (mut honest, mut honest_rx) = slot(1);
+        honest.peer_height = 2;
+        let mut st = IbdWorkState::new(vec![liar, honest], hub.tip_hash(), Some(2));
+        assert_eq!(st.max_peer_height, 100_000);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        assert_eq!(
+            peer_horizon(&st),
+            100_000,
+            "a peer still on the walk sets the progress horizon"
+        );
+        apply(&mut st, &hub, 0, vec![third.header]);
+        assert_eq!(st.header_walk.tip_height(), 3);
+        hub.accept_block(third).unwrap();
+        assert_eq!(hub.tip_height(), Some(3));
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, 3),
+            "the advertised height is still a candidate"
+        );
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+        assert!(st.ordered.is_empty());
+        assert!(
+            crate::ibd::exit::ibd_caught_up(&st, 3),
+            "no peer can extend the walk past the confirmed tip"
+        );
+        assert_eq!(st.max_peer_height, 100_000);
+        assert_eq!(
+            peer_horizon(&st),
+            3,
+            "a retired peer's advertised height leaves the progress horizon"
+        );
+
+        // The honest peer's start height is below the walk. A block inv is
+        // still a header it has and we do not.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![fourth.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        match honest_rx.try_recv() {
+            Ok(PeerCmd::GetHeaders { locator }) => {
+                assert_eq!(locator[0], third_hash, "the ask starts at the walk tip");
+            }
+            Ok(_) => panic!("expected getheaders"),
+            Err(_) => panic!("the announcing peer was not asked for headers"),
+        }
+        assert_eq!(drain_getheaders(&mut liar_rx), 0);
+        apply(&mut st, &hub, 1, vec![fourth.header]);
+        assert_eq!(st.header_walk.tip_height(), 4);
+        assert_eq!(peer_horizon(&st), 4);
+        assert!(st.ordered_set.contains(&fourth.block_hash()));
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, 3),
+            "the announced block is still owed"
+        );
+    }
+
+    /// The header peer's connect-time height is the walk tip and the queue
+    /// is full. Their block inv is still a getheaders, on this poll.
+    #[test]
+    fn a_reserved_peer_block_inv_is_asked_with_a_full_queue() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-reserved-inv");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (mut peer, mut rx) = slot(0);
+        peer.peer_height = 100;
+        let mut st = IbdWorkState::new(vec![peer], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut rx), 1);
+        let _ = take_header_ask(&mut st, 0);
+        assert_eq!(st.header_walk.reserved, Some(0));
+        st.header_walk.tip.height = 100;
+        assert!(
+            !wants_lookahead(&st),
+            "connect-time height is not past the walk"
+        );
+        assert_eq!(st.ordered.len(), ORDERED_HEADERS_SOFT_CAP);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 0,
+                hashes: vec![BlockHash::from_byte_array([7u8; 32])],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert_eq!(
+            st.header_walk.challenge,
+            Some(0),
+            "the reserved header peer's inv is still a challenge"
+        );
+        assert!(
+            matches!(
+                header_poll(
+                    &st,
+                    HeaderPollIn {
+                        live: st.ordered_set.len(),
+                        need_ready_headroom: false,
+                        lag: 0,
+                        min_cache: 8192,
+                        fan: 0,
+                    },
+                ),
+                HeaderPoll::Ask
+            ),
+            "a full queue does not hold the announced header"
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(
+            matches!(rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })),
+            "the announcing peer was asked for headers"
+        );
     }
 
     #[test]
