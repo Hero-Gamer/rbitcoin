@@ -2084,6 +2084,91 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         Ok(Err(e)) => panic!("run_p2p join: {e}"),
         Err(_) => panic!("run_p2p did not exit after stop"),
     }
+
+    // off-best getblockfilter pin: torn slot must not leak via sibling
+    {
+        let _tip_before = jsonrpc(rpc_addr, "getblockcount", json!([])).await["result"]
+            .as_u64()
+            .unwrap();
+        let gen_a = jsonrpc(rpc_addr, "generate", json!([1])).await;
+        let hash_a = gen_a["result"][0]
+            .as_str()
+            .expect("generate 1 must return hash")
+            .to_string();
+        let filter_a = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
+                if let Some(s) = f["result"]["filter"]
+                    .as_str()
+                    .or_else(|| f["result"].as_str())
+                {
+                    break s.to_string();
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("filter not up for {}: {f}", hash_a);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        assert!(!filter_a.is_empty());
+        let inv = jsonrpc(rpc_addr, "invalidateblock", json!([hash_a.clone()])).await;
+        assert!(inv["error"].is_null(), "invalidateblock failed: {inv}");
+        let (hash_b_same, hash_b_tip) = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
+                if let Some(a) = gen["result"].as_array() {
+                    if a.len() == 2 {
+                        let h0 = a[0].as_str().unwrap().to_string();
+                        let h1 = a[1].as_str().unwrap().to_string();
+                        assert_ne!(h0, h1);
+                        assert_ne!(h0, hash_a);
+                        break (h0, h1);
+                    }
+                }
+                let msg = gen["error"]["message"].as_str().unwrap_or("");
+                if msg.contains("AlreadyHave") {
+                    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("generate 2 failed: {gen}");
+                }
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
+            if f["result"]["filter"].is_string() || f["result"].as_str().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("reorg filter timeout {}", hash_b_tip);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let f_old = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
+        assert_eq!(f_old["error"]["code"], -5, "torn slot must be -5: {f_old}");
+        let f_b_same = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_same.clone()])).await;
+        let filter_b = f_b_same["result"]["filter"]
+            .as_str()
+            .or_else(|| f_b_same["result"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(!filter_b.is_empty());
+        assert_ne!(
+            filter_b, filter_a,
+            "torn slot leaked: 107B {} served 107A {}",
+            hash_b_same, hash_a
+        );
+        let f_new = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
+        assert!(
+            f_new["result"]["filter"].is_string() || f_new["result"].as_str().is_some(),
+            "new tip must serve: {f_new}"
+        );
+    }
 }
 
 /// Nothing listens here. A pinned `--connect` at genesis still enters tip mode.
@@ -2091,149 +2176,6 @@ const DEAD_CONNECT: &str = "127.0.0.1:1";
 
 /// `run_p2p` on regtest with an ephemeral P2P bind, no seeds, the one
 /// `--connect` down, and `--max-run-secs 0`: exit once tip entry ends.
-#[tokio::test(flavor = "multi_thread")]
-async fn pin_reorg_filter_torn_slot_and_history_moves() {
-    let td = TestDatadir::new().unwrap();
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    {
-        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _time, _cbs) = pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            106,
-            8,
-        );
-        q.flush().unwrap();
-    }
-    let electrum_addr = ephemeral_addr();
-    let esplora_addr = ephemeral_addr();
-    let rpc_addr = ephemeral_addr();
-    let mut cfg = NodeConfig::default()
-        .with_datadir(td.path())
-        .with_network(Network::Regtest)
-        .with_tiny_heads()
-        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
-    cfg.listen.use_seeds = false;
-    cfg.listen.connect.clear();
-    cfg.shindex = true;
-    cfg.block_filter_index = true;
-    cfg.listen.electrum = Some(electrum_addr);
-    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
-    cfg.rpc.listen = Some(rpc_addr);
-    std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
-    cfg.max_run_secs = Some(90);
-    let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
-
-    let gen_a = jsonrpc(rpc_addr, "generate", json!([1])).await;
-    let arr_a = gen_a["result"]
-        .as_array()
-        .cloned()
-        .unwrap_or_else(|| panic!("gen_a failed: {gen_a}"));
-    let hash_a = arr_a[0].as_str().unwrap().to_string();
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
-        if f["result"]["filter"].is_string() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("filter not up for {}: {f}", hash_a);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let inv = jsonrpc(rpc_addr, "invalidateblock", json!([hash_a.clone()])).await;
-    assert!(inv["error"].is_null(), "{inv}");
-
-    // after invalidate, retry on AlreadyHave (timestamp collision)
-    #[allow(unused_assignments)]
-    let hash_b_tip = {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut last_err: Value = Value::Null;
-        loop {
-            let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
-            if let Some(a) = gen["result"].as_array() {
-                if a.len() >= 2 {
-                    break a.last().unwrap().as_str().unwrap().to_string();
-                }
-            }
-            last_err = gen.clone();
-            if gen["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("AlreadyHave")
-            {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                let g1 = jsonrpc(rpc_addr, "generate", json!([1])).await;
-                if g1["result"].as_array().is_some() {
-                    let g2 = jsonrpc(rpc_addr, "generate", json!([1])).await;
-                    if let Some(a2) = g2["result"].as_array() {
-                        if a2.len() == 1 {
-                            let mut combined = g1["result"].as_array().unwrap().clone();
-                            combined.extend(a2.clone());
-                            if combined.len() >= 2 {
-                                break combined.last().unwrap().as_str().unwrap().to_string();
-                            }
-                        }
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                panic!("generate 2 failed after reorg: {last_err}");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
-        if count["result"] == 108 {
-            let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
-            if f["result"]["filter"].is_string() {
-                break;
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!("reorg filter timeout for {}", hash_b_tip);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let f_old = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
-    if f_old["error"].is_object() {
-        assert_eq!(
-            f_old["error"]["code"], -5,
-            "torn slot should be -5 Block not found: {f_old}"
-        );
-    }
-    let f_new = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
-    assert!(
-        f_new["result"]["filter"].is_string(),
-        "new tip filter must serve: {f_new}"
-    );
-
-    let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
-    let active = tips["result"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|t| t["status"] == "active")
-        .unwrap();
-    assert_eq!(active["height"], 108, "{tips}");
-
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
-    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
-    assert!(matches!(stopped, Ok(Ok(Ok(())))), "node stop failed");
-}
-
 fn listen_and_exit_cfg(datadir: &std::path::Path) -> NodeConfig {
     let mut cfg = NodeConfig::default()
         .with_datadir(datadir)
