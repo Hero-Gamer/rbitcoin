@@ -347,15 +347,10 @@ pub(super) fn replay_status_due(elapsed_ms: u64) -> bool {
     elapsed_ms >= REPLAY_STATUS_MS
 }
 
-fn tip_window_start(tip: u32) -> u32 {
-    tip.saturating_sub(rbitcoin_store::VERIFY_TIP_BLOCKS - 1)
-}
-
 /// Rewrite spend annotations above the durable marker, then `sync_data` and advance it.
 ///
-/// Idempotent. A missing marker checks the last 6 heights. When those spends
-/// already match, the marker is published at the tip and nothing is rewritten.
-/// A mismatch replays every height above genesis.
+/// Idempotent. A missing marker has no device-flushed cursor, so every height
+/// above genesis is rewritten before the marker is published at the surviving tip.
 /// Returns how many heights were rewritten. Call this on process open after
 /// tip-window revalidation.
 pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
@@ -368,12 +363,8 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
         .map_err(ConsensusError::from)?;
     let a = match annotated {
         Some(h) => h.min(tip),
-        None if tip_window_matches(query, tip)? => {
-            publish_spend_marker(query, tip)?;
-            return Ok(0);
-        }
         None => {
-            rbitcoin_log::info!("store: tip spend window inconsistent; replaying (0, {tip}]");
+            rbitcoin_log::info!("store: no spend durable marker; replaying (0, {tip}]");
             0
         }
     };
@@ -424,123 +415,6 @@ fn rewrite_spend_heights(query: &Query, annotated: u32, tip: u32) -> Result<u32,
     }
     publish_spend_marker(query, tip)?;
     Ok(replayed)
-}
-
-fn tip_window_matches(query: &Query, tip: u32) -> Result<bool, ConsensusError> {
-    for h in tip_window_start(tip)..=tip {
-        if !height_spends_match(query, h)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn height_spends_match(query: &Query, height: u32) -> Result<bool, ConsensusError> {
-    let Some((_, rec)) = query
-        .header_at_height(rbitcoin_primitives::Height(height))
-        .map_err(ConsensusError::from)?
-    else {
-        return Err(ConsensusError::Store(StoreError::Corrupt(
-            "invariant: spend replay missing header",
-        )));
-    };
-    let Some((hfk, _)) = query
-        .get_header_by_hash(&rec.hash)
-        .map_err(ConsensusError::from)?
-    else {
-        return Ok(true);
-    };
-    let Some(tx_fks) = query
-        .store()
-        .header_txs
-        .get_list(hfk)
-        .map_err(ConsensusError::from)?
-    else {
-        return Ok(true);
-    };
-    for &spend_fk in &tx_fks {
-        if !tx_spends_match(query, spend_fk)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn tx_spends_match(
-    query: &Query,
-    spend_fk: rbitcoin_primitives::Fk,
-) -> Result<bool, ConsensusError> {
-    let (_meta, ins, _outs) = query
-        .store()
-        .get_tx_full(spend_fk)
-        .map_err(ConsensusError::from)?;
-    for (inp_i, inp) in ins.into_iter().enumerate() {
-        if inp.is_coinbase() {
-            continue;
-        }
-        let create_fk = if inp.create_fk.is_null() {
-            query
-                .store()
-                .get_fk_by_txid_tip(&inp.prev_txid)
-                .map_err(ConsensusError::from)?
-                .unwrap_or(rbitcoin_primitives::Fk::NULL)
-        } else {
-            inp.create_fk
-        };
-        if create_fk.is_null() {
-            continue;
-        }
-        let (multi, field, field_vin) = query
-            .store()
-            .txs
-            .get_output_spender_meta(create_fk, inp.prev_index)
-            .map_err(ConsensusError::from)?;
-        let vin = inp_i as u32;
-        if annotation_matches(query, multi, field, field_vin, spend_fk, vin)? {
-            continue;
-        }
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-fn annotation_matches(
-    query: &Query,
-    multi: bool,
-    field: rbitcoin_primitives::Fk,
-    field_vin: u32,
-    spend_fk: rbitcoin_primitives::Fk,
-    spend_vin: u32,
-) -> Result<bool, ConsensusError> {
-    if !multi {
-        return Ok(field == spend_fk && field_vin == spend_vin);
-    }
-    let mut cur = field;
-    let mut n = 0u32;
-    while let Some(id) = cur.get() {
-        n = n.saturating_add(1);
-        if spender_multi_list_capped(n) {
-            return Err(ConsensusError::Store(StoreError::Corrupt(
-                "invariant: spender multi-list cycle",
-            )));
-        }
-        let (sfk, vin, next) = query
-            .store()
-            .spenders
-            .get(rbitcoin_primitives::Fk(id))
-            .map_err(ConsensusError::from)?;
-        if sfk == spend_fk && vin == spend_vin {
-            return Ok(true);
-        }
-        cur = next;
-    }
-    Ok(false)
-}
-
-// `==` differs from `>` only at 1_000_000 links.
-#[mutants::skip]
-fn spender_multi_list_capped(n: u32) -> bool {
-    n > 1_000_000
 }
 
 fn annotate_slots_from_connected_hash(
@@ -697,30 +571,4 @@ pub(super) fn fill_planned_create_layout_after_commit(
         batch_parents.set_spent_range_only(fk, pair.spent);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod annotation_match_tests {
-    use super::{annotation_matches, tip_window_start};
-    use rbitcoin_primitives::Fk;
-
-    #[test]
-    fn replay_tip_window_starts_at_genesis_or_last_six_heights() {
-        assert_eq!(tip_window_start(0), 0);
-        assert_eq!(tip_window_start(5), 0);
-        assert_eq!(tip_window_start(20), 15);
-    }
-
-    #[test]
-    fn multi_spender_match_requires_transaction_and_input() {
-        let (dir, query) = rbitcoin_query::testutil::tiny_query_labeled("annotation-match");
-        let node = query.store().spenders.append(Fk(20), 4, Fk::NULL).unwrap();
-
-        assert!(annotation_matches(&query, true, node, 0, Fk(20), 4).unwrap());
-        assert!(!annotation_matches(&query, true, node, 0, Fk(20), 5).unwrap());
-        assert!(!annotation_matches(&query, true, node, 0, Fk(21), 4).unwrap());
-        assert!(!annotation_matches(&query, true, node, 0, Fk(21), 5).unwrap());
-
-        let _ = std::fs::remove_dir_all(dir.path());
-    }
 }

@@ -180,12 +180,17 @@ impl Store {
     }
 
     fn effective_checkblocks(&self, n: u32) -> Result<u32, StoreError> {
-        let durable =
-            crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.durable_through());
+        // A missing marker is not "durable through nothing". Heights below the
+        // last six can still be torn, and `n == 0` is the only whole-chain walk.
+        let Some(durable) =
+            crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.durable_through())
+        else {
+            return Ok(0);
+        };
         Ok(crate::spend_durable::widen_checkblocks(
             n,
             self.confirmed.tip_height().map(|h| h.0),
-            durable,
+            Some(durable),
         ))
     }
 
@@ -199,9 +204,10 @@ impl Store {
 
     /// Same as [`Self::revalidate_tip_window`] with an explicit window.
     ///
-    /// `n == 0` walks from genesis (Core `-checkblocks=0`). A durable-through
-    /// marker widens any other window to at least [`VERIFY_TIP_BLOCKS`] and
-    /// far enough to cover heights above that marker.
+    /// `n == 0` walks from genesis (Core `-checkblocks=0`). A missing
+    /// `spend_durable` marker is that same walk: nothing has been device-flushed.
+    /// A present marker widens any other window to at least [`VERIFY_TIP_BLOCKS`]
+    /// and far enough to cover heights above that marker.
     pub fn revalidate_tip_window_n(&self, n: u32) -> Result<TipRevalidateReport, StoreError> {
         let n = self.effective_checkblocks(n)?;
         let mut report = TipRevalidateReport::default();
@@ -816,11 +822,16 @@ mod tests {
         s.confirmed.set(Height(1), genesis_fk).unwrap();
         s.flush_class_c_tip().unwrap();
         s.headers.flush().unwrap();
+        // A marker at the tip keeps the default window short. Without one,
+        // `n == 6` is the whole chain.
+        crate::spend_durable::SpendDurable::new(9, 9)
+            .store(s.path())
+            .unwrap();
 
         let r6 = s.revalidate_tip_window_n(6).unwrap();
         assert!(
             r6.is_clean(),
-            "default window must not see height-1 poison: {r6:?}"
+            "a tip marker keeps the default window off height-1 poison: {r6:?}"
         );
         assert_eq!(s.confirmed.tip_height(), Some(Height(9)));
 
@@ -858,6 +869,41 @@ mod tests {
         let r = s.revalidate_tip_window_n(6).unwrap();
         assert_eq!(r.first_bad_height, Some(1), "{r:?}");
         assert!(r.tip_shrunk, "marker at 0 must include height 1: {r:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `spend_durable` means nothing has been device-flushed. A fault older
+    /// than the last 6 heights is still in the window.
+    #[test]
+    fn missing_marker_revalidates_from_genesis() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        let mut genesis_fk = Fk::NULL;
+        for h in 0u32..10 {
+            let rec = hdr(prev, parent_hash, h as u8);
+            parent_hash = rec.hash;
+            let fk = s.put_header(&rec).unwrap();
+            if h == 0 {
+                genesis_fk = fk;
+            }
+            prev = fk;
+            s.confirmed.set(Height(h), fk).unwrap();
+        }
+        s.confirmed.set(Height(1), genesis_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        s.headers.flush().unwrap();
+        assert!(crate::spend_durable::SpendDurable::load(s.path())
+            .unwrap()
+            .is_none());
+
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert_eq!(r.first_bad_height, Some(1), "{r:?}");
+        assert!(
+            r.tip_shrunk,
+            "a missing marker must walk from genesis, not the last 6: {r:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
