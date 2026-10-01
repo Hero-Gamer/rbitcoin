@@ -87,7 +87,8 @@ impl ChainParams {
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
             bip34_hash: Some(bip34_block_hash(
-                "000000000000024b89b42a942fe0d9fcb078ad50a8c5d6e8e4a0c9d3c3c0c62e",
+                // Core `consensus.BIP34Hash`: mainnet block 227931.
+                "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
             )),
         }
     }
@@ -524,13 +525,26 @@ mod tests {
         let main = ChainParams::mainnet();
         assert_eq!(main.btc.bip34_height, 227_931);
         let hash = main.bip34_hash.expect("mainnet BIP34 hash");
+        // Core chainparams `consensus.BIP34Hash` (block 227931). A look-alike
+        // that is not this header keeps BIP30 on for the whole mainnet IBD.
+        assert_eq!(
+            hash,
+            block_hash_from_display_hex(
+                "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+            )
+        );
         assert!(main.bip30_skipped_for_bip34_ancestry(227_932, Some(hash)));
         assert!(!main.bip30_skipped_for_bip34_ancestry(227_931, Some(hash)));
         assert!(!main.bip30_skipped_for_bip34_ancestry(BIP34_IMPLIES_BIP30_LIMIT, Some(hash)));
         assert!(!main.bip30_skipped_for_bip34_ancestry(227_932, None));
         let tn = ChainParams::testnet();
         assert_eq!(tn.btc.bip34_height, 21_111);
-        assert!(tn.bip34_hash.is_some());
+        assert_eq!(
+            tn.bip34_hash.expect("testnet BIP34 hash"),
+            block_hash_from_display_hex(
+                "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+            )
+        );
         assert!(ChainParams::signet().bip34_hash.is_none());
         assert!(ChainParams::regtest().bip34_hash.is_none());
         assert_eq!(ChainParams::regtest().btc.bip34_height, 100_000_000);
