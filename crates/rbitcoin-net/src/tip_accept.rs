@@ -359,9 +359,11 @@ mod tests {
             })
             .await
         });
+        // The lane is shared by every test in this binary. A journey that
+        // mines 100+ blocks is one job and can hold it for seconds under load.
         let t0 = Instant::now();
         while !started.load(Ordering::Acquire) {
-            assert!(t0.elapsed() < Duration::from_secs(2), "job never started");
+            assert!(t0.elapsed() < Duration::from_secs(60), "job never started");
             tokio::task::yield_now().await;
         }
         waiter.abort();
