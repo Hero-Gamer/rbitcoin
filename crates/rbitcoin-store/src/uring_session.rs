@@ -850,40 +850,51 @@ impl UringSession {
         }
     }
 
+    fn pool_inflight(&self) -> usize {
+        match &self.backend {
+            SessionBackend::Pool(pool) => pool.inflight(),
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(_) => 0,
+            #[cfg(windows)]
+            SessionBackend::Iocp(_) => 0,
+        }
+    }
+
+    fn pool_harvest_uds(&mut self) -> Vec<u64> {
+        match &mut self.backend {
+            SessionBackend::Pool(pool) => {
+                pool.harvest_ready().into_iter().map(|(ud, _)| ud).collect()
+            }
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(_) => Vec::new(),
+            #[cfg(windows)]
+            SessionBackend::Iocp(_) => Vec::new(),
+        }
+    }
+
+    fn pool_wait_harvest_uds(&mut self) -> Vec<u64> {
+        match &mut self.backend {
+            SessionBackend::Pool(pool) => {
+                let _ = pool.wait_one_cqe_timeout(DRAIN_WINDOW);
+                pool.harvest_ready().into_iter().map(|(ud, _)| ud).collect()
+            }
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(_) => Vec::new(),
+            #[cfg(windows)]
+            SessionBackend::Iocp(_) => Vec::new(),
+        }
+    }
+
     fn drain_all_pool(&mut self, fail_closed: bool) -> Result<(), StoreError> {
         let mut budget = DrainBudget::with_defaults();
         loop {
-            let inflight = match &self.backend {
-                SessionBackend::Pool(pool) => pool.inflight(),
-                #[cfg(target_os = "linux")]
-                SessionBackend::Uring(_) => 0,
-                #[cfg(windows)]
-                SessionBackend::Iocp(_) => 0,
-            };
-            if inflight == 0 {
-                let uds = match &mut self.backend {
-                    SessionBackend::Pool(pool) => {
-                        pool.harvest_ready().into_iter().map(|(ud, _)| ud).collect()
-                    }
-                    #[cfg(target_os = "linux")]
-                    SessionBackend::Uring(_) => Vec::new(),
-                    #[cfg(windows)]
-                    SessionBackend::Iocp(_) => Vec::new(),
-                };
+            if self.pool_inflight() == 0 {
+                let uds = self.pool_harvest_uds();
                 return self.apply_drain_cqes(uds);
             }
             let before = self.pending.len();
             let t0 = Instant::now();
-            let uds = match &mut self.backend {
-                SessionBackend::Pool(pool) => {
-                    let _ = pool.wait_one_cqe_timeout(DRAIN_WINDOW);
-                    pool.harvest_ready().into_iter().map(|(ud, _)| ud).collect()
-                }
-                #[cfg(target_os = "linux")]
-                SessionBackend::Uring(_) => Vec::new(),
-                #[cfg(windows)]
-                SessionBackend::Iocp(_) => Vec::new(),
-            };
+            let uds = self.pool_wait_harvest_uds();
             self.apply_drain_cqes(uds)?;
             let completed = before.saturating_sub(self.pending.len());
             self.apply_drain_window(&mut budget, completed, t0.elapsed(), fail_closed)?;
