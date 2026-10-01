@@ -3483,6 +3483,86 @@ fn reopen_mid_segment_then_seal_no_fuse_fn() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Mainnet 963556 (reardencode/rbitcoin#843): two confirm writes appended
+/// their bodies and then rejected on the planned-fk check, so Class A held
+/// 9,506 bodies the head never received. The segment rolled on entry count,
+/// the seal re-read a range that included those orphans, and the last 9,506
+/// real entries were dropped with the OA. Here: 10 orphan bodies, drain across
+/// a roll, then every indexed txid must resolve before and after reopen.
+#[test]
+fn orphan_class_a_bodies_do_not_drop_head_entries_at_seal() {
+    let dir = tempfile_dir("orphan-gap-seal");
+    // 8-bit: max_keys = floor(0.8*256) = 204.
+    let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+    let rec = |i: u64| {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        }
+    };
+    let orphan = |fk: u64| (51..=60).contains(&fk);
+    let check = |t: &TxTable, when: &str| {
+        let mut lost = Vec::new();
+        for fk in (1..=301u64).filter(|fk| !orphan(*fk)) {
+            if t.probe_body_match_fk(&rec(fk).txid).unwrap() != Some(Fk(fk)) {
+                lost.push(fk);
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "{when}: head lost {} entries: {lost:?}",
+            lost.len()
+        );
+    };
+    {
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let recs: Vec<TxRecord> = (1..=300).map(rec).collect();
+        let fks = t
+            .put_full_batch_indexed(&meta_only_items(&recs), /*index=*/ false)
+            .unwrap();
+        assert_eq!(fks.first(), Some(&Fk(1)));
+        // The rejected writes never queued their head entries.
+        let pending: Vec<([u8; 32], Fk)> = recs
+            .iter()
+            .zip(fks.iter())
+            .filter(|(_, fk)| !orphan(fk.0))
+            .map(|(r, fk)| (r.txid, *fk))
+            .collect();
+        t.flush().unwrap();
+        t.head_note_pending(&pending);
+        t.head_drain_pending().unwrap();
+        // One more create publishes the finished seal (OA unlinked).
+        let tail = t
+            .put_full_batch_indexed(&meta_only_items(&[rec(301)]), false)
+            .unwrap();
+        t.head_note_pending(&[(rec(301).txid, tail[0])]);
+        t.flush().unwrap();
+        t.head_drain_pending().unwrap();
+        t.flush_head().unwrap();
+        assert!(
+            t.head.sealed_segment_count() >= 1,
+            "segment 0 must have sealed"
+        );
+        check(&t, "live");
+        assert_eq!(
+            t.head.last_inserted_fk(),
+            301,
+            "coverage must reach the last fk"
+        );
+        t.flush().unwrap();
+    }
+    let t = TxTable::open_tiny(&dir).unwrap();
+    check(&t, "reopen");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Insert does not retain fuse keys; seal still membership-tests from Class A.
 #[test]
 fn seal_without_retained_keys_matches_fuse_contains() {

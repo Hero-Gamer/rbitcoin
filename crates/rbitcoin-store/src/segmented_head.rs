@@ -229,6 +229,8 @@ impl SegmentedTxHead {
         self.segments_snapshot().iter().filter(|s| s.sealed).count()
     }
 
+    /// Sum of segment fk spans. Equals the number of indexed creates unless
+    /// Class A holds bodies the head never received (those gap fks count too).
     pub fn occupied(&self) -> u64 {
         self.segments_snapshot()
             .iter()
@@ -376,7 +378,8 @@ impl SegmentedTxHead {
     /// Relativizes `entries` fks in place (absolute → segment-relative) then
     /// sorts that same buffer in the open HashHead — no extra pair copy.
     ///
-    /// Rolls when open count reaches `max_keys` (80% of slots). Publish drains
+    /// Rolls when the open segment's fk span reaches `max_keys` (80% of slots),
+    /// or the next fk lies past that span. Publish drains
     /// on the next `insert_many`, [`Self::flush`], or `Drop` — not joined on
     /// the roll that started it. Seal keys are collected on the sidecar from
     /// `txid.body` (crash-reopen stays on the open thread).
@@ -410,6 +413,7 @@ impl SegmentedTxHead {
 
         self.try_publish_seal_locked()?;
 
+        // Callers pass non-decreasing absolute fks. `count` is the span, not the entry count.
         let mut i = 0usize;
         while i < entries.len() {
             self.ensure_open_for(entries[i].1 .0)?;
@@ -425,11 +429,27 @@ impl SegmentedTxHead {
                 self.roll_tail_background_locked(collect.clone())?;
                 continue;
             }
-            let room = self.max_keys - count;
-            let take = (entries.len() - i).min(room as usize);
-            let batch = &mut entries[i..i + take];
             let first_fk = last.first_fk;
+            let span_end = first_fk.saturating_add(self.max_keys);
+            let take = entries[i..]
+                .iter()
+                .take_while(|(_, fk)| fk.0 < span_end)
+                .count();
+            if take == 0 {
+                // The next fk lies past this segment's span (a gap at its end).
+                // An empty segment wholly inside the gap claims its full span,
+                // or the roll is a no-op (count == 0) and this loop never ends.
+                // A gap of k whole spans costs k serial seals here; on mainnet
+                // that needs a gap of max_keys (~26.8M) orphan bodies.
+                if count == 0 {
+                    last.count.store(self.max_keys, Ordering::Relaxed);
+                }
+                self.roll_tail_background_locked(collect.clone())?;
+                continue;
+            }
+            let batch = &mut entries[i..i + take];
 
+            let mut max_rel = count;
             for (_mixed, fk) in batch.iter_mut() {
                 if fk.0 < first_fk {
                     return Err(StoreError::Corrupt("tx.head insert fk before segment"));
@@ -438,17 +458,17 @@ impl SegmentedTxHead {
                 if rel == 0 || rel > u32::MAX as u64 {
                     return Err(StoreError::Corrupt("tx.head relative fk overflow"));
                 }
+                max_rel = max_rel.max(rel);
                 *fk = Fk(rel);
             }
             last.head
                 .as_ref()
                 .ok_or(StoreError::Corrupt("tx.head insert: open missing OA"))?
                 .insert_many_in_place(batch)?;
-            last.count.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            last.count.fetch_max(max_rel, Ordering::Relaxed);
             i += take;
 
-            let new_count = last.count.load(Ordering::Relaxed);
-            if new_count >= self.max_keys {
+            if max_rel >= self.max_keys {
                 self.roll_tail_background_locked(collect.clone())?;
             }
         }
@@ -1336,6 +1356,146 @@ mod tests {
             Err(other) => panic!("expected INDEX_REFUSE_FLAT_HEAD, got {other}"),
         }
         assert!(dir.join("tx.head.meta").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Class A can hold bodies the head never gets (a write that appends and
+    /// then rejects on the planned-fk check). The inserted fk stream then has
+    /// a gap. A segment must still seal exactly the fks it holds: the last
+    /// entries before the roll must stay findable after the seal publishes.
+    #[test]
+    fn fk_gap_before_roll_keeps_entries_findable_after_seal() {
+        let dir = tmp();
+        // 8-bit head: 256 slots, max_keys = floor(0.8*256) = 204.
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        // Production collect reads txids for the fk range from txid.body,
+        // which also holds the orphan bodies the head never saw.
+        let collect: SealCollect = std::sync::Arc::new(|first_fk, count| {
+            Ok((0..count)
+                .map(|i| (fuse_key_from_mixed(&mixed(first_fk + i)), (i as u32) + 1))
+                .collect())
+        });
+        let orphans = 51..=60u64;
+        let mut entries: Vec<_> = (1..=300u64)
+            .filter(|fk| !orphans.contains(fk))
+            .map(|fk| (mixed(fk), Fk(fk)))
+            .collect();
+        h.insert_many_with(&mut entries, collect.clone()).unwrap();
+        h.flush().unwrap();
+        // The next insert publishes the finished seal (OA unlinked).
+        h.insert_many_with(&mut [(mixed(301), Fk(301))], collect)
+            .unwrap();
+        assert!(h.sealed_segment_count() >= 1, "segment 0 must have sealed");
+
+        let mut lost = Vec::new();
+        for fk in (1..=301u64).filter(|fk| !orphans.contains(fk)) {
+            let cands = h.probe_candidates(&mixed(fk)).unwrap();
+            if !cands.contains(&Fk(fk)) {
+                lost.push(fk);
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "head lost {} entries: {lost:?}",
+            lost.len()
+        );
+        assert_eq!(h.last_inserted_fk(), 301, "coverage must reach the last fk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gap at the very end of a segment's span rolls on the next fk (the
+    /// `take == 0` path), and the result still reopens: `open` requires
+    /// `first_fk + count` of one segment to equal the next segment's first_fk.
+    #[test]
+    fn fk_gap_at_segment_end_rolls_and_reopens() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let collect: SealCollect = std::sync::Arc::new(|first_fk, count| {
+            Ok((0..count)
+                .map(|i| (fuse_key_from_mixed(&mixed(first_fk + i)), (i as u32) + 1))
+                .collect())
+        });
+        // fks 195..=210 are orphans: the span of segment 0 (1..=204) ends
+        // inside the gap, and 211 is the first fk past it.
+        let orphan = |fk: u64| (195..=210).contains(&fk);
+        {
+            let h = SegmentedTxHead::create(&dir, layout).unwrap();
+            let mut entries: Vec<_> = (1..=260u64)
+                .filter(|fk| !orphan(*fk))
+                .map(|fk| (mixed(fk), Fk(fk)))
+                .collect();
+            h.insert_many_with(&mut entries, collect.clone()).unwrap();
+            h.flush().unwrap();
+            h.insert_many_with(&mut [(mixed(261), Fk(261))], collect)
+                .unwrap();
+            h.flush().unwrap();
+            assert_eq!(h.first_fks_snapshot(), vec![1, 195]);
+            assert_eq!(h.last_inserted_fk(), 261);
+        }
+        let h = SegmentedTxHead::open(&dir).unwrap();
+        for fk in (1..=261u64).filter(|fk| !orphan(*fk)) {
+            assert!(
+                h.probe_candidates(&mixed(fk)).unwrap().contains(&Fk(fk)),
+                "fk={fk} lost after reopen"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gap longer than a whole segment: the empty segments inside it must
+    /// roll (not spin), and entries on both sides stay findable after reopen.
+    #[test]
+    fn fk_gap_longer_than_a_segment_rolls_empty_spans() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let collect: SealCollect = std::sync::Arc::new(|first_fk, count| {
+            Ok((0..count)
+                .map(|i| (fuse_key_from_mixed(&mixed(first_fk + i)), (i as u32) + 1))
+                .collect())
+        });
+        // max_keys = 204; orphans 150..=700 cover more than two full spans.
+        let orphan = |fk: u64| (150..=700).contains(&fk);
+        let live: Vec<u64> = (1..=760u64).filter(|fk| !orphan(*fk)).collect();
+        {
+            let h = SegmentedTxHead::create(&dir, layout).unwrap();
+            let mut entries: Vec<_> = live.iter().map(|&fk| (mixed(fk), Fk(fk))).collect();
+            h.insert_many_with(&mut entries, collect.clone()).unwrap();
+            h.flush().unwrap();
+            h.insert_many_with(&mut [(mixed(761), Fk(761))], collect)
+                .unwrap();
+            h.flush().unwrap();
+            assert_eq!(h.last_inserted_fk(), 761);
+        }
+        let h = SegmentedTxHead::open(&dir).unwrap();
+        for fk in live.iter().copied().chain([761]) {
+            assert!(
+                h.probe_candidates(&mixed(fk)).unwrap().contains(&Fk(fk)),
+                "fk={fk} lost"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A later fk behind the open segment's `first_fk` is refused. Callers
+    /// pass non-decreasing absolute fks; this path does not reorder them.
+    #[test]
+    fn fk_behind_open_segment_is_corrupt() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let collect: SealCollect = std::sync::Arc::new(|first_fk, count| {
+            Ok((0..count)
+                .map(|i| (fuse_key_from_mixed(&mixed(first_fk + i)), (i as u32) + 1))
+                .collect())
+        });
+        // 300 opens the segment; 5 is behind that first_fk. max_keys = 204.
+        let mut entries = [(mixed(300), Fk(300)), (mixed(5), Fk(5))];
+        let err = h.insert_many_with(&mut entries, collect).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(m) if m == "tx.head insert fk before segment"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2870,8 +2870,8 @@ impl TxTable {
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
     ///
-    /// Rolls the open OA at 80% slots (`max_keys`). Class A loc/body size
-    /// does not cut `tx.head` shards.
+    /// Rolls the open OA when its fk span reaches 80% slots (`max_keys`).
+    /// Class A loc/body size does not cut `tx.head` shards.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
