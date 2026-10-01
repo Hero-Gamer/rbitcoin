@@ -364,6 +364,11 @@ mod tests {
         }
     }
 
+    /// Phase, header-lag, scripthash-lag, and tip-age boundaries. One live
+    /// node would need a header fork, a stalled index, and a tip older than
+    /// `--max-tip-age` at once. `node_listen_and_exit` owns the HTTP answers
+    /// a probe sees: live during initial block download, ready after a fresh
+    /// block, and 503 when a listener did not bind.
     #[test]
     fn readiness_reports_the_first_failing_gate() {
         let mut cases = Vec::new();
@@ -446,22 +451,6 @@ mod tests {
         for (snap, want) in cases {
             assert_eq!(readiness(&snap), want, "{snap:?}");
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn opening_node_is_live_but_not_ready() {
-        let addr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
-        let _h = run_health(addr, NodeStatus::new(Network::Regtest, false), false)
-            .await
-            .unwrap();
-        assert_eq!(get(addr, "/healthz").await, "HTTP/1.1 200 OK|ok\n");
-        assert_eq!(
-            get(addr, "/readyz").await,
-            "HTTP/1.1 503 Service Unavailable|not ready: opening\n"
-        );
     }
 
     /// A blocking task cannot be cancelled, so a request that times out must
