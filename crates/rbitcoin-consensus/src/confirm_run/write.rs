@@ -230,11 +230,7 @@ pub fn confirm_write_phase(
 
         let spend_ann_ns = post_commit(query, &slots)?;
         if let Some(tip) = query.tip_height() {
-            let sync_ns = query
-                .store()
-                .note_spend_durable_batch(tip.0)
-                .map_err(ConsensusError::from)?;
-            rbitcoin_query::note_confirm(&query.confirm_stats().spend_durable_ns, sync_ns);
+            query.store().note_spend_snapshot(tip.0);
         }
         Ok((
             out,

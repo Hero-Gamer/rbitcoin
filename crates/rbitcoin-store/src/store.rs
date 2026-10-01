@@ -279,10 +279,8 @@ pub struct Store {
     height_fence: std::sync::RwLock<HeightFence>,
     /// BIP113 window at the fence tip (extend O(1); pop rebuilds).
     mtp_ring: std::sync::RwLock<MtpRing>,
-    /// Confirm batches since the last spend/body `sync_data`.
-    spend_batches: std::sync::atomic::AtomicU32,
-    /// Unix ms of that sync. The interval starts at process open.
-    spend_synced_ms: std::sync::atomic::AtomicU64,
+    /// Latest confirm height plus one. Zero means no snapshot yet.
+    spend_snapshot: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
@@ -370,8 +368,7 @@ impl Store {
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
-            spend_batches: std::sync::atomic::AtomicU32::new(0),
-            spend_synced_ms: std::sync::atomic::AtomicU64::new(crate::spend_durable::unix_ms()),
+            spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -433,8 +430,7 @@ impl Store {
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
-            spend_batches: std::sync::atomic::AtomicU32::new(0),
-            spend_synced_ms: std::sync::atomic::AtomicU64::new(crate::spend_durable::unix_ms()),
+            spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -1569,8 +1565,10 @@ impl Store {
     }
 
     /// `sync_data` the stems replay and the tip window read, then publish the marker at `tip`.
+    ///
+    /// Open replay calls this while confirm is stopped. The periodic checkpoint
+    /// uses [`Self::checkpoint_spend_through`] and does not publish a later tip.
     pub fn sync_spend_durable(&self, tip: u32) -> Result<u64, StoreError> {
-        use std::sync::atomic::Ordering;
         let t = std::time::Instant::now();
         let tip = match self.confirmed.tip_height() {
             Some(h) => tip.min(h.0),
@@ -1579,25 +1577,39 @@ impl Store {
         self.txs.sync_replay_bodies()?;
         self.spenders.flush()?;
         crate::spend_durable::SpendDurable::new(tip, tip).store(self.path())?;
-        self.spend_batches.store(0, Ordering::Release);
-        self.spend_synced_ms
-            .store(crate::spend_durable::unix_ms(), Ordering::Release);
         Ok(t.elapsed().as_nanos() as u64)
     }
 
-    /// Count one confirm batch. Returns sync nanoseconds, or 0 when the period has not elapsed.
-    pub fn note_spend_durable_batch(&self, tip: u32) -> Result<u64, StoreError> {
+    /// Record the confirmed height whose annotations have been written.
+    ///
+    /// This is not a durability claim. The checkpoint thread reads it before
+    /// `sync_data` and publishes that height only.
+    pub fn note_spend_snapshot(&self, tip: u32) {
         use std::sync::atomic::Ordering;
-        let n = self
-            .spend_batches
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        let now = crate::spend_durable::unix_ms();
-        let at = self.spend_synced_ms.load(Ordering::Acquire);
-        if !crate::spend_durable::spend_sync_due(n, now.saturating_sub(at)) {
-            return Ok(0);
+        self.spend_snapshot
+            .store(u64::from(tip).saturating_add(1), Ordering::Release);
+    }
+
+    pub fn spend_snapshot_height(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        match self.spend_snapshot.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(v.saturating_sub(1) as u32),
         }
-        self.sync_spend_durable(tip)
+    }
+
+    /// `sync_data` the replay stems, then publish `A = D = height` when the
+    /// confirmed tip is still at least `height`. A lower tip leaves the marker.
+    pub fn checkpoint_spend_through(&self, height: u32) -> Result<(), StoreError> {
+        self.txs.sync_replay_data()?;
+        self.spenders.sync_data_only()?;
+        let Some(tip) = self.confirmed.tip_height().map(|h| h.0) else {
+            return Ok(());
+        };
+        if tip < height {
+            return Ok(());
+        }
+        crate::spend_durable::SpendDurable::new(height, height).store(self.path())
     }
 
     /// A disconnect below the marker lowers both heights to the new tip.

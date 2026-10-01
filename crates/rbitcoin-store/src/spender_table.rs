@@ -112,6 +112,10 @@ impl SpenderTable {
         self.body.flush()
     }
 
+    pub(crate) fn sync_data_only(&self) -> Result<(), StoreError> {
+        self.body.sync_data_only()
+    }
+
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()
     }

@@ -233,6 +233,40 @@ fn missing_marker_replays_a_spend_below_the_tip_window() {
 }
 
 #[test]
+fn confirms_past_eight_batches_wait_for_an_explicit_checkpoint() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-checkpoint");
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    for h in 1..=9 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    assert!(
+        !q.store()
+            .path()
+            .join(rbitcoin_store::SPEND_DURABLE_NAME)
+            .is_file(),
+        "confirm must not publish the marker"
+    );
+    let h = q.store().spend_snapshot_height().unwrap();
+    assert_eq!(h, 9);
+    let b = mine(tip, tip_time + 600, 10, Vec::new());
+    accept_and_connect_block(&q, &params, Height(10), &b, ms).unwrap();
+    assert_eq!(q.store().spend_snapshot_height(), Some(10));
+    q.store().checkpoint_spend_through(h).unwrap();
+    let raw = std::fs::read(q.store().path().join(rbitcoin_store::SPEND_DURABLE_NAME)).unwrap();
+    assert_eq!(u32::from_le_bytes(raw[8..12].try_into().unwrap()), h);
+    assert_eq!(u32::from_le_bytes(raw[12..16].try_into().unwrap()), h);
+    let _ = dir;
+}
+
+#[test]
 fn replay_status_is_ten_seconds() {
     assert!(!super::write::replay_status_due(9_999));
     assert!(super::write::replay_status_due(10_000));

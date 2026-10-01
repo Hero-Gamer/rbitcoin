@@ -2937,6 +2937,17 @@ impl TxTable {
         Ok(())
     }
 
+    /// Device barrier for those bodies. Does not publish their high-water marks.
+    pub(crate) fn sync_replay_data(&self) -> Result<(), StoreError> {
+        self.body.sync_data_only()?;
+        self.seqsigwit.sync_data_only()?;
+        self.spent.sync_data_only()?;
+        self.txids.sync_data_only()?;
+        self.txstat.sync_data_only()?;
+        self.input.sync_data_only()?;
+        Ok(())
+    }
+
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
         self.seqsigwit.flush_async()?;
