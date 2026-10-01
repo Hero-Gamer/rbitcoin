@@ -429,13 +429,15 @@ pub(crate) fn peers_for_blocks(st: &IbdWorkState) -> Vec<usize> {
 /// Walk while a peer is taller than the walk. Refill while the walk is ahead
 /// of the stored path and the queue is under the soft cap. The reserved peer
 /// refills below [`ORDERED_REFILL_LOW`] and walks above it. A pending block-inv
-/// challenge is a walk ask, ahead of that refill.
+/// challenge is a walk ask, ahead of that refill, even when no peer's
+/// `version.start_height` is past the walk: that height is from connect time.
 fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
     let ahead = walk_ahead_of_queue(st, hub);
     let under_cap = st.ordered.len() < ORDERED_HEADERS_SOFT_CAP;
-    let mut want_walk = wants_lookahead(st);
+    let challenged = st.header_walk.challenge.is_some();
+    let mut want_walk = challenged || wants_lookahead(st);
     let mut want_refill = under_cap && ahead;
-    if st.header_walk.challenge.is_some() && want_walk {
+    if challenged {
         want_refill = false;
     } else if want_walk && want_refill {
         if st.ordered.len() < ORDERED_REFILL_LOW {
@@ -3012,12 +3014,15 @@ mod tests {
             hub.tip_hash().unwrap(),
             time,
             3,
-            op_true,
+            op_true.clone(),
             vec![],
         );
+        let third_hash = third.block_hash();
+        let fourth =
+            rbitcoin_consensus::mine_regtest_paying(third_hash, time + 1, 4, op_true, vec![]);
         let (mut liar, mut liar_rx) = slot(0);
         liar.peer_height = 100_000;
-        let (mut honest, _honest_rx) = slot(1);
+        let (mut honest, mut honest_rx) = slot(1);
         honest.peer_height = 2;
         let mut st = IbdWorkState::new(vec![liar, honest], hub.tip_hash(), Some(2));
         assert_eq!(st.max_peer_height, 100_000);
@@ -3041,6 +3046,37 @@ mod tests {
         assert!(
             crate::ibd::exit::ibd_caught_up(&st, 3),
             "no peer can extend the walk past the confirmed tip"
+        );
+
+        // The honest peer's start height is below the walk. A block inv is
+        // still a header it has and we do not.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![fourth.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        match honest_rx.try_recv() {
+            Ok(PeerCmd::GetHeaders { locator }) => {
+                assert_eq!(locator[0], third_hash, "the ask starts at the walk tip");
+            }
+            Ok(_) => panic!("expected getheaders"),
+            Err(_) => panic!("the announcing peer was not asked for headers"),
+        }
+        assert_eq!(drain_getheaders(&mut liar_rx), 0);
+        apply(&mut st, &hub, 1, vec![fourth.header]);
+        assert_eq!(st.header_walk.tip_height(), 4);
+        assert!(st.ordered_set.contains(&fourth.block_hash()));
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, 3),
+            "the announced block is still owed"
         );
     }
 
