@@ -460,6 +460,17 @@ mod tests {
         assert_eq!(block_individual_p10_sat_kvb(&rows, 100), Some(10_000));
         assert_eq!(block_individual_p10_sat_kvb(&[(1, 400)], 100), None);
         assert_eq!(block_individual_p10_sat_kvb(&[], 100), None);
+
+        assert_eq!(
+            block_individual_p10_sat_kvb(&[(1, 5), (3, 10)], 100),
+            Some(500),
+            "a 5-WU transaction occupies two vbytes after ceiling"
+        );
+        assert_eq!(
+            block_individual_p10_sat_kvb(&[(1, 5), (18, 72)], 100),
+            Some(500),
+            "two vbytes out of twenty place the first transaction exactly at p10"
+        );
     }
 
     #[test]

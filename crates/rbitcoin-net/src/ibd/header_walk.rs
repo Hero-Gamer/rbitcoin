@@ -837,9 +837,6 @@ fn tip_from_checkpoint(c: &Checkpoint) -> WalkTip {
         hash: Some(c.hash),
         height: c.height,
         work: Work::from_be_bytes(c.work),
-        header: c.header,
-        times: c.times.clone(),
-        diff: c.diff,
         ..WalkTip::default()
     }
 }
@@ -849,10 +846,6 @@ fn tip_from_base(st: &IbdWorkState) -> WalkTip {
         hash: st.header_walk.base_hash,
         height: st.header_walk.base_height,
         work: Work::from_be_bytes(st.header_walk.base_work),
-        diff: st.header_walk.base_diff,
-        milestone_hash: st.header_walk.tip.milestone_hash,
-        milestone_prev: st.header_walk.tip.milestone_prev,
-        milestone_header: st.header_walk.tip.milestone_header,
         ..WalkTip::default()
     }
 }
@@ -878,7 +871,6 @@ fn note_challenger(
         hash: Some(fork_hash),
         height: fork_height,
         work: parent_work,
-        header: parent_header(st, hub, fork_hash),
         times: times_ending_at(st, hub, fork_hash),
         diff: diff_at(st, hub, fork_hash),
         ..WalkTip::default()
@@ -4292,6 +4284,123 @@ mod tests {
     }
 
     #[test]
+    fn a_challenger_can_extend_past_the_current_tip() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-challenger-extend");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let common = mine(gen, 1);
+        let current = mine(common.block_hash(), 2);
+        let current_tip = mine(current.block_hash(), 3);
+        let side = mine(common.block_hash(), 12);
+        let side_tip = mine(side.block_hash(), 13);
+        let heavier = mine(side_tip.block_hash(), 14);
+        hub.milestone.height = 4;
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, vec![common]);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, vec![current, current_tip]);
+        assert_eq!(st.header_walk.tip_hash(), Some(current_tip.block_hash()));
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![side_tip.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        apply(&mut st, &hub, 1, vec![side, side_tip]);
+        assert_eq!(st.header_walk.tip_hash(), Some(current_tip.block_hash()));
+        assert!(st.header_walk.challenger.is_some());
+
+        apply(&mut st, &hub, 1, vec![heavier]);
+        assert_eq!(st.header_walk.tip_hash(), Some(heavier.block_hash()));
+        assert_eq!(st.header_walk.tip_height(), 4);
+        assert!(st.header_walk.challenger.is_none());
+        assert_eq!(
+            hub.query.milestone_header_at(4),
+            Some(heavier.block_hash().to_byte_array())
+        );
+    }
+
+    #[test]
+    fn a_challenger_keeps_its_median_time_context() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-challenger-mtp");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let chain = (1..=12).fold((Vec::new(), gen), |(mut headers, prev), n| {
+            let header = mine(prev, n);
+            headers.push(header);
+            (headers, header.block_hash())
+        });
+        let main = chain.0;
+        let side12 = mine(main[10].block_hash(), 32);
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, main[..11].to_vec());
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, main[11..].to_vec());
+        let current_tip = main[11].block_hash();
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![side12.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        apply(&mut st, &hub, 1, vec![side12]);
+        assert!(st.header_walk.challenger.is_some());
+
+        let side_times = st
+            .header_walk
+            .challenger
+            .as_ref()
+            .unwrap()
+            .tip
+            .times
+            .clone();
+        let mtp = rbitcoin_primitives::median_time_past_times(&side_times);
+        let invalid = mine_at(side12.block_hash(), 40, mtp);
+        apply(&mut st, &hub, 1, vec![invalid]);
+        assert_eq!(st.header_walk.tip_hash(), Some(current_tip));
+        assert_eq!(
+            st.header_walk.challenger.as_ref().unwrap().tip.hash,
+            Some(side12.block_hash())
+        );
+
+        let valid = mine_at(side12.block_hash(), 41, mtp + 1);
+        apply(&mut st, &hub, 1, vec![valid]);
+        assert_eq!(st.header_walk.tip_hash(), Some(valid.block_hash()));
+    }
+
+    #[test]
     fn refill_under_the_low_water_mark_stays_on_the_reserved_peer() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-one-peer-refill");
         hub.ensure_genesis().unwrap();
@@ -4938,9 +5047,10 @@ mod tests {
 
     #[test]
     fn restored_checkpoint_times_accept_a_header_under_the_tip_time() {
-        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-mtp");
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-mtp");
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
+        floor_unreachable(&mut hub);
         let mut prev = gen;
         let mut chain = Vec::new();
         for n in 1..=12 {
@@ -4967,6 +5077,13 @@ mod tests {
         apply(&mut st, &hub, 0, vec![soft]);
         assert_eq!(st.header_walk.tip_hash(), Some(soft.block_hash()));
         assert!(st.slots[0].alive);
+
+        apply(&mut st, &hub, 0, vec![]);
+        assert_eq!(st.header_walk.tip_hash(), Some(tip.block_hash()));
+        let mtp = rbitcoin_primitives::median_time_past_times(&st.header_walk.tip.times);
+        let invalid = mine_at(tip.block_hash(), 14, mtp);
+        apply(&mut st, &hub, 0, vec![invalid]);
+        assert_eq!(st.header_walk.tip_hash(), Some(tip.block_hash()));
     }
 
     #[test]
@@ -5053,6 +5170,50 @@ mod tests {
         apply(&mut st, &hub, 0, heavier);
         assert_eq!(st.header_walk.tip_hash(), Some(heavy_tip));
         assert!(st.slots[0].alive);
+    }
+
+    #[test]
+    fn a_rewound_walk_uses_the_confirmed_base_work_and_height() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-base-context");
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(5, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let base_height = hub.tip_height().unwrap();
+        let base_hash = hub.tip_hash().unwrap();
+        let base_header = hub.tip_header().unwrap();
+        floor_unreachable(&mut hub);
+        let (s0, _rx0) = slot(0);
+        let mut st = IbdWorkState::new(vec![s0], Some(base_hash), Some(base_height));
+        fill_queue(&mut st);
+        let first = mine_at(base_hash, 50, base_header.time + 1);
+        let second = mine_at(first.block_hash(), 51, base_header.time + 2);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![first, second]);
+        apply(&mut st, &hub, 0, vec![]);
+        assert_eq!(st.header_walk.tip_hash(), Some(base_hash));
+        assert_eq!(st.header_walk.tip_height(), base_height);
+        assert_eq!(
+            st.header_walk.tip.work,
+            Work::from_be_bytes(st.header_walk.base_work)
+        );
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        apply(&mut st, &hub, 0, vec![first, second]);
+        assert_eq!(st.header_walk.tip_hash(), Some(second.block_hash()));
+        assert_eq!(st.header_walk.tip_height(), base_height + 2);
+
+        let parent = hub
+            .query
+            .wire_header_at_height(rbitcoin_primitives::Height(base_height - 1))
+            .unwrap();
+        let side = mine_at(parent.block_hash(), 52, parent.time + 1);
+        apply(&mut st, &hub, 0, vec![side]);
+        assert_eq!(
+            st.header_walk.tip_hash(),
+            Some(second.block_hash()),
+            "one less-work header from the confirmed parent does not replace the walk"
+        );
     }
 
     fn arm_retarget(hub: &mut crate::chain::ChainHub) {
@@ -5179,6 +5340,58 @@ mod tests {
     }
 
     #[test]
+    fn a_challenger_keeps_its_retarget_snapshot() {
+        let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-challenger-retarget");
+        hub.ensure_genesis().unwrap();
+        arm_retarget(&mut hub);
+        let gen = hub.tip_hash().unwrap();
+        let genesis = hub.header_of(&gen).unwrap();
+        let main = extend_chain(&hub, &genesis, &[], 22, 1);
+        let side = extend_chain(&hub, &genesis, &main[..20], 21, 2);
+        floor_unreachable(&mut hub);
+        hub.milestone.height = 41;
+        let (first, mut first_rx) = slot(0);
+        let (second, mut second_rx) = slot(1);
+        let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+        fill_queue(&mut st);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, main[..20].to_vec());
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let _ = drain_getheaders(&mut first_rx);
+        apply(&mut st, &hub, 0, main[20..].to_vec());
+        assert_eq!(st.header_walk.tip_height(), 22);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![side[0].block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut second_rx), 1);
+        apply(&mut st, &hub, 1, vec![side[0]]);
+        assert_eq!(st.header_walk.tip_hash(), Some(main[21].block_hash()));
+        assert!(st.header_walk.challenger.is_some());
+
+        apply(&mut st, &hub, 1, side[1..].to_vec());
+        assert_eq!(st.header_walk.tip_height(), 41);
+        assert_eq!(st.header_walk.tip_hash(), Some(side[20].block_hash()));
+        assert!(st.header_walk.challenger.is_none());
+        assert_eq!(
+            hub.query.milestone_header_at(41),
+            Some(side[20].block_hash().to_byte_array())
+        );
+    }
+
+    #[test]
     fn rewind_restores_difficulty_before_the_next_retarget() {
         let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-retarget-rewind");
         hub.ensure_genesis().unwrap();
@@ -5213,6 +5426,8 @@ mod tests {
             36,
             "an empty reply below the floor steps back one checkpoint"
         );
+        let checkpoint_work = Work::from_be_bytes(st.header_walk.checkpoints.last().unwrap().work);
+        assert_eq!(st.header_walk.tip.work, checkpoint_work);
         let next = extend_chain(&hub, &genesis, &chain[..36], 20, 3);
         let tip = next.last().unwrap().block_hash();
         assert!(send_getheaders(&mut st, &hub).unwrap());
@@ -5223,6 +5438,14 @@ mod tests {
         );
         assert_eq!(st.header_walk.tip_height(), 56);
         assert_eq!(st.header_walk.tip_hash(), Some(tip));
+
+        let lighter = extend_chain(&hub, &genesis, &[], 55, 4);
+        apply(&mut st, &hub, 0, lighter);
+        assert_eq!(
+            st.header_walk.tip_hash(),
+            Some(tip),
+            "work before the restored checkpoint still counts when comparing a lighter fork"
+        );
     }
 
     #[test]

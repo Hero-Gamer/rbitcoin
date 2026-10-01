@@ -5534,6 +5534,23 @@ mod tests {
     }
 
     #[test]
+    fn fee_history_without_a_chain_is_exhausted_without_a_scan() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+
+        let stats = hub.backfill_block_fee_history();
+
+        assert_eq!(stats.tip_height, None);
+        assert_eq!(stats.heights_scanned, 0);
+        assert_eq!(stats.txstat_bytes, 0);
+        assert!(stats.history_exhausted);
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn fee_history_file_survives_a_restart_and_drops_heights_off_the_chain() {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
 
