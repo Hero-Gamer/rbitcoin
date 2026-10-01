@@ -10,8 +10,9 @@ use std::time::UNIX_EPOCH;
 pub(super) const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// One scrape. Chain reads may touch the store and the mempool totals take
-/// its lock, so call from the blocking pool. Cost: one peer snapshot and one
-/// fold over the mempool (the same fold as `getmempoolinfo`).
+/// its lock, so call from the blocking pool. Cost: those chain reads
+/// (`best_header_height`, tip header, `in_ibd`, scripthash lag), one peer
+/// snapshot, and one mempool fold (the same fold as `getmempoolinfo`).
 pub(super) fn render(status: &NodeStatus) -> String {
     let mut out = Exposition::default();
     out.family(
@@ -58,7 +59,7 @@ pub(super) fn render(status: &NodeStatus) -> String {
     if rss_kb > 0 {
         out.gauge(
             "process_resident_memory_bytes",
-            "Resident memory size in bytes (ibd: sizes rss=).",
+            "Resident memory size in bytes. ibd: sizes rss= is the same reading in MiB.",
             rss_kb * 1024,
         );
     }

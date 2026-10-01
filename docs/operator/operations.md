@@ -401,11 +401,14 @@ A k8s `httpGet` probe connects to the pod IP, so in a pod use
 
 ### Metrics
 
-`--metrics` (needs `--health-listen`) adds `GET /metrics`. Each gauge is a
-value the node already publishes on RPC or a log line, under a name that
-says which. A scrape reads a few atomics and one peer snapshot, and folds
-the mempool once for `rbitcoin_mempool_bytes` (the same fold as
-`getmempoolinfo`) on the blocking pool.
+`--metrics` (needs `--health-listen`) adds `GET /metrics`. Gauges are values
+the node already publishes on RPC or a log line, under a name that says
+which. Counters are the process-lifetime totals behind the 5s DEBUG
+`tip: perf` line; that line still prints only the change since its previous
+sample. A scrape runs on the blocking pool: chain reads
+(`best_header_height`, the tip header, `in_ibd`, and scripthash lag with
+`--sh-index`), one peer snapshot, and one mempool fold for
+`rbitcoin_mempool_bytes` (the same fold as `getmempoolinfo`).
 
 | Metric | Type | Equals |
 |--------|------|--------|
@@ -420,11 +423,11 @@ the mempool once for `rbitcoin_mempool_bytes` (the same fold as
 | `rbitcoin_mempool_transactions` | gauge | `getmempoolinfo.size` |
 | `rbitcoin_mempool_bytes` | gauge | `getmempoolinfo.bytes` (virtual size) |
 | `rbitcoin_scripthash_lag_blocks` | gauge | `tip: accept sh_lag=` (with `--sh-index`) |
-| `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | `tip: perf esplora req=` / `avg_us` × `req` |
-| `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | `tip: perf electrum req=` / `avg_us` × `req` |
-| `rbitcoin_block_serve_total` / `_bytes_total` | counter | `tip: perf serve n=` / `bytes=` |
-| `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | `tip: perf accepts=` / `rejects=` |
-| `process_resident_memory_bytes` | gauge | `ibd: sizes rss=` (Linux and macOS) |
+| `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf esplora req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
+| `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf electrum req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
+| `rbitcoin_block_serve_total` / `_bytes_total` | counter | Lifetime sum of `tip: perf serve n=` / `bytes=`. That line is the last ~5s window |
+| `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | Lifetime sum of `tip: perf accepts=` / `rejects=`. That line is the last ~5s window |
+| `process_resident_memory_bytes` | gauge | Same RSS reading as `ibd: sizes rss=` and `tip: perf rss=`, in bytes (`rss_kb * 1024`). Those lines print integer MiB (`rss_kb / 1024`). Linux and macOS |
 | `process_start_time_seconds` | gauge | Unix time `rbitcoin-node` started |
 
 Hub gauges appear once P2P has started. `/metrics` exposes peer and mempool
