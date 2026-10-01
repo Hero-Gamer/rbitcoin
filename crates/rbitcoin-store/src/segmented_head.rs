@@ -413,15 +413,7 @@ impl SegmentedTxHead {
 
         self.try_publish_seal_locked()?;
 
-        // A segment owns the fk *span* [first_fk, first_fk + count): the next
-        // segment starts at first_fk + count (`open` checks that), and the seal
-        // re-reads exactly that range from Class A. Class A can hold bodies the
-        // head never receives (a write that appends, then rejects on the
-        // planned-fk check), so the inserted fk stream can have gaps. `count`
-        // is the highest relative fk, not the number of entries, and entries
-        // are routed by fk. Counting entries let a gap push real entries past
-        // the span the seal covers; they vanished when the OA was unlinked.
-        entries.sort_by_key(|(_, fk)| fk.0);
+        // Callers pass non-decreasing absolute fks. `count` is the span, not the entry count.
         let mut i = 0usize;
         while i < entries.len() {
             self.ensure_open_for(entries[i].1 .0)?;
@@ -1482,6 +1474,28 @@ mod tests {
                 "fk={fk} lost"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A later fk behind the open segment's `first_fk` is refused. Callers
+    /// pass non-decreasing absolute fks; this path does not reorder them.
+    #[test]
+    fn fk_behind_open_segment_is_corrupt() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let collect: SealCollect = std::sync::Arc::new(|first_fk, count| {
+            Ok((0..count)
+                .map(|i| (fuse_key_from_mixed(&mixed(first_fk + i)), (i as u32) + 1))
+                .collect())
+        });
+        // 300 opens the segment; 5 is behind that first_fk. max_keys = 204.
+        let mut entries = [(mixed(300), Fk(300)), (mixed(5), Fk(5))];
+        let err = h.insert_many_with(&mut entries, collect).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt(m) if m == "tx.head insert fk before segment"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
