@@ -342,8 +342,7 @@ pub(crate) fn localaddresses_json(ctx: &RpcContext) -> Value {
 pub(crate) fn getnetworkinfo(ctx: &RpcContext) -> Value {
     let (cin, cout, timeoffset) = if let Some(hub) = ctx.peers.as_ref() {
         let rows = hub.snapshot();
-        let cin = rows.iter().filter(|p| p.inbound).count() as u64;
-        let cout = rows.iter().filter(|p| !p.inbound).count() as u64;
+        let (cin, cout) = rbitcoin_net::connection_counts(&rows);
         (cin, cout, outbound_median_time_offset(&rows))
     } else {
         (0, ctx.connections.load(Ordering::Relaxed), 0)

@@ -124,6 +124,7 @@ fn pin_argv_usage_errors() {
         &["--log-level"],
         &["--log-level", "loud"],
         &["--electrum-listen", "bad"],
+        &["--health-listen", "bad"],
         &["--api-log"],
         &["--asmap"],
         &["--conf"],
@@ -234,6 +235,7 @@ fn pin_validate_refusals(td: &TestDatadir) {
         ("chainwork-not-hex", &["--min-chain-work=test"][..]),
         ("challenge-off-signet", &["--signet-challenge", "51"]),
         ("tweaks-and-pruning", &["--sp-tweaks", "--prune-seqsigwit"]),
+        ("metrics-without-health", &["--metrics"]),
     ] {
         assert!(exit_is(smoke(td, name, args), 1), "{name} must refuse");
     }

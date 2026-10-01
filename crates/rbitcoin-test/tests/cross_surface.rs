@@ -13,6 +13,7 @@ use rbitcoin_primitives::{Height, Network};
 use rbitcoin_query::Query;
 use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -156,6 +157,111 @@ async fn jsonrpc_unix(path: &std::path::Path, method: &str, params: Value) -> Va
         .unwrap_or(text.as_ref())
         .trim();
     serde_json::from_str(json).unwrap_or_else(|e| panic!("unix rpc {method} json: {e} body={text}"))
+}
+
+/// `--health-listen` answers `GET /healthz` in every phase; nothing else is a route.
+async fn pin_healthz(health_addr: SocketAddr) {
+    assert_eq!(http_get(health_addr, "/healthz").await, (200, "ok".into()));
+    let (st, body) = http_post(health_addr, "/healthz", "").await;
+    assert_eq!(st, 405, "POST /healthz: {body}");
+    let (st, body) = http_get(health_addr, "/nope").await;
+    assert_eq!(st, 404, "unknown health path: {body}");
+}
+
+/// `/readyz` once `run_p2p` is past bring-up (opening … indexing).
+async fn readyz_after_startup(health_addr: SocketAddr) -> (u16, String) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (st, body) = http_get(health_addr, "/readyz").await;
+        let starting = ["opening", "starting", "catch-up", "indexing"]
+            .iter()
+            .any(|p| body == format!("not ready: {p}"));
+        if !starting || Instant::now() >= deadline {
+            return (st, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `GET /metrics` in the Prometheus text format: one value per series.
+async fn scrape_metrics(health_addr: SocketAddr) -> HashMap<String, f64> {
+    let mut stream = TcpStream::connect(health_addr)
+        .await
+        .expect("metrics connect");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut text = String::new();
+    stream.read_to_string(&mut text).await.unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("http headers");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: text/plain; version=0.0.4; charset=utf-8"),
+        "{head}"
+    );
+    body.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (series, v) = l.rsplit_once(' ').unwrap_or_else(|| panic!("sample: {l}"));
+            let v = v.parse().unwrap_or_else(|_| panic!("sample value: {l}"));
+            (series.to_string(), v)
+        })
+        .collect()
+}
+
+/// Every `/metrics` gauge that names an RPC field equals that field.
+async fn pin_metrics_equal_rpc(
+    health_addr: SocketAddr,
+    rpc_addr: SocketAddr,
+    ready: bool,
+) -> HashMap<String, f64> {
+    let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await["result"].clone();
+    let net = jsonrpc(rpc_addr, "getnetworkinfo", json!([])).await["result"].clone();
+    let mempool = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await["result"].clone();
+    let m = scrape_metrics(health_addr).await;
+    let num = |v: &Value| v.as_f64().unwrap_or_else(|| panic!("number: {v}"));
+    let flag = |b: bool| if b { 1.0 } else { 0.0 };
+    let build = format!(
+        "rbitcoin_build_info{{version=\"{}\",network=\"regtest\"}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (series, want) in [
+        (build.as_str(), 1.0),
+        ("rbitcoin_phase{phase=\"following\"}", 1.0),
+        ("rbitcoin_phase{phase=\"opening\"}", 0.0),
+        ("rbitcoin_ready", flag(ready)),
+        ("rbitcoin_blocks", num(&chain["blocks"])),
+        ("rbitcoin_headers", num(&chain["headers"])),
+        ("rbitcoin_tip_time_seconds", num(&chain["time"])),
+        (
+            "rbitcoin_initial_block_download",
+            flag(chain["initialblockdownload"] == true),
+        ),
+        (
+            "rbitcoin_connections{direction=\"in\"}",
+            num(&net["connections_in"]),
+        ),
+        (
+            "rbitcoin_connections{direction=\"out\"}",
+            num(&net["connections_out"]),
+        ),
+        ("rbitcoin_mempool_transactions", num(&mempool["size"])),
+        ("rbitcoin_mempool_bytes", num(&mempool["bytes"])),
+    ] {
+        assert_eq!(m.get(series), Some(&want), "{series}: {m:?}");
+    }
+    assert!(m["rbitcoin_scripthash_lag_blocks"] <= 6.0, "{m:?}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let started = m["process_start_time_seconds"];
+    assert!(started <= now && started > now - 600.0, "{m:?}");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert!(m["process_resident_memory_bytes"] > 0.0, "{m:?}");
+    m
 }
 
 async fn pin_address_prefix_404(esplora_addr: SocketAddr) {
@@ -1033,6 +1139,67 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     }
 }
 
+/// A configured listener that did not bind keeps `/readyz` at 503 while the
+/// node follows the tip. RPC only warns on a bind failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn readyz_names_a_listener_that_did_not_bind() {
+    let td = TestDatadir::new().unwrap();
+    {
+        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(
+            &q,
+            &ChainParams::regtest(),
+            Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        q.flush().unwrap();
+    }
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let health_addr = ephemeral_addr();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect.clear();
+    cfg.rpc.listen = Some(taken.local_addr().unwrap());
+    cfg.listen.health = Some(health_addr);
+    cfg.max_run_secs = Some(5);
+    let node = tokio::spawn(run_p2p(cfg));
+    wait_listeners(&[health_addr]).await;
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: rpc not listening".into())
+    );
+    let (st, body) = http_get(health_addr, "/metrics").await;
+    assert_eq!(st, 404, "/metrics without --metrics: {body}");
+    let stopped = tokio::time::timeout(Duration::from_secs(20), node).await;
+    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
+}
+
+/// The health listener binds before the store opens: a taken port stops the
+/// node with nothing written to the datadir.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_listen_bind_failure_stops_before_store_open() {
+    let td = TestDatadir::new().unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads();
+    cfg.listen.health = Some(taken.local_addr().unwrap());
+    let err = run_p2p(cfg).await.unwrap_err().to_string();
+    assert!(err.contains("health listen"), "{err}");
+    assert!(
+        !td.store_path().exists(),
+        "store opened before the health bind"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
@@ -1059,6 +1226,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let electrum_addr = ephemeral_addr();
     let esplora_addr = ephemeral_addr();
     let rpc_addr = ephemeral_addr();
+    let health_addr = ephemeral_addr();
 
     let mut cfg = NodeConfig::default()
         .with_datadir(td.path())
@@ -1072,6 +1240,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
+    cfg.listen.health = Some(health_addr);
+    cfg.metrics = true;
     // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
     let rpc_sock = td.path().join("run").join("rpc.sock");
     cfg.apply_kv("rpc_socket", rpc_sock.to_str().unwrap())
@@ -1080,7 +1250,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.max_run_secs = Some(90);
 
     let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
+    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr, health_addr]).await;
+    pin_healthz(health_addr).await;
     pin_address_prefix_404(esplora_addr).await;
     #[cfg(unix)]
     {
@@ -1106,6 +1277,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(count["result"], 106, "{count}");
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], true, "{chain}");
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: initial block download".into()),
+        "/readyz agrees with RPC initialblockdownload"
+    );
     let mpinfo = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
     assert_eq!(mpinfo["result"]["relay_enabled"], false, "{mpinfo}");
     let tips = jsonrpc(rpc_addr, "getchaintips", json!([])).await;
@@ -1668,6 +1844,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let (st, body) = http_get(esplora_addr, "/fee-estimates").await;
     assert_eq!(st, 503, "GET /fee-estimates: {body}");
 
+    let metrics_in_ibd = pin_metrics_equal_rpc(health_addr, rpc_addr, false).await;
+    assert!(
+        metrics_in_ibd["rbitcoin_mempool_transactions"] > 0.0,
+        "{metrics_in_ibd:?}"
+    );
     let tip_before = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await;
     let tip_hash = tip_before["result"].as_str().expect("tip hash").to_string();
     pin_waitforblockheight_timeout_zero_behind(rpc_addr, 106, &tip_hash).await;
@@ -1799,6 +1980,34 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     }
     let chain = jsonrpc(rpc_addr, "getblockchaininfo", json!([])).await;
     assert_eq!(chain["result"]["initialblockdownload"], false, "{chain}");
+    assert_eq!(
+        chain["result"]["headers"], chain["result"]["blocks"],
+        "{chain}"
+    );
+    assert_eq!(http_get(health_addr, "/readyz").await, (200, "ok".into()));
+    let metrics_ready = pin_metrics_equal_rpc(health_addr, rpc_addr, true).await;
+    for total in [
+        "rbitcoin_esplora_requests_total",
+        "rbitcoin_esplora_request_seconds_total",
+        "rbitcoin_electrum_requests_total",
+        "rbitcoin_electrum_request_seconds_total",
+        "rbitcoin_block_serve_total",
+        "rbitcoin_block_serve_bytes_total",
+        "rbitcoin_mempool_accepts_total",
+        "rbitcoin_mempool_rejects_total",
+    ] {
+        assert!(
+            metrics_ready[total] >= metrics_in_ibd[total],
+            "{total} counts up: {metrics_in_ibd:?} then {metrics_ready:?}"
+        );
+    }
+    for total in [
+        "rbitcoin_esplora_requests_total",
+        "rbitcoin_electrum_requests_total",
+        "rbitcoin_mempool_accepts_total",
+    ] {
+        assert!(metrics_in_ibd[total] >= 1.0, "{total}: {metrics_in_ibd:?}");
+    }
 
     let relay_parent = acs_spend(
         relay_cb,

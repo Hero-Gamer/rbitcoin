@@ -100,6 +100,8 @@ Clean smoke:
 | `--electrum-listen [ADDR]` | `electrum_listen=` | disabled; omit ADDR → `127.0.0.1:50001`. Address/scripthash methods need `--sh-index` |
 | `--esplora-listen [ADDR\|PATH]` | `esplora_listen=` | disabled (Esplora REST); omit ADDR → `127.0.0.1:3000`; a filesystem path is unix HTTP (mode **0660**, dummy `Host: api` is fine). Address/scripthash methods need `--sh-index` |
 | `--esplora-onion[=0\|1]` | `esplora_onion=` | **on** — `ADD_ONION` for Esplora when `--tor-control` is set |
+| `--health-listen [ADDR]` | `health_listen=` | disabled; omit ADDR → `127.0.0.1:9332`. Unauthenticated `GET /healthz` and `/readyz`, bound before the store opens ([Health probes and metrics](#health-probes-and-metrics)). A bind failure stops the node |
+| `--metrics[=0\|1]` | `metrics=` | **off** — Prometheus `GET /metrics` on the health listener. Refused without `--health-listen` |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
@@ -343,6 +345,100 @@ uniformly slow pack). Slow or constrained uplinks: [Slow / constrained uplink
 **Class A `txout` / `seqsigwit` / `spent` + `create.loc` / `seqsigwit.loc`, `tx.head`, header head,
 SH head/body, and spenders are fd pread/pwrite**.
 Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
+
+## Health probes and metrics
+
+`--health-listen [ADDR]` binds a small HTTP listener at the very start of
+`rbitcoin-node`, before the store opens. RPC, Electrum, and Esplora bind
+only after the store opens, catch-up finishes, and the scripthash index
+materializes; on mainnet those can take minutes (a schema backfill) to
+hours (IBD). The health listener answers through all of it.
+
+| Route | Answer |
+|-------|--------|
+| `GET /healthz` | `200 ok` in every phase. The process is up and serving HTTP |
+| `GET /readyz` | `200 ok` when the node follows the tip and every configured listener is up; otherwise `503 not ready: <reason>` |
+| `GET /metrics` | Prometheus text format with `--metrics`; 404 without it |
+
+Other paths are 404 and other methods 405. Requests carry no body and no
+auth, and time out after 5 s (408). `/readyz` runs at most 4 checks at
+once and `/metrics` one render at a time; past that a request answers 503
+at once (`not ready: busy`, `metrics: a scrape is already running`)
+instead of queueing, and a timed-out check keeps its slot until it
+returns. A non-loopback bind logs a WARN: keep the port on loopback or a
+probe-only network.
+
+`/readyz` reports the first failing check, in this order:
+
+| Reason | Meaning |
+|--------|---------|
+| `busy` | 4 checks are already running, so this one did not start |
+| `opening` | Store open: schema migration, backfill, spend replay |
+| `starting` | P2P, mempool, and proxy bring-up |
+| `catch-up` | Initial block download |
+| `indexing` | Tip-mode entry (scripthash materialize), follow peers, listeners |
+| `stopping` | Shutdown flush |
+| `rpc not listening` (also `electrum`, `esplora`) | That listener is configured but did not bind. Its start only warns, so the node keeps following |
+| `initial block download` | Same value as RPC `getblockchaininfo.initialblockdownload` (`--max-tip-age`, `--min-chain-work`). Latches off after the first exit, as in Core |
+| `tip stale (last block Ns ago)` | The non-latching half of that check: the tip block is older than `--max-tip-age` (default 24h). This still fires after IBD has latched off, so a node that later loses every peer stops being ready |
+| `tip N blocks behind headers` | `headers - blocks` is over 6 |
+| `scripthash index N blocks behind tip` | With `--sh-index`, the index trails the tip by more than 6 (`sh_lag=` on `tip: accept`) |
+
+Point liveness at `/healthz` and readiness at `/readyz`. Never use `/readyz`
+for liveness: a restart during a migration or IBD starts that work over.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 9332 }
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: 9332 }
+  periodSeconds: 10
+```
+
+A k8s `httpGet` probe connects to the pod IP, so in a pod use
+`--health-listen 0.0.0.0:9332` and keep the port off any Service.
+
+### Metrics
+
+`--metrics` (needs `--health-listen`) adds `GET /metrics`. Gauges are values
+the node already publishes on RPC or a log line, under a name that says
+which. Counters are the process-lifetime totals behind the 5s DEBUG
+`tip: perf` line; that line still prints only the change since its previous
+sample. A scrape runs on the blocking pool: chain reads
+(`best_header_height`, the tip header, `in_ibd`, and scripthash lag with
+`--sh-index`), one peer snapshot, and one mempool fold for
+`rbitcoin_mempool_bytes` (the same fold as `getmempoolinfo`).
+
+| Metric | Type | Equals |
+|--------|------|--------|
+| `rbitcoin_build_info{version,network}` | gauge | `1`; version and `network=` from the startup line |
+| `rbitcoin_phase{phase}` | gauge | `1` for the current `/readyz` phase, `0` for the others |
+| `rbitcoin_ready` | gauge | `1` when `/readyz` is 200 |
+| `rbitcoin_blocks` | gauge | `getblockchaininfo.blocks` |
+| `rbitcoin_headers` | gauge | `getblockchaininfo.headers` |
+| `rbitcoin_tip_time_seconds` | gauge | `getblockchaininfo.time` |
+| `rbitcoin_initial_block_download` | gauge | `getblockchaininfo.initialblockdownload` |
+| `rbitcoin_connections{direction="in"\|"out"}` | gauge | `getnetworkinfo.connections_in` / `connections_out` |
+| `rbitcoin_mempool_transactions` | gauge | `getmempoolinfo.size` |
+| `rbitcoin_mempool_bytes` | gauge | `getmempoolinfo.bytes` (virtual size) |
+| `rbitcoin_scripthash_lag_blocks` | gauge | `tip: accept sh_lag=` (with `--sh-index`) |
+| `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf esplora req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
+| `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf electrum req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
+| `rbitcoin_block_serve_total` / `_bytes_total` | counter | Lifetime sum of `tip: perf serve n=` / `bytes=`. That line is the last ~5s window |
+| `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | Lifetime sum of `tip: perf accepts=` / `rejects=`. That line is the last ~5s window |
+| `process_resident_memory_bytes` | gauge | Same RSS reading as `ibd: sizes rss=` and `tip: perf rss=`, in bytes (`rss_kb * 1024`). Those lines print integer MiB (`rss_kb / 1024`). Linux and macOS |
+| `process_start_time_seconds` | gauge | Unix time `rbitcoin-node` started |
+
+Hub gauges appear once P2P has started. `/metrics` exposes peer and mempool
+counts: do not publish it without a firewall.
+
+```yaml
+scrape_configs:
+  - job_name: rbitcoin
+    static_configs:
+      - targets: ["127.0.0.1:9332"]
+```
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 
