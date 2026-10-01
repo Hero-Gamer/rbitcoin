@@ -171,15 +171,15 @@ impl AnalogHistory {
                 .iter()
                 .map(|&(before, ahead)| ((before - now).abs(), ahead))
                 .collect();
-            nearest.select_nth_unstable_by(ANALOG_MIN_NEIGHBORS - 1, |a, b| a.0.total_cmp(&b.0));
+            nearest.select_nth_unstable_by(ANALOG_MIN_NEIGHBORS.saturating_sub(1), |a, b| {
+                a.0.total_cmp(&b.0)
+            });
             outcomes = nearest[..ANALOG_MIN_NEIGHBORS]
                 .iter()
                 .map(|&(_, ahead)| ahead)
                 .collect();
         }
-        let i = ((confidence * outcomes.len() as f64).ceil() as usize)
-            .saturating_sub(1)
-            .min(outcomes.len() - 1);
+        let i = ((confidence * outcomes.len() as f64).ceil() as usize).saturating_sub(1);
         Some(*outcomes.select_nth_unstable(i).1)
     }
 }
@@ -196,6 +196,13 @@ mod tests {
     fn history(targets: &[u32], hurdles: impl IntoIterator<Item = u64>) -> AnalogHistory {
         let mut h = AnalogHistory::new(targets);
         h.rebuild(hurdles);
+        h
+    }
+
+    fn paired_history(now: u64, pairs: impl IntoIterator<Item = (f64, u64)>) -> AnalogHistory {
+        let mut h = AnalogHistory::new(&[1]);
+        h.hurdles = VecDeque::from([now, now, now]);
+        h.depths[0].pairs = pairs.into_iter().collect();
         h
     }
 
@@ -265,6 +272,66 @@ mod tests {
         let h = history(&[2], hurdles);
         let rate = h.rate_sat_kvb(2, 0.5).unwrap();
         assert!(rate >= 1_000, "{rate}");
+    }
+
+    #[test]
+    fn analog_band_includes_its_exact_upper_boundary() {
+        let pairs = std::iter::repeat_n((0.0, 1_000), ANALOG_READY_PAIRS - 1)
+            .chain([(ANALOG_BAND.ln(), 50_000)]);
+        let h = paired_history(1, pairs);
+
+        assert_eq!(h.rate_sat_kvb(1, 1.0), Some(50_000));
+    }
+
+    #[test]
+    fn analog_band_filters_on_absolute_log_distance() {
+        let now = 10_000u64;
+        let center = (now as f64).ln();
+        let pairs = std::iter::repeat_n((center, 1_000), ANALOG_MIN_NEIGHBORS + 50)
+            .chain(std::iter::repeat_n((center + 0.1, 50_000), 50))
+            .chain(std::iter::repeat_n(
+                (center + 1.0, 90_000),
+                ANALOG_READY_PAIRS - ANALOG_MIN_NEIGHBORS - 100,
+            ));
+        let h = paired_history(now, pairs);
+
+        assert_eq!(h.rate_sat_kvb(1, 0.9), Some(50_000));
+    }
+
+    #[test]
+    fn analog_neighbors_use_absolute_log_distance_and_keep_the_requested_quantile() {
+        let now = 10_000u64;
+        let center = (now as f64).ln();
+        let pairs = std::iter::repeat_n((center + 0.3, 50_000), ANALOG_MIN_NEIGHBORS - 1).chain(
+            std::iter::repeat_n(
+                (center - 0.4, 1_000),
+                ANALOG_READY_PAIRS - ANALOG_MIN_NEIGHBORS + 1,
+            ),
+        );
+        let h = paired_history(now, pairs);
+
+        assert_eq!(h.rate_sat_kvb(1, 0.99), Some(50_000));
+    }
+
+    #[test]
+    fn nearest_neighbor_cutoff_keeps_the_two_hundredth_window() {
+        let now = 10_000u64;
+        let center = (now as f64).ln();
+        let mut pairs = std::iter::repeat_n((center + 0.3, 1_000), ANALOG_MIN_NEIGHBORS - 1)
+            .chain([(center + 0.31, 50_000), (center + 0.32, 1_000)])
+            .chain(std::iter::repeat_n(
+                (center + 0.4, 1_000),
+                ANALOG_READY_PAIRS - ANALOG_MIN_NEIGHBORS - 1,
+            ))
+            .collect::<Vec<_>>();
+        let mut seed = 341usize;
+        for i in (1..pairs.len()).rev() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pairs.swap(i, seed % (i + 1));
+        }
+        let h = paired_history(now, pairs);
+
+        assert_eq!(h.rate_sat_kvb(1, 1.0), Some(50_000));
     }
 
     #[test]
