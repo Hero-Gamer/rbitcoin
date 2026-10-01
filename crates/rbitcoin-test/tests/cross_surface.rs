@@ -1704,8 +1704,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     pin_esplora_blocks_summaries(esplora_addr, 107, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
     pin_internal_block_txs_and_outspends(esplora_addr, new_hash).await;
+    // Core-shaped coinbase input: a `coinbase` hex script and no txid/vout,
+    // which is what mempool's indexer requires.
     assert!(
-        txs[0]["vin"][0].get("txid").is_some(),
+        txs[0]["vin"][0].get("coinbase").is_some() && txs[0]["vin"][0].get("txid").is_none(),
         "verbosity 2 coinbase vin: {blk}"
     );
     assert!(

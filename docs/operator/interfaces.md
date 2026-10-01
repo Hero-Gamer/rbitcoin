@@ -199,87 +199,6 @@ the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-t
 pages lazy-build one published body snapshot (JSON `OnceLock` per live tx after
 the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](docs/ibd-memory.md).
 
-### mempool.space
-
-Stock mempool Node + MariaDB + frontend. nginx **`/api/`** → this Esplora
-(unix); **`/api/v1/`** → their process (`:8999`). Set `MEMPOOL.BACKEND=esplora`.
-Point Node `ESPLORA.UNIX_SOCKET_PATH` at `--esplora-listen
-/run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api` is fine) so
-`/internal/*` is available. Put the sock in `/run/rbitcoin` (**0750**,
-rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
-tree is `0700`. TCP `--esplora-listen host:port` is public REST only (no
-`/internal`). Core RPC is `--rpc-socket /run/rbitcoin/rpc.sock` (mode
-**0660**) plus the `bitcoin-client` `socketPath` patch below — **not**
-`COOKIE_PATH` / HTTP Basic. Requires
-`--sh-index`. The default `--max-sh-creates` is 10000; set 0 for an unlimited unpaged join.
-
-```bash
-sudo mkdir -p /run/rbitcoin
-sudo chown "$(id -un)":nginx /run/rbitcoin
-sudo chmod 0750 /run/rbitcoin
-
-./target/release/rbitcoin-node \
-  --datadir ./datadir-mainnet \
-  --network mainnet \
-  --sh-index \
-  --rpc-socket /run/rbitcoin/rpc.sock \
-  --esplora-listen /run/rbitcoin/esplora.sock \
-  --log-level info
-```
-
-Run mempool Node as a user in rbitcoin's group; both sockets are **0660**
-and `/run/rbitcoin` is **0750**. First start
-must import `pools-v2.json` or every block is **Unknown**: `npm run start
---update-pools` (needs GitHub, or point `POOLS_JSON_URL` /
-`POOLS_JSON_TREE_URL` at a local mirror). `SELECT COUNT(*) FROM pools` is
-hundreds when that worked. Predicted blocks wait on Node’s first mempool
-sync + rust-gbt; they are empty until `/internal/mempool/txs` has filled.
-
-## Core-class JSON-RPC
-
-Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
-`{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
-`--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a
-client in rbitcoin's group can connect without traversing the `0700` datadir.
-`--rpc-listen` adds TCP on `127.0.0.1:<network port>` when ADDR is omitted
-(mainnet 8332, testnet 18332, signet 38332, regtest 18443). TCP auth is
-`Authorization: Bearer` from `{datadir}/rpc.token` (0600). The same
-listeners serve Core REST: `GET /rest/chaininfo.json`, block, headers, tx,
-mempool, `getutxos`, `deploymentinfo`, and `blockfilter/basic` for heights
-`--block-filter-index` has sealed. TCP `/rest/` is unauthenticated (Core).
-Unix socket stays mode 0600 with no HTTP header. See
-[`docs/rpc.md`](../../docs/rpc.md) and [`COMPAT.md`](../../COMPAT.md).
-
-**mempool.space `CORE_RPC`:** stock mempool is TCP + cookie or user/pass.
-Their unix config is Esplora, not bitcoind. Point their Node at this
-socket with a small patch to `backend/src/api/bitcoin/bitcoin-client.ts`
-(same `socketPath` + dummy `http://rpc/` pattern as
-`ESPLORA.UNIX_SOCKET_PATH`). Do **not** send `Authorization`. Bind the
-socket with `--rpc-socket /run/rbitcoin/rpc.sock` (0660) and run their Node
-in rbitcoin's group, or run it as the **same UID** with the default 0600
-`{datadir}/rpc.sock`. TCP `--rpc-listen` stays Bearer — that is not the mempool recipe.
-
-```bash
-./target/release/rbitcoin-node \
-  --datadir ./datadir-mainnet \
-  --network mainnet \
-  --rpc \
-  --log-level info
-# local socket:
-rbitcoin-cli --datadir ./datadir-mainnet getblockcount
-```
-
-mempool `bitcoin-client` sketch (axios; dummy host required):
-
-```js
-const client = axios.create({
-  socketPath: '/path/to/datadir/rpc.sock',
-  baseURL: 'http://rpc/',
-  timeout: 60000,
-});
-// POST JSON-RPC body; no Authorization header
-```
-
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
@@ -294,6 +213,129 @@ const client = axios.create({
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
 
 DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
+
+### mempool.space
+
+Stock mempool Node + MariaDB + frontend. nginx **`/api/`** → this Esplora
+(unix); **`/api/v1/`** → their process (`:8999`). Set `MEMPOOL.BACKEND=esplora`.
+Point Node `ESPLORA.UNIX_SOCKET_PATH` at `--esplora-listen
+/run/rbitcoin/esplora.sock` (mode **0660**; dummy `Host: api` is fine) so
+`/internal/*` is available. Put the sock in `/run/rbitcoin` (**0750**,
+rbitcoin user + `nginx` group) — nginx cannot traverse `{datadir}` when that
+tree is `0700`. TCP `--esplora-listen host:port` is public REST only (no
+`/internal`). Core RPC is TCP plus a Core cookie, which stock mempool
+supports unpatched; see [mempool.space `CORE_RPC`](#mempoolspace-core_rpc).
+Requires `--sh-index`. The default `--max-sh-creates` is 10000; set 0 for an
+unlimited unpaged join.
+
+```bash
+sudo mkdir -p /run/rbitcoin
+sudo chown "$(id -un)":nginx /run/rbitcoin
+sudo chmod 0750 /run/rbitcoin
+
+# Core-format cookie: no trailing newline, 0640, group mempool, written before
+# every start (/run is tmpfs). The node's primary group may be shared (users).
+printf '__cookie__:%s' "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" |
+  sudo install -m 0640 -o "$(id -un)" -g mempool /dev/stdin /run/rbitcoin/rpc.cookie
+
+./target/release/rbitcoin-node \
+  --datadir ./datadir-mainnet \
+  --network mainnet \
+  --sh-index \
+  --rpc-listen 127.0.0.1:8332 \
+  --rpc-cookie-file /run/rbitcoin/rpc.cookie \
+  --esplora-listen /run/rbitcoin/esplora.sock \
+  --log-level info
+```
+
+mempool's Node user needs three memberships: `nginx` to traverse
+`/run/rbitcoin` (**0750**), the node's group for the **0660** Esplora socket,
+and `mempool` for the **0640** cookie. First start
+must import `pools-v2.json` or every block is **Unknown**: `npm run start
+--update-pools` (needs GitHub, or point `POOLS_JSON_URL` /
+`POOLS_JSON_TREE_URL` at a local mirror). `SELECT COUNT(*) FROM pools` is
+hundreds when that worked. Predicted blocks wait on Node’s first mempool
+sync + rust-gbt; they are empty until `/internal/mempool/txs` has filled.
+
+## Core-class JSON-RPC
+
+Optional HTTP JSON-RPC subset (default **off**). `--rpc` binds
+`{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
+`--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a
+client in rbitcoin's group can connect without traversing the `0700` datadir.
+`--rpc-listen` adds TCP on `127.0.0.1:<network port>` when ADDR is omitted
+(mainnet 8332, testnet 18332, signet 38332, regtest 18443). TCP auth is
+`Authorization: Bearer` from `{datadir}/rpc.token` (0600), plus optional Core
+cookie HTTP Basic from `--rpc-cookie-file PATH`. The same
+listeners serve Core REST: `GET /rest/chaininfo.json`, block, headers, tx,
+mempool, `getutxos`, `deploymentinfo`, and `blockfilter/basic` for heights
+`--block-filter-index` has sealed. TCP `/rest/` is unauthenticated (Core).
+`{datadir}/rpc.sock` stays mode 0600 with no HTTP header. See
+[`docs/rpc.md`](../../docs/rpc.md) and [`COMPAT.md`](../../COMPAT.md).
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir ./datadir-mainnet \
+  --network mainnet \
+  --rpc \
+  --log-level info
+# local socket:
+rbitcoin-cli --datadir ./datadir-mainnet getblockcount
+```
+
+### mempool.space `CORE_RPC`
+
+Stock mempool reaches bitcoind over TCP with HTTP Basic. rbitcoin has no
+`--rpcuser` / `--rpcpassword`; the only Basic credential it accepts is a
+Core-format cookie named by `--rpc-cookie-file PATH`, and only on the TCP
+listener. The node reads that file and never creates it, so write it before
+each start (the [mempool.space](#mempoolspace) command above does). Keep it
+readable only by the rbitcoin and mempool service identities.
+
+1. Start the node with `--rpc-listen 127.0.0.1:<network RPC port>` and
+   `--rpc-cookie-file /run/rbitcoin/rpc.cookie`.
+2. Point mempool at the same file:
+
+   ```json
+   "CORE_RPC": {
+     "HOST": "127.0.0.1",
+     "PORT": 8332,
+     "COOKIE": true,
+     "COOKIE_PATH": "/run/rbitcoin/rpc.cookie"
+   }
+   ```
+
+   `USERNAME` / `PASSWORD` are ignored while `COOKIE` is true. mempool
+   re-reads the file after a 401, so a cookie rewritten on node restart is
+   picked up.
+3. Check it as a user that can read the cookie (the credential goes through
+   stdin, not argv):
+
+   ```bash
+   printf 'user = "%s"\n' "$(cat /run/rbitcoin/rpc.cookie)" |
+     curl -sK- --data-binary '{"id":1,"method":"getblockcount","params":[]}' http://127.0.0.1:8332/
+   ```
+
+   returns the block count. The TCP listener, like Electrum and Esplora, binds
+   only after initial catch-up, so during IBD this is connection refused and
+   mempool retries. The cookie itself is checked at launch.
+
+The file must be exactly `username:password` with **no trailing newline**, as
+Core writes it. mempool sends the raw bytes as the credential, so a newline
+would 401 forever while bitcoin-cli (which strips it) still works. rbitcoin
+refuses to start on such a file. Write it with `printf`, not `echo`.
+
+**Optional: unix socket instead of TCP.** Stock mempool cannot do this:
+its unix config (`ESPLORA.UNIX_SOCKET_PATH`) is Esplora only, and Core RPC
+goes through `backend/src/rpc-api/jsonrpc.ts`, which builds Node
+`http.request` options from `CORE_RPC.HOST` / `PORT` with no socket support.
+A patched mempool adds `CORE_RPC.SOCKET_PATH`, plumbs it through
+`bitcoin-client.ts` into those request options as `socketPath`, and sets no
+`auth` when it is used; see the `rbitcoin-compat` branch of
+[reardencode/mempool](https://github.com/reardencode/mempool/tree/rbitcoin-compat).
+Bind `--rpc-socket /run/rbitcoin/rpc.sock`
+(mode **0660**, filesystem auth, mempool's user in rbitcoin's group); no
+cookie or `Authorization` header is involved.
 
 ### Reverse proxy (TLS)
 

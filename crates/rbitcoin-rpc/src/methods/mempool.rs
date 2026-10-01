@@ -3,6 +3,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::{OutPoint, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
+use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
 
 pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
@@ -233,9 +234,51 @@ pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<
     if !verbose {
         return Ok(json!(serialize_hex(&tx)));
     }
+    // The resolver falls back to an unconnected Class A row (reorg orphan,
+    // invalidateblock, never-connected archive). It has no active-chain block,
+    // so it gets the plain object, without confirmations or block fields.
+    let unconnected = || {
+        Ok(tx_to_json(
+            &tx,
+            Some(json!({ "in_mempool": false })),
+            rpc_btc_network(ctx.network),
+        ))
+    };
+    let store_err = |e: rbitcoin_store::StoreError| rpc_error(ERR_MISC, e.to_string());
+    let Some(height) = ctx.query.store().tx_height_get(fk).map_err(store_err)? else {
+        return unconnected();
+    };
+    // The fence and confirmed[] do not move together (connect extends the
+    // fence before setting confirmed[h]; disconnect clears confirmed[h] before
+    // popping the fence), so a reorg can put another block at `height` between
+    // these reads. Only report the header whose own Class A run holds `fk`.
+    let Some((header_fk, header)) = ctx
+        .query
+        .header_at_height(Height(height))
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    else {
+        return unconnected();
+    };
+    let holds_fk = ctx
+        .query
+        .store()
+        .header_txs
+        .get_range(header_fk)
+        .map_err(store_err)?
+        .is_some_and(|(first, n)| (first.0..first.0.saturating_add(u64::from(n))).contains(&fk.0));
+    let tip = ctx.query.tip_height();
+    let Some(tip) = tip.filter(|t| holds_fk && t.0 >= height) else {
+        return unconnected();
+    };
     Ok(tx_to_json(
         &tx,
-        Some(json!({ "in_mempool": false })),
+        Some(json!({
+            "in_mempool": false,
+            "confirmations": tip.0.saturating_sub(height).saturating_add(1),
+            "blockhash": hash_hex_display(&header.hash),
+            "blocktime": header.timestamp,
+            "time": header.timestamp,
+        })),
         rpc_btc_network(ctx.network),
     ))
 }

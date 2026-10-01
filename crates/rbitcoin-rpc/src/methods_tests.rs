@@ -1271,6 +1271,24 @@ fn getblock_verbosity_2_size_weight_and_tx_fee() {
     let hashes = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let tip = hashes.as_array().unwrap()[0].clone();
     let v2 = dispatch(&ctx, "getblock", vec![tip.clone(), json!(2)]).unwrap();
+    let coinbase = &v2["tx"][0];
+    assert!(
+        coinbase["vin"][0].get("coinbase").is_some(),
+        "coinbase vin must use Bitcoin Core's coinbase field: {coinbase}"
+    );
+    assert!(
+        coinbase["vin"][0].get("txid").is_none(),
+        "coinbase vin must not expose a normal prevout: {coinbase}"
+    );
+    let confirmed = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![coinbase["txid"].clone(), json!(true)],
+    )
+    .unwrap();
+    assert_eq!(confirmed["confirmations"], json!(1));
+    assert_eq!(confirmed["blockhash"], tip);
+    assert_eq!(confirmed["blocktime"], confirmed["time"]);
     let raw = dispatch(&ctx, "getblock", vec![tip, json!(0)]).unwrap();
     let raw_bytes = rbitcoin_primitives::hex_decode(raw.as_str().unwrap()).unwrap();
     let block: bitcoin::Block = deserialize(&raw_bytes).unwrap();
@@ -1396,6 +1414,146 @@ fn gettxout_disconnected_archive_row_is_null() {
         gone.is_null(),
         "disconnected Class A row must not be a UTXO: {gone}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Class A row that is no longer on the active chain still resolves
+/// (TipThenAny), so verbose getrawtransaction and REST json must return the
+/// tx object without block fields rather than an error.
+#[test]
+fn getrawtransaction_verbose_disconnected_tx_has_no_block_fields() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (addr, _) = p2wpkh_regtest();
+    dispatch(&ctx, "generatetoaddress", vec![json!(2), json!(addr)]).unwrap();
+    let tip = dispatch(&ctx, "getbestblockhash", vec![])
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blk = dispatch(&ctx, "getblock", vec![json!(tip.clone()), json!(2)]).unwrap();
+    let cb_txid = blk["tx"][0]["txid"].as_str().unwrap().to_string();
+    let connected = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid.clone()), json!(true)],
+    )
+    .unwrap();
+    assert_eq!(connected["confirmations"], json!(1), "{connected}");
+    assert_eq!(connected["blockhash"], json!(tip), "{connected}");
+
+    dispatch(&ctx, "invalidateblock", vec![json!(tip)]).unwrap();
+    let orphan = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid.clone()), json!(true)],
+    )
+    .unwrap_or_else(|e| panic!("verbose on a disconnected tx must not error: {e}"));
+    assert_eq!(orphan["txid"], json!(cb_txid), "{orphan}");
+    assert_eq!(orphan["in_mempool"], json!(false), "{orphan}");
+    for field in ["confirmations", "blockhash", "blocktime", "time"] {
+        assert!(orphan.get(field).is_none(), "{field}: {orphan}");
+    }
+    let hex = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid.clone()), json!(false)],
+    )
+    .unwrap();
+    assert_eq!(orphan["hex"], hex, "{orphan}");
+
+    let rest = dispatch_rest(&ctx, &format!("/rest/tx/{cb_txid}.json"), "", &[]);
+    assert_eq!(
+        rest.status,
+        axum::http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&rest.body)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&rest.body).unwrap();
+    assert_eq!(body["txid"], json!(cb_txid), "{body}");
+    assert!(body.get("confirmations").is_none(), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decoderawtransaction_segwit_coinbase_keeps_txinwitness() {
+    let (ctx, dir) = ctx_empty();
+    let coinbase = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00]),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::from_slice(&[vec![0u8; 32]]),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::new_op_return([0xaa; 4]),
+        }],
+    };
+    let obj = dispatch(
+        &ctx,
+        "decoderawtransaction",
+        vec![json!(serialize_hex(&coinbase))],
+    )
+    .unwrap();
+    let vin = &obj["vin"][0];
+    assert_eq!(vin["coinbase"], json!("5100"), "{obj}");
+    assert!(vin.get("txid").is_none(), "{obj}");
+    assert_eq!(vin["txinwitness"], json!(["00".repeat(32)]), "{obj}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Disconnect clears confirmed[h] before popping the height fence. A verbose
+/// lookup landing in that window must not error or invent a block.
+#[test]
+fn getrawtransaction_verbose_mid_disconnect_has_no_block_fields() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (addr, _) = p2wpkh_regtest();
+    dispatch(&ctx, "generatetoaddress", vec![json!(2), json!(addr)]).unwrap();
+    let tip = dispatch(&ctx, "getbestblockhash", vec![])
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blk = dispatch(&ctx, "getblock", vec![json!(tip.clone()), json!(2)]).unwrap();
+    let cb_txid = blk["tx"][0]["txid"].as_str().unwrap().to_string();
+    let height = Height(blk["height"].as_u64().unwrap() as u32);
+    // Stop halfway through Query::disconnect_tip: confirmed cleared, fence not.
+    ctx.query.store().confirmed.disconnect_tip(height).unwrap();
+    let mid = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid.clone()), json!(true)],
+    )
+    .unwrap_or_else(|e| panic!("verbose mid-disconnect must not error: {e}"));
+    assert_eq!(mid["txid"], json!(cb_txid), "{mid}");
+    for field in ["confirmations", "blockhash", "blocktime", "time"] {
+        assert!(mid.get(field).is_none(), "{field}: {mid}");
+    }
+
+    // A reorg can seat another block at that height before the fence pops.
+    // That block does not hold the tx, so it must not be reported as its block.
+    let (other_fk, other) = ctx
+        .query
+        .header_at_height(Height(height.0 - 1))
+        .unwrap()
+        .unwrap();
+    ctx.query.store().confirmed.set(height, other_fk).unwrap();
+    let replaced = dispatch(
+        &ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid.clone()), json!(true)],
+    )
+    .unwrap_or_else(|e| panic!("verbose after replacement must not error: {e}"));
+    assert_ne!(
+        replaced["blockhash"],
+        json!(hash_hex_display(&other.hash)),
+        "{replaced}"
+    );
+    for field in ["confirmations", "blockhash", "blocktime", "time"] {
+        assert!(replaced.get(field).is_none(), "{field}: {replaced}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

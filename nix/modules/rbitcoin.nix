@@ -80,6 +80,8 @@ let
   ++ optional cfg.rpc.enable (socket cfg.rpc.address cfg.rpc.port)
   ++ optional (cfg.rpc.socketPath != null) "--rpc-socket"
   ++ optional (cfg.rpc.socketPath != null) cfg.rpc.socketPath
+  ++ optional (cfg.rpc.cookieFile != null) "--rpc-cookie-file"
+  ++ optional (cfg.rpc.cookieFile != null) (toString cfg.rpc.cookieFile)
   ++ optional cfg.electrum.enable "--electrum-listen"
   ++ optional cfg.electrum.enable (socket cfg.electrum.address cfg.electrum.port)
   ++ optional cfg.esplora.enable "--esplora-listen"
@@ -337,6 +339,23 @@ in
           backend) can connect without reading the datadir. Independent of `enable` (TCP).
         '';
       };
+
+      cookieFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/run/rbitcoin/rpc.cookie";
+        description = ''
+          Existing Core-format `username:password` cookie (no trailing newline) accepted as
+          HTTP Basic on the TCP listener, alongside the Bearer token. Lets stock mempool use
+          `CORE_RPC.COOKIE`. Requires `enable`. The node checks it at startup and never
+          creates it or its directory: write both before every start if they live on tmpfs,
+          e.g. from a root `ExecStartPre` shell script (`"+" + pkgs.writeShellScript ...`,
+          since the unit runs as `user` under ProtectSystem=strict). `user` must be able to
+          read it, and mempool must be able to traverse its directory and read the file.
+          The unit's PrivateTmp and ProtectHome hide /tmp and /home, so keep it elsewhere
+          (e.g. /run/rbitcoin). Format: docs/operator/interfaces.md.
+        '';
+      };
     };
 
     electrum = {
@@ -413,6 +432,10 @@ in
       {
         assertion = !(builtins.elem "cjdns" cfg.onlyNet) || cfg.cjdns.reachable;
         message = "services.rbitcoin.onlyNet cjdns requires cjdns.reachable";
+      }
+      {
+        assertion = cfg.rpc.cookieFile == null || cfg.rpc.enable;
+        message = "services.rbitcoin.rpc.cookieFile requires rpc.enable (the cookie is accepted on TCP only)";
       }
     ];
 

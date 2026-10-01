@@ -210,8 +210,9 @@ Schema 21 is the current bytes; 0.x may still bump.
 
 Drop-in **mempool/electrs (or Blockstream electrs) HTTP** so a stock
 mempool.space Node+MariaDB+frontend can retire electrs. Core JSON-RPC for
-that stack is unix `{datadir}/rpc.sock` plus a documented mempool `CORE_RPC`
-socket patch, not cookie. Not their `/api/v1/` process. Not address-prefix.
+that stack is TCP plus an opt-in Core cookie (`--rpc-cookie-file`), so stock
+mempool `CORE_RPC` works unpatched; a unix-socket patch stays optional. Not
+their `/api/v1/` process. Not address-prefix.
 **Q-68**. Surface: [`COMPAT.md`](../COMPAT.md).
 
 | Done | Step |

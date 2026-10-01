@@ -7,7 +7,7 @@ mod blockstats;
 mod methods;
 mod server;
 
-pub use auth::{default_socket_path, default_token_path, RpcAuth};
+pub use auth::{default_socket_path, default_token_path, read_cookie_file, RpcAuth};
 pub use methods::{
     gbt_template, submit_received_block, RpcActive, RpcContext, RpcRegtest, SubmitBlockOutcome,
 };

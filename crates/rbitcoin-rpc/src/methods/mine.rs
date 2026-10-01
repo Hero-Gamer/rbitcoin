@@ -1194,16 +1194,25 @@ pub(crate) fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNet
     let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
     let mut vin = Vec::new();
     for (i, inp) in tx.input.iter().enumerate() {
-        let mut row = json!({
-            "txid": hash_hex_display(&inp.previous_output.txid.to_byte_array()),
-            "vout": inp.previous_output.vout,
-            "scriptSig": {
-                "asm": inp.script_sig.to_asm_string(),
-                "hex": hex_encode(inp.script_sig.as_bytes()),
-            },
-            "sequence": inp.sequence.to_consensus_u32(),
-            "n": i,
-        });
+        let mut row = if tx.is_coinbase() {
+            json!({
+                "coinbase": hex_encode(inp.script_sig.as_bytes()),
+                "sequence": inp.sequence.to_consensus_u32(),
+                "n": i,
+            })
+        } else {
+            json!({
+                "txid": hash_hex_display(&inp.previous_output.txid.to_byte_array()),
+                "vout": inp.previous_output.vout,
+                "scriptSig": {
+                    "asm": inp.script_sig.to_asm_string(),
+                    "hex": hex_encode(inp.script_sig.as_bytes()),
+                },
+                "sequence": inp.sequence.to_consensus_u32(),
+                "n": i,
+            })
+        };
+        // Core keeps a segwit coinbase's witness reserved value here too.
         if !inp.witness.is_empty() {
             let stack: Vec<String> = inp.witness.iter().map(hex_encode).collect();
             if let Some(m) = row.as_object_mut() {

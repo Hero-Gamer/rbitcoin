@@ -304,7 +304,7 @@ fn operator_usage() -> String {
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
-    [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-work-queue N] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
@@ -353,7 +353,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
   Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
-RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer). No --rpcuser.\n\
+RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser.\n\
 Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
@@ -617,6 +617,7 @@ mod tests {
             "--rpc-listen",
             "--rpc-socket",
             "--rpc-token-file",
+            "--rpc-cookie-file",
             "--proxy",
             "--onion",
             "--proxy-randomize",
@@ -945,6 +946,45 @@ mod tests {
         assert!(NodeConfig::default().esplora_onion);
         let onion_off = ready_config(["rbitcoin-node", "--esplora-onion=0"]);
         assert!(!onion_off.esplora_onion);
+    }
+
+    /// RPC binds only after catch-up, so a bad `--rpc-cookie-file` must fail
+    /// the launch rather than surface as a warning after IBD.
+    #[test]
+    fn cli_rejects_bad_rpc_cookie_at_launch() {
+        let _g = OPERATOR_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tmp_datadir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cookie = dir.join("rpc.cookie");
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "rbitcoin-node",
+                "--smoke",
+                "--network",
+                "regtest",
+                "--datadir",
+                dir.to_str().unwrap(),
+                "--log-level",
+                "error",
+                "--no-seeds",
+                "--milestone",
+                "0",
+                "--rpc-cookie-file",
+                cookie.to_str().unwrap(),
+            ];
+            args.extend_from_slice(extra);
+            cli_main(args)
+        };
+        assert_exit(run(&["--rpc-listen"]), ExitCode::FAILURE);
+        std::fs::write(&cookie, "__cookie__:secret\n").unwrap();
+        assert_exit(run(&["--rpc-listen"]), ExitCode::FAILURE);
+        std::fs::write(&cookie, "__cookie__:secret").unwrap();
+        // Socket-only RPC would silently ignore the cookie (message pinned in config.rs).
+        assert_exit(run(&["--rpc"]), ExitCode::FAILURE);
+        assert_exit(run(&["--rpc-listen"]), ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CLI omit of inbound must not clobber pre-set advanced envs.

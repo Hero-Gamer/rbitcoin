@@ -54,6 +54,7 @@ let
           rpc = {
             enable = true;
             socketPath = "/run/rbitcoin/rpc.sock";
+            cookieFile = "/run/rbitcoin/rpc.cookie";
           };
           electrum = {
             enable = true;
@@ -99,6 +100,40 @@ let
     ];
   };
   listenOffExec = listenOffSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart;
+  cookieWithoutTcp = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          rpc.socketPath = "/run/rbitcoin/rpc.sock";
+          rpc.cookieFile = "/run/rbitcoin/rpc.cookie";
+        };
+      }
+    ];
+  };
+  # Core keeps its cookie in the datadir; the option must not loosen that directory.
+  cookieInDataDir = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          rpc.enable = true;
+          rpc.cookieFile = "/var/lib/rbitcoin/.cookie";
+        };
+      }
+    ];
+  };
+  cookieDataDirMode =
+    cookieInDataDir.config.systemd.tmpfiles.settings."10-rbitcoin"."/var/lib/rbitcoin".d.mode;
+  cookieTcpOnly = "services.rbitcoin.rpc.cookieFile requires rpc.enable (the cookie is accepted on TCP only)";
+  failedAssertions =
+    sys: map (a: a.message) (builtins.filter (a: !a.assertion) sys.config.assertions);
 in
 assert defaultCfg.package == expectedPackage;
 assert defaultCfg.network == "mainnet";
@@ -109,6 +144,7 @@ assert defaultCfg.p2p.discover == true;
 assert defaultCfg.p2p.listenOnion == false;
 assert defaultCfg.rpc.port == 8332;
 assert defaultCfg.rpc.socketPath == null;
+assert defaultCfg.rpc.cookieFile == null;
 assert defaultCfg.proxy == null;
 assert defaultCfg.onionProxy == null;
 assert defaultCfg.proxyRandomize == true;
@@ -138,6 +174,7 @@ assert builtins.match ".*--network regtest.*" execStart != null;
 assert builtins.match ".*--listen 127.0.0.1:18444.*" execStart != null;
 assert builtins.match ".*--rpc-listen 127.0.0.1:18443.*" execStart != null;
 assert builtins.match ".*--rpc-socket /run/rbitcoin/rpc.sock.*" execStart != null;
+assert builtins.match ".*--rpc-cookie-file /run/rbitcoin/rpc.cookie.*" execStart != null;
 assert builtins.elem "/run/rbitcoin" service.serviceConfig.ReadWritePaths;
 assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
@@ -169,6 +206,10 @@ assert builtins.elem "cjdns.service" service.after;
 assert builtins.elem "cjdns.service" service.wants;
 assert builtins.match ".*--no-listen.*" listenOffExec != null;
 assert builtins.match ".*--rpc-socket.*" listenOffExec == null;
+assert builtins.match ".*--rpc-cookie-file.*" listenOffExec == null;
+assert !builtins.elem cookieTcpOnly (failedAssertions system);
+assert builtins.elem cookieTcpOnly (failedAssertions cookieWithoutTcp);
+assert cookieDataDirMode == "0700";
 assert builtins.match ".*--listen .*" listenOffExec == null;
 assert builtins.match ".*--max-inbound 0.*" listenOffExec != null;
 assert builtins.match ".*--no-discover.*" listenOffExec != null;
