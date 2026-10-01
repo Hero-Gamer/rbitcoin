@@ -310,6 +310,15 @@ pub(crate) fn wants_lookahead(st: &IbdWorkState) -> bool {
         .any(|s| s.alive && s.peer_height > tip && !st.header_walk.walk_quiet.contains(&s.id))
 }
 
+/// The proven walk is at or below the confirmed tip, and every connected
+/// peer that advertised more has failed to extend it.
+pub(crate) fn headers_complete(st: &IbdWorkState, tip_h: u32) -> bool {
+    st.header_walk.origin
+        && st.header_walk.proven
+        && st.header_walk.tip_height() <= tip_h
+        && !wants_lookahead(st)
+}
+
 /// Candidate hash before a headers reply is applied.
 pub(crate) fn candidate_tip(st: &IbdWorkState) -> Option<BlockHash> {
     st.header_walk.tip_hash()
@@ -2988,6 +2997,51 @@ mod tests {
             "a short fork that does not beat the candidate ends the walk"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    /// One peer advertised a height no chain has. Once the walk is at the
+    /// confirmed tip and that peer cannot extend it, IBD is caught up.
+    #[test]
+    fn a_false_peer_height_does_not_hold_ibd_at_the_tip() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-exit");
+        hub.ensure_genesis().unwrap();
+        let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let third = rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            3,
+            op_true,
+            vec![],
+        );
+        let (mut liar, mut liar_rx) = slot(0);
+        liar.peer_height = 100_000;
+        let (mut honest, _honest_rx) = slot(1);
+        honest.peer_height = 2;
+        let mut st = IbdWorkState::new(vec![liar, honest], hub.tip_hash(), Some(2));
+        assert_eq!(st.max_peer_height, 100_000);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        apply(&mut st, &hub, 0, vec![third.header]);
+        assert_eq!(st.header_walk.tip_height(), 3);
+        hub.accept_block(third).unwrap();
+        assert_eq!(hub.tip_height(), Some(3));
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, 3),
+            "the advertised height is still a candidate"
+        );
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+        assert!(st.ordered.is_empty());
+        assert!(
+            crate::ibd::exit::ibd_caught_up(&st, 3),
+            "no peer can extend the walk past the confirmed tip"
+        );
     }
 
     #[test]
