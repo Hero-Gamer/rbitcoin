@@ -8,3 +8,6 @@ Fixed
   its connect-time `version.start_height` is below the header walk. New
   blocks found during a long catch-up are no longer ignored until tip
   mode.
+- The `ibd: progress` percent, ETA, and `horizon=` count toward the header
+  walk tip or the tallest connected peer still on the walk. A disconnected
+  peer, or one that could not extend the walk, no longer sets the horizon.

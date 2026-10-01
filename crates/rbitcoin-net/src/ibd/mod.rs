@@ -795,11 +795,12 @@ pub async fn ibd_cancellable(
             let now = Instant::now();
             let window_secs = last_status.elapsed().as_secs_f64().max(0.001);
             let scan_t0 = Instant::now();
+            let horizon = header_walk::peer_horizon(&st);
             let prog = work_chain_progress(
                 hub.as_ref(),
                 &st.height_to_hash,
                 &mut st.body,
-                st.max_peer_height,
+                horizon,
                 st.max_ready_height,
             );
             loop_stats

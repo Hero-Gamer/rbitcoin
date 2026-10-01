@@ -138,7 +138,7 @@ pub(crate) fn work_chain_progress(
     hub: &ChainHub,
     height_to_hash: &HashMap<u32, BlockHash>,
     body: &mut BodyPresence,
-    max_peer_height: u32,
+    horizon: u32,
     max_ready_height: u32,
 ) -> WorkChainProgress {
     let tip = hub.tip_height().unwrap_or(0);
@@ -146,7 +146,7 @@ pub(crate) fn work_chain_progress(
     WorkChainProgress {
         tip,
         ready_hwm: tip.max(max_ready_height),
-        headers: tip.max(max_peer_height),
+        headers: tip.max(horizon),
         tip_hole,
     }
 }

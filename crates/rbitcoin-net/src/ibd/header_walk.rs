@@ -319,6 +319,21 @@ pub(crate) fn headers_complete(st: &IbdWorkState, tip_h: u32) -> bool {
         && !wants_lookahead(st)
 }
 
+/// Height the progress line counts toward. Before the walk has an origin,
+/// the advertised high-water mark. After that, the walk tip or the tallest
+/// connected peer still on the walk: a peer that disconnected or failed to
+/// extend the walk no longer sets it. Exit still uses `max_peer_height`.
+pub(crate) fn peer_horizon(st: &IbdWorkState) -> u32 {
+    if !st.header_walk.origin {
+        return st.max_peer_height;
+    }
+    st.slots
+        .iter()
+        .filter(|s| s.alive && !st.header_walk.walk_quiet.contains(&s.id))
+        .map(|s| s.peer_height)
+        .fold(st.header_walk.tip_height(), u32::max)
+}
+
 /// Candidate hash before a headers reply is applied.
 pub(crate) fn candidate_tip(st: &IbdWorkState) -> Option<BlockHash> {
     st.header_walk.tip_hash()
@@ -3029,6 +3044,11 @@ mod tests {
 
         assert!(send_getheaders(&mut st, &hub).unwrap());
         assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        assert_eq!(
+            peer_horizon(&st),
+            100_000,
+            "a peer still on the walk sets the progress horizon"
+        );
         apply(&mut st, &hub, 0, vec![third.header]);
         assert_eq!(st.header_walk.tip_height(), 3);
         hub.accept_block(third).unwrap();
@@ -3046,6 +3066,12 @@ mod tests {
         assert!(
             crate::ibd::exit::ibd_caught_up(&st, 3),
             "no peer can extend the walk past the confirmed tip"
+        );
+        assert_eq!(st.max_peer_height, 100_000);
+        assert_eq!(
+            peer_horizon(&st),
+            3,
+            "a retired peer's advertised height leaves the progress horizon"
         );
 
         // The honest peer's start height is below the walk. A block inv is
@@ -3073,6 +3099,7 @@ mod tests {
         assert_eq!(drain_getheaders(&mut liar_rx), 0);
         apply(&mut st, &hub, 1, vec![fourth.header]);
         assert_eq!(st.header_walk.tip_height(), 4);
+        assert_eq!(peer_horizon(&st), 4);
         assert!(st.ordered_set.contains(&fourth.block_hash()));
         assert!(
             !crate::ibd::exit::ibd_caught_up(&st, 3),
