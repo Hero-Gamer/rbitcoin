@@ -16,3 +16,8 @@ Added
   `{"coinbase": <hex>, "sequence": n}` (plus `n`) instead of a
   `txid`/`vout` pair that never existed. mempool needs both to index
   blocks.
+- **No panic reading a table during disconnect:** `ArrayTable::get`
+  checked the length before taking its read lock, so a concurrent
+  truncate (block disconnect) could panic a reader such as an RPC
+  `header_at_height` lookup. It now re-checks under the lock and reads
+  the shorter table.

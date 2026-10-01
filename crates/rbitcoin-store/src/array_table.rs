@@ -144,7 +144,8 @@ impl ArrayTable {
         }
         let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
         if let Some(ref v) = *guard {
-            return Ok(v[index as usize]);
+            // `len` was read before the lock; a truncate may have landed since.
+            return Ok(v.get(index as usize).copied().unwrap_or(0));
         }
         drop(guard);
         let mut buf = [0u8; 8];
@@ -347,6 +348,41 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// `get` checks `len` before taking the read lock, so a `truncate` can
+    /// land in between. The reader must see the shorter table, not panic.
+    #[test]
+    fn get_racing_truncate_does_not_panic() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
+        t.set(1023, 7).unwrap();
+        assert!(t.l2_resident_bytes() > 0, "test needs the in-RAM image");
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let v = t.get(1023).unwrap();
+                        assert!(v == 0 || v == 7, "torn read {v}");
+                    }
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            t.truncate(0).unwrap();
+            t.set(1023, 7).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            assert!(r.join().is_ok(), "get panicked racing truncate");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
