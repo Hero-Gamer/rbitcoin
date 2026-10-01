@@ -5,9 +5,10 @@
 //! that have not failed the walk. Above the work floor, one short reply that
 //! leaves the candidate unextended retires that peer and the reservation
 //! moves. A full 2,000-header window does not, so a lighter fork can still
-//! catch up. A block inv from someone else is one challenge ask: a reply that
-//! beats the candidate takes the reservation, and any other reply leaves it
-//! where it was. The first ask starts at the stored tip.
+//! catch up. A block inv is one challenge ask when that peer is not already
+//! the walk's next ask: a reply that beats the candidate takes the
+//! reservation, and any other reply leaves it where it was. The first ask
+//! starts at the stored tip.
 //! A solicited reply that continues that tip is a checkpoint, and so is any
 //! solicited reply once the walk is ahead of the stored path, at any queue
 //! length. The refill lane asks from the queue tail while the queue is under
@@ -92,7 +93,7 @@ pub(crate) struct HeaderWalk {
     walk_quiet: HashSet<usize>,
     /// Peer that serves the walk and the refill. Not written to `header.adopt`.
     reserved: Option<usize>,
-    /// One walk ask owed after a block inv from a peer who is not reserved.
+    /// One walk ask owed after a block inv.
     challenge: Option<usize>,
     /// Challenge ask already sent. Judged when that peer replies or times out.
     challenge_open: Option<usize>,
@@ -367,11 +368,19 @@ pub(crate) fn settle_walk_peer(
     st.header_walk.walk_quiet.insert(peer);
 }
 
-/// A block announcement may be a header this peer did not have. One walk
-/// ask follows when they are not already the reserved peer.
+/// A block announcement may be a header this peer has and we do not.
+///
+/// The reserved peer is already the walk's ask while some peer is still
+/// above the walk and this peer can serve it. Once that stops, their inv
+/// is the challenge: connect-time height does not move when a new block
+/// is found.
 pub(crate) fn note_block_inv(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
-    if st.header_walk.reserved != Some(peer) {
+    let above = st.header_walk.tip_height();
+    let walk_will_ask = st.header_walk.reserved == Some(peer)
+        && wants_lookahead(st)
+        && peer_can_head(st, peer, above);
+    if !walk_will_ask {
         st.header_walk.challenge = Some(peer);
     }
 }
@@ -462,6 +471,63 @@ fn header_lanes_due(st: &IbdWorkState, hub: &ChainHub) -> (bool, bool) {
         }
     }
     (want_walk, want_refill)
+}
+
+/// Inputs for one main-loop header poll. The loop owns the cadence clock.
+pub(crate) struct HeaderPollIn {
+    pub live: usize,
+    pub need_ready_headroom: bool,
+    pub lag: u32,
+    pub min_cache: usize,
+    pub fan: usize,
+}
+
+/// What the header poll should do with `headers_done` and `send_getheaders`.
+pub(crate) enum HeaderPoll {
+    /// Send getheaders.
+    Ask,
+    /// Empty path and peers are not ahead: latch `headers_done`.
+    LatchDone,
+    /// Leave header sync alone this turn.
+    Wait,
+}
+
+/// A block inv is waiting, and the walk lane is not already in flight.
+///
+/// An in-flight ask keeps the challenge until the lane clears. The poll
+/// must not call `send_getheaders` on every block event during that window.
+pub(crate) fn inv_challenge_due(st: &IbdWorkState) -> bool {
+    st.header_walk.challenge.is_some() && !lane_fresh(&st.header_walk.walk)
+}
+
+/// Decide the main-loop header poll.
+///
+/// A pending block-inv challenge is an ask even when the queue is at the
+/// soft cap, `headers_done` is latched, or no peer's connect-time height
+/// is past the walk.
+pub(crate) fn header_poll(st: &IbdWorkState, poll: HeaderPollIn) -> HeaderPoll {
+    if inv_challenge_due(st) {
+        return HeaderPoll::Ask;
+    }
+    if st.headers_done || poll.live >= super::MAX_ORDERED_HEADERS {
+        return HeaderPoll::Wait;
+    }
+    let under_soft = poll.live < ORDERED_HEADERS_SOFT_CAP;
+    if !(under_soft || poll.need_ready_headroom || wants_lookahead(st)) {
+        return HeaderPoll::Wait;
+    }
+    if poll.live == 0 {
+        return if poll.fan == 0 {
+            HeaderPoll::LatchDone
+        } else {
+            HeaderPoll::Ask
+        };
+    }
+    if poll.live < poll.min_cache || poll.lag > 0 || poll.need_ready_headroom || wants_lookahead(st)
+    {
+        return HeaderPoll::Ask;
+    }
+    HeaderPoll::Wait
 }
 
 /// A proven-chain reply that must not be written.
@@ -3104,6 +3170,68 @@ mod tests {
         assert!(
             !crate::ibd::exit::ibd_caught_up(&st, 3),
             "the announced block is still owed"
+        );
+    }
+
+    /// The header peer's connect-time height is the walk tip and the queue
+    /// is full. Their block inv is still a getheaders, on this poll.
+    #[test]
+    fn a_reserved_peer_block_inv_is_asked_with_a_full_queue() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-reserved-inv");
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let (mut peer, mut rx) = slot(0);
+        peer.peer_height = 100;
+        let mut st = IbdWorkState::new(vec![peer], Some(gen), Some(0));
+        fill_queue(&mut st);
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut rx), 1);
+        let _ = take_header_ask(&mut st, 0);
+        assert_eq!(st.header_walk.reserved, Some(0));
+        st.header_walk.tip.height = 100;
+        assert!(
+            !wants_lookahead(&st),
+            "connect-time height is not past the walk"
+        );
+        assert_eq!(st.ordered.len(), ORDERED_HEADERS_SOFT_CAP);
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 0,
+                hashes: vec![BlockHash::from_byte_array([7u8; 32])],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert_eq!(
+            st.header_walk.challenge,
+            Some(0),
+            "the reserved header peer's inv is still a challenge"
+        );
+        assert!(
+            matches!(
+                header_poll(
+                    &st,
+                    HeaderPollIn {
+                        live: st.ordered_set.len(),
+                        need_ready_headroom: false,
+                        lag: 0,
+                        min_cache: 8192,
+                        fan: 0,
+                    },
+                ),
+                HeaderPoll::Ask
+            ),
+            "a full queue does not hold the announced header"
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert!(
+            matches!(rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })),
+            "the announcing peer was asked for headers"
         );
     }
 
