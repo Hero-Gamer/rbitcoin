@@ -2646,6 +2646,21 @@ async fn tor_control_onion_lifecycle() {
     }
 }
 
+async fn history_closed(electrum_addr: SocketAddr, scripthash: &str) {
+    let mut el = TcpStream::connect(electrum_addr)
+        .await
+        .expect("electrum listens");
+    let hist = electrum_rpc(
+        &mut el,
+        1,
+        "blockchain.scripthash.get_history",
+        json!([scripthash]),
+    )
+    .await;
+    let msg = hist["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("scripthash index disabled"), "{hist}");
+}
+
 async fn history_len(electrum_addr: SocketAddr, scripthash: &str) -> usize {
     let mut el = TcpStream::connect(electrum_addr).await.unwrap();
     let hist = electrum_rpc(
@@ -2690,14 +2705,15 @@ async fn enter_tip_mode_indexes() {
     };
     let op_true = electrum_scripthash_hex(&[0x51]);
 
-    // No scripthash index: tip follow and RPC run, Electrum does not.
+    // No scripthash index: tip follow, RPC, and Electrum listen.
+    // Address methods fail closed.
     let node = start(false);
-    wait_listeners(&[rpc_addr]).await;
+    wait_listeners(&[rpc_addr, electrum_addr]).await;
     for _ in 0..3 {
         let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
         assert!(mined["result"]["hash"].is_string(), "{mined}");
     }
-    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    history_closed(electrum_addr, &op_true).await;
     stop_run_p2p(rpc_addr, node).await;
 
     // First start with the index: the three coinbases are collected from the
@@ -2707,10 +2723,11 @@ async fn enter_tip_mode_indexes() {
     assert_eq!(history_len(electrum_addr, &op_true).await, 3);
     stop_run_p2p(rpc_addr, node).await;
 
-    // Index off again: Electrum stays closed.
+    // Index off again: Electrum still listens. The watermark from the
+    // previous run keeps history answering.
     let node = start(false);
-    wait_listeners(&[rpc_addr]).await;
-    assert!(TcpStream::connect(electrum_addr).await.is_err());
+    wait_listeners(&[rpc_addr, electrum_addr]).await;
+    assert_eq!(history_len(electrum_addr, &op_true).await, 3);
     stop_run_p2p(rpc_addr, node).await;
 
     // A crash left a collect run behind and the write-behind mark short of
