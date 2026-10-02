@@ -48,6 +48,10 @@ path = "tests/core_analogs.rs"
 name = "cross_surface"
 path = "tests/cross_surface.rs"
 
+[[test]]
+name = "end_of_ibd"
+path = "tests/end_of_ibd.rs"
+
 [features]
 # Live private-mesh journeys. Default `cargo test` stays fake SOCKS/SAM/control.
 overlay = []
