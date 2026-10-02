@@ -53,7 +53,17 @@ async fn wait_listeners(addrs: &[SocketAddr]) {
 }
 
 async fn http_exchange(addr: SocketAddr, req: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.expect("http connect");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => break s,
+            Err(_e) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => panic!("http connect to {addr} failed: {e:?}"),
+        }
+    };
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
