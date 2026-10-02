@@ -303,7 +303,7 @@ fn operator_usage() -> String {
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
-    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--esplora-block-template] \\\n\
+    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--electrum-max-subs N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -348,6 +348,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
     Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
+  --electrum-max-subs N caps blockchain.scripthash.subscribe per Electrum connection (default 10000; >= 1). Wallets subscribe every address up to their gap limit.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --esplora-onion (default on) ADD_ONION for --esplora-listen when --tor-control is set.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
@@ -987,6 +988,32 @@ mod tests {
     }
 
     include!("overlay_config_journey.rs");
+
+    #[test]
+    fn electrum_max_subs_cli_conf_and_bounds() {
+        assert_eq!(
+            ready_config(["rbitcoin-node"]).electrum_max_subs,
+            rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--electrum-max-subs", "25000"]).electrum_max_subs,
+            25_000
+        );
+        assert_eq!(
+            ready_config(["rbitcoin-node", "--electrum-max-subs=5"]).electrum_max_subs,
+            5
+        );
+        let mut c = NodeConfig::default();
+        let zero = c.apply_kv("electrum_max_subs", "0").unwrap_err();
+        assert!(format!("{zero}").contains(">= 1"), "{zero}");
+        let bad = c.apply_kv("electrum_max_subs", "nope").unwrap_err();
+        assert!(format!("{bad}").contains("electrum_max_subs"), "{bad}");
+        assert_eq!(
+            c.electrum_max_subs,
+            rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
+            "a refused value leaves the default"
+        );
+    }
 
     #[test]
     fn max_sh_creates_and_esplora_block_template_cli_hyphens() {

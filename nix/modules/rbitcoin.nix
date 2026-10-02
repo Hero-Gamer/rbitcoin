@@ -84,6 +84,10 @@ let
   ++ optional (cfg.rpc.cookieFile != null) (toString cfg.rpc.cookieFile)
   ++ optional cfg.electrum.enable "--electrum-listen"
   ++ optional cfg.electrum.enable (socket cfg.electrum.address cfg.electrum.port)
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) "--electrum-max-subs"
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) (
+    toString cfg.electrum.maxSubs
+  )
   ++ optional cfg.esplora.enable "--esplora-listen"
   ++ optional cfg.esplora.enable (socket cfg.esplora.address cfg.esplora.port)
   ++ optional cfg.health.enable "--health-listen"
@@ -410,6 +414,17 @@ in
         type = types.bool;
         default = false;
         description = "ADD_ONION for Electrum when --electrum-listen is on. Implies tor.control 127.0.0.1:9051 if unset.";
+      };
+
+      maxSubs = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 25000;
+        description = ''
+          blockchain.scripthash.subscribe cap per Electrum connection (--electrum-max-subs).
+          Null keeps the node default (10000). Wallets subscribe every address up to their
+          gap limit.
+        '';
       };
     };
 

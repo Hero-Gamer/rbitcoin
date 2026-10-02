@@ -99,7 +99,7 @@ and idle clients fail closed.
 | Max connections | 256 | Concurrent Electrum TCP clients |
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
-| Max scripthash subs / conn | 1000 | Notify fan-out cap |
+| Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
 
 Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See

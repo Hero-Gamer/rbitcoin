@@ -61,7 +61,14 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 1_048_576;
 /// Alias for shared docs / Esplora body cap ([`DEFAULT_MAX_LINE_BYTES`]).
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 /// Max scripthash subscriptions per Electrum connection (notify fan-out).
-pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 1_000;
+///
+/// A desktop wallet subscribes every receive and change address up to its gap
+/// limit, so 1,000 cut off ordinary Sparrow wallets mid-sync. Each sub costs a
+/// key plus a last-sent status (~170 B; ~0.45 GB worst case at 256 connections
+/// x 10,000) and, per new block, one posting-list check against that block's
+/// shared touch set. A reorg or a tick gap > 32 restatuses every sub in full.
+/// Operators can raise it (`--electrum-max-subs`).
+pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
@@ -495,12 +502,18 @@ where
                 // (Cake: tens of gap-limit subs × full history + full-mempool scan).
                 if let Some(Ok(ann)) = ann {
                     if let Some(mp) = &mempool {
-                        for sh in conn.sh_subs.iter() {
-                            let hit = ann.scripthashes.iter().any(|s| s == sh)
-                                || ann.replaced_scripthashes.iter().any(|s| s == sh);
-                            if !hit {
-                                continue;
-                            }
+                        // Walk the tx's few scripthashes and probe the sub set,
+                        // so the cost per accept does not grow with sub count.
+                        let mut touched: Vec<[u8; 32]> = ann
+                            .scripthashes
+                            .iter()
+                            .chain(ann.replaced_scripthashes.iter())
+                            .filter(|sh| conn.sh_subs.contains(*sh))
+                            .copied()
+                            .collect();
+                        touched.sort_unstable();
+                        touched.dedup();
+                        for sh in &touched {
                             if let Ok(status) = scripthash_status_full(&query, mp, sh) {
                                 let Some(status) = take_new_status(
                                     &mut last_sent_status,
@@ -604,12 +617,15 @@ where
                     let mp = mempool.clone();
                     let method_owned = method.to_string();
                     let params_owned = params_v.clone();
+                    // Move the sub sets in and back (`conn = work` below): a
+                    // clone per request made a wallet's N-address sync O(N²).
+                    // A JoinError ends the connection, so nothing reuses them.
                     let mut work = ElectrumConn {
                         protocol: conn.protocol.clone(),
                         header_sub: conn.header_sub,
-                        sh_subs: conn.sh_subs.clone(),
+                        sh_subs: std::mem::take(&mut conn.sh_subs),
                         sh_join: conn.sh_join.take(),
-                        outpoint_subs: conn.outpoint_subs.clone(),
+                        outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
                         sp_sub: conn.sp_sub.clone(),
                         sp_scan_busy: conn.sp_scan_busy,
                     };
@@ -680,6 +696,12 @@ where
                                 (param_scripthash(&params_v, 0), v.as_str())
                             {
                                 last_sent_status.insert(sh, status.to_string());
+                            }
+                        } else if method == "blockchain.scripthash.unsubscribe" {
+                            // Exact and O(1): a resubscribe must not be
+                            // deduplicated against a status sent before.
+                            if let Ok(sh) = param_scripthash(&params_v, 0) {
+                                last_sent_status.remove(&sh);
                             }
                         }
                         rbitcoin_log::api_call(
@@ -1202,15 +1224,29 @@ fn restatus_notes(
     heights: Option<&[u32]>,
 ) -> Vec<([u8; 32], String)> {
     let mut out = Vec::new();
+    // Each height's touch set is built at most once, and only when a sub with
+    // postings needs it: a hash with no history can't be touched, so a
+    // connection watching only fresh addresses never loads the block's
+    // prevouts. (Probing per sub reloaded the block and its prevouts for each
+    // subscribed hash with history.) A height whose set fails to load counts
+    // as untouched, as the per-sub probe's `.ok().unwrap_or(false)` did.
+    let mut touches: Option<Vec<rbitcoin_query::BlockTouch>> = None;
     for sh in subs {
         let hit = match heights {
             None => true,
-            Some(hs) => hs.iter().any(|h| {
-                query
-                    .scripthash_touched_at_height(sh, Height(*h))
-                    .ok()
-                    .unwrap_or(false)
-            }),
+            Some(hs) => {
+                if !query.scripthash_has_postings(sh).unwrap_or(false) {
+                    false
+                } else {
+                    let ts = touches.get_or_insert_with(|| {
+                        hs.iter()
+                            .filter_map(|h| query.block_touch(Height(*h)).ok())
+                            .collect()
+                    });
+                    ts.iter()
+                        .any(|t| query.scripthash_touched_by(sh, t).ok().unwrap_or(false))
+                }
+            }
         };
         if !hit {
             continue;
@@ -1249,11 +1285,19 @@ fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>> {
     }
 }
 
+/// Backstop sweep of last-sent statuses for hashes no longer subscribed.
+///
+/// `scripthash.unsubscribe` already removes its entry exactly (post-dispatch),
+/// so this only catches leftovers and only runs when `last_sent` outgrows the
+/// sub set. Sweeping unconditionally on every push made each notification
+/// O(subs), so a block touching many subs of a large wallet went quadratic.
 fn drop_unsubscribed_status(
     last_sent: &mut HashMap<[u8; 32], String>,
     sh_subs: &HashSet<[u8; 32]>,
 ) {
-    last_sent.retain(|k, _| sh_subs.contains(k));
+    if last_sent.len() > sh_subs.len() {
+        last_sent.retain(|k, _| sh_subs.contains(k));
+    }
 }
 
 fn take_new_status(
