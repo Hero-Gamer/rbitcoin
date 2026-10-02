@@ -183,6 +183,30 @@ async fn readyz_after_startup(health_addr: SocketAddr) -> (u16, String) {
     }
 }
 
+/// `/metrics` gauges a probe reads while the node is up: build, phase, ready,
+/// initial block download, and block height.
+async fn pin_health_scrape(health_addr: SocketAddr, ready: bool, blocks: f64) {
+    let m = scrape_metrics(health_addr).await;
+    let build = format!(
+        "rbitcoin_build_info{{version=\"{}\",network=\"regtest\"}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+    assert_eq!(m.get(build.as_str()), Some(&1.0), "{m:?}");
+    assert_eq!(
+        m.get("rbitcoin_phase{phase=\"following\"}"),
+        Some(&1.0),
+        "{m:?}"
+    );
+    assert_eq!(m.get("rbitcoin_ready"), Some(&flag(ready)), "{m:?}");
+    assert_eq!(
+        m.get("rbitcoin_initial_block_download"),
+        Some(&flag(!ready)),
+        "{m:?}"
+    );
+    assert_eq!(m.get("rbitcoin_blocks"), Some(&blocks), "{m:?}");
+}
+
 /// `GET /metrics` in the Prometheus text format: one value per series.
 async fn scrape_metrics(health_addr: SocketAddr) -> HashMap<String, f64> {
     let mut stream = TcpStream::connect(health_addr)
@@ -1137,67 +1161,6 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
             "{run}: run_p2p did not stop cleanly"
         );
     }
-}
-
-/// A configured listener that did not bind keeps `/readyz` at 503 while the
-/// node follows the tip. RPC only warns on a bind failure.
-#[tokio::test(flavor = "multi_thread")]
-async fn readyz_names_a_listener_that_did_not_bind() {
-    let td = TestDatadir::new().unwrap();
-    {
-        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(
-            &q,
-            &ChainParams::regtest(),
-            Height::GENESIS,
-            &genesis,
-            Milestone::NONE,
-        )
-        .unwrap();
-        q.flush().unwrap();
-    }
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let health_addr = ephemeral_addr();
-    let mut cfg = NodeConfig::default()
-        .with_datadir(td.path())
-        .with_network(Network::Regtest)
-        .with_tiny_heads()
-        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
-    cfg.listen.use_seeds = false;
-    cfg.listen.connect.clear();
-    cfg.rpc.listen = Some(taken.local_addr().unwrap());
-    cfg.listen.health = Some(health_addr);
-    cfg.max_run_secs = Some(5);
-    let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[health_addr]).await;
-    assert_eq!(
-        readyz_after_startup(health_addr).await,
-        (503, "not ready: rpc not listening".into())
-    );
-    let (st, body) = http_get(health_addr, "/metrics").await;
-    assert_eq!(st, 404, "/metrics without --metrics: {body}");
-    let stopped = tokio::time::timeout(Duration::from_secs(20), node).await;
-    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
-}
-
-/// The health listener binds before the store opens: a taken port stops the
-/// node with nothing written to the datadir.
-#[tokio::test(flavor = "multi_thread")]
-async fn health_listen_bind_failure_stops_before_store_open() {
-    let td = TestDatadir::new().unwrap();
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut cfg = NodeConfig::default()
-        .with_datadir(td.path())
-        .with_network(Network::Regtest)
-        .with_tiny_heads();
-    cfg.listen.health = Some(taken.local_addr().unwrap());
-    let err = run_p2p(cfg).await.unwrap_err().to_string();
-    assert!(err.contains("health listen"), "{err}");
-    assert!(
-        !td.store_path().exists(),
-        "store opened before the health bind"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2169,15 +2132,31 @@ async fn stop_run_p2p(
 }
 
 /// One operator datadir restarted through the startup arms `run_p2p` owns
-/// while its one `--connect` peer is down: a junk peer book, a missing then a
-/// valid asmap, the wallet servers up until `stop`, an Electrum port someone
-/// else holds, seeds with no `--connect`, and a pruned datadir that refuses
-/// an unpruned start.
+/// while its one `--connect` peer is down: a health port that does not bind,
+/// a junk peer book, a missing then a valid asmap, the wallet servers and
+/// health probes up until `stop`, listeners someone else holds, seeds with
+/// no `--connect`, and a pruned datadir that refuses an unpruned start.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_listen_and_exit() {
     let td = TestDatadir::new().unwrap();
     let dir = td.path();
     let peers = dir.join("peers");
+
+    // Health binds before the store opens. A taken port stops the start
+    // with nothing written under store/.
+    let taken_health = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.listen.health = Some(taken_health.local_addr().unwrap());
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("taken health port")
+        .to_string();
+    assert!(err.contains("health listen"), "{err}");
+    assert!(
+        !td.store_path().exists(),
+        "store opened before the health bind"
+    );
+    drop(taken_health);
 
     // A copied-in datadir: the peer book is junk and the configured asmap is
     // not there. Catch-up gives up on the refused peer instead of hanging,
@@ -2201,17 +2180,32 @@ async fn node_listen_and_exit() {
     // answer until the operator stops the node.
     std::fs::write(dir.join("ip_asn.dat"), rbitcoin_net::TWO_PREFIX_ASMAP).unwrap();
     std::fs::write(dir.join("rpc.token"), "pass").unwrap();
-    let (electrum_addr, esplora_addr, rpc_addr) =
-        (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
+    let (electrum_addr, esplora_addr, rpc_addr, health_addr) = (
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+        ephemeral_addr(),
+    );
     let mut cfg = listen_and_exit_cfg(&dir);
     cfg.milestone_height = 100;
     cfg.shindex = true;
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
+    cfg.listen.health = Some(health_addr);
+    cfg.metrics = true;
     cfg.max_run_secs = Some(60);
     let node = spawn_run_p2p(cfg);
-    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr]).await;
+    wait_listeners(&[electrum_addr, esplora_addr, rpc_addr, health_addr]).await;
+    pin_healthz(health_addr).await;
+    // Genesis is older than the default tip-age window, so the process is
+    // live and following but not ready.
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: initial block download".into()),
+        "genesis tip is older than --max-tip-age"
+    );
+    pin_health_scrape(health_addr, false, 0.0).await;
     let (st, height) = http_get(esplora_addr, "/blocks/tip/height").await;
     assert_eq!((st, height.as_str()), (200, "0"), "esplora on genesis");
     let mut el = TcpStream::connect(electrum_addr).await.unwrap();
@@ -2219,18 +2213,43 @@ async fn node_listen_and_exit() {
     assert_eq!(tip["result"]["height"], 0, "{tip}");
     let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
     assert_eq!(count["result"], 0, "{count}");
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    assert!(mined["result"].is_array(), "{mined}");
+    let ready_deadline = Instant::now() + Duration::from_secs(20);
+    let ready = loop {
+        let got = http_get(health_addr, "/readyz").await;
+        if got.0 == 200 || Instant::now() >= ready_deadline {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(ready, (200, "ok".into()), "a fresh tip is ready");
+    pin_health_scrape(health_addr, true, 1.0).await;
     stop_run_p2p(rpc_addr, node).await;
 
-    // Another process holds the Electrum port. The bind fails with a warning
-    // and the node still starts and exits.
-    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Another process holds the Electrum and RPC ports. The binds warn, the
+    // node still follows, and `/readyz` names both. `/metrics` is absent
+    // without `--metrics`.
+    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held_rpc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let health_addr = ephemeral_addr();
     let mut cfg = listen_and_exit_cfg(&dir);
     cfg.shindex = true;
-    cfg.listen.electrum = Some(held.local_addr().unwrap());
-    start_and_exit(cfg)
-        .await
-        .expect("an Electrum bind failure is not fatal");
-    drop(held);
+    cfg.listen.electrum = Some(held_electrum.local_addr().unwrap());
+    cfg.rpc.listen = Some(held_rpc.local_addr().unwrap());
+    cfg.listen.health = Some(health_addr);
+    cfg.max_run_secs = Some(15);
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[health_addr]).await;
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: rpc, electrum not listening".into())
+    );
+    let (st, body) = http_get(health_addr, "/metrics").await;
+    assert_eq!(st, 404, "/metrics without --metrics: {body}");
+    let stopped = tokio::time::timeout(Duration::from_secs(30), node).await;
+    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
+    drop((held_electrum, held_rpc));
 
     // Without `--connect` and with seeds on: regtest resolves none, the one
     // saved peer still refuses, and the node exits short of tip mode.
