@@ -3296,3 +3296,151 @@ fn collect_spend_abs_after_fill_is_one_walk() {
         "got {msg}"
     );
 }
+
+/// A scratch reused for the next write batch must not keep the previous
+/// batch's annotate slots or pack-local double-spend set.
+#[test]
+fn structural_run_clears_reused_scratch_between_batches() {
+    use super::phases::{structural_run, StructuralReuse};
+    use super::{collect_spend_abs_after_fill, Prepared};
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::{InputRecord, OutputRecord};
+    use std::sync::Arc;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x41, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        parent_pin,
+        vec![0],
+        Some(false),
+        Some(loc[0].txout),
+        Vec::new(),
+    );
+    bp.set_spent_range_only(fks[0], loc[0].spent);
+    q.store().header_txs.put_range(Fk(100), fks[0], 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(100)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1_300_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![
+            coinbase,
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+        ],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    let params = ChainParams::regtest();
+    let bits = CompactTarget::from_consensus(0x207f_ffff);
+    let prepared = [Prepared {
+        height: Height(1),
+        header_fk: Fk(100),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![([0x41; 32], 0, Fk(9), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1_300_000_000,
+        bits,
+        hash: [2u8; 32],
+        prev_mtp: 1_300_000_000,
+    }];
+    let jobs = collect_spend_abs_after_fill(&bp, &prepared).expect("parent abs");
+    let wire = vec![Arc::new(block)];
+
+    let mut reuse = StructuralReuse::default();
+    reuse
+        .scratch
+        .slots
+        .push((999, Fk(1), 0, Fk(8), 0), (Fk::NULL, 0, 0));
+    reuse.pending.insert(([0x41; 32], 0u32));
+
+    let run = |reuse: &mut StructuralReuse| {
+        structural_run(
+            &q,
+            &params,
+            Milestone::NONE,
+            &prepared,
+            &wire,
+            &bp,
+            &jobs,
+            reuse,
+        )
+        .expect("reused scratch still connects")
+    };
+    let (_ph, slots) = run(&mut reuse);
+    assert!(
+        slots.abs_edges.iter().all(|e| e.0 != 999),
+        "previous batch slot leaked: {:?}",
+        slots.abs_edges
+    );
+    assert_eq!(slots.abs_edges.len(), 1);
+    let (_ph, slots2) = run(&mut reuse);
+    assert_eq!(slots2.abs_edges.len(), 1);
+    assert_ne!(slots2.abs_edges[0].0, 999);
+    let _ = std::fs::remove_dir_all(&path);
+}

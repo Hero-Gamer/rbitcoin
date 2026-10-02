@@ -1499,6 +1499,13 @@ impl Default for StructuralScratch {
 }
 
 impl StructuralScratch {
+    /// Drop annotate slots from the previous write batch. Per-block buffers
+    /// stay for [`Self::begin_block`]; slots accumulate inside one batch.
+    pub(crate) fn begin_batch(&mut self) {
+        self.slots.abs_edges.clear();
+        self.slots.known.clear();
+    }
+
     fn begin_block(&mut self) {
         self.abs_jobs.clear();
         self.abs_seen.clear();
@@ -1865,9 +1872,6 @@ fn structural_mark_pending(
 ) -> Result<(), ConsensusError> {
     for &(prev_txid, vout, _spend_fk, create_fk, _vin) in spends {
         let key = (prev_txid, vout);
-        if pending_spent.contains(&key) {
-            return Err(ConsensusError::PrevoutSpent);
-        }
         let spent = if create_fk.is_null() {
             false
         } else if let Some(id) = create_fk.get() {
@@ -1875,10 +1879,9 @@ fn structural_mark_pending(
         } else {
             false
         };
-        if spent {
+        if spent || !pending_spent.insert(key) {
             return Err(ConsensusError::PrevoutSpent);
         }
-        pending_spent.insert(key);
     }
     Ok(())
 }

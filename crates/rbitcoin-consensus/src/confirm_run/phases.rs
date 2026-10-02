@@ -230,6 +230,14 @@ pub(super) fn assemble_run(
     })
 }
 
+/// Scratch reused by the confirm write thread. Cleared at each batch.
+#[derive(Default)]
+pub(super) struct StructuralReuse {
+    pub scratch: crate::block::StructuralScratch,
+    pub pending: rbitcoin_query::OutPointSet,
+    pub heights: FkMap<u32>,
+}
+
 /// Durable spentness + maturity + subsidy after scripts (height order).
 pub(super) fn structural_run(
     query: &Query,
@@ -239,27 +247,30 @@ pub(super) fn structural_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
     abs_jobs: &[Vec<crate::block::StructuralAbsJob>],
+    reuse: &mut StructuralReuse,
 ) -> Result<(crate::block::StructuralPhaseNs, crate::block::AnnotateSlots), ConsensusError> {
-    use crate::block::{StructuralPhaseNs, StructuralScratch};
+    use crate::block::StructuralPhaseNs;
+    if abs_jobs.len() != prepared.len() {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: spend abs jobs length",
+        )));
+    }
     let t0 = Instant::now();
-    let mut scratch = StructuralScratch::default();
-    let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
+    // Reused across write batches on this thread. Slots, the pack-local
+    // double-spend set, and create heights are this batch only.
+    reuse.scratch.begin_batch();
+    reuse.pending.clear();
+    reuse.heights.clear();
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
         if p.height.0 > 0 {
             mtp_cache.insert(p.height.0 - 1, p.prev_mtp);
         }
     }
-    if abs_jobs.len() != prepared.len() {
-        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-            "invariant: spend abs jobs length",
-        )));
-    }
     let mut tot = StructuralPhaseNs::default();
-    let mut run_create_height: FkMap<u32> = FkMap::default();
     for p in prepared {
         for fk in &p.tx_fks {
-            run_create_height.insert(*fk, p.height.0);
+            reuse.heights.insert(*fk, p.height.0);
         }
     }
     for (i, p) in prepared.iter().enumerate() {
@@ -271,11 +282,11 @@ pub(super) fn structural_run(
             Some(&p.tx_fks),
             &p.spends,
             p.fees,
-            &mut pending_spent,
+            &mut reuse.pending,
             batch_parents,
             &mut mtp_cache,
-            &run_create_height,
-            &mut scratch,
+            &reuse.heights,
+            &mut reuse.scratch,
             Some(&abs_jobs[i]),
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
@@ -313,7 +324,7 @@ pub(super) fn structural_run(
         tot.create_h_ns,
     );
     rbitcoin_query::note_confirm(&query.confirm_stats().structural_bip68_ns, tot.bip68_ns);
-    Ok((tot, scratch.slots))
+    Ok((tot, std::mem::take(&mut reuse.scratch.slots)))
 }
 
 pub(super) fn class_c_commit(
