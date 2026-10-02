@@ -262,6 +262,9 @@ fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
         note_full_diff_snap(&mut st.header_walk.tip.diff, hub, &h, height);
     }
     st.header_walk.base_diff = st.header_walk.tip.diff;
+    // The confirmed tip is already validated. A restart has no new
+    // checkpoint yet; this base still meets the floor when its work does.
+    publish_work(st, hub);
 }
 
 fn below_floor(hub: &ChainHub, work: &[u8; 32]) -> bool {
@@ -3163,6 +3166,39 @@ mod tests {
             !crate::ibd::exit::ibd_caught_up(&st, 3),
             "the announced block is still owed"
         );
+    }
+
+    /// Restart on a validated tip. No new checkpoint has been built, and one
+    /// peer advertises a height no chain has. IBD is caught up once that
+    /// peer fails to extend the stored tip.
+    #[test]
+    fn a_restarted_tip_exits_once_the_false_height_fails() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-restart-tip");
+        hub.ensure_genesis().unwrap();
+        let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(2, op_true, vec![]).unwrap();
+        let tip = hub.tip_height().unwrap();
+        let (mut liar, mut liar_rx) = slot(0);
+        liar.peer_height = 100_000;
+        let (mut honest, _honest_rx) = slot(1);
+        honest.peer_height = tip;
+        let mut st = IbdWorkState::new(vec![liar, honest], hub.tip_hash(), Some(tip));
+        assert_eq!(st.max_peer_height, 100_000);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, tip),
+            "the advertised height is still a candidate"
+        );
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+        assert!(st.ordered.is_empty());
+        assert!(
+            crate::ibd::exit::ibd_caught_up(&st, tip),
+            "the stored tip is caught up once no peer can extend it"
+        );
+        assert_eq!(st.max_peer_height, 100_000);
     }
 
     /// The header peer's connect-time height is the walk tip and the queue
