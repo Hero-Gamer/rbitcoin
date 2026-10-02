@@ -1419,7 +1419,9 @@ pub(crate) fn spawn_confirm_engine(
     let load_ahead_reset_wb = Arc::clone(&load_ahead_reset);
     let write_thr = std::thread::Builder::new()
         .name("ibd-confirm-write".into())
-        .spawn(move || {
+        .spawn(
+            #[allow(clippy::cognitive_complexity)] // confirm write OS pipeline
+            move || {
             info!("ibd: confirm write on dedicated OS thread");
             let stats = hub_wb.query.confirm_stats_arc();
             // Non-contig leftover already note_write_recv'd; write it next iter.
