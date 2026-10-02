@@ -2839,6 +2839,36 @@ fn pass1_lying_include_hwm_still_resumes_pass2() {
 }
 
 #[test]
+fn pass1_ingest_append_does_not_hide_packed_history() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let script = vec![0x51];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], script.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], script.clone())], true)
+        .unwrap();
+    let n_shards = s.scripthash.head_shard_count();
+    let udir = crate::unsorted_shard_dir(s.path());
+    crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+    let rec = ScriptHashRecord::from_fk(script_hash(&script), Fk(2));
+    let mut heads = std::collections::HashMap::new();
+    s.scripthash
+        .put_create_batch_append(&[rec], &mut heads)
+        .unwrap();
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let mut fks: Vec<u64> = s
+        .scripthash
+        .entries(&script_hash(&script))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    fks.sort_unstable();
+    assert_eq!(fks, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn legacy_unmarked_head_soft_migrates_without_rescan() {
     let dir = tmp();
     let s = crate::Store::create_tiny(&dir).unwrap();

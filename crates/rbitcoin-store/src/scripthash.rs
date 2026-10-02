@@ -2743,6 +2743,7 @@ impl ScriptHashTable {
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
         self.note_shard_packed(shard)?;
+        self.drop_ingest_covered_by_packed_main(shard)?;
         Ok(())
     }
 
@@ -2780,7 +2781,42 @@ impl ScriptHashTable {
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
         self.note_shard_packed(shard)?;
+        self.drop_ingest_covered_by_packed_main(shard)?;
         Ok(bump)
+    }
+
+    /// A tip append while this shard is unsealed lands on ingest (main MPHF is
+    /// not loaded). Lookup reads ingest first, so that row would hide the
+    /// packed chain. Clear ingest keys this shard's main now owns. Ingest body
+    /// bytes stay; only the head slot is soft-cleared.
+    fn drop_ingest_covered_by_packed_main(&self, shard: usize) -> Result<(), StoreError> {
+        let Some(slot) = self.sorted_main.get(shard) else {
+            return Ok(());
+        };
+        let main = slot.read().unwrap();
+        let Some(head) = main.as_ref() else {
+            return Ok(());
+        };
+        let mut covered = Vec::new();
+        self.ingest.lock().unwrap().for_each_occupied(|key, _val| {
+            if self.shard_index(&key) != shard {
+                return Ok(());
+            }
+            let hk = head_key_from_full(&key);
+            if head.get(&hk)?.is_some() {
+                covered.push(key);
+            }
+            Ok(())
+        })?;
+        drop(main);
+        if covered.is_empty() {
+            return Ok(());
+        }
+        let ingest = self.ingest.lock().unwrap();
+        for key in &covered {
+            ingest.clear_key(key)?;
+        }
+        Ok(())
     }
 
     fn note_shard_packed(&self, shard: usize) -> Result<(), StoreError> {

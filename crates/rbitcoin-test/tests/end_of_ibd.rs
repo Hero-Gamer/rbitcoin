@@ -8,8 +8,9 @@ use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_electrum::electrum_scripthash_hex;
 use rbitcoin_net::{IbdConfig, NetAddr, P2PNode};
 use rbitcoin_node::{run_p2p, NodeConfig};
-use rbitcoin_primitives::Network;
+use rbitcoin_primitives::{Fk, Height, Network};
 use rbitcoin_query::Query;
+use rbitcoin_store::{script_hash, ScriptHashRecord};
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 use rbitcoin_test::TestDatadir;
 use serde_json::{json, Value};
@@ -118,6 +119,16 @@ fn load_chain(miner: &P2PNode, blocks: &[bitcoin::Block]) {
 }
 
 fn syncer_cfg(dir: &Path, miner: SocketAddr, rpc: SocketAddr, electrum: SocketAddr) -> NodeConfig {
+    syncer_cfg_sh(dir, miner, rpc, electrum, true)
+}
+
+fn syncer_cfg_sh(
+    dir: &Path,
+    miner: SocketAddr,
+    rpc: SocketAddr,
+    electrum: SocketAddr,
+    shindex: bool,
+) -> NodeConfig {
     let mut cfg = NodeConfig::default()
         .with_datadir(dir)
         .with_network(Network::Regtest)
@@ -126,7 +137,7 @@ fn syncer_cfg(dir: &Path, miner: SocketAddr, rpc: SocketAddr, electrum: SocketAd
     cfg.listen.connect = vec![NetAddr::Ip(miner)];
     cfg.listen.use_seeds = false;
     cfg.listen.electrum = Some(electrum);
-    cfg.shindex = true;
+    cfg.shindex = shindex;
     cfg.rpc.listen = Some(rpc);
     cfg.max_tip_age_secs = Some(u64::MAX);
     std::fs::write(dir.join("rpc.token"), "pass").unwrap();
@@ -558,4 +569,269 @@ async fn follow_journey() {
 
     ibd_then_restart(miner, miner_addr, &mut synced).await;
     partial_with_miner_down(miner_dir.path().as_path(), miner_addr, &synced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_of_ibd_sh_interrupt() {
+    let _live = live_p2p_lock().await;
+    let wall = llvm_cov_wall(120, 240);
+    tokio::time::timeout(wall, sh_interrupt_journey())
+        .await
+        .expect("end_of_ibd_sh_interrupt wall");
+}
+
+async fn wait_tip_electrum_down(rpc: SocketAddr, electrum: SocketAddr, height: u32, hash: &str) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        assert!(
+            TcpStream::connect(electrum).await.is_err(),
+            "Electrum listened while scripthash indexing was off"
+        );
+        if TcpStream::connect(rpc).await.is_ok() {
+            let count = jsonrpc(rpc, "getblockcount", json!([])).await;
+            let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
+            if count["result"].as_u64() == Some(u64::from(height))
+                && best["result"].as_str() == Some(hash)
+            {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("shindex-off syncer did not reach height {height} {hash}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn catch_without_index(dir: &Path, miner: SocketAddr, height: u32, hash: &str) {
+    let rpc = reserve_addr();
+    let electrum = reserve_addr();
+    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, rpc, electrum, false));
+    wait_tip_electrum_down(rpc, electrum, height, hash).await;
+    stop_run_p2p(rpc, node).await;
+}
+
+fn freeze_pass1(store: &Path) {
+    let query = Query::open_or_create_tiny(store).unwrap();
+    let n_shards = query.store().scripthash.head_shard_count();
+    let udir = rbitcoin_store::unsorted_shard_dir(query.store().path());
+    rbitcoin_store::collect_unsorted_shard_files(query.store(), &udir, n_shards, 1, None).unwrap();
+    assert!(udir.join("DONE.keys").is_file(), "pass 1 writes DONE.keys");
+    assert!(
+        !udir.join("DONE.post").is_file(),
+        "pass 1 stops before DONE.post"
+    );
+    assert!(
+        !query.store().scripthash.has_durable_index(),
+        "pass-1 mphf is not a packed head"
+    );
+    assert!(query.store().txs.count() > 1);
+}
+
+struct Resume {
+    node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
+    rpc: SocketAddr,
+    electrum: SocketAddr,
+}
+
+async fn resume_until_history(
+    dir: &Path,
+    miner: SocketAddr,
+    height: u32,
+    hash: &str,
+    script_a: &BTreeSet<String>,
+    script_b: &BTreeSet<String>,
+) -> Resume {
+    let rpc = reserve_addr();
+    let electrum = reserve_addr();
+    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, rpc, electrum, true));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if TcpStream::connect(electrum).await.is_ok() {
+            let hist_a = history_txids(electrum, &[0x51]).await;
+            let hist_b = history_txids(electrum, &[0x52]).await;
+            assert_eq!(
+                &hist_a, script_a,
+                "Electrum opened before script A history was complete"
+            );
+            assert_eq!(
+                &hist_b, script_b,
+                "Electrum opened before script B history was complete"
+            );
+            let count = jsonrpc(rpc, "getblockcount", json!([])).await;
+            let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
+            assert_eq!(count["result"].as_u64(), Some(u64::from(height)), "{count}");
+            assert_eq!(best["result"].as_str(), Some(hash), "{best}");
+            assert_tip_view(rpc, height, hash).await;
+            return Resume {
+                node,
+                rpc,
+                electrum,
+            };
+        }
+        if Instant::now() >= deadline {
+            panic!("pass-1 resume never served Electrum at {height} {hash}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn resume_pass1_and_restart(
+    dir: &Path,
+    miner: SocketAddr,
+    height: u32,
+    hash: &str,
+    script_a: &BTreeSet<String>,
+    script_b: &BTreeSet<String>,
+) -> SystemTime {
+    let resumed = resume_until_history(dir, miner, height, hash, script_a, script_b).await;
+    let store = dir.join("store");
+    let mark = pack_mark(&store);
+    let packed_at = mark_mtime(&mark);
+    assert!(!store.join("scripthash.unsorted").is_dir());
+    stop_run_p2p(resumed.rpc, resumed.node).await;
+
+    let again = resume_until_history(dir, miner, height, hash, script_a, script_b).await;
+    assert_eq!(mark_mtime(&mark), packed_at, "restart collected again");
+    assert!(!store.join("scripthash.unsorted").is_dir());
+    stop_run_p2p(again.rpc, again.node).await;
+    packed_at
+}
+
+fn mine_one_a(miner: &P2PNode) -> (u32, String, String) {
+    miner
+        .hub
+        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let height = miner.tip_height().unwrap();
+    let hash = miner.hub.tip_hash().unwrap().to_string();
+    let ids = miner.query.block_txids(Height(height)).unwrap();
+    let txid: String = ids[0].iter().rev().map(|b| format!("{b:02x}")).collect();
+    (height, hash, txid)
+}
+
+async fn contaminate_writebehind(dir: &Path, miner: &P2PNode, height: u32) {
+    let block = miner
+        .query
+        .reconstruct_block_at_height(Height(height))
+        .unwrap();
+    let store = dir.join("store");
+    let before = Query::open_or_create_tiny(&store)
+        .unwrap()
+        .store()
+        .txs
+        .count();
+    let query = Query::open_or_create_tiny(&store).unwrap();
+    let node = P2PNode::start(
+        "127.0.0.1:0".parse().unwrap(),
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+    )
+    .await
+    .expect("contaminated syncer");
+    node.ingest_block(height, block)
+        .unwrap_or_else(|e| panic!("write-behind ingest: {e}"));
+    let count = node.query.store().txs.count();
+    assert!(count > before, "ingested block did not grow Class A");
+    assert!(
+        !node.query.store().scripthash.has_durable_index(),
+        "write-behind on a pass-1 head must not pack it"
+    );
+    if node.query.store().scripthash.include_hwm() < count {
+        let fk = Fk(count);
+        let rec = ScriptHashRecord::from_fk(script_hash(&[0x51]), fk);
+        let mut heads = std::collections::HashMap::new();
+        node.query
+            .store()
+            .scripthash
+            .put_create_batch_append(&[rec], &mut heads)
+            .unwrap();
+        std::fs::write(
+            store.join(rbitcoin_store::INCLUDE_HWM_NAME),
+            count.to_le_bytes(),
+        )
+        .unwrap();
+    }
+    let udir = store.join("scripthash.unsorted");
+    assert!(udir.join("DONE.keys").is_file());
+    assert!(!udir.join("DONE.post").is_file());
+    node.shutdown().await;
+    let query = Query::open_or_create_tiny(&store).unwrap();
+    assert!(!query.store().scripthash.has_durable_index());
+    assert_eq!(query.store().scripthash.include_hwm(), count);
+}
+
+async fn sh_interrupt_journey() {
+    let (blocks, script_a, script_b) = fixture_chain();
+    let miner_dir = TestDatadir::new().unwrap();
+    let miner_addr = reserve_addr();
+    let miner = start_miner(miner_dir.path().as_path(), miner_addr).await;
+    load_chain(&miner, &blocks);
+    let height = miner.tip_height().unwrap();
+    let hash = miner.hub.tip_hash().unwrap().to_string();
+    assert_eq!(height as usize, blocks.len() - 1);
+
+    let frozen = TestDatadir::new().unwrap();
+    catch_without_index(frozen.path().as_path(), miner_addr, height, &hash).await;
+    freeze_pass1(&frozen.store_path());
+    let gap = TestDatadir::new().unwrap();
+    let lie = TestDatadir::new().unwrap();
+    copy_dir(&frozen.store_path(), &gap.store_path());
+    copy_dir(&frozen.store_path(), &lie.store_path());
+
+    let packed_at = resume_pass1_and_restart(
+        frozen.path().as_path(),
+        miner_addr,
+        height,
+        &hash,
+        &script_a,
+        &script_b,
+    )
+    .await;
+
+    let (new_height, new_hash, txid) = mine_one_a(&miner);
+    let mut with_new = script_a.clone();
+    with_new.insert(txid);
+    let resumed = resume_until_history(
+        gap.path().as_path(),
+        miner_addr,
+        new_height,
+        &new_hash,
+        &with_new,
+        &script_b,
+    )
+    .await;
+    stop_run_p2p(resumed.rpc, resumed.node).await;
+
+    contaminate_writebehind(lie.path().as_path(), &miner, new_height).await;
+    let resumed = resume_until_history(
+        lie.path().as_path(),
+        miner_addr,
+        new_height,
+        &new_hash,
+        &with_new,
+        &script_b,
+    )
+    .await;
+    stop_run_p2p(resumed.rpc, resumed.node).await;
+
+    let mark = pack_mark(&frozen.store_path());
+    let resumed = resume_until_history(
+        frozen.path().as_path(),
+        miner_addr,
+        new_height,
+        &new_hash,
+        &with_new,
+        &script_b,
+    )
+    .await;
+    assert_eq!(
+        mark_mtime(&mark),
+        packed_at,
+        "write-behind rewrote the pack mark"
+    );
+    assert_eq!(history_txids(resumed.electrum, &[0x51]).await, with_new);
+    stop_run_p2p(resumed.rpc, resumed.node).await;
+    miner.shutdown().await;
 }
