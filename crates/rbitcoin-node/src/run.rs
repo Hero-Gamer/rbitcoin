@@ -996,6 +996,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         true,
                         config.listen.electrum,
                         config.sptweaks_dust,
+                        config.electrum_max_subs,
                         &shutdown,
                         &node.hub,
                         &params,
