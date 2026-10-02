@@ -3,15 +3,18 @@
 use bitcoin::absolute::LockTime;
 use bitcoin::script::ScriptBuf;
 use bitcoin::transaction::Version as TxVersion;
-use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use rbitcoin_consensus::{ChainParams, Milestone};
+use bitcoin::{
+    Amount, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    Work,
+};
+use rbitcoin_consensus::{next_work_bits, ChainParams, Milestone};
 use rbitcoin_electrum::electrum_scripthash_hex;
 use rbitcoin_net::{IbdConfig, NetAddr, P2PNode};
 use rbitcoin_node::{run_p2p, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network};
 use rbitcoin_query::Query;
 use rbitcoin_store::{script_hash, ScriptHashRecord};
-use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+use rbitcoin_test::mine::{mine_regtest_block, mine_regtest_block_at, regtest_genesis};
 use rbitcoin_test::TestDatadir;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -834,4 +837,172 @@ async fn sh_interrupt_journey() {
     assert_eq!(history_txids(resumed.electrum, &[0x51]).await, with_new);
     stop_run_p2p(resumed.rpc, resumed.node).await;
     miner.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_of_ibd_work_fork() {
+    let _live = live_p2p_lock().await;
+    let wall = llvm_cov_wall(150, 300);
+    tokio::time::timeout(wall, work_fork_journey())
+        .await
+        .expect("end_of_ibd_work_fork wall");
+}
+
+fn fork_params() -> ChainParams {
+    let mut params = ChainParams::regtest();
+    let spacing = params.btc.pow_target_spacing;
+    params.btc.no_pow_retargeting = false;
+    params.btc.allow_min_difficulty_blocks = true;
+    params.btc.pow_target_timespan = spacing.saturating_mul(20);
+    params
+}
+
+fn expected_bits(
+    params: &ChainParams,
+    height: u32,
+    chain: &[bitcoin::Block],
+    time: u32,
+) -> CompactTarget {
+    let prev = &chain[(height - 1) as usize].header;
+    let interval = params.difficulty_adjustment_interval();
+    let first = if interval > 0 && height.is_multiple_of(interval) && !params.no_pow_retargeting() {
+        Some(chain[(height - interval) as usize].header.time)
+    } else {
+        None
+    };
+    next_work_bits(params, height, prev.bits, prev.time, time, first, |h| {
+        chain.get(h as usize).map(|block| block.header.bits)
+    })
+    .expect("next bits")
+}
+
+fn chain_work(blocks: &[bitcoin::Block]) -> Work {
+    blocks
+        .iter()
+        .fold(Work::from_be_bytes([0u8; 32]), |acc, block| {
+            acc + block.header.work()
+        })
+}
+
+fn push_block(params: &ChainParams, chain: &mut Vec<bitcoin::Block>, time: u32) {
+    let height = chain.len() as u32;
+    let bits = expected_bits(params, height, chain, time);
+    let prev = chain.last().unwrap().block_hash();
+    chain.push(mine_regtest_block_at(prev, time, height, bits, vec![]));
+}
+
+fn build_forks(params: &ChainParams) -> (Vec<bitcoin::Block>, Vec<bitcoin::Block>) {
+    let mut heavy = vec![regtest_genesis()];
+    let mut time = heavy[0].header.time;
+    for _ in 1..=25 {
+        time = time.saturating_add(1);
+        push_block(params, &mut heavy, time);
+    }
+    let mut light = heavy[..=20].to_vec();
+    let step = (params.btc.pow_target_spacing as u32).saturating_mul(2) + 1;
+    for _ in 21..=32 {
+        let prev_time = light.last().unwrap().header.time;
+        push_block(params, &mut light, prev_time.saturating_add(step));
+    }
+    (heavy, light)
+}
+
+async fn start_node(dir: &Path, addr: SocketAddr, params: ChainParams) -> P2PNode {
+    let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
+    let node = P2PNode::start(addr, query, params, Milestone::NONE)
+        .await
+        .expect("listen");
+    node.hub.set_max_tip_age_secs(u64::MAX);
+    node
+}
+
+async fn sync_heavy(
+    dir: &Path,
+    params: ChainParams,
+    peers: [SocketAddr; 2],
+    height: u32,
+    hash: BlockHash,
+) {
+    let node = start_node(dir, reserve_addr(), params).await;
+    node.sync(
+        &[NetAddr::Ip(peers[0]), NetAddr::Ip(peers[1])],
+        IbdConfig::for_test(),
+    )
+    .await
+    .expect("sync heavier fork");
+    assert_eq!(
+        node.tip_height(),
+        Some(height),
+        "syncer left the heavier tip"
+    );
+    assert_eq!(node.hub.tip_hash().unwrap(), hash);
+    node.shutdown().await;
+}
+
+async fn work_fork_journey() {
+    let params = fork_params();
+    let (mut heavy_blocks, mut light_blocks) = build_forks(&params);
+    let heavy_h = (heavy_blocks.len() - 1) as u32;
+    let light_h = (light_blocks.len() - 1) as u32;
+    assert!(light_h > heavy_h);
+    assert!(chain_work(&light_blocks) < chain_work(&heavy_blocks));
+    assert_ne!(
+        heavy_blocks.last().unwrap().header.bits,
+        light_blocks.last().unwrap().header.bits
+    );
+
+    let heavy_dir = TestDatadir::new().unwrap();
+    let light_dir = TestDatadir::new().unwrap();
+    let heavy_addr = reserve_addr();
+    let light_addr = reserve_addr();
+    let heavy = start_node(heavy_dir.path().as_path(), heavy_addr, params.clone()).await;
+    let light = start_node(light_dir.path().as_path(), light_addr, params.clone()).await;
+    load_chain(&heavy, &heavy_blocks);
+    load_chain(&light, &light_blocks);
+    assert!(
+        light.hub.work_through_height(light_h).unwrap()
+            < heavy.hub.work_through_height(heavy_h).unwrap()
+    );
+    let heavy_hash = heavy.hub.tip_hash().unwrap();
+    let syncer = TestDatadir::new().unwrap();
+    let peers = [heavy_addr, light_addr];
+    sync_heavy(
+        syncer.path().as_path(),
+        params.clone(),
+        peers,
+        heavy_h,
+        heavy_hash,
+    )
+    .await;
+    sync_heavy(
+        syncer.path().as_path(),
+        params.clone(),
+        peers,
+        heavy_h,
+        heavy_hash,
+    )
+    .await;
+
+    let heavy_time = heavy_blocks.last().unwrap().header.time.saturating_add(1);
+    push_block(&params, &mut heavy_blocks, heavy_time);
+    heavy
+        .ingest_block(heavy_h + 1, heavy_blocks.last().unwrap().clone())
+        .unwrap();
+    let step = (params.btc.pow_target_spacing as u32).saturating_mul(2) + 1;
+    for _ in 0..3 {
+        let prev_time = light_blocks.last().unwrap().header.time;
+        let height = light_blocks.len() as u32;
+        push_block(&params, &mut light_blocks, prev_time.saturating_add(step));
+        light
+            .ingest_block(height, light_blocks.last().unwrap().clone())
+            .unwrap();
+    }
+    let heavy_h = (heavy_blocks.len() - 1) as u32;
+    let light_h = (light_blocks.len() - 1) as u32;
+    assert!(light_h > heavy_h);
+    assert!(chain_work(&light_blocks) < chain_work(&heavy_blocks));
+    let heavy_hash = heavy.hub.tip_hash().unwrap();
+    sync_heavy(syncer.path().as_path(), params, peers, heavy_h, heavy_hash).await;
+    heavy.shutdown().await;
+    light.shutdown().await;
 }
