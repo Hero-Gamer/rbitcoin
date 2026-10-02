@@ -339,6 +339,15 @@ pub(crate) fn localaddresses_json(ctx: &RpcContext) -> Value {
         .collect::<Vec<_>>())
 }
 
+/// `getnetworkinfo.version`: Bitcoin Core 0.19.0 `CLIENT_VERSION`.
+///
+/// Typed clients compare this integer when they pick a response shape.
+/// `bitcoincore-rpc` requires the pre-0.19 `bip9_softforks` map below
+/// 190000 and then rejects our `getblockchaininfo`. This is an RPC shape
+/// floor. P2P stays `protocolversion` 70016. The crate semver stays in
+/// `subversion`.
+pub(crate) const RPC_COMPAT_VERSION: u64 = 190_000;
+
 pub(crate) fn getnetworkinfo(ctx: &RpcContext) -> Value {
     let (cin, cout, timeoffset) = if let Some(hub) = ctx.peers.as_ref() {
         let rows = hub.snapshot();
@@ -350,7 +359,7 @@ pub(crate) fn getnetworkinfo(ctx: &RpcContext) -> Value {
     let flags = rbitcoin_net::local_service_flags_pruned(ctx.query.prune_seqsigwit());
     let svc_bits = flags.to_u64();
     json!({
-        "version": rpc_client_version(env!("CARGO_PKG_VERSION")),
+        "version": RPC_COMPAT_VERSION,
         "subversion": ctx.subversion,
         "protocolversion": 70016,
         "localservices": format!("{svc_bits:016x}"),

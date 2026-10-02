@@ -857,17 +857,6 @@ pub(crate) fn getrpcinfo(ctx: &RpcContext) -> Value {
     })
 }
 
-/// Core-shaped version integer: major*10000 + minor*100 + patch.
-pub(crate) fn rpc_client_version(semver: &str) -> u64 {
-    let mut it = semver.split('.');
-    let maj: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let min: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let pat: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    maj.saturating_mul(10_000)
-        .saturating_add(min.saturating_mul(100))
-        .saturating_add(pat)
-}
-
 pub(crate) fn chain_name(n: Network) -> &'static str {
     match n {
         Network::Mainnet => "main",

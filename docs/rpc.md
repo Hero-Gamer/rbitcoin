@@ -18,6 +18,33 @@ scripthash index. It requires `--sh-index` (`scripthash index disabled`
 otherwise). Prefer **Electrum / Esplora** (with `--sh-index`) for address
 history.
 
+## `getnetworkinfo.version`
+
+`version` is the hardcoded integer **190000**, Bitcoin Core 0.19.0's
+`CLIENT_VERSION` (`10000 * 19` in Core's 0.x packing). Typed RPC clients
+compare this field when they choose a response shape. Below 190000,
+`bitcoincore-rpc`'s `get_blockchain_info` requires the pre-0.19
+`bip9_softforks` map and a `softforks` array, then returns
+`UnexpectedStructure` on our object. At 190000 it deserializes the
+modern object (`softforks` may be absent; `warnings` may be a string or
+an array).
+
+190000 is an RPC shape floor:
+
+- `subversion` stays `/rbitcoin:<semver>/`, plus any `--ua-comment`.
+  That string is the software version.
+- `protocolversion` stays **70016**, the same integer on the P2P
+  `VERSION` message. Peers negotiate with that, with service flags, and
+  with the handshake messages. They do not read this field.
+- The floor is not derived from the crate semver. Packing `0.7.99` with
+  Core's post-22 formula yields 799, which sits under every client
+  gate. Packing a later rbitcoin `19.0` or `22.0` the same way would
+  collide with a real Core `CLIENT_VERSION`.
+
+The floor stops at 0.19. A higher integer would tell those clients that
+later Core RPC is present, including descriptor-wallet calls from 0.21
+(`210000`). It would not change what peers accept.
+
 ## Operator knobs
 
 | Knob | Default | Meaning |
@@ -103,7 +130,7 @@ still wait for durable SH when shindex is on.
 | `getblockheader` / `getblock` (verbosity 0/1/2) | Archive reconstruct. `getblockheader` includes `chainwork`. Verbosity 0/2 below `pruneheight` is `-8` `Block not available (pruned data)`; verbosity 1 (txids) stays. |
 | `getblockstats` | All networks. Stamped `txstat` fee/size/weight/`n_in`. Size and count fields match Core for the keys we return: coinbase is left out of `ins`, fees, `total_size`, `total_weight`, and the segwit totals. `utxo_increase` is every output minus those inputs. `utxo_increase_actual` drops outputs that do not enter the UTXO set (height 0, the two mainnet BIP30-repeat coinbases, unspendable scripts). Omits coins-DB `utxo_size_inc` / `utxo_size_inc_actual` (selecting those names is invalid statistic `-8`). Unstamped leftover reconstructs then lazy-stamps. Reconstruct miss is `block body not in store`. Dummy `blk00000.dat` is shim-only so `rpc_getblockstats.py`'s rename-file needle stays Core-phrased. Pruned unstamped height is `-8` Core pruned text. |
 | `getdifficulty` | From tip bits |
-| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `timeoffset` is VERSION clock minus connect time (`0` before handshake). `synced_headers` is the height of that peer's advertised best block when we know it, else `-1`. `synced_blocks` is that height when the hash is on our best chain, else `-1`. `getnetworkinfo.timeoffset` is the median of outbound handshake-complete offsets (`0` if none). `mapped_as` is present when `--asmap` / `{datadir}/ip_asn.dat` mapped the peer (Core field; omitted without a map or ASN 0). `version` is rbitcoin semver as a Core integer (`major*10000+minor*100+patch`: `0.1.0` → `100`, `0.5.0` → `500`, `0.6.0` → `600`, `0.6.99` → `699`, `0.7.0` → `700`, `0.7.99` → `799`), not a Core release. `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2`, or `NETWORK_LIMITED\|WITNESS\|P2P_V2` under `--prune-seqsigwit`. `localaddresses` lists `--external-ip` (`score` = Core `LOCAL_MANUAL`) |
+| `getnetworkinfo` / `getconnectioncount` / `getpeerinfo` | BIP324 v2-only; `getpeerinfo` is the live session table. `timeoffset` is VERSION clock minus connect time (`0` before handshake). `synced_headers` is the height of that peer's advertised best block when we know it, else `-1`. `synced_blocks` is that height when the hash is on our best chain, else `-1`. `getnetworkinfo.timeoffset` is the median of outbound handshake-complete offsets (`0` if none). `mapped_as` is present when `--asmap` / `{datadir}/ip_asn.dat` mapped the peer (Core field; omitted without a map or ASN 0). `version` is the fixed integer `190000` (Core 0.19 client version; see [getnetworkinfo.version](#getnetworkinfoversion)). `localservices` matches advertised `NETWORK\|WITNESS\|P2P_V2`, or `NETWORK_LIMITED\|WITNESS\|P2P_V2` under `--prune-seqsigwit`. `localaddresses` lists `--external-ip` (`score` = Core `LOCAL_MANUAL`) |
 | `getnettotals` | All networks. Raw TCP `totalbytesrecv` / `totalbytessent` on live sessions. `uploadtarget` is a Core-shaped stub (`target` 0). |
 | `ping` | All networks. Queues a ping on each live session (`null`). |
 | `addpeeraddress` | Hidden Core name. Inserts `{address,port}` into addrman RAM (does not rewrite `peers` per call). |
