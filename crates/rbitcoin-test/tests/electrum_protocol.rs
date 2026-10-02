@@ -962,6 +962,242 @@ async fn electrum_server_version_history_balance() {
     handle.shutdown().await;
 }
 
+/// `block_touch` must see a scripthash that a block only *spends*: OP_TRUE
+/// coinbases (heights 1..=101) fund it, and block 102 pays its coinbase
+/// elsewhere while spending one of those outputs. Removing the input
+/// `create_fk`s from the touch set must fail this.
+#[test]
+fn block_touch_sees_spend_only_heights() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::accept_and_connect_block;
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::script_hash;
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let (tip, tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        101,
+        1,
+    );
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        }],
+    };
+    let blk = rbitcoin_consensus::mine_regtest_paying(
+        tip,
+        tip_time + 600,
+        102,
+        ScriptBuf::from_bytes(vec![0x53]),
+        vec![spend],
+    );
+    accept_and_connect_block(&q, &params, Height(102), &blk, Milestone::NONE).unwrap();
+    q.apply_sh_pending().unwrap();
+
+    let spent_only = script_hash(&[0x51]);
+    let touch = q.block_touch(Height(102)).unwrap();
+    assert!(
+        q.scripthash_touched_at_height(&spent_only, Height(102))
+            .unwrap(),
+        "fixture: OP_TRUE is spent (not paid) at 102"
+    );
+    assert!(
+        q.scripthash_touched_by(&spent_only, &touch).unwrap(),
+        "block_touch must include the spent outputs' create fks"
+    );
+    for (script, want) in [(vec![0x52], true), (vec![0x53], true), (vec![0x54], false)] {
+        let sh = script_hash(&script);
+        assert_eq!(
+            q.scripthash_touched_by(&sh, &touch).unwrap(),
+            want,
+            "{script:?}"
+        );
+        assert_eq!(
+            q.scripthash_touched_at_height(&sh, Height(102)).unwrap(),
+            want,
+            "{script:?}"
+        );
+    }
+}
+
+/// Every newline-delimited JSON message the server sends within `window`.
+/// Reads raw bytes, so two pushes that arrive together are both counted.
+async fn drain_lines(stream: &mut TcpStream, window: Duration) -> Vec<Value> {
+    let mut raw = Vec::new();
+    let deadline = tokio::time::Instant::now() + window;
+    let mut buf = [0u8; 4096];
+    while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8(raw)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// The mempool notify path probes the sub set with each accepted tx's
+/// scripthashes. Funding the watched hash pushes its new status, and an RBF
+/// replacement that stops paying it must push again via replaced_scripthashes
+/// (the hash is no longer in the replacement's own scripthashes).
+#[tokio::test]
+async fn electrum_mempool_notify_follows_funding_and_rbf() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_consensus::accept_and_connect_block;
+    use rbitcoin_net::MempoolHub;
+    use rbitcoin_primitives::Height;
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        101,
+        1,
+    );
+    let q = Arc::new(q);
+    let mp = Arc::new(MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap());
+    mp.set_relay_enabled(true);
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx, Some(Arc::clone(&mp)))
+        .await
+        .expect("electrum listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+
+    let watched = ScriptBuf::from_bytes(vec![0x52]);
+    let sh = electrum_scripthash_hex(watched.as_bytes());
+    let v = rpc(
+        &mut stream,
+        1,
+        "blockchain.scripthash.subscribe",
+        json!([sh.clone()]),
+    )
+    .await;
+    assert!(v.get("result").is_some(), "{v}");
+
+    let spend = |outputs: Vec<TxOut>| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_txids[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: outputs,
+    };
+    let pays = |spk: &ScriptBuf, sat: u64| TxOut {
+        value: Amount::from_sat(sat),
+        script_pubkey: spk.clone(),
+    };
+    // Two outputs to the watched script; one status push for the hash.
+    let first = spend(vec![
+        pays(&watched, 20_0000_0000),
+        pays(&watched, 29_9999_0000),
+    ]);
+    mp.accept_tx(&first).expect("accept first");
+    let pushes = drain_lines(&mut stream, Duration::from_millis(800)).await;
+    let for_sh: Vec<_> = pushes
+        .iter()
+        .filter(|m| m["method"] == "blockchain.scripthash.subscribe" && m["params"][0] == sh)
+        .collect();
+    assert_eq!(for_sh.len(), 1, "one push per accepted tx: {pushes:?}");
+    let funded_status = for_sh[0]["params"][1].clone();
+    assert!(funded_status.is_string(), "{pushes:?}");
+
+    // RBF the spend to a different script: the watched hash is only in
+    // replaced_scripthashes, and its status must be pushed again.
+    let other = ScriptBuf::from_bytes(vec![0x53]);
+    let replacement = spend(vec![pays(&other, 49_9990_0000)]);
+    mp.accept_tx(&replacement).expect("accept replacement");
+    let pushes = drain_lines(&mut stream, Duration::from_millis(800)).await;
+    let for_sh: Vec<_> = pushes
+        .iter()
+        .filter(|m| m["method"] == "blockchain.scripthash.subscribe" && m["params"][0] == sh)
+        .collect();
+    assert_eq!(
+        for_sh.len(),
+        1,
+        "RBF victim's hash is restatused: {pushes:?}"
+    );
+    assert_ne!(for_sh[0]["params"][1], funded_status, "{pushes:?}");
+
+    handle.shutdown().await;
+}
+
+/// Sparrow subscribes every receive and change address up to its gap limit on
+/// one connection; the old 1,000 default refused `../0/332` of a real wallet.
+/// The default must take a wallet well past that.
+#[tokio::test]
+async fn electrum_default_sub_cap_admits_a_large_wallet() {
+    let dir = TempDir::new().unwrap();
+    let q = Arc::new(Query::open_or_create_tiny(dir.path().join("store")).unwrap());
+    let params = ChainParams::regtest();
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    assert_eq!(
+        cfg.max_scripthash_subs,
+        rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS
+    );
+    let handle = run_electrum(cfg, q, params, tip_tx, None)
+        .await
+        .expect("electrum listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    for i in 0..1_200u64 {
+        let mut sh = [0u8; 32];
+        sh[..8].copy_from_slice(&(i + 1).to_le_bytes());
+        let v = rpc(
+            &mut stream,
+            i + 1,
+            "blockchain.scripthash.subscribe",
+            json!([sh.iter().map(|b| format!("{b:02x}")).collect::<String>()]),
+        )
+        .await;
+        assert!(v.get("result").is_some(), "sub #{} refused: {v}", i + 1);
+    }
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn electrum_scripthash_sub_cap_unsubscribe_frees_slot() {
     let dir = TempDir::new().unwrap();

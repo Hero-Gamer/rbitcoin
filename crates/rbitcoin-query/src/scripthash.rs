@@ -259,6 +259,12 @@ pub struct ScriptHashUtxo {
     pub create_tx_fk: rbitcoin_primitives::Fk,
 }
 
+/// Tx fks and input `create_fk`s of one block ([`Query::block_touch`]).
+#[derive(Clone, Debug, Default)]
+pub struct BlockTouch {
+    ids: std::collections::HashSet<u64>,
+}
+
 /// One confirmed unspent from [`Query::scan_unspent_scripts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanUtxo {
@@ -1116,6 +1122,56 @@ impl Query {
         Ok(!self
             .scripthash_tx_fks_at_height(scripthash, height)?
             .is_empty())
+    }
+
+    /// One block's touch set, built once and shared by many scripthash checks.
+    ///
+    /// Holds every tx fk in the block plus every input's `create_fk`. A
+    /// scripthash is touched at that height exactly when its posting list meets
+    /// this set, the same predicate as [`Self::scripthash_touched_at_height`],
+    /// without reloading the block and its prevouts per scripthash.
+    pub fn block_touch(&self, height: Height) -> Result<BlockTouch, QueryError> {
+        let mut ids = std::collections::HashSet::new();
+        for fk in self.block_tx_fks(height)? {
+            if let Some(id) = fk.get() {
+                ids.insert(id);
+            }
+            for (create_fk, _) in self.tx_prevouts_for_fk(fk)? {
+                if let Some(id) = create_fk.get() {
+                    ids.insert(id);
+                }
+            }
+        }
+        Ok(BlockTouch { ids })
+    }
+
+    /// Whether `scripthash` has any posting at all (durable or pending).
+    ///
+    /// The cheap test that lets callers skip [`Self::block_touch`] when no
+    /// subscribed hash could possibly be touched.
+    pub fn scripthash_has_postings(&self, scripthash: &[u8; 32]) -> Result<bool, QueryError> {
+        if !self.store.scripthash.create_fks(scripthash)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(!self.pending_sh_create_fks(scripthash).is_empty())
+    }
+
+    /// [`Self::scripthash_touched_at_height`] against a prebuilt [`BlockTouch`].
+    pub fn scripthash_touched_by(
+        &self,
+        scripthash: &[u8; 32],
+        touch: &BlockTouch,
+    ) -> Result<bool, QueryError> {
+        if touch.ids.is_empty() {
+            return Ok(false);
+        }
+        let entries = self.store.scripthash.create_fks(scripthash)?;
+        let hit = entries
+            .iter()
+            .chain(self.pending_sh_create_fks(scripthash).iter())
+            .filter_map(|fk| fk.get())
+            .any(|id| touch.ids.contains(&id));
+        Ok(hit)
     }
 
     /// Confirmed balance for a scripthash.

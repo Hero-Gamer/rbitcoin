@@ -60,6 +60,7 @@ let
             enable = true;
             openFirewall = true;
             hiddenService = true;
+            maxSubs = 25000;
           };
           esplora = {
             enable = true;
@@ -89,6 +90,7 @@ let
         services.rbitcoin = {
           enable = true;
           package = fakePackage;
+          electrum.maxSubs = 25000;
           p2p = {
             listen = false;
             maxInbound = 0;
@@ -152,6 +154,7 @@ assert defaultCfg.onlyNet == [ ];
 assert defaultCfg.tor.control == null;
 assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
+assert defaultCfg.electrum.maxSubs == null;
 assert defaultCfg.esplora.hiddenService == false;
 assert defaultCfg.i2p.sam == null;
 assert defaultCfg.i2p.acceptIncoming == false;
@@ -178,6 +181,8 @@ assert builtins.match ".*--rpc-cookie-file /run/rbitcoin/rpc.cookie.*" execStart
 assert builtins.elem "/run/rbitcoin" service.serviceConfig.ReadWritePaths;
 assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
+assert builtins.match ".*--electrum-max-subs 25000.*" execStart != null;
+assert builtins.match ".*--electrum-max-subs.*" listenOffExec == null;
 assert builtins.match ".*--esplora-listen 127.0.0.1:3000.*" execStart != null;
 assert builtins.match ".*--esplora-onion.*" execStart != null;
 assert builtins.match ".*--sh-index.*" execStart != null;

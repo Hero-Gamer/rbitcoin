@@ -789,6 +789,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         sh_tip_ready,
         config.listen.electrum,
         config.sptweaks_dust,
+        config.electrum_max_subs,
         &shutdown,
         &node.hub,
         &params,
@@ -1604,10 +1605,12 @@ async fn start_i2p_named_forward(
     Ok(sam)
 }
 
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn start_electrum_if_ready(
     sh_tip_ready: bool,
     addr: Option<SocketAddr>,
     tweaks_min_dust: u64,
+    electrum_max_subs: usize,
     shutdown: &Shutdown,
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
@@ -1634,6 +1637,7 @@ async fn start_electrum_if_ready(
         electrum_tip_notify,
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
+    ecfg.max_scripthash_subs = electrum_max_subs;
     ecfg.tweaks_min_dust = tweaks_min_dust;
     ecfg.onion_tcp = Arc::clone(&onion_tcp);
     let max_conn = ecfg.limits.max_connections;

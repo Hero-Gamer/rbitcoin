@@ -2178,6 +2178,18 @@ fn pin_scripthash_views_on_pad(
     assert!(!q
         .scripthash_touched_at_height(&script_hash(&[0x52]), Height(tip_h))
         .unwrap());
+    // The shared per-block touch set must agree with the per-hash probe at
+    // every height (creates, spends, and blocks that never touch it).
+    for h in 0..=tip_h {
+        let touch = q.block_touch(Height(h)).unwrap();
+        for probe in [sh, script_hash(&[0x52])] {
+            assert_eq!(
+                q.scripthash_touched_by(&probe, &touch).unwrap(),
+                q.scripthash_touched_at_height(&probe, Height(h)).unwrap(),
+                "height {h}"
+            );
+        }
+    }
 
     q.set_spend_index(false);
     let no_spends = q.scripthash_listunspent(&sh).unwrap();

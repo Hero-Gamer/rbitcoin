@@ -310,6 +310,9 @@ pub struct NodeConfig {
     pub sptweaks_dust: u64,
     /// 0 = unlimited. Electrum + Esplora refuse SH joins above this create count.
     pub max_sh_creates: u32,
+    /// Max `blockchain.scripthash.subscribe` entries per Electrum connection
+    /// (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS`].
+    pub electrum_max_subs: usize,
     /// Opt-in Esplora `GET /block-template` (GBT template JSON). Default off.
     pub esplora_block_template: bool,
     /// Prometheus `GET /metrics` on the health listener. Default off.
@@ -390,6 +393,7 @@ impl Default for NodeConfig {
             sptweaks: false,
             sptweaks_dust: rbitcoin_electrum::DEFAULT_TWEAKS_MIN_DUST,
             max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
+            electrum_max_subs: rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
             esplora_block_template: false,
             metrics: false,
             esplora_onion: true,
@@ -1056,6 +1060,17 @@ impl NodeConfig {
                 self.max_sh_creates = val
                     .parse()
                     .map_err(|e| NodeError::Config(format!("conf max_sh_creates: {e}")))?;
+            }
+            "electrum_max_subs" => {
+                let n: usize = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf electrum_max_subs: {e}")))?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf electrum_max_subs must be >= 1".into(),
+                    ));
+                }
+                self.electrum_max_subs = n;
             }
             "esplora_block_template" => {
                 self.esplora_block_template = parse_conf_bool(val)
