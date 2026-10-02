@@ -69,7 +69,9 @@ pub use lookup::{
 use phases::{assemble_run, Assembled};
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
-use pin::{collect_spend_abs_after_fill, ensure_spend_abs_layouts, pin_for_wire_batch};
+#[cfg(test)]
+use pin::ensure_spend_abs_layouts;
+use pin::{collect_spend_abs_after_fill, pin_for_wire_batch};
 pub use scripts::{confirm_scripts_phase, drive_script_waves_with};
 pub(crate) use write::finish_post_commit;
 pub use write::{confirm_write_phase, finish_post_commit_hashes, replay_spend_annotations};
@@ -352,6 +354,16 @@ impl ScriptOkBatch {
     /// Parent handles in this batch (may share Arc payloads with other batches).
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
+    }
+
+    /// Wire headers in the same order as [`Self::heights_hashes`].
+    pub fn wire_headers(&self) -> Result<Vec<bitcoin::block::Header>, ConsensusError> {
+        if self.wire_blocks.len() != self.prepared.len() {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: wire headers length",
+            )));
+        }
+        Ok(self.wire_blocks.iter().map(|b| b.header).collect())
     }
 
     #[allow(clippy::result_large_err)] // public error enum

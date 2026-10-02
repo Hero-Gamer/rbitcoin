@@ -461,10 +461,12 @@ mod class_a_rehydrate_tests {
         let time = 1_300_000_000u32;
         let mut prev = gen;
         let mut hashes = Vec::new();
+        let mut headers = Vec::new();
         for h in 1u32..=4 {
             let b = mine(prev, time + h * 600, h);
             hub.ensure_header(&b.header).unwrap();
             hashes.push(b.block_hash());
+            headers.push(b.header);
             prev = b.block_hash();
         }
 
@@ -486,7 +488,8 @@ mod class_a_rehydrate_tests {
         hub.query
             .block_queue_offer(2, hashes[1].to_byte_array(), 7, b"wire2")
             .unwrap();
-        hub.note_confirmed_tip(&[(3, hashes[2])]).unwrap();
+        hub.note_confirmed_tip(&[(3, hashes[2])], &[headers[2]])
+            .unwrap();
         assert!(
             hub.has_block(&hashes[2]),
             "stale confirmed-set must not dequeue above-tip wire"

@@ -311,7 +311,7 @@ fn denserels_by_stamped_range(
 /// Sources: plan/in-flight offline denserels → stamp-carried CreatePin →
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
 /// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
-/// `spent_range` onto pins. Write [`ensure_spend_abs_layouts`] is abs-or-Corrupt.
+/// `spent_range` onto pins. Write [`collect_spend_abs_after_fill`] is abs-or-Corrupt.
 pub(super) fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -476,6 +476,7 @@ pub(super) fn collect_spend_abs_after_fill(
 ///
 /// Direct tests keep this walk, including its skip of a null spend fk.
 /// [`collect_spend_abs_after_fill`] is the write-phase post-condition.
+#[cfg(test)]
 pub(super) fn ensure_spend_abs_layouts(
     batch_parents: &rbitcoin_query::BatchParents,
     prepared: &[Prepared],
