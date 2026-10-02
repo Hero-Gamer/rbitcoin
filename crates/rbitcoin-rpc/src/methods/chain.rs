@@ -296,8 +296,11 @@ fn held_chainwork_hex(ctx: &RpcContext, block: &Block) -> String {
 }
 
 fn insert_block_size_fields(obj: &mut Value, block: &Block) {
-    let size = block.total_size() as u64;
-    let weight = block.weight().to_wu();
+    insert_size_weight(obj, block.total_size() as u64, block.weight().to_wu());
+}
+
+/// Core `size` / `strippedsize` / `weight` (strippedsize = (weight - size) / 3).
+fn insert_size_weight(obj: &mut Value, size: u64, weight: u64) {
     let Some(o) = obj.as_object_mut() else {
         return;
     };
@@ -355,7 +358,7 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         String::new()
     };
     if verbosity == 1 {
-        let (_, rec) = ctx
+        let (header_fk, rec) = ctx
             .query
             .header_at_height(height)
             .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
@@ -381,6 +384,12 @@ pub(crate) fn getblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
             "tx": txids,
         });
         enrich_block_header_json(&mut obj, ctx, rec.version, rec.bits, Some(height), None);
+        // Core verbosity 1 carries size/strippedsize/weight (mempool's block
+        // indexer stores them NOT NULL). txstat answers without a reconstruct;
+        // if the body is gone the fields are left out rather than failing.
+        if let Ok(Some((size, weight))) = ctx.query.block_size_weight(header_fk) {
+            insert_size_weight(&mut obj, u64::from(size), u64::from(weight));
+        }
         return Ok(obj);
     }
     let block = ctx

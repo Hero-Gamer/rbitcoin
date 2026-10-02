@@ -1289,7 +1289,7 @@ fn getblock_verbosity_2_size_weight_and_tx_fee() {
     assert_eq!(confirmed["confirmations"], json!(1));
     assert_eq!(confirmed["blockhash"], tip);
     assert_eq!(confirmed["blocktime"], confirmed["time"]);
-    let raw = dispatch(&ctx, "getblock", vec![tip, json!(0)]).unwrap();
+    let raw = dispatch(&ctx, "getblock", vec![tip.clone(), json!(0)]).unwrap();
     let raw_bytes = rbitcoin_primitives::hex_decode(raw.as_str().unwrap()).unwrap();
     let block: bitcoin::Block = deserialize(&raw_bytes).unwrap();
     assert_eq!(v2["size"].as_u64().unwrap(), block.total_size() as u64);
@@ -1298,6 +1298,13 @@ fn getblock_verbosity_2_size_weight_and_tx_fee() {
         v2["strippedsize"].as_u64().unwrap(),
         (block.weight().to_wu() - block.total_size() as u64) / 3
     );
+    // Core verbosity 1 carries the same three; mempool's block indexer
+    // stores `size` NOT NULL and fails every block without it.
+    let v1 = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
+    for field in ["size", "strippedsize", "weight"] {
+        assert!(v1[field].is_u64(), "v1 {field} missing: {v1}");
+        assert_eq!(v1[field], v2[field], "v1 vs v2 {field}");
+    }
     let txs = v2["tx"].as_array().unwrap();
     assert!(txs[0].get("fee").is_none(), "coinbase must omit fee: {v2}");
     let fee = txs[1]["fee"].as_f64().expect("spend fee");
