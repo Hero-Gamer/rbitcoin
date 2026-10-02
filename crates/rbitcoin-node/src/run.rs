@@ -1743,7 +1743,9 @@ async fn start_esplora_if_ready(
 pub(crate) struct TipModeGates {
     /// Class A + spends ready: follow peers, tip loop, mempool tip-relay.
     pub tip_follow_ready: bool,
-    /// Durable SH tip-ready: Electrum / Esplora may start.
+    /// Electrum / Esplora may bind. With `--sh-index` this waits until the
+    /// index is caught up. Without it the listeners still bind; address
+    /// methods fail closed.
     pub sh_tip_ready: bool,
 }
 
@@ -1759,7 +1761,8 @@ pub(crate) struct TipModeGates {
 /// - No head: Class A collect + unsorted pack **while Direct** (write-behind
 ///   no-ops), then Tip. Cancel leaves Direct; Electrum stays closed.
 ///
-/// **When `!shindex`:** skip SH; `sh_tip_ready = false`; Tip for follow/relay.
+/// **When `!shindex`:** skip SH materialize. Listeners may bind
+/// (`sh_tip_ready`); address methods fail closed.
 pub(crate) fn enter_tip_mode(
     query: &Query,
     cancel: Option<Arc<AtomicBool>>,
@@ -1773,10 +1776,12 @@ pub(crate) fn enter_tip_mode(
             "node: IndexMode::Tip (tx.head + spend annotations already live) mode={:?}",
             query.index_mode()
         );
-        info!("node: tip-follow ready without scripthash (shindex off); Electrum/Esplora disabled");
+        info!(
+            "node: tip-follow ready without scripthash (shindex off); Electrum/Esplora listen, address methods fail closed"
+        );
         return TipModeGates {
             tip_follow_ready: true,
-            sh_tip_ready: false,
+            sh_tip_ready: true,
         };
     }
 
@@ -2077,6 +2082,27 @@ mod tests {
 
     /// Perf (5s) and RPC-stop (50ms) ticks must still evaluate stale redial.
     /// A one-shot sleep in the same `select!` is reset on every such wake.
+    /// `--sh-index` off still binds Electrum/Esplora. Address methods fail
+    /// closed inside the servers; the listeners themselves are not the gate.
+    #[test]
+    fn listeners_ready_without_sh_index() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-shoff-listen-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let gates = enter_tip_mode(&q, None, false);
+        assert!(gates.tip_follow_ready);
+        assert!(
+            gates.sh_tip_ready,
+            "Electrum/Esplora bind when --sh-index is off"
+        );
+        assert!(!q.sh_index_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn stale_follow_needs_room_at_max_outbound() {
         assert!(!stale_follow_needs_room(0, 16));
