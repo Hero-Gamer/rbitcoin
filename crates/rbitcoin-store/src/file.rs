@@ -24,7 +24,8 @@
 //! # Concurrency
 //!
 //! - **Published logical length** is an `AtomicU64` (Acquire/Release).
-//! - `File` is locked only for grow (fallocate / Windows EOF / `set_len`), fsync, and fadvise.
+//! - `File` is locked only for grow (fallocate / Windows EOF / `set_len`),
+//!   `flush`'s `sync_data`, and fadvise. `sync_data_only` uses the read fd.
 //! - Roles (see `docs/concurrency.md`): at most one appender and
 //!   one annotator; N concurrent readers of published ranges.
 
@@ -757,6 +758,16 @@ impl TableFile {
         self.needs_sync.load(Ordering::Acquire)
     }
 
+    /// Device barrier for bytes already written on this file.
+    ///
+    /// Does not publish the high-water mark and does not clear `needs_sync`.
+    /// Uses the read fd so the grow lock is not held across the wait.
+    pub(crate) fn sync_data_only(&self) -> Result<(), StoreError> {
+        self.read_file
+            .sync_data()
+            .map_err(|e| StoreError::io(&self.path, e))
+    }
+
     /// Persist HWM / trailer and `sync_data`.
     ///
     /// Skips entirely when no payload write has occurred since the last
@@ -1368,6 +1379,45 @@ mod advise_tests {
         f.read_at(off2, &mut got2).unwrap();
         assert_eq!(&got2, more);
         drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A data barrier must not publish the high-water mark or take the write
+    /// thread's sync bit. A flush after a later append still publishes that append.
+    #[test]
+    fn sync_data_only_leaves_hwm_and_pending_sync() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-sync-data-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
+        let payload = vec![0x5Au8; 64];
+        f.write_at_pwrite(FILE_HEADER_LEN as u64, &payload).unwrap();
+        let published = f.logical_len();
+        let hwm = |p: &std::path::Path| {
+            let raw = std::fs::read(p).unwrap();
+            u64::from_le_bytes(raw[8..16].try_into().unwrap())
+        };
+        assert_eq!(hwm(&path), published);
+        assert!(f.pending_sync());
+
+        f.sync_data_only().unwrap();
+        assert_eq!(hwm(&path), published);
+        assert!(f.pending_sync());
+
+        let more = b"AFTER!!";
+        let off2 = f.logical_len();
+        f.write_at_pwrite(off2, more).unwrap();
+        f.flush().unwrap();
+        drop(f);
+        let f2 = TableFile::open(&path, TableKind::TxOut).unwrap();
+        assert_eq!(f2.logical_len(), off2 + more.len() as u64);
+        let mut got = vec![0u8; payload.len()];
+        f2.read_at(FILE_HEADER_LEN as u64, &mut got).unwrap();
+        assert_eq!(got, payload);
+        let mut got2 = [0u8; 7];
+        f2.read_at(off2, &mut got2).unwrap();
+        assert_eq!(&got2, more);
         let _ = std::fs::remove_file(&path);
     }
 

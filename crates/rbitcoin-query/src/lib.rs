@@ -19,6 +19,7 @@ mod scripthash;
 mod sh_builder;
 mod soft_densify;
 mod sp_tweaks;
+mod spend_sync;
 mod stamp;
 pub mod testutil;
 mod tx_precompute;
@@ -180,6 +181,7 @@ pub use scripthash::{
     HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance, ScriptHashChainStats,
     ScriptHashHistoryItem, ScriptHashTxSummary, ScriptHashUtxo, ShJoinSlot,
 };
+pub use spend_sync::SpendSync;
 pub use stamp::{
     fill_missing_parent_ranges, stamp_external_parents, BatchParentIds, ExternalParentStamp,
     ParentIdent,

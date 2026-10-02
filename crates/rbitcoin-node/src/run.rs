@@ -12,7 +12,7 @@ use rbitcoin_net::{
     Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
 };
 use rbitcoin_primitives::Network;
-use rbitcoin_query::{spawn_sh_writebehind, Query};
+use rbitcoin_query::{spawn_sh_writebehind, Query, SpendSync};
 use rbitcoin_rpc::{
     gbt_template, run_rpc, RpcActive, RpcConfig, RpcContext, RpcHandle, RpcRegtest,
 };
@@ -293,6 +293,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    let spend_sync = SpendSync::spawn(std::sync::Arc::clone(&node.hub.query));
     status.attach_p2p(&node.hub, &node.peers);
     for extra in &config.listen.p2p_extra {
         let bound = node
@@ -1260,6 +1261,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     })
     .await
     .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
+    // One spend checkpoint at the snapshot, then Class C. Not `Store::flush`.
+    spend_sync.shutdown();
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {

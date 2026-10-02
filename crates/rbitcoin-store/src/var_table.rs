@@ -491,6 +491,10 @@ impl VarTable {
         Ok(())
     }
 
+    pub(crate) fn sync_data_only(&self) -> Result<(), StoreError> {
+        self.body.sync_data_only()
+    }
+
     /// HWM + MS_ASYNC (no fdatasync) — host-friendly process exit.
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;

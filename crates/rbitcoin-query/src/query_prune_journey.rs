@@ -37,6 +37,11 @@ fn prune_life_window(q: Query, dir: &crate::testutil::TempDir, hashes: &mut Vec<
     q.set_prune_seqsigwit(true).unwrap();
     q.apply_prune_seqsigwit_tip().unwrap();
     assert_eq!(witness_of(&q, tip_fk).len(), 1);
+    // The synthetic genesis hash is not a header hash. A tip marker keeps
+    // reopen on the default window; a missing marker walks from genesis.
+    q.store()
+        .sync_spend_durable(q.tip_height().unwrap().0)
+        .unwrap();
     drop(q);
     let q = Query::open_or_create_tiny(dir.path()).unwrap();
     assert_eq!(witness_of(&q, tip_fk).len(), 1);

@@ -85,6 +85,12 @@ impl Input {
         Ok(())
     }
 
+    pub(crate) fn sync_data_only(&self) -> Result<(), StoreError> {
+        self.loc.sync_data_only()?;
+        self.off.sync_data_only()?;
+        self.body.sync_data_only()
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_sync(&self) -> bool {
         self.loc.pending_sync() || self.off.pending_sync() || self.body.pending_sync()

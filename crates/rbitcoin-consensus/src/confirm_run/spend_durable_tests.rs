@@ -158,8 +158,10 @@ fn zeroed_spend_slot_after_tip_seal_rejects_respend() {
     let _ = dir;
 }
 
+/// A matching last-6 window does not prove spends below it. With no marker
+/// those spends were never device-flushed.
 #[test]
-fn missing_marker_with_matching_tip_spends_does_not_replay() {
+fn missing_marker_replays_a_spend_below_the_tip_window() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-window");
     q.set_spend_index(true);
     let params = ChainParams::regtest();
@@ -180,21 +182,87 @@ fn missing_marker_with_matching_tip_spends_does_not_replay() {
         tip = b.block_hash();
         tip_time = b.header.time;
     }
+    let h_spend = maturity + 3;
     let tx = spend_one(c1, Amount::from_sat(49_0000_0000));
-    let block = mine(tip, tip_time + 600, maturity + 3, vec![tx]);
-    accept_and_connect_block(&q, &params, Height(maturity + 3), &block, ms).unwrap();
+    let block = mine(tip, tip_time + 600, h_spend, vec![tx]);
+    accept_and_connect_block(&q, &params, Height(h_spend), &block, ms).unwrap();
+    tip = block.block_hash();
+    tip_time = block.header.time;
+    for h in (h_spend + 1)..=(h_spend + rbitcoin_store::VERIFY_TIP_BLOCKS) {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let create_fk = q.tx_fk_by_txid(c1.as_byte_array()).unwrap().unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs = spent_abs(off, 0);
     let store = q.store().path().to_path_buf();
-    let tip_h = q.tip_height().unwrap().0;
     drop(q);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("spent.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(abs)).unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+    }
     let _ = std::fs::remove_file(store.join(rbitcoin_store::SPEND_DURABLE_NAME));
     let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
     q.set_spend_index(true);
+    let tip_h = q.tip_height().unwrap();
     let replayed = crate::replay_spend_annotations(&q).unwrap();
-    assert_eq!(
-        replayed, 0,
-        "a matching tip window must not rewrite the chain"
+    assert!(
+        replayed >= h_spend,
+        "a missing marker must rewrite the spend below the tip window, replayed {replayed}"
     );
-    assert_eq!(q.store().spend_annotated_through().unwrap(), Some(tip_h));
+    let tip_hash = q.header_at_height(tip_h).unwrap().unwrap().1.hash;
+    let respend = mine(
+        bitcoin::BlockHash::from_byte_array(tip_hash),
+        tip_time + 1_200,
+        tip_h.0 + 1,
+        vec![spend_one(c1, Amount::from_sat(48_0000_0000))],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(tip_h.0 + 1), &respend, ms)
+        .expect_err("a spend below the tip window must stay spent when the marker is missing");
+    assert!(
+        matches!(err, ConsensusError::PrevoutSpent),
+        "reopen must reject the respend, got {err}"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn confirms_past_eight_batches_wait_for_an_explicit_checkpoint() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-checkpoint");
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    for h in 1..=9 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    assert!(
+        !q.store()
+            .path()
+            .join(rbitcoin_store::SPEND_DURABLE_NAME)
+            .is_file(),
+        "confirm must not publish the marker"
+    );
+    let h = q.store().spend_snapshot_height().unwrap();
+    assert_eq!(h, 9);
+    let b = mine(tip, tip_time + 600, 10, Vec::new());
+    accept_and_connect_block(&q, &params, Height(10), &b, ms).unwrap();
+    assert_eq!(q.store().spend_snapshot_height(), Some(10));
+    q.store().checkpoint_spend_through(h).unwrap();
+    let raw = std::fs::read(q.store().path().join(rbitcoin_store::SPEND_DURABLE_NAME)).unwrap();
+    assert_eq!(u32::from_le_bytes(raw[8..12].try_into().unwrap()), h);
+    assert_eq!(u32::from_le_bytes(raw[12..16].try_into().unwrap()), h);
     let _ = dir;
 }
 

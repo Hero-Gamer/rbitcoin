@@ -11,11 +11,8 @@ use std::path::Path;
 /// `store/spend_durable`. Annotated-through and durable-through heights.
 pub const SPEND_DURABLE_NAME: &str = "spend_durable";
 
-/// Confirm batches between Class A `sync_data`. Not a knob.
-pub(crate) const SPEND_DURABLE_BATCHES: u32 = 8;
-
-/// Wall time between those syncs when batches arrive slowly. Not a knob.
-pub(crate) const SPEND_DURABLE_INTERVAL_MS: u64 = 30_000;
+/// Wall time between spend `sync_data` checkpoints. Not a knob.
+pub const SPEND_DURABLE_INTERVAL_MS: u64 = 600_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpendDurable {
@@ -71,6 +68,7 @@ impl SpendDurable {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -78,9 +76,18 @@ pub(crate) fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// True when the write thread should `sync_data` and advance the marker.
-pub(crate) fn spend_sync_due(batches: u32, elapsed_ms: u64) -> bool {
-    batches >= SPEND_DURABLE_BATCHES || elapsed_ms >= SPEND_DURABLE_INTERVAL_MS
+/// True when a spend checkpoint is due. Batch count is not an input.
+pub fn spend_sync_due(elapsed_ms: u64) -> bool {
+    elapsed_ms >= SPEND_DURABLE_INTERVAL_MS
+}
+
+/// A failed publish does not start a new interval.
+pub fn elapsed_after_checkpoint(elapsed_ms: u64, published: bool) -> u64 {
+    if published {
+        0
+    } else {
+        elapsed_ms
+    }
 }
 
 /// `n == 0` stays "whole chain". A missing marker keeps `n`. Otherwise the
@@ -101,11 +108,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spend_sync_due_is_batches_or_elapsed() {
-        assert!(!spend_sync_due(SPEND_DURABLE_BATCHES - 1, 0));
-        assert!(spend_sync_due(SPEND_DURABLE_BATCHES, 0));
-        assert!(!spend_sync_due(1, SPEND_DURABLE_INTERVAL_MS - 1));
-        assert!(spend_sync_due(1, SPEND_DURABLE_INTERVAL_MS));
+    fn spend_sync_due_is_ten_minutes_elapsed_only() {
+        assert!(!spend_sync_due(0));
+        assert!(!spend_sync_due(SPEND_DURABLE_INTERVAL_MS - 1));
+        assert!(spend_sync_due(SPEND_DURABLE_INTERVAL_MS));
+        assert_eq!(
+            elapsed_after_checkpoint(SPEND_DURABLE_INTERVAL_MS, false),
+            SPEND_DURABLE_INTERVAL_MS
+        );
+        assert!(spend_sync_due(elapsed_after_checkpoint(
+            SPEND_DURABLE_INTERVAL_MS,
+            false
+        )));
+        assert!(!spend_sync_due(elapsed_after_checkpoint(
+            SPEND_DURABLE_INTERVAL_MS,
+            true
+        )));
     }
 
     #[test]
@@ -118,35 +136,64 @@ mod tests {
     }
 
     #[test]
-    fn eight_batches_publish_the_marker_and_clamp_drops_a_stale_height() {
+    fn eight_notes_do_not_publish_and_checkpoint_keeps_the_snapshot() {
         let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-spend-due-{}-{}",
+            "rbitcoin-spend-notes-{}-{}",
             std::process::id(),
             unix_ms()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         let s = crate::Store::create_tiny(&dir).unwrap();
-        assert!(s.spend_annotated_through().unwrap().is_none());
-        for _ in 0..(SPEND_DURABLE_BATCHES - 1) {
-            assert_eq!(s.note_spend_durable_batch(4).unwrap(), 0);
+        s.confirmed
+            .set(rbitcoin_primitives::Height(7), rbitcoin_primitives::Fk(1))
+            .unwrap();
+        for _ in 0..8 {
+            s.note_spend_snapshot(4);
         }
-        assert!(s.spend_annotated_through().unwrap().is_none());
-        assert!(unix_ms() > 1_700_000_000_000);
-        assert!(s.note_spend_durable_batch(4).unwrap() > 0);
-        assert_eq!(s.spend_annotated_through().unwrap(), Some(0));
+        assert!(SpendDurable::load(s.path()).unwrap().is_none());
 
+        let h = s.spend_snapshot_height().unwrap();
+        s.note_spend_snapshot(7);
+        s.checkpoint_spend_through(h).unwrap();
+        let m = SpendDurable::load(s.path()).unwrap().unwrap();
+        assert_eq!((m.annotated_through(), m.durable_through()), (4, 4));
+        assert_eq!(s.spend_snapshot_height(), Some(7));
+
+        // Tip below the snapshot: leave the marker. Disconnect clamps on its own.
+        s.checkpoint_spend_through(9).unwrap();
+        let m = SpendDurable::load(s.path()).unwrap().unwrap();
+        assert_eq!((m.annotated_through(), m.durable_through()), (4, 4));
+
+        let marker = s.path().join(SPEND_DURABLE_NAME);
+        let _ = std::fs::remove_file(&marker);
+        std::fs::create_dir(&marker).unwrap();
+        let err = s.checkpoint_spend_through(4).unwrap_err();
+        assert!(marker.is_dir(), "{err}");
+        assert!(spend_sync_due(elapsed_after_checkpoint(
+            SPEND_DURABLE_INTERVAL_MS,
+            false
+        )));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clamp_drops_a_stale_height() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-spend-clamp-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = crate::Store::create_tiny(&dir).unwrap();
         s.confirmed
             .set(rbitcoin_primitives::Height(0), rbitcoin_primitives::Fk(1))
             .unwrap();
         SpendDurable::new(5, 0).store(s.path()).unwrap();
-        let m = SpendDurable::load(s.path()).unwrap().unwrap();
-        assert_eq!((m.annotated_through(), m.durable_through()), (5, 0));
         s.clamp_spend_durable().unwrap();
         let m = SpendDurable::load(s.path()).unwrap().unwrap();
         assert_eq!((m.annotated_through(), m.durable_through()), (0, 0));
         SpendDurable::new(0, 5).store(s.path()).unwrap();
-        let m = SpendDurable::load(s.path()).unwrap().unwrap();
-        assert_eq!((m.annotated_through(), m.durable_through()), (0, 5));
         s.clamp_spend_durable().unwrap();
         let m = SpendDurable::load(s.path()).unwrap().unwrap();
         assert_eq!((m.annotated_through(), m.durable_through()), (0, 0));
