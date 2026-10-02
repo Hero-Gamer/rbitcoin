@@ -3500,59 +3500,23 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
         "maxmempool must be the hub weight budget, not a hardcoded 300M"
     );
     let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    // Core 0.19 CLIENT_VERSION. Below this, bitcoincore-rpc requires the
+    // pre-0.19 bip9_softforks map and rejects our getblockchaininfo.
+    assert_eq!(net["version"].as_u64(), Some(190_000), "{net}");
+    assert_eq!(
+        net["protocolversion"].as_u64(),
+        Some(70016),
+        "P2P nVersion stays 70016; version is the RPC shape floor"
+    );
     assert_ne!(
         net["version"].as_u64(),
-        Some(270000),
-        "must not impersonate Bitcoin Core 27.0"
-    );
-    assert_eq!(
-        net["version"].as_u64(),
-        Some(rpc_client_version(env!("CARGO_PKG_VERSION"))),
+        Some(799),
+        "crate semver packing must not be getnetworkinfo.version"
     );
     assert_eq!(
         net["subversion"].as_str().unwrap(),
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &[] as &[&str],)
             .unwrap()
-    );
-    assert_eq!(
-        rpc_client_version("0.1.0"),
-        100,
-        "0.1.0 is major*10000+minor*100+patch (not 10000, which is 1.0.0)"
-    );
-    assert_eq!(
-        rpc_client_version("0.5.0"),
-        500,
-        "0.5.0 is the same mapping (not Core 27.0 / 270000)"
-    );
-    assert_eq!(
-        rpc_client_version("0.5.1"),
-        501,
-        "0.5.1 patch is +1 on the Core-style integer"
-    );
-    assert_eq!(
-        rpc_client_version("0.5.99"),
-        599,
-        "0.5.99 is the in-tree pre-0.6.0 mapping"
-    );
-    assert_eq!(
-        rpc_client_version("0.6.0"),
-        600,
-        "0.6.0 is the same mapping (not Core 27.0 / 270000)"
-    );
-    assert_eq!(
-        rpc_client_version("0.6.99"),
-        699,
-        "0.6.99 is the in-tree pre-0.7.0 mapping"
-    );
-    assert_eq!(
-        rpc_client_version("0.7.0"),
-        700,
-        "0.7.0 is the same mapping (not Core 27.0 / 270000)"
-    );
-    assert_eq!(
-        rpc_client_version("0.7.99"),
-        799,
-        "0.7.99 is the in-tree pre-0.8.0 mapping"
     );
     let flags = rbitcoin_net::local_service_flags();
     let bits = flags.to_u64();
