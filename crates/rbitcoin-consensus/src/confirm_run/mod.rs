@@ -69,7 +69,7 @@ pub use lookup::{
 use phases::{assemble_run, Assembled};
 #[cfg(test)]
 use phases::{check_bip34, expected_bits_extending, post_commit};
-use pin::{ensure_spend_abs_layouts, pin_for_wire_batch};
+use pin::{collect_spend_abs_after_fill, ensure_spend_abs_layouts, pin_for_wire_batch};
 pub use scripts::{confirm_scripts_phase, drive_script_waves_with};
 pub(crate) use write::finish_post_commit;
 pub use write::{confirm_write_phase, finish_post_commit_hashes, replay_spend_annotations};

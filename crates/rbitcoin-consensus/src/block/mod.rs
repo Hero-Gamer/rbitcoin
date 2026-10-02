@@ -1541,6 +1541,7 @@ pub(crate) fn structural_validate_spends(
     mtp_cache: &mut U32Map<u32>,
     run_create_height: &FkMap<u32>,
     scratch: &mut StructuralScratch,
+    precomputed_abs: Option<&[StructuralAbsJob]>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::time::Instant;
 
@@ -1550,7 +1551,14 @@ pub(crate) fn structural_validate_spends(
     let t_spent = Instant::now();
     reject_bip30_unspent_overwrite(query, block, ctx)?;
     let t_abs = Instant::now();
-    structural_abs_heights(query, spends, batch_parents, run_create_height, scratch)?;
+    structural_abs_heights(
+        query,
+        spends,
+        batch_parents,
+        run_create_height,
+        scratch,
+        precomputed_abs,
+    )?;
     let tip = query.tip_height().map(|h| h.0);
     let mut spent_strong_ns = 0u64;
     let mut multi_list_ns = 0u64;
@@ -1592,7 +1600,7 @@ pub(crate) fn structural_validate_spends(
     })
 }
 
-type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32);
+pub(crate) type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32);
 type DurableSpentSet =
     std::collections::HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>>;
 type OverlayMetaSkip = std::collections::HashMap<
@@ -1651,16 +1659,37 @@ fn structural_abs_heights(
     batch_parents: &rbitcoin_query::BatchParents,
     run_create_height: &FkMap<u32>,
     scratch: &mut StructuralScratch,
+    precomputed_abs: Option<&[StructuralAbsJob]>,
 ) -> Result<(), ConsensusError> {
-    batch_parents
-        .spend_abs_jobs_into(
-            spends
-                .iter()
-                .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
-            &mut scratch.abs_jobs,
-            &mut scratch.abs_seen,
-        )
-        .map_err(ConsensusError::from)?;
+    if let Some(jobs) = precomputed_abs {
+        // Tests recompute so a stale list cannot skip a missing abs.
+        #[cfg(test)]
+        {
+            let fresh = batch_parents
+                .spend_abs_jobs(
+                    spends
+                        .iter()
+                        .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+                )
+                .map_err(ConsensusError::from)?;
+            if fresh.as_slice() != jobs {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: precomputed spend abs diverged from pin",
+                )));
+            }
+        }
+        scratch.abs_jobs.extend_from_slice(jobs);
+    } else {
+        batch_parents
+            .spend_abs_jobs_into(
+                spends
+                    .iter()
+                    .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+                &mut scratch.abs_jobs,
+                &mut scratch.abs_seen,
+            )
+            .map_err(ConsensusError::from)?;
+    }
     scratch.unique_fks.extend(
         scratch
             .abs_jobs

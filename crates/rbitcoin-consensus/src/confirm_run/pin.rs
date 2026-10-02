@@ -441,11 +441,41 @@ pub(super) fn pin_for_wire_batch(
     Ok((batch_parents, spend_edges))
 }
 
+/// One `spend_abs_jobs` walk per prepared block, after fill has stamped ranges.
+///
+/// Missing in-range abs is the ensure `Corrupt`. The write phase returns that
+/// before `tx.head` insert and passes the jobs to structural, which does not
+/// look them up again. Null create fk is skipped; duplicate abs is one job.
+pub(super) fn collect_spend_abs_after_fill(
+    batch_parents: &rbitcoin_query::BatchParents,
+    prepared: &[Prepared],
+) -> Result<Vec<Vec<crate::block::StructuralAbsJob>>, ConsensusError> {
+    let mut out = Vec::with_capacity(prepared.len());
+    for p in prepared {
+        let jobs = batch_parents
+            .spend_abs_jobs(
+                p.spends
+                    .iter()
+                    .map(|&(_txid, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+            )
+            .map_err(|_| {
+                ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: ensure denserels/abs incomplete for spend edge",
+                ))
+            })?;
+        out.push(jobs);
+    }
+    Ok(out)
+}
+
 /// Ensure spend abs for every spend edge on the write batch.
 ///
 /// Lookup stamps archived-parent spent ranges; load copies them onto
 /// the pin. Same-batch abs comes from append RAM in write fill. Missing
 /// abs is `Corrupt`. Never `put_spend*` and never preads `create.loc`.
+///
+/// Direct tests keep this walk, including its skip of a null spend fk.
+/// [`collect_spend_abs_after_fill`] is the write-phase post-condition.
 pub(super) fn ensure_spend_abs_layouts(
     batch_parents: &rbitcoin_query::BatchParents,
     prepared: &[Prepared],

@@ -162,11 +162,9 @@ pub fn confirm_write_phase(
         plan_take_ns,
         create_map_ns,
     } = apply_archive_plan(query, &mut batch)?;
-    {
-        let t_ens = Instant::now();
-        ensure_spend_abs_layouts(&batch.batch_parents, &batch.prepared)?;
-        ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
-    }
+    let t_ens = Instant::now();
+    let abs_jobs = super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)?;
+    ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
     if class_a_ns > 0 {
         rbitcoin_query::note_confirm(&query.confirm_stats().class_a_ns, class_a_ns);
     }
@@ -200,6 +198,7 @@ pub fn confirm_write_phase(
             &batch.prepared,
             &batch.wire_blocks,
             &batch.batch_parents,
+            &abs_jobs,
         )?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 

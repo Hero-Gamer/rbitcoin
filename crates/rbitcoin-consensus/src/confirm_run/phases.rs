@@ -238,6 +238,7 @@ pub(super) fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
+    abs_jobs: &[Vec<crate::block::StructuralAbsJob>],
 ) -> Result<(crate::block::StructuralPhaseNs, crate::block::AnnotateSlots), ConsensusError> {
     use crate::block::{StructuralPhaseNs, StructuralScratch};
     let t0 = Instant::now();
@@ -248,6 +249,11 @@ pub(super) fn structural_run(
         if p.height.0 > 0 {
             mtp_cache.insert(p.height.0 - 1, p.prev_mtp);
         }
+    }
+    if abs_jobs.len() != prepared.len() {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: spend abs jobs length",
+        )));
     }
     let mut tot = StructuralPhaseNs::default();
     let mut run_create_height: FkMap<u32> = FkMap::default();
@@ -270,6 +276,7 @@ pub(super) fn structural_run(
             &mut mtp_cache,
             &run_create_height,
             &mut scratch,
+            Some(&abs_jobs[i]),
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);

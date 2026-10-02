@@ -1460,6 +1460,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         &mut mtp,
         &run,
         &mut scratch,
+        None,
     )
     .expect("overlay spend is not durable-spent before tip");
     let meta_n = q
@@ -1606,6 +1607,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
             &mut mtp,
             &run,
             &mut scratch,
+            None,
         )
         .unwrap();
     }
@@ -3103,6 +3105,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &mut mtp,
         &rbitcoin_query::FkMap::default(),
         &mut crate::block::StructuralScratch::default(),
+        None,
     )
     .expect_err("pinned without abs must be invariant");
     let msg = format!("{err}");
@@ -3214,4 +3217,82 @@ fn one_shot_load_matches_stamp_then_load_from_plan() {
     assert_eq!(pa.index_tx, pb.index_tx);
     let _ = std::fs::remove_dir_all(&path_a);
     let _ = std::fs::remove_dir_all(&path_b);
+}
+
+/// Post-fill abs jobs come from one `spend_abs_jobs` walk. A vout outside the
+/// spent range is the ensure `Corrupt` (before head insert). Duplicate abs
+/// collapses to one job. A null create fk is skipped.
+#[test]
+fn collect_spend_abs_after_fill_is_one_walk() {
+    use super::{collect_spend_abs_after_fill, Prepared};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::OutputRecord;
+
+    let mut bp = BatchParents::new();
+    bp.insert_owned(
+        Fk(1),
+        rec_tx(0x11, 2),
+        vec![
+            (0, OutputRecord::unspent(1, vec![0x51])),
+            (1, OutputRecord::unspent(1, vec![0x51])),
+        ],
+        vec![0, 1],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    // One spent slot: vout 0 is in range, vout 1 is not.
+    bp.set_spent_range_only(Fk(1), (1000, OutputRecord::SPENT_SLOT_LEN as u64));
+
+    let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    let prepared_ok = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![
+            ([0x11; 32], 0, Fk(9), Fk(1), 0),
+            ([0x11; 32], 0, Fk(9), Fk(1), 1),
+            ([0; 32], 0, Fk(9), Fk::NULL, 0),
+        ],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits,
+        hash: [1u8; 32],
+        prev_mtp: 0,
+    }];
+    let jobs = collect_spend_abs_after_fill(&bp, &prepared_ok).expect("in-range vout 0");
+    assert_eq!(
+        jobs,
+        vec![vec![(
+            1u64,
+            0u32,
+            rbitcoin_store::spent_abs(1000, 0),
+            Fk(9),
+            0u32,
+        )]]
+    );
+
+    let prepared_miss = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![([0x11; 32], 1, Fk(9), Fk(1), 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits,
+        hash: [1u8; 32],
+        prev_mtp: 0,
+    }];
+    let err =
+        collect_spend_abs_after_fill(&bp, &prepared_miss).expect_err("vout past the spent range");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant: ensure denserels/abs incomplete for spend edge"),
+        "got {msg}"
+    );
 }

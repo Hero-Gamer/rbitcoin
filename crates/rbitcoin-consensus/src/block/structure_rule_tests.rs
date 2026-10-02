@@ -369,6 +369,7 @@ fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
             &mut U32Map::default(),
             &FkMap::default(),
             &mut crate::block::StructuralScratch::default(),
+            None,
         )
         .expect_err("an unspent overwrite must trip BIP30");
         let msg = format!("{err}");
@@ -454,6 +455,7 @@ fn bip30_message_at_mainnet_above_bip34(
         &mut U32Map::default(),
         &FkMap::default(),
         &mut crate::block::StructuralScratch::default(),
+        None,
     )
     .map(|_| ())
 }
@@ -2099,6 +2101,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &mut mtp,
             &FkMap::default(),
             &mut crate::block::StructuralScratch::default(),
+            None,
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");
