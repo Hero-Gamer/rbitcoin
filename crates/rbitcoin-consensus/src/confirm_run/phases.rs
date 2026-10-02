@@ -238,6 +238,7 @@ pub(super) struct StructuralReuse {
 }
 
 /// Durable spentness + maturity + subsidy after scripts (height order).
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(super) fn structural_run(
     query: &Query,
     params: &ChainParams,
