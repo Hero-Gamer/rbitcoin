@@ -2,6 +2,12 @@
 
 use super::phases::{class_c_commit, post_commit, structural_run};
 use super::*;
+use std::cell::RefCell;
+
+thread_local! {
+    static WRITE_REUSE: RefCell<super::phases::StructuralReuse> =
+        RefCell::new(super::phases::StructuralReuse::default());
+}
 
 pub(super) fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     match tip {
@@ -162,11 +168,9 @@ pub fn confirm_write_phase(
         plan_take_ns,
         create_map_ns,
     } = apply_archive_plan(query, &mut batch)?;
-    {
-        let t_ens = Instant::now();
-        ensure_spend_abs_layouts(&batch.batch_parents, &batch.prepared)?;
-        ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
-    }
+    let t_ens = Instant::now();
+    let abs_jobs = super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)?;
+    ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
     if class_a_ns > 0 {
         rbitcoin_query::note_confirm(&query.confirm_stats().class_a_ns, class_a_ns);
     }
@@ -193,14 +197,18 @@ pub fn confirm_write_phase(
     let overlap = (|| -> Result<_, ConsensusError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
         let t_struct = Instant::now();
-        let (struct_ph, slots) = structural_run(
-            query,
-            params,
-            milestone,
-            &batch.prepared,
-            &batch.wire_blocks,
-            &batch.batch_parents,
-        )?;
+        let (struct_ph, slots) = WRITE_REUSE.with(|reuse| {
+            structural_run(
+                query,
+                params,
+                milestone,
+                &batch.prepared,
+                &batch.wire_blocks,
+                &batch.batch_parents,
+                &abs_jobs,
+                &mut reuse.borrow_mut(),
+            )
+        })?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
         let n_blocks = batch.prepared.len();

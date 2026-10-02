@@ -1499,6 +1499,13 @@ impl Default for StructuralScratch {
 }
 
 impl StructuralScratch {
+    /// Drop annotate slots from the previous write batch. Per-block buffers
+    /// stay for [`Self::begin_block`]; slots accumulate inside one batch.
+    pub(crate) fn begin_batch(&mut self) {
+        self.slots.abs_edges.clear();
+        self.slots.known.clear();
+    }
+
     fn begin_block(&mut self) {
         self.abs_jobs.clear();
         self.abs_seen.clear();
@@ -1539,8 +1546,9 @@ pub(crate) fn structural_validate_spends(
     pending_spent: &mut rbitcoin_query::OutPointSet,
     batch_parents: &rbitcoin_query::BatchParents,
     mtp_cache: &mut U32Map<u32>,
-    run_create_height: &FkMap<u32>,
+    run_create_height: &RunCreateHeight,
     scratch: &mut StructuralScratch,
+    precomputed_abs: Option<&[StructuralAbsJob]>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::time::Instant;
 
@@ -1550,7 +1558,14 @@ pub(crate) fn structural_validate_spends(
     let t_spent = Instant::now();
     reject_bip30_unspent_overwrite(query, block, ctx)?;
     let t_abs = Instant::now();
-    structural_abs_heights(query, spends, batch_parents, run_create_height, scratch)?;
+    structural_abs_heights(
+        query,
+        spends,
+        batch_parents,
+        run_create_height,
+        scratch,
+        precomputed_abs,
+    )?;
     let tip = query.tip_height().map(|h| h.0);
     let mut spent_strong_ns = 0u64;
     let mut multi_list_ns = 0u64;
@@ -1592,7 +1607,82 @@ pub(crate) fn structural_validate_spends(
     })
 }
 
-type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32);
+pub(crate) type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32);
+
+/// Create heights for one write batch.
+///
+/// Contiguous per-block fk spans are the IBD shape (`first` + count). A gap
+/// or overlap uses the map so a fk between spans does not inherit a height.
+pub(crate) enum RunCreateHeight {
+    Spans(Vec<(u64, u64, u32)>),
+    Map(FkMap<u32>),
+}
+
+impl RunCreateHeight {
+    pub(crate) fn from_blocks<'a>(
+        blocks: impl IntoIterator<Item = (u32, &'a [rbitcoin_primitives::Fk])>,
+    ) -> Self {
+        let blocks: Vec<(u32, &'a [rbitcoin_primitives::Fk])> = blocks.into_iter().collect();
+        if let Some(spans) = contiguous_create_spans(&blocks) {
+            Self::Spans(spans)
+        } else {
+            let mut map = FkMap::default();
+            for (height, fks) in blocks {
+                for fk in fks {
+                    map.insert(*fk, height);
+                }
+            }
+            Self::Map(map)
+        }
+    }
+
+    pub(crate) fn get(&self, fk: rbitcoin_primitives::Fk) -> Option<u32> {
+        match self {
+            Self::Map(map) => map.get(&fk).copied(),
+            Self::Spans(spans) => {
+                let id = fk.get()?;
+                let i = spans.partition_point(|span| span.0 <= id);
+                let (_, end, height) = spans.get(i.checked_sub(1)?)?;
+                (*end > id).then_some(*height)
+            }
+        }
+    }
+}
+
+/// `Some` when every non-empty block is `[first, first+n)` and spans do not overlap.
+///
+/// A null fk, a gap, or an id that would wrap is `None` so the caller uses the map.
+/// A wrapped end must not cover fks that are not in the block.
+fn contiguous_create_spans(
+    blocks: &[(u32, &[rbitcoin_primitives::Fk])],
+) -> Option<Vec<(u64, u64, u32)>> {
+    let mut spans = Vec::with_capacity(blocks.len());
+    for &(height, fks) in blocks {
+        if fks.is_empty() {
+            continue;
+        }
+        let mut ids = fks.iter().map(|fk| fk.get());
+        let first = ids.next().flatten()?;
+        let mut prev = first;
+        for id in ids {
+            let id = id?;
+            let next = prev.checked_add(1)?;
+            if id != next {
+                return None;
+            }
+            prev = id;
+        }
+        let end = prev.checked_add(1)?;
+        spans.push((first, end, height));
+    }
+    spans.sort_unstable_by_key(|span| span.0);
+    for pair in spans.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return None;
+        }
+    }
+    Some(spans)
+}
 type DurableSpentSet =
     std::collections::HashSet<(u64, u32), BuildHasherDefault<rbitcoin_query::OutPointHasher>>;
 type OverlayMetaSkip = std::collections::HashMap<
@@ -1609,11 +1699,11 @@ fn fill_overlay_skip(
         rbitcoin_primitives::Fk,
         u32,
     )],
-    run_create_height: &FkMap<u32>,
+    run_create_height: &RunCreateHeight,
     scratch: &mut StructuralScratch,
 ) {
     for &(_, vout, sfk, cfk, vin) in spends {
-        if !run_create_height.contains_key(&cfk) {
+        if run_create_height.get(cfk).is_none() {
             continue;
         }
         let Some(id) = cfk.get() else {
@@ -1649,18 +1739,39 @@ fn structural_abs_heights(
         u32,
     )],
     batch_parents: &rbitcoin_query::BatchParents,
-    run_create_height: &FkMap<u32>,
+    run_create_height: &RunCreateHeight,
     scratch: &mut StructuralScratch,
+    precomputed_abs: Option<&[StructuralAbsJob]>,
 ) -> Result<(), ConsensusError> {
-    batch_parents
-        .spend_abs_jobs_into(
-            spends
-                .iter()
-                .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
-            &mut scratch.abs_jobs,
-            &mut scratch.abs_seen,
-        )
-        .map_err(ConsensusError::from)?;
+    if let Some(jobs) = precomputed_abs {
+        // Tests recompute so a stale list cannot skip a missing abs.
+        #[cfg(test)]
+        {
+            let fresh = batch_parents
+                .spend_abs_jobs(
+                    spends
+                        .iter()
+                        .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+                )
+                .map_err(ConsensusError::from)?;
+            if fresh.as_slice() != jobs {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: precomputed spend abs diverged from pin",
+                )));
+            }
+        }
+        scratch.abs_jobs.extend_from_slice(jobs);
+    } else {
+        batch_parents
+            .spend_abs_jobs_into(
+                spends
+                    .iter()
+                    .map(|&(_, vout, sfk, cfk, vin)| (cfk, vout, sfk, vin)),
+                &mut scratch.abs_jobs,
+                &mut scratch.abs_seen,
+            )
+            .map_err(ConsensusError::from)?;
+    }
     scratch.unique_fks.extend(
         scratch
             .abs_jobs
@@ -1677,7 +1788,7 @@ fn structural_abs_heights(
         let Some(id) = fk.get() else {
             continue;
         };
-        let Some(h) = h.or_else(|| run_create_height.get(fk).copied()) else {
+        let Some(h) = h.or_else(|| run_create_height.get(*fk)) else {
             continue;
         };
         scratch.height_by_id.insert(id, h);
@@ -1836,9 +1947,6 @@ fn structural_mark_pending(
 ) -> Result<(), ConsensusError> {
     for &(prev_txid, vout, _spend_fk, create_fk, _vin) in spends {
         let key = (prev_txid, vout);
-        if pending_spent.contains(&key) {
-            return Err(ConsensusError::PrevoutSpent);
-        }
         let spent = if create_fk.is_null() {
             false
         } else if let Some(id) = create_fk.get() {
@@ -1846,10 +1954,9 @@ fn structural_mark_pending(
         } else {
             false
         };
-        if spent {
+        if spent || !pending_spent.insert(key) {
             return Err(ConsensusError::PrevoutSpent);
         }
-        pending_spent.insert(key);
     }
     Ok(())
 }
@@ -2315,8 +2422,9 @@ mod overlay_meta_skip_tests {
 
     #[test]
     fn overlay_meta_skip_omits_matching_abs() {
-        let mut run = FkMap::default();
-        run.insert(Fk(10), 5);
+        let mut map = FkMap::default();
+        map.insert(Fk(10), 5);
+        let run = RunCreateHeight::Map(map);
         let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
         let mut scratch = StructuralScratch::default();
         fill_overlay_skip(&spends, &run, &mut scratch);
@@ -2328,8 +2436,9 @@ mod overlay_meta_skip_tests {
 
     #[test]
     fn overlay_meta_skip_keeps_conflicting_spender_on_disk_list() {
-        let mut run = FkMap::default();
-        run.insert(Fk(10), 5);
+        let mut map = FkMap::default();
+        map.insert(Fk(10), 5);
+        let run = RunCreateHeight::Map(map);
         let spends = spends(&[(0, Fk(11), Fk(10), 0), (0, Fk(12), Fk(10), 0)]);
         let mut scratch = StructuralScratch::default();
         fill_overlay_skip(&spends, &run, &mut scratch);
@@ -2339,11 +2448,47 @@ mod overlay_meta_skip_tests {
 
     #[test]
     fn overlay_meta_skip_historical_create_stays_on_disk() {
-        let run = FkMap::default();
+        let run = RunCreateHeight::Spans(Vec::new());
         let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
         let mut scratch = StructuralScratch::default();
         fill_overlay_skip(&spends, &run, &mut scratch);
         assert!(!overlay_meta_is_skip(10, 0, Fk(11), 0, &scratch.skip));
+    }
+}
+
+#[cfg(test)]
+mod run_create_height_tests {
+    use super::RunCreateHeight;
+    use rbitcoin_primitives::Fk;
+
+    fn fk(id: u64) -> Fk {
+        Fk(id)
+    }
+
+    #[test]
+    fn run_create_height_span_misses_gaps() {
+        let one = [fk(10), fk(11)];
+        let idx = RunCreateHeight::from_blocks([(7u32, one.as_slice())]);
+        assert!(matches!(idx, RunCreateHeight::Spans(_)));
+        assert_eq!(idx.get(fk(10)), Some(7));
+        assert_eq!(idx.get(fk(11)), Some(7));
+        assert_eq!(idx.get(fk(9)), None);
+        assert_eq!(idx.get(fk(12)), None);
+
+        let low = [fk(10), fk(11)];
+        let high = [fk(20), fk(21)];
+        let idx = RunCreateHeight::from_blocks([(1u32, low.as_slice()), (2, high.as_slice())]);
+        assert_eq!(idx.get(fk(15)), None);
+        assert_eq!(idx.get(fk(10)), Some(1));
+        assert_eq!(idx.get(fk(21)), Some(2));
+
+        let gapped = [fk(1), fk(2), fk(4)];
+        let idx = RunCreateHeight::from_blocks([(3u32, gapped.as_slice())]);
+        assert!(matches!(idx, RunCreateHeight::Map(_)));
+        assert_eq!(idx.get(fk(3)), None);
+        assert_eq!(idx.get(fk(1)), Some(3));
+        assert_eq!(idx.get(fk(2)), Some(3));
+        assert_eq!(idx.get(fk(4)), Some(3));
     }
 }
 

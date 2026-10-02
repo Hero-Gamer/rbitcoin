@@ -1637,6 +1637,7 @@ impl ChainHub {
 
     /// WRITE stage: structural + Class C + spend annotate (ordered).
     pub fn confirm_write(&self, batch: ScriptOkBatch) -> Result<Vec<AcceptOutcome>, NetError> {
+        let headers = batch.wire_headers().map_err(NetError::from_consensus)?;
         let meta: Vec<(u32, BlockHash)> = batch
             .heights_hashes()
             .into_iter()
@@ -1644,7 +1645,7 @@ impl ChainHub {
             .collect();
         confirm_write_phase(&self.query, &self.params, self.milestone, batch)
             .map_err(NetError::from_consensus)?;
-        self.note_confirmed_tip(&meta)?;
+        self.note_confirmed_tip(&meta, &headers)?;
         Ok(meta
             .iter()
             .map(|&(height, _)| AcceptOutcome::Accepted { height })
@@ -1654,7 +1655,15 @@ impl ChainHub {
     pub(crate) fn note_confirmed_tip(
         &self,
         need_meta: &[(u32, BlockHash)],
+        headers: &[Header],
     ) -> Result<(), NetError> {
+        if headers.len() != need_meta.len() {
+            return Err(NetError::from_consensus(
+                rbitcoin_consensus::ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: wire headers length",
+                )),
+            ));
+        }
         if let Some(mp) = self.mempool() {
             mp.clear_recent_rejects();
             if mp.relay_enabled() {
@@ -1680,16 +1689,14 @@ impl ChainHub {
             }
         }
         let mut confirmed = self.confirmed.write().unwrap();
-        for &(height, hash) in need_meta {
+        for (&(height, hash), header) in need_meta.iter().zip(headers.iter()) {
             confirmed.insert(hash);
-            if let Ok(hdr) = self.query.wire_header_at_height(Height(height)) {
-                let _ = self.tip_tx.send(TipEvent {
-                    height,
-                    hash,
-                    header: hdr,
-                    reorg_branch_len: 0,
-                });
-            }
+            let _ = self.tip_tx.send(TipEvent {
+                height,
+                hash,
+                header: *header,
+                reorg_branch_len: 0,
+            });
         }
         drop(confirmed);
         self.notify.notify_waiters();
@@ -4662,6 +4669,48 @@ mod tests {
             "release must not seed; worker/apply does that"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn note_confirmed_tip_sends_the_wire_header() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let block = hub
+            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .expect("assemble");
+        let wire = block.header;
+        let hash = block.block_hash();
+        match hub.accept_block(block).expect("connect") {
+            AcceptOutcome::Accepted { height } => assert_eq!(height, 1),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        let stored = hub
+            .query
+            .wire_header_at_height(Height(1))
+            .expect("stored header");
+        assert_eq!(stored.nonce, wire.nonce);
+        let mut claimed = wire;
+        claimed.nonce = wire.nonce.wrapping_add(1);
+        let mut tip_rx = hub.subscribe_tips();
+        hub.note_confirmed_tip(&[(1, hash)], &[claimed])
+            .expect("note");
+        let ev = tip_rx.try_recv().expect("tip event");
+        assert_eq!(ev.header, claimed);
+        assert_eq!(
+            hub.query
+                .wire_header_at_height(Height(1))
+                .expect("store")
+                .nonce,
+            stored.nonce
+        );
+        let err = hub
+            .note_confirmed_tip(&[(1, hash)], &[])
+            .expect_err("header count");
+        assert!(
+            err.to_string().contains("invariant: wire headers length"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

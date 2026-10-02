@@ -345,9 +345,9 @@ fn padded_spend(data_len: usize) -> Transaction {
 /// 91842/91880 grandfather). Signet activates BIP34 at height 1, and Core's
 /// empty BIP34 hash still enforces BIP30 on every signet block.
 fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
-    use crate::block::structural_validate_spends;
+    use crate::block::{structural_validate_spends, RunCreateHeight};
     use rbitcoin_primitives::Fk;
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    use rbitcoin_query::{BatchParents, OutPointSet, U32Map};
     let dup = block_with(vec![first.clone()]);
     let signet = Box::leak(Box::new(ChainParams::signet()));
     for (ctx, net) in [
@@ -357,6 +357,7 @@ fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
             "signet",
         ),
     ] {
+        let heights = RunCreateHeight::Spans(Vec::new());
         let err = structural_validate_spends(
             q,
             &dup,
@@ -367,8 +368,9 @@ fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
             &mut OutPointSet::default(),
             &BatchParents::new(),
             &mut U32Map::default(),
-            &FkMap::default(),
+            &heights,
             &mut crate::block::StructuralScratch::default(),
+            None,
         )
         .expect_err("an unspent overwrite must trip BIP30");
         let msg = format!("{err}");
@@ -438,10 +440,11 @@ fn bip30_message_at_mainnet_above_bip34(
     q: &rbitcoin_query::Query,
     block: &Block,
 ) -> Result<(), ConsensusError> {
-    use crate::block::structural_validate_spends;
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+    use crate::block::{structural_validate_spends, RunCreateHeight};
+    use rbitcoin_query::{BatchParents, OutPointSet, U32Map};
     let main = Box::leak(Box::new(ChainParams::mainnet()));
     let ctx = ValidationContext::at(main, Height(main.btc.bip34_height + 1), Milestone::NONE);
+    let heights = RunCreateHeight::Spans(Vec::new());
     structural_validate_spends(
         q,
         block,
@@ -452,8 +455,9 @@ fn bip30_message_at_mainnet_above_bip34(
         &mut OutPointSet::default(),
         &BatchParents::new(),
         &mut U32Map::default(),
-        &FkMap::default(),
+        &heights,
         &mut crate::block::StructuralScratch::default(),
+        None,
     )
     .map(|_| ())
 }
@@ -2078,15 +2082,16 @@ fn already_archived_schema13_pin_identity_tip_follow() {
 
     // Structural without denserels/abs is invariant — not soft PrevoutSpent recovery.
     {
-        use super::structural_validate_spends;
+        use super::{structural_validate_spends, RunCreateHeight};
         use rbitcoin_primitives::Fk;
-        use rbitcoin_query::{BatchParents, FkMap, OutPointSet, U32Map};
+        use rbitcoin_query::{BatchParents, OutPointSet, U32Map};
         let c2_fk = q.tx_fk_by_txid(c2_txid.as_byte_array()).unwrap().unwrap();
         let spends = vec![(c2_txid.to_byte_array(), 0u32, Fk(9_000_001), c2_fk, 0)];
         let parents = BatchParents::new();
         let ctx = ValidationContext::at(Box::leak(Box::new(params.clone())), Height(h_n1), ms);
         let mut pending = OutPointSet::default();
         let mut mtp = U32Map::default();
+        let heights = RunCreateHeight::Spans(Vec::new());
         let err = structural_validate_spends(
             &q,
             &b_n1,
@@ -2097,8 +2102,9 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &mut pending,
             &parents,
             &mut mtp,
-            &FkMap::default(),
+            &heights,
             &mut crate::block::StructuralScratch::default(),
+            None,
         )
         .expect_err("missing denserels abs must hard-fail");
         let msg = format!("{err}");

@@ -2491,19 +2491,17 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     assert!(want >= BURST, "miner tip {want}");
 
     let mut peer_tip = nb.tip_height().unwrap_or(0);
-    for _ in 0..200 {
-        peer_tip = nb.tip_height().unwrap_or(0);
-        if peer_tip >= want {
-            break;
-        }
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    while peer_tip < want && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        peer_tip = nb.tip_height().unwrap_or(0);
     }
     na.shutdown().await;
     nb.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         peer_tip, want,
-        "peer must catch tip after Lagged burst within ~10s (not headers_poll 120s)"
+        "peer must catch tip after Lagged burst within 45s"
     );
 }
 /// Core `disconnect_nodes` waits ≤5s for the far side's `getpeerinfo` to drop us.

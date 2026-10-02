@@ -1419,7 +1419,9 @@ pub(crate) fn spawn_confirm_engine(
     let load_ahead_reset_wb = Arc::clone(&load_ahead_reset);
     let write_thr = std::thread::Builder::new()
         .name("ibd-confirm-write".into())
-        .spawn(move || {
+        .spawn(
+            #[allow(clippy::cognitive_complexity)] // confirm write OS pipeline
+            move || {
             info!("ibd: confirm write on dedicated OS thread");
             let stats = hub_wb.query.confirm_stats_arc();
             // Non-contig leftover already note_write_recv'd; write it next iter.
@@ -1466,6 +1468,14 @@ pub(crate) fn spawn_confirm_engine(
                     feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                     continue;
                 }
+                let headers = match batch.wire_headers() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!("ibd: confirm write {e}");
+                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        break;
+                    }
+                };
                 let meta: Vec<(u32, BlockHash)> = heights_hashes
                     .iter()
                     .map(|&(h, raw)| (h, BlockHash::from_byte_array(raw)))
@@ -1477,7 +1487,7 @@ pub(crate) fn spawn_confirm_engine(
                     batch,
                 ) {
                     Ok(_fks) => {
-                        if let Err(e) = hub_wb.note_confirmed_tip(&meta) {
+                        if let Err(e) = hub_wb.note_confirmed_tip(&meta, &headers) {
                             warn!("ibd: confirm write note tip: {e}");
                         }
                         let t_deq = Instant::now();
@@ -1551,7 +1561,7 @@ pub(crate) fn spawn_confirm_engine(
                                     &heights_hashes,
                                 ) {
                                     Ok(()) => {
-                                        if let Err(e) = hub_wb.note_confirmed_tip(&meta) {
+                                        if let Err(e) = hub_wb.note_confirmed_tip(&meta, &headers) {
                                             warn!("ibd: confirm write note tip: {e}");
                                         }
                                         for (h, raw) in &heights_hashes {

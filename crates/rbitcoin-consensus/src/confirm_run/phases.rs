@@ -230,7 +230,15 @@ pub(super) fn assemble_run(
     })
 }
 
+/// Scratch reused by the confirm write thread. Cleared at each batch.
+#[derive(Default)]
+pub(super) struct StructuralReuse {
+    pub scratch: crate::block::StructuralScratch,
+    pub pending: rbitcoin_query::OutPointSet,
+}
+
 /// Durable spentness + maturity + subsidy after scripts (height order).
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(super) fn structural_run(
     query: &Query,
     params: &ChainParams,
@@ -238,11 +246,22 @@ pub(super) fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
+    abs_jobs: &[Vec<crate::block::StructuralAbsJob>],
+    reuse: &mut StructuralReuse,
 ) -> Result<(crate::block::StructuralPhaseNs, crate::block::AnnotateSlots), ConsensusError> {
-    use crate::block::{StructuralPhaseNs, StructuralScratch};
+    use crate::block::StructuralPhaseNs;
+    if abs_jobs.len() != prepared.len() {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: spend abs jobs length",
+        )));
+    }
     let t0 = Instant::now();
-    let mut scratch = StructuralScratch::default();
-    let mut pending_spent: rbitcoin_query::OutPointSet = Default::default();
+    // Slots and the pack-local double-spend set are this batch only.
+    reuse.scratch.begin_batch();
+    reuse.pending.clear();
+    let index = crate::block::RunCreateHeight::from_blocks(
+        prepared.iter().map(|p| (p.height.0, p.tx_fks.as_slice())),
+    );
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
         if p.height.0 > 0 {
@@ -250,12 +269,6 @@ pub(super) fn structural_run(
         }
     }
     let mut tot = StructuralPhaseNs::default();
-    let mut run_create_height: FkMap<u32> = FkMap::default();
-    for p in prepared {
-        for fk in &p.tx_fks {
-            run_create_height.insert(*fk, p.height.0);
-        }
-    }
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
         let ph = structural_validate_spends(
@@ -265,11 +278,12 @@ pub(super) fn structural_run(
             Some(&p.tx_fks),
             &p.spends,
             p.fees,
-            &mut pending_spent,
+            &mut reuse.pending,
             batch_parents,
             &mut mtp_cache,
-            &run_create_height,
-            &mut scratch,
+            &index,
+            &mut reuse.scratch,
+            Some(&abs_jobs[i]),
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);
@@ -306,7 +320,7 @@ pub(super) fn structural_run(
         tot.create_h_ns,
     );
     rbitcoin_query::note_confirm(&query.confirm_stats().structural_bip68_ns, tot.bip68_ns);
-    Ok((tot, scratch.slots))
+    Ok((tot, std::mem::take(&mut reuse.scratch.slots)))
 }
 
 pub(super) fn class_c_commit(

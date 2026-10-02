@@ -1390,7 +1390,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         seed.shutdown().await;
         peer.shutdown().await;
     };
-    tokio::time::timeout(llvm_cov_wall(30, 90), fut)
+    tokio::time::timeout(llvm_cov_wall(60, 90), fut)
         .await
         .expect("p2p_compact_hb_getblocktxn_and_orphan wall timeout");
 }

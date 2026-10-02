@@ -1326,7 +1326,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
 /// Overlay slot already in Class A: structural must not meta-pread it.
 #[test]
 fn structural_same_batch_overlay_skips_meta_pread() {
-    use crate::block::structural_validate_spends;
+    use crate::block::{structural_validate_spends, RunCreateHeight};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -1434,9 +1434,10 @@ fn structural_same_batch_overlay_skips_meta_pread() {
     bp.set_spent_range_only(fks[0], loc[0].spent);
 
     let spends = vec![([0x32u8; 32], 0u32, fks[1], fks[0], 0)];
-    let mut run = FkMap::default();
-    run.insert(fks[0], 1);
-    run.insert(fks[1], 1);
+    let mut map = FkMap::default();
+    map.insert(fks[0], 1);
+    map.insert(fks[1], 1);
+    let run = RunCreateHeight::Map(map);
     let params = ChainParams::regtest();
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
@@ -1460,6 +1461,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         &mut mtp,
         &run,
         &mut scratch,
+        None,
     )
     .expect("overlay spend is not durable-spent before tip");
     let meta_n = q
@@ -1492,7 +1494,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
 
 #[test]
 fn structural_scratch_second_block_does_not_replay_first_slots() {
-    use crate::block::{structural_validate_spends, StructuralScratch};
+    use crate::block::{structural_validate_spends, RunCreateHeight, StructuralScratch};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -1505,7 +1507,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
         Witness,
     };
     use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet};
+    use rbitcoin_query::{BatchParents, OutPointSet};
     use rbitcoin_store::{InputRecord, OutputRecord};
 
     let (path, q) = tiny_query();
@@ -1591,7 +1593,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
     mtp.insert(0, 1_300_000_000);
     let mut scratch = StructuralScratch::default();
-    let run = FkMap::default();
+    let run = RunCreateHeight::Spans(Vec::new());
     for vout in [0u32, 1] {
         let spends = vec![([0x41u8; 32], vout, Fk(9), fks[0], 0)];
         structural_validate_spends(
@@ -1606,6 +1608,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
             &mut mtp,
             &run,
             &mut scratch,
+            None,
         )
         .unwrap();
     }
@@ -3017,7 +3020,7 @@ fn wire_lookup_empty_and_noncontiguous() {
 /// Pin-covered parent without denserels/abs fails structural (no body-range cold).
 #[test]
 fn structural_pinned_without_abs_is_invariant_error() {
-    use crate::block::structural_validate_spends;
+    use crate::block::{structural_validate_spends, RunCreateHeight};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -3091,6 +3094,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
+    let heights = RunCreateHeight::Spans(Vec::new());
     let err = structural_validate_spends(
         &q,
         &block,
@@ -3101,8 +3105,9 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &mut pending,
         &bp,
         &mut mtp,
-        &rbitcoin_query::FkMap::default(),
+        &heights,
         &mut crate::block::StructuralScratch::default(),
+        None,
     )
     .expect_err("pinned without abs must be invariant");
     let msg = format!("{err}");
@@ -3214,4 +3219,230 @@ fn one_shot_load_matches_stamp_then_load_from_plan() {
     assert_eq!(pa.index_tx, pb.index_tx);
     let _ = std::fs::remove_dir_all(&path_a);
     let _ = std::fs::remove_dir_all(&path_b);
+}
+
+/// Post-fill abs jobs come from one `spend_abs_jobs` walk. A vout outside the
+/// spent range is the ensure `Corrupt` (before head insert). Duplicate abs
+/// collapses to one job. A null create fk is skipped.
+#[test]
+fn collect_spend_abs_after_fill_is_one_walk() {
+    use super::{collect_spend_abs_after_fill, Prepared};
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::OutputRecord;
+
+    let mut bp = BatchParents::new();
+    bp.insert_owned(
+        Fk(1),
+        rec_tx(0x11, 2),
+        vec![
+            (0, OutputRecord::unspent(1, vec![0x51])),
+            (1, OutputRecord::unspent(1, vec![0x51])),
+        ],
+        vec![0, 1],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    // One spent slot: vout 0 is in range, vout 1 is not.
+    bp.set_spent_range_only(Fk(1), (1000, OutputRecord::SPENT_SLOT_LEN as u64));
+
+    let bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    let prepared_ok = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![
+            ([0x11; 32], 0, Fk(9), Fk(1), 0),
+            ([0x11; 32], 0, Fk(9), Fk(1), 1),
+            ([0; 32], 0, Fk(9), Fk::NULL, 0),
+        ],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits,
+        hash: [1u8; 32],
+        prev_mtp: 0,
+    }];
+    let jobs = collect_spend_abs_after_fill(&bp, &prepared_ok).expect("in-range vout 0");
+    assert_eq!(
+        jobs,
+        vec![vec![(
+            1u64,
+            0u32,
+            rbitcoin_store::spent_abs(1000, 0),
+            Fk(9),
+            0u32,
+        )]]
+    );
+
+    let prepared_miss = [Prepared {
+        height: Height(1),
+        header_fk: Fk(1),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![([0x11; 32], 1, Fk(9), Fk(1), 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1,
+        bits,
+        hash: [1u8; 32],
+        prev_mtp: 0,
+    }];
+    let err =
+        collect_spend_abs_after_fill(&bp, &prepared_miss).expect_err("vout past the spent range");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invariant: ensure denserels/abs incomplete for spend edge"),
+        "got {msg}"
+    );
+}
+
+/// A scratch reused for the next write batch must not keep the previous
+/// batch's annotate slots or pack-local double-spend set.
+#[test]
+fn structural_run_clears_reused_scratch_between_batches() {
+    use super::phases::{structural_run, StructuralReuse};
+    use super::{collect_spend_abs_after_fill, Prepared};
+    use crate::milestone::Milestone;
+    use crate::params::ChainParams;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+        Witness,
+    };
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::{InputRecord, OutputRecord};
+    use std::sync::Arc;
+
+    let (path, q) = tiny_query();
+    let parent_pin = rbitcoin_query::CreatePinInner::records(
+        rec_tx(0x41, 1),
+        vec![OutputRecord::unspent(1, vec![0x51])],
+    );
+    let (fks, loc) = q
+        .store()
+        .put_tx_full_batch_from_pins(
+            &[(
+                std::sync::Arc::clone(&parent_pin),
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            )],
+            false,
+            &[],
+        )
+        .unwrap();
+    let mut bp = BatchParents::new();
+    bp.insert_create_pin(
+        fks[0],
+        parent_pin,
+        vec![0],
+        Some(false),
+        Some(loc[0].txout),
+        Vec::new(),
+    );
+    bp.set_spent_range_only(fks[0], loc[0].spent);
+    q.store().header_txs.put_range(Fk(100), fks[0], 1).unwrap();
+    q.store().confirmed.set(Height(0), Fk(100)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1_300_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        },
+        txdata: vec![
+            coinbase,
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([0x41; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+        ],
+    };
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    let params = ChainParams::regtest();
+    let bits = CompactTarget::from_consensus(0x207f_ffff);
+    let prepared = [Prepared {
+        height: Height(1),
+        header_fk: Fk(100),
+        tx_fks: vec![Fk(9)],
+        jobs: vec![],
+        spends: vec![([0x41; 32], 0, Fk(9), fks[0], 0)],
+        fees: 0,
+        check_scripts: false,
+        time: 1_300_000_000,
+        bits,
+        hash: [2u8; 32],
+        prev_mtp: 1_300_000_000,
+    }];
+    let jobs = collect_spend_abs_after_fill(&bp, &prepared).expect("parent abs");
+    let wire = vec![Arc::new(block)];
+
+    let mut reuse = StructuralReuse::default();
+    reuse
+        .scratch
+        .slots
+        .push((999, Fk(1), 0, Fk(8), 0), (Fk::NULL, 0, 0));
+    reuse.pending.insert(([0x41; 32], 0u32));
+
+    let run = |reuse: &mut StructuralReuse| {
+        structural_run(
+            &q,
+            &params,
+            Milestone::NONE,
+            &prepared,
+            &wire,
+            &bp,
+            &jobs,
+            reuse,
+        )
+        .expect("reused scratch still connects")
+    };
+    let (_ph, slots) = run(&mut reuse);
+    assert!(
+        slots.abs_edges.iter().all(|e| e.0 != 999),
+        "previous batch slot leaked: {:?}",
+        slots.abs_edges
+    );
+    assert_eq!(slots.abs_edges.len(), 1);
+    let (_ph, slots2) = run(&mut reuse);
+    assert_eq!(slots2.abs_edges.len(), 1);
+    assert_ne!(slots2.abs_edges[0].0, 999);
+    let _ = std::fs::remove_dir_all(&path);
 }

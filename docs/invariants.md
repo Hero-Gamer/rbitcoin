@@ -152,7 +152,7 @@ packs at/above the leaving **pack** height **before** the next bind.
 
 ## Related code
 
-- Confirm write annotate / ensure: `rbitcoin-consensus` `confirm_run::{post_commit,ensure_spend_abs_layouts,pin_for_wire_batch}`
+- Confirm write annotate / ensure: `rbitcoin-consensus` `confirm_run::{post_commit,collect_spend_abs_after_fill,ensure_spend_abs_layouts,pin_for_wire_batch}`
 - Structural: `rbitcoin-consensus` `block::structural_validate_spends`
 - Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `pin_for_wire_batch` (cold range / adopt)
 - Abs annotate: `rbitcoin-store` `put_spend_batch_by_abs_meta`
@@ -165,6 +165,7 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `pin_for_wire_incomplete_outs_is_invariant_error` | `pin_for_wire_batch` incomplete outs → cold miss |
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
+| `collect_spend_abs_after_fill_is_one_walk` | one `spend_abs_jobs` after fill; vout past the range is ensure Corrupt; duplicate abs is one job |
 | `write_ensure_stamps_spent_range_after_load_pin` / `pin_and_ensure_journey` / `fill_same_batch_abs_from_append_loc_ram` / `fill_just_written_survives_until_last_started_write` / `fill_stamp_spent_hole_from_write_tls` / `pin_and_ensure_from_pin_loc_without_tls` | load pin copies lookup spent range; missing stamp is Corrupt; same-batch abs from append RAM; just-written loc until write of last started height; stamp spent hole filled by write TLS; pin loc after TLS prune (no write loc pread) |
 | `fill_missing_parent_ranges_stamps_spent_idx_for_archived` / `inflight_hit_adopts_skeleton_loc` / `inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc` / `plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc` / `inflight_hit_uses_pin_loc_without_disk` | leftover TipOnly still loc-fills archived spent; InFlight takes skeleton loc; IBD skeleton miss leaves spent unset (no loc-by-fk); pin loc binds without disk |
 | `spend_abs_jobs_unique_and_missing_is_corrupt` | pin arithmetic abs list; missing → Corrupt |
