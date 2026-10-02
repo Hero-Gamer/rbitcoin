@@ -3071,6 +3071,23 @@ impl MempoolHub {
         Some((stats, a_mod, d_mod, chunk_fee, chunk_w))
     }
 
+    /// Core `-limitclustercount` and `-limitclustersize` (count, vbytes).
+    pub fn cluster_limits(&self) -> (u32, u64) {
+        let g = self.lock_read();
+        (
+            g.graph.cluster_count_limit() as u32,
+            g.graph.cluster_vsize_limit(),
+        )
+    }
+
+    /// Defaults when no hub is attached (`MAX_CLUSTER_COUNT`, `MAX_CLUSTER_VSIZE`).
+    pub fn default_cluster_limits() -> (u32, u64) {
+        (
+            rbitcoin_mempool::MAX_CLUSTER_COUNT as u32,
+            rbitcoin_mempool::MAX_CLUSTER_VSIZE,
+        )
+    }
+
     /// Cluster count/size overlay (`None` = keep default).
     pub fn set_cluster_limits(&self, count: Option<u32>, size_kvb: Option<u32>) {
         self.lock_write().set_cluster_limits(count, size_kvb);

@@ -770,7 +770,10 @@ fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCo
         (info["size"].clone(), info["bytes"].clone()),
         (json!(1), json!(4_000))
     );
-    assert_eq!(info["total_fee"], json!(0.00002));
+    assert_eq!(
+        serde_json::to_string(&info["total_fee"]).unwrap(),
+        "0.00002000"
+    );
     // Newest accept: the journey already admitted earlier spends into this ring.
     let recent = ctx.mempool.as_ref().unwrap().recent_accepts();
     assert_eq!(
