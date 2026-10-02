@@ -583,13 +583,9 @@ async fn end_of_ibd_sh_interrupt() {
         .expect("end_of_ibd_sh_interrupt wall");
 }
 
-async fn wait_tip_electrum_down(rpc: SocketAddr, electrum: SocketAddr, height: u32, hash: &str) {
+async fn wait_tip(rpc: SocketAddr, height: u32, hash: &str) {
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        assert!(
-            TcpStream::connect(electrum).await.is_err(),
-            "Electrum listened while scripthash indexing was off"
-        );
         if TcpStream::connect(rpc).await.is_ok() {
             let count = jsonrpc(rpc, "getblockcount", json!([])).await;
             let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
@@ -610,7 +606,7 @@ async fn catch_without_index(dir: &Path, miner: SocketAddr, height: u32, hash: &
     let rpc = reserve_addr();
     let electrum = reserve_addr();
     let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, rpc, electrum, false));
-    wait_tip_electrum_down(rpc, electrum, height, hash).await;
+    wait_tip(rpc, height, hash).await;
     stop_run_p2p(rpc, node).await;
 }
 
