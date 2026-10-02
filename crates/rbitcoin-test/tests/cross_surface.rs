@@ -1164,7 +1164,31 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
         );
         assert_eq!(fee["result"]["blocks"], 2, "{run}: {fee}");
 
-        let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+        // --- Reorg filter torn-slot: off-best getblockfilter must not serve stale body ---
+    let tip_hash: String = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await["result"].as_str().unwrap().to_string();
+    let f_a = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    let filter_a = f_a["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_a.is_empty(), "filter_a empty: {f_a}");
+    jsonrpc(rpc_addr, "invalidateblock", json!([tip_hash.clone()])).await;
+    let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
+    let arr = gen["result"].as_array().expect("generate array");
+    let hash_b_same = arr[0].as_str().unwrap().to_string();
+    let hash_b_next = arr[1].as_str().unwrap().to_string();
+    assert_ne!(hash_b_same, tip_hash);
+    let err_old = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    assert_eq!(err_old["error"]["code"], -5, "old hash should be -5: {err_old}");
+    let msg = err_old["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("Block not found"), "expected 'Block not found', got '{msg}': {err_old}");
+    let f_b = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_same.clone()])).await;
+    let filter_b = f_b["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_b.is_empty(), "sibling filter empty: {f_b}");
+    assert!(filter_b.len() > 10, "sibling filter implausibly short: {f_b}");
+    assert_ne!(filter_b, filter_a, "sibling filter == torn filter_a - truncate leak");
+    let f_tip = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_next.clone()])).await;
+    assert!(f_tip["result"]["filter"].as_str().is_some(), "new tip should serve filter: {f_tip}");
+
+
+ let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
         let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
         assert!(
             matches!(stopped, Ok(Ok(Ok(())))),
@@ -2086,98 +2110,37 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "RPC over-weight package: {fat}"
     );
 
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    // --- Reorg filter torn-slot: off-best getblockfilter must not serve stale body ---
+    let tip_hash: String = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await["result"].as_str().unwrap().to_string();
+    let f_a = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    let filter_a = f_a["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_a.is_empty(), "filter_a empty: {f_a}");
+    jsonrpc(rpc_addr, "invalidateblock", json!([tip_hash.clone()])).await;
+    let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
+    let arr = gen["result"].as_array().expect("generate array");
+    let hash_b_same = arr[0].as_str().unwrap().to_string();
+    let hash_b_next = arr[1].as_str().unwrap().to_string();
+    assert_ne!(hash_b_same, tip_hash);
+    let err_old = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    assert_eq!(err_old["error"]["code"], -5, "old hash should be -5: {err_old}");
+    let msg = err_old["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("Block not found"), "expected 'Block not found', got '{msg}': {err_old}");
+    let f_b = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_same.clone()])).await;
+    let filter_b = f_b["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_b.is_empty(), "sibling filter empty: {f_b}");
+    assert!(filter_b.len() > 10, "sibling filter implausibly short: {f_b}");
+    assert_ne!(filter_b, filter_a, "sibling filter == torn filter_a - truncate leak");
+    let f_tip = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_next.clone()])).await;
+    assert!(f_tip["result"]["filter"].as_str().is_some(), "new tip should serve filter: {f_tip}");
+
+
+ let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
     match stopped {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
         Ok(Err(e)) => panic!("run_p2p join: {e}"),
         Err(_) => panic!("run_p2p did not exit after stop"),
-    }
-
-    // off-best getblockfilter pin: torn slot must not leak via sibling
-    {
-        let _tip_before = jsonrpc(rpc_addr, "getblockcount", json!([])).await["result"]
-            .as_u64()
-            .unwrap();
-        let gen_a = jsonrpc(rpc_addr, "generate", json!([1])).await;
-        let hash_a = gen_a["result"][0]
-            .as_str()
-            .expect("generate 1 must return hash")
-            .to_string();
-        let filter_a = {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            loop {
-                let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
-                if let Some(s) = f["result"]["filter"]
-                    .as_str()
-                    .or_else(|| f["result"].as_str())
-                {
-                    break s.to_string();
-                }
-                if std::time::Instant::now() >= deadline {
-                    panic!("filter not up for {}: {f}", hash_a);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        };
-        assert!(!filter_a.is_empty());
-        let inv = jsonrpc(rpc_addr, "invalidateblock", json!([hash_a.clone()])).await;
-        assert!(inv["error"].is_null(), "invalidateblock failed: {inv}");
-        let (hash_b_same, hash_b_tip) = {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
-                if let Some(a) = gen["result"].as_array() {
-                    if a.len() == 2 {
-                        let h0 = a[0].as_str().unwrap().to_string();
-                        let h1 = a[1].as_str().unwrap().to_string();
-                        assert_ne!(h0, h1);
-                        assert_ne!(h0, hash_a);
-                        break (h0, h1);
-                    }
-                }
-                let msg = gen["error"]["message"].as_str().unwrap_or("");
-                if msg.contains("AlreadyHave") {
-                    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if std::time::Instant::now() >= deadline {
-                    panic!("generate 2 failed: {gen}");
-                }
-            }
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            let f = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
-            if f["result"]["filter"].is_string() || f["result"].as_str().is_some() {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("reorg filter timeout {}", hash_b_tip);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let f_old = jsonrpc(rpc_addr, "getblockfilter", json!([hash_a.clone()])).await;
-        assert_eq!(f_old["error"]["code"], -5, "torn slot must be -5: {f_old}");
-        let f_b_same = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_same.clone()])).await;
-        let filter_b = f_b_same["result"]["filter"]
-            .as_str()
-            .or_else(|| f_b_same["result"].as_str())
-            .unwrap()
-            .to_string();
-        assert!(!filter_b.is_empty());
-        assert_ne!(
-            filter_b, filter_a,
-            "torn slot leaked: 107B {} served 107A {}",
-            hash_b_same, hash_a
-        );
-        let f_new = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_tip.clone()])).await;
-        assert!(
-            f_new["result"]["filter"].is_string() || f_new["result"].as_str().is_some(),
-            "new tip must serve: {f_new}"
-        );
     }
 }
 
@@ -2217,7 +2180,31 @@ async fn stop_run_p2p(
     rpc_addr: SocketAddr,
     node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
 ) {
-    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    // --- Reorg filter torn-slot: off-best getblockfilter must not serve stale body ---
+    let tip_hash: String = jsonrpc(rpc_addr, "getbestblockhash", json!([])).await["result"].as_str().unwrap().to_string();
+    let f_a = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    let filter_a = f_a["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_a.is_empty(), "filter_a empty: {f_a}");
+    jsonrpc(rpc_addr, "invalidateblock", json!([tip_hash.clone()])).await;
+    let gen = jsonrpc(rpc_addr, "generate", json!([2])).await;
+    let arr = gen["result"].as_array().expect("generate array");
+    let hash_b_same = arr[0].as_str().unwrap().to_string();
+    let hash_b_next = arr[1].as_str().unwrap().to_string();
+    assert_ne!(hash_b_same, tip_hash);
+    let err_old = jsonrpc(rpc_addr, "getblockfilter", json!([tip_hash.clone()])).await;
+    assert_eq!(err_old["error"]["code"], -5, "old hash should be -5: {err_old}");
+    let msg = err_old["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("Block not found"), "expected 'Block not found', got '{msg}': {err_old}");
+    let f_b = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_same.clone()])).await;
+    let filter_b = f_b["result"]["filter"].as_str().expect("result.filter string").to_string();
+    assert!(!filter_b.is_empty(), "sibling filter empty: {f_b}");
+    assert!(filter_b.len() > 10, "sibling filter implausibly short: {f_b}");
+    assert_ne!(filter_b, filter_a, "sibling filter == torn filter_a - truncate leak");
+    let f_tip = jsonrpc(rpc_addr, "getblockfilter", json!([hash_b_next.clone()])).await;
+    assert!(f_tip["result"]["filter"].as_str().is_some(), "new tip should serve filter: {f_tip}");
+
+
+ let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     match tokio::time::timeout(Duration::from_secs(15), node).await {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(e))) => panic!("run_p2p error after stop: {e}"),
