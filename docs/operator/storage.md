@@ -210,7 +210,7 @@ to start over unless you intend a full Class A collect
 | No valid `DONE.keys` | Delete unsorted and restart pass 1. Seal rewrites the MPHF. |
 | `DONE.keys`, no `DONE.post` | Keep pass-1 MPHF; discard partial `post/` spills; pass 2 from fk 1; pack. Electrum stays down. |
 | `DONE.post`, some `.packed` | Pack only the unmarked shards. |
-| All `.packed` | Tip write-behind. A second start does not collect. |
+| All `.packed` | Tip write-behind. A second start does not collect. Electrum stays down until `include_hwm` covers the tip, then this process binds it. |
 | Complete head, no marks, no extract | Soft-migrate: write `.packed`. Missing `include_hwm` is set from the create count. |
 | Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](docs/crash-recovery.md). |
 | Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. |
