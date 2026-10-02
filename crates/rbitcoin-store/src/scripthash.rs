@@ -296,6 +296,8 @@ pub struct ScriptHashTable {
     l1_frozen_warned: AtomicBool,
     /// At least one sealed sorted main shard is installed.
     sorted_main_on: std::sync::atomic::AtomicBool,
+    /// Pack commit per shard. True only after `scripthash.head/NN.packed` is durable.
+    pack_marked: Box<[AtomicBool]>,
     /// One alloc per `bodies` entry (Shared: len 1).
     allocs: Vec<Mutex<AllocState>>,
     /// Dir-variant ovf alloc. Shared: `None` (ovf uses `allocs[0]`).
@@ -399,6 +401,83 @@ pub(crate) fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) 
     }
 }
 
+/// Pack commit sidecar. Pass-1 BDZ writes `.mphf`+`.val` and is not this file.
+pub(crate) fn shard_pack_mark_path(base: &Path) -> PathBuf {
+    let mut s = base.as_os_str().to_os_string();
+    s.push(".packed");
+    PathBuf::from(s)
+}
+
+fn write_shard_pack_mark(base: &Path) -> Result<(), StoreError> {
+    let p = shard_pack_mark_path(base);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    let mut tmp_s = p.as_os_str().to_os_string();
+    tmp_s.push(".tmp");
+    let tmp = PathBuf::from(tmp_s);
+    std::fs::write(&tmp, [1u8]).map_err(|e| StoreError::io(&tmp, e))?;
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .map_err(|e| StoreError::io(&tmp, e))?;
+        f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+    }
+    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
+    Ok(())
+}
+
+fn unlink_shard_pack_mark(base: &Path) {
+    let p = shard_pack_mark_path(base);
+    let _ = std::fs::remove_file(&p);
+    let mut tmp_s = p.as_os_str().to_os_string();
+    tmp_s.push(".tmp");
+    let _ = std::fs::remove_file(PathBuf::from(tmp_s));
+}
+
+/// `scripthash.unsorted` still has a pass-1 or pass-2 phase. Matches
+/// `UNSORTED_SHARD_DIR` in the materialize module (that module depends on this one).
+fn sh_unsorted_extract_in_progress(dir: &Path) -> bool {
+    let u = dir.join("scripthash.unsorted");
+    if !u.is_dir() {
+        return false;
+    }
+    if u.join("DONE.keys").is_file() || u.join("DONE.post").is_file() {
+        return true;
+    }
+    u.join("keys").exists() || u.join("post").exists()
+}
+
+/// Complete pre-marker heads (unsorted gone, every shard has MPHF+val) get
+/// `.packed`. An extract still on disk does not, even when `include_hwm` is at the tip.
+fn migrate_legacy_pack_marks(
+    dir: &Path,
+    n_shards: usize,
+    create_count: u64,
+) -> Result<(), StoreError> {
+    if sh_unsorted_extract_in_progress(dir) {
+        return Ok(());
+    }
+    let n = n_shards.max(1);
+    let bases: Vec<PathBuf> = (0..n).map(|i| sorted_main_shard_path(dir, i, n)).collect();
+    if !bases.iter().all(|b| MphfHead::exists(b)) {
+        return Ok(());
+    }
+    let mut wrote = false;
+    for b in &bases {
+        if shard_pack_mark_path(b).is_file() {
+            continue;
+        }
+        write_shard_pack_mark(b)?;
+        wrote = true;
+    }
+    if wrote && load_include_hwm(dir) == 0 && create_count > 0 {
+        store_include_hwm(dir, create_count)?;
+    }
+    Ok(())
+}
+
 fn open_sorted_main_shards(
     dir: &Path,
     n_shards: usize,
@@ -407,7 +486,9 @@ fn open_sorted_main_shards(
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let p = sorted_main_shard_path(dir, i, n);
-        if MphfHead::exists(&p) {
+        // Pass-1 BDZ exists without `.packed`. Leave the slot unsealed so pass 2
+        // can `MphfHead::open` by path.
+        if MphfHead::exists(&p) && shard_pack_mark_path(&p).is_file() {
             out.push(Some(MphfHead::open(&p)?));
         } else {
             out.push(None);
@@ -795,6 +876,10 @@ impl ScriptHashTable {
             ovf_l1: Mutex::new(None),
             l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(false),
+            pack_marked: std::iter::repeat_with(|| AtomicBool::new(false))
+                .take(n_shards)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             allocs,
             ovf_alloc: Some(Mutex::new(ovf_st)),
             page_ios: AtomicU64::new(0),
@@ -850,10 +935,22 @@ impl ScriptHashTable {
         let ovf_body = Some(ovf);
         let ovf_alloc = Some(Mutex::new(ost));
         wipe_legacy_fullsize_overflow(dir)?;
+        let mut create_count = 0u64;
+        for a in &allocs {
+            create_count = create_count.saturating_add(a.lock().unwrap().live_count);
+        }
+        create_count =
+            create_count.saturating_add(ovf_alloc.as_ref().unwrap().lock().unwrap().live_count);
+        migrate_legacy_pack_marks(dir, n_shards, create_count)?;
         let sorted_main = open_sorted_main_shards(dir, n_shards)?;
         let sealed_ovf = open_sealed_sorted_ovf(dir)?;
         let ovf_l1 = open_ovf_l1(dir)?;
         let sorted_on = sorted_main.iter().any(|s| s.is_some());
+        let pack_marked: Box<[AtomicBool]> = sorted_main
+            .iter()
+            .map(|s| AtomicBool::new(s.is_some()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let table = Self {
             store_dir: dir.to_path_buf(),
             layout,
@@ -867,6 +964,7 @@ impl ScriptHashTable {
             ovf_l1: Mutex::new(ovf_l1),
             l1_frozen_warned: AtomicBool::new(false),
             sorted_main_on: std::sync::atomic::AtomicBool::new(sorted_on),
+            pack_marked,
             allocs,
             ovf_alloc,
             page_ios: AtomicU64::new(0),
@@ -874,7 +972,7 @@ impl ScriptHashTable {
         // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15 slabs.
         // Field layout is the same; only an empty older header upgrades silently.
         if alloc_ver != SH_ALLOC_VERSION {
-            if table.has_durable_index() {
+            if table.has_index_occupancy() {
                 return Err(StoreError::Corrupt(
                     "scripthash alloc is a pre-schema-15 body; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize",
                 ));
@@ -1039,8 +1137,9 @@ impl ScriptHashTable {
     /// Wipe body alloc + all head slots for a full cold rematerialize.
     ///
     /// Used when runs/`*.run.mat` still hold the complete create set after a
-    /// partial/crashed bulk load. Does not delete files — resets in place so
-    /// open table handles stay valid. Exclusive: no concurrent SH readers/writers.
+    /// partial/crashed bulk load. Resets body alloc in place and unlinks
+    /// `.packed` so the emptied head is not pack-complete. MPHF files stay
+    /// until the next seal overwrites them. Exclusive: no concurrent SH readers/writers.
     ///
     /// Must run whenever claims are about to cold-load, not only when
     /// `entry_count > 0`: crash mid-finish can leave head shards occupied while
@@ -1052,6 +1151,13 @@ impl ScriptHashTable {
         }
         self.sorted_main_on
             .store(false, std::sync::atomic::Ordering::Release);
+        for b in self.pack_marked.iter() {
+            b.store(false, Ordering::Release);
+        }
+        let n = self.n_shards;
+        for i in 0..n {
+            unlink_shard_pack_mark(&sorted_main_shard_path(&self.store_dir, i, n));
+        }
         Ok(())
     }
 
@@ -1090,6 +1196,10 @@ impl ScriptHashTable {
             let _ = std::fs::remove_file(&p);
             let _ = std::fs::remove_file(scripthash_mphf::mphf_path(&p));
             let _ = std::fs::remove_file(scripthash_mphf::val_path(&p));
+            unlink_shard_pack_mark(&p);
+            if let Some(b) = self.pack_marked.get(i) {
+                b.store(false, Ordering::Release);
+            }
             let mut idx = p.clone().into_os_string();
             idx.push(".idx");
             let _ = std::fs::remove_file(idx);
@@ -1148,8 +1258,16 @@ impl ScriptHashTable {
         store_include_hwm(self.store_dir(), max_create_fk)
     }
 
-    /// True if durable head has any occupancy or live creates (protect from wipe).
+    /// True when every main shard's pack mark is durable.
+    ///
+    /// Pass-1 BDZ, ingest creates, and overflow are not a pack-complete head.
+    /// Schema refuse uses [`Self::has_index_occupancy`].
     pub fn has_durable_index(&self) -> bool {
+        !self.pack_marked.is_empty() && self.pack_marked.iter().all(|b| b.load(Ordering::Acquire))
+    }
+
+    /// Live creates, a loaded head, ingest, or sealed overflow. Not pack-complete.
+    pub fn has_index_occupancy(&self) -> bool {
         if self.entry_count() > 0 || !self.head_is_empty() {
             return true;
         }
@@ -2624,6 +2742,8 @@ impl ScriptHashTable {
         };
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
+        self.note_shard_packed(shard)?;
+        self.drop_ingest_covered_by_packed_main(shard)?;
         Ok(())
     }
 
@@ -2660,7 +2780,52 @@ impl ScriptHashTable {
         };
         write_alloc_header(body, &state)?;
         *self.shard_alloc(shard).lock().unwrap() = state;
+        self.note_shard_packed(shard)?;
+        self.drop_ingest_covered_by_packed_main(shard)?;
         Ok(bump)
+    }
+
+    /// A tip append while this shard is unsealed lands on ingest (main MPHF is
+    /// not loaded). Lookup reads ingest first, so that row would hide the
+    /// packed chain. Clear ingest keys this shard's main now owns. Ingest body
+    /// bytes stay; only the head slot is soft-cleared.
+    fn drop_ingest_covered_by_packed_main(&self, shard: usize) -> Result<(), StoreError> {
+        let Some(slot) = self.sorted_main.get(shard) else {
+            return Ok(());
+        };
+        let main = slot.read().unwrap();
+        let Some(head) = main.as_ref() else {
+            return Ok(());
+        };
+        let mut covered = Vec::new();
+        self.ingest.lock().unwrap().for_each_occupied(|key, _val| {
+            if self.shard_index(&key) != shard {
+                return Ok(());
+            }
+            let hk = head_key_from_full(&key);
+            if head.get(&hk)?.is_some() {
+                covered.push(key);
+            }
+            Ok(())
+        })?;
+        drop(main);
+        if covered.is_empty() {
+            return Ok(());
+        }
+        let ingest = self.ingest.lock().unwrap();
+        for key in &covered {
+            ingest.clear_key(key)?;
+        }
+        Ok(())
+    }
+
+    fn note_shard_packed(&self, shard: usize) -> Result<(), StoreError> {
+        let path = sorted_main_shard_path(&self.store_dir, shard, self.n_shards);
+        write_shard_pack_mark(&path)?;
+        if let Some(b) = self.pack_marked.get(shard) {
+            b.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 }
 

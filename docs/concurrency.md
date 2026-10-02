@@ -61,7 +61,7 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 | Mode | When | Spentness | Durable `tx.head` / spends | SH |
 |------|------|-----------|----------------------------|-----|
 | **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | commit-stage head insert; spend annotate in same stage | Class A collect → unsorted shards → seal at tip |
-| **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after tip commit (may lag live tip by 1+ blocks) |
+| **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends | write-behind after a pack-complete head (every `scripthash.head/NN.packed`; may lag live tip by 1+ blocks) |
 
 Do not enter Tip until IBD catch-up complete: no best-chain remainder
 (ordered / `height_to_hash` above tip / BQ ready ahead / awaiting reorg /

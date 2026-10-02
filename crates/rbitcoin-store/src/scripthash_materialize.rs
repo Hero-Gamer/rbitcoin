@@ -2015,7 +2015,9 @@ pub fn materialize_sh_unsorted_from_class_a(
         });
     }
 
-    if table.head_is_empty() {
+    // Pass-1 sets `live_count` and leaves MPHF on disk without loading it, so
+    // `head_is_empty` is true. Reinit would drop write-behind body rows.
+    if table.head_is_empty() && table.entry_count() == 0 {
         table.reinit_empty_for_cold_materialize()?;
     }
 

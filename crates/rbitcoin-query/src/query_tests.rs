@@ -624,13 +624,17 @@ fn sh_writebehind_recover_requeues_unapplied_heights() {
     );
     let hash0 = h0.hash;
     q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    q.finalize_sh_runs().unwrap();
+    assert!(
+        q.store().scripthash.has_durable_index(),
+        "write-behind recover requires a pack-complete head"
+    );
     let prev_fk = q.tip_header_fk().unwrap().unwrap();
     let (mut h1, t1) = coinbase_block(1, prev_fk, Some(hash0));
     h1.merkle_root = t1.tx.txid;
     rehash_header(&mut h1, &hash0);
     q.commit_class_a_only(&h1, &[t1]).unwrap();
     q.confirm_block(Height(1), &h1.hash).unwrap();
-    assert_eq!(q.sh_indexed_through_height(), Some(0));
     q.store().flush_class_c_tip().unwrap();
     drop(q);
     let q = Query::open_or_create_tiny(dir.path()).unwrap();

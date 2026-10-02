@@ -940,7 +940,8 @@ fn open_durable_alloc_v1_refused() {
     {
         let t = ScriptHashTable::create_tiny(&dir).unwrap();
         put_create(&t, rec(script_hash(&[0x99]), 7, 0));
-        assert!(t.has_durable_index());
+        assert!(t.has_index_occupancy());
+        assert!(!t.has_durable_index());
         t.flush().unwrap();
     }
     let body_path = dir.join("scripthash.body").join("00");
@@ -2762,6 +2763,227 @@ fn unsorted_cancel_before_collect_is_cancelled() {
         assert!(!udir.join("DONE.keys").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn pass1_mphf_is_not_a_durable_head_on_reopen() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let script = vec![0x51];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], script.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], script.clone())], true)
+        .unwrap();
+    let n_shards = s.scripthash.head_shard_count();
+    let udir = crate::unsorted_shard_dir(s.path());
+    crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+    assert!(udir.join("DONE.keys").is_file());
+    assert!(!udir.join("DONE.post").is_file());
+    drop(s);
+    let s = crate::Store::open_tiny(&dir).unwrap();
+    assert!(
+        !s.scripthash.has_durable_index(),
+        "pass-1 mphf is not a durable head"
+    );
+    assert!(
+        !s.scripthash.unsealed_main_shards().is_empty(),
+        "pass-1 mphf must stay unsealed until pack"
+    );
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let sh = script_hash(&script);
+    let mut fks: Vec<u64> = s
+        .scripthash
+        .entries(&sh)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    fks.sort_unstable();
+    assert_eq!(fks, vec![1, 2]);
+    assert!(s.scripthash.has_durable_index());
+    let base = sorted_main_shard_path(s.path(), 0, s.scripthash.head_shard_count());
+    assert!(shard_pack_mark_path(&base).is_file());
+    let again = crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    assert_eq!(again.keys, 0, "packed head must not collect again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pass1_lying_include_hwm_still_resumes_pass2() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let script = vec![0x51];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], script.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], script.clone())], true)
+        .unwrap();
+    let n_shards = s.scripthash.head_shard_count();
+    let udir = crate::unsorted_shard_dir(s.path());
+    crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+    store_include_hwm(s.path(), 99).unwrap();
+    drop(s);
+    let s = crate::Store::open_tiny(&dir).unwrap();
+    assert!(!s.scripthash.has_durable_index());
+    assert_eq!(s.scripthash.include_hwm(), 99);
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let mut fks: Vec<u64> = s
+        .scripthash
+        .entries(&script_hash(&script))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    fks.sort_unstable();
+    assert_eq!(fks, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pass1_ingest_append_does_not_hide_packed_history() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let script = vec![0x51];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], script.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], script.clone())], true)
+        .unwrap();
+    let n_shards = s.scripthash.head_shard_count();
+    let udir = crate::unsorted_shard_dir(s.path());
+    crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+    let rec = ScriptHashRecord::from_fk(script_hash(&script), Fk(2));
+    let mut heads = std::collections::HashMap::new();
+    s.scripthash
+        .put_create_batch_append(&[rec], &mut heads)
+        .unwrap();
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let mut fks: Vec<u64> = s
+        .scripthash
+        .entries(&script_hash(&script))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    fks.sort_unstable();
+    assert_eq!(fks, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_unmarked_head_soft_migrates_without_rescan() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let script = vec![0x51];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], script.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], script.clone())], true)
+        .unwrap();
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    assert!(s.scripthash.has_durable_index());
+    let n_shards = s.scripthash.head_shard_count();
+    let base = sorted_main_shard_path(s.path(), 0, n_shards);
+    std::fs::remove_file(shard_pack_mark_path(&base)).unwrap();
+    let _ = std::fs::remove_file(dir.join(crate::INCLUDE_HWM_NAME));
+    drop(s);
+    let s = crate::Store::open_tiny(&dir).unwrap();
+    assert!(
+        shard_pack_mark_path(&base).is_file(),
+        "complete unmarked head must gain .packed"
+    );
+    assert!(s.scripthash.has_durable_index());
+    assert!(s.scripthash.include_hwm() > 0);
+    let again = crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    assert_eq!(again.keys, 0);
+    let mut fks: Vec<u64> = s
+        .scripthash
+        .entries(&script_hash(&script))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    fks.sort_unstable();
+    assert_eq!(fks, vec![1, 2]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn partial_post_spills_without_done_post_are_recollected() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let multi = vec![0x51];
+    let single = vec![0x52];
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([1u8; 32], multi.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([2u8; 32], multi.clone())], true)
+        .unwrap();
+    s.put_tx_full_batch_indexed(&[class_a_coinbase([3u8; 32], single.clone())], true)
+        .unwrap();
+    let n_shards = s.scripthash.head_shard_count();
+    let udir = crate::unsorted_shard_dir(s.path());
+    crate::collect_unsorted_shard_files(&s, &udir, n_shards, 1, None).unwrap();
+    let spill = udir.join("post").join("00");
+    std::fs::create_dir_all(&spill).unwrap();
+    std::fs::write(spill.join("000000"), b"not-a-finished-post").unwrap();
+    assert!(!udir.join("DONE.post").is_file());
+    crate::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let mut multi_fks: Vec<u64> = s
+        .scripthash
+        .entries(&script_hash(&multi))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.0 .0)
+        .collect();
+    multi_fks.sort_unstable();
+    assert_eq!(multi_fks, vec![1, 2]);
+    assert_eq!(
+        s.scripthash
+            .entries(&script_hash(&single))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.0 .0)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn packed_subset_reopen_packs_the_rest_once() {
+    let dir = tmp();
+    let s = crate::Store::create_tiny(&dir).unwrap();
+    let n_shards = 4usize;
+    let mut keys = Vec::new();
+    for shard in 0..n_shards {
+        let script = script_for_prefix_shard(shard, n_shards);
+        keys.push(script_hash(&script));
+        let mut txid = [0u8; 32];
+        txid[0] = shard as u8;
+        s.put_tx_full_batch_indexed(&[class_a_coinbase(txid, script)], true)
+            .unwrap();
+    }
+    let sh_dir = dir.join("sh4");
+    std::fs::create_dir_all(&sh_dir).unwrap();
+    let table = four_shard_dir_table(&sh_dir);
+    let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+    collect_unsorted_covering_txs(&s.txs, &table, &udir, n_shards, 1, false, None).unwrap();
+    seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+    crate::scripthash_materialize::collect_posts_covering(&s.txs, &table, &udir, 1, false, None)
+        .unwrap();
+    pack_one_extract_shard(&table, &udir, 0).unwrap();
+    pack_one_extract_shard(&table, &udir, 1).unwrap();
+    assert!(shard_pack_mark_path(&sorted_main_shard_path(&sh_dir, 0, n_shards)).is_file());
+    assert!(!shard_pack_mark_path(&sorted_main_shard_path(&sh_dir, 2, n_shards)).is_file());
+    drop(table);
+    let table = ScriptHashTable::open_tiny(&sh_dir).unwrap();
+    assert!(!table.has_durable_index());
+    let unsealed = table.unsealed_main_shards();
+    assert!(!unsealed.contains(&0) && !unsealed.contains(&1));
+    assert!(unsealed.contains(&2) && unsealed.contains(&3));
+    materialize_sh_from_unsorted(&table, &udir, 1, None).unwrap();
+    assert!(table.has_durable_index());
+    for k in &keys {
+        assert_eq!(table.entries(k).unwrap().len(), 1);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

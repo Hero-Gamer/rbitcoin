@@ -785,7 +785,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    let (electrum_handles, electrum_bridge, electrum_onion) = start_electrum_if_ready(
+    let (mut electrum_handles, mut electrum_bridge, electrum_onion) = start_electrum_if_ready(
         sh_tip_ready,
         config.listen.electrum,
         config.sptweaks_dust,
@@ -809,7 +809,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers
             .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
     }
-    let esplora_handles = start_esplora_if_ready(
+    let mut esplora_handles = start_esplora_if_ready(
         sh_tip_ready,
         config.listen.esplora.clone(),
         config.network,
@@ -860,7 +860,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
         }
     }
-    let _i2p_wallet = i2p_wallet;
 
     let mut rpc_handle: Option<RpcHandle> = None;
     if (config.rpc.socket || config.rpc.listen.is_some()) && !shutdown.requested() {
@@ -983,6 +982,106 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 if Instant::now() >= d {
                     break;
                 }
+            }
+
+            // A durable head can lag `include_hwm` at tip entry. Electrum stays
+            // down until write-behind covers the tip, then this same process binds.
+            let electrum_due =
+                config.shindex && config.listen.electrum.is_some() && electrum_handles.is_empty();
+            let esplora_due =
+                config.shindex && config.listen.esplora.is_some() && esplora_handles.is_empty();
+            if (electrum_due || esplora_due) && node.hub.query.sh_is_tip_ready() {
+                if electrum_due {
+                    let (handles, bridge, onion) = start_electrum_if_ready(
+                        true,
+                        config.listen.electrum,
+                        config.sptweaks_dust,
+                        config.electrum_max_subs,
+                        &shutdown,
+                        &node.hub,
+                        &params,
+                        &mempool,
+                    )
+                    .await;
+                    if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
+                        let hs = ctl
+                            .add_electrum_onion(config.datadir.path(), h.local_addr)
+                            .await?;
+                        info!(
+                            "electrum onion {}.onion:{}",
+                            hs.service_id,
+                            h.local_addr.port()
+                        );
+                        let _ =
+                            onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
+                        node.peers.set_wallet_onion(
+                            format!("{}.onion", hs.service_id),
+                            h.local_addr.port(),
+                        );
+                    }
+                    if config.listen.i2p_accept_incoming {
+                        if let Some(addr) = config.listen.i2p_sam {
+                            if let Some(h) = handles.first() {
+                                i2p_wallet.push(
+                                    start_i2p_named_forward(
+                                        addr,
+                                        config.datadir.path(),
+                                        "electrum",
+                                        h.local_addr.port(),
+                                    )
+                                    .await?,
+                                );
+                            }
+                        }
+                    }
+                    electrum_bridge = bridge;
+                    electrum_handles = handles;
+                }
+                if esplora_due {
+                    let handles = start_esplora_if_ready(
+                        true,
+                        config.listen.esplora.clone(),
+                        config.network,
+                        config.esplora_block_template,
+                        &shutdown,
+                        Arc::clone(&node.hub),
+                        &mempool,
+                    )
+                    .await;
+                    if config.esplora_onion {
+                        if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
+                            let hs = ctl
+                                .add_esplora_onion(config.datadir.path(), h.local_addr)
+                                .await?;
+                            info!(
+                                "esplora onion http://{}.onion:{} (/ws same port)",
+                                hs.service_id,
+                                h.local_addr.port()
+                            );
+                            node.peers.set_wallet_onion(
+                                format!("{}.onion", hs.service_id),
+                                h.local_addr.port(),
+                            );
+                        }
+                    }
+                    if config.listen.i2p_accept_incoming {
+                        if let Some(addr) = config.listen.i2p_sam {
+                            if let Some(h) = handles.first() {
+                                i2p_wallet.push(
+                                    start_i2p_named_forward(
+                                        addr,
+                                        config.datadir.path(),
+                                        "esplora",
+                                        h.local_addr.port(),
+                                    )
+                                    .await?,
+                                );
+                            }
+                        }
+                    }
+                    esplora_handles = handles;
+                }
+                info!("node: scripthash inclusion reached the tip — wallet services bound");
             }
 
             // Prefer shutdown, then the 5s perf tick when both ready. Do **not**
@@ -1753,6 +1852,33 @@ pub(crate) struct TipModeGates {
     pub sh_tip_ready: bool,
 }
 
+fn sh_cancel_resume_note(query: &Query) -> &'static str {
+    let root = query.store().path();
+    if root.join("scripthash.cold_progress").is_file() {
+        "partial cold shards kept (scripthash.cold_progress) — \
+         restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
+    } else if root.join("scripthash.unsorted").is_dir() {
+        "partial scripthash extract kept (scripthash.unsorted) — \
+         restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
+    } else {
+        "cancelled before a durable scripthash extract — \
+         restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
+    }
+}
+
+fn sh_tip_ready_gates(query: &Query) -> TipModeGates {
+    let ready = query.sh_is_tip_ready();
+    if ready {
+        info!("node: tip-mode complete — safe to start Electrum");
+    } else {
+        info!("node: scripthash head is not tip-ready; Electrum stays down");
+    }
+    TipModeGates {
+        tip_follow_ready: true,
+        sh_tip_ready: ready,
+    }
+}
+
 /// Enter steady-state after true catch-up.
 ///
 /// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
@@ -1760,8 +1886,9 @@ pub(crate) struct TipModeGates {
 /// Incomplete IBD must not call this (`CatchUp::Complete` only after full horizon).
 ///
 /// **SH methods (exactly two):**
-/// - Durable head: stay/flip [`IndexMode::Tip`], discard leftover runs, Electrum
-///   on (`sh_tip_ready`); catch-up / follow use write-behind.
+/// - Durable head: stay/flip [`IndexMode::Tip`], discard leftover runs;
+///   catch-up / follow use write-behind. `sh_tip_ready` only when inclusion
+///   already covers the tip.
 /// - No head: Class A collect + unsorted pack **while Direct** (write-behind
 ///   no-ops), then Tip. Cancel leaves Direct; Electrum stays closed.
 ///
@@ -1803,11 +1930,7 @@ pub(crate) fn enter_tip_mode(
             "node: scripthash write-behind — skip collect; rows={}",
             query.scripthash_entry_count()
         );
-        info!("node: tip-mode complete — safe to start Electrum");
-        return TipModeGates {
-            tip_follow_ready: true,
-            sh_tip_ready: true,
-        };
+        return sh_tip_ready_gates(query);
     }
 
     info!("node: index materialize from Class A (Direct collect, then Tip)…");
@@ -1824,10 +1947,7 @@ pub(crate) fn enter_tip_mode(
         }
         Err(StoreError::Cancelled(msg)) => {
             warn!("node: index materialize cancelled ({msg})");
-            warn!(
-                "node: partial cold shards kept (scripthash.cold_progress) — \
-                 restart to resume; Electrum not ready yet (stay Direct; tip follow on)"
-            );
+            warn!("node: {}", sh_cancel_resume_note(query));
             false
         }
         Err(e) => {
@@ -1869,11 +1989,7 @@ pub(crate) fn enter_tip_mode(
         "node: scripthash rows={} (thin creates from Class A collect; spentness = confirmed-strong annotations)",
         query.scripthash_entry_count()
     );
-    info!("node: tip-mode complete — safe to start Electrum");
-    TipModeGates {
-        tip_follow_ready: true,
-        sh_tip_ready: true,
-    }
+    sh_tip_ready_gates(query)
 }
 
 /// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).
@@ -2617,5 +2733,73 @@ mod tests {
         sd.request();
         sd.request();
         j.await.unwrap();
+    }
+
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-{label}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A pack-marked head whose inclusion floor is behind the tip must not open
+    /// Electrum. Tip follow still starts so write-behind can catch up.
+    #[test]
+    fn enter_tip_mode_does_not_ready_electrum_when_inclusion_lags() {
+        let dir = scratch_dir("tip-gate");
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let bump = q.store().scripthash.alloc_bump();
+        q.store()
+            .scripthash
+            .publish_sorted_shard(0, &[], 0, bump)
+            .unwrap();
+        assert!(q.store().scripthash.has_durable_index());
+        assert!(q.sh_use_writebehind());
+        assert!(
+            !q.sh_is_tip_ready(),
+            "empty tip is not an inclusion-complete scripthash head"
+        );
+        let gates = enter_tip_mode(&q, None, true);
+        assert!(gates.tip_follow_ready);
+        assert!(
+            !gates.sh_tip_ready,
+            "lagging inclusion must not start Electrum"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancel before any extract file exists must not tell the operator to
+    /// resume from `scripthash.cold_progress`.
+    #[test]
+    fn enter_tip_mode_cancel_does_not_name_missing_cold_progress() {
+        let dir = scratch_dir("tip-cancel");
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        assert!(!q.store().path().join("scripthash.cold_progress").is_file());
+        assert!(!q.store().path().join("scripthash.unsorted").is_dir());
+        let cancel = Arc::new(AtomicBool::new(true));
+        rbitcoin_log::capture_logs(true);
+        let gates = enter_tip_mode(&q, Some(cancel), true);
+        let lines = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        assert!(gates.tip_follow_ready);
+        assert!(!gates.sh_tip_ready);
+        let joined = lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("scripthash.cold_progress"),
+            "cancel warn named a resume file that is not on disk:\n{joined}"
+        );
+        assert!(
+            joined.contains("cancelled before a durable scripthash extract"),
+            "cancel warn should name the phase that actually exists:\n{joined}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

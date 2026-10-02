@@ -122,12 +122,28 @@ pub fn mine_regtest_block(
     prev_hash: BlockHash,
     time: u32,
     height: u32,
+    extra_txs: Vec<Transaction>,
+) -> Block {
+    mine_regtest_block_at(
+        prev_hash,
+        time,
+        height,
+        CompactTarget::from_consensus(0x207f_ffff),
+        extra_txs,
+    )
+}
+
+/// Mine a regtest block at an explicit `nBits` and timestamp.
+pub fn mine_regtest_block_at(
+    prev_hash: BlockHash,
+    time: u32,
+    height: u32,
+    bits: CompactTarget,
     mut extra_txs: Vec<Transaction>,
 ) -> Block {
     let mut txdata = vec![coinbase_tx(height, Amount::from_sat(50_0000_0000))];
     txdata.append(&mut extra_txs);
 
-    let bits = CompactTarget::from_consensus(0x207f_ffff);
     let header = Header {
         version: Version::from_consensus(4),
         prev_blockhash: prev_hash,

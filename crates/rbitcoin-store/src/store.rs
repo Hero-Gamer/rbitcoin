@@ -1832,7 +1832,7 @@ fn open_layout_rewrite_pre15(
     scripthash: &ScriptHashTable,
 ) -> Result<(), StoreError> {
     if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION >= 15 {
-        if scripthash.has_durable_index() {
+        if scripthash.has_index_occupancy() {
             return Err(StoreError::Corrupt(
                 "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
             ));
@@ -2888,7 +2888,8 @@ mod tests {
             let s = Store::create_tiny(&dir).unwrap();
             let sh = [0xcdu8; 32];
             sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            assert!(s.scripthash.has_durable_index());
+            assert!(s.scripthash.has_index_occupancy());
+            assert!(!s.scripthash.has_durable_index());
             s.flush().unwrap();
         }
         write_store_meta_ver(&dir, 14);
@@ -2915,7 +2916,8 @@ mod tests {
             let s = Store::create_tiny(&dir).unwrap();
             let sh = [0xabu8; 32];
             sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            assert!(s.scripthash.has_durable_index());
+            assert!(s.scripthash.has_index_occupancy());
+            assert!(!s.scripthash.has_durable_index());
             s.flush().unwrap();
         }
         write_store_meta_ver(&dir, 13);
