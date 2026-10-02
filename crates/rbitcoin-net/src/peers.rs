@@ -1850,13 +1850,16 @@ impl PeerHub {
     #[cfg(test)]
     pub fn set_mock(&self, ts: u64) {
         self.clock.set_mock(ts as i64);
-        self.request_all_tx_inv();
-        self.on_session_heartbeat();
+        self.on_clock_jump();
     }
 
     pub fn on_clock_jump(&self) {
         self.request_all_tx_inv();
         self.on_session_heartbeat();
+        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
+        for p in g.values() {
+            p.queue_self_announce_if_due();
+        }
     }
 
     /// Ask every live session to flush due tx INVs (`p2p_blocksonly` RPC relay).
@@ -3486,5 +3489,43 @@ mod tests {
         assert_ne!(a, expired);
     }
 
+    #[test]
+    fn self_announce_due_on_peerhub_clock_jump() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::Ordering;
+
+        let hub = PeerHub::new(NodeClock::new());
+        let start = 1_700_000_000u64;
+        hub.set_mock(start);
+        // clearnet only - tests advertise_local_socket(), not onion bypass
+        hub.discover.store(true, Ordering::Relaxed);
+        hub.set_clearnet_listen(true);
+        hub.listen_port.store(8333, Ordering::Relaxed);
+        hub.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(1,2,3,4))]);
+
+        let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+        let peer = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), false, PeerConnType::OutboundFullRelay);
+
+        // Pin the 24h deadline: next send = start + DAY, so not due yet
+        peer.next_local_addr_send.store(start + 86400, Ordering::Relaxed);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *peer.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        while rx.try_recv().is_ok() {}
+
+        // 1s jump would NOT be due - this would fail if test used 0
+        // 25h jump IS due - proves on_clock_jump restores self-announce after mock jump past interval
+        hub.set_mock(start + 25*3600);
+
+        let msg = rx.try_recv().expect("self-announce should be queued after 25h jump past 24h interval");
+        match msg {
+            PeerOut::Msg(NetworkMessage::Addr(_)) | PeerOut::Msg(NetworkMessage::AddrV2(_)) => {},
+            other => panic!("expected Addr/AddrV2, got {other:?}"),
+        }
+    }
+
     include!("overlay_addrman_journey.rs");
+
+
+
 }
