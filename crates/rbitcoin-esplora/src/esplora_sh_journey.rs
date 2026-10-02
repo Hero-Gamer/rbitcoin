@@ -9,6 +9,25 @@ async fn cap_refuses_three_creates(q: &Query, app: &Router) {
         body.contains("scripthash join exceeds --max-sh-creates"),
         "{body}"
     );
+    let (st, utxo) =
+        oneshot_http(app, get_with_client(&format!("/scripthash/{h51}/utxo"), "cap")).await;
+    assert_eq!(st, 503, "unpaged utxo stays capped: {utxo}");
+    let (st, txs) = oneshot_http(app, get_with_client(&format!("/scripthash/{h51}/txs"), "cap")).await;
+    assert_eq!(st, 200, "paged /txs is served above the cap: {txs}");
+    let (st, page) = oneshot_http(
+        app,
+        get_with_client(&format!("/scripthash/{h51}/txs/chain"), "cap"),
+    )
+    .await;
+    assert_eq!(st, 200, "paged chain is served above the cap: {page}");
+    let rows: Value = serde_json::from_str(&page).unwrap();
+    assert!(!rows.as_array().unwrap().is_empty(), "{page}");
+    let (st, sum) = oneshot_http(
+        app,
+        get_with_client(&format!("/scripthash/{h51}/txs/summary"), "cap"),
+    )
+    .await;
+    assert_eq!(st, 200, "paged summary is served above the cap: {sum}");
     q.set_max_sh_creates(0);
 }
 

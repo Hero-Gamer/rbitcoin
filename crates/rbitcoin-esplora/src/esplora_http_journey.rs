@@ -98,6 +98,7 @@ async fn wallet_pages_after_txid(addr: SocketAddr, sh1: &str) {
     assert_eq!(st, 200, "{body}");
     let sum: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(sum[0]["txid"], t1);
+    assert_eq!(sum[0]["tx_position"], 1, "pay sits after the coinbase: {sum:?}");
     assert!(!sum.iter().any(|v| v["txid"] == t3));
 
     let unknown = "ff".repeat(32);
@@ -315,6 +316,19 @@ async fn junk_paths_asof_and_post(addr: SocketAddr, genesis: &[u8; 32]) {
             assert!(resp.contains(needle), "{path}: {resp}");
         }
     }
+
+    let sh = block_hash_hex(&script_hash(&[0x51]));
+    let (st, body) = http_get(
+        addr,
+        &format!("/scripthash/{sh}/txs/summary?asof={h0hex}"),
+    )
+    .await;
+    assert_eq!(st, 200, "summary accepts ?asof=: {body}");
+    let rows: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert!(
+        rows.iter().any(|r| r["tx_position"] == 0),
+        "genesis coinbase is position 0: {body}"
+    );
 }
 
 /// A same-height replace restamps a scripthash read. `/mempool` never pins a view.

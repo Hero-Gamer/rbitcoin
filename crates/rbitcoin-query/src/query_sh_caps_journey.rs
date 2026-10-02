@@ -109,6 +109,35 @@ fn sh_history_caps() {
         "the newest row spends the oldest create"
     );
 
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let page = crate::scripthash::HistoryFilter::esplora_chain_page(None);
+    let mut slot = None;
+    let rows = q
+        .scripthash_history_filtered_slot_in(&sh, &page, &mut slot, &view)
+        .expect("paged history skips the unpaged cap");
+    assert!(!rows.is_empty());
+    assert!(
+        slot.is_none(),
+        "a paged miss must not fill the join the cap refuses"
+    );
+    let sums = q
+        .scripthash_history_summary_filtered_slot_in(&sh, &page, &mut slot, &view)
+        .expect("paged summary skips the unpaged cap");
+    assert!(!sums.is_empty());
+    assert!(slot.is_none());
+    let err = q
+        .scripthash_history_filtered_slot_in(
+            &sh,
+            &crate::scripthash::HistoryFilter::open(),
+            &mut slot,
+            &view,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Rejected(m) if m == Query::MAX_SH_CREATES_MSG),
+        "{err}"
+    );
+
     q.set_max_sh_creates(0);
     assert_eq!(q.scripthash_history(&sh).unwrap().len(), 7);
     q.set_max_sh_creates(7);

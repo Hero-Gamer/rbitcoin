@@ -170,8 +170,8 @@ fn path_uses_sh_view(path: &str) -> bool {
         || path.starts_with("/scripthashes/")
 }
 
-/// COMPAT.md: `?asof=` only on tx status/outspend(s) and address/scripthash
-/// `/`, `/utxo`, `/txs`, `/txs/chain` (not `/txs/mempool`).
+/// COMPAT.md: `?asof=` on tx status/outspend(s) and address/scripthash
+/// `/`, `/utxo`, `/txs`, `/txs/chain`, `/txs/summary` (not `/txs/mempool`).
 fn path_accepts_asof(path: &str) -> bool {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     matches!(
@@ -189,6 +189,10 @@ fn path_accepts_asof(path: &str) -> bool {
             | ["scripthash", _, "txs", "chain"]
             | ["address", _, "txs", "chain", _]
             | ["scripthash", _, "txs", "chain", _]
+            | ["address", _, "txs", "summary"]
+            | ["scripthash", _, "txs", "summary"]
+            | ["address", _, "txs", "summary", _]
+            | ["scripthash", _, "txs", "summary", _]
     )
 }
 
@@ -1559,6 +1563,14 @@ mod tests {
             .route("/scripthash/{hash}", get(handlers::scripthash_info))
             .route("/scripthash/{hash}/utxo", get(handlers::scripthash_utxo))
             .route("/scripthash/{hash}/txs", get(handlers::scripthash_txs))
+            .route(
+                "/scripthash/{hash}/txs/chain",
+                get(handlers::scripthash_txs_chain),
+            )
+            .route(
+                "/scripthash/{hash}/txs/summary",
+                get(handlers::scripthash_txs_summary),
+            )
             .route("/address/{addr}/utxo", get(handlers::address_utxo))
             .route("/scripthashes/txs", post(handlers::post_scripthashes_txs))
             .with_state(state)
@@ -1680,6 +1692,9 @@ mod tests {
         assert!(path_accepts_asof("/tx/ab/outspend/0"));
         assert!(path_accepts_asof("/scripthash/ab/utxo"));
         assert!(path_accepts_asof("/address/bcrt1q/txs/chain/cd"));
+        assert!(path_accepts_asof("/address/bcrt1q/txs/summary"));
+        assert!(path_accepts_asof("/scripthash/ab/txs/summary/cd"));
+        assert!(!path_accepts_asof("/address/bcrt1q/txs/mempool"));
         assert!(!path_accepts_asof("/tx/ab"));
         assert!(!path_accepts_asof("/mempool"));
         assert!(!path_accepts_asof("/scripthash/ab/txs/mempool"));
@@ -1904,6 +1919,29 @@ mod tests {
     fn display_txid(txid: bitcoin::Txid) -> String {
         use bitcoin::hashes::Hash;
         rbitcoin_primitives::display_hash_hex(&txid.to_byte_array())
+    }
+
+    /// electrs: a start index at or past the last tx is 404, not an empty page.
+    #[tokio::test]
+    async fn block_txs_past_end_is_not_found() {
+        let (dir, q) = temp_query("txs-range");
+        let (header, ta) = coinbase(0, Fk::NULL, None);
+        let hash = header.hash;
+        q.connect_block(Height(0), &header, &[ta]).unwrap();
+        let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+        let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+        let h = block_hash_hex(&hash);
+        let (st, body) = http_get(handle.local_addr, &format!("/block/{h}/txs/0")).await;
+        assert_eq!(st, 200, "{body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "{body}");
+        let (st, body) = http_get(handle.local_addr, &format!("/block/{h}/txs/25")).await;
+        assert_eq!(st, 404, "{body}");
+        assert!(body.contains("start index out of range"), "{body}");
+        let (st, body) = http_get(handle.local_addr, &format!("/block/{h}/txs/1")).await;
+        assert_eq!(st, 400, "{body}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     include!("esplora_sh_journey.rs");

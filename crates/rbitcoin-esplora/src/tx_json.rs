@@ -308,16 +308,13 @@ fn tx_json_from_wire(
         vin_obj["scriptsig"] = Value::String(ss_f.hex);
         vin_obj["scriptsig_asm"] = Value::String(ss_f.asm);
 
-        let wit: Vec<String> = tin.witness.iter().map(hex_encode).collect();
-        vin_obj["witness"] = json!(wit);
-
-        if let Some(asm) = inner_redeemscript_asm(ss) {
-            vin_obj["inner_redeemscript_asm"] = Value::String(asm);
-        }
-        if let Some(asm) = inner_witnessscript_asm(&wit) {
-            vin_obj["inner_witnessscript_asm"] = Value::String(asm);
+        let wit_raw: Vec<Vec<u8>> = tin.witness.iter().map(|w| w.to_vec()).collect();
+        if !wit_raw.is_empty() {
+            let wit: Vec<String> = wit_raw.iter().map(hex_encode).collect();
+            vin_obj["witness"] = json!(wit);
         }
 
+        let mut spk_for_inner: Option<Vec<u8>> = None;
         if is_coinbase {
             prev_spks.push(Vec::new());
         } else if let Some(prev) = prevout_json(query, stored_inputs, i, tin, network, mempool)? {
@@ -333,11 +330,15 @@ fn tx_json_from_wire(
                 .and_then(|x| x.as_str())
                 .and_then(|h| rbitcoin_primitives::hex_decode(h).ok())
                 .unwrap_or_default();
+            spk_for_inner = Some(spk.clone());
             prev_spks.push(spk);
             vin_obj["prevout"] = prev;
         } else {
             fee_in = None;
             prev_spks.push(Vec::new());
+        }
+        if let Some(spk) = spk_for_inner.as_deref() {
+            attach_inner_scripts(&mut vin_obj, spk, ss, &wit_raw);
         }
 
         vin.push(vin_obj);
@@ -440,33 +441,60 @@ fn block_hash_hex(hash: &[u8; 32]) -> String {
     display_hash_hex(hash)
 }
 
-/// Last push of scriptSig as redeemscript asm (P2SH).
-fn inner_redeemscript_asm(script_sig: &[u8]) -> Option<String> {
-    let last = last_push_data(script_sig)?;
-    if last.is_empty() {
-        return None;
+/// electrs `get_innerscripts`: redeem only for P2SH; witness script only for
+/// P2WSH (or a P2SH redeem that is P2WSH); Taproot leaf is the second-to-last
+/// witness item after a trailing annex (`0x50`). Unknown prevout emits neither.
+fn attach_inner_scripts(vin_obj: &mut Value, spk: &[u8], script_sig: &[u8], witness: &[Vec<u8>]) {
+    let prev = bitcoin::Script::from_bytes(spk);
+    let redeem = if prev.is_p2sh() {
+        last_push_data(script_sig).filter(|b| !b.is_empty() && b.len() <= 10_000)
+    } else {
+        None
+    };
+    if let Some(bytes) = redeem {
+        if let Some(asm) = script_asm(bytes) {
+            vin_obj["inner_redeemscript_asm"] = Value::String(asm);
+        }
     }
-    Some(bitcoin::Script::from_bytes(last).to_asm_string())
+    let nested = redeem
+        .map(bitcoin::Script::from_bytes)
+        .filter(|s| s.is_witness_program());
+    let program = nested.unwrap_or(prev);
+    let leaf = if program.is_p2wsh() {
+        witness.last().map(Vec::as_slice)
+    } else if program.is_p2tr() {
+        tapscript_leaf(witness)
+    } else {
+        None
+    };
+    if let Some(bytes) = leaf {
+        if let Some(asm) = script_asm(bytes) {
+            vin_obj["inner_witnessscript_asm"] = Value::String(asm);
+        }
+    }
 }
 
-fn is_der_sig_prefix(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&0x30)
-}
-
-/// Witness script: last stack item when it looks like a script (P2WSH / nested).
-fn inner_witnessscript_asm(witness_hex: &[String]) -> Option<String> {
-    if witness_hex.len() < 2 {
-        return None;
-    }
-    let last = witness_hex.last()?;
-    let bytes = rbitcoin_primitives::hex_decode(last).ok()?;
+fn script_asm(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() || bytes.len() > 10_000 {
         return None;
     }
-    if is_der_sig_prefix(&bytes) {
+    Some(bitcoin::Script::from_bytes(bytes).to_asm_string())
+}
+
+/// BIP341: a last witness item starting with `0x50` is the annex. The leaf
+/// script is then the item before the control block.
+fn tapscript_leaf(witness: &[Vec<u8>]) -> Option<&[u8]> {
+    let mut n = witness.len();
+    if n == 0 {
         return None;
     }
-    Some(bitcoin::Script::from_bytes(&bytes).to_asm_string())
+    if witness[n - 1].first() == Some(&0x50) {
+        n -= 1;
+    }
+    if n < 2 {
+        return None;
+    }
+    Some(witness[n - 2].as_slice())
 }
 
 fn last_push_data(script: &[u8]) -> Option<&[u8]> {
@@ -545,23 +573,190 @@ mod tests {
     }
 
     #[test]
-    fn redeem_and_witness_script_asm_helpers() {
-        assert!(inner_redeemscript_asm(&[]).is_none());
-        assert!(inner_redeemscript_asm(&[0x00]).is_none()); // empty push
-        let redeem = inner_redeemscript_asm(&[0x01, 0x51]).unwrap();
-        assert!(redeem.contains("OP_1") || redeem.contains("1"));
+    fn vin_inner_scripts_follow_prevout_type() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+            Transaction, TxIn, TxOut, Witness,
+        };
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
-        assert!(inner_witnessscript_asm(&[]).is_none());
-        assert!(inner_witnessscript_asm(&[String::from("51")]).is_none()); // len < 2
-                                                                           // Two items, last is OP_TRUE script — not a DER sig.
-        let asm = inner_witnessscript_asm(&[String::from("00"), String::from("51")]).unwrap();
-        assert!(!asm.is_empty());
-        // DER-looking last item skipped.
-        assert!(inner_witnessscript_asm(&[String::from("00"), String::from("3000")]).is_none());
-        // Empty last stack item.
-        assert!(inner_witnessscript_asm(&[String::from("00"), String::new()]).is_none());
-        // Invalid hex.
-        assert!(inner_witnessscript_asm(&[String::from("00"), String::from("zz")]).is_none());
+        let p2pkh = ScriptBuf::from_bytes(vec![
+            0x76, 0xa9, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x88, 0xac,
+        ]);
+        let p2sh = ScriptBuf::from_bytes(vec![
+            0xa9, 0x14, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x87,
+        ]);
+        let p2wpkh = ScriptBuf::from_bytes({
+            let mut v = vec![0x00, 0x14];
+            v.extend_from_slice(&[0x33; 20]);
+            v
+        });
+        let witness_script = ScriptBuf::from_bytes(vec![0x51]);
+        let p2wsh = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        let p2tr =
+            ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                bitcoin::XOnlyPublicKey::from_slice(&[0x44; 32]).unwrap(),
+            ));
+        let spks = [p2pkh, p2sh, p2wpkh, p2wsh, p2tr];
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("inner-scripts");
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let parent = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: spks.len() as u32,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x01],
+                witness: vec![],
+            }],
+            outputs: spks
+                .iter()
+                .map(|s| OutputRecord::unspent(10_000, s.to_bytes()))
+                .collect(),
+        };
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: [1u8; 32],
+            hash: [1u8; 32],
+            size: 0,
+            weight: 0,
+        };
+        q.connect_block(Height(0), &header, &[parent]).unwrap();
+
+        let prev = bitcoin::Txid::from_byte_array(txid);
+        let mut child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 1,
+                    },
+                    script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 2,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[&[0x30, 0x01][..], &[0x02, 0x55][..]]),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 3,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[&[0x00][..], witness_script.as_bytes()]),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev,
+                        vout: 4,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[
+                        &[0x01][..],
+                        &[0x51][..],
+                        &{
+                            let mut c = vec![0xc0];
+                            c.extend_from_slice(&[0x44; 32]);
+                            c
+                        }[..],
+                    ]),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let v = build_tx_json_from_tx(&q, &child, Network::Regtest, None, None).unwrap();
+        let vin = v["vin"].as_array().unwrap();
+        assert!(vin[0].get("witness").is_none(), "p2pkh {}", vin[0]);
+        assert!(vin[0].get("inner_redeemscript_asm").is_none(), "{}", vin[0]);
+        assert!(
+            vin[0].get("inner_witnessscript_asm").is_none(),
+            "{}",
+            vin[0]
+        );
+        assert!(
+            vin[1]["inner_redeemscript_asm"]
+                .as_str()
+                .unwrap()
+                .contains("OP_1")
+                || vin[1]["inner_redeemscript_asm"]
+                    .as_str()
+                    .unwrap()
+                    .contains('1'),
+            "p2sh {}",
+            vin[1]
+        );
+        assert!(
+            vin[1].get("inner_witnessscript_asm").is_none(),
+            "{}",
+            vin[1]
+        );
+        assert!(vin[2].get("witness").is_some(), "{}", vin[2]);
+        assert!(
+            vin[2].get("inner_witnessscript_asm").is_none(),
+            "p2wpkh {}",
+            vin[2]
+        );
+        let wsh = vin[3]["inner_witnessscript_asm"].as_str().unwrap();
+        assert!(wsh.contains("OP_1") || wsh.contains('1'), "p2wsh {wsh}");
+        let tr = vin[4]["inner_witnessscript_asm"].as_str().unwrap();
+        assert!(tr.contains("OP_1") || tr.contains('1'), "tapscript {tr}");
+        assert!(
+            !tr.contains("OP_UNKNOWN"),
+            "control block must not be the leaf: {tr}"
+        );
+
+        child.input[4].witness = Witness::from_slice(&[&[0x22; 64][..]]);
+        let keypath = build_tx_json_from_tx(&q, &child, Network::Regtest, None, None).unwrap();
+        assert!(
+            keypath["vin"][4].get("inner_witnessscript_asm").is_none(),
+            "key path {}",
+            keypath["vin"][4]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

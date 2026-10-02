@@ -296,6 +296,9 @@ fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
     };
     match st.query.block_tx_fks(h) {
         Ok(fks) => {
+            if (start as usize) >= fks.len() {
+                return (StatusCode::NOT_FOUND, "start index out of range").into_response();
+            }
             let page: Vec<_> = fks.into_iter().skip(start as usize).take(25).collect();
             let mut out = Vec::with_capacity(page.len());
             for fk in page {
@@ -1089,6 +1092,8 @@ fn summaries_json(
     query: &Query,
     items: &[ScriptHashTxSummary],
 ) -> Result<Value, rbitcoin_query::QueryError> {
+    let mut positions: std::collections::HashMap<u32, Vec<rbitcoin_primitives::Fk>> =
+        std::collections::HashMap::new();
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         let time = if it.height >= 0 {
@@ -1099,12 +1104,22 @@ fn summaries_json(
         } else {
             0
         };
-        out.push(json!({
+        let mut row = json!({
             "txid": block_hash_hex(&it.txid),
             "value": it.value,
             "height": it.height,
             "time": time,
-        }));
+        });
+        if it.height >= 0 && !it.tx_fk.is_null() {
+            let h = it.height as u32;
+            if let std::collections::hash_map::Entry::Vacant(e) = positions.entry(h) {
+                e.insert(query.block_tx_fks(Height(h))?);
+            }
+            if let Some(pos) = positions[&h].iter().position(|fk| *fk == it.tx_fk) {
+                row["tx_position"] = json!(pos as u32);
+            }
+        }
+        out.push(row);
     }
     Ok(Value::Array(out))
 }
