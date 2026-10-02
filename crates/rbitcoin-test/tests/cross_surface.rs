@@ -1089,6 +1089,49 @@ async fn electrum_rpc(stream: &mut TcpStream, id: u64, method: &str, params: Val
     serde_json::from_str(&resp_line).unwrap()
 }
 
+/// True when `height` is a snapshot row, a snapshot hash, or a journal record.
+///
+/// Preload rewrites `fee_history` and truncates `fee_history.log` to its
+/// header. A later connect appends one 52-byte record. When the previous run
+/// already journaled a record of that size, the sum of the two files stays
+/// put while the height moves.
+fn fee_history_has_height(dir: &std::path::Path, height: u32) -> bool {
+    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+        let end = at.checked_add(4)?;
+        Some(u32::from_le_bytes(b.get(at..end)?.try_into().ok()?))
+    }
+    let snap = std::fs::read(dir.join("fee_history")).unwrap_or_default();
+    if snap.len() >= 16 && &snap[..4] == b"RBFH" {
+        if let (Some(count), Some(n_hashes)) = (u32_at(&snap, 8), u32_at(&snap, 12)) {
+            let rows = (count as usize).min(snap.len().saturating_sub(16) / 16);
+            let row_bytes = rows * 16;
+            for i in 0..rows {
+                if u32_at(&snap, 16 + i * 16) == Some(height) {
+                    return true;
+                }
+            }
+            let hash_base = 16 + row_bytes;
+            let hashes = (n_hashes as usize).min(snap.len().saturating_sub(hash_base) / 36);
+            for i in 0..hashes {
+                if u32_at(&snap, hash_base + i * 36) == Some(height) {
+                    return true;
+                }
+            }
+        }
+    }
+    let journal = std::fs::read(dir.join("fee_history.log")).unwrap_or_default();
+    if journal.len() >= 16 && &journal[..4] == b"RBFJ" {
+        let mut at = 16;
+        while at + 52 <= journal.len() {
+            if u32_at(&journal, at) == Some(height) {
+                return true;
+            }
+            at += 52;
+        }
+    }
+    false
+}
+
 /// A node that leaves IBD with relay on preloads fee history from the chain
 /// and keeps it in the mempool dir (snapshot plus per-connect journal), and a
 /// restart preloads again on top of that file. With flow cold and too little history for any target,
@@ -1107,13 +1150,6 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     }
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     let mempool_dir = td.path().join("mempool");
-    let file_len = || {
-        ["fee_history", "fee_history.log"]
-            .iter()
-            .map(|f| std::fs::metadata(mempool_dir.join(f)).map_or(0, |m| m.len()))
-            .sum::<u64>()
-    };
-    let mut history_len = 0;
     for run in ["first start", "restart"] {
         let rpc_addr = ephemeral_addr();
         let mut cfg = NodeConfig::default()
@@ -1129,22 +1165,24 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
         wait_listeners(&[rpc_addr]).await;
 
         // A fresh tip leaves IBD and turns relay on (a restart is already
-        // out of IBD); the new height lands in the snapshot or the journal.
+        // out of IBD). The new height is in the snapshot or the journal.
         let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
         assert!(mined["result"].is_array(), "{run}: {mined}");
+        let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+        let tip = u32::try_from(
+            count["result"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{run}: {count}")),
+        )
+        .unwrap_or_else(|_| panic!("{run}: {count}"));
         let deadline = Instant::now() + Duration::from_secs(10);
-        let written = loop {
-            let len = file_len();
-            if len > history_len || Instant::now() > deadline {
-                break len;
+        let seen = loop {
+            if fee_history_has_height(&mempool_dir, tip) || Instant::now() > deadline {
+                break fee_history_has_height(&mempool_dir, tip);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert!(
-            written > history_len,
-            "{run}: history file {written} B, was {history_len} B"
-        );
-        history_len = written;
+        assert!(seen, "{run}: fee history missing height {tip}");
 
         let fee = jsonrpc(rpc_addr, "estimatesmartfee", json!([2])).await;
         assert!(fee["result"].get("feerate").is_none(), "{run}: {fee}");
