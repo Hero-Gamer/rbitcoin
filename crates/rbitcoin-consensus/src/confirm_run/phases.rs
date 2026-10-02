@@ -235,7 +235,6 @@ pub(super) fn assemble_run(
 pub(super) struct StructuralReuse {
     pub scratch: crate::block::StructuralScratch,
     pub pending: rbitcoin_query::OutPointSet,
-    pub heights: FkMap<u32>,
 }
 
 /// Durable spentness + maturity + subsidy after scripts (height order).
@@ -256,11 +255,12 @@ pub(super) fn structural_run(
         )));
     }
     let t0 = Instant::now();
-    // Reused across write batches on this thread. Slots, the pack-local
-    // double-spend set, and create heights are this batch only.
+    // Slots and the pack-local double-spend set are this batch only.
     reuse.scratch.begin_batch();
     reuse.pending.clear();
-    reuse.heights.clear();
+    let index = crate::block::RunCreateHeight::from_blocks(
+        prepared.iter().map(|p| (p.height.0, p.tx_fks.as_slice())),
+    );
     let mut mtp_cache: U32Map<u32> = U32Map::default();
     for p in prepared {
         if p.height.0 > 0 {
@@ -268,11 +268,6 @@ pub(super) fn structural_run(
         }
     }
     let mut tot = StructuralPhaseNs::default();
-    for p in prepared {
-        for fk in &p.tx_fks {
-            reuse.heights.insert(*fk, p.height.0);
-        }
-    }
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
         let ph = structural_validate_spends(
@@ -285,7 +280,7 @@ pub(super) fn structural_run(
             &mut reuse.pending,
             batch_parents,
             &mut mtp_cache,
-            &reuse.heights,
+            &index,
             &mut reuse.scratch,
             Some(&abs_jobs[i]),
         )?;

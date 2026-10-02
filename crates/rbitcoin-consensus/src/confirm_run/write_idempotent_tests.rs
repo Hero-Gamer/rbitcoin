@@ -1326,7 +1326,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
 /// Overlay slot already in Class A: structural must not meta-pread it.
 #[test]
 fn structural_same_batch_overlay_skips_meta_pread() {
-    use crate::block::structural_validate_spends;
+    use crate::block::{structural_validate_spends, RunCreateHeight};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -1434,9 +1434,10 @@ fn structural_same_batch_overlay_skips_meta_pread() {
     bp.set_spent_range_only(fks[0], loc[0].spent);
 
     let spends = vec![([0x32u8; 32], 0u32, fks[1], fks[0], 0)];
-    let mut run = FkMap::default();
-    run.insert(fks[0], 1);
-    run.insert(fks[1], 1);
+    let mut map = FkMap::default();
+    map.insert(fks[0], 1);
+    map.insert(fks[1], 1);
+    let run = RunCreateHeight::Map(map);
     let params = ChainParams::regtest();
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
@@ -1493,7 +1494,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
 
 #[test]
 fn structural_scratch_second_block_does_not_replay_first_slots() {
-    use crate::block::{structural_validate_spends, StructuralScratch};
+    use crate::block::{structural_validate_spends, RunCreateHeight, StructuralScratch};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -1506,7 +1507,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
         Witness,
     };
     use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_query::{BatchParents, FkMap, OutPointSet};
+    use rbitcoin_query::{BatchParents, OutPointSet};
     use rbitcoin_store::{InputRecord, OutputRecord};
 
     let (path, q) = tiny_query();
@@ -1592,7 +1593,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
     mtp.insert(0, 1_300_000_000);
     let mut scratch = StructuralScratch::default();
-    let run = FkMap::default();
+    let run = RunCreateHeight::Spans(Vec::new());
     for vout in [0u32, 1] {
         let spends = vec![([0x41u8; 32], vout, Fk(9), fks[0], 0)];
         structural_validate_spends(
@@ -3019,7 +3020,7 @@ fn wire_lookup_empty_and_noncontiguous() {
 /// Pin-covered parent without denserels/abs fails structural (no body-range cold).
 #[test]
 fn structural_pinned_without_abs_is_invariant_error() {
-    use crate::block::structural_validate_spends;
+    use crate::block::{structural_validate_spends, RunCreateHeight};
     use crate::milestone::Milestone;
     use crate::params::ChainParams;
     use bitcoin::absolute::LockTime;
@@ -3093,6 +3094,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
     let mut pending = OutPointSet::default();
     let mut mtp = rbitcoin_query::U32Map::<u32>::default();
+    let heights = RunCreateHeight::Spans(Vec::new());
     let err = structural_validate_spends(
         &q,
         &block,
@@ -3103,7 +3105,7 @@ fn structural_pinned_without_abs_is_invariant_error() {
         &mut pending,
         &bp,
         &mut mtp,
-        &rbitcoin_query::FkMap::default(),
+        &heights,
         &mut crate::block::StructuralScratch::default(),
         None,
     )
