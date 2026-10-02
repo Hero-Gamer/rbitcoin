@@ -453,12 +453,19 @@ mod tests {
         }
     }
 
-    /// A blocking task cannot be cancelled, so a request that times out must
-    /// leave its permit with the task. Otherwise each timed-out request frees
-    /// a slot for another reader while the first still runs.
+    /// One listener, one gate. A timed-out `/readyz` keeps its permit, so the
+    /// next probe is 503 at once. After that work finishes, `/readyz` and
+    /// `/metrics` answer from the node again.
     #[tokio::test(flavor = "multi_thread")]
-    async fn gated_work_keeps_its_permit_past_a_dropped_request() {
-        let gate = Arc::new(Semaphore::new(1));
+    async fn health_gate_caps() {
+        let health = Health::new(NodeStatus::new(Network::Regtest, false));
+        let addr = serve(router_for(health.clone(), true)).await;
+        let gate = Arc::clone(&health.readyz);
+
+        let held = Arc::clone(&gate)
+            .acquire_many_owned((READYZ_IN_FLIGHT - 1) as u32)
+            .await
+            .unwrap();
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let dropped = tokio::time::timeout(
             Duration::from_millis(100),
@@ -466,51 +473,36 @@ mod tests {
         )
         .await;
         assert!(dropped.is_err(), "the request gave up while the work ran");
-        assert_eq!(gate.available_permits(), 0);
-        let turned_away = tokio::time::timeout(Duration::from_secs(2), gated(&gate, || ()))
-            .await
-            .expect("a full gate answers at once");
-        assert!(turned_away.is_none());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "a timed-out request keeps its permit"
+        );
+        assert_eq!(
+            get_soon(addr, "/readyz").await,
+            "HTTP/1.1 503 Service Unavailable|not ready: busy\n"
+        );
+
+        let scrape_held = Arc::clone(&health.scrape).acquire_owned().await.unwrap();
+        assert_eq!(
+            get_soon(addr, "/metrics").await,
+            "HTTP/1.1 503 Service Unavailable|metrics: a scrape is already running\n"
+        );
 
         release.send(()).unwrap();
+        drop(held);
+        drop(scrape_held);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while gate.available_permits() == 0 {
+            while gate.available_permits() < READYZ_IN_FLIGHT {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("the permit returns when the work ends");
-        let ran = gated(&gate, || 7).await.expect("a free gate runs");
-        assert_eq!(ran.unwrap(), 7);
-    }
-
-    /// With its gate full, `/readyz` or `/metrics` answers 503 at once rather
-    /// than queue; with the gate free, it answers from the node.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_full_gate_answers_503_without_queueing() {
-        let health = Health::new(NodeStatus::new(Network::Regtest, false));
-        let addr = serve(router_for(health.clone(), true)).await;
-
-        let held = Arc::clone(&health.readyz)
-            .acquire_many_owned(READYZ_IN_FLIGHT as u32)
-            .await
-            .unwrap();
-        assert_eq!(
-            get_soon(addr, "/readyz").await,
-            "HTTP/1.1 503 Service Unavailable|not ready: busy\n"
-        );
-        drop(held);
         assert_eq!(
             get_soon(addr, "/readyz").await,
             "HTTP/1.1 503 Service Unavailable|not ready: opening\n"
         );
-
-        let held = Arc::clone(&health.scrape).acquire_owned().await.unwrap();
-        assert_eq!(
-            get_soon(addr, "/metrics").await,
-            "HTTP/1.1 503 Service Unavailable|metrics: a scrape is already running\n"
-        );
-        drop(held);
         let scraped = get_soon(addr, "/metrics").await;
         assert!(
             scraped.starts_with("HTTP/1.1 200 OK|# HELP rbitcoin_build_info"),
