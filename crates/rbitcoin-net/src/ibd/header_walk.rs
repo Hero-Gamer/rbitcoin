@@ -3388,6 +3388,7 @@ mod tests {
     /// room, checkpoint an empty queue, refill onto the chain, and store a full
     /// batch without stirring a walk ask that is still inside its window.
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one walk, many queue arms
     fn a_seeded_header_walk_stores_drains_and_refills() {
         let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-seeded");
         hub.ensure_genesis().unwrap();
@@ -4205,6 +4206,7 @@ mod tests {
     /// so that arc is a second chapter on this hub. One peer alone is a
     /// third: nobody else can take the reservation.
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one hub, many reservation arms
     fn two_peers_reserve_the_header_walk() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-reserve");
         hub.ensure_genesis().unwrap();
@@ -4476,6 +4478,7 @@ mod tests {
     /// period length is not regtest difficulty, and each checkpoint layout
     /// replaces the candidate the previous layout measured.
     #[test]
+    #[allow(clippy::cognitive_complexity)] // one chain story, many context arms
     fn a_heavier_header_chain_keeps_its_context() {
         {
             let (_dir, mut hub) = crate::chain::tiny_regtest_hub_labeled("header-heavier-chain");
