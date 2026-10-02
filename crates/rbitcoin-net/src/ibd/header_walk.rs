@@ -12,7 +12,9 @@
 //! A solicited reply that continues that tip is a checkpoint, and so is any
 //! solicited reply once the walk is ahead of the stored path, at any queue
 //! length. The refill lane asks from the queue tail while the queue is under
-//! [`ORDERED_HEADERS_SOFT_CAP`]. A later reply that continues the walk at that
+//! [`ORDERED_HEADERS_SOFT_CAP`]. When no connected peer's start height is
+//! above that tail, any live peer is asked: the locator is a header this
+//! node already holds. A later reply that continues the walk at that
 //! stored top is written, and the walk advances with it. One competing chain
 //! is kept the same way until it loses or replaces the candidate. Work for a
 //! stored header between
@@ -262,6 +264,9 @@ fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
         note_full_diff_snap(&mut st.header_walk.tip.diff, hub, &h, height);
     }
     st.header_walk.base_diff = st.header_walk.tip.diff;
+    // The confirmed tip is already validated. A restart has no new
+    // checkpoint yet; this base still meets the floor when its work does.
+    publish_work(st, hub);
 }
 
 fn below_floor(hub: &ChainHub, work: &[u8; 32]) -> bool {
@@ -2048,7 +2053,16 @@ fn arm_lane(
             }
         }
     }
-    ensure_reserved(st, above, skip);
+    if id == AskLane::Refill {
+        ensure_reserved(st, above, skip);
+        if st.header_walk.reserved.is_none() {
+            // The walk is already ahead of a header we hold. Connect-time
+            // start height can sit on that header, so no peer looks taller.
+            st.header_walk.reserved = pick_refill_peer(st, skip);
+        }
+    } else {
+        ensure_reserved(st, above, skip);
+    }
     let Some(peer) = st.header_walk.reserved else {
         return Ok(false);
     };
@@ -2068,6 +2082,38 @@ fn peer_can_head(st: &IbdWorkState, id: usize, above: u32) -> bool {
     st.slots.iter().any(|s| {
         s.alive && s.id == id && s.peer_height > above && !st.header_walk.walk_quiet.contains(&id)
     })
+}
+
+/// A live peer for a refill when nobody's connect-time height is above the
+/// stored path. Peers still on the walk come first.
+fn pick_refill_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<usize> {
+    fn rank(st: &IbdWorkState, skip: Option<usize>, quiet_ok: bool) -> Option<usize> {
+        let mut best: Option<(u8, u64, usize)> = None;
+        for slot in &st.slots {
+            if !slot.alive || skip == Some(slot.id) {
+                continue;
+            }
+            if !quiet_ok && st.header_walk.walk_quiet.contains(&slot.id) {
+                continue;
+            }
+            let key = match header_ttfb(slot) {
+                Some(ttfb) => (0u8, ttfb, slot.id),
+                None => (1u8, 0, slot.id),
+            };
+            if best.is_none_or(|cur| key < cur) {
+                best = Some(key);
+            }
+        }
+        if let Some((_, _, id)) = best {
+            return Some(id);
+        }
+        skip.filter(|&id| {
+            st.slots.iter().any(|s| {
+                s.alive && s.id == id && (quiet_ok || !st.header_walk.walk_quiet.contains(&id))
+            })
+        })
+    }
+    rank(st, skip, false).or_else(|| rank(st, skip, true))
 }
 
 /// Lowest time-to-first-byte among peers still on the walk. A peer with no
@@ -3163,6 +3209,105 @@ mod tests {
             !crate::ibd::exit::ibd_caught_up(&st, 3),
             "the announced block is still owed"
         );
+    }
+
+    /// Restart on a validated tip. No new checkpoint has been built, and one
+    /// peer advertises a height no chain has. IBD is caught up once that
+    /// peer fails to extend the stored tip.
+    #[test]
+    fn a_restarted_tip_exits_once_the_false_height_fails() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-restart-tip");
+        hub.ensure_genesis().unwrap();
+        let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(2, op_true, vec![]).unwrap();
+        let tip = hub.tip_height().unwrap();
+        let (mut liar, mut liar_rx) = slot(0);
+        liar.peer_height = 100_000;
+        let (mut honest, _honest_rx) = slot(1);
+        honest.peer_height = tip;
+        let mut st = IbdWorkState::new(vec![liar, honest], hub.tip_hash(), Some(tip));
+        assert_eq!(st.max_peer_height, 100_000);
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        assert!(
+            !crate::ibd::exit::ibd_caught_up(&st, tip),
+            "the advertised height is still a candidate"
+        );
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+        assert!(st.ordered.is_empty());
+        assert!(
+            crate::ibd::exit::ibd_caught_up(&st, tip),
+            "the stored tip is caught up once no peer can extend it"
+        );
+        assert_eq!(st.max_peer_height, 100_000);
+    }
+
+    /// A block found after connect is checkpointed from the announcing peer.
+    /// That peer's `version.start_height` is still the old tip, so nobody
+    /// looks taller than the stored path. The refill lane must ask them.
+    /// Otherwise the walk sits one above the confirmed tip and IBD cannot
+    /// finish.
+    #[test]
+    fn refill_fetches_a_checkpoint_from_a_peer_at_the_stored_tip() {
+        let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("header-walk-refill-at-tip");
+        hub.ensure_genesis().unwrap();
+        let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+        let tip = hub.tip_height().unwrap();
+        let tip_hash = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time + 1;
+        let next = rbitcoin_consensus::mine_regtest_paying(tip_hash, time, 3, op_true, vec![]);
+        let (mut liar, mut liar_rx) = slot(0);
+        liar.peer_height = 100_000;
+        let (mut honest, mut honest_rx) = slot(1);
+        honest.peer_height = tip;
+        let mut st = IbdWorkState::new(vec![liar, honest], Some(tip_hash), Some(tip));
+
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut liar_rx), 1);
+        apply(&mut st, &hub, 0, vec![]);
+        assert!(!wants_lookahead(&st));
+
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlocksInv {
+                peer: 1,
+                hashes: vec![next.block_hash()],
+            },
+            &AtomicU32::new(0),
+            &mut AddrMan::new(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            None,
+        );
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        assert_eq!(drain_getheaders(&mut honest_rx), 1);
+        let before = hub.query.store().header_count();
+        apply(&mut st, &hub, 1, vec![next.header]);
+        assert_eq!(st.header_walk.tip_height(), tip + 1);
+        assert!(
+            !st.ordered_set.contains(&next.block_hash()),
+            "the first continuation of the stored tip is a checkpoint"
+        );
+        assert_eq!(hub.query.store().header_count(), before);
+
+        assert!(
+            send_getheaders(&mut st, &hub).unwrap(),
+            "refill asks a peer whose connect-time height is the stored tip"
+        );
+        match honest_rx.try_recv() {
+            Ok(PeerCmd::GetHeaders { locator }) => {
+                assert_eq!(locator[0], tip_hash, "refill starts at the stored tip");
+            }
+            Ok(_) => panic!("expected getheaders"),
+            Err(_) => panic!("the peer at the stored tip was not asked to refill"),
+        }
+        assert_eq!(drain_getheaders(&mut liar_rx), 0);
+        apply(&mut st, &hub, 1, vec![next.header]);
+        assert!(st.ordered_set.contains(&next.block_hash()));
+        assert!(!crate::ibd::exit::ibd_caught_up(&st, tip));
     }
 
     /// The header peer's connect-time height is the walk tip and the queue
