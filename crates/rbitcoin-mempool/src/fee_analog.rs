@@ -275,49 +275,22 @@ mod tests {
     }
 
     #[test]
-    fn analog_band_includes_its_exact_upper_boundary() {
-        let pairs = std::iter::repeat_n((0.0, 1_000), ANALOG_READY_PAIRS - 1)
-            .chain([(ANALOG_BAND.ln(), 50_000)]);
-        let h = paired_history(1, pairs);
-
-        assert_eq!(h.rate_sat_kvb(1, 1.0), Some(50_000));
-    }
-
-    #[test]
-    fn analog_band_filters_on_absolute_log_distance() {
+    fn analog_selector_keeps_each_boundary_rate() {
         let now = 10_000u64;
         let center = (now as f64).ln();
-        let pairs = std::iter::repeat_n((center, 1_000), ANALOG_MIN_NEIGHBORS + 50)
+        let band = std::iter::repeat_n((center, 1_000), ANALOG_MIN_NEIGHBORS + 50)
             .chain(std::iter::repeat_n((center + 0.1, 50_000), 50))
             .chain(std::iter::repeat_n(
                 (center + 1.0, 90_000),
                 ANALOG_READY_PAIRS - ANALOG_MIN_NEIGHBORS - 100,
             ));
-        let h = paired_history(now, pairs);
-
-        assert_eq!(h.rate_sat_kvb(1, 0.9), Some(50_000));
-    }
-
-    #[test]
-    fn analog_neighbors_use_absolute_log_distance_and_keep_the_requested_quantile() {
-        let now = 10_000u64;
-        let center = (now as f64).ln();
-        let pairs = std::iter::repeat_n((center + 0.3, 50_000), ANALOG_MIN_NEIGHBORS - 1).chain(
+        let quantile = std::iter::repeat_n((center + 0.3, 50_000), ANALOG_MIN_NEIGHBORS - 1).chain(
             std::iter::repeat_n(
                 (center - 0.4, 1_000),
                 ANALOG_READY_PAIRS - ANALOG_MIN_NEIGHBORS + 1,
             ),
         );
-        let h = paired_history(now, pairs);
-
-        assert_eq!(h.rate_sat_kvb(1, 0.99), Some(50_000));
-    }
-
-    #[test]
-    fn nearest_neighbor_cutoff_keeps_the_two_hundredth_window() {
-        let now = 10_000u64;
-        let center = (now as f64).ln();
-        let mut pairs = std::iter::repeat_n((center + 0.3, 1_000), ANALOG_MIN_NEIGHBORS - 1)
+        let mut nearest = std::iter::repeat_n((center + 0.3, 1_000), ANALOG_MIN_NEIGHBORS - 1)
             .chain([(center + 0.31, 50_000), (center + 0.32, 1_000)])
             .chain(std::iter::repeat_n(
                 (center + 0.4, 1_000),
@@ -325,13 +298,42 @@ mod tests {
             ))
             .collect::<Vec<_>>();
         let mut seed = 341usize;
-        for i in (1..pairs.len()).rev() {
+        for i in (1..nearest.len()).rev() {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            pairs.swap(i, seed % (i + 1));
+            nearest.swap(i, seed % (i + 1));
         }
-        let h = paired_history(now, pairs);
+        let upper = std::iter::repeat_n((0.0, 1_000), ANALOG_READY_PAIRS - 1)
+            .chain([(ANALOG_BAND.ln(), 50_000)]);
 
-        assert_eq!(h.rate_sat_kvb(1, 1.0), Some(50_000));
+        let cases = [
+            (
+                "exact upper boundary",
+                paired_history(1, upper),
+                1.0,
+                50_000,
+            ),
+            (
+                "absolute log distance",
+                paired_history(now, band),
+                0.9,
+                50_000,
+            ),
+            (
+                "absolute log distance quantile",
+                paired_history(now, quantile),
+                0.99,
+                50_000,
+            ),
+            (
+                "two hundredth window",
+                paired_history(now, nearest),
+                1.0,
+                50_000,
+            ),
+        ];
+        for (name, history, confidence, want) in cases {
+            assert_eq!(history.rate_sat_kvb(1, confidence), Some(want), "{name}");
+        }
     }
 
     #[test]

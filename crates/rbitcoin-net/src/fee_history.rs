@@ -211,23 +211,56 @@ mod tests {
     }
 
     #[test]
-    fn heights_without_a_hurdle_are_not_observations() {
-        let targets = [2];
-        let mut with_empties = FeeHistory::new(u64::MAX, &targets);
+    fn fee_history_gaps_cache_and_reorg_share_one_history() {
+        let targets = [1, 2];
+        let mut history = FeeHistory::new(u64::MAX, &targets);
         let mut hurdles_only = FeeHistory::new(u64::MAX, &targets);
-        let mut next = 0;
+        let mut next = 0u32;
         for height in 0..2_600u32 {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&height.to_le_bytes());
             if height % 10 == 9 {
-                with_empties.insert(height, block(None, 8), None);
-                continue;
+                history.insert(height, block(None, 8), Some(hash));
+            } else {
+                history.insert(height, block(Some(calm(height)), 8), Some(hash));
+                hurdles_only.insert(next, block(Some(calm(height)), 8), None);
+                next += 1;
             }
-            with_empties.insert(height, block(Some(calm(height)), 8), None);
-            hurdles_only.insert(next, block(Some(calm(height)), 8), None);
-            next += 1;
+            if height == 199 {
+                let hashes = history.recent_hashes();
+                assert_eq!(hashes.len(), RECENT_HASHES);
+                assert_eq!(hashes[0].0, 200 - RECENT_HASHES as u32);
+                // A later cut, after the window has slid past this height,
+                // drops every retained hash. The reorg has to land while 149
+                // is still inside the window. The replacement keeps the same
+                // hurdle so the observation sequence does not change.
+                history.insert(150, block(Some(calm(150)), 8), None);
+                assert_eq!(history.recent_hashes().last().map(|h| h.0), Some(149));
+                assert_eq!(history.entries().len(), 151);
+                for replay in 151u32..=199 {
+                    let mut hash = [0u8; 32];
+                    hash[..4].copy_from_slice(&replay.to_le_bytes());
+                    if replay % 10 == 9 {
+                        history.insert(replay, block(None, 8), Some(hash));
+                    } else {
+                        history.insert(replay, block(Some(calm(replay)), 8), Some(hash));
+                    }
+                }
+            }
         }
-        assert_eq!(with_empties.analog.pairs(2), hurdles_only.analog.pairs(2));
-        assert_eq!(with_empties.rates(), hurdles_only.rates());
-        assert!(with_empties.rates()[&2].is_some());
+        assert_eq!(history.analog.pairs(2), hurdles_only.analog.pairs(2));
+        assert_eq!(history.rates(), hurdles_only.rates());
+        assert!(history.rates()[&1].is_some());
+        assert!(history.rates()[&2].is_some());
+        assert!(history.rates.is_some(), "cached");
+        history.insert_if_absent(5, block(Some(1), 8), None);
+        assert!(history.rates.is_some(), "held height changes nothing");
+        history.insert(2_600, block(Some(1_000), 8), None);
+        assert!(history.rates.is_none(), "a connect clears the cache");
+
+        let hashes = history.recent_hashes();
+        assert_eq!(hashes.len(), RECENT_HASHES);
+        assert_eq!(hashes[0].0, 2_600 - RECENT_HASHES as u32);
     }
 
     #[test]
@@ -263,36 +296,5 @@ mod tests {
         for n in targets {
             assert_eq!(history.analog.pairs(n), rebuilt.pairs(n), "N={n}");
         }
-    }
-
-    #[test]
-    fn rates_are_kept_until_the_history_changes() {
-        let mut history = FeeHistory::new(u64::MAX, &[1]);
-        for height in 0..2_100 {
-            history.insert(height, block(Some(calm(height)), 8), None);
-        }
-        let rates = history.rates();
-        assert!(rates[&1].is_some());
-        assert!(history.rates.is_some(), "cached");
-        history.insert_if_absent(5, block(Some(1), 8), None);
-        assert!(history.rates.is_some(), "held height changes nothing");
-        history.insert(2_100, block(Some(1_000), 8), None);
-        assert!(history.rates.is_none(), "a connect clears the cache");
-    }
-
-    #[test]
-    fn only_the_newest_hashes_are_kept_and_a_reorg_drops_those_above() {
-        let mut history = FeeHistory::new(u64::MAX, &[1]);
-        for height in 0..200u32 {
-            let mut hash = [0u8; 32];
-            hash[..4].copy_from_slice(&height.to_le_bytes());
-            history.insert(height, block(Some(1_000), 8), Some(hash));
-        }
-        let hashes = history.recent_hashes();
-        assert_eq!(hashes.len(), RECENT_HASHES);
-        assert_eq!(hashes[0].0, 200 - RECENT_HASHES as u32);
-        history.insert(150, block(Some(1_000), 8), None);
-        assert_eq!(history.recent_hashes().last().map(|h| h.0), Some(149));
-        assert_eq!(history.entries().len(), 151);
     }
 }
