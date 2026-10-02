@@ -267,7 +267,7 @@ itself changed.
     scripthash.body                  # 17 file variant: one shared TableFile
     scripthash.body/NN               # 17 dir variant: one TableFile per main shard
     scripthash.ovf/body              # dir variant: ingest + all sealed ovf
-    scripthash.head/NN.mphf + NN.val # Class B sealed MPHF main (8 B pack8; no fuse)
+    scripthash.head/NN.mphf + NN.val + NN.packed # Class B MPHF main; `.packed` is the pack commit (pass-1 BDZ has no mark)
     scripthash.ovf/ingest                                # global OA ingest (key16+pack8, 2^25)
     scripthash.ovf/NNNNNN[.fuse8][.idx]                  # L0 SHSR pack8
     scripthash.ovf/NNNNNN.mphf|.val|.fuse8               # L1 promoted ovf (at most one)
@@ -798,7 +798,10 @@ the directory variant. A leftover file `scripthash.body` **refuses**.
 
 New `Store::create` writes the dir variant. ColdProgress `SHCOLDP1`:
 `next_shard` is the **lowest unsealed** main shard (holes after it
-stay); sealed `scripthash.head/NN.mphf`+`.val` is the per-shard commit. Overflow
+stay). The per-shard pack commit is `scripthash.head/NN.packed` next to
+`.mphf`+`.val`. Pass-1 BDZ writes the MPHF and is not that mark. A complete
+head with no extract in progress and no marks is soft-migrated on open
+(marks written; missing `include_hwm` set from the create count). Overflow
 compact still merges **heads only** — all ovf keys share
 `scripthash.ovf/body`.
 
