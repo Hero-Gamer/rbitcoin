@@ -1537,6 +1537,36 @@ fn genesis_coinbase_is_not_a_utxo() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core refuses the genesis coinbase in `getrawtransaction`. Its txindex skips
+/// height 0, so REST `/tx` answers 404.
+#[test]
+fn genesis_coinbase_is_not_an_ordinary_tx() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let genesis = bitcoin::blockdata::constants::genesis_block(BtcNetwork::Regtest);
+    let g_txid = genesis.txdata[0].compute_txid().to_string();
+    let g_hash = genesis.block_hash().to_string();
+    for params in [
+        vec![json!(g_txid)],
+        vec![json!(g_txid), json!(1)],
+        vec![json!(g_txid), json!(2), json!(g_hash)],
+    ] {
+        let e = dispatch(&ctx, "getrawtransaction", params.clone()).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY, "{params:?}: {e}");
+        assert_eq!(
+            e["message"],
+            "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+            "{params:?}: {e}"
+        );
+    }
+    for ext in ["json", "hex", "bin"] {
+        let rest = dispatch_rest(&ctx, &format!("/rest/tx/{g_txid}.{ext}"), "", &[]);
+        assert_eq!(rest.status, axum::http::StatusCode::NOT_FOUND, "{ext}");
+        let body = String::from_utf8(rest.body).unwrap();
+        assert_eq!(body.trim_end(), format!("{g_txid} not found"), "{ext}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A Class A row that is no longer on the active chain still resolves
 /// (TipThenAny), so verbose getrawtransaction and REST json must return the
 /// tx object without block fields rather than an error.
@@ -2799,7 +2829,10 @@ fn prune_life_getblock(ctx: &RpcContext) {
     let err2 = dispatch(ctx, "getblock", vec![genesis_hash, json!(2)]).unwrap_err();
     assert_eq!(err2["code"], json!(-8));
     let rerr = dispatch(ctx, "getrawtransaction", vec![v1["tx"][0].clone()]).unwrap_err();
-    assert_eq!(rerr["code"], json!(-8));
+    assert_eq!(
+        rerr["code"], ERR_INVALID_ADDRESS_OR_KEY,
+        "genesis first: {rerr}"
+    );
     let net = dispatch(ctx, "getnetworkinfo", vec![]).unwrap();
     let names: Vec<&str> = net["localservicesnames"]
         .as_array()
@@ -2813,6 +2846,11 @@ fn prune_life_getblock(ctx: &RpcContext) {
     assert_eq!(stats["txs"], 1);
     assert_eq!(stats["outs"], 1);
     assert_eq!(ctx.query.sample_reset_reconstruct_archived(), 0);
+    ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let b1 = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap();
+    let rerr = dispatch(ctx, "getrawtransaction", vec![b1["tx"][0].clone()]).unwrap_err();
+    assert_eq!(rerr["code"], json!(-8), "{rerr}");
 }
 
 #[test]

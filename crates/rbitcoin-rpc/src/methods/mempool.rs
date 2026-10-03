@@ -216,6 +216,13 @@ pub(crate) fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Va
 pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "verbose", "verbosity", "blockhash"])?;
     let hex = params.req_str(0, "txid")?;
+    let want = parse_hash32_display(hex)?;
+    if want == genesis_coinbase_txid(ctx) {
+        return Err(rpc_error(
+            ERR_INVALID_ADDRESS_OR_KEY,
+            "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+        ));
+    }
     let verbose = match params
         .get(1, "verbose")
         .or_else(|| params.get(1, "verbosity"))
@@ -226,7 +233,6 @@ pub(crate) fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<
             .map(|n| n != 0)
             .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "not of expected type number"))?,
     };
-    let want = parse_hash32_display(hex)?;
 
     if let Some(mp) = ctx.mempool.as_ref() {
         let tid = Txid::from_byte_array(want);

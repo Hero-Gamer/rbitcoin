@@ -6,3 +6,7 @@ Fixed
   reports it as missing, and `scantxoutset` leaves it out of `unspents`
   and `total_amount`. Electrum and Esplora are unchanged; Esplora matches
   Blockstream/mempool electrs, which index genesis.
+- **`getrawtransaction` refuses the genesis coinbase txid.** It returns
+  Core's `-5` "The genesis block coinbase is not considered an ordinary
+  transaction and cannot be retrieved". REST `/rest/tx/` answers `404`
+  `<txid> not found` for that txid, as Core does.
