@@ -64,6 +64,7 @@ mod txstat;
 mod uring_session;
 mod var_table;
 
+pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
 pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoredBlockFilter};

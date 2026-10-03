@@ -553,10 +553,12 @@ async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n
     assert_eq!(st, 404, "unknown block txs: {body}");
 
     let next = u32::try_from((n_tx / 25 + 1) * 25).expect("txs start");
-    let (st, body, empty) =
-        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/{next}")).await;
-    assert_eq!(st, 200, "one-past last page: {body}");
-    assert!(empty.is_empty(), "Esplora empty page is [] not 404: {body}");
+    let (st, body) = http_get(esplora_addr, &format!("/block/{tip_hash}/txs/{next}")).await;
+    assert_eq!(st, 404, "one-past last page: {body}");
+    assert!(
+        body.contains("start index out of range"),
+        "one-past last page: {body}"
+    );
 }
 
 /// Extra Esplora HTTP leftover: txids, merkle-proof, coinbase outspend.

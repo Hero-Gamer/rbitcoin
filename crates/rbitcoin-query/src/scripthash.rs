@@ -39,12 +39,15 @@ pub struct ScriptHashHistoryItem {
     pub fee: Option<i64>,
 }
 
-/// Light history row (mempool.space `/txs/summary` shape without `time`).
+/// Light history row (mempool.space `/txs/summary` shape without `time`
+/// or `tx_position`; those are filled when the row is serialized).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptHashTxSummary {
     pub txid: [u8; 32],
     pub value: i64,
     pub height: i64,
+    /// Confirmed Class A fk. `NULL` when the row has no stored body.
+    pub tx_fk: rbitcoin_primitives::Fk,
 }
 
 /// Sort order for [`apply_history_filter`].
@@ -239,6 +242,7 @@ fn summaries_from_joined(
             txid: it.txid,
             value: net.get(&it.tx_fk).copied().unwrap_or(0),
             height: it.height,
+            tx_fk: it.tx_fk,
         })
         .collect()
 }
@@ -637,6 +641,32 @@ impl Query {
         Ok(out)
     }
 
+    /// A height window never wants the whole join. A page limit skips it only
+    /// when the unpaged join would hit `--max-sh-creates`, so an under-cap
+    /// page still fills the last-1 slot.
+    fn page_without_full_slot(
+        &self,
+        scripthash: &[u8; 32],
+        filter: &HistoryFilter,
+        slot: &Option<Arc<ShJoinSlot>>,
+        view: &ChainView,
+    ) -> Result<bool, QueryError> {
+        if slot
+            .as_ref()
+            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view))
+        {
+            return Ok(false);
+        }
+        if filter.to_height.is_some() {
+            return Ok(true);
+        }
+        if filter.limit.is_none() {
+            return Ok(false);
+        }
+        let cap = self.max_sh_creates();
+        Ok(cap > 0 && self.scripthash_create_count(scripthash)? > cap)
+    }
+
     fn sh_join_slot_hit(slot: &ShJoinSlot, scripthash: &[u8; 32], view: &ChainView) -> bool {
         slot.scripthash == *scripthash && slot.tip_hash == view.hash
     }
@@ -1010,10 +1040,7 @@ impl Query {
         slot: &mut Option<Arc<ShJoinSlot>>,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let hit = slot
-            .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
-        if !hit && filter.to_height.is_some() {
+        if self.page_without_full_slot(scripthash, filter, slot, view)? {
             return self.scripthash_history_filtered_in(scripthash, filter, view);
         }
         self.ensure_sh_join_slot_in(scripthash, slot, view)?;
@@ -1049,10 +1076,7 @@ impl Query {
         slot: &mut Option<Arc<ShJoinSlot>>,
         view: &ChainView,
     ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
-        let hit = slot
-            .as_ref()
-            .is_some_and(|s| Self::sh_join_slot_hit(s, scripthash, view));
-        if !hit && filter.to_height.is_some() {
+        if self.page_without_full_slot(scripthash, filter, slot, view)? {
             return self.scripthash_history_summary_filtered_in(scripthash, filter, view);
         }
         self.ensure_sh_join_slot_in(scripthash, slot, view)?;

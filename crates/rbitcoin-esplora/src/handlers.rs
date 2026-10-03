@@ -296,6 +296,9 @@ fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
     };
     match st.query.block_tx_fks(h) {
         Ok(fks) => {
+            if (start as usize) >= fks.len() {
+                return (StatusCode::NOT_FOUND, "start index out of range").into_response();
+            }
             let page: Vec<_> = fks.into_iter().skip(start as usize).take(25).collect();
             let mut out = Vec::with_capacity(page.len());
             for fk in page {
@@ -1089,6 +1092,7 @@ fn summaries_json(
     query: &Query,
     items: &[ScriptHashTxSummary],
 ) -> Result<Value, rbitcoin_query::QueryError> {
+    let mut spans: HashMap<u32, (rbitcoin_primitives::Fk, u32)> = HashMap::new();
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         let time = if it.height >= 0 {
@@ -1099,12 +1103,27 @@ fn summaries_json(
         } else {
             0
         };
-        out.push(json!({
+        let mut row = json!({
             "txid": block_hash_hex(&it.txid),
             "value": it.value,
             "height": it.height,
             "time": time,
-        }));
+        });
+        if it.height >= 0 && !it.tx_fk.is_null() {
+            let h = it.height as u32;
+            let span = match spans.entry(h) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    *e.insert(query.tx_fk_span_at_height(Height(h))?)
+                }
+            };
+            if let Some(pos) =
+                rbitcoin_store::HeaderTxsTable::index_in_span(span.0, span.1, it.tx_fk)
+            {
+                row["tx_position"] = json!(pos);
+            }
+        }
+        out.push(row);
     }
     Ok(Value::Array(out))
 }
