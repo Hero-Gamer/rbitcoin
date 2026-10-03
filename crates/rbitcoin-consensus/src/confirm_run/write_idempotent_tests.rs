@@ -1435,8 +1435,8 @@ fn structural_same_batch_overlay_skips_meta_pread() {
 
     let spends = vec![([0x32u8; 32], 0u32, fks[1], fks[0], 0)];
     let mut map = FkMap::default();
-    map.insert(fks[0], 1);
-    map.insert(fks[1], 1);
+    map.insert(fks[0], (1, false));
+    map.insert(fks[1], (1, false));
     let run = RunCreateHeight::Map(map);
     let params = ChainParams::regtest();
     let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);

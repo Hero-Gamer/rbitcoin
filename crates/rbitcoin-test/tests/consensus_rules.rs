@@ -5,8 +5,8 @@
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash, CompactTarget};
 use rbitcoin_consensus::{
-    accept_and_connect_block, expected_next_bits, genesis_block, median_time_past, validate_header,
-    ChainParams, Checkpoint, ConsensusError, Milestone,
+    accept_and_connect_block, confirm_wire_run, expected_next_bits, genesis_block,
+    median_time_past, validate_header, ChainParams, Checkpoint, ConsensusError, Milestone,
 };
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -214,6 +214,54 @@ fn h7_rejects_header_hash_above_target() {
         matches!(err, ConsensusError::InvalidPow),
         "expected InvalidPow, got {err:?}"
     );
+}
+
+/// Blocks `1..=spend_h` on regtest genesis; block `spend_h` spends block 1's coinbase.
+fn run_spending_first_coinbase_at(spend_h: u32) -> Vec<(Height, bitcoin::Block)> {
+    let g = regtest_genesis();
+    let mut prev = g.block_hash();
+    let mut time = g.header.time;
+    let mut cb_txid = None;
+    let mut run = Vec::with_capacity(spend_h as usize);
+    for h in 1..=spend_h {
+        time += 600;
+        let txs = match cb_txid {
+            Some(txid) if h == spend_h => {
+                vec![spend_anyone_can_spend(
+                    txid,
+                    0,
+                    Amount::from_sat(49_0000_0000),
+                )]
+            }
+            _ => Vec::new(),
+        };
+        let b = mine_regtest_block(prev, time, h, txs);
+        cb_txid.get_or_insert(b.txdata[0].compute_txid());
+        prev = b.block_hash();
+        run.push((Height(h), b));
+    }
+    run
+}
+
+#[test]
+fn coinbase_maturity_holds_inside_one_confirm_batch() {
+    let maturity = ChainParams::regtest().coinbase_maturity();
+    for (spend_h, mature) in [(maturity, false), (maturity + 1, true)] {
+        let (_td, q, params) = regtest_q();
+        connect_genesis(&q, &params);
+        let run = run_spending_first_coinbase_at(spend_h);
+        let res = confirm_wire_run(&q, &params, Milestone::NONE, &run);
+        if mature {
+            res.expect("coinbase spent at created+100 in the same batch");
+            assert_eq!(q.tip_height(), Some(Height(spend_h)));
+        } else {
+            assert!(
+                matches!(res, Err(ConsensusError::BadTx(s)) if s.contains("immature")),
+                "coinbase spent at created+99 in the same batch: {res:?}"
+            );
+            assert_eq!(q.tip_height(), Some(Height::GENESIS));
+        }
+    }
 }
 
 #[allow(clippy::cognitive_complexity)] // one fixture, many boundary arms
