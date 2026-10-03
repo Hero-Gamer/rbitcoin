@@ -65,20 +65,16 @@ fn build_signet_txs(
     let cidx = witness_commitment_index(&modified_cb)
         .ok_or(ConsensusError::BadBlock("signet: no witness commitment"))?;
 
-    let commitment_spk = modified_cb.output[cidx].script_pubkey.as_bytes().to_vec();
-    // Core: no SIGNET_HEADER section is allowed only for trivial OP_TRUE challenges.
-    let (solution, stripped) = match fetch_and_clear_signet_section(&commitment_spk) {
-        Some(x) => x,
-        None if challenge.as_bytes() == [0x51] => (Vec::new(), commitment_spk.clone()),
-        None => return Err(ConsensusError::BadBlock("signet: no solution section")),
-    };
-    modified_cb.output[cidx].script_pubkey = ScriptBuf::from_bytes(stripped);
-
-    let (script_sig, witness) = if solution.is_empty() {
-        (ScriptBuf::new(), Witness::new())
-    } else {
-        parse_signet_solution(&solution)?
-    };
+    // Core: a missing SIGNET_HEADER section leaves the commitment as is and spends the
+    // challenge with an empty scriptSig and witness; the challenge script decides.
+    let (script_sig, witness) =
+        match fetch_and_clear_signet_section(modified_cb.output[cidx].script_pubkey.as_bytes()) {
+            Some((solution, stripped)) => {
+                modified_cb.output[cidx].script_pubkey = ScriptBuf::from_bytes(stripped);
+                parse_signet_solution(&solution)?
+            }
+            None => (ScriptBuf::new(), Witness::new()),
+        };
 
     let signet_merkle = modified_merkle_root(&modified_cb, block)?;
 
@@ -492,26 +488,10 @@ mod tests {
     }
 
     #[test]
-    fn op_true_challenge_allows_missing_signet_section() {
-        // Coinbase with bare witness commitment (no SIGNET_HEADER) + OP_TRUE challenge.
-        let cb = Transaction {
-            version: bitcoin::transaction::Version::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::from_bytes({
-                    let mut v = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-                    v.extend([0u8; 32]);
-                    v
-                }),
-            }],
-        };
+    fn missing_signet_section_lets_challenge_script_decide() {
+        // Bare BIP141 commitment, no SIGNET_HEADER: Core spends with an empty
+        // scriptSig and witness and lets VerifyScript decide for any challenge.
+        let cb = coinbase_outputs(vec![bip141_commitment_spk(0x00)]);
         let block = Block {
             header: bitcoin::block::Header {
                 version: bitcoin::block::Version::ONE,
@@ -521,16 +501,19 @@ mod tests {
                 bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
-            txdata: vec![cb.clone()],
+            txdata: vec![cb],
         };
-        // No SIGNET_HEADER → error for real challenge.
-        assert!(build_signet_txs(&block, default_signet_challenge().as_script()).is_err());
-        // OP_TRUE challenge allows empty solution.
-        let challenge = ScriptBuf::from_bytes(vec![0x51]);
-        let (to_spend, to_sign) = build_signet_txs(&block, challenge.as_script()).unwrap();
-        assert!(to_sign.input[0].script_sig.is_empty());
-        assert_eq!(to_spend.output[0].script_pubkey.as_bytes(), &[0x51]);
-        let _ = cb;
+        for challenge in [vec![0x51], vec![0x52], vec![0x74, 0x00, 0x87]] {
+            let challenge = ScriptBuf::from_bytes(challenge);
+            let (to_spend, to_sign) = build_signet_txs(&block, challenge.as_script()).unwrap();
+            assert!(to_sign.input[0].script_sig.is_empty());
+            assert!(to_sign.input[0].witness.is_empty());
+            assert_eq!(to_spend.output[0].script_pubkey, challenge);
+            validate_signet_block_solution(&block, challenge.as_script()).unwrap();
+        }
+        let err = validate_signet_block_solution(&block, default_signet_challenge().as_script())
+            .unwrap_err();
+        assert!(err.to_string().contains("signet solution invalid"), "{err}");
     }
 
     #[test]
