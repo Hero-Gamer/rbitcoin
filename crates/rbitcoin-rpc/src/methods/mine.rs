@@ -1124,6 +1124,14 @@ fn cheap_submit_tx_reject(
     mut confirmed_prevout: impl FnMut(bitcoin::OutPoint) -> Option<bitcoin::TxOut>,
 ) -> Option<String> {
     use bitcoin::{OutPoint, TxOut};
+    // Core CheckMerkleRoot runs before every body rule. Core's root of no
+    // transactions is zero.
+    let root = block
+        .compute_merkle_root()
+        .map_or([0u8; 32], |r| r.to_byte_array());
+    if root != block.header.merkle_root.to_byte_array() {
+        return Some("bad-txnmrklroot".into());
+    }
     if block.txdata.is_empty() {
         return Some("bad-blk-length".into());
     }
