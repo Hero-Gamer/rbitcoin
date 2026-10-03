@@ -233,9 +233,7 @@ fn chain_gauges(out: &mut Exposition, chain: &ChainHub, sh_index: bool) {
         "Seconds since the tip block time.",
         age,
     );
-    let difficulty = rec.map_or(0.0, |(_, rec)| {
-        rbitcoin_consensus::difficulty_from_bits(rec.bits)
-    });
+    let difficulty = rec.map_or(0.0, |(_, rec)| rbitcoin_rpc::difficulty_rpc_f64(rec.bits));
     out.gauge(
         "rbitcoin_difficulty",
         "Tip difficulty (getblockchaininfo.difficulty).",

@@ -6,19 +6,35 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
 
+fn mempool_info_limits(ctx: &RpcContext) -> (u32, u64) {
+    ctx.mempool
+        .as_ref()
+        .map(|mp| mp.cluster_limits())
+        .unwrap_or_else(MempoolHub::default_cluster_limits)
+}
+
+fn relay_fee_json() -> Value {
+    sat_btc_json(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as i64)
+}
+
 pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
+    let (limit_count, limit_vsize) = mempool_info_limits(ctx);
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(json!({
             "loaded": true,
             "size": 0,
             "bytes": 0,
             "usage": 0,
-            "total_fee": 0.0,
+            "total_fee": sat_btc_json(0),
             "maxmempool": 0,
-            "mempoolminfee": MempoolHub::relay_fee_btc_per_kb(),
-            "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
-            "incrementalrelayfee": MempoolHub::relay_fee_btc_per_kb(),
+            "mempoolminfee": relay_fee_json(),
+            "minrelaytxfee": relay_fee_json(),
+            "incrementalrelayfee": relay_fee_json(),
             "unbroadcastcount": 0,
+            "fullrbf": true,
+            "maxdatacarriersize": Value::Null,
+            "limitclustercount": limit_count,
+            "limitclustersize": limit_vsize,
             "permitbaremultisig": true,
             "optimal": true,
             "orphanage": { "size": 0, "bytes": 0 },
@@ -31,13 +47,17 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "size": size,
         "bytes": bytes,
         "usage": bytes,
-        "total_fee": (total_fee as f64) / 100_000_000.0,
+        "total_fee": sat_btc_json(total_fee as i64),
         "maxmempool": mp.max_weight(),
         "mempoolminfee": sat_btc_json(mp.mempool_min_fee_sat_kvb() as i64),
-        "minrelaytxfee": MempoolHub::relay_fee_btc_per_kb(),
-        "incrementalrelayfee": MempoolHub::relay_fee_btc_per_kb(),
+        "minrelaytxfee": relay_fee_json(),
+        "incrementalrelayfee": relay_fee_json(),
         "relay_enabled": mp.relay_enabled(),
         "unbroadcastcount": mp.unbroadcast_count(),
+        "fullrbf": true,
+        "maxdatacarriersize": Value::Null,
+        "limitclustercount": limit_count,
+        "limitclustersize": limit_vsize,
         "permitbaremultisig": true,
         "optimal": true,
         "orphanage": {

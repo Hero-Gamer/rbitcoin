@@ -193,6 +193,22 @@ impl Query {
         Ok(g.map.get(hash).copied().map(Height))
     }
 
+    /// Active-chain height of a hash already loaded from the header archive.
+    ///
+    /// Skips the extra header read in [`Self::height_of_hash`]. An ancestry
+    /// walk then costs one `prev_fk` read per step plus this index.
+    pub fn confirmed_height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(None);
+        };
+        self.ensure_height_by_hash_index(tip)?;
+        let g = self
+            .height_by_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(g.map.get(hash).copied().map(Height))
+    }
+
     /// Ensure height index matches `tip`.
     ///
     /// Incremental for any `new_tip ≠ prev_tip`. Full walk only when the map

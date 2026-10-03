@@ -282,6 +282,22 @@ fn getmempoolinfo_permitbaremultisig_is_always_true() {
         mem["permitbaremultisig"], true,
         "Libre has no Core IsStandard bare-multisig gate"
     );
+    assert_eq!(mem["fullrbf"], true);
+    assert!(mem["maxdatacarriersize"].is_null());
+    assert_eq!(mem["limitclustercount"], 64);
+    assert_eq!(mem["limitclustersize"], 101_000);
+    assert_eq!(
+        serde_json::to_string(&mem["mempoolminfee"]).unwrap(),
+        "0.00000100"
+    );
+    assert_eq!(
+        serde_json::to_string(&mem["minrelaytxfee"]).unwrap(),
+        "0.00000100"
+    );
+    assert_eq!(
+        serde_json::to_string(&mem["total_fee"]).unwrap(),
+        "0.00000000"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1318,12 +1334,73 @@ fn getblock_named_verbose_genesis_and_hex() {
     let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
     let named = named(json!({"blockhash": genesis.clone(), "verbose": true}));
     let v = dispatch(&ctx, "getblock", named).unwrap();
-    assert_eq!(v["previousblockhash"], "");
+    assert!(
+        v.get("previousblockhash").is_none(),
+        "genesis omits previousblockhash: {v}"
+    );
     assert_eq!(v["tx"].as_array().unwrap().len(), 1);
-    let hex = dispatch(&ctx, "getblock", vec![genesis, json!(0)]).unwrap();
+    let hex = dispatch(&ctx, "getblock", vec![genesis.clone(), json!(0)]).unwrap();
     assert!(hex.as_str().unwrap().len() > 160);
+    let genesis_hdr = dispatch(&ctx, "getblockheader", vec![genesis.clone()]).unwrap();
+    assert!(
+        genesis_hdr.get("previousblockhash").is_none(),
+        "{genesis_hdr}"
+    );
+    assert_eq!(genesis_hdr["target"].as_str().unwrap().len(), 64);
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["bits"], genesis_hdr["bits"]);
+    assert_eq!(info["target"], genesis_hdr["target"]);
+    let diff = serde_json::to_string(&dispatch(&ctx, "getdifficulty", vec![]).unwrap()).unwrap();
+    assert!(!diff.contains('e') && !diff.contains('E'), "{diff}");
+    dispatch(
+        &ctx,
+        "generatetoaddress",
+        vec![json!(1), json!(p2wpkh_regtest().0)],
+    )
+    .unwrap();
+    let parent = dispatch(&ctx, "getblockheader", vec![genesis]).unwrap();
+    assert!(parent["nextblockhash"].as_str().is_some(), "{parent}");
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    let tip_hdr = dispatch(&ctx, "getblockheader", vec![tip.clone()]).unwrap();
+    assert!(tip_hdr.get("nextblockhash").is_none(), "{tip_hdr}");
+    let parent_hash = tip_hdr["previousblockhash"].clone();
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    let gone = dispatch(&ctx, "getblockheader", vec![tip.clone()]).unwrap();
+    assert_eq!(gone["confirmations"], json!(-1), "{gone}");
+    assert_eq!(gone["previousblockhash"], parent_hash);
+    let body = dispatch(&ctx, "getblock", vec![tip, json!(1)]).unwrap();
+    assert_eq!(body["confirmations"], json!(-1), "{body}");
+    assert!(!body["tx"].as_array().unwrap().is_empty(), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Core `mediantime` on an inactive header is the median of that header and
+/// up to 10 ancestors, not the header's own timestamp.
+#[test]
+fn inactive_header_mediantime_is_branch_median() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let addr = p2wpkh_regtest().0;
+    let mut hashes = Vec::new();
+    for i in 0..12u32 {
+        let t = 1_700_000_000u64 + u64::from(i) * 1_000;
+        dispatch(&ctx, "setmocktime", vec![json!(t)]).unwrap();
+        let mined = dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        hashes.push(mined.as_array().unwrap()[0].clone());
+    }
+    let old_tip = hashes[11].clone();
+    dispatch(&ctx, "invalidateblock", vec![hashes[9].clone()]).unwrap();
+    let gone = dispatch(&ctx, "getblockheader", vec![old_tip.clone()]).unwrap();
+    assert_eq!(gone["confirmations"], json!(-1), "{gone}");
+    assert_eq!(gone["height"], json!(12), "{gone}");
+    assert_eq!(gone["previousblockhash"], hashes[10], "{gone}");
+    // Heights 2..=12. Sorted median is height 7: 1_700_000_000 + 6*1000.
+    assert_eq!(gone["mediantime"], json!(1_700_006_000u64), "{gone}");
+    let body = dispatch(&ctx, "getblock", vec![old_tip, json!(1)]).unwrap();
+    assert_eq!(body["confirmations"], json!(-1), "{body}");
+    assert_eq!(body["mediantime"], gone["mediantime"], "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn miniwallet_raw_scan_and_gettxout() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
@@ -3809,6 +3886,26 @@ fn decode_rpc_subset() {
     )
     .unwrap();
     assert_eq!(mainnet, json!({"isvalid": false}));
+
+    let p2tr_spk = ScriptBuf::from_bytes(
+        rbitcoin_primitives::hex_decode(
+            "512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap(),
+    );
+    let p2tr = Address::from_script(&p2tr_spk, BtcNetwork::Regtest).expect("p2tr address");
+    let tr = dispatch(&ctx, "validateaddress", vec![json!(p2tr.to_string())]).unwrap();
+    assert_eq!(tr["isscript"], json!(true), "{tr}");
+    assert_eq!(tr["iswitness"], json!(true));
+    assert_eq!(tr["witness_version"], json!(1));
+
+    let p2a_spk = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]);
+    let p2a = Address::from_script(&p2a_spk, BtcNetwork::Regtest).expect("p2a address");
+    let anchor = dispatch(&ctx, "validateaddress", vec![json!(p2a.to_string())]).unwrap();
+    assert_eq!(anchor["isscript"], json!(true), "{anchor}");
+    assert_eq!(anchor["iswitness"], json!(true));
+    assert!(anchor.get("witness_version").is_none(), "{anchor}");
+    assert!(anchor.get("witness_program").is_none(), "{anchor}");
 
     let still_never = dispatch(&ctx, "createrawtransaction", vec![]).unwrap_err();
     assert_eq!(still_never["code"], ERR_METHOD_NOT_FOUND);

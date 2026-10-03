@@ -42,8 +42,8 @@ pub(crate) fn validateaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Va
     let (isscript, iswitness) = match addr.address_type() {
         Some(AddressType::P2pkh) => (false, false),
         Some(AddressType::P2sh) => (true, false),
-        Some(AddressType::P2wpkh | AddressType::P2tr | AddressType::P2a) => (false, true),
-        Some(AddressType::P2wsh) => (true, true),
+        Some(AddressType::P2wpkh) => (false, true),
+        Some(AddressType::P2wsh | AddressType::P2tr | AddressType::P2a) => (true, true),
         Some(_) | None => (false, addr.witness_program().is_some()),
     };
     let mut obj = json!({
@@ -53,13 +53,16 @@ pub(crate) fn validateaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Va
         "isscript": isscript,
         "iswitness": iswitness,
     });
-    if let Some(wp) = addr.witness_program() {
-        if let Some(m) = obj.as_object_mut() {
-            m.insert("witness_version".into(), json!(wp.version().to_num()));
-            m.insert(
-                "witness_program".into(),
-                json!(hex_encode(wp.program().as_bytes())),
-            );
+    // Core omits witness_version / witness_program for pay-to-anchor.
+    if addr.address_type() != Some(AddressType::P2a) {
+        if let Some(wp) = addr.witness_program() {
+            if let Some(m) = obj.as_object_mut() {
+                m.insert("witness_version".into(), json!(wp.version().to_num()));
+                m.insert(
+                    "witness_program".into(),
+                    json!(hex_encode(wp.program().as_bytes())),
+                );
+            }
         }
     }
     Ok(obj)
