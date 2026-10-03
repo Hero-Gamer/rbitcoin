@@ -388,11 +388,26 @@ fn plant_unspent_coinbase(
     rbitcoin_query::Query,
     Transaction,
 ) {
+    let (path, q, first, _fk) = plant_coinbase_with_outputs(label, coinbase(1).output);
+    (path, q, first)
+}
+
+/// Connects a height-1 coinbase paying `outputs` at height 0 of a tiny store.
+fn plant_coinbase_with_outputs(
+    label: &str,
+    outputs: Vec<TxOut>,
+) -> (
+    rbitcoin_store::testutil::TempDir,
+    rbitcoin_query::Query,
+    Transaction,
+    rbitcoin_primitives::Fk,
+) {
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
     let (path, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
     q.enter_direct_index_mode().unwrap();
-    let first = coinbase(1);
+    let mut first = coinbase(1);
+    first.output = outputs;
     let txid = first.compute_txid().to_byte_array();
     let rec = TxRecord {
         txid,
@@ -401,15 +416,24 @@ fn plant_unspent_coinbase(
         input_start_fk: Fk::NULL,
         input_count: 1,
         output_start_fk: Fk::NULL,
-        output_count: 1,
+        output_count: first.output.len() as u32,
     };
+    let outs = first
+        .output
+        .iter()
+        .map(|o| OutputRecord::unspent(o.value.to_sat() as i64, o.script_pubkey.to_bytes()))
+        .collect();
     let fk = q
         .store()
         .put_tx_full_batch_indexed(
             &[(
                 rec,
-                vec![InputRecord::coinbase(u32::MAX, vec![0x00, 0x00], vec![])],
-                vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+                vec![InputRecord::coinbase(
+                    u32::MAX,
+                    first.input[0].script_sig.to_bytes(),
+                    vec![],
+                )],
+                outs,
             )],
             true,
         )
@@ -417,7 +441,7 @@ fn plant_unspent_coinbase(
     q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
     q.store().confirmed.set(Height(0), Fk(1)).unwrap();
     q.store().rebuild_height_fence().unwrap();
-    (path, q, first)
+    (path, q, first, fk)
 }
 
 fn plant_bip34_ancestor(q: &rbitcoin_query::Query, hash: [u8; 32]) {
@@ -1236,14 +1260,16 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
 #[test]
 fn optimistic_assemble_unstamped_parent_is_invariant() {
     use super::assemble_block_prevouts;
-    use crate::accept_and_connect_block;
+    use crate::{accept_and_connect_block, mine_empty_regtest};
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, OutPointSet, SpendEdges};
     let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("assemble-unstamped");
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let parent_txid = genesis.txdata[0].compute_txid();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let parent_txid = b1.txdata[0].compute_txid();
     let spend = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -1264,17 +1290,17 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     let mut block = Block {
         header: Header {
             version: Version::from_consensus(4),
-            prev_blockhash: genesis.block_hash(),
+            prev_blockhash: b1.block_hash(),
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
-            time: genesis.header.time + 600,
+            time: b1.header.time + 600,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         },
-        txdata: vec![coinbase(1), spend],
+        txdata: vec![coinbase(2), spend],
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let p = Box::leak(Box::new(params));
-    let ctx = ValidationContext::at(p, Height(1), Milestone::height(840_000));
+    let ctx = ValidationContext::at(p, Height(2), Milestone::height(840_000));
     let parents = BatchParents::new();
     let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
@@ -1285,7 +1311,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         .map(|t| t.compute_txid().to_byte_array())
         .collect();
     let bh = block.header.block_hash().to_byte_array();
-    let spend_fks = [Fk(1), Fk(2)];
+    let spend_fks = [Fk(3), Fk(4)];
     let err = assemble_block_prevouts(
         &q,
         &block,
@@ -1296,9 +1322,9 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         &parents,
         &thin,
         &create_txids,
-        genesis.header.time,
+        b1.header.time,
         &bh,
-        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, genesis.header.time),
+        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, b1.header.time),
         None,
         None,
     )
@@ -1423,6 +1449,72 @@ fn accept_rejects_connect_spend_rules() {
         matches!(err, ConsensusError::BadTx(s) if s.contains("immature")),
         "4-deep immature: {err:?}"
     );
+}
+
+/// Core never adds the genesis coinbase to the coin view. A spend of it is a
+/// missing prevout at any depth, with or without script checks.
+#[test]
+fn genesis_coinbase_is_never_a_coin() {
+    use crate::{
+        accept_and_connect_block, mine_empty_regtest, pad_empty_from, prepare_regtest_candidate,
+    };
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("genesis-cb-spend");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let op = OutPoint {
+        txid: genesis.txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let spend_genesis = |tip: BlockHash, time: u32, h: u32| {
+        let mut b = mine_empty_regtest(tip, time + 600, h);
+        b.txdata.push(Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        });
+        prepare_regtest_candidate(&mut b, tip, time + 600);
+        b
+    };
+
+    let b1 = spend_genesis(genesis.block_hash(), genesis.header.time, 1);
+    let err = accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE)
+        .expect_err("genesis coinbase spend at height 1");
+    assert!(
+        matches!(err, ConsensusError::MissingPrevout),
+        "height 1: {err:?}"
+    );
+
+    let maturity = params.coinbase_maturity();
+    let (tip, time, _) = pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        maturity,
+        0,
+    );
+    let h = maturity + 1;
+    let block = spend_genesis(tip, time, h);
+    for ms in [Milestone::NONE, Milestone::height(h)] {
+        let err = accept_and_connect_block(&q, &params, Height(h), &block, ms)
+            .expect_err("mature genesis coinbase spend");
+        assert!(
+            matches!(err, ConsensusError::MissingPrevout),
+            "{ms:?}: {err:?}"
+        );
+        assert_eq!(q.tip_height(), Some(Height(maturity)));
+    }
 }
 
 #[test]
@@ -1648,6 +1740,108 @@ fn signet_low_work_fork_runs_scripts(q: &rbitcoin_query::Query) {
     assert!(!crate::milestone::check_scripts(ms, q, 1, &bh));
     q.clear_milestone_path_above(0);
     assert_eq!(run(q).len(), 1, "cleared path checks scripts again");
+}
+
+/// Confirms a height-1 tx that spends `create_fk:0`.
+fn plant_confirmed_spend(
+    q: &rbitcoin_query::Query,
+    create_txid: [u8; 32],
+    create_fk: rbitcoin_primitives::Fk,
+) {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let rec = TxRecord {
+        txid: [0x5e; 32],
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 1,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let input = InputRecord {
+        prev_txid: create_txid,
+        create_fk,
+        prev_index: 0,
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    };
+    let spender = q
+        .store()
+        .put_tx_full_batch_indexed(
+            &[(
+                rec,
+                vec![input],
+                vec![OutputRecord::unspent(1_000, vec![0x51])],
+            )],
+            true,
+        )
+        .unwrap()[0];
+    q.store().header_txs.put_range(Fk(2), spender, 1).unwrap();
+    q.store().confirmed.set(Height(1), Fk(2)).unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    q.store().strong_tx.set_strong(spender, Fk(2)).unwrap();
+    q.store()
+        .put_spend_create(create_fk, 0, spender, 0)
+        .unwrap();
+}
+
+/// Core never adds `IsUnspendable` outputs (leading `OP_RETURN`, or a script
+/// over 10_000 bytes) to the coin view, so they do not block a BIP30
+/// overwrite. A spendable unspent output still does.
+#[test]
+fn bip30_ignores_unspendable_outputs() {
+    use crate::block::{structural_validate_spends, RunCreateHeight};
+    use rbitcoin_query::{BatchParents, OutPointSet, U32Map};
+    let outputs = vec![
+        TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        },
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x42]),
+        },
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 10_001]),
+        },
+    ];
+    let (path, q, first, fk) = plant_coinbase_with_outputs("bip30-unspendable", outputs);
+    let dup = block_with(vec![first.clone()]);
+    let check = |q: &rbitcoin_query::Query| {
+        let mut mtp_cache = U32Map::default();
+        mtp_cache.insert(9, 0);
+        structural_validate_spends(
+            q,
+            &dup,
+            &ctx_h(10),
+            Some(&[rbitcoin_primitives::Fk(3)]),
+            &[],
+            0,
+            &mut OutPointSet::default(),
+            &BatchParents::new(),
+            &mut mtp_cache,
+            &RunCreateHeight::Spans(Vec::new()),
+            &mut crate::block::StructuralScratch::default(),
+            None,
+        )
+        .err()
+        .map(|e| format!("{e}"))
+        .unwrap_or_default()
+    };
+    assert!(
+        check(&q).contains("bad-txns-BIP30"),
+        "a spendable unspent output must still block the overwrite"
+    );
+    plant_confirmed_spend(&q, first.compute_txid().to_byte_array(), fk);
+    let msg = check(&q);
+    assert!(
+        msg.is_empty(),
+        "unspendable outputs are not coins, got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&path);
 }
 
 #[test]

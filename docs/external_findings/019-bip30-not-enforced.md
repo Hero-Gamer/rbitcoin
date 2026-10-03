@@ -11,7 +11,9 @@
 A new block may contain a txid already on the best chain with **unspent**
 outputs. Without BIP30 the new instance overwrites the old in indexes.
 
-Fully-spent earlier instances may be duplicated. Mainnet also **grandfathers**
+Fully-spent earlier instances may be duplicated. Unspendable outputs
+(`OP_RETURN` first byte, or a script over 10,000 bytes) never enter
+Core's coin view, so they do not count as unspent. Mainnet also **grandfathers**
 two overwrites of **unspent** coinbases (Core `IsBIP30Repeat`): **91842**
 (`d5d27987…` from 91812, still immature) and **91880** (`e3bf3d07…` from
 91722). Those UTXOs were overwritten, not spent — do not `bad-txns-BIP30`
@@ -27,3 +29,11 @@ Gate: if `bip34_active_at(height)` skip (hot path). Else if
 `is_bip30_repeat(height, hash)` (91842 / 91880 mainnet hashes) skip. Else
 TipOnly connected sibling + durable spentness. Never treat just-archived self
 as a conflict.
+
+Known gap: the genesis coinbase is not a coin in Core, and assemble
+rejects spends of its txid as a missing prevout. But
+`reject_bip30_unspent_overwrite` still counts the genesis instance's
+outputs as unspent, so a later byte-identical genesis coinbase would be
+`bad-txns-BIP30` here and accepted by Core. This is unreachable: after
+BIP34 its height push matches only height 486,604,799, where the subsidy
+no longer covers its 50 BTC output.
