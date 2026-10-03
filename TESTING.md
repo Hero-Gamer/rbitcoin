@@ -160,6 +160,8 @@ test bytes are RAM.
 
 **CI-class (2026-08-17):** required GitHub Actions `test` job (`ubuntu-24.04`, `cargo test --workspace` + node/cli build) is **~85 s** (PR 85). That meets the ≤3 min budget and the **&lt;2 min** stretch on CI hardware. Do **not** re-run multi-minute full-suite timing loops as a planning spike; package walls below are still the local budget if a change feels slow.
 
+**Agent VM (2026-10-03, warm test profile, tmpfs runner):** `cargo test --workspace` was **199.3 s** on `1d2f8896` and **117.2 s** / **118.5 s** after this cut, rebased onto current master. `end_of_ibd` went from **83.8 s** to **~23 s** (the work-fork journey was two 30 s stall waits, then **~5 s**). `cross_surface` went from **19.3 s** to **~9.5 s**. `integration_multinode` stayed **~32 s**.
+
 | Package / binary (warm, order-of-magnitude) | Budget | Notes |
 |---------------------------------------------|-------:|-------|
 | `rbitcoin-store --lib` | **&lt;45 s** | Catalog-run fixtures stay tens of tiny files, not thousands |
