@@ -246,7 +246,12 @@ fn block(
 }
 
 fn tx(ctx: &RpcContext, fmt: RestFmt, txid: &str) -> Result<RestReply, RestReply> {
-    let _ = parse_hash(txid)?;
+    if parse_hash(txid)? == genesis_coinbase_txid(ctx) {
+        return Err(err(
+            axum::http::StatusCode::NOT_FOUND,
+            &format!("{txid} not found"),
+        ));
+    }
     if fmt == RestFmt::Json {
         let params = RpcParams::positional(vec![json!(txid), json!(true)]);
         return Ok(json_body(map_tx_missing(

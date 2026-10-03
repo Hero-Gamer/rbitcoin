@@ -1501,6 +1501,72 @@ fn gettxout_disconnected_archive_row_is_null() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core never adds the genesis coinbase output to the UTXO set.
+#[test]
+fn genesis_coinbase_is_not_a_utxo() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let genesis = bitcoin::blockdata::constants::genesis_block(BtcNetwork::Regtest);
+    let spk = hex_encode(genesis.txdata[0].output[0].script_pubkey.as_bytes());
+    let desc = format!("raw({spk})");
+    dispatch(&ctx, "generatetodescriptor", vec![json!(1), json!(desc)]).unwrap();
+
+    let g_hash = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    let g_blk = dispatch(&ctx, "getblock", vec![g_hash, json!(2)]).unwrap();
+    let g_txid = g_blk["tx"][0]["txid"].as_str().unwrap().to_string();
+    assert_eq!(g_txid, genesis.txdata[0].compute_txid().to_string());
+    for include_mempool in [true, false] {
+        let out = dispatch(
+            &ctx,
+            "gettxout",
+            vec![json!(g_txid), json!(0), json!(include_mempool)],
+        )
+        .unwrap();
+        assert!(out.is_null(), "include_mempool={include_mempool}: {out}");
+    }
+    let rest = dispatch_rest(&ctx, &format!("/rest/getutxos/{g_txid}-0.json"), "", &[]);
+    assert_eq!(rest.status, axum::http::StatusCode::OK);
+    let body: Value = serde_json::from_slice(&rest.body).unwrap();
+    assert_eq!(body["bitmap"], "0", "{body}");
+
+    let scan = dispatch(&ctx, "scantxoutset", vec![json!("start"), json!([desc])]).unwrap();
+    let uns = scan["unspents"].as_array().unwrap();
+    assert_eq!(uns.len(), 1, "only the height-1 coinbase: {scan}");
+    assert_eq!(uns[0]["height"], 1, "{scan}");
+    assert_ne!(uns[0]["txid"], json!(g_txid), "{scan}");
+    assert_eq!(scan["total_amount"], uns[0]["amount"], "{scan}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core refuses the genesis coinbase in `getrawtransaction`. Its txindex skips
+/// height 0, so REST `/tx` answers 404.
+#[test]
+fn genesis_coinbase_is_not_an_ordinary_tx() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let genesis = bitcoin::blockdata::constants::genesis_block(BtcNetwork::Regtest);
+    let g_txid = genesis.txdata[0].compute_txid().to_string();
+    let g_hash = genesis.block_hash().to_string();
+    for params in [
+        vec![json!(g_txid)],
+        vec![json!(g_txid), json!(1)],
+        vec![json!(g_txid), json!(2), json!(g_hash)],
+    ] {
+        let e = dispatch(&ctx, "getrawtransaction", params.clone()).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY, "{params:?}: {e}");
+        assert_eq!(
+            e["message"],
+            "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+            "{params:?}: {e}"
+        );
+    }
+    for ext in ["json", "hex", "bin"] {
+        let rest = dispatch_rest(&ctx, &format!("/rest/tx/{g_txid}.{ext}"), "", &[]);
+        assert_eq!(rest.status, axum::http::StatusCode::NOT_FOUND, "{ext}");
+        let body = String::from_utf8(rest.body).unwrap();
+        assert_eq!(body.trim_end(), format!("{g_txid} not found"), "{ext}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A Class A row that is no longer on the active chain still resolves
 /// (TipThenAny), so verbose getrawtransaction and REST json must return the
 /// tx object without block fields rather than an error.
@@ -2763,7 +2829,10 @@ fn prune_life_getblock(ctx: &RpcContext) {
     let err2 = dispatch(ctx, "getblock", vec![genesis_hash, json!(2)]).unwrap_err();
     assert_eq!(err2["code"], json!(-8));
     let rerr = dispatch(ctx, "getrawtransaction", vec![v1["tx"][0].clone()]).unwrap_err();
-    assert_eq!(rerr["code"], json!(-8));
+    assert_eq!(
+        rerr["code"], ERR_INVALID_ADDRESS_OR_KEY,
+        "genesis first: {rerr}"
+    );
     let net = dispatch(ctx, "getnetworkinfo", vec![]).unwrap();
     let names: Vec<&str> = net["localservicesnames"]
         .as_array()
@@ -2777,6 +2846,11 @@ fn prune_life_getblock(ctx: &RpcContext) {
     assert_eq!(stats["txs"], 1);
     assert_eq!(stats["outs"], 1);
     assert_eq!(ctx.query.sample_reset_reconstruct_archived(), 0);
+    ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let b1 = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap();
+    let rerr = dispatch(ctx, "getrawtransaction", vec![b1["tx"][0].clone()]).unwrap_err();
+    assert_eq!(rerr["code"], json!(-8), "{rerr}");
 }
 
 #[test]

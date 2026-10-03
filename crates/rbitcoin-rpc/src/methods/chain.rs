@@ -895,9 +895,10 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
         .query
         .scan_unspent_scripts(&scripts)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let genesis_txid = genesis_coinbase_txid(ctx);
     let mut unspents = Vec::with_capacity(found.len());
     let mut total_sat = 0u64;
-    for u in found {
+    for u in found.into_iter().filter(|u| u.txid != genesis_txid) {
         total_sat = total_sat.saturating_add(u.value);
         let blockhash = ctx
             .query
@@ -978,6 +979,9 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let n = params.req_u64(1, "n")? as u32;
     let include_mempool = params.opt_bool(2, "include_mempool")?.unwrap_or(true);
     let want = parse_hash32_display(hex)?;
+    if want == genesis_coinbase_txid(ctx) {
+        return Ok(Value::Null);
+    }
     let connected = ctx
         .query
         .tx_fk_by_txid_tip(&want)

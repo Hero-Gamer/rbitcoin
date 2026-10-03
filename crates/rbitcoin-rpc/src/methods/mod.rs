@@ -49,6 +49,16 @@ pub(crate) fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
     })
 }
 
+/// Core's `ConnectBlock` returns before adding the genesis coinbase output
+/// to the coins view, and its txindex skips height 0. The coin is never
+/// unspent and the tx is not an ordinary transaction.
+pub(crate) fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
+    use bitcoin::hashes::Hash;
+    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(ctx.network)).txdata[0]
+        .compute_txid()
+        .to_byte_array()
+}
+
 mod chain;
 mod decode;
 mod descriptor_scan;
