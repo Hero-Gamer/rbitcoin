@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell};
 
 use bitcoin::hashes::Hash;
 use bitcoin::script::{Instruction, Script};
-use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::sighash::SighashCache;
 use bitcoin::{Amount, Sequence, Transaction, TxOut};
 
 use super::crypto;
@@ -182,12 +182,14 @@ pub(crate) struct EvalContext<'a> {
     ///
     /// BIP143 / legacy CHECKSIG use this truncated script as `scriptCode`.
     codeseparator_script_off: Cell<Option<usize>>,
-    /// Legacy / taproot midstate. Created on first use (WitnessV0 uses `pre` only).
+    /// Legacy midstate. Created on first use (WitnessV0 uses `pre`, tapscript `tapscript`).
     cache: RefCell<Option<SighashCache<&'a Transaction>>>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pre: Cow<'a, rbitcoin_query::TxPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
     validation_weight_left: Cell<i64>,
+    /// Tapscript only: per-input sighash facts from the script-path spend.
+    tapscript: Option<crypto::TapscriptExecData>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -276,7 +278,14 @@ impl<'a> EvalContext<'a> {
             cache: RefCell::new(None),
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(tx, input_index, sig_version)),
+            tapscript: None,
         }
+    }
+
+    /// Attach the tapleaf and annex facts of a BIP341 script-path spend.
+    pub(crate) fn with_tapscript(mut self, exec: crypto::TapscriptExecData) -> Self {
+        self.tapscript = Some(exec);
+        self
     }
 
     /// Copy standardness / fixture flags from a [`crate::block::ScriptCheckJob`].
@@ -1444,32 +1453,18 @@ fn checksig_schnorr(
         Ok(s) => s,
         Err(_) => return Ok(false),
     };
-    let prevouts = Prevouts::All(ctx.prevouts);
-    use bitcoin::sighash::Annex;
-    use bitcoin::taproot::LeafVersion;
-    use bitcoin::TapLeafHash;
-    let leaf = TapLeafHash::from_script(ctx.script_code, LeafVersion::TapScript);
-    // BIP341/BIP342: include last OP_CODESEPARATOR instruction index (default
-    // 0xFFFFFFFF). `taproot_script_spend_signature_hash` hard-codes the default
-    // and would reject multisig leaves that use CODESEPARATOR (signet 90719).
-    // Annex (if present on the witness) must also enter the sighash.
-    let codesep = ctx.codeseparator_pos.get();
-    let annex = super::p2tr::bip341_annex(&ctx.tx.input[ctx.input_index].witness)
-        .map(Annex::new)
-        .transpose()
-        .map_err(|_| ConsensusError::Script("tapscript annex".into()))?;
-    let mut slot = ctx.cache.borrow_mut();
-    let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
-    let sighash = cache
-        .taproot_signature_hash(
-            ctx.input_index,
-            &prevouts,
-            annex,
-            Some((leaf, codesep)),
-            sighash_ty,
-        )
-        .map_err(|_| ConsensusError::Script("tapscript sighash".into()))?;
-    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let exec = ctx.tapscript.as_ref().ok_or_else(|| {
+        ConsensusError::Script("invariant: tapscript spend without tapleaf hash".into())
+    })?;
+    let sighash = exec.signature_hash(
+        ctx.tx,
+        ctx.input_index,
+        ctx.prevouts,
+        ctx.pre.as_ref(),
+        sighash_ty,
+        ctx.codeseparator_pos.get(),
+    )?;
+    let msg = bitcoin::secp256k1::Message::from_digest(sighash);
     Ok(crypto::SECP.with(|secp| secp.verify_schnorr(&schnorr, &msg, &xonly).is_ok()))
 }
 
