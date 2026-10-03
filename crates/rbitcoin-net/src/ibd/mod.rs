@@ -70,7 +70,7 @@ use bitcoin::p2p::Magic;
 use rbitcoin_log::{info, info_bold, warn};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -304,7 +304,6 @@ pub async fn ibd_cancellable(
         );
     }
     let mut peer_sess = PeerBookSession::new(cfg.peers.clone(), peers);
-    let next_peer_id = Arc::new(AtomicUsize::new(0));
 
     // Initial concurrent dial — cap to ~2× live target (never the whole book).
     // With DNS/peers persistence the book can be 300+ addresses; dialing them all
@@ -317,7 +316,6 @@ pub async fn ibd_cancellable(
         .max(1);
     let initial = dial_batch(
         peer_sess.book(),
-        &next_peer_id,
         initial_dial_n,
         HashSet::new(),
         &[],
@@ -409,6 +407,7 @@ pub async fn ibd_cancellable(
         0
     }));
     let confirm_feed = Arc::new(ConfirmFeed::new());
+    st.confirm_feed = Some(Arc::clone(&confirm_feed));
     // Body queue is RAM-only; restart is empty. Same-process residual can still note feed.
     match rehydrate_block_queue_into_confirm(hub.as_ref(), &mut st, confirm_feed.as_ref()) {
         Ok(n) if n > 0 => {
@@ -777,7 +776,6 @@ pub async fn ibd_cancellable(
                 already.len()
             );
             let book = peer_sess.book().clone();
-            let next_id = next_peer_id.clone();
             let tip_h = hub.tip_height();
             let sinks_r = sinks.clone();
             let cto = cfg.connect_timeout;
@@ -785,8 +783,8 @@ pub async fn ibd_cancellable(
             let dialer_c = cfg.dialer.clone();
             redial_handle = Some(tokio::spawn(async move {
                 dial_batch(
-                    &book, &next_id, want, already, &occupied, magic, local_addr, tip_h, sinks_r,
-                    cto, cancel_c, dialer_c,
+                    &book, want, already, &occupied, magic, local_addr, tip_h, sinks_r, cto,
+                    cancel_c, dialer_c,
                 )
                 .await
             }));

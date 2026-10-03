@@ -17,6 +17,8 @@ pub struct ResolvedWire {
     /// Same-wave creates stay here so a later load chunk can in-flight bind;
     /// TipOnly / `need_vouts` ∩ wave ids still drop them.
     pub spend_keys: Arc<[([u8; 32], u32)]>,
+    /// Peer id given at BQ enqueue ([`crate::Query::block_queue_offer_from`]).
+    pub sender: Option<u64>,
 }
 
 impl ResolvedWire {
@@ -33,18 +35,19 @@ impl ResolvedWire {
             n_inputs,
             header_fk: 0,
             spend_keys: Arc::from([]),
+            sender: None,
         }
     }
 }
 
 /// One mutex snapshot of unresolved heights: still-raw vs already promoted.
 ///
-/// `raw` is **(height, n_inputs, header_fk)** — no payload clone. Lookup
+/// `raw` is **(height, n_inputs, header_fk, sender)** — no payload clone. Lookup
 /// packs/holds from the stamped count; decode clones via
 /// [`crate::Query::block_queue_raw_payload`] only for heights it emits.
 #[derive(Clone, Debug, Default)]
 pub struct BlockQueueWaveIntake {
-    pub raw: Vec<(u32, u32, u64)>,
+    pub raw: Vec<(u32, u32, u64, Option<u64>)>,
     pub resolved: Vec<(u32, ResolvedWire)>,
 }
 
@@ -75,6 +78,7 @@ mod tests {
             n_inputs: 9,
             header_fk: 7,
             spend_keys: Arc::from([([0x11u8; 32], 3)]),
+            sender: None,
         };
         assert_eq!(stamped.n_inputs, 9);
         assert_eq!(stamped.header_fk, 7);

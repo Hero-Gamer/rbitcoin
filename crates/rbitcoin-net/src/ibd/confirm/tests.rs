@@ -1151,6 +1151,7 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         ConfirmRejectClass::ConsensusInvalid,
         "script failed".into(),
         8,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1178,6 +1179,7 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         ConfirmRejectClass::ConsensusInvalid,
         "script failed".into(),
         1,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1204,6 +1206,7 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         ConfirmRejectClass::EngineFault,
         "io_uring leftover cqe".into(),
         8,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1228,6 +1231,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         ConfirmRejectClass::ConsensusInvalid,
         "script failed".into(),
         8,
+        None,
     )
     .unwrap();
     assert_eq!(feed.isolate_until(), 107);
@@ -1259,6 +1263,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         ConfirmRejectClass::ConsensusInvalid,
         "script failed".into(),
         8,
+        None,
     )
     .unwrap();
     assert_eq!(feed_n1.isolate_until(), 107);
@@ -1270,6 +1275,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         ConfirmRejectClass::ConsensusInvalid,
         "script failed".into(),
         1,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -1612,7 +1618,10 @@ fn ibd_confirm_pin_fault() {
 
     // A stale load queue only restores the body queue; lookup stays taken.
     hub.query.set_lookup_taken_hi(Some(t + 3));
-    reoffer_blocks_to_body_queue(&hub, std::iter::once((t + 3, tail.block_hash(), &tail)));
+    reoffer_blocks_to_body_queue(
+        &hub,
+        std::iter::once((t + 3, tail.block_hash(), &tail, None)),
+    );
     assert_eq!(
         hub.query.block_queue_payload(t + 3).unwrap().as_deref(),
         Some(serialize(&tail).as_slice())
@@ -1722,9 +1731,10 @@ fn ibd_confirm_pin_fault() {
 /// A two-block load wave fails, named by tip+1: pins clear, the epoch drops
 /// same-wave loads, lookup rewinds to the tip, the retry is one block at a
 /// time, and both bodies go back on the body queue, not feed.ready. A
-/// one-block wave drops the block that failed.
+/// one-block verdict drops the block that failed; a one-block cascade goes
+/// back for a retry.
 fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHash, tip_time: u32) {
-    use super::{load_fail_rewind_wave, LoadAheadState};
+    use super::{load_fail_rewind_wave, ConfirmRejectClass, LoadAheadState};
     use bitcoin::consensus::encode::serialize;
     use rbitcoin_consensus::mine_empty_regtest;
     use rbitcoin_query::ArchiveWritePlan;
@@ -1754,9 +1764,10 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
         hub,
         &mut st,
         t + 1,
+        ConfirmRejectClass::Cascade,
         &[
-            (t + 1, head.block_hash(), &head),
-            (t + 2, tail.block_hash(), &tail),
+            (t + 1, head.block_hash(), &head, None),
+            (t + 2, tail.block_hash(), &tail, None),
         ],
     );
     assert_eq!(st.in_flight.entry_count(), 0, "pin/stamp fail clears all");
@@ -1786,16 +1797,27 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
     hub.query.block_queue_dequeue_height(t + 1).unwrap();
     hub.query.block_queue_dequeue_height(t + 2).unwrap();
 
-    let solo = ConfirmFeed::new();
-    load_fail_rewind_wave(
-        &solo,
-        hub,
-        &mut st,
-        t + 1,
-        &[(t + 1, head.block_hash(), &head)],
-    );
-    assert!(!solo.single_block());
-    assert!(!hub.query.block_queue_has_height(t + 1));
+    for (class, kept) in [
+        (ConfirmRejectClass::ConsensusInvalid, false),
+        (ConfirmRejectClass::SoftWire, false),
+        (ConfirmRejectClass::EngineFault, false),
+        (ConfirmRejectClass::Cascade, true),
+    ] {
+        let solo = ConfirmFeed::new();
+        load_fail_rewind_wave(
+            &solo,
+            hub,
+            &mut st,
+            t + 1,
+            class,
+            &[(t + 1, head.block_hash(), &head, None)],
+        );
+        assert!(!solo.single_block(), "{class:?}");
+        assert_eq!(hub.query.block_queue_has_height(t + 1), kept, "{class:?}");
+        if kept {
+            hub.query.block_queue_dequeue_height(t + 1).unwrap();
+        }
+    }
 }
 
 /// A write or scripts reject re-arms lookup at the tip. A retried batched

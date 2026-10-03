@@ -28,10 +28,8 @@ pub(crate) struct BodyPresenceSizes {
 pub(crate) struct BodyPresence {
     known: HashSet<BlockHash>,
     /// Received on the wire / in body queue, not yet tip-confirmed.
-    /// Membership **is** the pending set; value is when marked (stale expire)
-    /// and the peer whose wire was queued (16 B per pending body), so a
-    /// mutated-body reject can punish it.
-    pending_since: HashMap<BlockHash, (Instant, Option<usize>)>,
+    /// Membership **is** the pending set; value is when marked (stale expire).
+    pending_since: HashMap<BlockHash, Instant>,
     /// Store-probed and not archived yet (safe to request getdata).
     missing: HashSet<BlockHash>,
     /// Confirm rejected this hash; do not re-offer or re-download.
@@ -58,27 +56,7 @@ impl BodyPresence {
             return;
         }
         self.missing.remove(&h);
-        self.pending_since
-            .entry(h)
-            .or_insert((Instant::now(), None));
-    }
-
-    /// [`Self::mark_pending`] for wire `peer` just queued.
-    pub(crate) fn mark_pending_from(&mut self, h: BlockHash, peer: usize) {
-        if self.rejected.contains(&h) {
-            return;
-        }
-        self.missing.remove(&h);
-        self.pending_since
-            .entry(h)
-            .or_insert((Instant::now(), None))
-            .1 = Some(peer);
-    }
-
-    /// Peer whose queued wire is pending for `h` (`None` after a restart or
-    /// for a body that did not come from intake).
-    pub(crate) fn pending_sender(&self, h: &BlockHash) -> Option<usize> {
-        self.pending_since.get(h).and_then(|(_, peer)| *peer)
+        self.pending_since.entry(h).or_insert_with(Instant::now);
     }
 
     pub(crate) fn mark_archived(&mut self, h: BlockHash) {
@@ -123,7 +101,7 @@ impl BodyPresence {
         let stale: Vec<BlockHash> = self
             .pending_since
             .iter()
-            .filter(|(h, (t, _))| pred(h) && now.duration_since(*t) >= max_age)
+            .filter(|(h, t)| pred(h) && now.duration_since(**t) >= max_age)
             .map(|(h, _)| *h)
             .collect();
         for h in &stale {

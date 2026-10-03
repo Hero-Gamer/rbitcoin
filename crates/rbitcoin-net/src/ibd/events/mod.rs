@@ -618,10 +618,13 @@ fn apply_block_framed(
     if hub.query.block_queue_has_hash(&raw) {
         return;
     }
-    match hub
-        .query
-        .block_queue_offer(height, raw, header_fk.0, &payload)
-    {
+    match hub.query.block_queue_offer_from(
+        height,
+        raw,
+        header_fk.0,
+        &payload,
+        u64::try_from(peer).ok(),
+    ) {
         Ok(_offer) => {
             let _ = try_complete_awaiting_reorg(st, hub);
         }
@@ -631,7 +634,7 @@ fn apply_block_framed(
             return;
         }
     }
-    st.body.mark_pending_from(hash, peer);
+    st.body.mark_pending(hash);
     if let Some(feed) = confirm_feed {
         feed.note(height, hash);
     }
@@ -766,6 +769,7 @@ pub(crate) fn apply_confirm_events(
                 class,
                 err,
                 batch_len,
+                sender,
             } => {
                 apply_confirm_reject(
                     st,
@@ -777,6 +781,7 @@ pub(crate) fn apply_confirm_events(
                     Some(hub),
                     batch_len,
                     feed,
+                    sender,
                 );
             }
         }
@@ -800,6 +805,7 @@ pub(crate) fn apply_confirm_reject(
     hub: Option<&crate::chain::ChainHub>,
     batch_len: usize,
     feed: Option<&super::confirm::ConfirmFeed>,
+    sender: Option<usize>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -830,7 +836,7 @@ pub(crate) fn apply_confirm_reject(
         }
     }
     if class.is_soft() {
-        apply_soft_wire_reject(st, height, hash, err, query, hub);
+        apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
         return;
     }
     match class {
@@ -839,7 +845,7 @@ pub(crate) fn apply_confirm_reject(
         }
         ConfirmRejectClass::SoftWire => {}
         ConfirmRejectClass::Cascade => {
-            apply_cascade_reject(st, height, hash, err, hub, batch_len);
+            apply_cascade_reject(st, height, hash, err, hub);
         }
         ConfirmRejectClass::EngineFault => {
             apply_engine_fault_reject(st, height, hash, err, query);
@@ -857,6 +863,7 @@ fn apply_soft_wire_reject(
     err: &str,
     query: Option<&rbitcoin_query::Query>,
     hub: Option<&crate::chain::ChainHub>,
+    sender: Option<usize>,
 ) {
     let bad_prev = super::reorg::is_bad_prev_err(err);
     if bad_prev {
@@ -892,9 +899,10 @@ fn apply_soft_wire_reject(
     }
     if !bad_prev {
         // `isolate_if_batched` leaves SoftWire only for a one-block wave, so
-        // `hash` is the block that failed.
+        // `hash` is the block that failed and `sender` sent that copy. The
+        // live pending sender may be a replacement's.
         if crate::chain::reject_is_mutated(err) {
-            if let Some(peer) = st.body.pending_sender(&hash) {
+            if let Some(peer) = sender {
                 punish_mutated_sender(st, peer, hash);
             }
         }
@@ -946,43 +954,16 @@ fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
     );
 }
 
-/// A cascaded wave lost its in-pipeline work, and lookup had already taken
-/// its bodies off the queue. A pending flag in `heights` with no queue wire
-/// behind it would wait for the stale timeout, so mark it missing and reopen
-/// densify for a re-get. Earlier waves are not touched: they are still in
-/// scripts or write, and if a load-side rewind left them epoch-stale, the
-/// write drops them and tip-hole cover fetches them again.
-fn demote_unqueued_pending(st: &mut IbdWorkState, hub: &ChainHub, heights: std::ops::Range<u32>) {
-    let mut freed = Vec::new();
-    for ht in heights {
-        if let Some(&hash) = st.height_to_hash.get(&ht) {
-            super::assign::demote_zombie_pending_for_fetch(&mut st.body, hub, hash, Some(ht));
-            if st.body.is_missing(&hash) {
-                freed.push(hash);
-            }
-        }
-    }
-    st.reopen_for_densify(&freed);
-}
-
 fn apply_cascade_reject(
     st: &mut IbdWorkState,
     height: u32,
     hash: BlockHash,
     err: &str,
     hub: Option<&crate::chain::ChainHub>,
-    batch_len: usize,
 ) {
-    // Leave the body queue: the plan was stale, the wire is still good. A
-    // body of this wave that lookup already took is fetched again.
+    // Leave the body queue: the plan was stale, and the confirm thread that
+    // rejected offered any body it held back.
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    if let Some(h) = hub {
-        demote_unqueued_pending(
-            st,
-            h,
-            height..height.saturating_add(batch_len.max(1) as u32),
-        );
-    }
     const CASCADE_HALT_AFTER: u8 = 3;
     let tip = hub
         .and_then(|h| h.tip_hash())

@@ -230,13 +230,21 @@ pub(crate) struct DialBatchResult {
     pub attempted: Vec<crate::NetAddr>,
 }
 
+/// Process-wide, not per IBD run: a body queue row outlives the run that
+/// queued it and names its sender by this id.
+static NEXT_PEER_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// A peer id no other connection in this process has had.
+pub(crate) fn next_peer_id() -> usize {
+    NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 /// Dial up to `count` ranked candidates from `book`. `already` is exclude
 /// (slots + cooldown). `occupied` is live addrs whose netgroups are skipped
 /// while unused-group candidates remain.
 pub(crate) async fn dial_batch(
     book: &AddrMan,
-    next_id: &AtomicUsize,
     count: usize,
     mut already: HashSet<crate::NetAddr>,
     occupied: &[SocketAddr],
@@ -276,7 +284,7 @@ pub(crate) async fn dial_batch(
         if !already.insert(addr) {
             continue;
         }
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let id = next_peer_id();
         let sinks = sinks.clone();
         debug!(
             "{}",
@@ -1295,7 +1303,6 @@ mod tests {
     #[test]
     fn dial_batch_empty_count_or_book() {
         let book = AddrMan::new();
-        let next = AtomicUsize::new(0);
         let (body_tx, _body_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
         let sinks = PeerEventSinks {
@@ -1308,7 +1315,6 @@ mod tests {
             .unwrap();
         let r = rt.block_on(dial_batch(
             &book,
-            &next,
             0,
             HashSet::new(),
             &[],
@@ -1323,7 +1329,6 @@ mod tests {
         assert!(r.slots.is_empty() && r.failed.is_empty());
         let r2 = rt.block_on(dial_batch(
             &book,
-            &next,
             4,
             HashSet::new(),
             &[],

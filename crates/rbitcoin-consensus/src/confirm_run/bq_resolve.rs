@@ -184,12 +184,16 @@ pub fn confirm_bq_resolve_wave_capped(
     let intake = query.block_queue_wave_intake(heights);
     let mut n_inputs_at: U32Map<u32> = U32Map::default();
     let mut header_fk_at: U32Map<u64> = U32Map::default();
+    let mut sender_at: U32Map<u64> = U32Map::default();
     let raw_h: HashSet<u32> = intake
         .raw
         .into_iter()
-        .map(|(h, n, fk)| {
+        .map(|(h, n, fk, sender)| {
             n_inputs_at.insert(h, n);
             header_fk_at.insert(h, fk);
+            if let Some(s) = sender {
+                sender_at.insert(h, s);
+            }
             h
         })
         .collect();
@@ -282,6 +286,7 @@ pub fn confirm_bq_resolve_wave_capped(
                     n_inputs: n_inputs_at.get(&h).copied().unwrap_or(0),
                     header_fk: header_fk_at.get(&h).copied().unwrap_or(0),
                     spend_keys: Arc::from([]),
+                    sender: sender_at.get(&h).copied(),
                 },
             ));
             (block, pres)

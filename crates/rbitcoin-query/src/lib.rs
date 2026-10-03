@@ -1534,19 +1534,44 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        self.block_queue_offer_from(height, hash, header_fk, payload, None)
+    }
+
+    /// [`Self::block_queue_offer`] that records the caller's id for the peer
+    /// the wire came from. Lookup carries it on [`ResolvedWire::sender`].
+    pub fn block_queue_offer_from(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: &[u8],
+        sender: Option<u64>,
+    ) -> Result<BlockQueueOffer, QueryError> {
         {
             let g = self.block_queue.lock().unwrap();
             if let Some(id) = g.id_for_height(height) {
                 return Ok(BlockQueueOffer { queue_id: id });
             }
         }
-        let n_inputs = rbitcoin_store::block_wire_input_count(payload);
-        let owned = payload.to_vec();
+        self.block_queue_offer_vec(height, hash, header_fk, payload.to_vec(), sender)
+    }
+
+    /// [`Self::block_queue_offer_from`] for a payload the caller already
+    /// owns (moved in, not copied).
+    pub fn block_queue_offer_vec(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        owned: Vec<u8>,
+        sender: Option<u64>,
+    ) -> Result<BlockQueueOffer, QueryError> {
+        let n_inputs = rbitcoin_store::block_wire_input_count(&owned);
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
-        let id = g.enqueue_vec(height, hash, header_fk, owned, n_inputs)?;
+        let id = g.enqueue_vec(height, hash, header_fk, owned, n_inputs, sender)?;
         Ok(BlockQueueOffer { queue_id: id })
     }
 
@@ -1561,7 +1586,7 @@ impl Query {
         let n_inputs = rbitcoin_store::block_wire_input_count(payload);
         let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
-        g.enqueue_vec(height, hash, header_fk, owned, n_inputs)
+        g.enqueue_vec(height, hash, header_fk, owned, n_inputs, None)
     }
 
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
@@ -1707,6 +1732,7 @@ impl Query {
                     h,
                     g.input_count_at(h).unwrap_or(0),
                     g.header_fk_at(h).unwrap_or(0),
+                    g.sender_at(h),
                 ));
             }
         }

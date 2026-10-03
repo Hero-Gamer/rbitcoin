@@ -244,6 +244,11 @@ impl ConfirmFeed {
         }
     }
 
+    /// Load claimed `height` and write has not finished it.
+    pub(crate) fn holds(&self, height: u32) -> bool {
+        self.inner.lock().unwrap().inflight.contains(&height)
+    }
+
     /// Note readiness (wire lives in the body queue — denserels reloads it).
     pub(crate) fn note(&self, height: u32, hash: BlockHash) {
         self.note_wire(height, hash, None);
@@ -510,27 +515,58 @@ fn requeue_on_uring_recover(
     true
 }
 
-fn reoffer_blocks_to_body_queue<'a>(
+/// A body to offer back, with the BQ sender id it was enqueued with.
+type OfferBack<'a> = (u32, BlockHash, &'a bitcoin::Block, Option<u64>);
+
+/// A body serialized for the queue, ready to insert.
+struct PreparedOffer {
+    height: u32,
+    hash: [u8; 32],
+    header_fk: u64,
+    payload: Vec<u8>,
+    sender: Option<u64>,
+}
+
+/// Serialize and look up the header row for each body not yet connected.
+/// RAM: the wave's serialized bodies are held together until the insert,
+/// which moves them into the queue.
+fn prepare_offer_back<'a>(
     hub: &ChainHub,
-    items: impl IntoIterator<Item = (u32, BlockHash, &'a bitcoin::Block)>,
-) {
+    items: impl IntoIterator<Item = OfferBack<'a>>,
+) -> Vec<PreparedOffer> {
     use bitcoin::consensus::encode::serialize;
-    for (h, hash, block) in items {
-        if hub.has_block(&hash) {
-            continue;
-        }
-        let payload = serialize(block);
-        let header_fk = hub
-            .query
-            .get_header_by_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-            .map(|(fk, _)| fk.0)
-            .unwrap_or(0);
+    items
+        .into_iter()
+        .filter(|(_, hash, _, _)| !hub.has_block(hash))
+        .map(|(height, hash, block, sender)| PreparedOffer {
+            height,
+            hash: hash.to_byte_array(),
+            header_fk: hub
+                .query
+                .get_header_by_hash(&hash.to_byte_array())
+                .ok()
+                .flatten()
+                .map(|(fk, _)| fk.0)
+                .unwrap_or(0),
+            payload: serialize(block),
+            sender,
+        })
+        .collect()
+}
+
+fn offer_back(hub: &ChainHub, prepared: Vec<PreparedOffer>) {
+    for p in prepared {
         let _ = hub
             .query
-            .block_queue_offer(h, hash.to_byte_array(), header_fk, &payload);
+            .block_queue_offer_vec(p.height, p.hash, p.header_fk, p.payload, p.sender);
     }
+}
+
+fn reoffer_blocks_to_body_queue<'a>(
+    hub: &ChainHub,
+    items: impl IntoIterator<Item = OfferBack<'a>>,
+) {
+    offer_back(hub, prepare_offer_back(hub, items));
 }
 
 /// A write or scripts reject: lookup took the wave's bodies off the body
@@ -538,8 +574,16 @@ fn reoffer_blocks_to_body_queue<'a>(
 /// drops its look-ahead plan before the next wave. When the wave is retried
 /// (a cascade, or a batched reject being isolated), turn on isolation
 /// before the re-arm and offer its bodies back after it, so lookup cannot
-/// rebuild the same wave from them. Returns false when the class does not
-/// re-arm (cancel, engine fault).
+/// rebuild the same wave from them. Write and scripts re-offer without a
+/// sender: load already checked these bodies for mutation. Returns false
+/// when the class does not re-arm (cancel, engine fault).
+///
+/// Order: serialize, isolate, re-arm, insert. The insert must follow the
+/// re-arm: a body queued first could be selected by a lookup pass that read
+/// the old generation and isolation off, and its take would still match.
+/// Between the re-arm and the insert assign sees these heights neither
+/// taken nor queued and may fetch them again, so the serialize runs first
+/// and only the queue inserts are left in that window.
 fn rearm_after_reject(
     hub: &ChainHub,
     feed: &ConfirmFeed,
@@ -553,6 +597,11 @@ fn rearm_after_reject(
         return false;
     }
     let retried = class.isolate_if_batched(wave.len()) == ConfirmRejectClass::Cascade;
+    let prepared = if retried {
+        prepare_offer_back(hub, wave.iter().map(|&(h, ha, b)| (h, ha, b, None)))
+    } else {
+        Vec::new()
+    };
     if let Some(&(first_h, _, _)) = wave.first() {
         if retried && wave.len() > 1 {
             feed.request_single_block(first_h.saturating_add(wave.len() as u32 - 1));
@@ -561,23 +610,32 @@ fn rearm_after_reject(
     hub.query.set_lookup_taken_hi(hub.tip_height());
     hub.query.set_lookup_started_hi(hub.tip_height());
     if retried {
-        reoffer_blocks_to_body_queue(hub, wave.iter().copied());
+        offer_back(hub, prepared);
         feed.notify();
     }
     true
 }
 
 /// Stamp/pin fail: drop speculative fks, bump the feed epoch, re-offer to BQ.
-/// A one-block wave drops its failing block. A batched reject names the first
-/// hash but may be any block's fault, so every block goes back and the retry
-/// runs one block at a time.
+/// A one-block verdict drops its failing block; a one-block cascade (a stale
+/// plan, or a consensus reject against a parent that is not the tip) goes
+/// back for a retry. A batched reject names the first hash but may be any
+/// block's fault, so every block goes back and the retry runs one block at
+/// a time. Same order as [`rearm_after_reject`]: serialize, isolate,
+/// re-arm, insert.
 fn load_fail_rewind_wave(
     feed: &ConfirmFeed,
     hub: &ChainHub,
     lookup_ahead: &mut LoadAheadState,
     first_h: u32,
-    wave: &[(u32, BlockHash, &bitcoin::Block)],
+    class: ConfirmRejectClass,
+    wave: &[OfferBack<'_>],
 ) {
+    let drop_head = match wave {
+        [(_, hash, _, _)] => class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade,
+        _ => false,
+    };
+    let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
     lookup_ahead.clear_all(hub);
     feed.finish(std::iter::once(first_h));
     feed.clear();
@@ -588,8 +646,13 @@ fn load_fail_rewind_wave(
     }
     hub.query.set_lookup_taken_hi(hub.tip_height());
     hub.query.set_lookup_started_hi(hub.tip_height());
-    reoffer_blocks_to_body_queue(hub, wave[usize::from(wave.len() == 1)..].iter().copied());
+    offer_back(hub, prepared);
     feed.notify();
+}
+
+/// Peer id the wire was enqueued with: `sender` on [`ConfirmEvent::Reject`].
+fn wire_sender(wire: &rbitcoin_query::ResolvedWire) -> Option<usize> {
+    wire.sender.and_then(|s| usize::try_from(s).ok())
 }
 
 pub(crate) fn lookup_ready_hash(feed: &ConfirmFeed, height: u32) -> Option<BlockHash> {
@@ -651,9 +714,14 @@ pub(crate) enum ConfirmEvent {
         /// Heights in the failing wave. `> 1` means the hash is the batch
         /// first, not necessarily the failing block.
         batch_len: usize,
+        /// Peer that sent the copy of `hash` that failed, read from the wire
+        /// the confirm thread held. IBD's own record may by now name the
+        /// sender of a replacement copy.
+        sender: Option<usize>,
     },
 }
 
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 fn emit_confirm_reject(
     tx: &std::sync::mpsc::Sender<ConfirmEvent>,
     feed: &ConfirmFeed,
@@ -662,6 +730,7 @@ fn emit_confirm_reject(
     class: ConfirmRejectClass,
     err: String,
     batch_len: usize,
+    sender: Option<usize>,
 ) -> Result<(), std::sync::mpsc::SendError<ConfirmEvent>> {
     let class = class.isolate_if_batched(batch_len);
     if class == ConfirmRejectClass::Cascade && batch_len > 1 {
@@ -674,6 +743,7 @@ fn emit_confirm_reject(
         class,
         err,
         batch_len,
+        sender,
     })
 }
 
@@ -1713,6 +1783,7 @@ pub(crate) fn spawn_confirm_engine(
                             class,
                             msg,
                             heights_hashes.len(),
+                            None,
                         );
                     }
                 }
@@ -1838,6 +1909,7 @@ pub(crate) fn spawn_confirm_engine(
                         class,
                         msg,
                         meta.heights_hashes.len(),
+                        None,
                     );
                     true
                 },
@@ -1905,7 +1977,8 @@ pub(crate) fn spawn_confirm_engine(
                         &hub_load,
                         lb.items.iter().filter_map(|(h, raw, w)| {
                             let hash = BlockHash::from_byte_array(*raw);
-                            (!hub_load.has_block(&hash)).then_some((*h, hash, w.block.as_ref()))
+                            (!hub_load.has_block(&hash))
+                                .then_some((*h, hash, w.block.as_ref(), w.sender))
                         }),
                     );
                     feed_load.finish(lb.items.iter().map(|(h, _, _)| *h));
@@ -2037,12 +2110,14 @@ pub(crate) fn spawn_confirm_engine(
                             continue;
                         }
                         let first_hash = wire_batch[0].1;
+                        let sender = wire_sender(&wire_batch[0].2);
                         let class = ConfirmRejectClass::from_consensus(&e);
                         if class == ConfirmRejectClass::EngineFault {
                             reoffer_blocks_to_body_queue(
                                 &hub_load,
                                 wire_batch.iter().filter_map(|(h, ha, w)| {
-                                    (!hub_load.has_block(ha)).then_some((*h, *ha, w.block.as_ref()))
+                                    (!hub_load.has_block(ha))
+                                        .then_some((*h, *ha, w.block.as_ref(), w.sender))
                                 }),
                             );
                         } else {
@@ -2051,9 +2126,10 @@ pub(crate) fn spawn_confirm_engine(
                                 &hub_load,
                                 &mut lookup_ahead,
                                 expect_h,
+                                class,
                                 &wire_batch
                                     .iter()
-                                    .map(|(h, ha, w)| (*h, *ha, w.block.as_ref()))
+                                    .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
                                     .collect::<Vec<_>>(),
                             );
                         }
@@ -2076,6 +2152,7 @@ pub(crate) fn spawn_confirm_engine(
                             class,
                             log_msg,
                             wire_batch.len(),
+                            sender,
                         );
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
@@ -2204,14 +2281,17 @@ pub(crate) fn spawn_confirm_engine(
                             );
                             continue;
                         }
+                        let class = ConfirmRejectClass::from_net(&e);
+                        let sender = wire_sender(&wire_batch[0].2);
                         load_fail_rewind_wave(
                             &feed_load,
                             &hub_load,
                             &mut lookup_ahead,
                             expect_h,
+                            class,
                             &wire_batch
                                 .iter()
-                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref()))
+                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
                                 .collect::<Vec<_>>(),
                         );
                         loop_stats_load
@@ -2223,9 +2303,10 @@ pub(crate) fn spawn_confirm_engine(
                             &feed_load,
                             expect_h,
                             first_hash,
-                            ConfirmRejectClass::from_net(&e),
+                            class,
                             msg,
                             heights_hashes.len(),
+                            sender,
                         )
                         .is_err()
                         {
@@ -2433,6 +2514,7 @@ pub(crate) fn spawn_confirm_engine(
                                                     ConfirmRejectClass::EngineFault,
                                                     e.to_string(),
                                                     1,
+                                                    None,
                                                 );
                                             }
                                             None => {
