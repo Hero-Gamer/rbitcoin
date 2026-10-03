@@ -140,114 +140,82 @@ fn build_signet_txs(
     Ok((to_spend, to_sign))
 }
 
+/// Core `CScript << std::span<const std::byte>`: direct push below 76 bytes, then
+/// PUSHDATA1, PUSHDATA2, or PUSHDATA4. A one-byte payload is not turned into `OP_N`.
 fn push_data(out: &mut Vec<u8>, data: &[u8]) {
     if data.len() < 0x4c {
         out.push(data.len() as u8);
-        out.extend_from_slice(data);
-    } else if data.len() <= 0xff {
+    } else if let Ok(n) = u8::try_from(data.len()) {
         out.push(0x4c);
-        out.push(data.len() as u8);
-        out.extend_from_slice(data);
-    } else {
+        out.push(n);
+    } else if let Ok(n) = u16::try_from(data.len()) {
         out.push(0x4d);
-        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        out.extend_from_slice(data);
+        out.extend_from_slice(&n.to_le_bytes());
+    } else {
+        out.push(0x4e);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     }
+    out.extend_from_slice(data);
 }
 
 fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
     crate::block::witness_commitment_vout_index(coinbase)
 }
 
-/// Extract signet solution after SIGNET_HEADER; return (solution, rewritten script).
+/// Core `GetScriptOp`: the opcode at `pc` and its push payload (empty for a non-push).
+/// `None` at the end of the script or on a truncated push.
+fn next_script_op<'a>(spk: &'a [u8], pc: &mut usize) -> Option<(u8, &'a [u8])> {
+    let op = *spk.get(*pc)?;
+    let mut at = *pc + 1;
+    let len = match op {
+        0x01..=0x4b => usize::from(op),
+        0x4c => {
+            let n = *spk.get(at)?;
+            at += 1;
+            usize::from(n)
+        }
+        0x4d => {
+            let n = spk.get(at..at + 2)?;
+            at += 2;
+            usize::from(u16::from_le_bytes([n[0], n[1]]))
+        }
+        0x4e => {
+            let n = spk.get(at..at + 4)?;
+            at += 4;
+            usize::try_from(u32::from_le_bytes([n[0], n[1], n[2], n[3]])).ok()?
+        }
+        _ => 0,
+    };
+    let end = at.checked_add(len)?;
+    let data = spk.get(at..end)?;
+    *pc = end;
+    Some((op, data))
+}
+
+/// Core `FetchAndClearCommitmentSection`: take the payload after SIGNET_HEADER from the
+/// first push that holds the header and some data; return (solution, rewritten script).
+///
+/// The rewrite stops at a truncated push. An empty push (OP_0 or a zero-length
+/// PUSHDATA1/2/4) is re-emitted as its bare opcode, and a non-empty push through
+/// [`push_data`], so the modified coinbase txid matches Core.
 fn fetch_and_clear_signet_section(spk: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut pc = 0usize;
     let mut solution: Option<Vec<u8>> = None;
-    let mut replacement = Vec::new();
+    let mut replacement = Vec::with_capacity(spk.len());
 
-    while pc < spk.len() {
-        let op = spk[pc];
-        pc += 1;
-        if op == 0x00 {
-            replacement.push(0x00);
+    while let Some((op, data)) = next_script_op(spk, &mut pc) {
+        if data.is_empty() {
+            replacement.push(op);
             continue;
         }
-        if (1..=75).contains(&op) {
-            let n = op as usize;
-            if pc + n > spk.len() {
-                break;
+        if solution.is_none() {
+            if let Some(sol) = extract_header_payload(data) {
+                solution = Some(sol);
+                push_data(&mut replacement, &SIGNET_HEADER);
+                continue;
             }
-            let data = &spk[pc..pc + n];
-            pc += n;
-            if solution.is_none() {
-                if let Some(sol) = extract_header_payload(data) {
-                    solution = Some(sol);
-                    // Keep only the 4-byte header in the rewritten push (Core behaviour).
-                    push_data(&mut replacement, &SIGNET_HEADER);
-                    continue;
-                }
-            }
-            push_data(&mut replacement, data);
-            continue;
         }
-        if op == 0x4c && pc < spk.len() {
-            let n = spk[pc] as usize;
-            pc += 1;
-            if pc + n > spk.len() {
-                break;
-            }
-            let data = &spk[pc..pc + n];
-            pc += n;
-            if solution.is_none() {
-                if let Some(sol) = extract_header_payload(data) {
-                    solution = Some(sol);
-                    push_data(&mut replacement, &SIGNET_HEADER);
-                    continue;
-                }
-            }
-            push_data(&mut replacement, data);
-            continue;
-        }
-        if op == 0x4d && pc + 1 < spk.len() {
-            let n = u16::from_le_bytes([spk[pc], spk[pc + 1]]) as usize;
-            pc += 2;
-            if pc + n > spk.len() {
-                break;
-            }
-            let data = &spk[pc..pc + n];
-            pc += n;
-            if solution.is_none() {
-                if let Some(sol) = extract_header_payload(data) {
-                    solution = Some(sol);
-                    push_data(&mut replacement, &SIGNET_HEADER);
-                    continue;
-                }
-            }
-            push_data(&mut replacement, data);
-            continue;
-        }
-        if op == 0x4e && pc + 3 < spk.len() {
-            let n = u32::from_le_bytes([spk[pc], spk[pc + 1], spk[pc + 2], spk[pc + 3]]) as usize;
-            pc += 4;
-            if pc + n > spk.len() {
-                break;
-            }
-            let data = &spk[pc..pc + n];
-            pc += n;
-            if solution.is_none() {
-                if let Some(sol) = extract_header_payload(data) {
-                    solution = Some(sol);
-                    push_data(&mut replacement, &SIGNET_HEADER);
-                    continue;
-                }
-            }
-            push_data(&mut replacement, data);
-            continue;
-        }
-        if matches!(op, 0x4c..=0x4e) {
-            break;
-        }
-        replacement.push(op);
+        push_data(&mut replacement, data);
     }
 
     solution.map(|sol| (sol, replacement))
@@ -668,6 +636,35 @@ mod tests {
     }
 
     #[test]
+    fn signet_section_reencodes_pushes_like_core_cscript() {
+        // Core FetchAndClearCommitmentSection: an empty push (OP_0 or a zero-length
+        // PUSHDATA1/2/4) is re-emitted as its bare opcode; a non-empty push goes
+        // through CScript `<<` (direct, PUSHDATA1, PUSHDATA2, or PUSHDATA4).
+        let mut spk = vec![0x6a, 0x4c, 0x00, 0x05];
+        spk.extend_from_slice(&SIGNET_HEADER);
+        spk.extend_from_slice(&[0x11, 0x4d, 0x00, 0x00, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let (sol, repl) = fetch_and_clear_signet_section(&spk).expect("section");
+        assert_eq!(sol, vec![0x11]);
+        let mut want = vec![0x6a, 0x4c, 0x04];
+        want.extend_from_slice(&SIGNET_HEADER);
+        want.extend_from_slice(&[0x4d, 0x4e, 0x00]);
+        assert_eq!(repl, want);
+
+        let big = vec![0x22u8; 0x1_0000];
+        let mut spk = vec![0x05];
+        spk.extend_from_slice(&SIGNET_HEADER);
+        spk.push(0x11);
+        spk.extend_from_slice(&[0x4e, 0x00, 0x00, 0x01, 0x00]);
+        spk.extend_from_slice(&big);
+        let (_, repl) = fetch_and_clear_signet_section(&spk).expect("section");
+        let mut want = vec![0x04];
+        want.extend_from_slice(&SIGNET_HEADER);
+        want.extend_from_slice(&[0x4e, 0x00, 0x00, 0x01, 0x00]);
+        want.extend_from_slice(&big);
+        assert_eq!(repl, want);
+    }
+
+    #[test]
     fn modified_merkle_odd_leaf_count() {
         let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
         let block: Block = deserialize(raw).unwrap();
@@ -785,13 +782,13 @@ mod tests {
 
     #[test]
     fn push_data_mid_and_unknown_op_passthrough() {
-        // push_data uses PUSHDATA2 for len > 0xff (no PUSHDATA4 branch).
+        // push_data uses PUSHDATA2 for 0xff < len <= 0xffff.
         let mid = vec![0u8; 300];
         let mut out = Vec::new();
         push_data(&mut out, &mid);
         assert_eq!(out[0], 0x4d);
         assert_eq!(u16::from_le_bytes([out[1], out[2]]), 300);
-        // Bare 0x4e is treated as a non-push opcode (no solution).
+        // Truncated PUSHDATA4 stops the scan (no solution).
         assert!(fetch_and_clear_signet_section(&[0x4e, 0x05, 0x00, 0x00, 0x00, 0x01]).is_none());
         // OP_RETURN + OP_TRUE: no signet header → None.
         assert!(fetch_and_clear_signet_section(&[0x6a, 0x51]).is_none());
