@@ -740,13 +740,6 @@ pub(crate) fn issue_batch(
     let batch: Vec<BlockHash> = batch
         .into_iter()
         .filter(|h| {
-            if st
-                .notfound_by
-                .get(h)
-                .is_some_and(|peers| peers.contains(&pid))
-            {
-                return false;
-            }
             if st.slots[idx].in_flight.contains(h) {
                 return false;
             }
@@ -1659,25 +1652,6 @@ pub(in crate::ibd) mod tests {
         assert_eq!(st.slots[0].rate.progress_ms, 42);
         assert!(st.slots[0].rate.work_started_ms >= t0);
         assert!(st.slots[0].rate.work_started_ms <= t1);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn issue_one_skips_peer_that_notfound_the_hash() {
-        let (dir, _hub) = tmp_hub();
-        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
-        let hash = h(30);
-        st.notfound_by.entry(hash).or_default().insert(0);
-        let mut room = 4usize;
-        let mut issued = 0u64;
-        assert!(
-            !issue_one(&mut st, 0, hash, &mut room, &mut issued),
-            "notfound peer is not asked again"
-        );
-        assert!(st.inflight.is_empty());
-        assert!(issue_one(&mut st, 1, hash, &mut room, &mut issued));
-        assert!(st.slots[1].in_flight.contains(&hash));
-        assert!(!st.slots[0].in_flight.contains(&hash));
         let _ = std::fs::remove_dir_all(dir);
     }
 

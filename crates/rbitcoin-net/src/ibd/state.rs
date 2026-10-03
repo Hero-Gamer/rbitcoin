@@ -184,9 +184,6 @@ pub(crate) struct IbdWorkState {
     pub(crate) block_lens: VecDeque<u32>,
     /// Checkpoints for headers past the download queue.
     pub header_walk: super::header_walk::HeaderWalk,
-    /// Peers that answered `notfound` for a block hash. Do not ask them again
-    /// this IBD: they do not have the block, and a retry waits out the stall floor.
-    pub(crate) notfound_by: HashMap<BlockHash, HashSet<usize>>,
 }
 
 impl IbdWorkState {
@@ -247,7 +244,6 @@ impl IbdWorkState {
             intake_queued: 0,
             block_lens: VecDeque::new(),
             header_walk: super::header_walk::HeaderWalk::default(),
-            notfound_by: HashMap::new(),
         }
     }
 

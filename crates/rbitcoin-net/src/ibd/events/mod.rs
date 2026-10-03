@@ -646,9 +646,6 @@ fn apply_block_decode_failed(st: &mut IbdWorkState, peer: usize, hash: BlockHash
 
 fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     note_block_progress(&mut st.slots, peer);
-    for h in &hashes {
-        st.notfound_by.entry(*h).or_default().insert(peer);
-    }
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {
