@@ -2917,7 +2917,13 @@ async fn serve_getdata(
     for item in inv {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                serve_getdata_full_block(hub, out_tx, session, inflight, h).await?;
+                // Unknown hash: Core ProcessGetData answers notfound. Silence
+                // holds the requester's getdata until the stall floor.
+                if hub.header_of(h).is_none() {
+                    notfound.push(*item);
+                } else {
+                    serve_getdata_full_block(hub, out_tx, session, inflight, h).await?;
+                }
             }
             Inventory::CompactBlock(h) => {
                 serve_getdata_compact(hub, out_tx, follow, session, inflight, h)?;

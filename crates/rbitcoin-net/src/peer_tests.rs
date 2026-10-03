@@ -958,6 +958,25 @@ fn handle_peer_frame_control_and_inv_paths() {
             other => panic!("expected GetHeaders for unknown inv, got {other:?}"),
         }
 
+        // GetData for a block this node has never seen → notfound, not silence.
+        handle_peer_frame(
+            frame_for(NetworkMessage::GetData(vec![Inventory::WitnessBlock(
+                want2,
+            )])),
+            &hub,
+            &out_tx,
+            &mut follow,
+            None,
+        )
+        .await
+        .unwrap();
+        match out_rx.try_recv().unwrap().expect_msg() {
+            NetworkMessage::NotFound(v) => {
+                assert_eq!(v, vec![Inventory::WitnessBlock(want2)]);
+            }
+            other => panic!("expected NotFound for unknown block getdata, got {other:?}"),
+        }
+
         // Inv for known tip → no GetData.
         handle_peer_frame(
             frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(tip)])),
