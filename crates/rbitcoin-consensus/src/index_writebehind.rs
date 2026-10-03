@@ -612,11 +612,14 @@ mod tests {
     }
 
     /// Seal from the current watermarks through the released tip.
-    fn drive_index_pass(query: &Query) -> Vec<String> {
+    /// `hold_first` blocks the first window so a later window in the same
+    /// pass can cross [`PROGRESS_EVERY`].
+    fn drive_index_pass(query: &Query, hold_first: Duration) -> Vec<String> {
         let stop = AtomicBool::new(false);
         let resync = AtomicBool::new(false);
         let stages = IndexStageMs::default();
-        let (tx, rx) = sync_channel(2);
+        let (tx, rx) = sync_channel(0);
+        let (worker_tx, worker_rx) = sync_channel(2);
         let forced = AtomicBool::new(false);
         let started = Instant::now();
         let logs = std::thread::scope(|scope| {
@@ -633,8 +636,18 @@ mod tests {
             let worker = scope.spawn(|| {
                 rbitcoin_log::capture_logs(false);
                 rbitcoin_log::capture_logs(true);
-                cpu_worker(query, rx, &resync, &stages).unwrap();
+                cpu_worker(query, worker_rx, &resync, &stages).unwrap();
                 rbitcoin_log::take_logs()
+            });
+            let forward = scope.spawn(move || {
+                if !hold_first.is_zero() {
+                    std::thread::sleep(hold_first);
+                }
+                while let Ok(window) = rx.recv() {
+                    if worker_tx.send(window).is_err() {
+                        break;
+                    }
+                }
             });
             rbitcoin_log::capture_logs(false);
             rbitcoin_log::capture_logs(true);
@@ -646,6 +659,7 @@ mod tests {
             rbitcoin_log::capture_logs(false);
             stop.store(true, Ordering::Relaxed);
             drop(tx);
+            forward.join().unwrap();
             logs.extend(worker.join().unwrap());
             logs
         });
@@ -922,12 +936,21 @@ mod tests {
         let pass_tip = resume + WINDOW_HEIGHTS;
         connect_coinbases(&q, resume, pass_tip, &mut prev_fk, &mut prev_hash);
         q.release_index_writebehind(Height(pass_tip));
-        let lines = drive_index_pass(&q);
+        let lines = drive_index_pass(&q, PROGRESS_EVERY + Duration::from_secs(2));
         let heights = pass_tip + 1 - resume;
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains(&format!("heights={heights} elapsed"))),
+            "{lines:?}"
+        );
+        let progress: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("index: build next="))
+            .collect();
+        assert_eq!(progress.len(), 1, "{lines:?}");
+        assert!(
+            progress[0].contains(&format!("next={pass_tip} tip=")),
             "{lines:?}"
         );
         assert_eq!(q.filter_index_next(), Some(pass_tip + 1));
@@ -937,7 +960,7 @@ mod tests {
         let short_tip = short_from + 10;
         connect_coinbases(&q, short_from, short_tip, &mut prev_fk, &mut prev_hash);
         q.release_index_writebehind(Height(short_tip));
-        let lines = drive_index_pass(&q);
+        let lines = drive_index_pass(&q, Duration::ZERO);
         assert!(
             lines
                 .iter()
