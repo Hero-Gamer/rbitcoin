@@ -1591,7 +1591,14 @@ pub(crate) fn structural_validate_spends(
     let spent_pending_ns = t_pending.elapsed().as_nanos() as u64;
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
     let t_create = Instant::now();
-    structural_create_heights(query, batch_parents, ctx.height.0, maturity, scratch)?;
+    structural_create_heights(
+        query,
+        batch_parents,
+        run_create_height,
+        ctx.height.0,
+        maturity,
+        scratch,
+    )?;
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
     let t_bip68 = Instant::now();
     structural_bip68(
@@ -1622,9 +1629,10 @@ pub(crate) type StructuralAbsJob = (u64, u32, u64, rbitcoin_primitives::Fk, u32)
 ///
 /// Contiguous per-block fk spans are the IBD shape (`first` + count). A gap
 /// or overlap uses the map so a fk between spans does not inherit a height.
+/// Each block's first fk is its coinbase: a span's `first`, or the map's flag.
 pub(crate) enum RunCreateHeight {
     Spans(Vec<(u64, u64, u32)>),
-    Map(FkMap<u32>),
+    Map(FkMap<(u32, bool)>),
 }
 
 impl RunCreateHeight {
@@ -1637,8 +1645,8 @@ impl RunCreateHeight {
         } else {
             let mut map = FkMap::default();
             for (height, fks) in blocks {
-                for fk in fks {
-                    map.insert(*fk, height);
+                for (i, fk) in fks.iter().enumerate() {
+                    map.insert(*fk, (height, i == 0));
                 }
             }
             Self::Map(map)
@@ -1646,13 +1654,18 @@ impl RunCreateHeight {
     }
 
     pub(crate) fn get(&self, fk: rbitcoin_primitives::Fk) -> Option<u32> {
+        self.create(fk).map(|(height, _)| height)
+    }
+
+    /// Height of a create in this batch and whether it is its block's coinbase.
+    pub(crate) fn create(&self, fk: rbitcoin_primitives::Fk) -> Option<(u32, bool)> {
         match self {
             Self::Map(map) => map.get(&fk).copied(),
             Self::Spans(spans) => {
                 let id = fk.get()?;
                 let i = spans.partition_point(|span| span.0 <= id);
-                let (_, end, height) = spans.get(i.checked_sub(1)?)?;
-                (*end > id).then_some(*height)
+                let (first, end, height) = spans.get(i.checked_sub(1)?)?;
+                (*end > id).then_some((*height, *first == id))
             }
         }
     }
@@ -1973,13 +1986,20 @@ fn structural_mark_pending(
 fn structural_create_heights(
     query: &Query,
     batch_parents: &rbitcoin_query::BatchParents,
+    run_create_height: &RunCreateHeight,
     spend_height: u32,
     maturity: u32,
     scratch: &mut StructuralScratch,
 ) -> Result<(), ConsensusError> {
-    scratch
-        .height_list
-        .extend(scratch.height_by_id.values().copied());
+    // `confirmed[h]` for a height in this batch is written at Class C, after
+    // structural; the batch index owns coinbase identity there.
+    scratch.height_list.extend(
+        scratch
+            .height_by_id
+            .iter()
+            .filter(|&(&id, &h)| run_create_height.get(rbitcoin_primitives::Fk(id)) != Some(h))
+            .map(|(_, &h)| h),
+    );
     scratch.height_list.sort_unstable();
     scratch.height_list.dedup();
     let coinbase_fk_by_height = query
@@ -1995,14 +2015,19 @@ fn structural_create_heights(
         let Some(&durable_h) = scratch.height_by_id.get(&id) else {
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
-        if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
-            scratch.create_height_by_fk.insert(create_fk, durable_h);
-            continue;
-        }
-        let is_cb = batch_parents.get_parent_coinbase(create_fk) == Some(true)
-            || coinbase_fk_by_height
-                .get(&durable_h)
-                .is_some_and(|cb| *cb == create_fk);
+        let pin_cb = batch_parents.get_parent_coinbase(create_fk);
+        let is_cb = match (pin_cb, run_create_height.create(create_fk)) {
+            (Some(cb), _) => cb,
+            (None, Some((h, cb))) if h == durable_h => cb,
+            (None, _) => {
+                let cb = coinbase_fk_by_height
+                    .get(&durable_h)
+                    .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                        "invariant: no coinbase fk at confirmed create height",
+                    )))?;
+                *cb == create_fk
+            }
+        };
         if is_cb && spend_height < durable_h.saturating_add(maturity) {
             return Err(ConsensusError::BadTx("coinbase immature"));
         }
@@ -2441,7 +2466,7 @@ mod overlay_meta_skip_tests {
     #[test]
     fn overlay_meta_skip_omits_matching_abs() {
         let mut map = FkMap::default();
-        map.insert(Fk(10), 5);
+        map.insert(Fk(10), (5, false));
         let run = RunCreateHeight::Map(map);
         let spends = spends(&[(0, Fk(11), Fk(10), 0)]);
         let mut scratch = StructuralScratch::default();
@@ -2455,7 +2480,7 @@ mod overlay_meta_skip_tests {
     #[test]
     fn overlay_meta_skip_keeps_conflicting_spender_on_disk_list() {
         let mut map = FkMap::default();
-        map.insert(Fk(10), 5);
+        map.insert(Fk(10), (5, false));
         let run = RunCreateHeight::Map(map);
         let spends = spends(&[(0, Fk(11), Fk(10), 0), (0, Fk(12), Fk(10), 0)]);
         let mut scratch = StructuralScratch::default();
@@ -2507,6 +2532,27 @@ mod run_create_height_tests {
         assert_eq!(idx.get(fk(1)), Some(3));
         assert_eq!(idx.get(fk(2)), Some(3));
         assert_eq!(idx.get(fk(4)), Some(3));
+    }
+
+    #[test]
+    fn run_create_height_marks_each_block_first_fk_coinbase() {
+        let low = [fk(10), fk(11)];
+        let high = [fk(12), fk(13)];
+        let idx = RunCreateHeight::from_blocks([(1u32, low.as_slice()), (2, high.as_slice())]);
+        assert!(matches!(idx, RunCreateHeight::Spans(_)));
+        assert_eq!(idx.create(fk(10)), Some((1, true)));
+        assert_eq!(idx.create(fk(11)), Some((1, false)));
+        assert_eq!(idx.create(fk(12)), Some((2, true)));
+        assert_eq!(idx.create(fk(13)), Some((2, false)));
+
+        let gapped = [fk(20), fk(22)];
+        let idx = RunCreateHeight::from_blocks([(1u32, low.as_slice()), (2, gapped.as_slice())]);
+        assert!(matches!(idx, RunCreateHeight::Map(_)));
+        assert_eq!(idx.create(fk(10)), Some((1, true)));
+        assert_eq!(idx.create(fk(11)), Some((1, false)));
+        assert_eq!(idx.create(fk(20)), Some((2, true)));
+        assert_eq!(idx.create(fk(22)), Some((2, false)));
+        assert_eq!(idx.create(fk(21)), None);
     }
 }
 

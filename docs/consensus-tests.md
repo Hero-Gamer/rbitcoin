@@ -136,6 +136,7 @@ version floors and exact +2h).
 | C26 | P2SH scriptSig eval + IsPushOnly | `script too large` / accept OP_1NEGATE | `p2sh_legacy_op_1negate_scriptsig_accepted`, `p2sh_legacy_scriptsig_over_10k_rejected` |
 | C22 | Subsidy halving interval from params | 50 BTC until interval | `p1_block_subsidy_halvings`; `rejects_coinbase_excess_value_fast`; journey overlay interval=2: `header_and_spending_boundaries` |
 | C27 | Captured signet/mainnet script-edge wire blocks (not Core JSON) | hash / opcode presence; detached verify | `script_edge_fixtures` |
+| C28 | Coinbase maturity (`COINBASE_MATURITY`) when the coinbase and its spender are in different blocks of one confirm batch | `BadTx("coinbase immature")` at created+99; created+100 accepts | `consensus_rules::coinbase_maturity_holds_inside_one_confirm_batch`; one-block-per-batch: `header_and_spending_boundaries` |
 
 ## Adding a new rule
 
