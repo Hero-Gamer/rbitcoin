@@ -1092,8 +1092,7 @@ fn summaries_json(
     query: &Query,
     items: &[ScriptHashTxSummary],
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let mut positions: std::collections::HashMap<u32, Vec<rbitcoin_primitives::Fk>> =
-        std::collections::HashMap::new();
+    let mut spans: HashMap<u32, (rbitcoin_primitives::Fk, u32)> = HashMap::new();
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         let time = if it.height >= 0 {
@@ -1112,11 +1111,16 @@ fn summaries_json(
         });
         if it.height >= 0 && !it.tx_fk.is_null() {
             let h = it.height as u32;
-            if let std::collections::hash_map::Entry::Vacant(e) = positions.entry(h) {
-                e.insert(query.block_tx_fks(Height(h))?);
-            }
-            if let Some(pos) = positions[&h].iter().position(|fk| *fk == it.tx_fk) {
-                row["tx_position"] = json!(pos as u32);
+            let span = match spans.entry(h) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    *e.insert(query.tx_fk_span_at_height(Height(h))?)
+                }
+            };
+            if let Some(pos) =
+                rbitcoin_store::HeaderTxsTable::index_in_span(span.0, span.1, it.tx_fk)
+            {
+                row["tx_position"] = json!(pos);
             }
         }
         out.push(row);

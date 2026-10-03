@@ -978,6 +978,12 @@ mod chain_table_tests {
         assert!(!ht.contains_tx(Fk(1), Fk(9)).unwrap());
         assert!(!ht.contains_tx(Fk(1), Fk(13)).unwrap());
         assert!(!ht.contains_tx(Fk(2), Fk(10)).unwrap(), "other header");
+        assert_eq!(ht.tx_index(Fk(1), Fk(10)).unwrap(), Some(0));
+        assert_eq!(ht.tx_index(Fk(1), Fk(12)).unwrap(), Some(2));
+        assert_eq!(ht.tx_index(Fk(1), Fk(9)).unwrap(), None);
+        assert_eq!(ht.tx_index(Fk(1), Fk(13)).unwrap(), None);
+        assert_eq!(ht.tx_index(Fk(1), Fk::NULL).unwrap(), None);
+        assert_eq!(ht.tx_index(Fk(2), Fk(10)).unwrap(), None, "other header");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1123,18 +1129,33 @@ impl HeaderTxsTable {
         Ok(self.get_range(header_fk)?.is_some())
     }
 
+    /// Index of `tx_fk` inside a contiguous `(first, count)` span.
+    pub fn index_in_span(first: Fk, n: u32, tx_fk: Fk) -> Option<u32> {
+        let tid = tx_fk.get()?;
+        let lo = first.get()?;
+        if n == 0 {
+            return None;
+        }
+        let end = lo.saturating_add(u64::from(n));
+        if tid < lo || tid >= end {
+            return None;
+        }
+        u32::try_from(tid - lo).ok()
+    }
+
     /// True if `tx_fk` is in this header's contiguous Class A body range.
     pub fn contains_tx(&self, header_fk: Fk, tx_fk: Fk) -> Result<bool, StoreError> {
-        let Some(tid) = tx_fk.get() else {
-            return Ok(false);
-        };
+        Ok(self.tx_index(header_fk, tx_fk)?.is_some())
+    }
+
+    /// Index of `tx_fk` in this header's contiguous Class A range.
+    ///
+    /// One `(first, count)` read. Does not expand the block's fk list.
+    pub fn tx_index(&self, header_fk: Fk, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
         let Some((first, n)) = self.get_range(header_fk)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let Some(lo) = first.get() else {
-            return Ok(false);
-        };
-        Ok(tid >= lo && tid < lo.saturating_add(u64::from(n)))
+        Ok(Self::index_in_span(first, n, tx_fk))
     }
 
     /// Drop Class A body association for `header_fk` (does not free tx rows).

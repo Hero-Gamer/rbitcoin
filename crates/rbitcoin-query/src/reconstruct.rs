@@ -199,6 +199,23 @@ impl Query {
             .ok_or(StoreError::Corrupt("confirmed header missing body list"))
     }
 
+    /// Contiguous Class A fk span for the confirmed block at `height`.
+    ///
+    /// Position in the block is [`rbitcoin_store::HeaderTxsTable::index_in_span`].
+    /// This does not expand the block's fk list. A confirmed header with no
+    /// body span is the same corrupt miss as [`Self::block_tx_fks`].
+    pub fn tx_fk_span_at_height(&self, height: Height) -> Result<(Fk, u32), QueryError> {
+        let header_fk = self
+            .store
+            .confirmed
+            .get(height)?
+            .ok_or(StoreError::NotFound)?;
+        self.store
+            .header_txs
+            .get_range(header_fk)?
+            .ok_or(StoreError::Corrupt("confirmed header missing body list"))
+    }
+
     fn contiguous_fk_run(fks: &[Fk]) -> Option<(u64, u64)> {
         let first = fks.first()?.get()?;
         if first == 0 {
