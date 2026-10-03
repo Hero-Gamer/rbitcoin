@@ -633,6 +633,7 @@ fn apply_block_framed(
         {
             warn!("ibd: peer[{peer}] block {hash} h={height}: {why}; dropping peer");
             st.body.mark_missing(hash);
+            st.reopen_for_densify(&[hash]);
             disconnect_peer(
                 &mut st.slots,
                 &mut st.addr_cooldown,
@@ -925,6 +926,7 @@ fn apply_soft_wire_reject(
         // verdict, so the pipeline is not stuck repeating that cascade.
         st.cascade_at = None;
         st.body.mark_missing(hash);
+        st.reopen_for_densify(&[hash]);
         st.body.demote_known(hash);
         st.reopen_for_densify(&[hash]);
         warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
