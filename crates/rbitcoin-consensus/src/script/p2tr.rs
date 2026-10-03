@@ -414,6 +414,31 @@ mod bip341_tests {
         script::verify_job_all_inputs(&job).expect("1 CHECKSIG within budget");
     }
 
+    /// Tapscript has no opcode limit, so `(OP_1 OP_IF)×K OP_1 OP_ENDIF×K` must
+    /// cost O(K) like Core's `ConditionStack`, not O(K²). At this depth a
+    /// per-opcode scan of the condition stack runs for tens of seconds.
+    #[test]
+    fn script_path_deep_if_nesting_verifies_in_linear_time() {
+        const DEPTH: usize = 100_000;
+        let mut leaf = [0x51u8, 0x63].repeat(DEPTH);
+        leaf.push(0x51);
+        leaf.extend(std::iter::repeat_n(0x68u8, DEPTH));
+
+        let (job, _) = make_script_path_spend_with(&leaf, &[]);
+        let started = std::time::Instant::now();
+        script::verify_job_all_inputs(&job).expect("deep nested IF");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "deep IF nesting took {elapsed:?}"
+        );
+
+        leaf.pop();
+        let (job, _) = make_script_path_spend_with(&leaf, &[]);
+        let err = script::verify_job_all_inputs(&job).expect_err("one ENDIF short");
+        assert!(format!("{err}").contains("unbalanced IF"), "{err}");
+    }
+
     /// Core ExecuteWitnessScript: every initial tapscript witness element ≤ 520.
     #[test]
     fn script_path_rejects_initial_element_over_520() {

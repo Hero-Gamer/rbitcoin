@@ -383,6 +383,53 @@ pub(crate) fn eval_script_sig_pushes(
     Ok(())
 }
 
+/// Core `ConditionStack`: IF/NOTIF/ELSE nesting as a depth plus the index of
+/// the first false entry, so the per-opcode "executing" check is O(1).
+///
+/// Tapscript has no opcode limit; a `Vec<bool>` scanned on every opcode is
+/// quadratic in nesting depth. Toggling an entry above the first false one
+/// is unobservable, so only that index is tracked.
+#[derive(Default)]
+struct ConditionStack {
+    size: usize,
+    first_false: Option<usize>,
+}
+
+impl ConditionStack {
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    fn all_true(&self) -> bool {
+        self.first_false.is_none()
+    }
+
+    fn push(&mut self, value: bool) {
+        if self.first_false.is_none() && !value {
+            self.first_false = Some(self.size);
+        }
+        self.size += 1;
+    }
+
+    /// Caller checks [`Self::is_empty`] first (`OP_ENDIF` without `OP_IF`).
+    fn pop(&mut self) {
+        self.size -= 1;
+        if self.first_false == Some(self.size) {
+            self.first_false = None;
+        }
+    }
+
+    /// Caller checks [`Self::is_empty`] first (`OP_ELSE` without `OP_IF`).
+    fn toggle_top(&mut self) {
+        let top = self.size - 1;
+        match self.first_false {
+            None => self.first_false = Some(top),
+            Some(pos) if pos == top => self.first_false = None,
+            Some(_) => {}
+        }
+    }
+}
+
 /// Evaluate `script`. On success returns `true` if cleanstack must still be
 /// checked; `false` if the script already fully succeeded (e.g. OP_SUCCESS).
 pub(crate) fn eval_script(
@@ -412,7 +459,7 @@ pub(crate) fn eval_script(
     }
 
     let mut altstack: Vec<Vec<u8>> = Vec::new();
-    let mut if_stack: Vec<bool> = Vec::new();
+    let mut cond_stack = ConditionStack::default();
     let mut op_count = 0usize;
     let enforce_op_limit = ctx.sig_version != SigVersion::TapScript;
     // TapScript always MINIMALIF. SCRIPT_VERIFY_MINIMALIF applies to witness v0
@@ -427,7 +474,7 @@ pub(crate) fn eval_script(
         let (byte_index, ins) = item.map_err(|_| ConsensusError::Script("script parse".into()))?;
         let this_pos = opcode_pos;
         opcode_pos = opcode_pos.saturating_add(1);
-        let executing = if_stack.iter().all(|&x| x);
+        let executing = cond_stack.all_true();
 
         match ins {
             Instruction::PushBytes(b) => {
@@ -471,7 +518,7 @@ pub(crate) fn eval_script(
                             }
                             cond = cast_to_bool(&v);
                         }
-                        if_stack.push(executing && cond);
+                        cond_stack.push(executing && cond);
                         continue;
                     }
                     0x64 => {
@@ -483,21 +530,21 @@ pub(crate) fn eval_script(
                             }
                             cond = !cast_to_bool(&v);
                         }
-                        if_stack.push(executing && cond);
+                        cond_stack.push(executing && cond);
                         continue;
                     }
                     0x67 => {
-                        if if_stack.is_empty() {
+                        if cond_stack.is_empty() {
                             return Err(ConsensusError::Script("OP_ELSE".into()));
                         }
-                        let last = if_stack.last_mut().unwrap();
-                        *last = !*last;
+                        cond_stack.toggle_top();
                         continue;
                     }
                     0x68 => {
-                        if if_stack.pop().is_none() {
+                        if cond_stack.is_empty() {
                             return Err(ConsensusError::Script("OP_ENDIF".into()));
                         }
+                        cond_stack.pop();
                         continue;
                     }
                     _ => {}
@@ -887,7 +934,7 @@ pub(crate) fn eval_script(
         }
     }
 
-    if !if_stack.is_empty() {
+    if !cond_stack.is_empty() {
         return Err(ConsensusError::Script("unbalanced IF".into()));
     }
     Ok(true)
