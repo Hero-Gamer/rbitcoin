@@ -684,7 +684,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    if tip_follow_ready && !shutdown.requested() && addrman.is_empty() {
+    if tip_follow_ready
+        && !shutdown.requested()
+        && addrman.is_empty()
+        && seednodes_allowed(&config.listen)
+    {
         for raw in &config.listen.seednodes {
             let addr = match resolve_seednode(raw, config.network) {
                 Ok(a) => a,
@@ -700,7 +704,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
         }
     }
-    if !shutdown.requested() && seednode_fallback_armed(&config.listen, addrman.is_empty()) {
+    if !shutdown.requested() && !addrman.is_empty() && seednodes_allowed(&config.listen) {
         const ADD_NEXT_SEEDNODE_SECS: u64 = 10;
         let seeds = config.listen.seednodes.clone();
         let network = config.network;
@@ -2119,12 +2123,12 @@ pub(crate) fn follow_dial_type(connect: &[rbitcoin_net::NetAddr]) -> PeerConnTyp
     }
 }
 
-/// Whether to arm the 10 s `--seednode` addr-fetch fallback (it fires when
-/// fewer than 2 outbound full-relay peers are live). Core never dials
-/// seednodes under `-connect`, and `--connect` peers are `manual`, so they
-/// would never hold those slots off.
-pub(crate) fn seednode_fallback_armed(listen: &ListenOpts, book_empty: bool) -> bool {
-    !listen.seednodes.is_empty() && !book_empty && !listen.has_pinned_connect()
+/// Whether `--seednode` may be dialled as addr-fetch: at startup with an
+/// empty addrman, or by the 10 s fallback when fewer than 2 outbound
+/// full-relay peers are live. Core never dials seednodes under `-connect`.
+/// `--connect` peers are `manual`, so they would never hold the fallback off.
+pub(crate) fn seednodes_allowed(listen: &ListenOpts) -> bool {
+    !listen.seednodes.is_empty() && !listen.has_pinned_connect()
 }
 
 /// Whether this wake should run the stale-tip redial check.
@@ -2277,28 +2281,21 @@ mod tests {
     }
 
     #[test]
-    fn seednode_fallback_is_off_under_connect() {
+    fn seednodes_are_off_under_connect() {
         let mut listen = NodeConfig::default().listen;
-        assert!(!seednode_fallback_armed(&listen, false), "no seednodes");
+        assert!(!seednodes_allowed(&listen), "no seednodes");
         listen.seednodes = vec!["127.0.0.1:18444".into()];
-        assert!(seednode_fallback_armed(&listen, false));
-        assert!(
-            !seednode_fallback_armed(&listen, true),
-            "empty book takes the startup path"
-        );
+        assert!(seednodes_allowed(&listen));
         listen.connect = vec![rbitcoin_net::NetAddr::Ip(
             "127.0.0.1:18445".parse().unwrap(),
         )];
         assert!(
-            !seednode_fallback_armed(&listen, false),
+            !seednodes_allowed(&listen),
             "Core skips seednodes under -connect"
         );
         listen.connect.clear();
         listen.connect_dns = vec!["localhost:18445".into()];
-        assert!(
-            !seednode_fallback_armed(&listen, false),
-            "a --connect hostname pins too"
-        );
+        assert!(!seednodes_allowed(&listen), "a --connect hostname pins too");
     }
 
     #[test]

@@ -5,5 +5,5 @@ Fixed
   preferred download peers, and so does this node now: one whose outbound
   peers all come from `--connect` or `addnode` replaces a stalling
   headers-sync peer instead of waiting on it. As in Core, a `--connect` peer
-  is no longer dropped for missing `NODE_NETWORK`, and the 10 s
-  `--seednode` fallback does not run under `--connect`.
+  is no longer dropped for missing `NODE_NETWORK`, and `--seednode` is not
+  dialled under `--connect`.
