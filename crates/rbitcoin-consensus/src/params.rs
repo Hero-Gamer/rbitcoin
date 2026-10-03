@@ -59,8 +59,9 @@ impl ChainParams {
         let genesis = constants::genesis_block(Network::Regtest);
         let mut btc = BtcParams::new(Network::Regtest);
         // rust-bitcoin still carries Core's historical regtest heights
-        // (BIP65=1351, BIP66=1251). Modern Core sets both to 1.
-        // BIP34 stays at rust-bitcoin's 100_000_000 (in-tree tests pin that).
+        // (BIP34=100_000_000, BIP65=1351, BIP66=1251). Core `CRegTestParams`
+        // sets all three to 1.
+        btc.bip34_height = 1;
         btc.bip65_height = 1;
         btc.bip66_height = 1;
         Self {
@@ -560,7 +561,8 @@ mod tests {
         );
         assert!(ChainParams::signet().bip34_hash.is_none());
         assert!(ChainParams::regtest().bip34_hash.is_none());
-        assert_eq!(ChainParams::regtest().btc.bip34_height, 100_000_000);
+        assert_eq!(ChainParams::regtest().btc.bip34_height, 1);
+        assert!(!ChainParams::regtest().bip30_skipped_for_bip34_ancestry(2, None));
         assert!(!ChainParams::signet().bip30_skipped_for_bip34_ancestry(2, None));
     }
 

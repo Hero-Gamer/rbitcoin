@@ -9,7 +9,7 @@ BIP34 at height 1, so a repeated unspent txid was accepted. Core skips
 BIP30 only when the block's ancestor at BIP34 height is the network BIP34
 hash, and enforces it again from height 1_983_702. Signet and regtest use
 a null BIP34 hash, so they always enforce. The two historical mainnet
-repeats are unchanged. Regtest's BIP34 height is unchanged.
+repeats are unchanged. Regtest's BIP34 height is 1 (finding 021).
 
 The txid batch is one `get_fk_by_txid_batch` per checked block, counted in
 the structural `spent=` timer. The BIP34 header is one `header_at_height`

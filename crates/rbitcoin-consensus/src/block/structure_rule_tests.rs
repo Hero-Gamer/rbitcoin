@@ -686,16 +686,32 @@ fn s7_bip34_not_required_at_height_0() {
 }
 
 #[test]
-fn s7_regtest_does_not_activate_bip34_early() {
-    // rust-bitcoin REGTEST bip34_height is 100_000_000 — our mined regtest
-    // blocks may still *include* a height push, but empty/missing is OK.
+fn s7_regtest_rejects_bip34_missing_at_height_1() {
+    // Core `CRegTestParams`: `BIP34Height = 1`.
     let p = Box::leak(Box::new(ChainParams::regtest()));
-    assert!(p.btc.bip34_height > 1_000_000);
     let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
+    validate_block_structure(&block_with(vec![coinbase(1)]), &ctx)
+        .expect("BIP34 height push at height 1");
     let mut cb = coinbase(1);
     cb.input[0].script_sig = ScriptBuf::from_bytes(b"regtest".to_vec());
-    let b = block_with(vec![cb]);
-    validate_block_structure(&b, &ctx).expect("regtest height 1: BIP34 not active");
+    let err = validate_block_structure(&block_with(vec![cb]), &ctx).unwrap_err();
+    assert_bad_block(err, "bip34");
+}
+
+#[test]
+fn s7_regtest_bip34_activation_height_override() {
+    // `-testactivationheight=bip34@N` moves the gate like Core.
+    let mut over = ChainParams::regtest();
+    over.apply_test_activation_height("bip34", 3).unwrap();
+    let p = Box::leak(Box::new(over));
+    let mut cb = coinbase(2);
+    cb.input[0].script_sig = ScriptBuf::from_bytes(b"regtest".to_vec());
+    let ctx = ValidationContext::at(p, Height(2), Milestone::NONE);
+    validate_block_structure(&block_with(vec![cb.clone()]), &ctx)
+        .expect("below the overridden BIP34 height");
+    let ctx = ValidationContext::at(p, Height(3), Milestone::NONE);
+    let err = validate_block_structure(&block_with(vec![cb]), &ctx).unwrap_err();
+    assert_bad_block(err, "bip34");
 }
 
 #[test]

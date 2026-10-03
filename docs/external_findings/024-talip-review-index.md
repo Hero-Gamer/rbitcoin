@@ -28,7 +28,7 @@ board. Each fixed row names the regression. No reproduction steps.
 | C14 / M-4 | medium | Milestone hash and signet default | fixed | `low_work_fork_does_not_skip_even_at_the_milestone_height` ([042](./042-milestone-anchor.md)) |
 | L-1 / L-3 / L-12 | low | Local auth and datadir mode | fixed | `tor_control_onion_lifecycle` ([044](./044-local-auth.md)) |
 | L-9 | low | BIP30 after the exception window | fixed | `buried_rules_and_a_lying_header_path` ([035](./035-bip30-bip34-ancestry.md)) |
-| C16 | low | Regtest BIP34 height | won't-fix | `s7_regtest_does_not_activate_bip34_early` (`bip34_height` stays rust-bitcoin's value, above 1_000_000). Signet is already height 1. Production networks are unaffected. |
+| C16 | low | Regtest BIP34 height | fixed | `s7_regtest_rejects_bip34_missing_at_height_1` ([021](./021-regtest-activation-heights.md)). Regtest `bip34_height` is 1 like Core. Production networks are unaffected. |
 | #03 / #13 / #16 | — | Witness reserved value, RBFR, admin RPC | rejected | not defects |
 
 Owner: [`quality.md`](../quality.md) **Q-71**.

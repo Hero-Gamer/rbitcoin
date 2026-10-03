@@ -29,13 +29,18 @@ fn propose(ctx: &RpcContext, block: &Block) -> Value {
     dispatch(ctx, "getblocktemplate", vec![req]).unwrap()
 }
 
-/// Child of the tip carrying the tip's own coinbase, for proposal needles.
+/// Child of the tip carrying the tip's coinbase re-stamped with the child's
+/// BIP34 height, for proposal needles.
 fn proposal_on_tip(ctx: &RpcContext, extra: Vec<Transaction>) -> Block {
     use bitcoin::block::{Header, Version as BlockVersion};
     use bitcoin::TxMerkleNode;
     let raw = dispatch(ctx, "getblock", vec![best_hash(ctx), json!(0)]).unwrap();
     let mined: Block = deserialize(&hex_decode(raw.as_str().unwrap()).unwrap()).unwrap();
-    let mut txdata = vec![mined.txdata[0].clone()];
+    let mut coinbase = mined.txdata[0].clone();
+    let mut height_push = rbitcoin_consensus::bip34_height_script(tip_count(ctx) as u32 + 1);
+    height_push.resize(height_push.len().max(2), 0x00);
+    coinbase.input[0].script_sig = ScriptBuf::from_bytes(height_push);
+    let mut txdata = vec![coinbase];
     txdata.extend(extra);
     let mut next = Block {
         header: Header {
@@ -337,7 +342,7 @@ fn chain_ops_first_block_info(
     let info = dispatch(ctx, "getdeploymentinfo", vec![]).unwrap();
     assert_eq!(info["height"], 1);
     let d = &info["deployments"];
-    for (fork, active) in [("csv", true), ("bip65", true), ("bip66", true), ("bip34", false)] {
+    for (fork, active) in [("csv", true), ("bip65", true), ("bip66", true), ("bip34", true)] {
         assert_eq!(d[fork]["active"], active, "{fork}");
     }
 

@@ -2783,7 +2783,6 @@ fn store_start_states_lookup_load_confirm() {
     };
     use bitcoin::hashes::Hash;
     use bitcoin::locktime::absolute::LockTime;
-    use bitcoin::script::PushBytesBuf;
     use bitcoin::CompactTarget;
     use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Sequence, TxMerkleNode, Witness};
     use rbitcoin_primitives::Height;
@@ -2796,10 +2795,9 @@ fn store_start_states_lookup_load_confirm() {
     let maturity = params.coinbase_maturity();
 
     fn coinbase(height: u32) -> Transaction {
-        let mut script = ScriptBuf::new();
-        let pb = PushBytesBuf::try_from(height.to_le_bytes().to_vec()).unwrap();
-        script.push_slice(pb);
-        script.push_opcode(bitcoin::opcodes::all::OP_CHECKSIG);
+        let mut ss = crate::bip34_height_script(height);
+        ss.push(bitcoin::opcodes::all::OP_CHECKSIG.to_u8());
+        let script = ScriptBuf::from_bytes(ss);
         Transaction {
             version: TxVersion::ONE,
             lock_time: LockTime::ZERO,
